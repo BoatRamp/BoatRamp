@@ -500,6 +500,16 @@ pub fn mysqldump_definer_objects_invocation(conn: &MysqlConnection, db: &str) ->
 /// call time, so routines-first is safe). `--no-data` (no rows — the base tables already swapped in),
 /// `--skip-triggers` (triggers ride the routines/events dump). Pass ONLY view names — never call this
 /// with an empty `views` (a bare `mysqldump <db>` would dump the WHOLE database).
+///
+/// SECURITY: the `views` are ATTACKER-CONTROLLED (names of views the untrusted dump created in the
+/// shadow), and this `mysqldump` runs as the admin / cluster superuser. `my_getopt` treats a
+/// `--`-prefixed operand at ANY position as an option, so a view named `--all-databases` /
+/// `--host=attacker` would turn into a mysqldump OPTION (cross-tenant dump / connection redirect of
+/// the superuser credential). A literal `--` end-of-options marker is pushed BEFORE the `db` + view
+/// names so EVERY operand is taken literally. The caller
+/// ([`mysql_dump_shadow_views`](crate::project_export)) ALSO validates each name fail-closed — belt
+/// and suspenders. (argv is `exec`'d, never shelled, so no shell metachar concern — the risk is
+/// purely mysqldump's own option parsing, which `--` closes.)
 pub fn mysqldump_views_invocation(
     conn: &MysqlConnection,
     db: &str,
@@ -513,6 +523,9 @@ pub fn mysqldump_views_invocation(
         "--skip-triggers".to_string(),
     ];
     argv.extend(conn.conn_args());
+    // End-of-options: every following operand (the db + the attacker-named views) is LITERAL, so a
+    // `--`-prefixed view name can never be parsed as a mysqldump option.
+    argv.push("--".to_string());
     argv.push(db.to_string());
     for v in views {
         argv.push(v.clone());

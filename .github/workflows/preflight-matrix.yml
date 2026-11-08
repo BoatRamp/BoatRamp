@@ -402,8 +402,8 @@ jobs:
           # success markers below. (The libsql true-delta + its CHAIN gate are
           # `#[cfg(feature = "sql-delta-libsql")]`, NOT compiled in this `--features project-export`
           # build, so they are NOT in this count — they gate in capability.yml.)
-          grep -qE 'test result: ok\. 23 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 23 tests (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 24 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 24 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
@@ -440,6 +440,8 @@ jobs:
             || { echo "::error::live Shared managed-mysql sync sidecar shadow+swap gate never reached its marker (silent skip, a regression, or a cross-tenant leak)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK' project-export-live.log \
             || { echo "::error::live mysql triggers/routines/events carry + DEFINER re-point gate never reached its marker (silent skip, or a carried object was not re-pointed to the tenant role)" >&2; exit 1; }
+          grep -q 'PROJECT EXPORT MYSQL VIEW-NAME INJECTION REFUSED OK' project-export-live.log \
+            || { echo "::error::live mysql view-name argument-injection refusal gate never reached its marker (silent skip, or an attacker-named view was NOT rejected fail-closed)" >&2; exit 1; }
 
           # --- no-docker members of the SAME test binary (always run) — gating on their markers
           #     too proves the whole file executed, not just the live-pg/mysql subset above (e.g.

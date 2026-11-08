@@ -3346,6 +3346,289 @@ async fn project_export_mysql_routines_triggers_live() {
     println!("PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK");
 }
 
+/// **Live managed-MySQL VIEW-NAME argument-injection refusal gate** (Tier-2 / nightly — Docker + a
+/// MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE DATABASE`). Self-skips.
+///
+/// NEGATIVE control for the Security HIGH: the by-name view capture passes the shadow's (ATTACKER-
+/// created) view names as positional `mysqldump` operands AS THE ADMIN, so a view named
+/// `--all-databases` / `--host=…` could inject a mysqldump OPTION (dump every tenant / redirect the
+/// superuser credential). A Shared source tenant is seeded with a view literally named
+/// `` `--all-databases` ``; on import into a FRESH tenant the restore must be REFUSED fail-closed by
+/// the view-name validator BEFORE the capture mysqldump runs — asserted by the error naming the
+/// unsafe view, the fresh target staying EMPTY (the swap never happened — the validation precedes
+/// it), and a pre-existing SIBLING tenant's data being byte-for-byte unchanged (no cross-tenant dump
+/// occurred). Emits `PROJECT EXPORT MYSQL VIEW-NAME INJECTION REFUSED OK`.
+#[tokio::test]
+async fn project_export_mysql_view_name_injection_refused_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, IdentityChoice, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{sanitize_ident, tenant_db_name};
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_MYSQL_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL unset (mysql view-injection gate not run)");
+        return;
+    };
+    let Some((superuser, su_password, host, port, _db)) = parse_mysql_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL is not a mysql://user:pw@host:port/db URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (mysql view-injection gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+    let image = "mysql:8.0";
+
+    const COMPUTE: &str = "my";
+    const DB_BINDING: &str = "app";
+    const DATABASE: &str = "injtest";
+    let s = now_suffix();
+    let src_project = format!("myinj-src-{s}");
+    let fresh_project = format!("myinj-fresh-{s}");
+    let other_project = format!("myinj-other-{s}");
+
+    let su = MysqlConnection {
+        host: host.clone(),
+        port,
+        user: superuser.clone(),
+        password: su_password.clone(),
+        database: String::new(),
+        connect_timeout_secs: 10,
+        ephemeral_network: None,
+    };
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-myinj-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([3u8; 32]));
+
+    let sealed_su = envelope
+        .wrap(su_password.as_bytes())
+        .await
+        .expect("seal superuser pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed_su,
+    )
+    .await
+    .expect("pre-seal superuser credential");
+
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-mysql".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed healthy replica");
+
+    let binding = ExternalDatabaseConfig {
+        kind: "mysql".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(DATABASE.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(DB_BINDING.to_string(), binding.clone())]);
+    let db_name = |project: &str| tenant_db_name(DATABASE, &sanitize_ident(project));
+
+    for p in [&src_project, &fresh_project, &other_project] {
+        let _ = mysql_run(
+            backend.as_ref(),
+            image,
+            &su,
+            None,
+            &format!("DROP DATABASE IF EXISTS `{}`;", db_name(p)),
+        )
+        .await;
+    }
+
+    provision_tenant(&deploy, &kv, &envelope, &binding, &src_project, "")
+        .await
+        .expect("provision source tenant");
+    provision_tenant(&deploy, &kv, &envelope, &binding, &other_project, "")
+        .await
+        .expect("provision the pre-existing sibling tenant");
+
+    // Seed the SOURCE with a table + a VIEW whose NAME is a mysqldump argument-injection payload.
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&db_name(&src_project)),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); \
+         INSERT INTO t VALUES (1,'alpha'); \
+         CREATE VIEW `--all-databases` AS SELECT id FROM t;",
+    )
+    .await;
+    assert_eq!(
+        c, 0,
+        "seed source + injection-named view; mysql output:\n{o}"
+    );
+    // The sibling tenant's known data (must stay byte-for-byte unchanged).
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&db_name(&other_project)),
+        "CREATE TABLE t(id INT PRIMARY KEY, v TEXT); INSERT INTO t VALUES (99,'untouched');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed sibling tenant; mysql output:\n{o}");
+    let other_before = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&db_name(&other_project)),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await
+    .1;
+
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-myinj-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-myinj-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases, deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false);
+
+    let bundle = {
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        driver
+            .export(
+                &src_project,
+                &ExportOptions {
+                    scope: BundleScope::DataPlane,
+                    managed_restore: ManagedRestore::ShadowSwap,
+                    include_identity: false,
+                    transport_key: None,
+                    delta: None,
+                },
+                &mut sink,
+            )
+            .await
+            .expect("driver export of the source tenant");
+        sink.into_inner()
+    };
+
+    // IMPORT must be REFUSED fail-closed by the view-name validator.
+    let refused = {
+        let mut source = futures::io::Cursor::new(bundle);
+        driver
+            .import(
+                &fresh_project,
+                &mut source,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: false,
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+    };
+    let err = refused.expect_err("an injection-named view MUST refuse the import fail-closed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unsafe name") && msg.contains("--all-databases"),
+        "the refusal must be the view-name rejection, got: {msg}"
+    );
+
+    // Fail-closed: the swap never happened (the validation precedes it), so the fresh target's table
+    // did NOT land (the carried table is absent / the query errors).
+    let (code, _out) = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&db_name(&fresh_project)),
+        "SELECT COUNT(*) FROM t;",
+    )
+    .await;
+    assert_ne!(
+        code, 0,
+        "the refused import must NOT have swapped the source table into the fresh tenant"
+    );
+
+    // No cross-tenant dump occurred: the sibling tenant is byte-for-byte unchanged.
+    let other_after = mysql_run(
+        backend.as_ref(),
+        image,
+        &su,
+        Some(&db_name(&other_project)),
+        "SELECT CONCAT(id, ':', v) FROM t ORDER BY id;",
+    )
+    .await
+    .1;
+    assert_eq!(
+        other_after, other_before,
+        "a refused injection import must not touch the sibling tenant"
+    );
+
+    for p in [&src_project, &fresh_project, &other_project] {
+        let _ = mysql_run(
+            backend.as_ref(),
+            image,
+            &su,
+            None,
+            &format!("DROP DATABASE IF EXISTS `{}`;", db_name(p)),
+        )
+        .await;
+    }
+
+    println!("PROJECT EXPORT MYSQL VIEW-NAME INJECTION REFUSED OK");
+}
+
 /// **Live full-DRIVER round-trip** — drives the real `NodeProjectExport::export()` /
 /// `import()` (not the reconstructed primitives the pg/mysql/libsql tests use), closing the
 /// "driver has no end-to-end live coverage" gap for the pg path: it exercises the driver's

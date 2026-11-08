@@ -2304,6 +2304,23 @@ fn rewrite_one_definer_clause_at(
     }
 }
 
+/// Whether `name` is a SAFE mysql object name to pass as a positional `mysqldump` operand (a
+/// table/view name) that runs as the admin. The names come from ATTACKER-created objects, so this is
+/// fail-closed: a name is safe ONLY when it is non-empty, does NOT start with `-` (the
+/// argument-injection vector — `--all-databases`/`--host=…` as a `mysqldump` option run as the
+/// superuser), and every character is a normal mysql identifier character — ASCII alphanumeric,
+/// `_`, `$`, or non-ASCII (unicode identifier chars) — i.e. NO control characters and no ASCII
+/// punctuation/space. (With the `--` end-of-options guard the leading `-` can no longer become an
+/// option, and argv is `exec`'d not shelled; this is the belt to that suspenders, and it also keeps
+/// the newline-delimited enumeration unambiguous.)
+fn is_safe_mysql_object_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name.chars().all(|c| {
+            !c.is_control() && (c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii())
+        })
+}
+
 /// If `s` begins with a complete `` `user`@`host` `` MySQL account spec (each a backtick-quoted
 /// identifier, doubled `` `` `` for a literal backtick), return its byte length; else `None`.
 fn mysql_definer_account_len(s: &str) -> Option<usize> {
@@ -6651,6 +6668,22 @@ impl NodeProjectExport {
         if views.is_empty() {
             return Ok(String::new());
         }
+        // SECURITY (fail-closed): these view names are ATTACKER-CONTROLLED (views the untrusted dump
+        // created in the shadow), and the capture `mysqldump` below runs them as positional operands
+        // AS THE ADMIN / cluster superuser. Even with the `--` end-of-options guard in
+        // `mysqldump_views_invocation`, REFUSE any name that is not a plausible, safe identifier —
+        // reject a leading `-` (argument-injection: `--all-databases` dumps every tenant, `--host=…`
+        // redirects the superuser credential) and anything carrying a control character (which would
+        // also mis-split the newline-delimited enumeration) or ASCII punctuation/space that is not a
+        // normal mysql identifier char (`_`/`$`/alphanumeric/non-ASCII allowed). Abort the whole
+        // restore — never silently skip a rejected object.
+        if let Some(bad) = views.iter().find(|v| !is_safe_mysql_object_name(v)) {
+            return Err(Perr::Other(format!(
+                "mysql shadow REFUSED: a carried VIEW has an unsafe name {bad:?} (leading '-', a \
+                 control character, or a non-identifier character) — it could inject a mysqldump \
+                 option run as the admin; the import is aborted fail-closed, live untouched"
+            )));
+        }
         let inv = mysqldump_views_invocation(&plan.maint, &plan.shadow_db, &views);
         let outfile = stage_dir.join(format!("myviews-{}.sql", shadow_suffix()));
         let code = self
@@ -10856,6 +10889,48 @@ INSERT INTO `logs` VALUES (1,'note CREATE DEFINER=`evil`@`host` PROCEDURE foo');
             rewrite_mysql_definers(proc1, &role).contains("DEFINER=`ro``le`@`%`"),
             "a re-point target's backtick is doubled in the emitted identifier"
         );
+    }
+
+    /// SECURITY: the attacker-controlled VIEW-name validator (`is_safe_mysql_object_name`) that gates
+    /// the by-name view capture `mysqldump` run as the admin. It MUST reject the argument-injection
+    /// vectors (a leading `-`: `--all-databases` dumps every tenant, `--host=…` redirects the
+    /// superuser credential) and control characters, while accepting legitimate identifiers (incl.
+    /// unicode). Mutation proof: drop the `!starts_with('-')` guard and the injection names pass.
+    #[test]
+    fn mysql_view_name_validation_rejects_argv_injection() {
+        // REJECTED: the argv-injection view names.
+        for bad in [
+            "--all-databases",
+            "--host=attacker-listener",
+            "-anything",
+            "",
+            "has space",
+            "semi;colon",
+            "name`tick",
+            "quote'd",
+            "dot.name",
+            "new\nline",
+            "ctrl\u{0007}bell",
+        ] {
+            assert!(
+                !is_safe_mysql_object_name(bad),
+                "must reject unsafe view name {bad:?}"
+            );
+        }
+        // ACCEPTED: legitimate identifiers, including `_`/`$`/digits and non-ASCII (unicode).
+        for ok in [
+            "v_sales_2026",
+            "ViewName",
+            "view$1",
+            "_underscore",
+            "représentant",
+            "台帳",
+        ] {
+            assert!(
+                is_safe_mysql_object_name(ok),
+                "must accept legitimate view name {ok:?}"
+            );
+        }
     }
 
     /// The EXPORT-side framing decision behind `plan_export` (the pure complement of the import-side

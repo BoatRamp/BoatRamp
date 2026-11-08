@@ -51,6 +51,10 @@ versions.
   is ONLY ever the tenant's own role (a malicious object body then runs with the tenant's own grants —
   its own risk, never cross-tenant or server-wide); an object requiring a privilege the tenant role
   lacks fails the import fail-closed rather than escalating.
+  The attacker-controlled object names that reach a `mysqldump` run as the admin are fenced: the
+  by-name VIEW capture passes a literal `--` end-of-options marker and the driver validates each view
+  name fail-closed (rejecting a leading `-` / control characters), so a view named `--all-databases`
+  or `--host=…` cannot inject a `mysqldump` option (cross-tenant dump / superuser-credential redirect).
 - **The overloaded `data_only` flag that caused the bug is SPLIT into two orthogonal concepts**,
   threaded end-to-end (export options → the bundle manifest → the clone/sync wire → import routing):
   - **`BundleScope` (`DataPlane` | `Full`)** — WHAT the bundle carries: the data plane only (pg/mysql
