@@ -372,14 +372,17 @@ jobs:
           # gone in 8.4. The ephemeral mysqldump/mysql client containers the test launches reach
           # it by its bridge IP.
           # `--log-bin --binlog-format=ROW --gtid-mode=ON …` enables the row binlog + GTID so the
-          # mysql binlog TRUE-DELTA gate can snapshot-pin a base + stream the delta (a bring-your-own
-          # test mysql must launch with it, the way `managed_db_spec` bakes it into a managed DB's
-          # launch argv under `delta_capture`).
+          # mysql binlog TRUE-DELTA gate can snapshot-pin a base + stream the delta; and
+          # `--log-bin-trust-function-creators=ON` lets the non-SUPER shadow-apply user CREATE
+          # TRIGGER/FUNCTION on a binlog-on server (the routines/triggers/views gate) — else ERROR 1419.
+          # A bring-your-own test mysql must launch with both, the way `managed_db_spec` bakes them
+          # into a managed DB's launch argv (native_password unconditionally; the binlog set under
+          # `delta_capture`).
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
           docker run -d --name brexport-mysql -e MYSQL_ROOT_PASSWORD=mysql \
             mysql:8.0 --default-authentication-plugin=mysql_native_password \
             --log-bin --binlog-format=ROW --gtid-mode=ON --enforce-gtid-consistency=ON \
-            --server-id=1 >/dev/null
+            --log-bin-trust-function-creators=ON --server-id=1 >/dev/null
           for _ in $(seq 1 90); do
             docker exec brexport-mysql mysqladmin ping -h 127.0.0.1 -uroot -pmysql >/dev/null 2>&1 && break
             sleep 2

@@ -725,7 +725,7 @@ pub fn plan_sync(
 
     // A DB is "present on the destination after this sync" iff it is already on the dest, OR this
     // sync carries it (databases included, the source declares it as a FEASIBLE restore, and it is
-    // not per-item excluded). An INFEASIBLE DB (external/BYO, Shared MySQL, …) is NOT carried, so a
+    // not per-item excluded). An INFEASIBLE DB (external/BYO, an unknown engine, …) is NOT carried, so a
     // site binding it is correctly judged incoherent (its reason surfaces on the DB row).
     let db_present_after = |name: &str| -> bool {
         if dest_dbs.contains(name) {
@@ -805,7 +805,7 @@ pub fn plan_sync(
                 });
             } else if let Some(reason) = db.infeasible_reason() {
                 // FEASIBILITY preflight (fail in the PLAN, not at apply): a DB whose restore the
-                // sync cannot perform (external/BYO binding, Shared MySQL, unknown engine) is SKIPPED
+                // sync cannot perform (external/BYO binding, an unknown engine) is SKIPPED
                 // with its reason — surfaced by `--strict` + the skipped count, so the operator sees
                 // it up front rather than hitting the node's late apply-time refusal.
                 items.push(ItemPlan {
@@ -815,8 +815,8 @@ pub fn plan_sync(
                     reason: Some(reason),
                 });
             } else {
-                // Feasible: a managed pg (any tenant) or a managed dedicated MySQL — carried and
-                // restored via the provision + non-superuser shadow+swap (post-fix).
+                // Feasible: a managed pg or MySQL of either tenancy (dedicated or Shared) — carried
+                // and restored via the provision + non-superuser shadow+swap.
                 items.push(ItemPlan {
                     kind: ItemKind::Database,
                     name: db.name.clone(),

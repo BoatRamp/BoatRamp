@@ -1216,12 +1216,15 @@
                     "-c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10"
                 )
                 # `--log-bin --binlog-format=ROW --gtid-mode=ON …` enables the row binlog + GTID so
-                # the mysql binlog TRUE-DELTA gate can snapshot-pin a base + stream the delta.
+                # the mysql binlog TRUE-DELTA gate can snapshot-pin a base + stream the delta;
+                # `--log-bin-trust-function-creators=ON` lets the non-SUPER shadow-apply user CREATE
+                # TRIGGER/FUNCTION on a binlog-on server (the routines/triggers/views gate) — else
+                # ERROR 1419. Mirrors `managed_db_spec` (the way a managed DB's launch argv bakes them).
                 machine.succeed(
                     "docker run -d --name brexport-mysql -e MYSQL_ROOT_PASSWORD=mysql "
                     "mysql:8.0 --default-authentication-plugin=mysql_native_password "
                     "--log-bin --binlog-format=ROW --gtid-mode=ON "
-                    "--enforce-gtid-consistency=ON --server-id=1"
+                    "--enforce-gtid-consistency=ON --log-bin-trust-function-creators=ON --server-id=1"
                 )
 
                 # Wait for both to accept connections (readiness, not a fixed sleep).
