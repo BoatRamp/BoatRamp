@@ -394,6 +394,14 @@ jobs:
             cargo test -p boatramp-node --features project-export \
             --test project_export_roundtrip \
             -- --nocapture --test-threads=1 2>&1 | tee project-export-live.log
+          # Cross-node SOURCE-VERSION-INDEPENDENCE gate (v0.59.2): the REAL clone/stream +
+          # project-import handlers on a SOURCE + TARGET node, with the managed-restore signal on the
+          # wire only. Same pg+mysql servers; self-skips → gate on its markers below.
+          BOATRAMP_TEST_PG_URL="postgres://postgres:postgres@${PGIP}:5432/postgres" \
+          BOATRAMP_TEST_MYSQL_URL="mysql://root:mysql@${MYIP}:3306/mysql" \
+            cargo test -p boatramp-node --features project-export \
+            --test project_sync_cross_node_source_independent_live \
+            -- --nocapture --test-threads=1 2>&1 | tee project-sync-xnode-live.log
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
 
@@ -455,3 +463,11 @@ jobs:
             || { echo "::error::libsql chunked ATOMIC shadow round-trip never reached its marker (silent skip or a regression?)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT CROSS-TENANT LEAK GATE OK' project-export-live.log \
             || { echo "::error::cross-tenant leak gate never reached its marker (silent skip, or a cross-tenant byte leak)" >&2; exit 1; }
+
+          # --- cross-node SOURCE-VERSION-INDEPENDENCE (v0.59.2) — the REAL wire (clone/stream +
+          #     project-import handlers), proving a managed-DB sync into an ABSENT dest lands against
+          #     ANY source version + the old-source Overlay is refused with the version-skew error. ---
+          grep -q 'PROJECT SYNC CROSS-NODE PG SOURCE-INDEPENDENT OK' project-sync-xnode-live.log \
+            || { echo "::error::cross-node managed-pg source-independent sync gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'PROJECT SYNC CROSS-NODE MYSQL SOURCE-INDEPENDENT OK' project-sync-xnode-live.log \
+            || { echo "::error::cross-node managed-mysql source-independent sync gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }

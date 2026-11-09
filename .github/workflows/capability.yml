@@ -461,6 +461,16 @@ jobs:
             timeout -k 30 900 cargo test -p boatramp-node --features project-export,sql-delta-libsql \
             --test project_export_roundtrip \
             -- --test-threads=1 --nocapture 2>&1 | tee project-export.log
+          # Cross-node SOURCE-VERSION-INDEPENDENCE gate (v0.59.2): drives the REAL boatramp-server
+          # clone/stream + project-import HANDLERS over the real axum stack on a SOURCE + TARGET node,
+          # so the wire layer where a pre-v0.59.1 source drops the `managed_restore` signal is
+          # exercised. The managed-restore mode travels ONLY as a wire query param (NO hand-built
+          # ExportOptions/ImportOptions). Same pg+mysql servers; self-skips → gate on its markers.
+          BOATRAMP_TEST_PG_URL="postgres://postgres:postgres@${PGIP}:5432/postgres" \
+          BOATRAMP_TEST_MYSQL_URL="mysql://root:mysql@${MYIP}:3306/mysql" \
+            timeout -k 30 900 cargo test -p boatramp-node --features project-export \
+            --test project_sync_cross_node_source_independent_live \
+            -- --test-threads=1 --nocapture 2>&1 | tee project-sync-xnode.log
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
           # The test self-skips (and still prints `test result: ok`) when pg/docker are
@@ -538,6 +548,19 @@ jobs:
           # admin — gate on its marker so the argv-injection guard can't silently regress.
           grep -q 'PROJECT EXPORT MYSQL VIEW-NAME INJECTION REFUSED OK' project-export.log \
             || { echo "::error::mysql view-name argument-injection refusal gate never reached its marker (silent skip, or the injection guard regressed)" >&2; exit 1; }
+          # Cross-node SOURCE-VERSION-INDEPENDENCE (v0.59.2 — construens's 3rd-repeat production
+          # failure): a managed-DB `project sync` into an ABSENT dest must land data CROSS-NODE against
+          # ANY source version. The gate drives the REAL clone/stream + project-import handlers over
+          # the real axum stack (SOURCE + TARGET node), simulates a pre-v0.59.1 source by OMITTING the
+          # `managed_restore` wire param, and asserts (a) the old-source Overlay is REFUSED with the
+          # distinct VERSION-SKEW message, and (b) the sync's own absent-dest decision
+          # (`data_clone_request`) LANDS the rows via a full-bundle shadow+swap. Self-skips without
+          # pg/mysql → gate on its markers so a skip or a regression (the fix or the version-skew error
+          # regressing) fails the job.
+          grep -q 'PROJECT SYNC CROSS-NODE PG SOURCE-INDEPENDENT OK' project-sync-xnode.log \
+            || { echo "::error::cross-node managed-pg source-independent sync gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'PROJECT SYNC CROSS-NODE MYSQL SOURCE-INDEPENDENT OK' project-sync-xnode.log \
+            || { echo "::error::cross-node managed-mysql source-independent sync gate never reached its marker (silent skip or a regression?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true

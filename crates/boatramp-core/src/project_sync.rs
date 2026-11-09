@@ -532,6 +532,56 @@ pub enum DestPrecondition {
     Exists,
 }
 
+/// The data-plane clone request `project sync` issues for its managed-DB-contents + blobs transfer
+/// (the `clone --from` data-only path). Split out as a PURE decision so the cross-node gate can
+/// drive the EXACT choice the CLI executor makes (the fix is a change to [`data_clone_request`], and
+/// the gate exercises the real choice over the real wire rather than a hand-built `ExportOptions`).
+///
+/// The two orthogonal bundle descriptors it maps to on the wire:
+/// - `data_only` — the control-plane [`BundleScope`](crate::project_export::BundleScope) requested of
+///   the SOURCE (`true` ⇒ DataPlane; `false` ⇒ a FULL bundle carrying schema + the control-plane KV
+///   slice).
+/// - `managed_restore` — the managed-member [`ManagedRestore`](crate::project_export::ManagedRestore)
+///   mode; `None` ⇒ let the source apply the legacy coupling (`data_only → Overlay`, full →
+///   ShadowSwap) — exactly what a PRE-v0.59.1 source does with the field it does not understand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataCloneRequest {
+    /// Request a `--data-only` (DataPlane-scope) clone of the SOURCE (`true`) vs a FULL bundle
+    /// (`false`). A full bundle also carries the control-plane KV slice (the target re-keys +
+    /// tenant-enforces + strips system-principal markers + mints a FRESH identity on restore).
+    pub data_only: bool,
+    /// The managed-restore MODE to request of the source (orthogonal to `data_only`); `None` ⇒ the
+    /// source's own legacy coupling decides it.
+    pub managed_restore: Option<crate::project_export::ManagedRestore>,
+    /// Overlay a non-empty control-plane KV destination on import (`kv_dump` commingle override). A
+    /// full bundle carries the KV slice, and a just-created + provisioned dest already holds its
+    /// project/declared-DB records, so the full-bundle landing needs it.
+    pub force: bool,
+}
+
+/// Decide the data-plane clone request `project sync` issues, given whether the managed destination
+/// is ABSENT/fresh (env-replication — the dest project does not exist yet and sync will create +
+/// provision it) vs an EXISTING populated dest (incremental mirror).
+///
+/// This is the SOURCE-VERSION-INDEPENDENCE seam. A PRE-v0.59.1 source silently drops the
+/// `managed_restore` query param, so a `data_only=true` request degrades to a schema-less Overlay the
+/// v0.59.1+ target then correctly REFUSES for a managed binding (`RefuseManagedDataOnly`) — breaking a
+/// clone FROM an older prod into a fresh env. [`data_clone_request`] is where that is fixed.
+///
+/// (v0.59.1 behavior — RETAINED here until the source-independence fix: always a DataPlane + explicit
+/// ShadowSwap request, which needs a v0.59.1+ source to honour the `managed_restore` signal.)
+#[must_use]
+pub fn data_clone_request(dest_absent: bool) -> DataCloneRequest {
+    // The fresh-dest FULL-bundle branch (source-version-independent) is wired in the fix; today both
+    // preconditions take the DataPlane + explicit ShadowSwap request (the v0.59.1 shape).
+    let _ = dest_absent;
+    DataCloneRequest {
+        data_only: true,
+        managed_restore: Some(crate::project_export::ManagedRestore::ShadowSwap),
+        force: false,
+    }
+}
+
 /// How one piece is handled under the resolved selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PiecePlan {
