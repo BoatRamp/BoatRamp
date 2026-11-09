@@ -673,6 +673,14 @@ pub struct ImportOptions {
     /// spool) and SKIP every other member (blobs not listed + all non-blob members). Built from a
     /// skip MANIFEST (`--only-blobs`). `None` ⇒ restore everything (the normal path).
     pub only_blobs: Option<std::collections::BTreeSet<String>>,
+    /// The managed-restore MODE the CALLER requested of the source (`project sync` / a clone sets
+    /// `ShadowSwap`). Used ONLY to sharpen the error when a managed member arrives as a LEGACY Overlay
+    /// head despite the request: that is a SOURCE VERSION SKEW (a pre-v0.59.1 source silently dropped
+    /// the `managed_restore` signal and emitted a schema-less Overlay), so the refusal names the skew
+    /// explicitly instead of the generic data-only-overlay RCE message. `None` ⇒ no expectation (the
+    /// generic refusal stands — e.g. a deliberate `project import` of a data-only bundle). NEVER
+    /// relaxes the guard: a managed Overlay is refused either way; this only changes the MESSAGE.
+    pub expected_managed_restore: Option<ManagedRestore>,
 }
 
 impl std::fmt::Debug for ImportOptions {
@@ -694,6 +702,7 @@ impl std::fmt::Debug for ImportOptions {
                     .as_ref()
                     .map(std::collections::BTreeSet::len),
             )
+            .field("expected_managed_restore", &self.expected_managed_restore)
             .finish()
     }
 }

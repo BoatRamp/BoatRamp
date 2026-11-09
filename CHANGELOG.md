@@ -7,6 +7,32 @@ versions.
 
 ## [Unreleased]
 
+## [0.59.2]
+
+### Fixed
+
+- **`project sync --apply --include-pg` (and `--include-mysql`) into an ABSENT/fresh managed-DB
+  destination now lands the data CROSS-NODE against ANY source version** — including a pre-v0.59.1
+  source (e.g. a production node still on v0.49.0). The v0.59.1 shadow-swap fix is split across the
+  source and target: it needs the SOURCE to emit a `managed_restore=shadow-swap` marker in the
+  streamed bundle head (new in v0.59.1). A pre-v0.59.1 source silently drops the unknown
+  `managed_restore` query param and streams a LEGACY data-only head, which the v0.59.1 target
+  correctly refuses for a managed binding — so a new node cloning FROM an older prod failed. Sync now
+  requests a **FULL bundle** for an absent managed dest (the schema+data env-replication shape every
+  source version understands — exactly the proven `--force` full-bundle recovery path): the target
+  provisions and restores the managed member via the SAME safe non-superuser shadow+swap, and the
+  full-scope control-plane KV slice is re-keyed to the target, tenant-scoped fail-closed, and
+  system-principal-stripped on import. An EXISTING managed dest keeps the v0.59.1 DataPlane +
+  shadow-swap incremental path (no control-plane slice dragged into a mirror).
+- **A managed-DB restore that was requested as shadow-swap but arrives as a legacy data-only Overlay
+  now fails with a distinct VERSION-SKEW error** naming the cause ("the source node did not emit a
+  shadow-swap bundle head … upgrade the source to v0.59.1+, or re-export as a full bundle"), instead
+  of the generic data-only-overlay RCE refusal — so a source/target version skew is never again
+  mistaken for a missing feature. The genuine RCE guard (a deliberate data-only overlay into a
+  managed binding) keeps its refusal; this only sharpens the message, keyed on the caller's
+  requested managed-restore mode (`project sync`/clone sets `shadow-swap`; the clone orchestrator and
+  `project import` both carry it into the import).
+
 ## [0.59.1]
 
 ### Fixed

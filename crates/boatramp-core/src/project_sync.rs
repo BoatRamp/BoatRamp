@@ -566,19 +566,38 @@ pub struct DataCloneRequest {
 /// This is the SOURCE-VERSION-INDEPENDENCE seam. A PRE-v0.59.1 source silently drops the
 /// `managed_restore` query param, so a `data_only=true` request degrades to a schema-less Overlay the
 /// v0.59.1+ target then correctly REFUSES for a managed binding (`RefuseManagedDataOnly`) — breaking a
-/// clone FROM an older prod into a fresh env. [`data_clone_request`] is where that is fixed.
+/// clone FROM an older prod into a fresh env. This is where that is fixed.
 ///
-/// (v0.59.1 behavior — RETAINED here until the source-independence fix: always a DataPlane + explicit
-/// ShadowSwap request, which needs a v0.59.1+ source to honour the `managed_restore` signal.)
+/// - **ABSENT/fresh managed dest** → a FULL bundle (`data_only=false`, legacy-coupled ShadowSwap via
+///   `None`, `force`). A full bundle is understood by ANY source version (it is exactly construens's
+///   proven `--force` full-bundle recovery path): it carries schema+data and the target provisions +
+///   restores the managed member via the SAME safe non-superuser shadow+swap. Crucially this does NOT
+///   depend on the source honouring `managed_restore` — so a pre-v0.59.1 source works. `force` is set
+///   because a full bundle carries the control-plane KV slice and the just-created+provisioned dest
+///   already holds its project/declared-DB records (the import re-keys the slice to the target,
+///   enforces target-scoping fail-closed, strips system-principal markers, and mints a FRESH identity,
+///   so the full-scope KV is landed SAFELY).
+/// - **EXISTING managed dest** → DataPlane + explicit ShadowSwap (the v0.59.1 shape), so an
+///   incremental mirror into a populated dest lands the managed delta WITHOUT dragging in the
+///   control-plane slice. This path needs a v0.59.1+ source; against an older source it degrades to a
+///   refused Overlay, which the import now reports as a clear VERSION SKEW (see `restore_member`).
 #[must_use]
 pub fn data_clone_request(dest_absent: bool) -> DataCloneRequest {
-    // The fresh-dest FULL-bundle branch (source-version-independent) is wired in the fix; today both
-    // preconditions take the DataPlane + explicit ShadowSwap request (the v0.59.1 shape).
-    let _ = dest_absent;
-    DataCloneRequest {
-        data_only: true,
-        managed_restore: Some(crate::project_export::ManagedRestore::ShadowSwap),
-        force: false,
+    use crate::project_export::ManagedRestore;
+    if dest_absent {
+        // Source-version-independent: a FULL bundle is understood by every source version.
+        DataCloneRequest {
+            data_only: false,
+            managed_restore: None,
+            force: true,
+        }
+    } else {
+        // v0.59.1 incremental-mirror shape: DataPlane scope + an explicit ShadowSwap managed dump.
+        DataCloneRequest {
+            data_only: true,
+            managed_restore: Some(ManagedRestore::ShadowSwap),
+            force: false,
+        }
     }
 }
 
@@ -1404,6 +1423,34 @@ mod tests {
             identity_fresh: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn data_clone_request_is_source_version_independent_for_a_fresh_dest() {
+        use crate::project_export::ManagedRestore;
+        // ABSENT/fresh managed dest → a FULL bundle understood by ANY source version (no dependence
+        // on the source honouring `managed_restore`), with `force` to overlay the control-plane slice.
+        let fresh = data_clone_request(true);
+        assert!(
+            !fresh.data_only,
+            "a fresh dest pulls a FULL bundle (data_only=false)"
+        );
+        assert_eq!(
+            fresh.managed_restore, None,
+            "a fresh dest lets the source's legacy coupling pick ShadowSwap (works on an old source)"
+        );
+        assert!(
+            fresh.force,
+            "a full bundle carries the KV slice → overlay the provisioned dest"
+        );
+        // EXISTING dest → the v0.59.1 incremental shape: DataPlane + an explicit ShadowSwap.
+        let existing = data_clone_request(false);
+        assert!(
+            existing.data_only,
+            "an existing dest keeps a DataPlane (no control-plane) clone"
+        );
+        assert_eq!(existing.managed_restore, Some(ManagedRestore::ShadowSwap));
+        assert!(!existing.force);
     }
 
     #[test]
