@@ -537,6 +537,14 @@ jobs:
           # its marker.
           grep -q 'PROJECT SYNC MANAGED MYSQL SHARED SHADOW LAND OK' project-export.log \
             || { echo "::error::project sync managed-mysql Shared shadow-land gate never reached its marker (silent skip, a regression, or a cross-tenant leak)" >&2; exit 1; }
+          # Shared rls_session force-RLS REPLICATE (v0.59.2): the non-super shadow restore EXCLUDES
+          # boatramp's superuser-only force-RLS trigger+fn (no "permission denied to create event
+          # trigger"), REPLICATES the source's per-table ENABLE/FORCE state exactly (NO sweep —
+          # construens runs deliberate ENABLE-not-FORCE), re-installs the trigger via re-provision, and
+          # proves cross-tenant isolation under a NON-OWNER runtime + a MUTATION (plain restore → the
+          # exact wall). Same self-skip trap → gate on its marker.
+          grep -q 'PROJECT SYNC SHARED RLS FORCE REPLICATE OK' project-export.log \
+            || { echo "::error::Shared rls_session force-RLS replicate gate never reached its marker (silent skip, the exclude regressed into the event-trigger wall, or force was wrongly imposed)" >&2; exit 1; }
           # Managed MySQL carries triggers/stored routines/events across the shadow+swap, restored as
           # a non-SUPER user and RE-POINTED to the tenant's own role post-swap (the DEFINER-handling
           # seam). Gate on its marker so a skip or a regression (a carried object NOT re-pointed, or
