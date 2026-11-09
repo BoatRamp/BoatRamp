@@ -2935,6 +2935,434 @@ async fn project_sync_managed_mysql_shared_shadow_land_live() {
     println!("PROJECT SYNC MANAGED MYSQL SHARED SHADOW LAND OK");
 }
 
+/// **Live Shared `rls_session` force-RLS REPLICATE gate** (Tier-2 / nightly — needs a Docker daemon
+/// AND a Postgres whose DSN user is the bootstrap superuser; self-skips). The proof for the v0.59.2
+/// force-RLS fix: a non-superuser shadow restore of a Shared `rls_session` managed-pg dump — which
+/// carries boatramp's OWN superuser-only `boatramp_force_rls_trg` event trigger + `boatramp_force_rls()`
+/// function — EXCLUDES exactly those two objects (via a `pg_restore -L` TOC filter) so the restore no
+/// longer hits construens's wall (`permission denied to create event trigger`), and then faithfully
+/// REPLICATES the source's per-table RLS-force state (NO blanket FORCE: construens runs a DELIBERATE
+/// ENABLE-not-FORCE deployment — non-owner runtime confined by ENABLE, owner/migrator relies on
+/// non-FORCE to seed — so forcing would break it + diverge preview-a from prod).
+///
+/// Mirrors construens's prod exactly: the source is a Shared rls_session tenant (gets the trigger+fn),
+/// with ≥2 tenants in the shared keyspace, RLS tables ENABLE'd, DELIBERATELY `NO FORCE` on one (the
+/// 144-NO-FORCE-tables shape) and left FORCE on another (both directions round-trip). Asserts:
+///  1. CRASH FIX: the non-super shadow restore SUCCEEDS (no event-trigger permission error).
+///  2. REPLICATE: every dest table's `relforcerowsecurity` == the source's — NO-FORCE stays NO-FORCE
+///     (NOT swept to FORCE), FORCE stays FORCE.
+///  3. the trigger + function are PRESENT on the dest live db (the existing post-swap re-provision —
+///     construens's prod HAS them, so re-installing REPLICATES, not diverges).
+///  4. BEHAVIORAL cross-tenant isolation under construens's ACTUAL model: a DISTINCT NON-OWNER,
+///     non-super role with tenant GUC = A sees ONLY A's rows on an A+B-seeded ENABLE+NO-FORCE table —
+///     zero foreign (B) bytes — proving isolation holds without FORCE.
+///  5. MUTATION ("drop the EXCLUDE"): a PLAIN (unfiltered) non-super restore of the same dump FAILS
+///     with construens's exact wall, `permission denied to create event trigger`.
+/// Emits `PROJECT SYNC SHARED RLS FORCE REPLICATE OK`.
+#[tokio::test]
+async fn project_sync_shared_rls_force_replicate_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, IdentityChoice, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::{ManagedSqlCredentials, NodeOperatorSql};
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{
+        sanitize_ident, tenant_db_name, tenant_owner_role_name, tenant_role_name,
+    };
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (Shared rls_session force-RLS replicate gate)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (force-RLS replicate gate)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const DB_BINDING: &str = "app";
+    const DATABASE: &str = "rlsforce";
+    let s = now_suffix();
+    let src_project = format!("rlsf-src-{s}");
+    let other_project = format!("rlsf-other-{s}");
+    let fresh_project = format!("rlsf-fresh-{s}");
+
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    // --- control plane: MemoryKv + throwaway FsStorage DeployStore + a reversible test envelope. ---
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-rlsf-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([5u8; 32]));
+
+    // Pre-seal the SUPERUSER credential the resolver + provisioner read — `(DEFAULT_PROJECT, COMPUTE)`.
+    let sealed_su = envelope
+        .wrap(su_pw.as_bytes())
+        .await
+        .expect("seal superuser pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed_su,
+    )
+    .await
+    .expect("pre-seal superuser credential");
+    // One healthy, already-Provisioned replica of the `pg` workload pointing at the test Postgres.
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed healthy replica");
+
+    // A SHARED, Project-grain, `rls_session = true` managed-pg binding (gets the force-RLS trigger).
+    let binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(DATABASE.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        rls_session: true,
+        tenant_guc: Some("app.tenant_id".into()),
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(DB_BINDING.to_string(), binding.clone())]);
+
+    let db_name = |p: &str| tenant_db_name(DATABASE, &sanitize_ident(p));
+    // Teardown any prior run (re-runnable).
+    for p in [&src_project, &other_project, &fresh_project] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{}\"", db_name(p)),
+        )
+        .await;
+    }
+
+    // === Provision the SOURCE + a sibling tenant through the SHIPPED path (both get the trigger). ===
+    provision_tenant(&deploy, &kv, &envelope, &binding, &src_project, "")
+        .await
+        .expect("provision source tenant");
+    provision_tenant(&deploy, &kv, &envelope, &binding, &other_project, "")
+        .await
+        .expect("provision sibling tenant");
+
+    // === Seed the SOURCE tenant db to MIRROR construens's prod: ENABLE'd RLS tables, one DELIBERATELY
+    //     NO-FORCE (disable the trigger around `NO FORCE` so it sticks), one left FORCE. ===
+    let src_db = db_name(&src_project);
+    let src_owner = tenant_owner_role_name(COMPUTE, &sanitize_ident(&src_project));
+    let src_conn = conn(&superuser, &su_pw, &host, port, &src_db);
+    let seed_sql = format!(
+        "CREATE TABLE t_noforce(id int primary key, tid text, v text); \
+         ALTER TABLE t_noforce OWNER TO \"{src_owner}\"; \
+         ALTER TABLE t_noforce ENABLE ROW LEVEL SECURITY; \
+         CREATE POLICY p_noforce ON t_noforce USING (tid = current_setting('app.tenant_id', true)); \
+         INSERT INTO t_noforce VALUES (1,'A','a1'),(2,'B','b1'),(3,'A','a2'); \
+         ALTER EVENT TRIGGER boatramp_force_rls_trg DISABLE; \
+         ALTER TABLE t_noforce NO FORCE ROW LEVEL SECURITY; \
+         ALTER EVENT TRIGGER boatramp_force_rls_trg ENABLE; \
+         CREATE TABLE t_forced(id int primary key, tid text); \
+         ALTER TABLE t_forced OWNER TO \"{src_owner}\"; \
+         ALTER TABLE t_forced ENABLE ROW LEVEL SECURITY; \
+         INSERT INTO t_forced VALUES (1,'A'),(2,'B');"
+    );
+    let (c, o) = psql(backend.as_ref(), &image, &src_conn, &seed_sql).await;
+    assert_eq!(c, 0, "seed source RLS tables: {o}");
+    // The per-table force-state probe (the replicate baseline + the dest assertion share it).
+    const FORCE_Q: &str = "SELECT relname || ':' || relforcerowsecurity::text FROM pg_class \
+         WHERE relname IN ('t_noforce','t_forced') ORDER BY relname";
+    let src_force = psql(backend.as_ref(), &image, &src_conn, FORCE_Q).await.1;
+    assert_eq!(
+        src_force, "t_forced:true\nt_noforce:false",
+        "source baseline: t_forced FORCE'd, t_noforce ENABLE-but-NO-FORCE (got {src_force:?})"
+    );
+
+    // --- the driver, wired like the serve path (managed pg context). ---
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-rlsf-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-rlsf-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases, deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false)
+        .with_trusted_extensions(vec![]);
+
+    // === EXPORT the source tenant as DataPlane + ShadowSwap (a FULL `-Fc` dump — carries the trigger). ===
+    let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+    driver
+        .export(
+            &src_project,
+            &ExportOptions {
+                scope: BundleScope::DataPlane,
+                managed_restore: ManagedRestore::ShadowSwap,
+                include_identity: false,
+                transport_key: None,
+                delta: None,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("driver export of the source tenant");
+    let bundle = sink.into_inner();
+
+    // === IMPORT into the BRAND-NEW `fresh` tenant → non-super shadow+swap via the EXCLUDE path. ===
+    // ASSERTION 1 (crash fix): this SUCCEEDS — without the exclude it would exit 1 on the event trigger.
+    let report = {
+        let mut body = futures::io::Cursor::new(bundle.clone());
+        driver
+            .import(
+                &fresh_project,
+                &mut body,
+                ImportOptions {
+                    apply: true,
+                    force: true,
+                    overwrite: false,
+                    identity: IdentityChoice::Fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect(
+                "Shared rls_session DataPlane+ShadowSwap import MUST SUCCEED (the EXCLUDE fix — a \
+                 non-super restore of a dump carrying boatramp_force_rls_trg)",
+            )
+    };
+    assert!(
+        report.pg_databases >= 1,
+        "the clone restored the pg database"
+    );
+
+    let dest_db = db_name(&fresh_project);
+    let dest_conn = conn(&superuser, &su_pw, &host, port, &dest_db);
+
+    // ASSERTION 2 (REPLICATE — the key one): per-table force state round-trips EXACTLY. NO sweep.
+    let dest_force = psql(backend.as_ref(), &image, &dest_conn, FORCE_Q).await.1;
+    assert_eq!(
+        dest_force, src_force,
+        "force-RLS state must REPLICATE the source per table: NO-FORCE stays NO-FORCE (never swept \
+         to FORCE), FORCE stays FORCE. source={src_force:?} dest={dest_force:?}"
+    );
+
+    // ASSERTION 3: the trigger + function are PRESENT on the dest (post-swap re-provision — prod HAS them).
+    let (_c, trg) = psql(
+        backend.as_ref(),
+        &image,
+        &dest_conn,
+        "SELECT count(*) FROM pg_event_trigger WHERE evtname = 'boatramp_force_rls_trg'",
+    )
+    .await;
+    assert_eq!(
+        trg, "1",
+        "the force-RLS event trigger must be re-installed on the dest"
+    );
+    let (_c, func) = psql(
+        backend.as_ref(),
+        &image,
+        &dest_conn,
+        "SELECT count(*) FROM pg_proc WHERE proname = 'boatramp_force_rls'",
+    )
+    .await;
+    assert_eq!(
+        func, "1",
+        "the boatramp_force_rls() function must be present on the dest"
+    );
+
+    // ASSERTION 4 (behavioral): a DISTINCT NON-OWNER, non-super role with tenant GUC = A sees ONLY A.
+    let fresh_ident = sanitize_ident(&fresh_project);
+    let fresh_login = tenant_role_name(COMPUTE, &fresh_ident);
+    let creds = ManagedSqlCredentials::new(kv.clone(), envelope.clone());
+    let fresh_login_pw = creds
+        .password(&fresh_project, &format!("{COMPUTE}/{fresh_ident}"))
+        .await
+        .expect("fresh login credential (minted at self-provision)");
+    let login_conn = conn(&fresh_login, &fresh_login_pw, &host, port, &dest_db);
+    let (c, seen) = psql(
+        backend.as_ref(),
+        &image,
+        &login_conn,
+        "SET app.tenant_id = 'A'; SELECT string_agg(v, ',' ORDER BY id) FROM t_noforce",
+    )
+    .await;
+    assert_eq!(
+        c, 0,
+        "the non-owner login role must read its own tenant's rows: {seen}"
+    );
+    assert_eq!(
+        seen, "a1,a2",
+        "RLS must confine the NON-OWNER runtime to tenant A on an ENABLE+NO-FORCE table (zero B \
+         bytes) — isolation holds WITHOUT force; got {seen:?}"
+    );
+    let (_c, bcount) = psql(
+        backend.as_ref(),
+        &image,
+        &login_conn,
+        "SET app.tenant_id = 'A'; SELECT count(*) FROM t_noforce WHERE tid = 'B'",
+    )
+    .await;
+    assert_eq!(
+        bcount, "0",
+        "CROSS-TENANT LEAK: the tenant-A runtime saw tenant-B rows"
+    );
+
+    // ASSERTION 5 (MUTATION — "drop the EXCLUDE"): a PLAIN non-super restore of the same dump shape
+    // FAILS with construens's exact wall. We produce a full `-Fc` dump of the source (carries the
+    // event trigger), create a fresh db owned by a fresh NON-super role, and restore WITHOUT the TOC
+    // filter as that role → `permission denied to create event trigger`.
+    let mut_db = format!("{src_db}__mut");
+    let mut_role = format!("brexp_mut_{s}");
+    let (mc, mo) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "DROP DATABASE IF EXISTS \"{mut_db}\"; \
+             DROP ROLE IF EXISTS \"{mut_role}\"; \
+             CREATE ROLE \"{mut_role}\" LOGIN PASSWORD 'mutpw' NOSUPERUSER; \
+             CREATE DATABASE \"{mut_db}\" OWNER \"{mut_role}\";"
+        ),
+    )
+    .await;
+    assert_eq!(mc, 0, "mutation setup (fresh non-super role + db): {mo}");
+    // Full `-Fc` dump of the source (includes the event trigger + function).
+    let dumpfile = std::env::temp_dir().join(format!("rlsf-mut-dump-{s}.fc"));
+    {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let argv = vec![
+            "pg_dump".to_string(),
+            "--no-owner".to_string(),
+            "--no-privileges".to_string(),
+            "--no-comments".to_string(),
+            "-Fc".to_string(),
+            "-d".to_string(),
+            src_db.clone(),
+        ];
+        let f = tokio::fs::File::create(&dumpfile).await.unwrap();
+        let mut out = f.compat_write();
+        let code = backend
+            .run_ephemeral(&image, &argv, &src_conn.env(), None, &mut out)
+            .await
+            .expect("pg_dump for the mutation");
+        assert_eq!(
+            code, 0,
+            "pg_dump of the source for the mutation must succeed"
+        );
+    }
+    // PLAIN (unfiltered) non-super restore → the wall.
+    let mut_conn = conn(&mut_role, "mutpw", &host, port, &mut_db);
+    let mut_out = {
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "exec pg_restore --no-owner --no-privileges --exit-on-error --single-transaction \
+                 -d {mut_db} 2>&1"
+            ),
+        ];
+        let td = tempfile::tempdir().unwrap();
+        let outp = td.path().join("mut.out");
+        let inf = tokio::fs::File::open(&dumpfile).await.unwrap();
+        let mut rdr = inf.compat();
+        let f = tokio::fs::File::create(&outp).await.unwrap();
+        let mut sink = f.compat_write();
+        let code = backend
+            .run_ephemeral(&image, &argv, &mut_conn.env(), Some(&mut rdr), &mut sink)
+            .await
+            .expect("plain non-super restore (mutation)");
+        let text = tokio::fs::read_to_string(&outp).await.unwrap_or_default();
+        (code, text)
+    };
+    assert_ne!(
+        mut_out.0, 0,
+        "MUTATION: a PLAIN (unfiltered) non-super restore MUST FAIL (construens's wall): {}",
+        mut_out.1
+    );
+    assert!(
+        mut_out
+            .1
+            .to_ascii_lowercase()
+            .contains("permission denied to create event trigger"),
+        "the plain-restore failure must be construens's exact wall (permission denied to create \
+         event trigger), got: {}",
+        mut_out.1
+    );
+
+    // --- cleanup (best-effort) ---
+    let _ = tokio::fs::remove_file(&dumpfile).await;
+    for sql in [
+        format!("DROP DATABASE IF EXISTS \"{mut_db}\""),
+        format!("DROP ROLE IF EXISTS \"{mut_role}\""),
+        format!("DROP DATABASE IF EXISTS \"{dest_db}\""),
+        format!("DROP DATABASE IF EXISTS \"{src_db}\""),
+        format!("DROP DATABASE IF EXISTS \"{}\"", db_name(&other_project)),
+    ] {
+        let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
+    }
+
+    println!("PROJECT SYNC SHARED RLS FORCE REPLICATE OK");
+}
+
 /// **Live managed-MySQL triggers/routines/events carry + DEFINER re-point gate** (Tier-2 / nightly —
 /// needs a Docker daemon AND a MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE
 /// DATABASE`). Self-skips.
