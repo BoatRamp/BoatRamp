@@ -1521,6 +1521,50 @@ fn pg_terminate_backends_sql(db: &str) -> String {
     )
 }
 
+/// Node-side `pg_restore` TOC filter (DELETIONS ONLY, archive order PRESERVED): drop the TOC entries
+/// for boatramp's OWN superuser-only force-RLS machinery — the `boatramp_force_rls_trg` EVENT TRIGGER,
+/// the `boatramp_force_rls()` FUNCTION, and any COMMENT/ACL referencing them — so a NON-superuser
+/// shadow restore does not attempt the superuser-only `CREATE EVENT TRIGGER` (which exits 1). FIXED
+/// reserved names only; every other entry — including ALL `;`-comment / header lines — is preserved
+/// verbatim and IN ORDER, so `pg_restore -L` applies the retained entries over a non-seekable stdin
+/// archive without reordering (no seek). The tenancy FORCE those objects would enforce is re-asserted
+/// by the superuser sweep on the shadow + the post-swap re-provision.
+fn filter_force_rls_toc(listing: &str) -> String {
+    let mut out = String::with_capacity(listing.len());
+    for line in listing.split_inclusive('\n') {
+        if !force_rls_toc_entry_is_excluded(line) {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Whether ONE `pg_restore -l` line is a force-RLS object entry to drop. Only a real TOC entry
+/// (`<dumpId>; …`) is a candidate — never a `;`-comment/header line — and only when it both names a
+/// fixed reserved force-RLS object (`boatramp_force_rls_trg` or the `boatramp_force_rls(` function
+/// header) AND is one of the object descs we installed (EVENT TRIGGER / FUNCTION) or a COMMENT/ACL on
+/// them. The `(` immediately after `boatramp_force_rls` is the discriminator: a user object merely
+/// PREFIXED `boatramp_force_rls_…` (e.g. `boatramp_force_rls_helper(`) does not match the function,
+/// and a table/other object never carries these descs.
+fn force_rls_toc_entry_is_excluded(line: &str) -> bool {
+    let is_entry = line
+        .trim_start()
+        .split_once(';')
+        .is_some_and(|(id, _)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+    if !is_entry {
+        return false;
+    }
+    let names_trigger = line.contains("boatramp_force_rls_trg");
+    let names_function = line.contains("boatramp_force_rls(");
+    if !names_trigger && !names_function {
+        return false;
+    }
+    line.contains("EVENT TRIGGER")
+        || line.contains("FUNCTION")
+        || line.contains("COMMENT")
+        || line.contains("ACL")
+}
+
 /// POSIX-single-quote each token of a driver-composed argv and join with spaces, so the
 /// command can run under `sh -c '… 2>&1'` (merging stderr into the captured sink). Only
 /// ever applied to driver-derived flags + identifiers — never a credential (the password
@@ -5933,42 +5977,141 @@ impl NodeProjectExport {
             return Err(e);
         }
         // Apply the untrusted dump into the shadow AS the ephemeral role, reading the staged member
-        // FILE on stdin. `--single-transaction` (in `pg_restore_shadow_invocation`) makes the shadow
-        // restore all-or-nothing; stderr is merged so a refused/failed object is diagnosable
-        // (`run_ephemeral` drops a container's stderr on a non-zero exit).
-        let inv = pg_restore_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
-        let merged = merge_stderr_argv(&inv.argv);
-        let outfile = stage_dir.join(format!("pgrestore-sidecar-{}.out", shadow_suffix()));
-        let code = match self
-            .run_sql_client(&plan.image, &merged, &inv.env, Some(temp), &outfile)
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&outfile).await;
-                self.pg_drop_shadow(&plan, stage_dir).await;
-                return Err(e);
-            }
-        };
-        if code != 0 {
-            let diag = tokio::fs::read_to_string(&outfile)
+        // FILE on stdin. `--single-transaction` makes the shadow restore all-or-nothing; stderr is
+        // merged so a refused/failed object is diagnosable.
+        //
+        // SHARED rls_session (construens's wall, once both ends are v0.59.1): boatramp's OWN force-RLS
+        // machinery — the superuser-only `boatramp_force_rls_trg` EVENT TRIGGER + `boatramp_force_rls()`
+        // FUNCTION, installed at provision time as the bootstrap superuser — rides in the dump, and a
+        // NON-superuser restore CANNOT create a superuser-only event trigger (`pg_restore` exits 1). So
+        // for a Shared rls_session tenant we EXCLUDE those two superuser-only objects (+ any COMMENT/ACL
+        // on them) from the non-super restore via a `pg_restore` TOC filter — and NOTHING ELSE. The
+        // dump's OWN per-table `ALTER TABLE … ENABLE`/`FORCE ROW LEVEL SECURITY` statements carry the
+        // source's EXACT per-table RLS state, and the ephemeral role OWNS the restored shadow tables, so
+        // it applies them under the non-super restore — i.e. the clone faithfully REPLICATES the
+        // source's per-table ENABLE/FORCE state (never imposes FORCE: a deliberate ENABLE-not-FORCE
+        // table, where a non-owner runtime is confined by ENABLE while the owner/migrator relies on
+        // non-FORCE to seed, round-trips unchanged). TARGET-side only — works against an UNCHANGED
+        // (v0.49.0/v0.59.1) source — and also covers v0.59.2's own absent-dest FULL-bundle restore,
+        // which lands a Shared rls_session dest through this very path. Single/dedicated + Shared-DEFAULT
+        // do NOT carry the trigger, so they keep the plain restore untouched.
+        let rls_shared = plan.shared_reprovision.is_some() && cfg.rls_session;
+        let restore = if rls_shared {
+            self.pg_sidecar_restore_rls_filtered(&plan, db, temp, stage_dir)
                 .await
-                .unwrap_or_default();
-            let _ = tokio::fs::remove_file(&outfile).await;
+        } else {
+            self.pg_sidecar_restore_plain(&plan, db, temp, stage_dir)
+                .await
+        };
+        if let Err(e) = restore {
             self.pg_drop_shadow(&plan, stage_dir).await;
-            return Err(Perr::Other(format!(
-                "pg_restore into shadow {:?} for {db:?} exited {code}; live untouched: {}",
-                plan.shadow_db,
-                diag.trim()
-            )));
+            return Err(e);
         }
-        let _ = tokio::fs::remove_file(&outfile).await;
         // Restore clean (and the sidecar member was SHA-verified at staging) → atomic swap. A swap
         // failure tears the shadow down (its own rollback keeps live intact); live is untouched.
         if let Err(e) = self.pg_swap_shadow(&plan, stage_dir).await {
             self.pg_drop_shadow(&plan, stage_dir).await;
             return Err(e);
         }
+        Ok(())
+    }
+
+    /// The standard non-super sidecar restore: `pg_restore` the staged dump into the shadow as the
+    /// ephemeral role, stdin-fed, `--single-transaction`, stderr merged for diagnostics. Factored out
+    /// so the Shared rls_session path can wrap it with the force-RLS TOC filter without duplicating the
+    /// exit-code/diagnostic handling.
+    async fn pg_sidecar_restore_plain(
+        &self,
+        plan: &PgShadowPlan,
+        db: &str,
+        temp: &Path,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        let inv = pg_restore_shadow_invocation(&plan.apply_conn(), &plan.shadow_db);
+        let merged = merge_stderr_argv(&inv.argv);
+        let outfile = stage_dir.join(format!("pgrestore-sidecar-{}.out", shadow_suffix()));
+        let code = self
+            .run_sql_client(&plan.image, &merged, &inv.env, Some(temp), &outfile)
+            .await?;
+        self.pg_restore_check(code, db, &plan.shadow_db, &outfile)
+            .await
+    }
+
+    /// SHARED rls_session sidecar restore: pass-1 `pg_restore -l` the staged dump to capture its TOC,
+    /// node-side filter out boatramp's superuser-only force-RLS objects ([`filter_force_rls_toc`] —
+    /// DELETIONS ONLY, archive order preserved), then pass-2 `pg_restore -L <filtered>` so the
+    /// non-superuser restore never attempts the superuser-only `CREATE EVENT TRIGGER`. The `-Fc` dump
+    /// stays on STDIN in BOTH passes (never spilled to disk); the filtered list rides an env var into a
+    /// container-local tmpfs file (it is not a credential — the password stays in `PGPASSWORD`).
+    /// Preserving archive order means `pg_restore -L` streams the non-seekable stdin archive without
+    /// reordering (no seek), exactly as the plain restore already reads `-Fc` from stdin.
+    async fn pg_sidecar_restore_rls_filtered(
+        &self,
+        plan: &PgShadowPlan,
+        db: &str,
+        temp: &Path,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        // pass-1: list the archive TOC. No server connection (empty env); pure stdout, so NO merge.
+        let list_argv = vec!["pg_restore".to_string(), "-l".to_string()];
+        let (lcode, listing) = self
+            .run_sql_capture_nomerge(&plan.image, &list_argv, &[], Some(temp), stage_dir)
+            .await?;
+        if lcode != 0 {
+            return Err(Perr::Other(format!(
+                "pg_restore -l (TOC list) for {db:?} exited {lcode} while excluding the force-RLS \
+                 objects from a Shared rls_session restore; live untouched"
+            )));
+        }
+        let filtered = filter_force_rls_toc(&listing);
+        // pass-2: restore only the retained TOC entries (in archive order). The list is written to a
+        // container-local tmpfs file from an env var, then `exec pg_restore -L` applies it; `2>&1`
+        // merges stderr for diagnostics; the dump arrives on stdin.
+        let restore_argv = vec![
+            "pg_restore".to_string(),
+            "-L".to_string(),
+            "/tmp/br_restore.list".to_string(),
+            "--no-owner".to_string(),
+            "--no-privileges".to_string(),
+            "--exit-on-error".to_string(),
+            "--single-transaction".to_string(),
+            "-d".to_string(),
+            plan.shadow_db.clone(),
+        ];
+        let cmd = format!(
+            "printf %s \"$BR_RESTORE_LIST\" > /tmp/br_restore.list && exec {} 2>&1",
+            sh_join(&restore_argv)
+        );
+        let argv = vec!["sh".to_string(), "-c".to_string(), cmd];
+        let mut env = plan.apply_conn().env();
+        env.push(("BR_RESTORE_LIST".to_string(), filtered));
+        let outfile = stage_dir.join(format!("pgrestore-rls-{}.out", shadow_suffix()));
+        let code = self
+            .run_sql_client(&plan.image, &argv, &env, Some(temp), &outfile)
+            .await?;
+        self.pg_restore_check(code, db, &plan.shadow_db, &outfile)
+            .await
+    }
+
+    /// Shared `pg_restore` exit-code + diagnostic handling for the sidecar restore helpers: on a
+    /// non-zero exit, read the merged stderr from `outfile` into a loud error (live untouched); on
+    /// success, clean up the temp. Always removes `outfile`.
+    async fn pg_restore_check(
+        &self,
+        code: i32,
+        db: &str,
+        shadow_db: &str,
+        outfile: &Path,
+    ) -> Result<(), Perr> {
+        if code != 0 {
+            let diag = tokio::fs::read_to_string(outfile).await.unwrap_or_default();
+            let _ = tokio::fs::remove_file(outfile).await;
+            return Err(Perr::Other(format!(
+                "pg_restore into shadow {shadow_db:?} for {db:?} exited {code}; live untouched: {}",
+                diag.trim()
+            )));
+        }
+        let _ = tokio::fs::remove_file(outfile).await;
         Ok(())
     }
 
@@ -9728,6 +9871,74 @@ async fn write_member_from_producer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_force_rls_toc_drops_only_the_reserved_force_rls_objects() {
+        // A representative `pg_restore -l` listing: header comments, user objects, and boatramp's own
+        // superuser-only force-RLS machinery (function + its COMMENT/ACL + the event trigger).
+        let listing = "\
+;
+; Archive created at 2026-01-01
+;     dbname: brtenant
+;
+; Selected TOC Entries:
+;
+215; 1259 16456 TABLE public widgets tenant_owner
+216; 0 16456 TABLE DATA public widgets tenant_owner
+220; 1255 16500 FUNCTION public boatramp_force_rls_helper(integer) tenant_owner
+3000; 1255 16460 FUNCTION public boatramp_force_rls() postgres
+3001; 0 0 COMMENT - FUNCTION boatramp_force_rls() postgres
+3002; 0 0 ACL - FUNCTION boatramp_force_rls() postgres
+3003; 1262 16470 EVENT TRIGGER - boatramp_force_rls_trg postgres
+230; 1259 16600 TABLE public boatramp_force_rls_audit tenant_owner
+";
+        let out = filter_force_rls_toc(listing);
+        // The four reserved force-RLS entries are gone…
+        assert!(!out.contains("16460 FUNCTION public boatramp_force_rls()"));
+        assert!(!out.contains("COMMENT - FUNCTION boatramp_force_rls()"));
+        assert!(!out.contains("ACL - FUNCTION boatramp_force_rls()"));
+        assert!(!out.contains("EVENT TRIGGER - boatramp_force_rls_trg"));
+        // …and EVERYTHING else is preserved, in order (header comments, user table + data, a user
+        // function merely PREFIXED `boatramp_force_rls_` (different signature), and a user table named
+        // `boatramp_force_rls_audit` — none of which must be dropped).
+        for keep in [
+            "; Archive created at 2026-01-01",
+            "215; 1259 16456 TABLE public widgets tenant_owner",
+            "216; 0 16456 TABLE DATA public widgets tenant_owner",
+            "220; 1255 16500 FUNCTION public boatramp_force_rls_helper(integer) tenant_owner",
+            "230; 1259 16600 TABLE public boatramp_force_rls_audit tenant_owner",
+        ] {
+            assert!(
+                out.contains(keep),
+                "filter dropped a line it must keep: {keep}"
+            );
+        }
+        // Order preserved: widgets (215) precedes the helper (220) precedes the audit table (230).
+        let p215 = out.find("215;").unwrap();
+        let p220 = out.find("220;").unwrap();
+        let p230 = out.find("230;").unwrap();
+        assert!(
+            p215 < p220 && p220 < p230,
+            "archive order must be preserved"
+        );
+        // Exactly four entry lines were removed (8 entries in, 4 out) — count non-comment entry lines.
+        let count_entries = |s: &str| {
+            s.lines()
+                .filter(|l| force_rls_toc_entry_is_excluded(&format!("{l}\n")) || is_toc_entry(l))
+                .count()
+        };
+        fn is_toc_entry(l: &str) -> bool {
+            l.trim_start()
+                .split_once(';')
+                .is_some_and(|(id, _)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        }
+        assert_eq!(count_entries(listing), 8, "fixture has 8 TOC entries");
+        assert_eq!(
+            count_entries(&out),
+            4,
+            "exactly the 4 reserved entries were dropped"
+        );
+    }
 
     #[test]
     fn create_replication_slot_export_sql_is_version_aware_and_quoted() {
