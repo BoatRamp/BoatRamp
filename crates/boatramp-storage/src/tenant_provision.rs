@@ -386,6 +386,26 @@ fn mysql_user(role: &str) -> String {
 ///    that upgrades a table whose owner opted into plain `ENABLE ROW LEVEL SECURITY` to `FORCE ROW
 ///    LEVEL SECURITY`, so RLS binds the owner the operate-as-owner role acts as.
 ///
+/// # Two serving postures — the `rls_session` soundness contract
+///
+/// `rls_session` is sound iff the role a request is actually served by is SUBJECT to the app's
+/// RLS on tenant tables. boatramp has two serving postures, with DIFFERENT requirements:
+///
+/// * **Handler / FaaS path** ([`NodeTenantSqlResolver::build_backend`](boatramp_node)) — connects
+///   as the per-tenant runtime `_role`, a **NON-OWNER** ([`tenant_role_name`], distinct from
+///   [`tenant_owner_role_name`]). PostgreSQL binds a plain `ENABLE ROW LEVEL SECURITY` table
+///   against a non-owner, so RLS holds here with **NO `FORCE`** — this is the primary guarantee,
+///   and it is why a tenant (e.g. `construens`) can legitimately run `ENABLE`-not-`FORCE` tables
+///   and seed through an owner-authority migrator that `ENABLE` deliberately exempts.
+/// * **Managed-compute path** (the per-replica dynamic role, operate-as-owner via `SET role`) —
+///   the serving role acts AS the table owner, which `ENABLE` does NOT bind, so here `FORCE` is
+///   **required** and is installed + re-asserted by [`force_rls_event_trigger_ddl`].
+///
+/// So `FORCE` is the backstop for the OWNER posture; the NON-OWNER invariant is what makes the
+/// handler path sound. The two must not be crossed: an owner-posture role served against an
+/// `ENABLE`-not-`FORCE` table leaks cross-tenant (proven in the `managed_rls_nonowner_runtime` and
+/// `managed_rls_fencing` live gates). `build_backend` asserts the non-owner invariant fail-closed.
+///
 /// Default **off**: a binding WITHOUT `rls_session` (+ `tenant_guc`) gets NEITHER, and the emitted
 /// DDL is byte-identical to the pre-feature output.
 ///

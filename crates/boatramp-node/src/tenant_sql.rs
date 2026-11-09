@@ -1530,6 +1530,31 @@ impl NodeTenantSqlResolver {
             ),
         };
 
+        // TENANCY INVARIANT (fail-closed) — the `rls_session` soundness contract. With
+        // `rls_session` on, the app's row-level security is enforced against THIS serving role, so
+        // the role MUST be a NON-OWNER of the tenant tables: PostgreSQL binds a plain `ENABLE ROW
+        // LEVEL SECURITY` table against a non-owner, so RLS holds WITHOUT relying on the owner-
+        // droppable `FORCE ROW LEVEL SECURITY` (an owner-posture role is NOT bound by `ENABLE` and
+        // would leak cross-tenant — proven in the `managed_rls_nonowner_runtime_sqlx_live` gate).
+        // The handler serving path connects as the per-tenant runtime `_role`, derived DISTINCT
+        // from the `_owner` role ([`tenant_role_name`] vs [`tenant_owner_role_name`]), so this holds
+        // structurally today; the assertion makes it a GUARD so a future refactor that resolved the
+        // owner identity onto the serving path fails CLOSED rather than silently un-enforcing the
+        // app's RLS. Scoped to the Shared non-default Postgres cell — the only one with a distinct
+        // owner role; everywhere else the runtime identity is already the sole/owning login.
+        if self.rls_session
+            && self.kind == ExternalSqlKind::Postgres
+            && self.isolation == TenantIsolation::Shared
+            && !is_default
+            && user == names.owner_role
+        {
+            return Err(SqlError::other(format!(
+                "rls_session tenancy invariant violated: the resolved serving role ({user}) is the \
+                 tenant table OWNER — plain ENABLE RLS does not bind the owner, so serving here \
+                 would un-enforce the app's row-level security; refusing (fail-closed)"
+            )));
+        }
+
         let password = ManagedSqlCredentials::new(self.kv.clone(), self.envelope.clone())
             .password(&cred_project, &cred_workload)
             .await
