@@ -813,9 +813,15 @@ impl CliSyncExecutor {
                 true,          // apply
                 false,         // verify
                 true,          // overwrite — sync's data plane is source-authoritative (mirror)
-                req.force, // overlay a non-empty control-plane KV dest (a full bundle carries it)
+                req.force, // overlay a non-empty control-plane KV dest (unused: the clamp skips it)
                 req.data_only, // DataPlane scope (existing dest) vs a FULL bundle (fresh dest)
                 req.managed_restore,
+                // DATA-PLANE-ONLY CLAMP on a fresh dest: the FULL bundle lands the managed DATA but
+                // the target SKIPS the control-plane KV slice, so the source's domain layer
+                // (domainverify/alias/the SiteConfig.domains field) never carries onto the fresh
+                // target (construens acceptance bar D). `carry_kv_stratum` carries the control plane
+                // selectively instead (honouring --exclude-domains + the --identity-fresh domain drop).
+                req.skip_control_plane_kv,
                 client::MismatchFlags::default(),
             )
             .await

@@ -553,10 +553,16 @@ pub struct DataCloneRequest {
     /// The managed-restore MODE to request of the source (orthogonal to `data_only`); `None` ⇒ the
     /// source's own legacy coupling decides it.
     pub managed_restore: Option<crate::project_export::ManagedRestore>,
-    /// Overlay a non-empty control-plane KV destination on import (`kv_dump` commingle override). A
-    /// full bundle carries the KV slice, and a just-created + provisioned dest already holds its
-    /// project/declared-DB records, so the full-bundle landing needs it.
+    /// Overlay a non-empty control-plane KV destination on import (`kv_dump` commingle override).
+    /// With the data-plane-only clamp below the control-plane KV member is skipped entirely, so this
+    /// is `false` on the sync paths; retained for completeness of the request shape.
     pub force: bool,
+    /// DATA-PLANE-ONLY CLAMP on import: apply the managed-DB (+ blob/libsql) members of the full
+    /// bundle but SKIP its control-plane KV slice — so a FULL bundle lands the managed DATA
+    /// source-version-independently WITHOUT carrying the source's control-plane slice (whose domain
+    /// layer must NOT cross a `--identity fresh` sync; the selective `carry_kv_stratum` carries the
+    /// control plane under sync's strict contract instead). Set on the ABSENT-dest path.
+    pub skip_control_plane_kv: bool,
 }
 
 /// Decide the data-plane clone request `project sync` issues, given whether the managed destination
@@ -569,14 +575,17 @@ pub struct DataCloneRequest {
 /// clone FROM an older prod into a fresh env. This is where that is fixed.
 ///
 /// - **ABSENT/fresh managed dest** → a FULL bundle (`data_only=false`, legacy-coupled ShadowSwap via
-///   `None`, `force`). A full bundle is understood by ANY source version (it is exactly construens's
-///   proven `--force` full-bundle recovery path): it carries schema+data and the target provisions +
-///   restores the managed member via the SAME safe non-superuser shadow+swap. Crucially this does NOT
-///   depend on the source honouring `managed_restore` — so a pre-v0.59.1 source works. `force` is set
-///   because a full bundle carries the control-plane KV slice and the just-created+provisioned dest
-///   already holds its project/declared-DB records (the import re-keys the slice to the target,
-///   enforces target-scoping fail-closed, strips system-principal markers, and mints a FRESH identity,
-///   so the full-scope KV is landed SAFELY).
+///   `None`) WITH the data-plane-only CLAMP (`skip_control_plane_kv`). A full bundle is understood by
+///   ANY source version (it is exactly construens's proven `--force` full-bundle recovery path): it
+///   carries schema+data and the target provisions + restores the managed member via the SAME safe
+///   non-superuser shadow+swap. Crucially this does NOT depend on the source honouring
+///   `managed_restore`, so a pre-v0.59.1 source works. The CLAMP then makes the target apply ONLY the
+///   managed-DB (+ blob/libsql) members and SKIP the full bundle's control-plane KV slice — so the
+///   source's DOMAIN layer (`domainverify`/`alias`/the `SiteConfig.domains` field) never lands on the
+///   fresh target (construens acceptance bar D: dest keeps its own domains, ZERO source-domain carry,
+///   `--identity fresh`). The control plane is carried by the SELECTIVE `carry_kv_stratum` instead
+///   (which honours `--exclude-domains`, drops `domainverify`/`alias`, and rewrites the `domains`
+///   field under fresh). So `force` is unnecessary (the KV member is skipped) and left `false`.
 /// - **EXISTING managed dest** → DataPlane + explicit ShadowSwap (the v0.59.1 shape), so an
 ///   incremental mirror into a populated dest lands the managed delta WITHOUT dragging in the
 ///   control-plane slice. This path needs a v0.59.1+ source; against an older source it degrades to a
@@ -585,18 +594,22 @@ pub struct DataCloneRequest {
 pub fn data_clone_request(dest_absent: bool) -> DataCloneRequest {
     use crate::project_export::ManagedRestore;
     if dest_absent {
-        // Source-version-independent: a FULL bundle is understood by every source version.
+        // Source-version-independent: a FULL bundle (understood by every source version) with the
+        // data-plane-only clamp, so the managed DATA lands but the control-plane slice does NOT.
         DataCloneRequest {
             data_only: false,
             managed_restore: None,
-            force: true,
+            force: false,
+            skip_control_plane_kv: true,
         }
     } else {
         // v0.59.1 incremental-mirror shape: DataPlane scope + an explicit ShadowSwap managed dump.
+        // (A DataPlane bundle carries no control-plane KV member, so the clamp is moot here.)
         DataCloneRequest {
             data_only: true,
             managed_restore: Some(ManagedRestore::ShadowSwap),
             force: false,
+            skip_control_plane_kv: false,
         }
     }
 }
@@ -1429,7 +1442,8 @@ mod tests {
     fn data_clone_request_is_source_version_independent_for_a_fresh_dest() {
         use crate::project_export::ManagedRestore;
         // ABSENT/fresh managed dest → a FULL bundle understood by ANY source version (no dependence
-        // on the source honouring `managed_restore`), with `force` to overlay the control-plane slice.
+        // on the source honouring `managed_restore`), CLAMPED to data-plane-only so the control-plane
+        // slice (incl. the domain layer) does NOT carry.
         let fresh = data_clone_request(true);
         assert!(
             !fresh.data_only,
@@ -1440,10 +1454,15 @@ mod tests {
             "a fresh dest lets the source's legacy coupling pick ShadowSwap (works on an old source)"
         );
         assert!(
-            fresh.force,
-            "a full bundle carries the KV slice → overlay the provisioned dest"
+            fresh.skip_control_plane_kv,
+            "a fresh dest clamps the full bundle to data-plane-only — the control-plane slice (incl. \
+             the domain layer) must NOT carry; `carry_kv_stratum` carries it selectively instead"
         );
-        // EXISTING dest → the v0.59.1 incremental shape: DataPlane + an explicit ShadowSwap.
+        assert!(
+            !fresh.force,
+            "the clamp skips the KV member, so no commingle override is needed"
+        );
+        // EXISTING dest → the v0.59.1 incremental shape: DataPlane + an explicit ShadowSwap, no clamp.
         let existing = data_clone_request(false);
         assert!(
             existing.data_only,
@@ -1451,6 +1470,10 @@ mod tests {
         );
         assert_eq!(existing.managed_restore, Some(ManagedRestore::ShadowSwap));
         assert!(!existing.force);
+        assert!(
+            !existing.skip_control_plane_kv,
+            "a DataPlane bundle carries no control-plane KV member, so the clamp is moot (false)"
+        );
     }
 
     #[test]

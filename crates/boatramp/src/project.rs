@@ -1215,6 +1215,10 @@ pub async fn run(
                         // managed-restore mode from `data_only`); `project sync` is the surface that
                         // requests an explicit `ShadowSwap`.
                         None,
+                        // `project clone` imports the full bundle AS-IS (an explicit env clone — the
+                        // operator asked for the whole project); only `project sync` clamps to
+                        // data-plane-only to keep its selective control-plane contract.
+                        false,
                         mismatch,
                     )
                     .await?;

@@ -681,6 +681,20 @@ pub struct ImportOptions {
     /// generic refusal stands — e.g. a deliberate `project import` of a data-only bundle). NEVER
     /// relaxes the guard: a managed Overlay is refused either way; this only changes the MESSAGE.
     pub expected_managed_restore: Option<ManagedRestore>,
+    /// DATA-PLANE-ONLY CLAMP: apply the MANAGED-DB + blob + libsql members of a FULL bundle but SKIP
+    /// the control-plane KV slice (and its delta) entirely, even though the bundle head says `Full`.
+    /// `project sync` sets this on the ABSENT-dest FULL-bundle path so the managed-DB DATA lands
+    /// source-version-independently (a full bundle's schema → the safe shadow+swap, understood by any
+    /// source version) WITHOUT carrying the source's control-plane slice — whose DOMAIN layer
+    /// (`domainverify`/`alias`/the `SiteConfig.domains` field) would otherwise LAND on the fresh
+    /// target, silently ignoring `--exclude-domains` and breaking the `--identity fresh` guarantee
+    /// that domain proofs are re-earned, not carried (construens acceptance bar D). The control plane
+    /// is instead carried by sync's SELECTIVE `carry_kv_stratum` (which honours `--exclude-domains`,
+    /// drops `domainverify`/`alias`, and rewrites the `domains` field under `--identity fresh`).
+    /// Default `false` ⇒ a Full bundle imports its control-plane slice as before. NEVER relaxes a
+    /// guard — it only SKIPS a member; the managed-overlay RCE guard and the fresh-identity drop are
+    /// unaffected (with the slice skipped there is nothing source-sealed to drop).
+    pub skip_control_plane_kv: bool,
 }
 
 impl std::fmt::Debug for ImportOptions {
@@ -703,6 +717,7 @@ impl std::fmt::Debug for ImportOptions {
                     .map(std::collections::BTreeSet::len),
             )
             .field("expected_managed_restore", &self.expected_managed_restore)
+            .field("skip_control_plane_kv", &self.skip_control_plane_kv)
             .finish()
     }
 }
