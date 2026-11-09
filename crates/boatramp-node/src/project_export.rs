@@ -326,6 +326,33 @@ fn sidecar_managed_apply(is_managed: bool, restore: ManagedRestore) -> SidecarMa
     }
 }
 
+/// The refusal message for a MANAGED member that arrived as a LEGACY Overlay head. The guard itself
+/// is unconditional (a managed overlay is ALWAYS refused — the RCE boundary; see `sidecar_managed_apply`);
+/// this only picks the MESSAGE. When the caller EXPECTED a shadow-swap (`project sync` / a clone sets
+/// it), an Overlay means the SOURCE dropped the `managed_restore` signal and streamed a schema-less
+/// data-only dump — a SOURCE VERSION SKEW — so the message names that cause distinctly, so a
+/// version-skew never again looks like a missing feature. Otherwise the generic data-only-overlay RCE
+/// refusal stands (a deliberate data-only overlay into a managed binding).
+fn managed_overlay_refusal(engine: &str, db: &str, expected: Option<ManagedRestore>) -> String {
+    if matches!(expected, Some(ManagedRestore::ShadowSwap)) {
+        format!(
+            "managed-DB restore refused: the source node did not emit a shadow-swap bundle head for \
+             MANAGED {engine} database ({db:?}) — it streamed a legacy data-only Overlay instead (a \
+             SOURCE VERSION SKEW: a pre-v0.59.1 source silently drops the `managed_restore` signal a \
+             cross-node sync sends). Fix: upgrade the source to v0.59.1+, or re-export as a FULL \
+             bundle (a `project sync` into an ABSENT dest pulls a full bundle automatically)."
+        )
+    } else {
+        format!(
+            "import refused: a data-only restore of MANAGED {engine} database ({db:?}) is not \
+             supported — it would overlay the untrusted dump onto the live schema as the bootstrap \
+             superuser (RCE risk), with no atomic shadow+swap; a least-privilege data-only/overlay \
+             apply is a pending follow-up. Re-export as a FULL bundle, or import into an external \
+             (bring-your-own-URL) binding."
+        )
+    }
+}
+
 /// Whether a MANAGED engine member (pg/mysql) is framed CHUNKED (a streamed dump → the atomic
 /// shadow-restore, Stage C/D) vs SIDECAR, from the binding's managed-ness, the bundle's
 /// [`ManagedRestore`] mode, and whether the tenant is Shared. Chunked IFF managed AND ShadowSwap AND
@@ -4267,14 +4294,13 @@ impl NodeProjectExport {
                             // bootstrap superuser. A least-privilege overlay apply is a pending
                             // follow-up (OPEN questions: grant surface on LIVE tenant tables,
                             // FK/trigger ordering without superuser, non-atomic partial-apply
-                            // semantics). Fail-closed.
-                            return Err(Perr::Unavailable(format!(
-                                "import refused: a data-only restore of MANAGED pg database \
-                                 ({db:?}) is not supported — it would overlay the untrusted dump \
-                                 onto the live schema as the bootstrap superuser (RCE risk), with no \
-                                 atomic shadow+swap; a least-privilege data-only/overlay apply is a \
-                                 pending follow-up. Re-export as a FULL bundle, or import into an \
-                                 external (bring-your-own-URL) binding."
+                            // semantics). Fail-closed. When the caller EXPECTED a shadow-swap (a
+                            // cross-node `project sync`), this Overlay is a SOURCE VERSION SKEW — the
+                            // message names that distinctly (see `managed_overlay_refusal`).
+                            return Err(Perr::Unavailable(managed_overlay_refusal(
+                                "pg",
+                                db,
+                                opts.expected_managed_restore,
                             )));
                         }
                         SidecarManagedApply::ManagedShadowSwap => {
@@ -4357,14 +4383,12 @@ impl NodeProjectExport {
                             // shadow+swap for an overlay (the shadow is a FRESH db, not the live
                             // schema), and a direct apply would run the untrusted dump as the bootstrap
                             // superuser. A least-privilege overlay apply is a pending follow-up.
-                            // Fail-closed.
-                            return Err(Perr::Unavailable(format!(
-                                "import refused: a data-only restore of MANAGED mysql database \
-                                 ({db:?}) is not supported — it would overlay the untrusted dump \
-                                 onto the live schema as the bootstrap superuser (RCE risk), with no \
-                                 atomic shadow+swap; a least-privilege data-only/overlay apply is a \
-                                 pending follow-up. Re-export as a FULL bundle, or import into an \
-                                 external (bring-your-own-URL) binding."
+                            // Fail-closed. A caller that EXPECTED a shadow-swap (a cross-node
+                            // `project sync`) gets the distinct SOURCE-VERSION-SKEW message.
+                            return Err(Perr::Unavailable(managed_overlay_refusal(
+                                "mysql",
+                                db,
+                                opts.expected_managed_restore,
                             )));
                         }
                         SidecarManagedApply::ManagedShadowSwap => {

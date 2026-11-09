@@ -3443,6 +3443,12 @@ pub(super) struct ProjectImportQuery {
     /// transport-key header).
     #[serde(default = "default_identity")]
     identity: String,
+    /// The managed-restore MODE the caller EXPECTED the bundle to carry (`shadow-swap` / `overlay`).
+    /// Used ONLY to sharpen the error when a managed member arrives as a LEGACY Overlay head despite
+    /// a `shadow-swap` expectation — a SOURCE VERSION SKEW (a pre-v0.59.1 source dropped the signal),
+    /// reported distinctly from the generic data-only-overlay RCE refusal. Unknown token ⇒ `400`.
+    #[serde(default)]
+    managed_restore: Option<String>,
     /// RESUMABLE mode (T3): a relative directory NAME under the node's configured
     /// `[serve] resumable_export_dir` base to import from (the output of a resumable
     /// export), instead of a streamed request body. Host-confined under the base.
@@ -3579,6 +3585,21 @@ pub(super) async fn project_import(
                     .into_response();
             }
         };
+    let expected_managed_restore = match q.managed_restore.as_deref() {
+        None => None,
+        Some(tok) => match boatramp_core::project_export::ManagedRestore::parse(tok) {
+            Some(mr) => Some(mr),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "project import: unknown managed_restore {tok:?} (want overlay / shadow-swap)\n"
+                    ),
+                )
+                    .into_response();
+            }
+        },
+    };
     let opts = boatramp_core::project_export::ImportOptions {
         apply: q.apply,
         force: q.force,
@@ -3590,6 +3611,7 @@ pub(super) async fn project_import(
         skip_any_blob_mismatch: q.skip_any_blob_mismatch,
         continue_on_error,
         only_blobs: parse_only_blobs(q.only_blobs.as_deref()),
+        expected_managed_restore,
     };
     // RESUMABLE mode (T3): import from a node-local member-object directory (the output of a
     // resumable export) named relative to the configured base — no request body. The host
@@ -4007,6 +4029,10 @@ pub(super) async fn clone_from(
         req.verify,
         req.overwrite,
         req.force,
+        // The requested managed-restore mode (orthogonal to `data_only`) — carried into the import so
+        // a LEGACY Overlay head from an old source is reported as a VERSION SKEW, not a generic RCE
+        // refusal. `ManagedRestore` is `Copy`, so this reuse of the value sent to the source is fine.
+        managed_restore,
         CloneMismatchPolicy {
             enumerate: req.enumerate_mismatches,
             skip: req.skip_member_mismatch,
@@ -4234,6 +4260,10 @@ async fn orchestrate_clone(
     verify: bool,
     overwrite: bool,
     force: bool,
+    // The managed-restore mode the caller requested of the source (`project sync` sets `ShadowSwap`).
+    // Carried into the import ONLY to sharpen the error when the source returns a LEGACY Overlay head
+    // for a managed member despite the request — a SOURCE VERSION SKEW (see `restore_member`).
+    expected_managed_restore: Option<boatramp_core::project_export::ManagedRestore>,
     mismatch: CloneMismatchPolicy,
 ) -> Response {
     // 1. Manifest (cheap LIST).
@@ -4291,6 +4321,7 @@ async fn orchestrate_clone(
         skip_any_blob_mismatch: mismatch.skip_any_blob,
         continue_on_error: mismatch.continue_on_error.clone(),
         only_blobs: mismatch.only_blobs.clone(),
+        expected_managed_restore,
     };
     clone_progress_response(cap, target, plan, reader, opts)
 }
@@ -7594,6 +7625,7 @@ mod tests {
             false, // verify
             false, // overwrite
             false, // force
+            None,  // expected_managed_restore
             CloneMismatchPolicy::default(),
         )
         .await;
@@ -7647,6 +7679,7 @@ mod tests {
             false, // verify
             false, // overwrite
             false, // force
+            None,  // expected_managed_restore
             CloneMismatchPolicy::default(),
         )
         .await;
@@ -7711,6 +7744,7 @@ mod tests {
             false,
             false,
             false,
+            None, // expected_managed_restore
             CloneMismatchPolicy::default(),
         )
         .await;
