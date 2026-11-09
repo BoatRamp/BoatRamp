@@ -3266,7 +3266,12 @@ async fn project_sync_shared_rls_force_replicate_live() {
     // FAILS with construens's exact wall. We produce a full `-Fc` dump of the source (carries the
     // event trigger), create a fresh db owned by a fresh NON-super role, and restore WITHOUT the TOC
     // filter as that role → `permission denied to create event trigger`.
-    let mut_db = format!("{src_db}__mut");
+    //
+    // The mut db/role names MUST be SHORT and independent of `src_db`: `src_db` is a real tenant db
+    // name already at Postgres's 63-byte NAMEDATALEN limit, so a `{src_db}__mut` suffix TRUNCATES back
+    // to exactly `src_db` — and `DROP DATABASE IF EXISTS {mut_db}` would then DROP THE SOURCE itself,
+    // leaving an empty dump (the CI-vs-short-name-proof gap this gate now covers).
+    let mut_db = format!("brexp_mutdb_{s}");
     let mut_role = format!("brexp_mut_{s}");
     let (mc, mo) = psql(
         backend.as_ref(),
@@ -3281,7 +3286,21 @@ async fn project_sync_shared_rls_force_replicate_live() {
     )
     .await;
     assert_eq!(mc, 0, "mutation setup (fresh non-super role + db): {mo}");
-    // Full `-Fc` dump of the source (includes the event trigger + function).
+    // The fresh role MUST be a genuine NON-superuser — the restore confinement is the whole point
+    // (the CI pg's default DSN role is the bootstrap SUPERUSER, which CAN create the trigger, so the
+    // mutation must NOT run as it). Assert it fail-closed, else the mutation is vacuous.
+    let (_c, issuper) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT rolsuper FROM pg_roles WHERE rolname = '{mut_role}'"),
+    )
+    .await;
+    assert_eq!(
+        issuper, "f",
+        "the mutation role {mut_role:?} MUST be NOSUPERUSER (rolsuper={issuper:?})"
+    );
+    // Full `-Fc` dump of the source (as the SUPERUSER) — carries the event trigger + function.
     let dumpfile = std::env::temp_dir().join(format!("rlsf-mut-dump-{s}.fc"));
     {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -3305,7 +3324,30 @@ async fn project_sync_shared_rls_force_replicate_live() {
             "pg_dump of the source for the mutation must succeed"
         );
     }
-    // PLAIN (unfiltered) non-super restore → the wall.
+    // The dump MUST contain the superuser-only event trigger — else the mutation is vacuous (there
+    // would be nothing for a non-super restore to choke on). Verify its TOC (dump fed on stdin).
+    let mut_toc = {
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        let argv = vec!["pg_restore".to_string(), "-l".to_string()];
+        let td = tempfile::tempdir().unwrap();
+        let outp = td.path().join("toc.out");
+        let inf = tokio::fs::File::open(&dumpfile).await.unwrap();
+        let mut rdr = inf.compat();
+        let f = tokio::fs::File::create(&outp).await.unwrap();
+        let mut sink = f.compat_write();
+        let _ = backend
+            .run_ephemeral(&image, &argv, &[], Some(&mut rdr), &mut sink)
+            .await
+            .expect("pg_restore -l for the mutation TOC");
+        tokio::fs::read_to_string(&outp).await.unwrap_or_default()
+    };
+    assert!(
+        mut_toc.contains("boatramp_force_rls_trg"),
+        "the mutation dump MUST carry the force-RLS EVENT TRIGGER (else the mutation is vacuous); \
+         TOC was: {mut_toc}"
+    );
+    // PLAIN (unfiltered) restore as the NON-SUPER role — EXPLICIT `-U` (belt-and-suspenders to the
+    // env's PGUSER) so it can never silently connect as a default superuser → the wall.
     let mut_conn = conn(&mut_role, "mutpw", &host, port, &mut_db);
     let mut_out = {
         use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -3314,7 +3356,7 @@ async fn project_sync_shared_rls_force_replicate_live() {
             "-c".to_string(),
             format!(
                 "exec pg_restore --no-owner --no-privileges --exit-on-error --single-transaction \
-                 -d {mut_db} 2>&1"
+                 -U {mut_role} -d {mut_db} 2>&1"
             ),
         ];
         let td = tempfile::tempdir().unwrap();
