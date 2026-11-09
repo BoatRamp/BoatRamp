@@ -22,10 +22,11 @@ name: Cache
 # closure, not just the CLI leaf) using that token. Until the secret is set this
 # still runs green: cachix-action simply skips the push.
 on:
+  # Release-scoped: warm the cache on the main push that carries each release (plus
+  # on-demand dispatch). No nightly cron — downstream consumers pin released revisions,
+  # so per-release warming is enough and avoids a daily macOS-runner spend for `main`.
   push:
     branches: [main]
-  schedule:
-    - cron: "0 5 * * *" # nightly — keep the cache warm against nixpkgs drift
   workflow_dispatch:
 
 permissions:
