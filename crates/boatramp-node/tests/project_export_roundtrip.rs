@@ -3237,32 +3237,29 @@ async fn project_sync_shared_rls_force_replicate_live() {
         .await
         .expect("fresh login credential (minted at self-provision)");
     let login_conn = conn(&fresh_login, &fresh_login_pw, &host, port, &dest_db);
-    let (c, seen) = psql(
-        backend.as_ref(),
-        &image,
-        &login_conn,
-        "SET app.tenant_id = 'A'; SELECT string_agg(v, ',' ORDER BY id) FROM t_noforce",
-    )
-    .await;
+    // Set the GUC and read the RLS-filtered table in ONE session, returning a MARKER-prefixed line
+    // (`SEEN[<A rows>] B=<count of B rows still visible>`) so the exact comparison is immune to the
+    // `SET` command's own `SET` status tag that psql prints to stdout ahead of the row. `string_agg`
+    // over the RLS-filtered table yields exactly A's rows; the `FILTER (WHERE tid='B')` count is the
+    // explicit zero-foreign-bytes probe (RLS removed B, so a non-owner can't even count them).
+    let probe = "SET app.tenant_id = 'A'; \
+                 SELECT 'SEEN[' || coalesce(string_agg(v, ',' ORDER BY id), '') || '] B=' \
+                 || count(*) FILTER (WHERE tid = 'B') FROM t_noforce";
+    let (c, out) = psql(backend.as_ref(), &image, &login_conn, probe).await;
     assert_eq!(
         c, 0,
-        "the non-owner login role must read its own tenant's rows: {seen}"
+        "the non-owner login role must read its own tenant's rows: {out}"
     );
+    // Find the marker line (ignoring the leading `SET` tag / any other status echo).
+    let seen = out
+        .lines()
+        .find(|l| l.starts_with("SEEN["))
+        .unwrap_or("<no SEEN marker>");
     assert_eq!(
-        seen, "a1,a2",
-        "RLS must confine the NON-OWNER runtime to tenant A on an ENABLE+NO-FORCE table (zero B \
-         bytes) — isolation holds WITHOUT force; got {seen:?}"
-    );
-    let (_c, bcount) = psql(
-        backend.as_ref(),
-        &image,
-        &login_conn,
-        "SET app.tenant_id = 'A'; SELECT count(*) FROM t_noforce WHERE tid = 'B'",
-    )
-    .await;
-    assert_eq!(
-        bcount, "0",
-        "CROSS-TENANT LEAK: the tenant-A runtime saw tenant-B rows"
+        seen, "SEEN[a1,a2] B=0",
+        "RLS must confine the NON-OWNER runtime to tenant A on an ENABLE+NO-FORCE table: it must \
+         see EXACTLY A's rows (a1,a2) and ZERO B rows (B=0) — isolation holds WITHOUT force. Full \
+         psql output: {out:?}"
     );
 
     // ASSERTION 5 (MUTATION — "drop the EXCLUDE"): a PLAIN non-super restore of the same dump shape
