@@ -34,11 +34,18 @@
 //!
 //! ARMS:
 //!   - **GREEN (the fix):** the sync's OWN decision for an absent managed dest
-//!     (`project_sync::data_clone_request(/*dest_absent=*/true)`) drives the SOURCE clone/stream over
-//!     the wire (simulating an OLD source that ignores `managed_restore`), then the TARGET imports it
-//!     and the seeded rows LAND on the provisioned dest. On the UNFIXED base `data_clone_request`
-//!     returns `data_only=true` ⇒ the old source emits an Overlay ⇒ the import REFUSES ⇒ the "rows
-//!     land" assertion FAILS (the gate is RED). After the fix it returns a FULL bundle ⇒ rows land.
+//!     (`project_sync::data_clone_request(/*dest_absent=*/true)` — `data_only=false` +
+//!     `skip_control_plane_kv=true`) drives the SOURCE clone/stream over the wire (simulating an OLD
+//!     source that ignores `managed_restore`), then the TARGET imports it and the seeded rows LAND on
+//!     the provisioned dest. On the UNFIXED base `data_clone_request` returns `data_only=true` ⇒ the
+//!     old source emits an Overlay ⇒ the import REFUSES ⇒ the "rows land" assertion FAILS (RED).
+//!   - **ZERO SOURCE-DOMAIN CARRY (construens bar D):** the source's control-plane DOMAIN layer
+//!     (`domainverify`/`alias`/a settings key) is seeded, so the FULL bundle carries it. After the
+//!     clamped absent-dest import the fresh target holds NONE of it (the data-plane-only clamp skips
+//!     the control-plane KV slice; `carry_kv_stratum` carries the control plane selectively instead).
+//!     A CONTROL arm imports the SAME full bundle WITHOUT the clamp and asserts the domain layer DOES
+//!     land — so the zero-carry is the clamp's doing, not a source that carried nothing (F1 can never
+//!     silently regress).
 //!   - **VERSION-SKEW (permanent RED-refusing):** the EXISTING-dest shape (`data_only=true`, no
 //!     `managed_restore`, simulating an old source) is REFUSED on import — proving the real wire
 //!     signal-drop reaches the managed-overlay guard. After the error-hardening the refusal names the
@@ -333,12 +340,47 @@ async fn wire_managed(
         .unwrap();
 }
 
-/// A managed-DB NODE under test: the real router app + the physical DB name it binds + the
+/// A managed-DB NODE under test: the real router app + the node's control-plane KV store (held so a
+/// test can SEED the source's domain layer and ASSERT zero source-domain carry on the target) + the
 /// tempdirs kept alive for the driver's lifetime.
 struct ManagedNode {
     app: axum::Router,
+    kv: Arc<dyn KvStore>,
     _tempdirs: Vec<tempfile::TempDir>,
 }
+
+/// Seed the SOURCE node's control-plane KV with a DOMAIN layer: a `domainverify` proof, an `alias`,
+/// and a non-domain settings key. A FULL bundle stages all of these in its control-plane KV member.
+/// The data-plane-only clamp must land the managed DATA but carry NONE of these to a fresh target
+/// (construens bar D: zero source-domain carry under `--identity fresh`).
+async fn seed_domain_layer(kv: &Arc<dyn KvStore>) {
+    kv.put(
+        "project/default/domainverify/example.com",
+        br#"{"token":"src-proof"}"#.to_vec(),
+    )
+    .await
+    .unwrap();
+    kv.put(
+        "project/default/alias/www.example.com",
+        b"example.com".to_vec(),
+    )
+    .await
+    .unwrap();
+    kv.put(
+        "project/default/config/settings",
+        br#"{"k":"src"}"#.to_vec(),
+    )
+    .await
+    .unwrap();
+}
+
+/// The three source-owned control-plane keys `seed_domain_layer` writes — the data-plane-only clamp
+/// must leave ALL of them ABSENT on the target.
+const DOMAIN_LAYER_KEYS: [&str; 3] = [
+    "project/default/domainverify/example.com",
+    "project/default/alias/www.example.com",
+    "project/default/config/settings",
+];
 
 // ---------------------------------------------------------------------------------------------
 // PG gate
@@ -457,6 +499,7 @@ async fn project_sync_cross_node_pg_source_independent_live() {
                 let app = node_app(Arc::new(driver), deploy);
                 ManagedNode {
                     app,
+                    kv,
                     _tempdirs: vec![td],
                 }
             }
@@ -465,6 +508,9 @@ async fn project_sync_cross_node_pg_source_independent_live() {
 
     let src_node = build_node(source_db.clone()).await;
     let dst_node = build_node(live_db.clone()).await;
+    // Seed the SOURCE's control-plane DOMAIN layer, so the FULL bundle carries it (and we can prove
+    // the data-plane-only clamp does NOT carry it to the fresh target — construens bar D).
+    seed_domain_layer(&src_node.kv).await;
 
     // ============================ VERSION-SKEW arm (permanent RED-refusing) ============================
     // The EXISTING-dest shape against an OLD source: `data_only=true`, NO `managed_restore` on the
@@ -502,9 +548,17 @@ async fn project_sync_cross_node_pg_source_independent_live() {
     // UNFIXED base `req.data_only == true` ⇒ Overlay ⇒ the import refuses ⇒ this arm FAILS (RED).
     let req = data_clone_request(/*dest_absent=*/ true);
     let full_bundle = clone_stream_bundle(&src_node.app, "default", req.data_only, None).await;
-    let force_q = if req.force { "&force=true" } else { "" };
+    // Build the import query from the sync's OWN decision (force + the data-plane-only clamp) — so the
+    // gate exercises the real `data_clone_request` choice over the real wire, not a hand-set flag.
+    let mut green_q = String::new();
+    if req.force {
+        green_q.push_str("&force=true");
+    }
+    if req.skip_control_plane_kv {
+        green_q.push_str("&skip_control_plane_kv=true");
+    }
     let (land_status, land_body) =
-        project_import(&dst_node.app, "default", full_bundle, force_q).await;
+        project_import(&dst_node.app, "default", full_bundle.clone(), &green_q).await;
     assert_eq!(
         land_status,
         StatusCode::OK,
@@ -519,6 +573,47 @@ async fn project_sync_cross_node_pg_source_independent_live() {
             .and_then(serde_json::Value::as_u64),
         Some(1),
         "exactly one managed pg db restored: {land_body}"
+    );
+
+    // --- F1 (construens bar D): ZERO source-domain carry. The clamped FULL-bundle import landed the
+    //     managed DATA but must have carried NONE of the source's control-plane domain layer. ---
+    for key in DOMAIN_LAYER_KEYS {
+        let got = dst_node.kv.get(key).await.unwrap();
+        assert!(
+            got.is_none(),
+            "data-plane-only clamp LEAKED a source control-plane key onto the fresh target: {key} \
+             (= {got:?}); the domain layer must be carried only by sync's selective carry_kv_stratum"
+        );
+    }
+
+    // --- CONTROL: the SAME full bundle imported WITHOUT the clamp DOES carry the domain layer — so
+    //     the zero-carry above is the CLAMP's doing, not a source that carried nothing. A fresh third
+    //     node + db so the control's managed restore has somewhere to land. ---
+    let ctrl_db = format!("brxn_ctrl_{s}");
+    for sql in [
+        format!("DROP DATABASE IF EXISTS {ctrl_db}"),
+        format!("CREATE DATABASE {ctrl_db}"),
+    ] {
+        let (c, o) = psql(backend.as_ref(), &image, &maint, &sql).await;
+        assert_eq!(c, 0, "ctrl setup `{sql}`: {o}");
+    }
+    let ctrl_node = build_node(ctrl_db.clone()).await;
+    let (ctrl_status, ctrl_body) =
+        project_import(&ctrl_node.app, "default", full_bundle, "&force=true").await;
+    assert_eq!(
+        ctrl_status,
+        StatusCode::OK,
+        "control (unclamped) full-bundle import must succeed: {ctrl_body}"
+    );
+    let carried = ctrl_node
+        .kv
+        .get("project/default/domainverify/example.com")
+        .await
+        .unwrap();
+    assert!(
+        carried.is_some(),
+        "control: an UNCLAMPED full-bundle import MUST carry the source domain layer (proving the \
+         clamp is load-bearing); got absent"
     );
 
     // --- rows LAND + are queryable on the provisioned dest db ---
@@ -552,6 +647,7 @@ async fn project_sync_cross_node_pg_source_independent_live() {
     for sql in [
         format!("DROP DATABASE IF EXISTS {live_db}"),
         format!("DROP DATABASE IF EXISTS {source_db}"),
+        format!("DROP DATABASE IF EXISTS {ctrl_db}"),
     ] {
         let _ = psql(backend.as_ref(), &image, &maint, &sql).await;
     }
@@ -678,6 +774,7 @@ async fn project_sync_cross_node_mysql_source_independent_live() {
                 let app = node_app(Arc::new(driver), deploy);
                 ManagedNode {
                     app,
+                    kv,
                     _tempdirs: vec![td],
                 }
             }
@@ -686,6 +783,8 @@ async fn project_sync_cross_node_mysql_source_independent_live() {
 
     let src_node = build_node(source_db.clone()).await;
     let dst_node = build_node(live_db.clone()).await;
+    // Seed the SOURCE domain layer so we can prove the clamp carries NONE of it to the fresh target.
+    seed_domain_layer(&src_node.kv).await;
 
     // VERSION-SKEW arm: old-source Overlay → refused (with the version-skew phrasing post-hardening).
     let overlay_bundle = clone_stream_bundle(&src_node.app, "default", true, None).await;
@@ -706,18 +805,22 @@ async fn project_sync_cross_node_mysql_source_independent_live() {
         "the refusal must be the managed-overlay guard, got: {skew_body}"
     );
     assert!(
-        skew_body.contains("shadow-swap bundle head")
-            || skew_body.contains("source node")
-            || skew_body.contains("upgrade the source"),
+        skew_body.contains("shadow-swap bundle head") && skew_body.contains("upgrade the source"),
         "version-skew refusal must name the cause, got: {skew_body}"
     );
 
-    // GREEN arm: the fix's absent-dest decision over the real wire → rows land.
+    // GREEN arm: the fix's absent-dest decision over the real wire → rows land + ZERO domain carry.
     let req = data_clone_request(/*dest_absent=*/ true);
     let full_bundle = clone_stream_bundle(&src_node.app, "default", req.data_only, None).await;
-    let force_q = if req.force { "&force=true" } else { "" };
+    let mut green_q = String::new();
+    if req.force {
+        green_q.push_str("&force=true");
+    }
+    if req.skip_control_plane_kv {
+        green_q.push_str("&skip_control_plane_kv=true");
+    }
     let (land_status, land_body) =
-        project_import(&dst_node.app, "default", full_bundle, force_q).await;
+        project_import(&dst_node.app, "default", full_bundle, &green_q).await;
     assert_eq!(
         land_status,
         StatusCode::OK,
@@ -733,6 +836,16 @@ async fn project_sync_cross_node_mysql_source_independent_live() {
         Some(1),
         "exactly one managed mysql db restored: {land_body}"
     );
+
+    // F1 (construens bar D): ZERO source-domain carry — the clamped import landed the managed DATA
+    // but must have carried none of the source's control-plane domain layer onto the fresh target.
+    for key in DOMAIN_LAYER_KEYS {
+        let got = dst_node.kv.get(key).await.unwrap();
+        assert!(
+            got.is_none(),
+            "data-plane-only clamp LEAKED a source control-plane key onto the fresh target: {key}"
+        );
+    }
 
     let (_c, got) = mysql_run(
         backend.as_ref(),

@@ -18,12 +18,17 @@ versions.
   streamed bundle head (new in v0.59.1). A pre-v0.59.1 source silently drops the unknown
   `managed_restore` query param and streams a LEGACY data-only head, which the v0.59.1 target
   correctly refuses for a managed binding — so a new node cloning FROM an older prod failed. Sync now
-  requests a **FULL bundle** for an absent managed dest (the schema+data env-replication shape every
-  source version understands — exactly the proven `--force` full-bundle recovery path): the target
-  provisions and restores the managed member via the SAME safe non-superuser shadow+swap, and the
-  full-scope control-plane KV slice is re-keyed to the target, tenant-scoped fail-closed, and
-  system-principal-stripped on import. An EXISTING managed dest keeps the v0.59.1 DataPlane +
-  shadow-swap incremental path (no control-plane slice dragged into a mirror).
+  requests a **FULL bundle** for an absent managed dest (the schema+data shape every source version
+  understands) with a **data-plane-only clamp**: the target applies the managed-DB (+ blob/libsql)
+  members via the SAME safe non-superuser shadow+swap, but SKIPS the full bundle's control-plane KV
+  slice entirely. So the managed DATA lands source-version-independently while the source's control
+  plane — critically its DOMAIN layer (`domainverify`/`alias`/the `SiteConfig.domains` field) — never
+  carries onto the fresh target: that would silently ignore `--exclude-domains` and break the
+  `--identity fresh` guarantee that domain proofs are re-earned, not carried (construens acceptance
+  bar D). The control plane is instead carried by sync's existing SELECTIVE KV-stratum path (which
+  honours `--exclude-domains`, drops `domainverify`/`alias`, and rewrites the `domains` field under
+  `--identity fresh`). An EXISTING managed dest keeps the v0.59.1 DataPlane + shadow-swap incremental
+  path unchanged (no control-plane slice dragged into a mirror).
 - **A managed-DB restore that was requested as shadow-swap but arrives as a legacy data-only Overlay
   now fails with a distinct VERSION-SKEW error** naming the cause ("the source node did not emit a
   shadow-swap bundle head … upgrade the source to v0.59.1+, or re-export as a full bundle"), instead

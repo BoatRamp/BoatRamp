@@ -1118,6 +1118,9 @@ impl ControlPlane {
         force: bool,
         data_only: bool,
         managed_restore: Option<boatramp_core::project_export::ManagedRestore>,
+        // DATA-PLANE-ONLY CLAMP: apply the managed-DB members of a FULL bundle but SKIP its
+        // control-plane KV slice (so the source's domain layer never lands). Set on an absent-dest sync.
+        skip_control_plane_kv: bool,
         mismatch: MismatchFlags,
     ) -> Result<CloneOutcome> {
         use boatramp_core::project_export::{CloneEvent, ClonePlan};
@@ -1142,6 +1145,7 @@ impl ControlPlane {
             "skip_member_mismatch": mismatch.skip,
             "skip_any_blob_mismatch": mismatch.skip_any_blob,
             "only_blobs": mismatch.only_blobs,
+            "skip_control_plane_kv": skip_control_plane_kv,
         });
         if let Some(sp) = source_project {
             body["source_project"] = serde_json::Value::String(sp.to_string());

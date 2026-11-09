@@ -3449,6 +3449,11 @@ pub(super) struct ProjectImportQuery {
     /// reported distinctly from the generic data-only-overlay RCE refusal. Unknown token ⇒ `400`.
     #[serde(default)]
     managed_restore: Option<String>,
+    /// DATA-PLANE-ONLY CLAMP: apply the managed-DB (+ blob/libsql) members of a FULL bundle but SKIP
+    /// its control-plane KV slice entirely (so the source's domain layer never lands). The absent-dest
+    /// `project sync` clone sets it; the control plane is carried by sync's selective KV-stratum path.
+    #[serde(default)]
+    skip_control_plane_kv: bool,
     /// RESUMABLE mode (T3): a relative directory NAME under the node's configured
     /// `[serve] resumable_export_dir` base to import from (the output of a resumable
     /// export), instead of a streamed request body. Host-confined under the base.
@@ -3612,6 +3617,7 @@ pub(super) async fn project_import(
         continue_on_error,
         only_blobs: parse_only_blobs(q.only_blobs.as_deref()),
         expected_managed_restore,
+        skip_control_plane_kv: q.skip_control_plane_kv,
     };
     // RESUMABLE mode (T3): import from a node-local member-object directory (the output of a
     // resumable export) named relative to the configured base — no request body. The host
@@ -3882,6 +3888,12 @@ pub(super) struct CloneFromRequest {
     /// EXCLUSIVELY (re-streamed from the source). Empty ⇒ restore everything.
     #[serde(default)]
     only_blobs: Vec<String>,
+    /// DATA-PLANE-ONLY CLAMP: apply the managed-DB (+ blob/libsql) members of a FULL bundle but SKIP
+    /// its control-plane KV slice entirely (so the source's domain layer never lands). `project sync`
+    /// sets this on the ABSENT-dest FULL-bundle path; the control plane is then carried by sync's
+    /// selective KV-stratum path. Default `false` ⇒ a full bundle imports its control-plane slice.
+    #[serde(default)]
+    skip_control_plane_kv: bool,
 }
 
 /// TARGET — the clone ORCHESTRATOR (`POST /api/projects/<target>/clone/from`, `Project·Admin`):
@@ -4033,6 +4045,10 @@ pub(super) async fn clone_from(
         // a LEGACY Overlay head from an old source is reported as a VERSION SKEW, not a generic RCE
         // refusal. `ManagedRestore` is `Copy`, so this reuse of the value sent to the source is fine.
         managed_restore,
+        // DATA-PLANE-ONLY CLAMP: skip the full bundle's control-plane KV slice on import (managed-DB
+        // DATA still lands). `project sync` sets it on an absent-dest clone so the source's domain
+        // layer never carries onto the fresh target.
+        req.skip_control_plane_kv,
         CloneMismatchPolicy {
             enumerate: req.enumerate_mismatches,
             skip: req.skip_member_mismatch,
@@ -4264,6 +4280,9 @@ async fn orchestrate_clone(
     // Carried into the import ONLY to sharpen the error when the source returns a LEGACY Overlay head
     // for a managed member despite the request — a SOURCE VERSION SKEW (see `restore_member`).
     expected_managed_restore: Option<boatramp_core::project_export::ManagedRestore>,
+    // DATA-PLANE-ONLY CLAMP: apply the managed-DB members of a full bundle but skip its control-plane
+    // KV slice (the absent-dest sync path — keeps the source domain layer off the fresh target).
+    skip_control_plane_kv: bool,
     mismatch: CloneMismatchPolicy,
 ) -> Response {
     // 1. Manifest (cheap LIST).
@@ -4322,6 +4341,7 @@ async fn orchestrate_clone(
         continue_on_error: mismatch.continue_on_error.clone(),
         only_blobs: mismatch.only_blobs.clone(),
         expected_managed_restore,
+        skip_control_plane_kv,
     };
     clone_progress_response(cap, target, plan, reader, opts)
 }
@@ -7626,6 +7646,7 @@ mod tests {
             false, // overwrite
             false, // force
             None,  // expected_managed_restore
+            false, // skip_control_plane_kv
             CloneMismatchPolicy::default(),
         )
         .await;
@@ -7680,6 +7701,7 @@ mod tests {
             false, // overwrite
             false, // force
             None,  // expected_managed_restore
+            false, // skip_control_plane_kv
             CloneMismatchPolicy::default(),
         )
         .await;
@@ -7744,7 +7766,8 @@ mod tests {
             false,
             false,
             false,
-            None, // expected_managed_restore
+            None,  // expected_managed_restore
+            false, // skip_control_plane_kv
             CloneMismatchPolicy::default(),
         )
         .await;

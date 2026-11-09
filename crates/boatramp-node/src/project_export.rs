@@ -3337,8 +3337,12 @@ impl ProjectExport for NodeProjectExport {
         // "zero source-sealed artifacts that unwrap" a POSITIVE absence rather than
         // present-but-inert. Only for a FULL bundle (data-only carries no KV/secrets) and
         // only when applying.
+        // The data-plane-only clamp skipped the control-plane KV member, so NOTHING source-sealed was
+        // written — there is nothing to drop (the target holds only its own self-provisioned managed
+        // credential). Skip the scan under the clamp.
         if matches!(opts.identity, IdentityChoice::Fresh)
             && head.scope.carries_control_plane()
+            && !opts.skip_control_plane_kv
             && opts.apply
         {
             let prefixes =
@@ -3379,8 +3383,9 @@ impl ProjectExport for NodeProjectExport {
         // Operational prerequisites after a FULL control-plane restore — the portable bundle
         // deliberately carries no function/component CODE (deploy artifacts live in blob storage,
         // not this slice), no TLS private keys and no global routing ownership. Surface the
-        // follow-up steps so the target is not silently half-restored.
-        if head.scope.carries_control_plane() {
+        // follow-up steps so the target is not silently half-restored. (Suppressed under the
+        // data-plane-only clamp: no control-plane slice was restored, so there is nothing to re-attach.)
+        if head.scope.carries_control_plane() && !opts.skip_control_plane_kv {
             report.notes.push(
                 "post-import: re-deploy function/component code (deploy artifacts are not \
                  bundled), re-verify + re-attach the project's domains, and let ACME re-issue TLS \
@@ -4462,6 +4467,22 @@ impl NodeProjectExport {
                     // (the post-stream note records that KV is not imported for a data-plane bundle).
                     return Ok(());
                 }
+                if opts.skip_control_plane_kv {
+                    // DATA-PLANE-ONLY CLAMP (construens bar D): a FULL bundle whose managed-DB (+
+                    // blob/libsql) members we DO apply, but whose control-plane KV slice we SKIP
+                    // entirely — so the source's domain layer (`domainverify`/`alias`/the
+                    // `SiteConfig.domains` field, all in this slice) never lands on a fresh sync
+                    // target. The control plane is carried by sync's SELECTIVE `carry_kv_stratum`
+                    // instead (which honours `--exclude-domains` + the `--identity fresh` domain drop).
+                    // This only SKIPS the member — the managed-overlay RCE guard is untouched.
+                    report.notes.push(
+                        "control-plane KV slice NOT imported: data-plane-only clamp (managed-DB data \
+                         landed via the full bundle; the control plane is carried selectively by \
+                         `project sync`, keeping the source domain layer off the fresh target)"
+                            .into(),
+                    );
+                    return Ok(());
+                }
                 // `adopt` must have installed the source KEK (from an identity member that
                 // precedes the KV slice in v2 restore order) BEFORE any sealed KV byte is
                 // written — otherwise the sealed secrets could never unseal. Refuse here,
@@ -4552,6 +4573,11 @@ impl NodeProjectExport {
                 // The control-plane KV DELTA slice (a delta bundle only): the upserts + tombstones
                 // since the base. A data-plane bundle carries no KV, so ignore one if present.
                 if head.scope.is_data_only() {
+                    return Ok(());
+                }
+                if opts.skip_control_plane_kv {
+                    // DATA-PLANE-ONLY CLAMP: skip the control-plane KV delta too (same rationale as
+                    // the full `Kv` arm — the control plane is carried by `carry_kv_stratum`).
                     return Ok(());
                 }
                 // adopt must have installed the source KEK before any sealed KV byte is written
