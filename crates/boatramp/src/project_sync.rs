@@ -692,6 +692,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
         source_project,
         source_token,
         source_dbs,
+        dest_absent: !dest_present,
         pg_included: selection.includes(Piece::Pg),
         blobs_included: selection.includes(Piece::Blobs),
         strict: selection.strict,
@@ -743,6 +744,12 @@ struct CliSyncExecutor {
     source_project: String,
     source_token: Vec<u8>,
     source_dbs: Vec<boatramp_core::compute::ApplyDatabase>,
+    /// The destination project is ABSENT (sync creates + provisions it) — drives a
+    /// SOURCE-VERSION-INDEPENDENT data clone: a FULL bundle whose managed members carry schema and
+    /// restore via the safe shadow+swap on ANY source version, instead of a DataPlane + ShadowSwap
+    /// request a pre-v0.59.1 source would degrade to a refused Overlay (see
+    /// [`project_sync::data_clone_request`]).
+    dest_absent: bool,
     pg_included: bool,
     blobs_included: bool,
     /// `--strict`: a KV-stratum record the dest skips-and-reports aborts the whole run (PLAN rule 3).
@@ -782,22 +789,33 @@ impl CliSyncExecutor {
                     .into(),
             ));
         }
+        // SOURCE-VERSION-INDEPENDENT data clone. The managed-DB data plane is landed via the safe
+        // non-superuser shadow+swap, but HOW we ask the source for it depends on whether the managed
+        // dest is fresh:
+        //   - EXISTING dest → DataPlane + explicit `ShadowSwap` (the v0.59.1 shape): a managed member
+        //     is dumped FULL and shadow-swapped, WITHOUT dragging the control-plane KV slice into an
+        //     incremental mirror. Needs a v0.59.1+ source to honour the `managed_restore` signal.
+        //   - ABSENT/fresh dest (env-replication, e.g. cloning FROM an older prod) → a FULL bundle
+        //     (`data_only=false`, legacy-coupled ShadowSwap, `force`). A full bundle is understood by
+        //     ANY source version — it carries schema+data and the target provisions + restores the
+        //     managed member via the SAME safe shadow+swap. This does NOT depend on the source
+        //     honouring `managed_restore` (a pre-v0.59.1 source silently drops it, degrading a
+        //     `data_only=true` request to a schema-less Overlay the target then refuses).
+        // The choice is the pure `data_clone_request` so the cross-node gate drives the EXACT same
+        // decision over the real wire.
+        let req = project_sync::data_clone_request(self.dest_absent);
         self.dest_cp
             .project_clone_from(
                 &self.target,
                 &self.source_url,
                 Some(&self.source_project),
                 &self.source_token,
-                true,  // apply
-                false, // verify
-                true,  // overwrite — sync's data plane is source-authoritative (mirror)
-                false, // force (data-plane bundle carries no control-plane KV)
-                true,  // data_only == DataPlane scope: no control-plane KV / identity
-                // ShadowSwap is THE fix: a managed pg/mysql member is dumped FULL and restored via
-                // the atomic non-superuser shadow+swap (dedicated → chunked; Shared pg → sidecar
-                // shadow+swap), NOT the schema-less overlay the import categorically refuses for a
-                // managed binding. Orthogonal to the DataPlane scope above.
-                Some(boatramp_core::project_export::ManagedRestore::ShadowSwap),
+                true,          // apply
+                false,         // verify
+                true,          // overwrite — sync's data plane is source-authoritative (mirror)
+                req.force, // overlay a non-empty control-plane KV dest (a full bundle carries it)
+                req.data_only, // DataPlane scope (existing dest) vs a FULL bundle (fresh dest)
+                req.managed_restore,
                 client::MismatchFlags::default(),
             )
             .await
@@ -1118,6 +1136,7 @@ mod tests {
             source_project: "src".into(),
             source_token: Vec::new(),
             source_dbs: Vec::new(),
+            dest_absent: false,
             pg_included: pg,
             blobs_included: blobs,
             strict: false,
@@ -1234,6 +1253,7 @@ mod tests {
             source_project: "src".into(),
             source_token: Vec::new(),
             source_dbs: Vec::new(),
+            dest_absent: false,
             pg_included: false,
             blobs_included: false,
             strict: false,
@@ -1319,6 +1339,7 @@ mod tests {
             source_project: "src".into(),
             source_token: Vec::new(),
             source_dbs: Vec::new(),
+            dest_absent: false,
             pg_included: false,
             blobs_included: false,
             strict: true, // <-- strict
@@ -1429,6 +1450,7 @@ mod tests {
             source_project: "A".into(),
             source_token: Vec::new(),
             source_dbs: Vec::new(),
+            dest_absent: false,
             pg_included: true,
             blobs_included: true,
             strict: false,

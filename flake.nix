@@ -439,6 +439,17 @@
             testName = "project_export_roundtrip";
           };
 
+          # v0.59.2 cross-node SOURCE-VERSION-INDEPENDENCE gate — the REAL boatramp-server
+          # clone/stream + project-import handlers on a SOURCE + TARGET node, proving a managed-DB
+          # `project sync` into an ABSENT dest lands cross-node against ANY source version. Shipped
+          # into the SAME `export-import-live` VM (same DBs + docker daemon).
+          projectSyncXnodeTestBin = mkWorkspaceTestBin {
+            pname = "boatramp-node-project-sync-xnode-test";
+            package = "boatramp-node";
+            features = "project-export";
+            testName = "project_sync_cross_node_source_independent_live";
+          };
+
           # The exact Docker-Hub images the live export/import round-trip drives — pulled
           # reproducibly from the nix store as fixed-output derivations (digest + output hash both pinned) so the
           # hermetic `export-import-live` VM can serve them from its own offline registry
@@ -1166,6 +1177,7 @@
                 virtualisation.diskSize = 12000;
                 environment.systemPackages = [
                   projectExportTestBin
+                  projectSyncXnodeTestBin
                   pkgs.skopeo
                 ];
                 # Seed the mirror from the nix-store image tarballs BEFORE the test runs. Each
@@ -1285,6 +1297,23 @@
                     "PROJECT EXPORT MYSQL VIEW-NAME INJECTION REFUSED OK",
                 ]:
                     assert marker in out, f"missing success marker: {marker}"
+
+                # v0.59.2 cross-node SOURCE-VERSION-INDEPENDENCE gate — the REAL clone/stream +
+                # project-import handlers on a SOURCE + TARGET node (self-skips → gate on markers).
+                xnode = machine.succeed(
+                    f"{env} project_sync_cross_node_source_independent_live "
+                    f"--nocapture --test-threads=1 2>&1",
+                    timeout=1200,
+                )
+                print(xnode)
+                assert re.search(r"test result: ok\. 2 passed", xnode), (
+                    "both cross-node source-independent tests must run (silent skip?)"
+                )
+                for marker in [
+                    "PROJECT SYNC CROSS-NODE PG SOURCE-INDEPENDENT OK",
+                    "PROJECT SYNC CROSS-NODE MYSQL SOURCE-INDEPENDENT OK",
+                ]:
+                    assert marker in xnode, f"missing success marker: {marker}"
 
                 machine.succeed("docker rm -f brexport-pg brexport-mysql || true")
               '';
