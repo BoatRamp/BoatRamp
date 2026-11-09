@@ -6,14 +6,13 @@ name: Cache
 # pull it in seconds instead of rebuilding from source. Additive — it does not
 # touch the existing CI/nightly/release workflows.
 #
-# Cross-platform coverage is data-driven: the `matrix.include` list below pairs
+# Cross-platform coverage is data-driven: the `matrix` the `setup` job emits pairs
 # each Nix `system` with the GitHub runner that can build it natively. We populate
 # the cache for x86_64-linux, **aarch64-linux** (so the multi-arch release's arm64
 # OCI image closure is warmed, not compiled on the critical path — see the container
 # build step), and Apple Silicon (macOS `aarch64-darwin`), so a fresh machine
 # substitutes the whole `.#default` closure — including the `boatramp-console-trunk`
-# wasm/Trunk bundle it depends on — instead of compiling. Add `x86_64-darwin` by
-# uncommenting its entry below (a native runner is the only requirement).
+# wasm/Trunk bundle it depends on — instead of compiling.
 #
 # Pushing needs the `CACHIX_AUTH_TOKEN` repo secret (the push token / signing key
 # for the `boatramp` cache) — the SAME secret every other workflow uses; there is
@@ -21,47 +20,129 @@ name: Cache
 # the build steps, pushes every store path realized during the job (the built
 # closure, not just the CLI leaf) using that token. Until the secret is set this
 # still runs green: cachix-action simply skips the push.
+#
+# ── macOS de-confliction (why the trigger is SPLIT by system) ─────────────────
+# A release cut pushes the release commit to `main` (this workflow) and then the
+# `vX.Y.Z` tag (release.yml). The aarch64-darwin cache leg and release.yml's two
+# `*-apple-darwin` build legs would then run CONCURRENTLY on the account's limited
+# macOS runner pool — the exact overlap seen on the v0.59.2 cut (the darwin cache
+# leg ran while release.yml's aarch64-apple-darwin leg was LOST-RUNNER cancelled
+# inside the same window). The account's macOS pool is the scarce resource, so the
+# fix is to never schedule the darwin cache leg while a release is building:
+#
+#   • Linux legs (x86_64-linux, aarch64-linux) stay on `push:[main]`. The
+#     aarch64-linux leg's arm64 OCI pre-warm MUST land on the release's main push,
+#     BEFORE release.yml's `container-build` arm64 leg substitutes it (that leg is
+#     gated behind the long preflight+build matrix, so the push-triggered pre-warm
+#     finishes first — unchanged behaviour). Ubuntu runners are plentiful; no macOS
+#     contention here.
+#
+#   • The aarch64-darwin leg — the SOLE builder of the released rev's aarch64-darwin
+#     `.#default` closure (release.yml builds macOS via cargo and pushes NOTHING to
+#     the nix cache) — moves OFF `push:[main]` and onto `workflow_run` AFTER the
+#     Release workflow COMPLETES. By then release.yml's own macOS legs have long
+#     finished, so the two never share the macOS pool. It warms the exact released
+#     commit (`workflow_run.head_sha`), which is what `nix build github:BoatRamp/...`
+#     consumers pin — consistent with the release-scoped warming policy that already
+#     dropped the nightly cron ("downstream consumers pin released revisions").
+#
+#   • `workflow_dispatch` keeps the full three-system warm (manual, operator-timed,
+#     so no release contention) as an on-demand escape hatch.
+#
+# Trade-off: the released rev's darwin closure is warmed shortly AFTER the release
+# finishes rather than during it, so a Mac consumer pulling in that brief window may
+# build from source once (a plain cache-miss: correct, just slower). Non-release
+# `main` commits no longer warm darwin — aligned with the per-release warming policy;
+# `workflow_dispatch` covers an ad-hoc need. The win: zero macOS-pool contention on
+# every release.
 on:
-  # Release-scoped: warm the cache on the main push that carries each release (plus
-  # on-demand dispatch). No nightly cron — downstream consumers pin released revisions,
-  # so per-release warming is enough and avoids a daily macOS-runner spend for `main`.
   push:
     branches: [main]
   workflow_dispatch:
+  # Warm the released rev's darwin closure once the release is fully built, off the
+  # macOS pool's critical path. Matched by workflow NAME; gated to a real tag-push
+  # release that SUCCEEDED in the `setup` job below (release dry-runs and failed
+  # releases warm nothing).
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 permissions:
   contents: read
 
 jobs:
+  # Per-event dispatcher: pick which systems to warm and which commit to build.
+  #   push / workflow_dispatch → run NOW on the triggering ref (empty `ref` = default
+  #     checkout). push warms the Linux legs (incl. the arm64 OCI pre-warm); dispatch
+  #     additionally warms darwin on demand.
+  #   workflow_run (Release completed, real tag push, success) → warm ONLY
+  #     aarch64-darwin, checking out the released commit, after the release's macOS
+  #     legs have finished.
+  setup:
+    name: select matrix
+    runs-on: ubuntu-latest
+    # push / workflow_dispatch always proceed. A workflow_run proceeds only for a
+    # real release (tag push ⇒ `workflow_run.event == 'push'`; release.yml's only push
+    # trigger is `tags: ["v*"]`) that concluded `success` — so a dispatch dry-run or a
+    # failed/cancelled release warms nothing. A skipped `setup` skips `push` (needs:).
+    if: >-
+      ${{ github.event_name != 'workflow_run'
+          || (github.event.workflow_run.event == 'push'
+              && github.event.workflow_run.conclusion == 'success') }}
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      ref: ${{ steps.pick.outputs.ref }}
+    steps:
+      - id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # Each matrix leg pairs a Nix `system` with the runner that builds it natively.
+          linux='{"system":"x86_64-linux","os":"ubuntu-latest"},{"system":"aarch64-linux","os":"ubuntu-24.04-arm"}'
+          darwin='{"system":"aarch64-darwin","os":"macos-15"}'  # GitHub's Apple-Silicon runner
+          case "$EVENT" in
+            workflow_run)
+              # Released rev's darwin closure, after the release finished building.
+              echo "matrix={\"include\":[${darwin}]}" >> "$GITHUB_OUTPUT"
+              echo "ref=${RELEASE_SHA}" >> "$GITHUB_OUTPUT"
+              ;;
+            workflow_dispatch)
+              # On-demand full warm (operator-timed; no release contention).
+              echo "matrix={\"include\":[${linux},${darwin}]}" >> "$GITHUB_OUTPUT"
+              echo "ref=" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # push to main: Linux legs (incl. the arm64 OCI pre-warm) on the pushed commit.
+              echo "matrix={\"include\":[${linux}]}" >> "$GITHUB_OUTPUT"
+              echo "ref=" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+          echo "selected matrix for event '${EVENT}':"
+          tail -n2 "$GITHUB_OUTPUT"
+
   push:
     name: build + cache (${{ matrix.system }})
-    runs-on: ${{ matrix.runs-on }}
-    # Keyed on the system too, so the Linux and macOS pushes for the same ref
-    # don't cancel each other (they run on different runners and populate
-    # different per-system store paths). `concurrency` lives on the job — the
-    # workflow-level block can't see the `matrix` context.
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    # Keyed on the system too, so the Linux and macOS pushes for the same ref don't
+    # cancel each other (different runners, different per-system store paths). For a
+    # workflow_run warm, `github.ref` is the default branch, so key on the released
+    # commit instead to keep each release's warm distinct.
     concurrency:
-      group: cache-${{ github.ref }}-${{ matrix.system }}
+      group: cache-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}-${{ matrix.system }}
       cancel-in-progress: true
     strategy:
       # A hiccup building one platform must not abort the others' cache push.
       fail-fast: false
-      matrix:
-        include:
-          - system: x86_64-linux
-            runs-on: ubuntu-latest
-          - system: aarch64-darwin
-            runs-on: macos-15 # GitHub's Apple-Silicon runner
-          # aarch64-linux is ENABLED so the release's arm64 OCI image closure is
-          # warmed here (see the container build step below) instead of compiled from
-          # source on the multi-arch release leg. x86_64-darwin stays off — toggle it
-          # on by uncommenting (a native runner is the only requirement):
-          - system: aarch64-linux
-            runs-on: ubuntu-24.04-arm # GitHub's Linux arm64 runner
-          # - system: x86_64-darwin
-          #   runs-on: macos-13 # Intel macOS runner
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
+      # Empty `ref` (push / dispatch) = checkout the triggering ref; for a workflow_run
+      # warm it is the released commit that `setup` resolved.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.setup.outputs.ref }}
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: cachix/cachix-action@v15
         with:
