@@ -87,18 +87,19 @@ use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
-use boatramp_core::sql::{DeclareError, RestartOutcome, SqlBackend, SqlError};
+use boatramp_core::sql::{DeclareError, RestartOutcome, SqlBackend, SqlError, SqlValue};
 use boatramp_storage::ExternalSqlKind;
 use boatramp_storage::sql_compute::{
     ComputeEndpointResolver, ComputeResolvedSqlBackend, SESSION_KEY_PROJECT, SESSION_KEY_SITE,
 };
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use boatramp_storage::tenant_provision::{
-    force_rls_event_trigger_ddl, grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl,
-    sanitize_ident, soft_deprovision_ddl, tenant_db_name, tenant_owner_role_name, tenant_role_name,
+    RLS_ENABLE_NOT_FORCE_COUNT_SQL, force_rls_event_trigger_ddl, force_rls_sweep_ddl,
+    grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl, sanitize_ident,
+    soft_deprovision_ddl, tenant_db_name, tenant_owner_role_name, tenant_role_name,
 };
 
-use crate::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+use crate::config::{ExternalDatabaseConfig, ServeAs, TenantIsolation, TenantScope};
 use crate::managed_sql::{DeployEndpointResolver, ManagedSqlCredentials};
 use crate::tenant_tombstone::{self, Tombstone};
 
@@ -598,7 +599,9 @@ pub async fn provision_tenant(
                 project,
                 &names,
                 &ident,
-                binding.rls_session,
+                // FORCE follows the `serve_as` posture: installed iff this binding serves
+                // `rls_session` AS the owner (the only posture `ENABLE` does not already bind).
+                install_force_rls(binding.rls_session, binding.serve_as, kind),
             )
             .await
         }
@@ -687,7 +690,7 @@ async fn provision_shared(
     project: &str,
     names: &TenantNames,
     tenant_ident: &str,
-    rls_session: bool,
+    install_force_rls: bool,
 ) -> Result<(), String> {
     // Superuser credential = the server's own managed credential, keyed under the
     // reserved default project + the bare workload (exactly as the server was
@@ -774,12 +777,15 @@ async fn provision_shared(
     // bypasses the CONNECT gate and can set default privileges on behalf of any role). Idempotent;
     // the migrate path re-runs it after each apply so newly-created tables are covered too.
     let mut tenant_db_ddl = grant_app_role_ddl(kind, &names.role, &names.owner_role);
-    // OPT-IN container RLS fencing (Postgres only): install the FORCE-on-ENABLE event trigger in
-    // the TENANT database (event triggers are per-database objects, so they belong here, not on
-    // the maintenance connection above). The `SECURITY DEFINER` function is owned by the per-tenant
-    // owner so it may FORCE RLS on the owner-owned tenant tables. Idempotent; a re-provision
-    // re-runs it harmlessly. Empty for MySQL (no row-level security).
-    if rls_session {
+    // `serve_as: owner` RLS fencing (Postgres only): install the FORCE-on-ENABLE event trigger in
+    // the TENANT database (event triggers are per-database objects, so they belong here, not on the
+    // maintenance connection above). FORCE is installed IFF the binding serves `rls_session` AS the
+    // owner (`install_force_rls` — computed by the caller from the posture) — the only posture whose
+    // serving role operates as the owner, which plain `ENABLE` does not bind. A `non-owner` binding
+    // serves a role `ENABLE` already binds, so no trigger is installed. The `SECURITY DEFINER`
+    // function is owned by the per-tenant owner so it may FORCE RLS on the owner-owned tenant tables.
+    // Idempotent; a re-provision re-runs it harmlessly. Empty for MySQL (no row-level security).
+    if install_force_rls {
         tenant_db_ddl.extend(force_rls_event_trigger_ddl(kind, &names.owner_role));
     }
     if !tenant_db_ddl.is_empty() {
@@ -803,6 +809,48 @@ async fn provision_shared(
                 .run_script(&stmt)
                 .await
                 .map_err(|e| format!("provision tenant-db DDL on {}: {e}", names.database))?;
+        }
+
+        // `serve_as: owner` FORCE-LIVE invariant (Security FINDING 1) — owner-posture ONLY
+        // (`install_force_rls` ⟺ `serve_as: owner`), so it NEVER touches the non-owner / REPLICATE
+        // path (construens's deliberate ENABLE-not-FORCE shape stays byte-identical). The event
+        // trigger installed above is SURGICAL / non-retroactive — it FORCEs only tables created or
+        // altered AFTER install. A posture flip onto a POPULATED database, or a cross-posture
+        // clone/sync (a non-owner source's ENABLE-only tables landing here), would otherwise leave
+        // PRE-EXISTING ENABLE-only tables un-FORCED while the owner-serving role serves them, and
+        // plain ENABLE does NOT bind the owner ⇒ within-app cross-tenant leak. So: (1) retroactively
+        // FORCE-sweep every existing ENABLE-not-FORCE table, then (2) hard-assert ZERO remain —
+        // REFUSE fail-closed if any slipped past the sweep. This makes owner-serving ⟺ FORCE
+        // ACTUALLY LIVE (not merely posture-declared); it runs here (a DB connection exists), never
+        // in `connection_parts` (which composes the DSN before the DB may be up).
+        if install_force_rls {
+            for stmt in force_rls_sweep_ddl(kind) {
+                tenant_admin
+                    .run_script(&stmt)
+                    .await
+                    .map_err(|e| format!("force-rls sweep on {}: {e}", names.database))?;
+            }
+            let rows = tenant_admin
+                .run_query(RLS_ENABLE_NOT_FORCE_COUNT_SQL)
+                .await
+                .map_err(|e| format!("force-rls assert query on {}: {e}", names.database))?;
+            let remaining = match rows.rows.into_iter().flatten().next() {
+                Some(SqlValue::Integer(n)) => n,
+                other => {
+                    return Err(format!(
+                        "force-rls assert on {}: unexpected count cell {other:?}",
+                        names.database
+                    ));
+                }
+            };
+            if remaining != 0 {
+                return Err(format!(
+                    "serve_as: owner FORCE-live invariant violated on {}: {remaining} RLS-enabled \
+                     table(s) remain ENABLE-but-NOT-FORCE after the FORCE-sweep — the owner-serving \
+                     role could bypass their row-level security; refusing to provision (fail-closed)",
+                    names.database
+                ));
+            }
         }
     }
     Ok(())
@@ -1478,6 +1526,10 @@ pub struct NodeTenantSqlResolver {
     isolation: TenantIsolation,
     scope: TenantScope,
     rls_session: bool,
+    // The declared serving posture (Shared + rls_session + Postgres only). Selects whether the
+    // serving identity is the non-owner runtime role (`NonOwner`, the default) or the owner role
+    // (`Owner`), and — via provisioning — whether the FORCE-on-ENABLE RLS trigger is installed.
+    serve_as: ServeAs,
     pool_max: Option<u32>,
     // Opt-in warm floor for the per-tenant storefront pool. Held PER TENANT (one pool per
     // resolved tenant), so a non-zero value keeps that many idle DB sessions per tenant —
@@ -1514,6 +1566,7 @@ impl NodeTenantSqlResolver {
             isolation: binding.tenant,
             scope: binding.tenant_scope,
             rls_session: binding.rls_session,
+            serve_as: binding.serve_as,
             pool_max: binding.pool_max,
             pool_min: binding.pool_min,
             read_only: binding.read_only,
@@ -1551,7 +1604,86 @@ impl PerTenantSqlResolver for NodeTenantSqlResolver {
     }
 }
 
+/// Whether to install the FORCE-on-ENABLE RLS event trigger for a managed binding — the
+/// provisioning half of the `serve_as` posture. `FORCE` is installed **iff** the binding serves
+/// `rls_session` AS the owner on the Shared-Postgres owner/runtime split: an owner-serving session
+/// operates as the table owner, which plain `ENABLE ROW LEVEL SECURITY` does NOT bind, so `FORCE` is
+/// required there. A `non-owner` posture (the default) serves a role `ENABLE` already binds, so no
+/// `FORCE` is installed (and none is needed). Postgres-only; MySQL has no row-level security.
+pub(crate) fn install_force_rls(
+    rls_session: bool,
+    serve_as: ServeAs,
+    kind: ExternalSqlKind,
+) -> bool {
+    rls_session && serve_as == ServeAs::Owner && kind == ExternalSqlKind::Postgres
+}
+
+/// The `rls_session` **owner-serving tenancy invariant**, as a pure predicate shared by BOTH guard
+/// sites ([`NodeTenantSqlResolver::build_backend`] and
+/// [`NodeTenantSqlResolver::connection_parts`]'s `Runtime` role) so the fail-closed decision is ONE
+/// place and is unit-testable with the owner-serving-without-FORCE mutation.
+///
+/// Returns `true` when serving MUST be refused: the resolved serving role is the tenant table
+/// **owner** on the Shared, non-default, Postgres `rls_session` cell, but the binding did **not**
+/// declare [`ServeAs::Owner`] — the posture that installs the FORCE-on-ENABLE trigger ([`install_force_rls`]).
+/// Without `FORCE`, plain `ENABLE` does not bind the owner, so an owner serving role would
+/// un-enforce the app's row-level security and leak cross-tenant (proven live in the
+/// `managed_rls_nonowner_runtime_sqlx_live` gate's owner arm). Under [`ServeAs::Owner`] the serving
+/// role is legitimately the owner AND `FORCE` is installed, so this returns `false` (permitted). The
+/// invariant it enforces: **owner-serving ⟺ `FORCE` present** — the serving role resolves to the
+/// owner ONLY under the owner posture, and the owner posture is the ONLY thing that installs `FORCE`,
+/// so any OTHER route to the owner identity on the serving path (a future refactor) is caught here.
+fn owner_serving_without_force(
+    rls_session: bool,
+    kind: ExternalSqlKind,
+    isolation: TenantIsolation,
+    is_default: bool,
+    serving_user: &str,
+    owner_role: &str,
+    serve_as: ServeAs,
+) -> bool {
+    rls_session
+        && kind == ExternalSqlKind::Postgres
+        && isolation == TenantIsolation::Shared
+        && !is_default
+        && serving_user == owner_role
+        && serve_as != ServeAs::Owner
+}
+
+/// The fail-closed error returned by both guard sites when [`owner_serving_without_force`] holds.
+fn owner_serving_without_force_error(user: &str) -> SqlError {
+    SqlError::other(format!(
+        "rls_session tenancy invariant: the resolved serving role ({user}) is the tenant table \
+         OWNER but this binding did not declare `serve_as: owner`, so boatramp did NOT install the \
+         FORCE-on-ENABLE RLS trigger — plain ENABLE RLS does not bind the owner, so serving here \
+         would un-enforce the app's row-level security; refusing (fail-closed). Invariant: \
+         owner-serving ⟺ FORCE present (declare `serve_as: owner` to install FORCE, or \
+         `serve_as: non-owner` to serve as the non-owner runtime role)."
+    ))
+}
+
 impl NodeTenantSqlResolver {
+    /// The Shared, non-default **serving identity** `(cred_workload, user)` for the declared posture:
+    /// [`ServeAs::Owner`] (Postgres only) → the per-tenant **owner** role + its sealed owner
+    /// credential (operate-as-owner, FORCE-bound); otherwise (the default `non-owner`, or any MySQL
+    /// binding — which has no owner/runtime split) → the per-tenant **non-owner** runtime role + its
+    /// credential. The SAME selection drives [`build_backend`](Self::build_backend) and
+    /// [`connection_parts`](Self::connection_parts)'s `Runtime` role, so a handler's `sql.open()` DSN
+    /// and a sibling container's `{{sql.dsn}}` serve as the IDENTICAL posture-selected role.
+    fn shared_serving_identity(&self, ident: &str, names: &TenantNames) -> (String, String) {
+        if self.serve_as == ServeAs::Owner && self.kind == ExternalSqlKind::Postgres {
+            (
+                owner_credential_workload_key(&self.compute, ident),
+                names.owner_role.clone(),
+            )
+        } else {
+            (
+                credential_workload_key(&self.compute, ident),
+                names.role.clone(),
+            )
+        }
+    }
+
     /// Build the per-tenant backend: resolve the endpoint, seal + fetch the
     /// per-tenant credential, and construct the connection. Split out from `resolve`
     /// so it can be unit-tested without a live server — `resolve` runs the
@@ -1583,12 +1715,11 @@ impl NodeTenantSqlResolver {
                         self.user.clone(),
                     )
                 } else {
+                    // The serving role follows the declared `serve_as` posture: the non-owner runtime
+                    // role (default) or — under `serve_as: owner` — the owner role (FORCE-bound).
                     let ident = sanitize_ident(&tenant_ident_raw);
-                    (
-                        project.to_string(),
-                        credential_workload_key(&self.compute, &ident),
-                        names.role.clone(),
-                    )
+                    let (cred_workload, user) = self.shared_serving_identity(&ident, &names);
+                    (project.to_string(), cred_workload, user)
                 }
             }
             // Single: connect as the plain configured user to the per-tenant server,
@@ -1603,29 +1734,26 @@ impl NodeTenantSqlResolver {
             ),
         };
 
-        // TENANCY INVARIANT (fail-closed) — the `rls_session` soundness contract. With
-        // `rls_session` on, the app's row-level security is enforced against THIS serving role, so
-        // the role MUST be a NON-OWNER of the tenant tables: PostgreSQL binds a plain `ENABLE ROW
-        // LEVEL SECURITY` table against a non-owner, so RLS holds WITHOUT relying on the owner-
-        // droppable `FORCE ROW LEVEL SECURITY` (an owner-posture role is NOT bound by `ENABLE` and
-        // would leak cross-tenant — proven in the `managed_rls_nonowner_runtime_sqlx_live` gate).
-        // The handler serving path connects as the per-tenant runtime `_role`, derived DISTINCT
-        // from the `_owner` role ([`tenant_role_name`] vs [`tenant_owner_role_name`]), so this holds
-        // structurally today; the assertion makes it a GUARD so a future refactor that resolved the
-        // owner identity onto the serving path fails CLOSED rather than silently un-enforcing the
-        // app's RLS. Scoped to the Shared non-default Postgres cell — the only one with a distinct
-        // owner role; everywhere else the runtime identity is already the sole/owning login.
-        if self.rls_session
-            && self.kind == ExternalSqlKind::Postgres
-            && self.isolation == TenantIsolation::Shared
-            && !is_default
-            && user == names.owner_role
-        {
-            return Err(SqlError::other(format!(
-                "rls_session tenancy invariant violated: the resolved serving role ({user}) is the \
-                 tenant table OWNER — plain ENABLE RLS does not bind the owner, so serving here \
-                 would un-enforce the app's row-level security; refusing (fail-closed)"
-            )));
+        // TENANCY INVARIANT (fail-closed) — the `rls_session` **owner-serving** contract. With
+        // `rls_session` on, the app's row-level security is enforced against THIS serving role. Under
+        // the `serve_as` posture (v0.59.4 "Option C") a Shared-Postgres binding serves either the
+        // NON-OWNER runtime role (default — bound by plain `ENABLE`, no `FORCE`) or — with
+        // `serve_as: owner` — the owner role, for which boatramp installs the FORCE-on-ENABLE trigger
+        // ([`install_force_rls`]) because `ENABLE` does NOT bind the owner. The GUARD permits the
+        // owner serving role ONLY under the `serve_as: owner` posture (⇒ FORCE present), and refuses
+        // the owner identity on the serving path by ANY OTHER route (a future refactor) — enforcing
+        // **owner-serving ⟺ FORCE present** fail-closed. Shared non-default Postgres only (the sole
+        // cell with a distinct owner role); everywhere else the runtime identity is the owning login.
+        if owner_serving_without_force(
+            self.rls_session,
+            self.kind,
+            self.isolation,
+            is_default,
+            &user,
+            &names.owner_role,
+            self.serve_as,
+        ) {
+            return Err(owner_serving_without_force_error(&user));
         }
 
         let password = ManagedSqlCredentials::new(self.kv.clone(), self.envelope.clone())
@@ -1794,12 +1922,16 @@ impl NodeTenantSqlResolver {
                 self.user.clone(),
             ),
             TenantIsolation::Shared => {
+                // The sibling-DSN RUNTIME identity follows the SAME `serve_as` posture selection as
+                // `build_backend`, so a container's `{{sql.dsn}}` serves as the identical role a
+                // handler's `sql.open()` would (non-owner by default; the owner role under
+                // `serve_as: owner`). When `serve_as: owner`, the Phase-2 operate-as-owner dynamic
+                // per-replica role (also gated on the owner posture in `dynamic_creds`) overrides
+                // this static owner identity in the DSN resolver — both are owner-posture, both
+                // FORCE-bound.
                 let ident = sanitize_ident(&tenant_ident_raw);
-                (
-                    project.to_string(),
-                    credential_workload_key(&self.compute, &ident),
-                    names.role.clone(),
-                )
+                let (cred_workload, user) = self.shared_serving_identity(&ident, &names);
+                (project.to_string(), cred_workload, user)
             }
             TenantIsolation::Single => (
                 single_credential_project(project, is_default),
@@ -1808,28 +1940,26 @@ impl NodeTenantSqlResolver {
             ),
         };
 
-        // TENANCY INVARIANT (fail-closed) — the SAME `rls_session` non-owner guard
-        // `build_backend` applies, mirrored onto the Phase-1 sibling-DSN serving identity (the
-        // `{{sql.*}}` / `url_env` RUNTIME parts a container composes). Scoped to `ConnRole::Runtime`
-        // only: the `ConnRole::Migration` identity is DELIBERATELY the owner and already returned
-        // above, and a Migration call that FELL THROUGH to here resolves the non-owner runtime (no
-        // sealed owner cred), which must not be refused. With `rls_session` on, a Shared non-default
-        // Postgres RUNTIME role that resolved to the table OWNER would serve under an identity plain
-        // ENABLE RLS does not bind — refuse (fail-closed) rather than un-enforce the app's RLS. The
-        // runtime role is derived DISTINCT from the owner, so this never trips today; it guards the
-        // invariant against a future refactor that resolved the owner onto this serving path.
+        // TENANCY INVARIANT (fail-closed) — the SAME owner-serving guard `build_backend` applies,
+        // mirrored onto the Phase-1 sibling-DSN serving identity (the `{{sql.*}}` / `url_env` RUNTIME
+        // parts a container composes). Scoped to `ConnRole::Runtime` only: the `ConnRole::Migration`
+        // identity is DELIBERATELY the owner and already returned above, and a Migration call that
+        // FELL THROUGH to here resolves the runtime identity (no sealed owner cred), which must not be
+        // refused. The shared [`owner_serving_without_force`] predicate enforces **owner-serving ⟺
+        // FORCE present**: an owner serving role is permitted only under `serve_as: owner` (which
+        // installs FORCE); any other route to it is refused fail-closed.
         if role == ConnRole::Runtime
-            && self.rls_session
-            && self.kind == ExternalSqlKind::Postgres
-            && self.isolation == TenantIsolation::Shared
-            && !is_default
-            && user == names.owner_role
+            && owner_serving_without_force(
+                self.rls_session,
+                self.kind,
+                self.isolation,
+                is_default,
+                &user,
+                &names.owner_role,
+                self.serve_as,
+            )
         {
-            return Err(SqlError::other(format!(
-                "rls_session tenancy invariant violated: the resolved serving role ({user}) is the \
-                 tenant table OWNER — plain ENABLE RLS does not bind the owner, so serving here \
-                 would un-enforce the app's row-level security; refusing (fail-closed)"
-            )));
+            return Err(owner_serving_without_force_error(&user));
         }
 
         let password = creds
@@ -2833,5 +2963,180 @@ mod tests {
         let ddl = recover_soft_deprovision_ddl("appdb__deleted_1", "appdb", "appdb_role");
         assert!(ddl[0].contains("RENAME TO \"appdb\""), "renames back");
         assert!(ddl[1].contains("LOGIN") && !ddl[1].contains("NOLOGIN"));
+    }
+
+    // ---- serve_as posture: serving-role selection + the owner-serving ⟺ FORCE guard --------
+
+    /// A Shared, project-scoped, `rls_session` Postgres binding with an explicit serving posture.
+    fn shared_rls_binding(serve_as: ServeAs) -> ExternalDatabaseConfig {
+        ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("appdb".into()),
+            user: Some("super".into()),
+            tenant: TenantIsolation::Shared,
+            tenant_scope: TenantScope::Project,
+            rls_session: true,
+            serve_as,
+            ..Default::default()
+        }
+    }
+
+    /// `install_force_rls` truth table: FORCE is installed IFF `rls_session` + owner posture +
+    /// Postgres. The default (non-owner) posture installs none (the runtime role `ENABLE` binds).
+    #[test]
+    fn install_force_rls_only_for_owner_posture_postgres() {
+        use ExternalSqlKind::{Mysql, Postgres};
+        assert!(install_force_rls(true, ServeAs::Owner, Postgres));
+        assert!(
+            !install_force_rls(true, ServeAs::NonOwner, Postgres),
+            "non-owner posture installs NO FORCE"
+        );
+        assert!(
+            !install_force_rls(false, ServeAs::Owner, Postgres),
+            "no rls_session ⇒ no FORCE"
+        );
+        assert!(
+            !install_force_rls(true, ServeAs::Owner, Mysql),
+            "MySQL has no row-level security / FORCE"
+        );
+    }
+
+    /// The shared owner-serving tenancy-invariant predicate — the GUARD both serving paths call.
+    /// THE MUTATION arm: an owner serving identity under a NON-owner posture (⇒ FORCE was NOT
+    /// installed) ⇒ REFUSE (fail-closed); under the owner posture (⇒ FORCE installed) ⇒ permitted;
+    /// the default non-owner runtime identity never trips it; every off-cell is out of scope.
+    #[test]
+    fn owner_serving_without_force_guard_decision() {
+        let k = ExternalSqlKind::Postgres;
+        let owner = "appdb_acme_owner";
+        let runtime = "appdb_acme_role";
+        // MUTATION — serving AS the owner while the binding is NON-owner posture ⇒ no FORCE ⇒ REFUSE.
+        assert!(
+            owner_serving_without_force(
+                true,
+                k,
+                TenantIsolation::Shared,
+                false,
+                owner,
+                owner,
+                ServeAs::NonOwner
+            ),
+            "owner-serving without the FORCE-installing posture must be refused (fail-closed)"
+        );
+        // Owner posture (⇒ FORCE installed at provision) ⇒ owner-serving is PERMITTED.
+        assert!(!owner_serving_without_force(
+            true,
+            k,
+            TenantIsolation::Shared,
+            false,
+            owner,
+            owner,
+            ServeAs::Owner
+        ));
+        // The default non-owner RUNTIME identity never trips the guard (any posture).
+        assert!(!owner_serving_without_force(
+            true,
+            k,
+            TenantIsolation::Shared,
+            false,
+            runtime,
+            owner,
+            ServeAs::NonOwner
+        ));
+        // Off-cell: no rls_session / the default tenant / Single / MySQL are all out of scope.
+        assert!(!owner_serving_without_force(
+            false,
+            k,
+            TenantIsolation::Shared,
+            false,
+            owner,
+            owner,
+            ServeAs::NonOwner
+        ));
+        assert!(!owner_serving_without_force(
+            true,
+            k,
+            TenantIsolation::Shared,
+            true,
+            owner,
+            owner,
+            ServeAs::NonOwner
+        ));
+        assert!(!owner_serving_without_force(
+            true,
+            k,
+            TenantIsolation::Single,
+            false,
+            owner,
+            owner,
+            ServeAs::NonOwner
+        ));
+        assert!(!owner_serving_without_force(
+            true,
+            ExternalSqlKind::Mysql,
+            TenantIsolation::Shared,
+            false,
+            owner,
+            owner,
+            ServeAs::NonOwner
+        ));
+    }
+
+    /// `serve_as: non-owner` (the default) — BOTH the sibling-DSN `Runtime` identity and the handler
+    /// path serve the per-tenant NON-OWNER runtime `_role` (ENABLE binds it; the guard never trips).
+    #[tokio::test]
+    async fn serve_as_non_owner_serves_the_runtime_role() {
+        let binding = shared_rls_binding(ServeAs::NonOwner);
+        let (_kv, resolver) = build_resolver(&binding);
+        let ident = sanitize_ident("acme");
+        let parts = resolver
+            .connection_parts("acme", "web", ConnRole::Runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            parts.user,
+            tenant_role_name("pg", &ident),
+            "non-owner posture serves the runtime _role"
+        );
+        assert_ne!(parts.user, tenant_owner_role_name("pg", &ident));
+        // The handler path agrees + is permitted (no guard trip under non-owner posture).
+        resolver
+            .build_backend("acme", "web")
+            .await
+            .expect("non-owner serving is permitted");
+    }
+
+    /// `serve_as: owner` — BOTH paths serve the per-tenant OWNER role, sealed under the OWNER
+    /// credential key, and the guard PERMITS it (owner posture ⇒ provision installs FORCE). This is
+    /// the end of the posture wiring: the same owner the Phase-2 operate-as-owner dynamic role acts as.
+    #[tokio::test]
+    async fn serve_as_owner_serves_the_owner_role_and_is_permitted() {
+        let binding = shared_rls_binding(ServeAs::Owner);
+        let (kv, resolver) = build_resolver(&binding);
+        let ident = sanitize_ident("acme");
+        let parts = resolver
+            .connection_parts("acme", "web", ConnRole::Runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            parts.user,
+            tenant_owner_role_name("pg", &ident),
+            "owner posture serves the _owner role"
+        );
+        // The serving credential is the sealed OWNER credential (`…/owner`), not the runtime-role key.
+        let owner_key = format!(
+            "managed-sql-cred/acme/{}",
+            owner_credential_workload_key("pg", &ident)
+        );
+        assert!(
+            kv.get(&owner_key).await.unwrap().is_some(),
+            "owner posture seals + serves the owner credential"
+        );
+        // The handler path serves the owner too and is PERMITTED (the guard allows under this posture).
+        resolver
+            .build_backend("acme", "web")
+            .await
+            .expect("owner serving is permitted under serve_as: owner");
     }
 }

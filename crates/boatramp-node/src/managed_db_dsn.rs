@@ -510,6 +510,8 @@ mod tests {
             user: Some("postgres".into()),
             tenant: crate::config::TenantIsolation::Shared,
             tenant_scope: crate::config::TenantScope::Project,
+            // Phase 2's operate-as-owner dynamic role applies only under the owner posture.
+            serve_as: crate::config::ServeAs::Owner,
             ..Default::default()
         }
     }

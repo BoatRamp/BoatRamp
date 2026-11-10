@@ -580,6 +580,55 @@ pub fn force_rls_event_trigger_ddl(kind: ExternalSqlKind, owner_role: &str) -> V
     }
 }
 
+/// The count query backing the **`serve_as: owner` FORCE-live invariant** (Security FINDING 1): the
+/// number of ordinary tables whose RLS is `ENABLE`-but-NOT-`FORCE`. **Zero** ⇒ every RLS table is
+/// `FORCE`-bound, so the owner identity the operate-as-owner serving role acts as cannot bypass any
+/// table's row-level security. **Non-zero** ⇒ an owner-served table whose RLS the owner can bypass —
+/// a within-app cross-tenant leak. Run on the TENANT database (per-tenant DB ⇒ every row is this
+/// tenant's). Postgres-only; MySQL has no row-level security.
+pub const RLS_ENABLE_NOT_FORCE_COUNT_SQL: &str = "SELECT count(*)::int FROM pg_catalog.pg_class \
+     WHERE relkind = 'r' AND relrowsecurity AND NOT relforcerowsecurity";
+
+/// A one-shot, **idempotent FORCE-sweep** (Postgres only): upgrade EVERY existing
+/// `ENABLE ROW LEVEL SECURITY`-but-NOT-`FORCE` table in the connected database to `FORCE ROW LEVEL
+/// SECURITY`. The retroactive companion to [`force_rls_event_trigger_ddl`].
+///
+/// # Why (Security FINDING 1)
+///
+/// The event trigger is **surgical / non-retroactive** — it upgrades only tables created/altered
+/// AFTER it is installed. So a **posture flip** (`non-owner` → `owner`) onto a POPULATED database,
+/// or a **cross-posture clone/sync** (a non-owner source's `ENABLE`-only tables landing in a
+/// `serve_as: owner` target), leaves PRE-EXISTING `ENABLE`-only tables un-`FORCE`d; the owner-serving
+/// role then serves them and plain `ENABLE` does NOT bind the owner ⇒ a within-app cross-tenant
+/// leak the posture guard alone would permit. This sweep closes that window RETROACTIVELY, so
+/// **owner-serving ⟺ `FORCE` actually live** (not merely posture-declared). The caller pairs it with
+/// a fail-closed assert ([`RLS_ENABLE_NOT_FORCE_COUNT_SQL`] must read zero) as the backstop.
+///
+/// # Owner-posture ONLY — the caller MUST gate this on `serve_as: owner` (`install_force_rls`)
+///
+/// It must **NEVER** run on the non-owner / REPLICATE path: a non-owner tenant (e.g. `construens`)
+/// deliberately runs `ENABLE`-not-`FORCE` tables seeded by an owner-authority migrator that `ENABLE`
+/// exempts, and v0.59's REPLICATE restore mode must stay byte-identical for non-owner. `FORCE`-ing
+/// those would break that model — so the sweep fires only under the owner posture.
+///
+/// Run as the superuser (or the table owner) on the **tenant** database. Idempotent: once every
+/// table is `FORCE`, the loop finds nothing. Everything is `pg_catalog`-qualified so a mutated
+/// `search_path` cannot redirect it. Empty for MySQL (no row-level security).
+pub fn force_rls_sweep_ddl(kind: ExternalSqlKind) -> Vec<String> {
+    match kind {
+        ExternalSqlKind::Postgres => vec![
+            "DO $$ DECLARE r record; BEGIN \
+             FOR r IN SELECT oid FROM pg_catalog.pg_class \
+             WHERE relkind = 'r' AND relrowsecurity AND NOT relforcerowsecurity LOOP \
+             EXECUTE pg_catalog.format('ALTER TABLE %s FORCE ROW LEVEL SECURITY', \
+             r.oid::pg_catalog.regclass); \
+             END LOOP; END $$;"
+                .to_string(),
+        ],
+        ExternalSqlKind::Mysql => Vec::new(),
+    }
+}
+
 /// Ordered, **idempotent** DDL to create a tenant's isolated database + login
 /// role. `db` and `role` are already-derived names (see [`tenant_db_name`] /
 /// [`tenant_role_name`]); `password` is the role's login password (hex in
@@ -2433,6 +2482,31 @@ mod tests {
         );
         assert_eq!(off, on, "RLS fencing must be a no-op on MySQL provision");
         assert!(force_rls_event_trigger_ddl(ExternalSqlKind::Mysql, "appdb_acme_owner").is_empty());
+    }
+
+    /// The retroactive FORCE-sweep (Security FINDING 1): Postgres emits a single idempotent DO block
+    /// that FORCEs every `ENABLE`-not-`FORCE` table (fully `pg_catalog`-qualified so a mutated
+    /// search_path can't redirect it); MySQL is a no-op. The count-query constant targets exactly
+    /// the `relrowsecurity AND NOT relforcerowsecurity` population the sweep clears.
+    #[test]
+    fn force_rls_sweep_is_postgres_only_and_pg_catalog_qualified() {
+        assert!(force_rls_sweep_ddl(ExternalSqlKind::Mysql).is_empty());
+        let pg = force_rls_sweep_ddl(ExternalSqlKind::Postgres);
+        assert_eq!(pg.len(), 1, "a single DO-block sweep statement");
+        let s = &pg[0];
+        assert!(s.contains("FORCE ROW LEVEL SECURITY"), "it FORCEs tables");
+        assert!(
+            s.contains("relrowsecurity AND NOT relforcerowsecurity"),
+            "it targets exactly the ENABLE-not-FORCE population"
+        );
+        assert!(
+            s.contains("pg_catalog.pg_class") && s.contains("pg_catalog.format"),
+            "fully pg_catalog-qualified against search_path redirection: {s}"
+        );
+        assert!(
+            RLS_ENABLE_NOT_FORCE_COUNT_SQL.contains("relrowsecurity AND NOT relforcerowsecurity"),
+            "the assert backstop counts the same ENABLE-not-FORCE population"
+        );
     }
 
     fn tenant_fencing() -> RlsFencing {

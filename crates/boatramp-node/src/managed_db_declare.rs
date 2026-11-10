@@ -135,6 +135,12 @@ pub fn lower(project: &str, db: &ApplyDatabase) -> ExternalDatabaseConfig {
         tenant_guc: db.tenant_guc.clone(),
         session_guc: db.session_guc.clone(),
         tenant_all_marker: db.tenant_all_marker.clone(),
+        // A declaratively-applied managed DB serves under the SAFE default posture (`non-owner`:
+        // the runtime role plain `ENABLE` binds, no FORCE). Like `pool_min`, the `owner` posture is
+        // not (yet) exposed on the declarative apply surface — it stays an explicit serving-config
+        // opt-in (`[…sql.databases.<name>] serve_as = "owner"`), so a self-migrating owner-serving
+        // app is a deliberate serving-config choice rather than a manifest default.
+        serve_as: crate::config::ServeAs::NonOwner,
         // Passes through unchanged (same shared type) — the manifest author sets the gate;
         // the serving config honors it.
         readiness_gate: db.readiness_gate,

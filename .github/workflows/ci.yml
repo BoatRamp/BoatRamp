@@ -2990,12 +2990,18 @@ jobs:
           # the OWNER posture sees BOTH rows under ENABLE-not-FORCE (why an owner-posture serving role
           # must NOT serve rls_session without FORCE); (3) FORCE closes the owner leak. A regression on
           # any arm (the invariant not holding, or the leak not exhibited) fails the assertion.
+          # The file now carries BOTH the non-owner invariant gate AND the serve_as serving-posture
+          # gate ("Option C"): posture drives FORCE install + the serving role, and owner-serving ⟺
+          # FORCE (the MUTATION arm exhibits the FORCE-absent owner leak the node guard refuses). Both
+          # must run (2 passed) and BOTH markers must appear, else a silent skip / failure fails CI.
           cargo test -p boatramp-storage --features sql-postgres \
             --test managed_rls_nonowner_runtime_sqlx_live -- --ignored --nocapture 2>&1 | tee rls-nonowner.log
-          grep -qE 'test result: ok\. 1 passed' rls-nonowner.log \
-            || { echo "::error::rls_session non-owner invariant gate did not run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 2 passed' rls-nonowner.log \
+            || { echo "::error::rls_session non-owner + serve_as posture gates did not both run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
           grep -q 'MANAGED RLS NON-OWNER RUNTIME OK \[postgres\]' rls-nonowner.log \
             || { echo "::error::rls_session non-owner invariant never reached its marker (the non-owner runtime leaked cross-tenant under ENABLE, the owner-posture leak was not exhibited, or FORCE did not bind the owner)" >&2; exit 1; }
+          grep -q 'MANAGED RLS SERVE-AS POSTURE OK \[postgres\]' rls-nonowner.log \
+            || { echo "::error::serve_as posture gate never reached its marker (posture did not drive FORCE install / serving role, or the FORCE-absent owner-serving mutation did not leak)" >&2; exit 1; }
       - name: Owner-gated schema-migration owner-role confinement on a real Postgres (v0.4.25)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp

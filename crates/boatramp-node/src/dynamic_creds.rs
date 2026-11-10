@@ -28,12 +28,16 @@
 //! # Scope (phase 2)
 //!
 //! Only a **Shared** (one server, per-tenant database + roles), **non-default**,
-//! compute-backed managed binding has the owner-role model this builds on, so phase 2
-//! applies there and [`mint_dynamic_role`] / [`revoke_dynamic_role`] return `None` (no-op)
-//! for every other cell — a bring-your-own `url_env` binding, the reserved `default` tenant
-//! (its plain configured user already owns its one ordinary database), and `Single`
-//! isolation (a dedicated per-tenant container; its own user is the owner). Phase 1 falls
-//! back to the static per-tenant credential there. The tenant is derived from the
+//! compute-backed managed binding that declares the **`serve_as: owner`** posture has the
+//! owner-role model this builds on, so phase 2 applies there and [`mint_dynamic_role`] /
+//! [`revoke_dynamic_role`] return `None` (no-op) for every other cell — a bring-your-own
+//! `url_env` binding, the reserved `default` tenant (its plain configured user already owns its
+//! one ordinary database), `Single` isolation (a dedicated per-tenant container; its own user is
+//! the owner), and — crucially — a **`serve_as: non-owner`** binding (the default): the dynamic
+//! role operates AS the owner, so it is sound only under the FORCE-installing owner posture;
+//! a non-owner binding must serve the static non-owner runtime role (phase 1) that plain `ENABLE`
+//! binds, never an operate-as-owner role without FORCE. Phase 1 falls back to the static
+//! per-tenant credential in every no-op cell. The tenant is derived from the
 //! **consumer's own project** (the replica's `(project, …)` identity — never a request
 //! field), so a replica can only ever mint a role on its own tenant's database.
 //!
@@ -62,7 +66,7 @@ use boatramp_storage::tenant_provision::{
     RlsFencing, drop_dynamic_role_ddl, dynamic_role_name, mint_dynamic_role_ddl, sanitize_ident,
 };
 
-use crate::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+use crate::config::{ExternalDatabaseConfig, ServeAs, TenantIsolation, TenantScope};
 use crate::managed_sql::{DeployEndpointResolver, ManagedSqlCredentials};
 use crate::tenant_sql::{maintenance_database, tenant_key, tenant_names};
 
@@ -190,6 +194,18 @@ fn resolve_target(
     }
     // A compute consumer's tenant is its own project; site-scoped bindings are out of scope.
     if binding.tenant_scope != TenantScope::Project {
+        return None;
+    }
+    // The per-replica dynamic role is minted to **operate AS the owner** (`SET role = <owner>`), so
+    // it is an OWNER-posture serving identity — sound only when FORCE binds the owner. Under the
+    // `serve_as` posture ("Option C"), that is EXACTLY `serve_as: owner`, which installs the
+    // FORCE-on-ENABLE trigger. A `non-owner` binding (the default) must NOT mint an operate-as-owner
+    // dynamic role — it would serve as the owner on the sibling DSN WITHOUT FORCE and leak
+    // cross-tenant. There, phase 2 is a no-op and the sibling DSN falls back to the static NON-OWNER
+    // runtime role (phase 1), which plain `ENABLE` binds. Keeps the invariant owner-serving ⟺ FORCE
+    // on the sibling-DSN path too. (Follow-up: a per-replica NON-owner dynamic role would restore
+    // revoke-on-stop rotation for the non-owner posture; out of scope here.)
+    if binding.serve_as != ServeAs::Owner {
         return None;
     }
     let database = binding.database.as_deref().unwrap_or_default();
@@ -457,6 +473,8 @@ mod tests {
             user: Some("postgres".to_string()),
             tenant: TenantIsolation::Shared,
             tenant_scope: TenantScope::Project,
+            // Phase 2's operate-as-owner dynamic role is the OWNER posture — gated on `serve_as: owner`.
+            serve_as: ServeAs::Owner,
             ..ExternalDatabaseConfig::default()
         }
     }
@@ -572,6 +590,12 @@ mod tests {
         let mut site = shared_pg_binding();
         site.tenant_scope = TenantScope::Site;
         assert!(resolve_target(&site, "acme", "acme-web-0").is_none());
+        // `serve_as: non-owner` (the DEFAULT posture): the operate-as-owner dynamic role must NOT be
+        // minted — it would serve as the owner on the sibling DSN without FORCE and leak. Phase 2 is
+        // a no-op; the sibling falls back to the static non-owner runtime role.
+        let mut non_owner = shared_pg_binding();
+        non_owner.serve_as = ServeAs::NonOwner;
+        assert!(resolve_target(&non_owner, "acme", "acme-web-0").is_none());
         // bring-your-own (no compute).
         let mut byo = shared_pg_binding();
         byo.compute = None;

@@ -188,6 +188,47 @@ Two requirements make this safe and durable:
   keep accepting the same credential. See
   [persistent volumes](./compute.md).
 
+### Serving posture — `serve_as` (shared + `rls_session` Postgres)
+
+For a **`tenant: shared`** managed-**Postgres** binding with **`rls_session`**, boatramp mints a
+per-tenant *owner* role (which owns the schema + runs migrations) distinct from the per-tenant
+*runtime* role a request is served by. The optional `serve_as` knob declares **which identity serves
+a request**, and — mechanically — whether boatramp installs the `FORCE ROW LEVEL SECURITY` trigger:
+
+```ron
+"app": (
+    kind: "postgres",
+    compute: "pg",
+    database: "app",
+    user: "postgres",            // the shared server's superuser (runs provisioning DDL)
+    tenant: "shared", tenant_scope: "project",
+    rls_session: true, tenant_guc: "app.tenant_id",
+    serve_as: "non-owner",       // the default — may be omitted
+),
+```
+
+- **`serve_as: "non-owner"` (the default, the safe posture)** — the serving DSN authenticates as the
+  per-tenant **non-owner** runtime role. PostgreSQL enforces a plain `ENABLE ROW LEVEL SECURITY`
+  table against a non-owner, so your RLS holds **with no `FORCE`**. No FORCE trigger is installed.
+  This is the right choice for an RLS-aware app — serving as your own table owner would silently
+  **bypass** your `ENABLE`-only policies.
+- **`serve_as: "owner"`** — the serving DSN authenticates **as the per-tenant owner role**
+  (operate-as-owner, so one DSN can auto-migrate its own schema). Because `ENABLE` does *not* bind a
+  table's owner, boatramp installs the **FORCE-on-ENABLE** event trigger for this binding, so RLS
+  binds the owner too. Choose it only for a self-migrating app that must own its schema on its
+  serving DSN.
+
+The invariant **owner-serving ⟺ `FORCE` present** is enforced **fail-closed** in two coupled places:
+the serving-path guard refuses an owner serving role unless this binding declared `serve_as: "owner"`
+(the posture that installs `FORCE`); and, because the FORCE-on-ENABLE trigger only upgrades tables
+created/altered *after* it is installed, the owner-posture **provision** additionally FORCE-sweeps
+every pre-existing `ENABLE`-only table and refuses if any table is still `ENABLE`-but-not-`FORCE` —
+so `FORCE` is actually live (not merely posture-declared) before the owner is ever served, even after
+a posture flip onto a populated database or a cross-posture clone. `serve_as` is **ignored** outside the shared + `rls_session` +
+Postgres cell (a `tenant: single`/dedicated app owns its whole database; the reserved `default`
+tenant serves as its plain user; MySQL has no owner/runtime split). The migration/DDL identity
+(`migration_url_env`, `{{sql.migration_dsn}}`) is always the owner role, regardless of `serve_as`.
+
 ## Typed queries with the `orm` builder
 
 The `orm` binding is a **typed, injection-safe, tenant-scoped query builder** over the
