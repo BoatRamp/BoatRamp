@@ -327,23 +327,41 @@ async fn nonowner_runtime_is_confined_by_plain_enable_while_the_owner_posture_le
 /// (the event trigger is a per-database object, so it MUST land there). This is byte-for-byte what
 /// `NodeTenantSqlResolver`'s provisioning does for the posture; the test then proves the serving
 /// confinement the posture produces.
+/// The per-posture provisioning inputs for [`provision_posture`], grouped into one struct so the
+/// helper stays within clippy's argument budget (the node resolves these from a single binding +
+/// posture; the test spells them out).
+struct PosturePlan<'a> {
+    db: &'a str,
+    role: &'a str,
+    role_pw: &'a str,
+    owner: &'a str,
+    owner_pw: &'a str,
+    /// Exactly `install_force_rls(rls_session, serve_as, kind)` in the node — `true` only for the
+    /// `serve_as: owner` posture (installs the FORCE-on-ENABLE event trigger); a `non-owner` posture
+    /// installs NOTHING.
+    install_force: bool,
+}
+
 async fn provision_posture(
     su: &std::sync::Arc<dyn SqlBackend>,
     su_tenant: &std::sync::Arc<dyn SqlBackend>,
-    db: &str,
-    role: &str,
-    role_pw: &str,
-    owner: &str,
-    owner_pw: &str,
-    install_force: bool,
+    plan: PosturePlan<'_>,
 ) {
     let k = ExternalSqlKind::Postgres;
-    for stmt in provision_ddl(k, db, role, role_pw, owner, owner_pw, false) {
+    for stmt in provision_ddl(
+        k,
+        plan.db,
+        plan.role,
+        plan.role_pw,
+        plan.owner,
+        plan.owner_pw,
+        false,
+    ) {
         su.run_script(&stmt)
             .await
             .unwrap_or_else(|e| panic!("provision `{stmt}`: {e}"));
     }
-    for stmt in grant_app_role_ddl(k, role, owner) {
+    for stmt in grant_app_role_ddl(k, plan.role, plan.owner) {
         su_tenant
             .run_script(&stmt)
             .await
@@ -351,8 +369,8 @@ async fn provision_posture(
     }
     // The posture's FORCE install — exactly `install_force_rls(rls_session, serve_as, kind)` in the
     // node (true only for `serve_as: owner`). A `non-owner` posture installs NOTHING here.
-    if install_force {
-        for stmt in force_rls_event_trigger_ddl(k, owner) {
+    if plan.install_force {
+        for stmt in force_rls_event_trigger_ddl(k, plan.owner) {
             su_tenant
                 .run_script(&stmt)
                 .await
@@ -429,7 +447,19 @@ async fn serve_as_posture_drives_force_install_and_confines_each_posture() {
     // ARM (a) — serve_as: non-owner (DEFAULT). install_force = false ⇒ NO trigger.
     // =====================================================================
     let su_no = connect(k, &ExternalSqlOptions::new(su_to_db(&su_url, NO_DB))).unwrap();
-    provision_posture(&su, &su_no, NO_DB, NO_ROLE, PW, NO_OWNER, PW, false).await;
+    provision_posture(
+        &su,
+        &su_no,
+        PosturePlan {
+            db: NO_DB,
+            role: NO_ROLE,
+            role_pw: PW,
+            owner: NO_OWNER,
+            owner_pw: PW,
+            install_force: false,
+        },
+    )
+    .await;
     // Pin BOTH identities to the SAME tenant via a role-default GUC (the leak, if any, is RLS
     // exemption — not a different GUC).
     for stmt in [
@@ -509,7 +539,19 @@ async fn serve_as_posture_drives_force_install_and_confines_each_posture() {
     // ARM (b) — serve_as: owner. install_force = true ⇒ trigger installed; owner serving FORCE-bound.
     // =====================================================================
     let su_ow = connect(k, &ExternalSqlOptions::new(su_to_db(&su_url, OW_DB))).unwrap();
-    provision_posture(&su, &su_ow, OW_DB, OW_ROLE, PW, OW_OWNER, PW, true).await;
+    provision_posture(
+        &su,
+        &su_ow,
+        PosturePlan {
+            db: OW_DB,
+            role: OW_ROLE,
+            role_pw: PW,
+            owner: OW_OWNER,
+            owner_pw: PW,
+            install_force: true,
+        },
+    )
+    .await;
     su.run_script(&format!(
         "ALTER ROLE \"{OW_OWNER}\" SET \"{TENANT_GUC}\" = '{TENANT}'"
     ))
