@@ -571,9 +571,15 @@ pub fn router_with_fast(
         // `/api/projects/{proj}/databases/…` form is served here via the `project_scope`
         // layer. The `PUT` body is a small typed record; the ambient body limit is fine.
         .route("/api/databases", get(list_databases))
+        // GET reads the declaration (`Project·Read`); PUT declares+provisions, DELETE HARD-DROPs the
+        // managed database (both `Project·Admin` — the `(&"databases", _)` family gate covers every
+        // method at this prefix). The DELETE (`boatramp db drop database`) is the IRREVERSIBLE
+        // orphan-recovery verb, additionally guarded by a typed `?confirm=<name>` inside the handler.
         .route(
             "/api/databases/{name}",
-            get(get_database).put(declare_database),
+            get(get_database)
+                .put(declare_database)
+                .delete(drop_database),
         )
         .route("/api/databases/{name}/status", get(database_status))
         .route("/api/databases/{name}/ensure", post(ensure_database))

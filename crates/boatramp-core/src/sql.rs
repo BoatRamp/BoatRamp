@@ -2267,6 +2267,38 @@ pub trait ManagedDbDeclare: Send + Sync {
     /// tenancy is out of scope for the restart primitive (see `restart`'s docs): there is
     /// nothing meaningful to report pending in those cases.
     async fn restart_pending(&self, project: &str, name: &str) -> Result<bool, DeclareError>;
+
+    /// Hard-DROP managed database `name` in `project` — the `DELETE /api/databases/{name}` verb /
+    /// `boatramp db drop database`. **IRREVERSIBLE and immediate** (no soft-delete grace window —
+    /// unlike a project/site delete, which rename-asides a Shared-Postgres tenant for recovery):
+    /// the operator's explicit, confirmed teardown of a managed database, and the ONLY CLI recovery
+    /// path for one ORPHANED by a failed `project sync` or a pre-fix `project rm` (`db` was
+    /// read/ensure only, `rm` missed it, `sql` needs a live project).
+    ///
+    /// Resolves the SAME derived tenant DB/role as provisioning (through the merge point, so a
+    /// node-static OR a project-declared binding both resolve), scoped to THIS project: the physical
+    /// names derive from `(project, binding)`, NEVER an operator-supplied raw name, so it can only
+    /// ever drop this project's OWN managed database. It then immediately drops the database + role +
+    /// sealed credential (Shared) or the dedicated workload + its credential (Single). Idempotent —
+    /// dropping an already-absent database is a clean no-op (`IF EXISTS`-guarded DDL). `NotDeclared`
+    /// if `name` is neither a node-static binding nor a project declaration (re-apply the manifest to
+    /// re-bind a fully-purged orphan, then drop). The reserved `default` project's database is the
+    /// single-tenant install and is NEVER dropped (refused) — the catastrophic-drop guard.
+    async fn drop_database(
+        &self,
+        project: &str,
+        name: &str,
+    ) -> Result<DropDatabaseOutcome, DeclareError>;
+}
+
+/// The outcome of [`ManagedDbDeclare::drop_database`]: the derived PHYSICAL database name that was
+/// targeted for the (idempotent, `IF EXISTS`) drop — surfaced so the operator sees exactly which
+/// cluster database the derived, project-scoped name resolved to.
+#[derive(Debug, Clone)]
+pub struct DropDatabaseOutcome {
+    /// The derived physical database name the drop targeted (e.g. `appdb_<tenant-digest>` on Shared,
+    /// or the plain configured name inside the dedicated server on Single).
+    pub database: String,
 }
 
 /// The outcome of [`ManagedDbDeclare::restart`]: which server workload was restarted,

@@ -405,17 +405,18 @@ jobs:
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
 
-          # HARD gate: the file's 23 live/always-on tests (incl. the v0.59.1 managed-pg
+          # HARD gate: the file's 24 live/always-on tests (incl. the v0.59.1 managed-pg
           # `project_sync_managed_pg_shadow_land_live` gate + the v0.59.2 Shared rls_session
-          # force-RLS REPLICATE gate) + the 2 pure-unit tests (URL-parser,
-          # WAL-render-inertness) = 25 must ALL actually run (both live DBs reachable, docker usable
+          # force-RLS REPLICATE gate + the idempotency/orphan-recovery gate) + the 2 pure-unit
+          # tests (URL-parser, WAL-render-inertness) = 26 must ALL actually run (both live DBs
+          # reachable, docker usable
           # for the ephemeral client containers) — a self-skip (unset env / unreachable docker) still
           # prints `test result: ok`, so require the exact passed-count AND every one of the file's
           # success markers below. (The libsql true-delta + its CHAIN gate are
           # `#[cfg(feature = "sql-delta-libsql")]`, NOT compiled in this `--features project-export`
           # build, so they are NOT in this count — they gate in capability.yml.)
-          grep -qE 'test result: ok\. 25 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 25 tests (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 26 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 26 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
@@ -458,6 +459,14 @@ jobs:
           # NON-OWNER runtime + a MUTATION (plain restore → the wall). Self-skip trap → gate on marker.
           grep -q 'PROJECT SYNC SHARED RLS FORCE REPLICATE OK' project-export-live.log \
             || { echo "::error::Shared rls_session force-RLS replicate gate never reached its marker (silent skip, the exclude regressed into the event-trigger wall, or force was wrongly imposed)" >&2; exit 1; }
+          # Idempotency + orphan-recovery (construens re-run shape): a RE-RUN of the restore into a
+          # same-named dest whose managed DB ALREADY EXISTS RECOVERS (idempotent replace); the
+          # soft-deprovision of a 63-byte-name tenant SUCCEEDS (bounded `__deleted_` aside never
+          # collapses to the live name → no `database … already exists`); `project rm`'s deprovisioner
+          # tears down a PROJECT-DECLARED db even with an empty node-static map; and `db drop database`
+          # clears an orphan — all with ≥2 tenants + zero foreign bytes. Self-skip trap → gate on marker.
+          grep -q 'PROJECT SYNC IDEMPOTENCY ORPHAN OK' project-export-live.log \
+            || { echo "::error::sync idempotency/orphan-recovery gate never reached its marker (silent skip, the aside overflow regressed into 'database already exists', a declared db was orphaned on rm, or the orphan-drop verb broke)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK' project-export-live.log \
             || { echo "::error::live mysql triggers/routines/events carry + DEFINER re-point gate never reached its marker (silent skip, or a carried object was not re-pointed to the tenant role)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT MYSQL VIEW-NAME INJECTION REFUSED OK' project-export-live.log \

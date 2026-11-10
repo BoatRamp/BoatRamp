@@ -1035,7 +1035,21 @@ fn plan_deprovision(
             // The aside name carries the delete timestamp, so it's unique per
             // soft-delete and never collides with a same-named re-create's fresh
             // database (the freed original name can't alias the renamed-aside data).
-            let renamed_db = format!("{}__deleted_{now}", names.database);
+            //
+            // BOUNDED to Postgres's 63-byte NAMEDATALEN (truncating the live-db PREFIX, never the
+            // `__deleted_<ts>` distinguisher): a per-tenant `names.database` is already capped AT
+            // 63 bytes, so the naive `format!("{db}__deleted_{now}")` overflows → Postgres
+            // truncates it back to its first 63 bytes → which, for a db already at the cap,
+            // COLLAPSES RIGHT BACK to `names.database` → `ALTER DATABASE <db> RENAME TO <db>`
+            // renames it to itself and fails `database "<db>" already exists`, orphaning the
+            // delete (the construens soft-deprovision failure). The bounded helper keeps the
+            // `__deleted_<ts>` tail intact so the aside name is always ≤ 63 bytes AND distinct
+            // from the live name — the SAME bounding the shadow-restore aside names use.
+            let renamed_db = boatramp_storage::tenant_provision::bounded_aside_db_name(
+                &names.database,
+                "__deleted_",
+                &now.to_string(),
+            );
             let ddl = soft_deprovision_ddl(&names.database, &renamed_db, &names.role);
             let tombstone = Tombstone {
                 version: 1,
@@ -1179,12 +1193,22 @@ impl NodeTenantDeprovisioner {
     /// Deprovision every compute-backed managed-credential binding whose
     /// `tenant_scope` matches `scope`, for the tenant `(project, site)`. Best-effort:
     /// log-and-continue on error, and never touch the reserved `default` project.
+    ///
+    /// TWO sources are walked (the ownership-accounting fix): the node operator's **static**
+    /// `[handlers].bindings.sql.databases` map AND the deleted project's **own declared** managed
+    /// databases (`project/<proj>/database/<name>`, the declarative front door `project sync` /
+    /// `db ensure` provision through). Before this the deprovisioner only walked the static map, so
+    /// a self-declared tenant database — the ONLY kind a cross-node `project sync` creates — was
+    /// invisible to the delete and left orphaned (the construens `project rm` "owns nothing" shape).
+    /// A declared name that ALSO appears in the static map is skipped here (the static walk owns it;
+    /// the daemon-wins invariant forbids the two from denoting different databases anyway).
     async fn deprovision_scope(&self, scope: TenantScope, project: &str, site: &str) {
         if project == DEFAULT_PROJECT {
             // The reserved default project is the single-tenant install; its managed
             // database IS the install. A stray delete must never drop it.
             return;
         }
+        // 1. Node-operator STATIC bindings (per-tenant templates applied to every project).
         for (name, _kind, binding) in managed_bindings(&self.databases) {
             // Only our managed-credential bindings on this delete's axis. A
             // bring-your-own binding is filtered out by `managed_bindings` already;
@@ -1192,41 +1216,90 @@ impl NodeTenantDeprovisioner {
             if !binding.is_managed_credential() || binding.tenant_scope != scope {
                 continue;
             }
-            match deprovision_tenant(
-                &self.deploy,
-                &self.kv,
-                &self.envelope,
-                binding,
+            self.deprovision_one(name, binding, scope, project, site)
+                .await;
+        }
+        // 2. The deleted project's OWN declared managed databases (the declarative front door). Each
+        //    is lowered to the SAME managed-credential `ExternalDatabaseConfig` it was provisioned
+        //    through (`managed_db_declare::lower`), so the derived tenant DB/role names match exactly
+        //    what provision created — scoped to THIS project (names derive from `(project, binding)`),
+        //    never another tenant. Read BEFORE the caller purges the project's KV (the force cascade
+        //    deprovisions, then purges), so the declarations are still present here.
+        match self
+            .deploy
+            .list_project_databases(ProjectRef::new(project))
+            .await
+        {
+            Ok(declared) => {
+                for db in declared {
+                    // Daemon-wins: a name present in the static map is the operator's binding,
+                    // already handled in step 1 — never shadow it with the project declaration.
+                    if self.databases.contains_key(&db.name) {
+                        continue;
+                    }
+                    let binding = crate::managed_db_declare::lower(project, &db);
+                    if !binding.is_managed_credential() || binding.tenant_scope != scope {
+                        continue;
+                    }
+                    self.deprovision_one(&db.name, &binding, scope, project, site)
+                        .await;
+                }
+            }
+            Err(e) => tracing::warn!(
+                project,
+                error = %e,
+                "could not enumerate the project's declared managed databases for deprovision \
+                 (best-effort; delete not blocked)"
+            ),
+        }
+    }
+
+    /// Deprovision ONE resolved managed-credential binding for `(project, site)`, best-effort:
+    /// log success at `info`, log-and-continue on error at `warn` (a stuck database never blocks the
+    /// delete — an orphaned DB is a lesser evil than a half-deleted project). Shared by the
+    /// node-static and project-declared walks so both sources tear down identically.
+    async fn deprovision_one(
+        &self,
+        name: &str,
+        binding: &ExternalDatabaseConfig,
+        scope: TenantScope,
+        project: &str,
+        site: &str,
+    ) {
+        match deprovision_tenant(
+            &self.deploy,
+            &self.kv,
+            &self.envelope,
+            binding,
+            project,
+            site,
+            self.grace_secs,
+        )
+        .await
+        {
+            Ok(()) => {
+                if matches!(scope, TenantScope::Site) {
+                    tracing::info!(
+                        binding = name,
+                        project,
+                        site,
+                        "deprovisioned managed database for deleted site tenant"
+                    );
+                } else {
+                    tracing::info!(
+                        binding = name,
+                        project,
+                        "deprovisioned managed database for deleted project tenant"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                binding = name,
                 project,
                 site,
-                self.grace_secs,
-            )
-            .await
-            {
-                Ok(()) => {
-                    if matches!(scope, TenantScope::Site) {
-                        tracing::info!(
-                            binding = name,
-                            project,
-                            site,
-                            "deprovisioned managed database for deleted site tenant"
-                        );
-                    } else {
-                        tracing::info!(
-                            binding = name,
-                            project,
-                            "deprovisioned managed database for deleted project tenant"
-                        );
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    binding = name,
-                    project,
-                    site,
-                    error = %e,
-                    "managed-database deprovision failed (best-effort; delete not blocked)"
-                ),
-            }
+                error = %e,
+                "managed-database deprovision failed (best-effort; delete not blocked)"
+            ),
         }
     }
 }
@@ -2343,6 +2416,79 @@ mod tests {
         );
     }
 
+    /// THE OWNERSHIP-ACCOUNTING FIX (gap 1): the deprovisioner tears down a project's OWN DECLARED
+    /// managed database (the declarative front door / `project sync` path, stored under
+    /// `project/<proj>/database/<name>`) even when the NODE-STATIC map is EMPTY. A `Single`
+    /// declaration makes the teardown observable without a live database (a workload + sealed
+    /// credential). MUTATION: before the fix, `deprovision_scope` walked ONLY `self.databases`, so an
+    /// empty static map enumerated nothing and the declared tenant's workload + credential were
+    /// orphaned on `project rm` (the construens "owns nothing" shape).
+    #[tokio::test]
+    async fn deprovision_enumerates_project_declared_databases() {
+        use boatramp_core::sql::TenantDeprovisioner as _;
+
+        // A project-DECLARED Single managed DB — NOT in the node-static map.
+        let db: boatramp_core::compute::ApplyDatabase = serde_json::from_value(serde_json::json!({
+            "name": "orphanapp",
+            "kind": "postgres",
+            "tenant": "single",
+            "tenant_scope": "project",
+        }))
+        .expect("minimal ApplyDatabase");
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let envelope: Arc<dyn KeyEnvelope> = Arc::new(RevEnvelope);
+
+        // Persist the declaration + provision via the SAME lowered binding the declare/sync path uses.
+        deploy
+            .set_project_database(ProjectRef::new("acme"), &db)
+            .await
+            .unwrap();
+        let binding = crate::managed_db_declare::lower("acme", &db);
+        provision_tenant(&deploy, &kv, &envelope, &binding, "acme", "")
+            .await
+            .unwrap();
+
+        // The derived Single workload + its sealed credential now exist.
+        let ident = sanitize_ident("acme");
+        let compute = crate::managed_db_declare::derived_workload("acme", "orphanapp");
+        let wl = format!("{compute}-{ident}");
+        let cred = format!("managed-sql-cred/acme/{compute}-{ident}");
+        assert!(
+            deploy
+                .get_compute_workload(ProjectRef::new("acme"), &wl)
+                .await
+                .unwrap()
+                .is_some(),
+            "precondition: the declared Single workload is registered"
+        );
+        assert!(kv.get(&cred).await.unwrap().is_some());
+
+        // The deprovisioner has an EMPTY node-static map — it must STILL find + tear down the
+        // project-declared database by enumerating the project's own declarations.
+        let deprovisioner = NodeTenantDeprovisioner::new(
+            deploy.clone(),
+            kv.clone(),
+            envelope.clone(),
+            std::collections::BTreeMap::new(), // EMPTY node-static map
+            DEFAULT_DEPROVISION_GRACE_SECS,
+        );
+        deprovisioner.deprovision_project("acme").await;
+
+        assert!(
+            deploy
+                .get_compute_workload(ProjectRef::new("acme"), &wl)
+                .await
+                .unwrap()
+                .is_none(),
+            "the project-declared Single workload must be torn down even with an EMPTY static map"
+        );
+        assert!(
+            kv.get(&cred).await.unwrap().is_none(),
+            "the project-declared tenant's sealed credential must be gone"
+        );
+    }
+
     /// An operator-set per-binding `startup_grace_secs` flows into the spec
     /// `provision_single` stores (overriding the engine default), and it matches the
     /// same override the shared `auto_register` path applies — the two managed
@@ -2475,9 +2621,21 @@ mod tests {
         assert_eq!(tombstone.engine, "postgres");
         assert_eq!(tombstone.compute, "pg");
         assert_eq!(tombstone.superuser, "super");
-        // The renamed name carries the timestamp; the original is recorded for recovery.
+        // The renamed name carries the timestamp distinguisher, is BOUNDED to Postgres's 63-byte
+        // identifier limit (a long tenant db has its PREFIX truncated, never the `__deleted_<ts>`
+        // tail — the fix for the overflow→truncate→collapse-to-live bug), and is DISTINCT from the
+        // original (it never collapses back to it, so the RENAME can't rename the db to itself).
         assert!(tombstone.renamed_db.ends_with(&format!("__deleted_{now}")));
-        assert!(tombstone.renamed_db.starts_with(&tombstone.original_db));
+        assert!(
+            tombstone.renamed_db.len() <= 63,
+            "aside name must fit NAMEDATALEN (≤63 bytes), got {} bytes: {}",
+            tombstone.renamed_db.len(),
+            tombstone.renamed_db
+        );
+        assert_ne!(
+            tombstone.renamed_db, tombstone.original_db,
+            "the aside name must never collapse back to the live name"
+        );
         // The RENAME target in the DDL is exactly the tombstone's renamed name.
         assert!(joined.contains(&tombstone.renamed_db));
     }
