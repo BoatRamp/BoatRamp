@@ -2205,6 +2205,33 @@ pub struct ExternalDatabaseConfig {
     /// can never set it — the `tenant_guc` namespace is already reserved against guest writes.
     #[serde(default)]
     pub tenant_all_marker: Option<String>,
+    /// **Serving posture** (default `non-owner`) for a `Shared` + `rls_session` managed-**Postgres**
+    /// binding — the ONE cell with a per-tenant owner/runtime role split. It declares the role a
+    /// request (handler `sql.open` DSN and the sibling-container `{{sql.dsn}}`) is served AS, and —
+    /// mechanically — whether boatramp installs the `FORCE ROW LEVEL SECURITY` event trigger:
+    ///
+    /// * [`non-owner`](ServeAs::NonOwner) (**the default, the safe posture**) — the serving DSN
+    ///   authenticates as the per-tenant **non-owner** runtime role ([`tenant_role_name`]). PostgreSQL
+    ///   binds a plain `ENABLE ROW LEVEL SECURITY` table against a non-owner, so the app's RLS holds
+    ///   with **no `FORCE`** (the primary guarantee). An RLS-aware app serving as its table owner would
+    ///   silently bypass its own `ENABLE`-only RLS, so `non-owner` is the natural default; and the
+    ///   default must be fail-safe because owner-serving is sound *only* via `FORCE`.
+    /// * [`owner`](ServeAs::Owner) — the serving DSN authenticates **as the per-tenant owner role**
+    ///   (operate-as-owner, so one DSN can auto-migrate its own schema). Because `ENABLE` does **not**
+    ///   bind a table's owner, boatramp installs the **FORCE-on-ENABLE** event trigger for this binding
+    ///   (`force_rls_event_trigger_ddl`) so RLS binds the owner. Choose it only for a self-migrating app
+    ///   that must own its schema on its serving DSN.
+    ///
+    /// The serving path enforces the coupling fail-closed: an owner serving role is refused unless this
+    /// posture (which installs `FORCE`) is declared — the invariant **owner-serving ⟺ `FORCE` present**
+    /// (see [`NodeTenantSqlResolver::build_backend`](crate::tenant_sql)). **Ignored** outside the
+    /// `Shared` + `rls_session` + Postgres cell: a `Single`/dedicated app owns its whole database and
+    /// serves as that owner with no RLS; the reserved `default` tenant serves as its plain configured
+    /// user; MySQL has no owner/runtime RLS split.
+    ///
+    /// [`tenant_role_name`]: boatramp_storage::tenant_provision::tenant_role_name
+    #[serde(default)]
+    pub serve_as: ServeAs,
     /// The on-disk file path for a single-node **`libsql`** database (`kind: "libsql"`), e.g.
     /// `/data/app.db`. The parent directory is created if absent. Used only by the embedded engine;
     /// ignored for `postgres`/`mysql` and for a remote-sqld `libsql` binding (which uses `url_env`).
@@ -2241,6 +2268,25 @@ pub enum TenantScope {
     Project,
     /// A tenant is a **site** (finer than project).
     Site,
+}
+
+/// The **serving posture** of a `Shared` + `rls_session` managed-**Postgres** binding — the identity a
+/// request is served AS, and (mechanically) whether boatramp installs the `FORCE ROW LEVEL SECURITY`
+/// event trigger. See [`ExternalDatabaseConfig::serve_as`] for the full contract. Only meaningful on
+/// the `Shared` + `rls_session` + Postgres cell (the one with a per-tenant owner/runtime role split);
+/// ignored everywhere else.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServeAs {
+    /// Serve as the per-tenant **non-owner** runtime role (the default). Plain `ENABLE ROW LEVEL
+    /// SECURITY` binds a non-owner, so the app's RLS holds with no `FORCE`, and no FORCE trigger is
+    /// installed. The safe, fail-closed default.
+    #[default]
+    NonOwner,
+    /// Serve as the per-tenant **owner** role (operate-as-owner). `ENABLE` does not bind the owner, so
+    /// boatramp installs the FORCE-on-ENABLE event trigger for this binding — RLS then binds the owner.
+    Owner,
 }
 
 /// Re-export: the readiness-gate value types live in `boatramp-types` (shared between the
@@ -4307,6 +4353,40 @@ mod tests {
         assert_eq!(db.tenant_guc.as_deref(), Some("app.tenant_id"));
         assert_eq!(db.session_guc.as_deref(), Some("app.session_id"));
         assert_eq!(db.tenant_all_marker.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn serve_as_posture_defaults_to_non_owner_and_parses_from_env() {
+        // Default: a binding that never sets `serve_as` is the SAFE `non-owner` posture.
+        assert_eq!(
+            ExternalDatabaseConfig::default().serve_as,
+            crate::config::ServeAs::NonOwner
+        );
+
+        // `SERVE_AS=owner` parses to the owner posture (kebab-cased enum token, lowercased by the
+        // env overlay like `tenant` / `tenant_scope`).
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND", "postgres"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_DATABASE", "appdb"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_SERVE_AS", "owner"),
+        ]))
+        .expect("valid env overrides apply");
+        let db = &cfg.handlers.unwrap().bindings.sql.unwrap().databases
+            [boatramp_core::project::DEFAULT_DB_NAME];
+        assert_eq!(db.serve_as, crate::config::ServeAs::Owner);
+
+        // `non-owner` round-trips too (the explicit default).
+        let mut cfg2 = ServerConfig::default();
+        cfg2.apply_env_overrides(&env(&[
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND", "postgres"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_DATABASE", "appdb"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_SERVE_AS", "non-owner"),
+        ]))
+        .expect("valid env overrides apply");
+        let db2 = &cfg2.handlers.unwrap().bindings.sql.unwrap().databases
+            [boatramp_core::project::DEFAULT_DB_NAME];
+        assert_eq!(db2.serve_as, crate::config::ServeAs::NonOwner);
     }
 
     #[test]
@@ -6848,7 +6928,11 @@ pub(crate) mod figment_resolve {
                 }
             }
             // enum fields (lowercased token)
-            for (suffix, field) in [("TENANT", "tenant"), ("TENANT_SCOPE", "tenant_scope")] {
+            for (suffix, field) in [
+                ("TENANT", "tenant"),
+                ("TENANT_SCOPE", "tenant_scope"),
+                ("SERVE_AS", "serve_as"),
+            ] {
                 if let Some(v) = source.get(&format!("{prefix}{suffix}")) {
                     put(
                         d,

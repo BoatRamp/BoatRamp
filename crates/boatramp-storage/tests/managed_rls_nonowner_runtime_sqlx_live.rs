@@ -33,6 +33,14 @@
 //!      owner-role `SELECT` returns ONLY its tenant's row — matching the fencing gate, and proving
 //!      the failure in (2) is precisely the owner/`FORCE` semantics, not a seeding/visibility bug.
 //!
+//! This file ALSO carries the **`serve_as` serving-posture gate** ("Option C", v0.59.4):
+//! [`serve_as_posture_drives_force_install_and_confines_each_posture`] proves the declared posture
+//! drives the FORCE install and the serving role — `non-owner` (default) serves the non-owner role
+//! confined by `ENABLE` with NO trigger; `owner` installs the FORCE trigger and serves the owner
+//! role confined by `FORCE`; and the MUTATION arm exhibits the cross-tenant leak (owner-serving with
+//! FORCE absent) that the node guard refuses fail-closed. It prints `MANAGED RLS SERVE-AS POSTURE OK
+//! [postgres]`.
+//!
 //! Requires `BOATRAMP_TEST_PG_URL` = a **superuser** Postgres URL (skips cleanly when unset).
 //! Marked `#[ignore]` (run it explicitly — e.g. on lighthouse — or via the live-pg CI lane, which
 //! greps the marker). Prints `MANAGED RLS NON-OWNER RUNTIME OK [postgres]` on success.
@@ -44,7 +52,8 @@ use std::sync::Arc;
 use boatramp_core::sql::{SqlBackend, SqlValue};
 use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 use boatramp_storage::tenant_provision::{
-    grant_app_role_ddl, provision_ddl, tenant_owner_role_name, tenant_role_name,
+    force_rls_event_trigger_ddl, grant_app_role_ddl, provision_ddl, tenant_owner_role_name,
+    tenant_role_name,
 };
 
 const DB: &str = "rlsnonowner_appdb";
@@ -304,4 +313,307 @@ async fn nonowner_runtime_is_confined_by_plain_enable_while_the_owner_posture_le
     }
 
     println!("MANAGED RLS NON-OWNER RUNTIME OK [postgres]");
+}
+
+// ===========================================================================
+// serve_as POSTURE gate ("Option C", v0.59.4) — the posture DRIVES the FORCE install + the
+// serving role, and the owner-serving ⟺ FORCE invariant holds on a real Postgres.
+// ===========================================================================
+
+/// Reproduce the node's `provision_shared` for ONE posture, faithfully: the real three-identity
+/// `provision_ddl` (NO force-append — the node passes `false` to it) on the maintenance connection,
+/// `grant_app_role_ddl` on the tenant DB, and — IFF the posture installs FORCE (`serve_as: owner`,
+/// i.e. `install_force = rls_session && owner`) — `force_rls_event_trigger_ddl` on the tenant DB
+/// (the event trigger is a per-database object, so it MUST land there). This is byte-for-byte what
+/// `NodeTenantSqlResolver`'s provisioning does for the posture; the test then proves the serving
+/// confinement the posture produces.
+async fn provision_posture(
+    su: &std::sync::Arc<dyn SqlBackend>,
+    su_tenant: &std::sync::Arc<dyn SqlBackend>,
+    db: &str,
+    role: &str,
+    role_pw: &str,
+    owner: &str,
+    owner_pw: &str,
+    install_force: bool,
+) {
+    let k = ExternalSqlKind::Postgres;
+    for stmt in provision_ddl(k, db, role, role_pw, owner, owner_pw, false) {
+        su.run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("provision `{stmt}`: {e}"));
+    }
+    for stmt in grant_app_role_ddl(k, role, owner) {
+        su_tenant
+            .run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("grant app role `{stmt}`: {e}"));
+    }
+    // The posture's FORCE install — exactly `install_force_rls(rls_session, serve_as, kind)` in the
+    // node (true only for `serve_as: owner`). A `non-owner` posture installs NOTHING here.
+    if install_force {
+        for stmt in force_rls_event_trigger_ddl(k, owner) {
+            su_tenant
+                .run_script(&stmt)
+                .await
+                .unwrap_or_else(|e| panic!("force trigger `{stmt}`: {e}"));
+        }
+    }
+}
+
+const NO_DB: &str = "rlsserveas_nonowner_db";
+const NO_ROLE: &str = "rlsserveas_nonowner_role";
+const NO_OWNER: &str = "rlsserveas_nonowner_owner";
+const OW_DB: &str = "rlsserveas_owner_db";
+const OW_ROLE: &str = "rlsserveas_owner_role";
+const OW_OWNER: &str = "rlsserveas_owner_owner";
+const PW: &str = "p0sturepw";
+
+/// Rewrite a superuser URL to connect to database `db` as the SUPERUSER (keeps the su creds).
+fn su_to_db(su_url: &str, db: &str) -> String {
+    let (scheme, rest) = su_url.split_once("://").unwrap();
+    let (creds, after) = rest.split_once('@').unwrap();
+    let (hostport, _) = after.split_once('/').unwrap_or((after, ""));
+    format!("{scheme}://{creds}@{hostport}/{db}")
+}
+
+/// **Live gate: the `serve_as` serving posture ("Option C").** Proves on a real Postgres, with TWO
+/// tenants' rows in ONE shared table (the `rls_session` keyspace), that the DECLARED posture drives
+/// the FORCE install and the serving role, and that the owner-serving ⟺ FORCE invariant holds:
+///
+///   * **(a) `serve_as: non-owner`** (the default) — provisioning installs NO force trigger; serving
+///     AS the per-tenant NON-OWNER runtime role is confined by plain `ENABLE` (sees ONLY its own
+///     tenant's row — ZERO foreign bytes). The table is `ENABLE`-but-NOT-`FORCE`.
+///   * **(b) `serve_as: owner`** — provisioning installs the FORCE-on-ENABLE trigger, which upgrades
+///     the owner's `ENABLE` table to `FORCE` on `ALTER TABLE … ENABLE`; serving AS the OWNER role is
+///     then confined by `FORCE` (ZERO foreign bytes). This is the owner the Phase-2 operate-as-owner
+///     dynamic role also acts as.
+///   * **(c) MUTATION (owner-serving with FORCE absent)** — drop the trigger + `ALTER TABLE … NO
+///     FORCE` on the owner-posture DB, and the OWNER serving role LEAKS BOTH tenants' rows. This is
+///     precisely the state the node guard (`owner_serving_without_force`, enforced in both
+///     `build_backend` and `connection_parts`) REFUSES fail-closed — proving FORCE is load-bearing
+///     for the owner posture and the invariant is not vacuous.
+///
+/// Requires `BOATRAMP_TEST_PG_URL` = a superuser Postgres URL (skips cleanly when unset). Prints
+/// `MANAGED RLS SERVE-AS POSTURE OK [postgres]` on success.
+#[tokio::test]
+#[ignore = "needs a live superuser Postgres via BOATRAMP_TEST_PG_URL (run on lighthouse / the live-pg CI lane)"]
+async fn serve_as_posture_drives_force_install_and_confines_each_posture() {
+    let Ok(su_url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("skip serve_as_posture: BOATRAMP_TEST_PG_URL unset");
+        return;
+    };
+    let k = ExternalSqlKind::Postgres;
+    let su = connect(k, &ExternalSqlOptions::new(su_url.clone())).unwrap();
+
+    // --- teardown any prior run (re-runnable) ---
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS \"{NO_DB}\" WITH (FORCE)"),
+        format!("DROP DATABASE IF EXISTS \"{OW_DB}\" WITH (FORCE)"),
+        format!("DROP ROLE IF EXISTS \"{NO_ROLE}\""),
+        format!("DROP ROLE IF EXISTS \"{NO_OWNER}\""),
+        format!("DROP ROLE IF EXISTS \"{OW_ROLE}\""),
+        format!("DROP ROLE IF EXISTS \"{OW_OWNER}\""),
+    ] {
+        let _ = su.run_script(&stmt).await;
+    }
+
+    // =====================================================================
+    // ARM (a) — serve_as: non-owner (DEFAULT). install_force = false ⇒ NO trigger.
+    // =====================================================================
+    let su_no = connect(k, &ExternalSqlOptions::new(su_to_db(&su_url, NO_DB))).unwrap();
+    provision_posture(&su, &su_no, NO_DB, NO_ROLE, PW, NO_OWNER, PW, false).await;
+    // Pin BOTH identities to the SAME tenant via a role-default GUC (the leak, if any, is RLS
+    // exemption — not a different GUC).
+    for stmt in [
+        format!("ALTER ROLE \"{NO_ROLE}\" SET \"{TENANT_GUC}\" = '{TENANT}'"),
+        format!("ALTER ROLE \"{NO_OWNER}\" SET \"{TENANT_GUC}\" = '{TENANT}'"),
+    ] {
+        su.run_script(&stmt).await.unwrap();
+    }
+    // The owner (migrator) creates a plain ENABLE table + seeds its own tenant's row.
+    let no_owner_conn = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, NO_OWNER, PW, NO_DB)),
+    )
+    .unwrap();
+    for stmt in [
+        "CREATE TABLE t (tenant text, v int)",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        &format!("CREATE POLICY p ON t USING (tenant = current_setting('{TENANT_GUC}', true))"),
+        &format!("INSERT INTO t (tenant, v) VALUES ('{TENANT}', 1)"),
+    ] {
+        no_owner_conn
+            .run_script(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("non-owner arm owner DDL/seed `{stmt}`: {e}"));
+    }
+    su_no
+        .run_script(&format!(
+            "INSERT INTO t (tenant, v) VALUES ('{OTHER_TENANT}', 2)"
+        ))
+        .await
+        .expect("superuser seeds the other-tenant row");
+    // The posture installed NO force trigger, and the table is ENABLE-but-NOT-FORCE.
+    assert_eq!(
+        probe(
+            &su_no,
+            "SELECT count(*)::int FROM pg_event_trigger WHERE evtname = 'boatramp_force_rls_trg'"
+        )
+        .await,
+        "0",
+        "serve_as: non-owner must install NO FORCE event trigger"
+    );
+    assert_eq!(
+        probe(
+            &su_no,
+            "SELECT relforcerowsecurity::text FROM pg_class WHERE relname = 't'"
+        )
+        .await,
+        "false",
+        "non-owner posture: the table stays ENABLE-but-NOT-FORCE"
+    );
+    assert_eq!(
+        probe(&su_no, "SELECT count(*)::int FROM t").await,
+        "2",
+        "both rows on disk"
+    );
+    // Serving AS the NON-OWNER runtime role: confined by plain ENABLE — ZERO foreign bytes.
+    let no_runtime = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, NO_ROLE, PW, NO_DB)),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(&no_runtime, "SELECT current_user::text").await,
+        NO_ROLE
+    );
+    assert_eq!(
+        probe(&no_runtime, "SELECT count(*)::int FROM t").await,
+        "1",
+        "serve_as: non-owner serving role sees ONLY its own tenant's row (ZERO foreign bytes, no FORCE)"
+    );
+    assert_eq!(
+        probe(&no_runtime, "SELECT tenant::text FROM t").await,
+        TENANT
+    );
+
+    // =====================================================================
+    // ARM (b) — serve_as: owner. install_force = true ⇒ trigger installed; owner serving FORCE-bound.
+    // =====================================================================
+    let su_ow = connect(k, &ExternalSqlOptions::new(su_to_db(&su_url, OW_DB))).unwrap();
+    provision_posture(&su, &su_ow, OW_DB, OW_ROLE, PW, OW_OWNER, PW, true).await;
+    su.run_script(&format!(
+        "ALTER ROLE \"{OW_OWNER}\" SET \"{TENANT_GUC}\" = '{TENANT}'"
+    ))
+    .await
+    .unwrap();
+    // The trigger IS installed.
+    assert_eq!(
+        probe(
+            &su_ow,
+            "SELECT count(*)::int FROM pg_event_trigger WHERE evtname = 'boatramp_force_rls_trg'"
+        )
+        .await,
+        "1",
+        "serve_as: owner must install the FORCE-on-ENABLE event trigger"
+    );
+    // The owner creates a plain ENABLE table; the trigger upgrades it to FORCE on ENABLE.
+    let ow_owner_conn = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, OW_OWNER, PW, OW_DB)),
+    )
+    .unwrap();
+    for stmt in [
+        "CREATE TABLE t (tenant text, v int)",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        &format!("CREATE POLICY p ON t USING (tenant = current_setting('{TENANT_GUC}', true))"),
+        &format!("INSERT INTO t (tenant, v) VALUES ('{TENANT}', 1)"),
+    ] {
+        ow_owner_conn
+            .run_script(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("owner arm owner DDL/seed `{stmt}`: {e}"));
+    }
+    su_ow
+        .run_script(&format!(
+            "INSERT INTO t (tenant, v) VALUES ('{OTHER_TENANT}', 2)"
+        ))
+        .await
+        .expect("superuser seeds the other-tenant row");
+    assert_eq!(
+        probe(
+            &su_ow,
+            "SELECT relforcerowsecurity::text FROM pg_class WHERE relname = 't'"
+        )
+        .await,
+        "true",
+        "serve_as: owner — the FORCE trigger upgraded the ENABLE table to FORCE"
+    );
+    assert_eq!(
+        probe(&su_ow, "SELECT count(*)::int FROM t").await,
+        "2",
+        "both rows on disk"
+    );
+    // Serving AS the OWNER role: confined by FORCE — ZERO foreign bytes.
+    let ow_serving = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, OW_OWNER, PW, OW_DB)),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(&ow_serving, "SELECT current_user::text").await,
+        OW_OWNER
+    );
+    assert_eq!(
+        probe(&ow_serving, "SELECT count(*)::int FROM t").await,
+        "1",
+        "serve_as: owner serving role (FORCE-bound) sees ONLY its own tenant's row (ZERO foreign bytes)"
+    );
+    assert_eq!(
+        probe(&ow_serving, "SELECT tenant::text FROM t").await,
+        TENANT
+    );
+
+    // =====================================================================
+    // ARM (c) — MUTATION: owner-serving with FORCE somehow ABSENT ⇒ the cross-tenant leak the node
+    // guard refuses. Drop the trigger + un-FORCE the table, then the OWNER serving role LEAKS both
+    // rows. The node's `owner_serving_without_force` guard (build_backend + connection_parts) refuses
+    // to serve the owner role in exactly this FORCE-absent state — so this leaking state is never
+    // reachable through the serving path; here we PROVE it would leak, so the invariant is not vacuous.
+    // =====================================================================
+    for stmt in [
+        "DROP EVENT TRIGGER IF EXISTS boatramp_force_rls_trg",
+        "ALTER TABLE t NO FORCE ROW LEVEL SECURITY",
+    ] {
+        su_ow
+            .run_script(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("mutation `{stmt}`: {e}"));
+    }
+    let ow_leak = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, OW_OWNER, PW, OW_DB)),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(&ow_leak, "SELECT count(*)::int FROM t").await,
+        "2",
+        "MUTATION PROOF: with FORCE absent the OWNER serving role LEAKS BOTH tenants' rows — \
+         exactly the state owner_serving_without_force refuses fail-closed (owner-serving ⟺ FORCE)"
+    );
+
+    // --- teardown (best-effort) ---
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS \"{NO_DB}\" WITH (FORCE)"),
+        format!("DROP DATABASE IF EXISTS \"{OW_DB}\" WITH (FORCE)"),
+        format!("DROP ROLE IF EXISTS \"{NO_ROLE}\""),
+        format!("DROP ROLE IF EXISTS \"{NO_OWNER}\""),
+        format!("DROP ROLE IF EXISTS \"{OW_ROLE}\""),
+        format!("DROP ROLE IF EXISTS \"{OW_OWNER}\""),
+    ] {
+        let _ = su.run_script(&stmt).await;
+    }
+
+    println!("MANAGED RLS SERVE-AS POSTURE OK [postgres]");
 }
