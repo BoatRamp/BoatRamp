@@ -6195,6 +6195,13 @@ impl NodeProjectExport {
 
     /// Whether a database `name` exists (via the maintenance connection) — so the swap can skip the
     /// rename-aside when cloning into a target that has no live db yet.
+    ///
+    /// Uses the NON-merging capture (pure stdout): the `datname` existence answer drives the swap's
+    /// rename-aside and the fresh-dest reconcile's occupant check, so a connection-time `NOTICE`/
+    /// `WARNING` on the maintenance db (e.g. a collation-version mismatch) must never co-mingle into
+    /// the output and flip the `== "1"` test (Security review LOW). A probe error (non-zero exit)
+    /// aborts the caller — the swap guards fail-closed (it refuses to rename live aside without a
+    /// proven shadow replacement), so losing the merged stderr detail here only costs a diagnostic.
     async fn pg_db_exists(
         &self,
         plan: &PgShadowPlan,
@@ -6204,24 +6211,34 @@ impl NodeProjectExport {
         let sql = format!("SELECT 1 FROM pg_database WHERE datname = {}", pg_lit(name));
         let inv = psql_invocation(&plan.maint, &sql);
         let (code, out) = self
-            .run_sql_capture(&plan.image, &inv.argv, &inv.env, None, stage_dir)
+            .run_sql_capture_nomerge(&plan.image, &inv.argv, &inv.env, None, stage_dir)
             .await?;
         if code != 0 {
             return Err(Perr::Other(format!(
-                "pg shadow: could not probe database {name:?} (exit {code}): {out}"
+                "pg shadow: could not probe database {name:?} (exit {code})"
             )));
         }
         Ok(out.trim() == "1")
     }
 
-    /// Whether database `name` holds ANY user table — the "real data" signature that distinguishes a
+    /// Whether database `name` holds ANY user object — the "real data" signature that distinguishes a
     /// POPULATED occupant (a red flag on the fresh-sync path — must NOT be clobbered) from an EMPTY
     /// one (a freshly-`CREATE DATABASE`d-but-never-restored failed-restore orphan — the
-    /// "unrestored-orphan signature", safe to replace). Counts tables in every schema EXCEPT the
-    /// system ones (`pg_catalog`/`information_schema`; `pg_toast` is never in `pg_tables`), via the
-    /// SUPERUSER maintenance connection pointed at `name`. A freshly-provisioned tenant db (only the
-    /// empty `public` schema, no tables) returns `false`; a db carrying any restored/real table
-    /// returns `true`. Fail-safe bias: ANY user table ⇒ populated ⇒ preserve.
+    /// "unrestored-orphan signature", safe to replace), via the SUPERUSER maintenance connection
+    /// pointed at `name`.
+    ///
+    /// Counts, in every schema EXCEPT the system ones (`pg_catalog`/`information_schema`/`pg_toast`),
+    /// ordinary + partitioned TABLES, MATERIALIZED VIEWS, SEQUENCES, and FOREIGN TABLES
+    /// (`pg_class.relkind IN ('r','p','m','S','f')`), PLUS LARGE OBJECTS (`pg_largeobject_metadata`) —
+    /// so data that lives only in a matview / large-object store / foreign table is NOT misread as
+    /// empty (Security review MEDIUM). A freshly-provisioned tenant db (only the empty `public`
+    /// schema) returns `false`; any restored/real object returns `true`.
+    ///
+    /// FAIL-CLOSED (Security review HIGH): the count is read via the NON-merging capture so a
+    /// connection-time `WARNING` (e.g. a collation-version mismatch after a PG-major/glibc change —
+    /// realistic on this restore path) can never co-mingle into the output; and an unparsable or
+    /// error result ABORTS the restore rather than being silently treated as "empty" (which would
+    /// green-light a clobber of real data). The only non-error path to `false` is an exact `0`.
     async fn pg_db_has_user_tables(
         &self,
         plan: &PgShadowPlan,
@@ -6232,18 +6249,31 @@ impl NodeProjectExport {
         on_db.database = name.to_string();
         let inv = psql_invocation(
             &on_db,
-            "SELECT count(*) FROM pg_tables \
-             WHERE schemaname NOT IN ('pg_catalog', 'information_schema')",
+            "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+             AND c.relkind IN ('r', 'p', 'm', 'S', 'f')) \
+             + (SELECT count(*) FROM pg_largeobject_metadata)",
         );
+        // NON-merging capture: pure stdout, so a NOTICE/WARNING on connect cannot pollute the count.
         let (code, out) = self
-            .run_sql_capture(&plan.image, &inv.argv, &inv.env, None, stage_dir)
+            .run_sql_capture_nomerge(&plan.image, &inv.argv, &inv.env, None, stage_dir)
             .await?;
         if code != 0 {
             return Err(Perr::Other(format!(
-                "pg fresh-dest reconcile: could not probe user tables in {name:?} (exit {code}): {out}"
+                "pg fresh-dest reconcile: could not probe user objects in {name:?} (exit {code}) — \
+                 refusing to risk a clobber; live left intact"
             )));
         }
-        Ok(out.trim().parse::<i64>().unwrap_or(0) > 0)
+        // FAIL-CLOSED: a clean `0` is EMPTY (safe to replace); any positive count is POPULATED
+        // (preserve); anything UNPARSABLE aborts (never a silent "empty" that licenses a clobber).
+        match out.trim().parse::<i64>() {
+            Ok(0) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(_) => Err(Perr::Other(format!(
+                "pg fresh-dest reconcile: unparsable user-object count in {name:?} ({out:?}) — \
+                 refusing to risk a clobber; live left intact"
+            ))),
+        }
     }
 
     /// FAIL-SAFE fresh-dest reconciliation (construens's UNDECLARED-orphan gap; DATA-LOSS-SENSITIVE
