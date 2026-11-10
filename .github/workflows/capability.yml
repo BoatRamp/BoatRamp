@@ -925,19 +925,22 @@ jobs:
             || { echo "::error::listener node-cert gate never reached the success marker (silent skip, or the listener did not serve the node-managed cert)" >&2; exit 1; }
 
   # Tier — the blob `/img` COLD-PATH FAN-OUT gate (image-serve-latency Ask 3c). N concurrent COLD
-  # fetches through the REAL `aws_sdk_s3` backend must FAN OUT, not serialize at the connector. MinIO is
-  # the local S3-compatible endpoint (a real aws client, real TCP — the `benchmark-must-exercise-real
+  # fetches through the REAL `aws_sdk_s3` backend must FAN OUT, not serialize at the connector. SeaweedFS
+  # is the local S3-compatible endpoint (a real aws client, real TCP — the `benchmark-must-exercise-real
   # -path` rule: no warm/in-memory stand-in). The object is PRE-SEEDED (so the burst is the first — cold
   # — op, empty pool). On a localhost endpoint this is a functional + coarse fan-out smoke; the NODE run
   # against Tigris (real cold-connect latency) is the AUTHORITATIVE measurement.
+  # (SeaweedFS — MinIO's open-source server/client are archived + unpullable.)
   blob-cold-fanout:
-    name: blob /img cold-path fan-out (MinIO)
+    name: blob /img cold-path fan-out (SeaweedFS)
     runs-on: ubuntu-latest
     env:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      # SeaweedFS S3 runs anonymous (no SigV4 verify), but the aws_sdk client still signs, so give it
+      # dummy static creds.
+      AWS_ACCESS_KEY_ID: anykey
+      AWS_SECRET_ACCESS_KEY: anysecret
       AWS_REGION: us-east-1
-      BOATRAMP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      BOATRAMP_TEST_S3_ENDPOINT: http://127.0.0.1:8333
       BOATRAMP_TEST_S3_BUCKET: boatramp
       # Pre-seeded key ⇒ the test's burst is the first S3 op (empty pool = genuinely cold).
       BOATRAMP_TEST_S3_COLD_KEY: zz/cold-fanout-seed.webp
@@ -948,27 +951,27 @@ jobs:
         with:
           key: capability-blob-cold-fanout
 
-      - name: Start MinIO + pre-seed a 12 KB object
+      - name: Start SeaweedFS + pre-seed a 12 KB object
         run: |
           set -o pipefail
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:9000/minio/health/ready >/dev/null 2>&1 && break
+          docker run -d --name seaweed -p 8333:8333 chrislusf/seaweedfs:latest \
+            server -s3 -ip.bind=0.0.0.0 -s3.port=8333
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/ 2>/dev/null || echo 000)
+            [ "$code" = "200" ] && { echo "seaweedfs s3 ready"; break; }
             sleep 1
           done
-          # aws CLI (preinstalled on the runner) reads the AWS_* creds from the job env.
-          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://boatramp
+          # CreateBucket + seed the cold object (anonymous, path-style — no aws CLI needed).
+          curl -sf -X PUT http://127.0.0.1:8333/boatramp >/dev/null && echo "bucket created"
           head -c 12288 /dev/zero > /tmp/seed.webp
-          aws --endpoint-url http://127.0.0.1:9000 s3 cp /tmp/seed.webp \
-            s3://boatramp/zz/cold-fanout-seed.webp
-          echo "minio up + seeded"
+          curl -sf -X PUT --data-binary @/tmp/seed.webp \
+            http://127.0.0.1:8333/boatramp/zz/cold-fanout-seed.webp >/dev/null
+          echo "seaweedfs up + seeded"
 
       - name: N concurrent cold fetches must fan out, not serialize (hard gate)
         run: |
           set -o pipefail
-          # The REAL aws_sdk_s3 backend against MinIO, firing N concurrent cold get_range. The gate
+          # The REAL aws_sdk_s3 backend against SeaweedFS, firing N concurrent cold get_range. The gate
           # asserts the max per-request latency is not ~N× the median (serialization) and prints the
           # marker ONLY after the fan-out assertions hold.
           cargo test -p boatramp-storage --features s3 --test s3_minio \
