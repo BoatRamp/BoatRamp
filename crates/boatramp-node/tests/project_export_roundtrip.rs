@@ -3797,6 +3797,21 @@ async fn project_sync_idempotency_orphan_recovery_live() {
 
     // === GAP 1: a PROJECT-DECLARED managed db (the declarative front door `project sync` uses) is
     //     torn down by the deprovisioner even with an EMPTY node-static map. ===
+    // The declarative front door lowers a declaration to `user = database = <binding name>`, i.e.
+    // its managed server is initialized with a superuser NAMED after the binding ("idemapp"). Our
+    // one shared test container's superuser is "postgres", so stand up that superuser role (= su_pw)
+    // here so the declared-path provision/deprovision/drop authenticates exactly as production does.
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='idemapp') THEN \
+             CREATE ROLE idemapp SUPERUSER LOGIN PASSWORD '{su_pw}'; END IF; END $$;"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "create the declared-binding superuser role: {o}");
     seal_and_seed(decl_compute.clone()).await; // the declared binding's DERIVED compute → same pg server
     let applydb: boatramp_core::compute::ApplyDatabase =
         serde_json::from_value(serde_json::json!({
@@ -3919,6 +3934,13 @@ async fn project_sync_idempotency_orphan_recovery_live() {
         )
         .await;
     }
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        "DROP ROLE IF EXISTS idemapp",
+    )
+    .await;
 
     println!("PROJECT SYNC IDEMPOTENCY ORPHAN OK");
 }
