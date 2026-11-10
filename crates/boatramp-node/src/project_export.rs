@@ -1456,45 +1456,17 @@ fn shadow_suffix() -> String {
 /// Postgres `NAMEDATALEN - 1`: the maximum BYTE length of a stored identifier before the server
 /// silently TRUNCATES it to this prefix (emitting a `NOTICE: identifier … will be truncated`).
 /// MySQL's identifier cap is 64 bytes, so bounding a derived name to this value is safe for BOTH
-/// engines.
-const MAX_DERIVED_DB_NAME_LEN: usize = 63;
+/// engines. Aliased to the storage-crate constant so the limit has ONE source of truth. Used only
+/// by the bounding tests now that [`bounded_derived_db_name`] delegates to the storage helper.
+#[cfg(test)]
+const MAX_DERIVED_DB_NAME_LEN: usize = boatramp_storage::tenant_provision::PG_NAMEDATALEN_MINUS_1;
 
 /// Compose a transient database name `<live_db><marker><suffix>` (the `__shadow_` / `__old_` aside
-/// names) that NEVER exceeds Postgres's 63-byte identifier limit.
-///
-/// A Shared-tenant live db name is tenant-qualified and already close to the 63-byte cap, so the
-/// naive `format!("{live_db}{marker}{suffix}")` can push the identifier past `NAMEDATALEN`.
-/// Postgres then TRUNCATES the name back to its first 63 bytes — which, for a long live db,
-/// collapses right back to the LIVE name — so the shadow `CREATE DATABASE` fails with
-/// `database … already exists` and the clone/import fails. (Latent for ANY live db long enough
-/// that `<live><marker><suffix>` crosses 63 bytes, not only Shared tenants.)
-///
-/// Contract:
-/// - **Short names unchanged.** When `<live_db><marker><suffix>` already fits in 63 bytes the
-///   result is byte-identical to `format!("{live_db}{marker}{suffix}")`, so the dedicated/chunked
-///   path and every existing shadow-name test keep their exact names.
-/// - **Long names bounded.** Otherwise the `live_db` PREFIX is truncated (on a UTF-8 char
-///   boundary, never splitting a multi-byte sequence) to whatever room is left, so the whole name
-///   is ≤ 63 bytes while the FULL `{marker}{suffix}` distinguisher is preserved intact and within
-///   the first 63 bytes. This guarantees the result is (a) ≤ 63 bytes; (b) distinct from `live_db`
-///   truncated to 63 bytes (it ends in the `{marker}{suffix}` tail that a plain truncation of
-///   `live_db` drops — the exact collapse that caused the bug); (c) collision-free across imports,
-///   because the per-import-unique `suffix` is retained verbatim; and (d) still carrying the intact
-///   `marker` substring, so the `%__shadow_%` / `%__old_%` startup-sweep LIKE-patterns keep
-///   matching it. The marker (and suffix) are NEVER truncated — only the `live_db` prefix is.
+/// names) that NEVER exceeds Postgres's 63-byte identifier limit — see the canonical
+/// [`boatramp_storage::tenant_provision::bounded_aside_db_name`], which the soft-delete
+/// rename-aside names share so the 63-byte bounding has ONE implementation.
 fn bounded_derived_db_name(live_db: &str, marker: &str, suffix: &str) -> String {
-    let tail_len = marker.len() + suffix.len();
-    if live_db.len() + tail_len <= MAX_DERIVED_DB_NAME_LEN {
-        return format!("{live_db}{marker}{suffix}");
-    }
-    // Keep the whole `{marker}{suffix}` distinguisher; give the live_db prefix whatever bytes are
-    // left (possibly zero). Floor the cut at a UTF-8 char boundary so a multi-byte char is intact.
-    let keep = MAX_DERIVED_DB_NAME_LEN.saturating_sub(tail_len);
-    let mut end = keep.min(live_db.len());
-    while end > 0 && !live_db.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{marker}{suffix}", &live_db[..end])
+    boatramp_storage::tenant_provision::bounded_aside_db_name(live_db, marker, suffix)
 }
 
 /// Quote a Postgres **string literal** (single-quoted, doubling any embedded `'`) — for the
@@ -1502,6 +1474,16 @@ fn bounded_derived_db_name(live_db: &str, marker: &str, suffix: &str) -> String 
 /// utility SQL (the db name is driver-derived, never a credential or bundle data).
 fn pg_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Whether a trusted-DDL error is a Postgres "database already exists" (SQLSTATE `42P04`,
+/// `duplicate_database`). The pg shadow-swap DDL runs via `psql -c` and surfaces the failure as
+/// `Perr::Other("pg shadow DDL exited … : ERROR: database \"…\" already exists")`, so the match is
+/// on the message substring (case-insensitive), the same message-based recognition
+/// `is_database_exists_error` uses for the sqlx path. Powers the idempotent swap recovery below.
+fn is_pg_database_exists_error(e: &Perr) -> bool {
+    let m = e.to_string().to_ascii_lowercase();
+    m.contains("already exists") && m.contains("database")
 }
 
 /// Compose the superuser terminate-sweep that evicts EVERY backend attached to database `db`
@@ -6423,8 +6405,12 @@ impl NodeProjectExport {
             stage_dir,
         )
         .await?;
-        let live_exists = self.pg_db_exists(plan, &plan.live_db, stage_dir).await?;
-        if live_exists {
+        // Rename any live DB aside so the shadow→live rename lands on a FREE name. `aside_done`
+        // tracks whether an aside is in place (so the failure path can roll it back and the success
+        // path can drop it) regardless of WHICH probe found live — the early one here, or the
+        // late-recovery re-probe below.
+        let mut aside_done = self.pg_db_exists(plan, &plan.live_db, stage_dir).await?;
+        if aside_done {
             self.pg_run_ddl(
                 plan,
                 &format!(
@@ -6453,16 +6439,61 @@ impl NodeProjectExport {
             stage_dir,
         )
         .await?;
-        if let Err(e) = self
+        let mut swap = self
             .pg_run_ddl(
                 plan,
                 &format!("ALTER DATABASE {shadow_q} RENAME TO {live_q}"),
                 stage_dir,
             )
-            .await
+            .await;
+        // IDEMPOTENT REPLACE (construens seam-E recovery): if the shadow→live rename failed with
+        // `database "<live>" already exists`, a live DB of that name occupies the target that the
+        // earlier probe did NOT move aside — one a prior FAILED `project sync --apply` left orphaned
+        // (the re-run must RECOVER by replacing it, not die), or one a race created between the
+        // probe and the rename. Re-probe, move it aside, and retry the rename ONCE, so a
+        // fresh-identity sync REPLACES the dest's managed DB (drop-and-recreate). Guarded on NOT
+        // having already asided (we never clobber the rollback copy) + the error being an
+        // already-exists (any other failure stays fatal).
+        if !aside_done
+            && swap.as_ref().err().is_some_and(is_pg_database_exists_error)
+            && self
+                .pg_db_exists(plan, &plan.live_db, stage_dir)
+                .await
+                .unwrap_or(false)
         {
+            let _ = self
+                .pg_run_ddl(
+                    plan,
+                    &format!(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                         WHERE datname = {} AND pid <> pg_backend_pid()",
+                        pg_lit(&plan.live_db)
+                    ),
+                    stage_dir,
+                )
+                .await;
+            if self
+                .pg_run_ddl(
+                    plan,
+                    &format!("ALTER DATABASE {live_q} RENAME TO {old_q}"),
+                    stage_dir,
+                )
+                .await
+                .is_ok()
+            {
+                aside_done = true;
+                swap = self
+                    .pg_run_ddl(
+                        plan,
+                        &format!("ALTER DATABASE {shadow_q} RENAME TO {live_q}"),
+                        stage_dir,
+                    )
+                    .await;
+            }
+        }
+        if let Err(e) = swap {
             // Roll the aside back to live so a failed swap never loses the original.
-            if live_exists {
+            if aside_done {
                 let _ = self
                     .pg_run_ddl(
                         plan,
@@ -6473,7 +6504,7 @@ impl NodeProjectExport {
             }
             return Err(e);
         }
-        if live_exists {
+        if aside_done {
             // The swap succeeded; the aside copy is obsolete (best-effort drop).
             let _ = self
                 .pg_run_ddl(

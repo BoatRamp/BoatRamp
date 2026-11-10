@@ -788,6 +788,73 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         };
         crate::tenant_sql::restart_pending(&self.deploy, &binding, project).await
     }
+
+    async fn drop_database(
+        &self,
+        project: &str,
+        name: &str,
+    ) -> Result<boatramp_core::sql::DropDatabaseOutcome, DeclareError> {
+        use boatramp_core::sql::DropDatabaseOutcome;
+        boatramp_core::project::validate_resource_name("project", project)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        boatramp_core::project::validate_resource_name("database", name)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        // CATASTROPHIC-DROP GUARD: the reserved `default` project's database IS the single-tenant
+        // install — never droppable through this operator verb. (`deprovision_tenant` ALSO guards it
+        // defensively via `tenant_key`'s `is_default`, so this is belt-and-suspenders + a clear
+        // message instead of a silent no-op.)
+        if project == boatramp_core::project::DEFAULT_PROJECT {
+            return Err(DeclareError::Other(
+                "the reserved `default` project's managed database is the single-tenant install \
+                 and cannot be dropped"
+                    .to_string(),
+            ));
+        }
+        // Resolve through the merge point: a node-static OR a project-declared binding both resolve.
+        // A bring-your-own (`url_env` / `password_env`) binding is the operator's OWN database, not
+        // ours to drop, so only a managed-credential binding is accepted (else `NotDeclared`).
+        let binding = match resolve_binding(&self.static_dbs, &self.deploy, project, name).await? {
+            Some(b) if b.is_managed_credential() => b,
+            _ => return Err(DeclareError::NotDeclared(name.to_string())),
+        };
+        // A site-scoped binding has no single project-level database (its per-site databases are
+        // created lazily per site); refuse rather than guess a target, mirroring the operator-SQL
+        // project-level restriction. A site's managed DB is torn down when the site is deleted.
+        if matches!(binding.tenant_scope, TenantScope::Site) {
+            return Err(DeclareError::Other(format!(
+                "database {name:?} is site-scoped; `db drop database` is project-level — a site's \
+                 managed database is torn down when its site is deleted"
+            )));
+        }
+        // The derived PHYSICAL name the drop targets — EXACTLY the derivation provisioning used, so
+        // what the outcome reports is what is dropped. Derived from `(project, binding)`, NEVER an
+        // operator-supplied raw name, so this can only ever drop THIS project's own managed database.
+        let (ident_raw, is_default) =
+            crate::tenant_sql::tenant_key(binding.tenant_scope, project, "");
+        let physical = crate::tenant_sql::tenant_names(
+            binding.tenant,
+            binding.compute.as_deref().unwrap_or_default(),
+            binding.database.as_deref().unwrap_or_default(),
+            &ident_raw,
+            is_default,
+        )
+        .database;
+        // IMMEDIATE hard drop (grace = 0: no soft-delete/tombstone — the operator explicitly wants
+        // it GONE, e.g. clearing an orphan to re-sync cleanly). `deprovision_tenant` is `IF
+        // EXISTS`-guarded, so a clean no-op on an already-absent database.
+        crate::tenant_sql::deprovision_tenant(
+            &self.deploy,
+            &self.kv,
+            &self.envelope,
+            &binding,
+            project,
+            "",
+            0,
+        )
+        .await
+        .map_err(DeclareError::Other)?;
+        Ok(DropDatabaseOutcome { database: physical })
+    }
 }
 
 #[cfg(test)]

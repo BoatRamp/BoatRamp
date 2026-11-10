@@ -28,6 +28,13 @@ pub enum Error {
     /// The `<name>` is not a safe URL path segment (validated client-side).
     #[error("{0}")]
     InvalidName(String),
+    /// `db drop database` was invoked without `-y/--yes`. The drop is IRREVERSIBLE, so it is
+    /// refused rather than prompted (the CLI is non-interactive).
+    #[error(
+        "dropping managed database {0:?} is IRREVERSIBLE (the database + its data are destroyed) \
+         — re-run with -y/--yes to confirm"
+    )]
+    DropNotConfirmed(String),
     /// `ensure --wait` observed the database end in a `provision_failed` readiness: a
     /// post-launch action failed. The reconcile keeps retrying, but the operator asked to
     /// wait, so this is surfaced as a non-zero exit with the server's reason.
@@ -107,6 +114,20 @@ enum DropWhat {
         /// The managed database whose server the role lives on.
         #[arg(long)]
         database: String,
+    },
+    /// HARD-DROP a managed database — the database + its role + sealed credential (Shared), or the
+    /// dedicated server workload + credential (Single). IRREVERSIBLE (no soft-delete grace window):
+    /// the explicit operator teardown, and the recovery path for a managed database ORPHANED by a
+    /// failed `project sync` or an older `project rm` (which could leave it with no CLI path to
+    /// reach it). Idempotent on an already-absent database. Requires `-y/--yes` — there is no
+    /// interactive prompt, and the server independently re-confirms the name.
+    Database {
+        /// The database binding name (defaults to the project's `default` database).
+        #[arg(default_value = "default")]
+        name: String,
+        /// Confirm the IRREVERSIBLE drop (required — there is no interactive prompt).
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
     },
 }
 
@@ -205,6 +226,9 @@ pub enum DbOutput {
         role_name: String,
         existed: bool,
     },
+    /// `db drop database <name> -y` — the managed database was hard-dropped. `physical` is the
+    /// derived cluster database name the server actually dropped.
+    DropDatabase { name: String, physical: String },
     /// `db restart [--db <name>]` — the database was restarted; `config_applied` is
     /// whether a pending config change (e.g. a flipped `delta_capture`) was adopted in
     /// the process, `replicas_restarted` how many running replicas were stopped for
@@ -425,6 +449,16 @@ impl crate::output::Rendered for DbOutput {
                 }
                 Ok(())
             }
+            Self::DropDatabase { name, physical } => {
+                writeln!(w, "dropped managed database `{name}`")?;
+                if physical != name {
+                    writeln!(w, "  physical database: {physical}")?;
+                }
+                writeln!(
+                    w,
+                    "  this was IRREVERSIBLE — the database and its data are gone"
+                )
+            }
             Self::Restart {
                 name,
                 workload,
@@ -484,6 +518,13 @@ pub async fn run(args: DbArgs, config: &ProjectConfig) -> Result<DbOutput> {
                 validate_name(&database)?;
                 drop_user(&cp, &database, &name).await
             }
+            DropWhat::Database { name, yes } => {
+                validate_name(&name)?;
+                if !yes {
+                    return Err(Error::DropNotConfirmed(name));
+                }
+                drop_database(&cp, &name).await
+            }
         },
         DbCommand::Restart { db } => {
             validate_name(&db)?;
@@ -510,6 +551,15 @@ async fn ensure_user(
         // BYO: the operator supplied the secret, so the server mints/returns nothing — the
         // CLI renders a BYO-aware line rather than a created/already-exists one.
         byo: password_secret.is_some(),
+    })
+}
+
+/// `db drop database <name> -y` — hard-drop the managed database (+ role + credential).
+async fn drop_database(cp: &ControlPlane, name: &str) -> Result<DbOutput> {
+    let physical = cp.drop_database(name).await?;
+    Ok(DbOutput::DropDatabase {
+        name: name.to_string(),
+        physical,
     })
 }
 

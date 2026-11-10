@@ -1803,6 +1803,31 @@ impl ControlPlane {
         ))
     }
 
+    /// HARD-DROP a managed database (`DELETE /api/{seg}/databases/{name}?confirm={name}`).
+    /// `Project·Admin`. IRREVERSIBLE: the explicit operator teardown / orphan-recovery verb. The
+    /// `?confirm={name}` echoes the name as the server's typed confirmation guard. Returns the
+    /// derived PHYSICAL database name the server dropped (for operator confirmation).
+    pub async fn drop_database(&self, name: &str) -> Result<String> {
+        let seg = project_seg(&self.project, "databases");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let v: serde_json::Value = client
+            .delete(format!("{server}/api/{seg}/{name}"))
+            .query(&[("confirm", name)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(v.get("physical")
+            .and_then(|p| p.as_str())
+            .unwrap_or(name)
+            .to_string())
+    }
+
     /// Clear the project's tenancy schema (revert to legacy `Uniform` scoping).
     pub async fn clear_project_tenancy(&self) -> Result<()> {
         let seg = project_seg(&self.project, "tenancy");

@@ -242,6 +242,49 @@ pub fn tenant_db_name(base: &str, tenant_ident: &str) -> String {
     sanitize_ident(&format!("{base}_{tenant_ident}"))
 }
 
+/// Postgres silently TRUNCATES a stored identifier to its first `NAMEDATALEN - 1`
+/// (= [`MAX_IDENT_LEN`], 63) bytes; MySQL caps at 64. So a derived name that crosses
+/// this limit is a correctness hazard, not just a cosmetic one.
+pub const PG_NAMEDATALEN_MINUS_1: usize = MAX_IDENT_LEN;
+
+/// Compose a transient **aside** database name `<base><marker><suffix>` (e.g. the
+/// `__deleted_<ts>` soft-delete rename-aside, or the shadow-restore `__shadow_` / `__old_`
+/// names) that NEVER exceeds Postgres's 63-byte identifier limit.
+///
+/// A per-tenant `base` ([`tenant_db_name`]) is already capped at [`MAX_IDENT_LEN`] and can
+/// sit *at* the 63-byte limit, so the naive `format!("{base}{marker}{suffix}")` pushes the
+/// identifier past `NAMEDATALEN`. Postgres then **truncates it back to its first 63 bytes**
+/// — which, for a `base` already at the cap, collapses **right back to `base`**, so an
+/// `ALTER DATABASE <base> RENAME TO <that>` renames the database to *itself* and fails with
+/// `database "<base>" already exists`, orphaning the delete (the construens soft-deprovision
+/// failure shape). This helper bounds the result so that can never happen.
+///
+/// Contract (identical to the shadow-restore bounding so both share one implementation):
+/// - **Short names unchanged.** When `<base><marker><suffix>` already fits in 63 bytes the
+///   result is byte-identical to `format!("{base}{marker}{suffix}")`.
+/// - **Long names bounded.** Otherwise the `base` PREFIX is truncated (on a UTF-8 char
+///   boundary, never splitting a multi-byte sequence) to whatever room is left, so the whole
+///   name is ≤ 63 bytes while the FULL `{marker}{suffix}` distinguisher is preserved intact
+///   and within the first 63 bytes. This guarantees the result is (a) ≤ 63 bytes; (b)
+///   distinct from `base` truncated to 63 bytes (it ends in the `{marker}{suffix}` tail that a
+///   plain truncation of `base` drops — the exact collapse that caused the bug); and (c)
+///   collision-free across calls when `suffix` is per-call-unique (it is retained verbatim).
+///   The `marker` (and `suffix`) are NEVER truncated — only the `base` prefix is.
+pub fn bounded_aside_db_name(base: &str, marker: &str, suffix: &str) -> String {
+    let tail_len = marker.len() + suffix.len();
+    if base.len() + tail_len <= PG_NAMEDATALEN_MINUS_1 {
+        return format!("{base}{marker}{suffix}");
+    }
+    // Keep the whole `{marker}{suffix}` distinguisher; give the base prefix whatever bytes are
+    // left (possibly zero). Floor the cut at a UTF-8 char boundary so a multi-byte char is intact.
+    let keep = PG_NAMEDATALEN_MINUS_1.saturating_sub(tail_len);
+    let mut end = keep.min(base.len());
+    while end > 0 && !base.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}{suffix}", &base[..end])
+}
+
 /// Derive the per-tenant **login role** name.
 ///
 /// Scheme: `<base>_<tenant_ident>_role`, then re-sanitized and length-capped via
@@ -1919,6 +1962,52 @@ mod tests {
             "soft delete must not DROP the database:\n{joined}"
         );
         assert!(!joined.to_ascii_uppercase().contains("DROP ROLE"));
+    }
+
+    /// [`bounded_aside_db_name`]: a SHORT base is byte-identical to the naive join; a base AT the
+    /// 63-byte cap is bounded by truncating the PREFIX while keeping the FULL `{marker}{suffix}`
+    /// tail — so the result is ≤ 63 bytes AND distinct from the base (the collapse-to-live fix).
+    #[test]
+    fn bounded_aside_db_name_prevents_the_collapse() {
+        // Short: unchanged.
+        assert_eq!(
+            bounded_aside_db_name("appdb_acme", "__deleted_", "1700000000"),
+            "appdb_acme__deleted_1700000000",
+        );
+        // A base already AT the 63-byte cap — exactly what `tenant_db_name` can produce for a long
+        // tenant. The naive `format!("{base}__deleted_{ts}")` would be > 63 bytes; Postgres would
+        // truncate it back to its first 63 bytes = the base itself, so `ALTER DATABASE base RENAME
+        // TO <that>` renames the db to ITSELF → `database "base" already exists`. The bounded name
+        // must avoid that.
+        let base = tenant_db_name(
+            "appdb",
+            &sanitize_ident("a-very-long-tenant-project-name-xyz"),
+        );
+        assert_eq!(
+            base.len(),
+            MAX_IDENT_LEN,
+            "precondition: base is at the cap"
+        );
+        let aside = bounded_aside_db_name(&base, "__deleted_", "1700000000");
+        assert!(
+            aside.len() <= PG_NAMEDATALEN_MINUS_1,
+            "aside must fit NAMEDATALEN, got {} bytes: {aside}",
+            aside.len()
+        );
+        assert!(
+            aside.ends_with("__deleted_1700000000"),
+            "the distinguisher tail must be preserved intact: {aside}"
+        );
+        assert_ne!(
+            aside, base,
+            "the aside must never collapse back to the live name"
+        );
+        // Distinct per suffix (never collides across deletes).
+        let other = bounded_aside_db_name(&base, "__deleted_", "1700000099");
+        assert_ne!(
+            aside, other,
+            "distinct timestamps give distinct aside names"
+        );
     }
 
     /// Recovery reverses the soft delete: rename back to the original + re-enable

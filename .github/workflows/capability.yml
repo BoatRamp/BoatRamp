@@ -545,6 +545,14 @@ jobs:
           # exact wall). Same self-skip trap → gate on its marker.
           grep -q 'PROJECT SYNC SHARED RLS FORCE REPLICATE OK' project-export.log \
             || { echo "::error::Shared rls_session force-RLS replicate gate never reached its marker (silent skip, the exclude regressed into the event-trigger wall, or force was wrongly imposed)" >&2; exit 1; }
+          # Idempotency + orphan-recovery (construens re-run shape): a RE-RUN of the restore into a
+          # same-named dest whose managed DB ALREADY EXISTS RECOVERS (idempotent replace); the
+          # soft-deprovision of a 63-byte-name tenant SUCCEEDS (the bounded `__deleted_` aside never
+          # collapses to the live name → no `database … already exists`); `project rm`'s deprovisioner
+          # tears down a PROJECT-DECLARED db even with an empty node-static map; and `db drop database`
+          # clears an orphan — all with ≥2 tenants + zero foreign bytes. Self-skip trap → gate on marker.
+          grep -q 'PROJECT SYNC IDEMPOTENCY ORPHAN OK' project-export.log \
+            || { echo "::error::sync idempotency/orphan-recovery gate never reached its marker (silent skip, the aside overflow regressed into 'database already exists', a declared db was orphaned on rm, or the orphan-drop verb broke)" >&2; exit 1; }
           # Managed MySQL carries triggers/stored routines/events across the shadow+swap, restored as
           # a non-SUPER user and RE-POINTED to the tenant's own role post-swap (the DEFINER-handling
           # seam). Gate on its marker so a skip or a regression (a carried object NOT re-pointed, or

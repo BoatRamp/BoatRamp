@@ -3402,6 +3402,527 @@ async fn project_sync_shared_rls_force_replicate_live() {
     println!("PROJECT SYNC SHARED RLS FORCE REPLICATE OK");
 }
 
+/// **Live construens-SHAPED idempotency + orphan-recovery gate** (Tier-2 / nightly; needs a live
+/// Postgres `BOATRAMP_TEST_PG_URL` + Docker). Self-skips. Reproduces the construens cross-node
+/// re-run incident and proves all four managed-DB fixes end-to-end on REAL pg, with ≥2 tenants in
+/// the shared keyspace so cross-tenant isolation (ZERO foreign bytes) is asserted throughout.
+///
+/// The incident: a `project sync --apply` into a managed-pg dest FAILED at pg (`ERROR: database
+/// "construens_…" already exists`); the best-effort deprovision then failed with a MISLABELED
+/// `sql syntax error: database … already exists` (a broken soft-deprovision renaming INTO an
+/// existing/collapsed name); `project rm` reported "owns nothing" yet LEFT the managed DB orphaned;
+/// and no operator verb could drop the orphan. This gate proves the fixes:
+///
+/// 1. GAP 3 — a RE-RUN of the restore into a SAME-named dest whose managed DB ALREADY EXISTS (and
+///    holds stale data) RECOVERS (idempotent replace / drop-and-recreate), twice, with the rows
+///    landing and no orphan `__shadow_`/`__old_` db left.
+/// 2. GAP 2 — the SOFT-deprovision of a tenant whose derived db name is AT Postgres's 63-byte cap
+///    SUCCEEDS: the rename-aside is BOUNDED, so it never collapses back to the live name (the
+///    construens `already exists`). MUTATION: the pre-fix unbounded `{db}__deleted_{ts}` overflows →
+///    truncates to the live name → `ALTER DATABASE <db> RENAME TO <db>` → `database … already
+///    exists`, so this `.expect(...)` fails without the fix.
+/// 3. GAP 1 — `project rm`'s deprovisioner, given an EMPTY node-static map (the node that serves
+///    managed DBs ONLY through the per-project declarative front door `project sync` uses), STILL
+///    tears down a project's OWN DECLARED managed database. MUTATION: pre-fix it walked only the
+///    static map, so the declared db was orphaned ("owns nothing").
+/// 4. GAP 4 — the operator `db drop database` verb (`drop_database`) clears an orphaned managed
+///    database, hard, scoped to the project's derived name.
+///
+/// Emits `PROJECT SYNC IDEMPOTENCY ORPHAN OK`.
+#[tokio::test]
+async fn project_sync_idempotency_orphan_recovery_live() {
+    use boatramp_core::compute::{
+        BackendRegistry, Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase,
+        Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_core::sql::{ManagedDbDeclare, TenantDeprovisioner};
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_db_declare::{self, DeclareQuota, NodeManagedDbDeclare};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::{
+        DEFAULT_DEPROVISION_GRACE_SECS, NodeTenantDeprovisioner, deprovision_tenant,
+        provision_tenant,
+    };
+    use boatramp_storage::tenant_provision::{sanitize_ident, tenant_db_name};
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (idempotency/orphan gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (idempotency/orphan gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const DB_BINDING: &str = "app";
+    const DATABASE: &str = "idem";
+    let s = now_suffix();
+    // A DELIBERATELY LONG dest project name so its derived tenant db name sits AT the 63-byte
+    // NAMEDATALEN cap — the regime where the pre-fix `__deleted_<ts>` aside overflows + collapses.
+    let dest = format!("idem-dest-{s}-{}", "z".repeat(28));
+    let src = format!("idem-src-{s}");
+    let sibling = format!("idem-sib-{s}");
+    let decl = format!("idem-decl-{s}"); // gap 1 + gap 4: a PROJECT-DECLARED db (declarative front door)
+
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    // --- control plane: MemoryKv + throwaway FsStorage DeployStore + a reversible test envelope. ---
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-idem-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([7u8; 32]));
+
+    // Seal the SUPERUSER credential + seed ONE healthy replica of the shared `pg` workload.
+    let seal_and_seed = |compute: String| {
+        let (kv, deploy, envelope, su_pw, host) = (
+            kv.clone(),
+            deploy.clone(),
+            envelope.clone(),
+            su_pw.clone(),
+            host.clone(),
+        );
+        async move {
+            let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+            kv.put(
+                &format!("managed-sql-cred/{DEFAULT_PROJECT}/{compute}"),
+                sealed,
+            )
+            .await
+            .expect("pre-seal superuser credential");
+            deploy
+                .set_replica_state(
+                    ProjectRef::DEFAULT,
+                    &ObservedInstance {
+                        handle: InstanceHandle {
+                            project: DEFAULT_PROJECT.to_string(),
+                            workload: compute.clone(),
+                            replica: 0,
+                            backend_ref: "test-external-pg".to_string(),
+                        },
+                        node: 0,
+                        backend: "external".to_string(),
+                        endpoint: Endpoint {
+                            scheme: Scheme::Http,
+                            host: host.clone(),
+                            port,
+                        },
+                        region: None,
+                        healthy: true,
+                        started_at: None,
+                        phase: ReplicaPhase::Running,
+                        readiness: Readiness::Provisioned,
+                        data_dir: None,
+                        snapshot: None,
+                        active_spec: None,
+                    },
+                )
+                .await
+                .expect("seed healthy replica");
+        }
+    };
+    seal_and_seed(COMPUTE.to_string()).await;
+
+    // A SHARED, Project-grain, NON-rls managed-pg binding (per-tenant db on the shared `pg` server).
+    let binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(DATABASE.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(DB_BINDING.to_string(), binding.clone())]);
+    let db_name = |p: &str| tenant_db_name(DATABASE, &sanitize_ident(p));
+    let dest_db = db_name(&dest);
+    let src_db = db_name(&src);
+    let sib_db = db_name(&sibling);
+
+    // Precondition: the dest db name is AT the 63-byte cap (the overflow regime the fix targets).
+    assert!(
+        dest_db.len() >= 60,
+        "the dest db name must be near the 63-byte cap to exercise the aside overflow, got {} bytes: {dest_db}",
+        dest_db.len()
+    );
+
+    // Teardown any prior run (re-runnable).
+    let decl_compute = managed_db_declare::derived_workload(&decl, "idemapp");
+    let decl_db = tenant_db_name("idemapp", &sanitize_ident(&decl));
+    for db in [&dest_db, &src_db, &sib_db, &decl_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    // Sweep any stale bounded asides from a prior run of THIS test's dest.
+    let aside_like = format!("{}%", &dest_db[..dest_db.len().min(30)]);
+    let (_c, stale) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT datname FROM pg_database WHERE datname LIKE '{aside_like}' AND datname LIKE '%__deleted_%'"),
+    )
+    .await;
+    for a in stale.lines().filter(|l| !l.trim().is_empty()) {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{}\"", a.trim()),
+        )
+        .await;
+    }
+
+    // === Provision the three static-binding tenants (shared keyspace: ≥2 tenants). ===
+    for p in [&src, &dest, &sibling] {
+        provision_tenant(&deploy, &kv, &envelope, &binding, p, "")
+            .await
+            .unwrap_or_else(|e| panic!("provision {p}: {e}"));
+    }
+
+    // Seed: SOURCE rows, a DISTINCT sibling secret (the isolation witness), and STALE dest data
+    // (to prove the re-run REPLACES it). Marker table seeded as the superuser (reaches every tenant db).
+    let seed = |db: String, rows: &str| {
+        let c = conn(&superuser, &su_pw, &host, port, &db);
+        let sql =
+            format!("CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES {rows};");
+        let backend = backend.clone();
+        let image = image.clone();
+        async move {
+            let (code, o) = psql(backend.as_ref(), &image, &c, &sql).await;
+            assert_eq!(code, 0, "seed {db}: {o}");
+        }
+    };
+    seed(src_db.clone(), "('A','src-a'),('B','src-b')").await;
+    seed(sib_db.clone(), "('S','sibling-secret')").await;
+    seed(dest_db.clone(), "('X','stale-dest')").await;
+
+    // --- the driver (static binding, wired like the serve path). ---
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-idem-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-idem-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases, deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false)
+        .with_trusted_extensions(vec![]);
+
+    // === EXPORT the source tenant (DataPlane + ShadowSwap — a FULL `-Fc` dump). ===
+    let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+    driver
+        .export(
+            &src,
+            &ExportOptions {
+                scope: BundleScope::DataPlane,
+                managed_restore: ManagedRestore::ShadowSwap,
+                include_identity: false,
+                transport_key: None,
+                delta: None,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("export source tenant");
+    let bundle = sink.into_inner();
+
+    // === GAP 3: RE-RUN the restore into the SAME-named dest whose managed DB ALREADY EXISTS (with
+    //     stale data) — TWICE. Each RECOVERS (idempotent replace / drop-and-recreate). ===
+    for attempt in 1..=2 {
+        let mut body = futures::io::Cursor::new(bundle.clone());
+        driver
+            .import(
+                &dest,
+                &mut body,
+                ImportOptions {
+                    apply: true,
+                    overwrite: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "RE-RUN #{attempt} into a same-named dest whose managed DB already exists MUST \
+                     RECOVER (idempotent replace), got: {e}"
+                )
+            });
+        let live = conn(&superuser, &su_pw, &host, port, &dest_db);
+        let (_c, got) = psql(
+            backend.as_ref(),
+            &image,
+            &live,
+            "SELECT tid || ':' || v FROM marker ORDER BY tid",
+        )
+        .await;
+        assert_eq!(
+            got, "A:src-a\nB:src-b",
+            "re-run #{attempt}: the source rows must land + the stale dest data must be gone"
+        );
+    }
+    // No orphan shadow/old db left behind by the swap.
+    let (_c, orphans) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "SELECT datname FROM pg_database WHERE datname LIKE '{aside_like}' AND (datname LIKE '%__shadow_%' OR datname LIKE '%__old_%')"
+        ),
+    )
+    .await;
+    assert!(
+        orphans.trim().is_empty(),
+        "no orphan __shadow_/__old_ db may remain after the swap: {orphans:?}"
+    );
+
+    // === ISOLATION (zero foreign bytes): the sibling tenant is a SEPARATE physical db, untouched by
+    //     all the dest churn — it still holds ONLY its own secret, no src/dest bytes. ===
+    let sib_conn = conn(&superuser, &su_pw, &host, port, &sib_db);
+    let (_c, sib_rows) = psql(
+        backend.as_ref(),
+        &image,
+        &sib_conn,
+        "SELECT tid || ':' || v FROM marker ORDER BY tid",
+    )
+    .await;
+    assert_eq!(
+        sib_rows, "S:sibling-secret",
+        "cross-tenant isolation: the sibling db must hold ONLY its own row (zero foreign bytes)"
+    );
+
+    // === GAP 2: SOFT-deprovision the 63-byte-name dest tenant. The rename-aside must SUCCEED
+    //     (bounded) — the pre-fix unbounded name collapses to the live name → `already exists`. ===
+    deprovision_tenant(
+        &deploy,
+        &kv,
+        &envelope,
+        &binding,
+        &dest,
+        "",
+        DEFAULT_DEPROVISION_GRACE_SECS,
+    )
+    .await
+    .expect(
+        "soft-deprovision of a 63-byte-name tenant MUST SUCCEED — the BOUNDED `__deleted_` aside \
+         never collapses to the live name (the pre-fix unbounded name would fail `database … \
+         already exists`, the construens soft-deprovision shape)",
+    );
+    // The live name is FREED (renamed aside) …
+    let (_c, still_live) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{dest_db}'"),
+    )
+    .await;
+    assert!(
+        still_live.trim().is_empty(),
+        "the soft-deprovision must FREE the live name (rename it aside): {dest_db}"
+    );
+    // … and the aside db exists, is ≤ 63 bytes, and is DISTINCT from the live name (never collapsed).
+    let (_c, asides) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT datname FROM pg_database WHERE datname LIKE '{aside_like}' AND datname LIKE '%__deleted_%'"),
+    )
+    .await;
+    let aside_names: Vec<&str> = asides
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        aside_names.len(),
+        1,
+        "exactly one bounded aside must exist: {asides:?}"
+    );
+    assert!(
+        aside_names[0].len() <= 63,
+        "the aside must fit NAMEDATALEN (≤63 bytes), got {} bytes: {}",
+        aside_names[0].len(),
+        aside_names[0]
+    );
+    assert_ne!(
+        aside_names[0], dest_db,
+        "the aside must never collapse back to the live name"
+    );
+    // Clean up the aside (best-effort hard drop — grace recovery is not under test here).
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP DATABASE IF EXISTS \"{}\"", aside_names[0]),
+    )
+    .await;
+
+    // === GAP 1: a PROJECT-DECLARED managed db (the declarative front door `project sync` uses) is
+    //     torn down by the deprovisioner even with an EMPTY node-static map. ===
+    seal_and_seed(decl_compute.clone()).await; // the declared binding's DERIVED compute → same pg server
+    let applydb: boatramp_core::compute::ApplyDatabase =
+        serde_json::from_value(serde_json::json!({
+            "name": "idemapp",
+            "kind": "postgres",
+            "tenant": "shared",
+            "tenant_scope": "project",
+        }))
+        .expect("minimal ApplyDatabase");
+    deploy
+        .set_project_database(ProjectRef::new(&decl), &applydb)
+        .await
+        .expect("store the project declaration");
+    let decl_binding = managed_db_declare::lower(&decl, &applydb);
+    provision_tenant(&deploy, &kv, &envelope, &decl_binding, &decl, "")
+        .await
+        .expect("provision the declared tenant");
+    let (_c, exists) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{decl_db}'"),
+    )
+    .await;
+    assert_eq!(exists.trim(), "1", "precondition: the declared db exists");
+
+    // EMPTY node-static map — the deprovisioner must still find the project's OWN declaration.
+    // grace=0 → immediate hard drop, so the teardown is directly observable.
+    let deprovisioner = NodeTenantDeprovisioner::new(
+        deploy.clone(),
+        kv.clone(),
+        envelope.clone(),
+        BTreeMap::new(),
+        0,
+    );
+    deprovisioner.deprovision_project(&decl).await;
+    let (_c, after_rm) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{decl_db}'"),
+    )
+    .await;
+    assert!(
+        after_rm.trim().is_empty(),
+        "GAP 1: `project rm`'s deprovisioner (empty static map) MUST drop the PROJECT-DECLARED db — \
+         pre-fix it walked only the static map and orphaned it"
+    );
+
+    // === GAP 4: the operator orphan-drop verb (`db drop database`) clears an orphan. ===
+    provision_tenant(&deploy, &kv, &envelope, &decl_binding, &decl, "")
+        .await
+        .expect("re-provision the declared tenant for the orphan-drop");
+    let (_c, reexists) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{decl_db}'"),
+    )
+    .await;
+    assert_eq!(
+        reexists.trim(),
+        "1",
+        "precondition: re-provisioned declared db exists"
+    );
+    let declare = NodeManagedDbDeclare::new(
+        BTreeMap::new(), // EMPTY static map — resolves the project's own declaration
+        deploy.clone(),
+        kv.clone(),
+        envelope.clone(),
+        DeclareQuota::from_config(None, None),
+        BackendRegistry::new(),
+    );
+    let outcome = declare
+        .drop_database(&decl, "idemapp")
+        .await
+        .expect("GAP 4: `db drop database` must hard-drop the declared managed db");
+    assert_eq!(
+        outcome.database, decl_db,
+        "the orphan-drop must target the DERIVED physical name (project-scoped, never raw)"
+    );
+    let (_c, after_drop) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{decl_db}'"),
+    )
+    .await;
+    assert!(
+        after_drop.trim().is_empty(),
+        "GAP 4: `db drop database` must drop the managed db (the orphan is cleared)"
+    );
+    // The reserved `default` project is refused (the catastrophic-drop guard).
+    let refused = declare.drop_database(DEFAULT_PROJECT, "idemapp").await;
+    assert!(
+        refused.is_err(),
+        "the default project's install db must never be droppable"
+    );
+
+    // === FINAL ISOLATION RE-CHECK: the sibling survived every dest/decl operation intact. ===
+    let (_c, sib_final) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &sib_db),
+        "SELECT tid || ':' || v FROM marker ORDER BY tid",
+    )
+    .await;
+    assert_eq!(
+        sib_final, "S:sibling-secret",
+        "the sibling tenant must be untouched by all dest/decl churn (zero foreign bytes)"
+    );
+
+    // --- cleanup (best-effort) ---
+    for db in [&src_db, &sib_db, &dest_db, &decl_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+
+    println!("PROJECT SYNC IDEMPOTENCY ORPHAN OK");
+}
+
 /// **Live managed-MySQL triggers/routines/events carry + DEFINER re-point gate** (Tier-2 / nightly —
 /// needs a Docker daemon AND a MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE
 /// DATABASE`). Self-skips.

@@ -930,9 +930,17 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>> = None;
 
     // Tenant-deprovision capability (drop a deleted tenant's managed DB/role/sealed
-    // credential on project/site delete). Wired only when a compute-backed managed
-    // database + a secrets envelope are both present — same gating as operator_sql,
-    // plus the envelope requirement (it must seal/unseal per-tenant credentials).
+    // credential on project/site delete). Wired whenever a secrets envelope is present (it must
+    // seal/unseal per-tenant credentials) + a sqlx engine is compiled in. UNLIKE operator_sql it is
+    // NOT gated on `!sql.databases.is_empty()`: a node that serves managed DBs ONLY through the
+    // per-project declarative front door (`db ensure` / `project sync`, which store the binding at
+    // `project/<proj>/database/<name>`, never in the node-static map) has an EMPTY node-static
+    // `databases` map — gating on it left the deprovisioner `None`, so a declared tenant DB was
+    // NEVER deprovisioned on delete (orphaned on `project rm`). Matches the `managed_db_declare`
+    // wiring (the provisioning side), so provision + deprovision are gated identically. The
+    // node-static map (possibly empty) is still threaded so a node-static per-tenant binding is
+    // deprovisioned too; the deprovisioner ALSO enumerates the deleted project's OWN declared
+    // databases via the `DeployStore`.
     // The soft-delete grace window for a Shared-Postgres managed tenant
     // (`handlers.bindings.sql.deprovision_grace_secs`, env-settable). Default 7 days;
     // `0` disables the soft path (immediate hard drop). Threaded to the deprovisioner
@@ -946,18 +954,19 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         .and_then(|sql| sql.deprovision_grace_secs)
         .unwrap_or(crate::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS);
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    let tenant_deprovisioner: Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>> = config
-        .handlers
-        .as_ref()
-        .and_then(|h| h.bindings.sql.as_ref())
-        .filter(|sql| !sql.databases.is_empty())
-        .zip(deprovision_envelope)
-        .map(|(sql, envelope)| {
+    let tenant_deprovisioner: Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>> =
+        deprovision_envelope.map(|envelope| {
+            let static_dbs = config
+                .handlers
+                .as_ref()
+                .and_then(|h| h.bindings.sql.as_ref())
+                .map(|sql| sql.databases.clone())
+                .unwrap_or_default();
             Arc::new(crate::tenant_sql::NodeTenantDeprovisioner::new(
                 deploy.clone(),
                 kv.clone(),
                 envelope,
-                sql.databases.clone(),
+                static_dbs,
                 deprovision_grace_secs,
             )) as Arc<_>
         });

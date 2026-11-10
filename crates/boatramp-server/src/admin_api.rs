@@ -2257,6 +2257,67 @@ pub(super) async fn drop_user(
     }
 }
 
+/// Query for [`drop_database`]: the typed `?confirm=<name>` confirmation guard on the
+/// irreversible managed-DB drop.
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct DropDatabaseQuery {
+    /// Must EXACTLY equal the database name for the drop to proceed — a deliberate confirmation a
+    /// stray `DELETE` can never satisfy.
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+/// `DELETE /api/projects/{proj}/databases/{name}` — **HARD-DROP** a managed database
+/// (`Project·Admin`). **IRREVERSIBLE**: the explicit operator teardown + the ONLY recovery verb for
+/// a database ORPHANED by a failed `project sync` / pre-fix `project rm`. Guarded by a typed
+/// `?confirm=<name>` that MUST equal the database name — a deliberate confirmation a stray `DELETE`
+/// can never satisfy — on top of the `Project·Admin` gate. Drops the DERIVED per-tenant database +
+/// role + sealed credential (Shared) or the dedicated workload + its credential (Single);
+/// idempotent on an absent DB. The reserved `default` project is refused. Backs
+/// `boatramp db drop database`.
+pub(super) async fn drop_database(
+    Extension(project): Extension<ProjectContext>,
+    Extension(declare): Extension<Option<Arc<dyn boatramp_core::sql::ManagedDbDeclare>>>,
+    Path(name): Path<String>,
+    Query(q): Query<DropDatabaseQuery>,
+) -> Response {
+    if let Some(bad) = reject_invalid_db(&name) {
+        return bad;
+    }
+    if let Some(forbidden) = assert_databases_is_admin(project.as_ref().as_str()) {
+        return forbidden;
+    }
+    // CONFIRMATION (hard guard on an IRREVERSIBLE `DROP DATABASE`): `?confirm=<name>` must exactly
+    // match the database name. A `DELETE` with no / a wrong confirm is a `400`, never a drop.
+    if q.confirm.as_deref() != Some(name.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "dropping managed database {name:?} is IRREVERSIBLE — re-send with \
+                 ?confirm={name} to proceed\n"
+            ),
+        )
+            .into_response();
+    }
+    let Some(declare) = declare else {
+        return declare_unavailable();
+    };
+    match declare
+        .drop_database(project.as_ref().as_str(), &name)
+        .await
+    {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "database": name,
+                "physical": outcome.database,
+            })),
+        )
+            .into_response(),
+        Err(e) => declare_error_response(e),
+    }
+}
+
 /// `GET /api/projects/{proj}/databases` — list the project's declared managed databases
 /// (read-only; `Project·Read`). Each is the stored typed
 /// [`ApplyDatabase`](boatramp_core::compute::ApplyDatabase).

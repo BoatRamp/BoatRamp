@@ -626,6 +626,17 @@ fn map_err(err: sqlx::Error) -> SqlError {
             if code.starts_with("23") {
                 return SqlError::Constraint(db.message().to_string());
             }
+            // `42P04` is Postgres `duplicate_database` ("database … already exists"). It lives in
+            // SQLSTATE class 42, but it is an ALREADY-EXISTS condition, NOT a syntax/access-rule
+            // error — labelling it `Syntax` produces the misleading "sql syntax error: database …
+            // already exists" an idempotent provision/deprovision surfaces. Route it to `Other` so
+            // the message reads plainly ("sql error: database … already exists"); only our own
+            // trusted `CREATE DATABASE` can raise it (a guest has no privilege to create a
+            // database), so this never changes a guest-facing error class. The `already exists`
+            // substring is preserved, so the provision idempotency tolerance still matches.
+            if code == "42P04" {
+                return SqlError::Other(db.message().to_string());
+            }
             if code.starts_with("42") {
                 return SqlError::Syntax(db.message().to_string());
             }
