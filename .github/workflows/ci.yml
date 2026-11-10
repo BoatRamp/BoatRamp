@@ -2976,6 +2976,26 @@ jobs:
           # unset GUC stay fail-closed. A leak (marker over-opening) fails the assertion.
           grep -q 'RLS ALL-READ MARKER OK \[postgres\]' rls-guc.log \
             || { echo "::error::RLS all-read marker never reached its marker (the marker didn't open an opted-in all-read, or it leaked to a non-opted table / a write)" >&2; exit 1; }
+      - name: rls_session NON-OWNER runtime tenancy invariant on a real Postgres (fix/rls-tenancy-contract)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # The `rls_session` two-posture soundness contract. The handler/FaaS serving path connects
+          # as the per-tenant NON-OWNER runtime `_role`, and PostgreSQL binds a plain ENABLE ROW LEVEL
+          # SECURITY table against a non-owner — so RLS holds with NO FORCE (the construens shape:
+          # ENABLE-not-FORCE + an owner-authority migrator). On a real PG, with TWO tenants' rows in
+          # one shared table, the REAL provision_ddl+grant_app_role_ddl model proves: (1) the NON-OWNER
+          # runtime sees ONLY its own tenant's row (ZERO foreign bytes, no FORCE); (2) FAILURE MODE —
+          # the OWNER posture sees BOTH rows under ENABLE-not-FORCE (why an owner-posture serving role
+          # must NOT serve rls_session without FORCE); (3) FORCE closes the owner leak. A regression on
+          # any arm (the invariant not holding, or the leak not exhibited) fails the assertion.
+          cargo test -p boatramp-storage --features sql-postgres \
+            --test managed_rls_nonowner_runtime_sqlx_live -- --ignored --nocapture 2>&1 | tee rls-nonowner.log
+          grep -qE 'test result: ok\. 1 passed' rls-nonowner.log \
+            || { echo "::error::rls_session non-owner invariant gate did not run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
+          grep -q 'MANAGED RLS NON-OWNER RUNTIME OK \[postgres\]' rls-nonowner.log \
+            || { echo "::error::rls_session non-owner invariant never reached its marker (the non-owner runtime leaked cross-tenant under ENABLE, the owner-posture leak was not exhibited, or FORCE did not bind the owner)" >&2; exit 1; }
       - name: Owner-gated schema-migration owner-role confinement on a real Postgres (v0.4.25)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
