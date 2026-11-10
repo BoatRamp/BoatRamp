@@ -128,6 +128,13 @@ enum DropWhat {
         /// Confirm the IRREVERSIBLE drop (required — there is no interactive prompt).
         #[arg(short = 'y', long = "yes")]
         yes: bool,
+        /// Clear an UNDECLARED ORPHAN: hard-drop the derived managed database even when NO binding is
+        /// declared (a prior failed `project sync` / `project rm` left it orphaned, so the normal
+        /// drop reports it is not declared). The physical database + its `_owner`/login roles +
+        /// credentials are derived from `(project, name)` server-side (never a raw name) and dropped.
+        /// Shared-Postgres only. Idempotent on an already-absent orphan.
+        #[arg(long = "orphan")]
+        orphan: bool,
     },
 }
 
@@ -518,12 +525,12 @@ pub async fn run(args: DbArgs, config: &ProjectConfig) -> Result<DbOutput> {
                 validate_name(&database)?;
                 drop_user(&cp, &database, &name).await
             }
-            DropWhat::Database { name, yes } => {
+            DropWhat::Database { name, yes, orphan } => {
                 validate_name(&name)?;
                 if !yes {
                     return Err(Error::DropNotConfirmed(name));
                 }
-                drop_database(&cp, &name).await
+                drop_database(&cp, &name, orphan).await
             }
         },
         DbCommand::Restart { db } => {
@@ -554,9 +561,10 @@ async fn ensure_user(
     })
 }
 
-/// `db drop database <name> -y` — hard-drop the managed database (+ role + credential).
-async fn drop_database(cp: &ControlPlane, name: &str) -> Result<DbOutput> {
-    let physical = cp.drop_database(name).await?;
+/// `db drop database <name> -y [--orphan]` — hard-drop the managed database (+ roles + credential).
+/// With `orphan`, drops an UNDECLARED orphan whose binding is gone (derived server-side).
+async fn drop_database(cp: &ControlPlane, name: &str, orphan: bool) -> Result<DbOutput> {
+    let physical = cp.drop_database(name, orphan).await?;
     Ok(DbOutput::DropDatabase {
         name: name.to_string(),
         physical,

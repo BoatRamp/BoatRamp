@@ -4347,8 +4347,15 @@ impl NodeProjectExport {
                             let stage_dir = temp.parent().ok_or_else(|| {
                                 Perr::Other("sidecar pg member temp has no parent dir".into())
                             })?;
-                            self.pg_sidecar_shadow_restore(project, db, cfg, temp, stage_dir)
-                                .await?;
+                            self.pg_sidecar_shadow_restore(
+                                project,
+                                db,
+                                cfg,
+                                temp,
+                                stage_dir,
+                                opts.skip_control_plane_kv,
+                            )
+                            .await?;
                         }
                         SidecarManagedApply::External => {
                             // EXTERNAL bring-your-own-URL binding: the OPERATOR'S OWN database +
@@ -5923,8 +5930,21 @@ impl NodeProjectExport {
         cfg: &ExternalDatabaseConfig,
         temp: &Path,
         stage_dir: &Path,
+        fresh_dest: bool,
     ) -> Result<(), Perr> {
         let plan = self.pg_shadow_plan(project, db, cfg).await?;
+        // FAIL-SAFE fresh-dest reconciliation (construens undeclared-orphan, DATA-LOSS-SENSITIVE):
+        // on the ABSENT-dest / fresh-sync path the sync treats the dest as absent, so a database
+        // already occupying the derived target name is an UNEXPECTED orphan a prior `project rm` /
+        // failed sync left behind. Preserve its data (soft-delete tombstone) before the swap lands,
+        // rather than let the swap silently clobber it. See `pg_reconcile_fresh_dest_occupant`.
+        if fresh_dest
+            && let Err(e) = self
+                .pg_reconcile_fresh_dest_occupant(project, db, cfg, &plan, stage_dir)
+                .await
+        {
+            return Err(e);
+        }
         // TRUSTED DDL (superuser/maint): mint the ephemeral NON-SUPERUSER role + the shadow it owns +
         // (Shared) the REVOKE-PUBLIC lockdown + pre-create the allow-listed extensions.
         if let Err(e) = self.pg_create_shadow(&plan, stage_dir).await {
@@ -6192,6 +6212,135 @@ impl NodeProjectExport {
             )));
         }
         Ok(out.trim() == "1")
+    }
+
+    /// Whether database `name` holds ANY user table — the "real data" signature that distinguishes a
+    /// POPULATED occupant (a red flag on the fresh-sync path — must NOT be clobbered) from an EMPTY
+    /// one (a freshly-`CREATE DATABASE`d-but-never-restored failed-restore orphan — the
+    /// "unrestored-orphan signature", safe to replace). Counts tables in every schema EXCEPT the
+    /// system ones (`pg_catalog`/`information_schema`; `pg_toast` is never in `pg_tables`), via the
+    /// SUPERUSER maintenance connection pointed at `name`. A freshly-provisioned tenant db (only the
+    /// empty `public` schema, no tables) returns `false`; a db carrying any restored/real table
+    /// returns `true`. Fail-safe bias: ANY user table ⇒ populated ⇒ preserve.
+    async fn pg_db_has_user_tables(
+        &self,
+        plan: &PgShadowPlan,
+        name: &str,
+        stage_dir: &Path,
+    ) -> Result<bool, Perr> {
+        let mut on_db = plan.maint.clone();
+        on_db.database = name.to_string();
+        let inv = psql_invocation(
+            &on_db,
+            "SELECT count(*) FROM pg_tables \
+             WHERE schemaname NOT IN ('pg_catalog', 'information_schema')",
+        );
+        let (code, out) = self
+            .run_sql_capture(&plan.image, &inv.argv, &inv.env, None, stage_dir)
+            .await?;
+        if code != 0 {
+            return Err(Perr::Other(format!(
+                "pg fresh-dest reconcile: could not probe user tables in {name:?} (exit {code}): {out}"
+            )));
+        }
+        Ok(out.trim().parse::<i64>().unwrap_or(0) > 0)
+    }
+
+    /// FAIL-SAFE fresh-dest reconciliation (construens's UNDECLARED-orphan gap; DATA-LOSS-SENSITIVE
+    /// — flagged for Security review).
+    ///
+    /// On the ABSENT-dest / fresh-sync path (`project sync` into a dest it treats as absent — the
+    /// `skip_control_plane_kv` full-bundle shape), the managed-pg restore EXPECTS the derived target
+    /// name to be FREE. A database ALREADY occupying it is an orphan a prior `project rm` / failed
+    /// `project sync --apply` left behind (physically present in the cluster, but the sync no longer
+    /// sees a declared binding for it — exactly construens's shape). The shadow-swap's own
+    /// rename-aside+drop would otherwise SILENTLY REPLACE it, destroying whatever it held. A
+    /// failed-restore orphan is empty/stale and fine to replace; a POPULATED database at the target
+    /// name is a RED FLAG (it may hold real tenant data).
+    ///
+    /// This classifies the occupant and picks the FAIL-SAFE option:
+    /// - absent / EMPTY (the unrestored-orphan signature) ⇒ no-op — the swap replaces it (a
+    ///   fresh-identity sync replacing an empty orphan is fine).
+    /// - POPULATED ⇒ do NOT clobber: SOFT-DEPROVISION it to a recoverable `__deleted_<ts>` tombstone
+    ///   (reusing the v0.59.3 soft-delete + grace machinery via [`crate::tenant_sql::deprovision_tenant`]),
+    ///   which terminates sessions, renames the live db aside (FREEING the derived name), marks it
+    ///   `NOLOGIN`, KEEPS the sealed credential, and writes the grace tombstone. The restore then
+    ///   lands on the now-free name, and the preserved data is recoverable within the grace window (or
+    ///   droppable via `db drop database --orphan` once the operator has confirmed it is disposable).
+    ///
+    /// SCOPE: the Shared recoverable cell only — a non-default Shared tenant (`shared_reprovision`
+    /// is `Some`), whose per-tenant database is the deterministically-named thing a prior rm orphaned.
+    /// A Single/dedicated or Shared-DEFAULT occupant (`shared_reprovision` is `None`) has no
+    /// rename-aside soft-delete (Single's isolation unit is a whole container), so it is left to the
+    /// swap unchanged. The derived target name + the deprovision derivation are both computed
+    /// STRUCTURALLY from the caller's own `(project, binding)` — never from dump/guest content — so
+    /// this can only ever touch THIS caller's own derived database.
+    async fn pg_reconcile_fresh_dest_occupant(
+        &self,
+        project: &str,
+        db: &str,
+        cfg: &ExternalDatabaseConfig,
+        plan: &PgShadowPlan,
+        stage_dir: &Path,
+    ) -> Result<(), Perr> {
+        // Only the Shared recoverable cell has a soft-delete tombstone path.
+        if plan.shared_reprovision.is_none() {
+            return Ok(());
+        }
+        // Nothing at the derived target name ⇒ a genuinely fresh dest; nothing to reconcile.
+        if !self.pg_db_exists(plan, &plan.live_db, stage_dir).await? {
+            return Ok(());
+        }
+        // An EMPTY occupant is a freshly-provisioned-but-never-restored failed-restore orphan — the
+        // swap replaces it cheaply (its own rename-aside+drop). Only a POPULATED occupant is a red flag.
+        if !self
+            .pg_db_has_user_tables(plan, &plan.live_db, stage_dir)
+            .await?
+        {
+            return Ok(());
+        }
+        let envelope = self.envelope.as_ref().ok_or_else(|| {
+            Perr::Unavailable(format!(
+                "fresh-dest reconcile of {:?} needs a [secrets] envelope to unseal its superuser \
+                 credential — none on this node",
+                plan.live_db
+            ))
+        })?;
+        tracing::warn!(
+            database = %db,
+            physical = %plan.live_db,
+            "fresh-sync dest reconcile: a POPULATED database already occupies the derived target name \
+             (an orphan a prior `project rm` / failed sync left behind); soft-deprovisioning it to a \
+             recoverable `__deleted_` tombstone (grace recovery) instead of clobbering it, then landing \
+             the restore on the freed name"
+        );
+        crate::tenant_sql::deprovision_tenant(
+            &self.deploy,
+            &self.kv,
+            envelope,
+            cfg,
+            project,
+            "",
+            crate::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS,
+        )
+        .await
+        .map_err(|e| {
+            Perr::Other(format!(
+                "fresh-dest reconcile: failed to soft-deprovision the populated orphan at {:?} \
+                 (refusing to clobber real data; live left intact): {e}",
+                plan.live_db
+            ))
+        })?;
+        // Belt-and-suspenders: the soft-deprovision must have FREED the derived name (renamed it
+        // aside). If it somehow did not, refuse rather than let the swap clobber the occupant.
+        if self.pg_db_exists(plan, &plan.live_db, stage_dir).await? {
+            return Err(Perr::Other(format!(
+                "fresh-dest reconcile: the populated orphan at {:?} still occupies the derived name \
+                 after soft-deprovision — refusing to clobber it; live left intact",
+                plan.live_db
+            )));
+        }
+        Ok(())
     }
 
     /// TRUSTED DDL (superuser): mint the EPHEMERAL non-superuser apply role, create the shadow

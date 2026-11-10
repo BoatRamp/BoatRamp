@@ -2289,6 +2289,31 @@ pub trait ManagedDbDeclare: Send + Sync {
         project: &str,
         name: &str,
     ) -> Result<DropDatabaseOutcome, DeclareError>;
+
+    /// Hard-DROP an **UNDECLARED ORPHAN** managed database by IDENTITY — the
+    /// `DELETE /api/databases/{name}?orphan=true` verb / `boatramp db drop database --orphan`. The
+    /// fail-safe recovery path for a managed database whose declaration is GONE (a prior failed
+    /// `project sync` or a `project rm` left the physical database + roles behind, but `db ls` shows
+    /// "no declared managed databases"), which [`drop_database`](Self::drop_database) cannot reach:
+    /// it `NotDeclared`s when neither a node-static binding nor a project declaration resolves — the
+    /// exact "no CLI path to reach it" case construens's v0.59.3 acceptance hit.
+    ///
+    /// **IRREVERSIBLE and immediate.** Hard-scoped STRUCTURALLY, not by a string check: when no
+    /// binding resolves, a MINIMAL managed Shared-Postgres/Project binding is reconstructed from
+    /// `(project, name)` and EVERY physical name (the database, its login + owner roles, the sealed
+    /// credentials) is DERIVED from `(project, name)` exactly as provisioning derived them — NEVER an
+    /// operator-supplied raw database name — so this can ONLY ever target THIS project's own derived
+    /// database within the node's managed derived-name namespace; an arbitrary / foreign / system
+    /// database name is unreachable by construction. Drops the database + its orphaned OWNER
+    /// (`…_owner`) + login role (best-effort on the roles — a role still owning other objects is left
+    /// intact) + the sealed credentials. Idempotent (`IF EXISTS`). The reserved `default` project is
+    /// refused (the catastrophic-drop guard). Scoped to Shared Postgres (the per-tenant-db orphan
+    /// shape); a declared binding, if one still resolves, is hard-dropped the same way.
+    async fn drop_orphan_database(
+        &self,
+        project: &str,
+        name: &str,
+    ) -> Result<DropDatabaseOutcome, DeclareError>;
 }
 
 /// The outcome of [`ManagedDbDeclare::drop_database`]: the derived PHYSICAL database name that was

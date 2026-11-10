@@ -3945,6 +3945,542 @@ async fn project_sync_idempotency_orphan_recovery_live() {
     println!("PROJECT SYNC IDEMPOTENCY ORPHAN OK");
 }
 
+/// **Live UNDECLARED-ORPHAN reconcile + absent-dest FULL-bundle shadow-swap LAND gate** (Tier-2 /
+/// nightly — needs a Docker daemon AND real Postgres). The fifth-layer construens failure: a prior
+/// `project rm` / failed sync leaves a managed DB **ORPHANED + UNDECLARED** (the physical per-tenant
+/// db + roles exist in pg, but no declared binding), then a fresh `project sync --apply` runs an
+/// ABSENT-dest FULL-bundle restore into the SAME project identity. v0.59.3's gap-3 idempotency
+/// recovery lives in `pg_swap_shadow`'s shadow→live RENAME (the existing-dest swap path); the fresh
+/// path's reconciliation of a POPULATED occupant was the gap. This gate reproduces that EXACT shape
+/// on real pg and proves, with CONTENT checks (not just "no error"):
+///
+/// 1. **The FULL shadow-swap restore LANDS end-to-end**: create (reconciling the undeclared orphan at
+///    the target name) → the real `pg_restore` into the shadow → the atomic swap into the live name →
+///    the SOURCE rows are genuinely present + correct in the live dest DB afterward (exact rows).
+/// 2. **FAIL-SAFE reconciliation (fix #1; DATA-LOSS-SENSITIVE, flagged for Security)**: a POPULATED
+///    orphan occupying the target name is NOT silently clobbered — it is soft-deprovisioned to a
+///    recoverable `__deleted_<ts>` tombstone (grace recovery), which still holds its REAL data.
+///    MUTATION WITNESS: without the fix the orphan's data is destroyed with no recoverable aside — so
+///    the "the preserved tombstone holds the real data" assertion fails on the unfixed code (the
+///    construens silent-data-loss wall; the v0.59.2 restore mechanism itself had never completed
+///    end-to-end against a real cross-node run, so this LANDS it on our rig).
+/// 3. **Cross-tenant isolation**: ≥2 tenants, each a SEPARATE physical db (the Shared per-tenant-db
+///    model) under `rls_session` RLS fencing. The sibling holds ONLY its own secret — zero foreign
+///    bytes — through all the dest churn, and the restored dest carries the re-installed force-RLS
+///    event trigger (the RLS fence re-asserted post-swap).
+/// 4. **Raw UNDECLARED-ORPHAN drop (fix #2)**: `drop_orphan_database` clears an orphan whose binding
+///    is GONE (the "no CLI path" case `drop_database` `NotDeclared`s), deriving the physical db +
+///    `_owner`/login roles STRUCTURALLY from `(project, name)` (never a raw name), and REFUSES the
+///    reserved `default` project (the catastrophic / out-of-namespace guard).
+///
+/// Emits `PROJECT SYNC UNDECLARED ORPHAN RECONCILE OK`.
+#[tokio::test]
+async fn project_sync_undeclared_orphan_reconcile_live() {
+    use boatramp_core::compute::{
+        BackendRegistry, Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase,
+        Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_core::sql::ManagedDbDeclare;
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_db_declare::{self, DeclareQuota, NodeManagedDbDeclare};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{sanitize_ident, tenant_db_name};
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (undeclared-orphan reconcile gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!(
+                "SKIP: no reachable Docker daemon (undeclared-orphan reconcile gate not run)"
+            );
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const DB_BINDING: &str = "app";
+    const DATABASE: &str = "uorph";
+    let s = now_suffix();
+    let dest = format!("uorph-dest-{s}");
+    let src = format!("uorph-src-{s}");
+    let sibling = format!("uorph-sib-{s}");
+
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-uorph-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+
+    // Seal the superuser credential + seed one healthy replica of a named shared `pg` workload.
+    let seal_and_seed = |compute: String, su: String| {
+        let (kv, deploy, envelope, su_pw, host) = (
+            kv.clone(),
+            deploy.clone(),
+            envelope.clone(),
+            su_pw.clone(),
+            host.clone(),
+        );
+        async move {
+            let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+            kv.put(
+                &format!("managed-sql-cred/{DEFAULT_PROJECT}/{compute}"),
+                sealed,
+            )
+            .await
+            .expect("pre-seal superuser credential");
+            deploy
+                .set_replica_state(
+                    ProjectRef::DEFAULT,
+                    &ObservedInstance {
+                        handle: InstanceHandle {
+                            project: DEFAULT_PROJECT.to_string(),
+                            workload: compute.clone(),
+                            replica: 0,
+                            backend_ref: "test-external-pg".to_string(),
+                        },
+                        node: 0,
+                        backend: "external".to_string(),
+                        endpoint: Endpoint {
+                            scheme: Scheme::Http,
+                            host: host.clone(),
+                            port,
+                        },
+                        region: None,
+                        healthy: true,
+                        started_at: None,
+                        phase: ReplicaPhase::Running,
+                        readiness: Readiness::Provisioned,
+                        data_dir: None,
+                        snapshot: None,
+                        active_spec: None,
+                    },
+                )
+                .await
+                .expect("seed healthy replica");
+            let _ = su; // the shared `pg` server's superuser is the DSN's own ("postgres").
+        }
+    };
+    seal_and_seed(COMPUTE.to_string(), superuser.clone()).await;
+
+    // A SHARED, Project-grain, RLS-fenced managed-pg binding (per-tenant db on the shared `pg`
+    // server) — construens's tenancy shape. `rls_session` so the restore exercises the RLS-fenced
+    // path (the superuser-only force-RLS objects excluded from the non-super restore, re-installed by
+    // the post-swap re-provision).
+    let binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(DATABASE.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        rls_session: true,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(DB_BINDING.to_string(), binding.clone())]);
+    let db_name = |p: &str| tenant_db_name(DATABASE, &sanitize_ident(p));
+    let dest_db = db_name(&dest);
+    let src_db = db_name(&src);
+    let sib_db = db_name(&sibling);
+
+    // Teardown any prior run (re-runnable), including any bounded asides from a prior dest.
+    for db in [&dest_db, &src_db, &sib_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    let aside_like = format!("{}%", &dest_db[..dest_db.len().min(24)]);
+    let (_c, stale) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT datname FROM pg_database WHERE datname LIKE '{aside_like}' AND datname LIKE '%__deleted_%'"),
+    )
+    .await;
+    for a in stale.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{a}\""),
+        )
+        .await;
+    }
+
+    // === Provision the three tenants (shared keyspace: ≥2 tenants, each a SEPARATE physical db). ===
+    for p in [&src, &dest, &sibling] {
+        provision_tenant(&deploy, &kv, &envelope, &binding, p, "")
+            .await
+            .unwrap_or_else(|e| panic!("provision {p}: {e}"));
+    }
+
+    // Seed: SOURCE rows, a DISTINCT sibling secret (the isolation witness), and the POPULATED dest
+    // orphan's REAL data (what a fresh sync must NOT silently clobber).
+    let seed = |db: String, rows: &str| {
+        let c = conn(&superuser, &su_pw, &host, port, &db);
+        let sql =
+            format!("CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES {rows};");
+        let backend = backend.clone();
+        let image = image.clone();
+        async move {
+            let (code, o) = psql(backend.as_ref(), &image, &c, &sql).await;
+            assert_eq!(code, 0, "seed {db}: {o}");
+        }
+    };
+    seed(src_db.clone(), "('A','src-a'),('B','src-b')").await;
+    seed(sib_db.clone(), "('S','sibling-secret')").await;
+    seed(dest_db.clone(), "('X','REAL-DEST-DATA'),('Y','more-real')").await;
+
+    // --- the driver (static binding, wired like the serve path). ---
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-uorph-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-uorph-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases.clone(), deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false)
+        .with_trusted_extensions(vec![]);
+
+    // === EXPORT the source tenant as a FULL bundle (the absent-dest sync shape). ===
+    let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+    driver
+        .export(
+            &src,
+            &ExportOptions {
+                scope: BundleScope::Full,
+                managed_restore: ManagedRestore::ShadowSwap,
+                include_identity: false,
+                transport_key: None,
+                delta: None,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("export source tenant");
+    let bundle = sink.into_inner();
+
+    // === THE FRESH SYNC: an ABSENT-dest FULL-bundle restore (`skip_control_plane_kv`, the sync's own
+    //     absent-dest shape) into the same project identity whose managed DB is a POPULATED orphan. ===
+    let mut body = futures::io::Cursor::new(bundle.clone());
+    driver
+        .import(
+            &dest,
+            &mut body,
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                skip_control_plane_kv: true,
+                expected_managed_restore: Some(ManagedRestore::ShadowSwap),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "absent-dest FULL-bundle shadow-swap restore into a POPULATED undeclared orphan MUST \
+                 LAND (reconcile the orphan + restore the source), got: {e}"
+            )
+        });
+
+    // (1) The FULL shadow-swap restore LANDED: the SOURCE rows are genuinely present + correct.
+    let live = conn(&superuser, &su_pw, &host, port, &dest_db);
+    let (_c, got) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT tid || ':' || v FROM marker ORDER BY tid",
+    )
+    .await;
+    assert_eq!(
+        got, "A:src-a\nB:src-b",
+        "the full shadow-swap restore must land the SOURCE rows in the live dest db (end-to-end on real pg)"
+    );
+
+    // (2) FAIL-SAFE: the POPULATED orphan was NOT clobbered — its REAL data survives in a recoverable
+    //     `__deleted_` tombstone. MUTATION WITNESS: without the fix no tombstone exists and the data is gone.
+    let (_c, asides) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT datname FROM pg_database WHERE datname LIKE '{aside_like}' AND datname LIKE '%__deleted_%'"),
+    )
+    .await;
+    let tombstones: Vec<&str> = asides
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        tombstones.len(),
+        1,
+        "the populated orphan MUST be preserved as EXACTLY ONE recoverable `__deleted_` tombstone \
+         (fail-safe reconcile) — WITHOUT the fix it is silently clobbered (no tombstone): {asides:?}"
+    );
+    assert!(
+        tombstones[0].len() <= 63 && tombstones[0] != dest_db,
+        "the tombstone must be bounded (≤63 bytes) and distinct from the live name: {}",
+        tombstones[0]
+    );
+    let tconn = conn(&superuser, &su_pw, &host, port, tombstones[0]);
+    let (_c, trows) = psql(
+        backend.as_ref(),
+        &image,
+        &tconn,
+        "SELECT tid || ':' || v FROM marker ORDER BY tid",
+    )
+    .await;
+    assert_eq!(
+        trows, "X:REAL-DEST-DATA\nY:more-real",
+        "the preserved tombstone MUST still hold the orphan's REAL data (fail-safe, never clobbered)"
+    );
+
+    // (3a) RLS fence re-installed post-swap: the restored dest db carries the force-RLS event trigger.
+    let (_c, trg) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT count(*) FROM pg_event_trigger WHERE evtname = 'boatramp_force_rls_trg'",
+    )
+    .await;
+    assert_eq!(
+        trg.trim(),
+        "1",
+        "the post-swap re-provision must re-install the RLS force-fence event trigger on the restored \
+         dest db (RLS held through the restore)"
+    );
+
+    // (3b) Cross-tenant isolation (zero foreign bytes): the sibling is a SEPARATE physical db, untouched.
+    let sib_conn = conn(&superuser, &su_pw, &host, port, &sib_db);
+    let (_c, sib_rows) = psql(
+        backend.as_ref(),
+        &image,
+        &sib_conn,
+        "SELECT tid || ':' || v FROM marker ORDER BY tid",
+    )
+    .await;
+    assert_eq!(
+        sib_rows, "S:sibling-secret",
+        "cross-tenant isolation: the sibling db must hold ONLY its own row (zero foreign bytes)"
+    );
+
+    // Clean up the tombstone (grace recovery is not under test here).
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP DATABASE IF EXISTS \"{}\"", tombstones[0]),
+    )
+    .await;
+
+    // === (4) RAW UNDECLARED-ORPHAN DROP (fix #2). Provision a tenant via the DERIVED (declarative)
+    //     binding, DON'T declare it (⇒ UNDECLARED), prove `drop_database` can't reach it, then
+    //     `drop_orphan_database` clears it by reconstructed derivation. ===
+    let orphanp = format!("uorph-orphan-{s}");
+    let orphan_binding_name = "uorphapp";
+    let orphan_compute = managed_db_declare::derived_workload(&orphanp, orphan_binding_name);
+    let orphan_db = tenant_db_name(orphan_binding_name, &sanitize_ident(&orphanp));
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP DATABASE IF EXISTS \"{orphan_db}\""),
+    )
+    .await;
+    // The declarative front door lowers `user = database = <binding name>`, so the managed server's
+    // superuser is NAMED after the binding; our one shared container's superuser is "postgres", so
+    // stand up that role (= su_pw) and seal/seed the DERIVED compute exactly as production would.
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{orphan_binding_name}') THEN \
+             CREATE ROLE {orphan_binding_name} SUPERUSER LOGIN PASSWORD '{su_pw}'; END IF; END $$;"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "create the derived-binding superuser role: {o}");
+    seal_and_seed(orphan_compute.clone(), orphan_binding_name.to_string()).await;
+    // The reconstructed managed Shared/Project/pg binding — EXACTLY what `drop_orphan_database`
+    // rebuilds for an undeclared name, so provisioning here derives the SAME physical db + roles.
+    let orphan_binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(orphan_compute.clone()),
+        database: Some(orphan_binding_name.into()),
+        user: Some(orphan_binding_name.into()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    provision_tenant(&deploy, &kv, &envelope, &orphan_binding, &orphanp, "")
+        .await
+        .expect("provision the (to-be-orphaned) tenant");
+    let (_c, exists) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{orphan_db}'"),
+    )
+    .await;
+    assert_eq!(exists.trim(), "1", "precondition: the orphan db exists");
+    // The owner role exists too (what the immediate declared drop LEAKS, and the orphan drop clears).
+    let owner_role = boatramp_storage::tenant_provision::tenant_owner_role_name(
+        &orphan_compute,
+        &sanitize_ident(&orphanp),
+    );
+    let (_c, owner_exists) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_roles WHERE rolname='{owner_role}'"),
+    )
+    .await;
+    assert_eq!(
+        owner_exists.trim(),
+        "1",
+        "precondition: the orphan's _owner role exists"
+    );
+
+    // NO declaration stored ⇒ UNDECLARED. An EMPTY static map NodeManagedDbDeclare models a node that
+    // served this DB only through the declarative front door (construens).
+    let declare = NodeManagedDbDeclare::new(
+        BTreeMap::new(),
+        deploy.clone(),
+        kv.clone(),
+        envelope.clone(),
+        DeclareQuota::from_config(None, None),
+        BackendRegistry::new(),
+    );
+    // The gap: the DECLARED drop can't reach an undeclared orphan ("no CLI path").
+    assert!(
+        matches!(
+            declare.drop_database(&orphanp, orphan_binding_name).await,
+            Err(boatramp_core::sql::DeclareError::NotDeclared(_))
+        ),
+        "the declared `db drop database` MUST `NotDeclared` an undeclared orphan (the gap the orphan verb fixes)"
+    );
+    // The fix: the ORPHAN drop clears it by reconstructed, project-scoped derivation.
+    let outcome = declare
+        .drop_orphan_database(&orphanp, orphan_binding_name)
+        .await
+        .expect("`db drop database --orphan` MUST clear an UNDECLARED orphan");
+    assert_eq!(
+        outcome.database, orphan_db,
+        "the orphan drop must target the DERIVED physical name (project-scoped, never raw)"
+    );
+    let (_c, after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{orphan_db}'"),
+    )
+    .await;
+    assert!(
+        after.trim().is_empty(),
+        "the orphan db must be gone after the orphan drop"
+    );
+    // The `_owner` role is also cleared (the leak the task requires fixed).
+    let (_c, owner_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_roles WHERE rolname='{owner_role}'"),
+    )
+    .await;
+    assert!(
+        owner_after.trim().is_empty(),
+        "the orphan's `_owner` role must be dropped too (not leaked)"
+    );
+    // Idempotent: a second orphan drop on the now-absent db is a clean no-op.
+    declare
+        .drop_orphan_database(&orphanp, orphan_binding_name)
+        .await
+        .expect("orphan drop must be idempotent on an already-absent db");
+    // Out-of-namespace / catastrophic guard: the reserved `default` project is refused.
+    assert!(
+        declare
+            .drop_orphan_database(DEFAULT_PROJECT, orphan_binding_name)
+            .await
+            .is_err(),
+        "the reserved `default` project's install db must never be orphan-droppable"
+    );
+
+    // === FINAL isolation re-check: the sibling survived every dest/orphan operation intact. ===
+    let (_c, sib_final) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &sib_db),
+        "SELECT tid || ':' || v FROM marker ORDER BY tid",
+    )
+    .await;
+    assert_eq!(
+        sib_final, "S:sibling-secret",
+        "the sibling tenant must be untouched by all dest/orphan churn (zero foreign bytes)"
+    );
+
+    // --- cleanup (best-effort) ---
+    for db in [&src_db, &sib_db, &dest_db, &orphan_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP ROLE IF EXISTS {orphan_binding_name}"),
+    )
+    .await;
+
+    println!("PROJECT SYNC UNDECLARED ORPHAN RECONCILE OK");
+}
+
 /// **Live managed-MySQL triggers/routines/events carry + DEFINER re-point gate** (Tier-2 / nightly —
 /// needs a Docker daemon AND a MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE
 /// DATABASE`). Self-skips.

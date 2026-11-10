@@ -1805,18 +1805,25 @@ impl ControlPlane {
 
     /// HARD-DROP a managed database (`DELETE /api/{seg}/databases/{name}?confirm={name}`).
     /// `Project·Admin`. IRREVERSIBLE: the explicit operator teardown / orphan-recovery verb. The
-    /// `?confirm={name}` echoes the name as the server's typed confirmation guard. Returns the
-    /// derived PHYSICAL database name the server dropped (for operator confirmation).
-    pub async fn drop_database(&self, name: &str) -> Result<String> {
+    /// `?confirm={name}` echoes the name as the server's typed confirmation guard. With
+    /// `orphan = true` adds `?orphan=true` — the UNDECLARED-ORPHAN recovery path that hard-drops the
+    /// derived database even when no binding is declared (the derivation is reconstructed server-side
+    /// from `(project, name)`, never a raw name). Returns the derived PHYSICAL database name the
+    /// server dropped (for operator confirmation).
+    pub async fn drop_database(&self, name: &str, orphan: bool) -> Result<String> {
         let seg = project_seg(&self.project, "databases");
         let Self {
             http: client,
             base: server,
             ..
         } = self;
+        let mut query: Vec<(&str, &str)> = vec![("confirm", name)];
+        if orphan {
+            query.push(("orphan", "true"));
+        }
         let v: serde_json::Value = client
             .delete(format!("{server}/api/{seg}/{name}"))
-            .query(&[("confirm", name)])
+            .query(&query)
             .send()
             .await?
             .error_for_status()?
