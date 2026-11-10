@@ -1735,6 +1735,30 @@ impl NodeTenantSqlResolver {
             ),
         };
 
+        // TENANCY INVARIANT (fail-closed) — the SAME `rls_session` non-owner guard
+        // `build_backend` applies, mirrored onto the Phase-1 sibling-DSN serving identity (the
+        // `{{sql.*}}` / `url_env` RUNTIME parts a container composes). Scoped to `ConnRole::Runtime`
+        // only: the `ConnRole::Migration` identity is DELIBERATELY the owner and already returned
+        // above, and a Migration call that FELL THROUGH to here resolves the non-owner runtime (no
+        // sealed owner cred), which must not be refused. With `rls_session` on, a Shared non-default
+        // Postgres RUNTIME role that resolved to the table OWNER would serve under an identity plain
+        // ENABLE RLS does not bind — refuse (fail-closed) rather than un-enforce the app's RLS. The
+        // runtime role is derived DISTINCT from the owner, so this never trips today; it guards the
+        // invariant against a future refactor that resolved the owner onto this serving path.
+        if role == ConnRole::Runtime
+            && self.rls_session
+            && self.kind == ExternalSqlKind::Postgres
+            && self.isolation == TenantIsolation::Shared
+            && !is_default
+            && user == names.owner_role
+        {
+            return Err(SqlError::other(format!(
+                "rls_session tenancy invariant violated: the resolved serving role ({user}) is the \
+                 tenant table OWNER — plain ENABLE RLS does not bind the owner, so serving here \
+                 would un-enforce the app's row-level security; refusing (fail-closed)"
+            )));
+        }
+
         let password = creds
             .password(&cred_project, &cred_workload)
             .await

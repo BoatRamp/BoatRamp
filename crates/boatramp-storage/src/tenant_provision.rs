@@ -399,12 +399,24 @@ fn mysql_user(role: &str) -> String {
 ///   and seed through an owner-authority migrator that `ENABLE` deliberately exempts.
 /// * **Managed-compute path** (the per-replica dynamic role, operate-as-owner via `SET role`) —
 ///   the serving role acts AS the table owner, which `ENABLE` does NOT bind, so here `FORCE` is
-///   **required** and is installed + re-asserted by [`force_rls_event_trigger_ddl`].
+///   **required** and is installed + re-asserted by [`force_rls_event_trigger_ddl`]. Its
+///   tamper-resistance against the owner holds on **PG ≥ 15** only (see that fn's version note).
 ///
 /// So `FORCE` is the backstop for the OWNER posture; the NON-OWNER invariant is what makes the
 /// handler path sound. The two must not be crossed: an owner-posture role served against an
 /// `ENABLE`-not-`FORCE` table leaks cross-tenant (proven in the `managed_rls_nonowner_runtime` and
 /// `managed_rls_fencing` live gates). `build_backend` asserts the non-owner invariant fail-closed.
+///
+/// Both postures above are the **`Shared`, non-default** cell (the one with a per-tenant
+/// owner/runtime role split). For **`Single`** isolation and the reserved **`default`** tenant, the
+/// serving identity IS the container's own DB login (the stock-image superuser for `Single`; the
+/// plain configured user for `default`), which **bypasses RLS**, and NO force-trigger is installed
+/// (that path does not run [`provision_ddl`]). This is consistent with the trust model: the
+/// cross-tenant boundary for `Single` is the dedicated per-tenant container — and for every cell the
+/// per-tenant **database + role** — so `rls_session` there is an in-tenant-DB app convenience, **not
+/// load-bearing** isolation (see `ExternalDatabaseConfig::rls_session`'s trust-model note in
+/// `boatramp-node`). `rls_session` is load-bearing for an app's within-DB tenancy only on the
+/// `Shared` non-default path, where the two postures above apply.
 ///
 /// Default **off**: a binding WITHOUT `rls_session` (+ `tenant_guc`) gets NEITHER, and the emitted
 /// DDL is byte-identical to the pre-feature output.
@@ -491,6 +503,17 @@ END $$;"#;
 /// [`grant_app_role_ddl`]; a test / gate that runs the whole [`provision_ddl`] vec against a single
 /// connection installs the trigger in THAT database, so it must connect to the tenant DB (or run
 /// these four statements there separately).
+///
+/// # PostgreSQL version dependency (PG ≥ 15 — read before supporting an older managed image)
+///
+/// FORCE's **tamper-resistance against the tenant owner** relies on the owner being unable to
+/// neutralize it — i.e. it cannot drop the (superuser-owned) event trigger and cannot create a new
+/// table OUTSIDE the trigger's reach. That holds on **PG ≥ 15**, where `PUBLIC` lost its default
+/// `CREATE` on schema `public` and the per-tenant owner is `NOCREATEROLE`/non-superuser. On **PG <
+/// 15** an owner could create objects the operate-as-owner posture then serves un-FORCED, so a
+/// guard (or refusing the older engine) would be needed there. The shipped managed image is
+/// `pgvector/pgvector:pg16`, so this is not currently exposed — but any older PG managed image must
+/// re-establish the guarantee before this trigger can be relied on.
 ///
 /// # MySQL
 ///
