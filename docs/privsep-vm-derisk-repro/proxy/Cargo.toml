@@ -1,0 +1,26 @@
+# Standalone (own `[workspace]` table) so the parent boatramp workspace never treats this
+# de-risk reproduction crate as a member — it is NOT shippable code, only the O3b harness.
+[workspace]
+
+[package]
+name = "proxy"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+
+[[bin]]
+name = "payload"
+path = "src/bin/payload.rs"
+
+[[bin]]
+name = "shim"
+path = "src/bin/shim.rs"
+
+[[bin]]
+name = "payload_big"
+path = "src/bin/payload_big.rs"
