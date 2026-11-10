@@ -1332,6 +1332,39 @@ pub enum CompositionViolation {
         /// The offending VM instance label (holds ≥1 group-A crown jewel but not `secrets.sealer`).
         instance: String,
     },
+    /// A [`InstanceSubstrate::Vm`] instance falls OUTSIDE the approved first-cut VM scope
+    /// ("no-backends-in-VM / static-parser-frontends-or-co-located-sealer-only" — design
+    /// `DESIGN-privsep-phase3-vm-derisk.md` §2.3 / S2 companion lint). The approved VM forms are EXACTLY
+    /// two:
+    /// - **P3 — a key-free static parser FRONTEND:** it holds NO group-A key authority and EVERY
+    ///   capability it holds is an untrusted-byte `listen.*` parser surface (its sealer links, if any,
+    ///   are listener-peer links a serving splice rides — excluded from serve-designation, so no key
+    ///   material crosses to it); or
+    /// - **P1 — a co-located sealer BUNDLE:** it holds `secrets.sealer` (so it unlocks its own keys
+    ///   in-guest, never over a root-relayed link) and holds ONLY group-A crown-jewel key authorities
+    ///   (the sealer + signer + any other key, nothing else).
+    ///
+    /// Anything else — a key-free **backend/exec/control** instance in a VM (the gap the S2 tiers alone
+    /// did not close: they would have ALLOWED it), or a sealer bundle polluted with a non-key authority
+    /// — is REFUSED fail-closed. The least-privilege point is that the strongest, highest-overhead wall
+    /// (a VM) exists ONLY for the most-exposed parser frontend or the most-valuable key bundle; a data-
+    /// plane / spawn / control instance belongs on a lighter substrate reached over a feature-link, not
+    /// behind a hypervisor boundary the secret-blind root must relay. (The sibling
+    /// [`CompositionViolation::VmKeyHolderNotSelfSufficient`] owns the DISTINCT "a VM holds a crown jewel
+    /// but not its sealer" shape, so this variant never double-reports that case.) Run at `plan_root`
+    /// before any spawn ([`check_vm_secret_blindness_closure`] Tier 3).
+    VmInstanceOutsideApprovedScope {
+        /// The offending VM instance label.
+        instance: String,
+        /// Whether it holds `secrets.sealer` — `true` ⇒ it is a sealer bundle polluted with a
+        /// non-key authority (the `disallowed` set); `false` ⇒ it is a key-free instance that is not
+        /// listener-only (the `disallowed` set is the non-listener authorities to move off the VM).
+        holds_sealer: bool,
+        /// The held authorities that place it outside scope: for a sealer bundle, every non-group-A
+        /// authority; for a key-free instance, every non-`listen.*` authority (the backend/exec/control
+        /// credentials a VM may not hold). Non-empty whenever this fires.
+        disallowed: Vec<HostAuthority>,
+    },
 }
 
 impl std::fmt::Display for CompositionViolation {
@@ -1486,6 +1519,34 @@ impl std::fmt::Display for CompositionViolation {
                  hold NO group-A key authority (a key-free parser frontend / compute instance) or \
                  co-reside its `secrets.sealer` (the key conversation then never leaves the guest)"
             ),
+            Self::VmInstanceOutsideApprovedScope {
+                instance,
+                holds_sealer,
+                disallowed,
+            } => {
+                if *holds_sealer {
+                    write!(
+                        f,
+                        "VM instance {instance:?} is a `secrets.sealer` bundle but also holds \
+                         non-key authorities [{}] — a co-located sealer bundle in a VM (P1) may hold \
+                         ONLY group-A crown-jewel key authorities (the sealer + signer); move the \
+                         backend/exec/control/listener authorities onto a separate non-VM instance \
+                         reached over a feature-link",
+                        tags(disallowed)
+                    )
+                } else {
+                    write!(
+                        f,
+                        "VM instance {instance:?} holds [{}] — a key-free VM instance must be a \
+                         listener-only parser FRONTEND (P3): the strongest hypervisor wall is for the \
+                         most-exposed parser surface or a co-located sealer bundle ONLY, never a \
+                         backend/exec/control instance; move these authorities onto a separate non-VM \
+                         instance reached over a feature-link, or co-locate `secrets.sealer` if this \
+                         is meant to be a key bundle",
+                        tags(disallowed)
+                    )
+                }
+            }
         }
     }
 }
@@ -1888,6 +1949,77 @@ fn instances_linked(cfg: &PrivsepConfig, a: &str, b: &str) -> bool {
         .any(|l| (l.from == a && l.to == b) || (l.from == b && l.to == a))
 }
 
+/// One `secrets.sealer` ↔ `token.signer` **unseal-unlock edge** in a [`PrivsepConfig`]: a feature-link
+/// between two DIFFERENT instances, one end holding [`HostAuthority::SecretsSealer`] and the other
+/// [`HostAuthority::TokenSigner`] — the link the sealer serves the signer's key unlock over. The
+/// [`sealer_instance`](Self::sealer_instance) field names the end that HOLDS the KEK (the key-material
+/// source); [`signer_instance`](Self::signer_instance) names the receiving `token.signer` end.
+///
+/// This is the SINGLE source of truth for "the sealer→signer key link". Both
+/// `boatramp::privsep::compute_unseal_allowlists` (the root's per-link unseal-allowlist wiring) and the
+/// S2 VM secret-blindness lint ([`check_vm_secret_blindness_closure`] clause 1) DERIVE their edge set
+/// from [`PrivsepConfig::sealer_signer_unseal_edges`] — so a future widening of the unseal model is
+/// picked up by BOTH automatically and the two can never drift (the lint cannot silently under-refuse a
+/// key link the root would wire an unseal allowlist onto). The topological edge ALONE; the node-global
+/// "`[serve.signer]` is the sealed variant" (`sealed_signer`) gate — which this wasm-clean types layer
+/// cannot see — is applied by each caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealerSignerUnsealEdge<'a> {
+    /// The link name (a key of [`PrivsepConfig::links`]).
+    pub link: &'a str,
+    /// The endpoint holding [`HostAuthority::SecretsSealer`] — the KEK-bearing key-material source.
+    pub sealer_instance: &'a str,
+    /// The other endpoint holding [`HostAuthority::TokenSigner`] — the receiver of the unsealed key.
+    pub signer_instance: &'a str,
+}
+
+impl PrivsepConfig {
+    /// Whether the instance labelled `label` MATERIALIZES `authority` (the shared "does this instance
+    /// hold X" predicate the closure checks and the shared edge enumeration below all key off).
+    fn instance_holds(&self, label: &str, authority: HostAuthority) -> bool {
+        self.instances
+            .get(label)
+            .is_some_and(|i| i.capabilities.contains(&authority))
+    }
+
+    /// Enumerate every `secrets.sealer` ↔ `token.signer` [`SealerSignerUnsealEdge`] in this composition
+    /// — the SINGLE shared edge set both `boatramp::privsep::compute_unseal_allowlists` and the S2 VM
+    /// secret-blindness lint ([`check_vm_secret_blindness_closure`] clause 1) derive from, so the two
+    /// cannot drift from the unseal model (obligation (a)). A self-link (`from == to`) is excluded (it
+    /// resolves in-process and wires no cross-instance allowlist); the enumeration mirrors
+    /// `compute_unseal_allowlists`'s two INDEPENDENT direction checks exactly, so a (degenerate) link
+    /// whose BOTH ends hold sealer+signer yields one edge per matching direction. The node-global
+    /// `sealed_signer` gate is NOT applied here (a caller applies it): this is topology alone, pure and
+    /// host-testable.
+    pub fn sealer_signer_unseal_edges(&self) -> Vec<SealerSignerUnsealEdge<'_>> {
+        let mut edges = Vec::new();
+        for (link_name, link) in &self.links {
+            if link.from == link.to {
+                continue;
+            }
+            if self.instance_holds(&link.from, HostAuthority::SecretsSealer)
+                && self.instance_holds(&link.to, HostAuthority::TokenSigner)
+            {
+                edges.push(SealerSignerUnsealEdge {
+                    link: link_name.as_str(),
+                    sealer_instance: link.from.as_str(),
+                    signer_instance: link.to.as_str(),
+                });
+            }
+            if self.instance_holds(&link.to, HostAuthority::SecretsSealer)
+                && self.instance_holds(&link.from, HostAuthority::TokenSigner)
+            {
+                edges.push(SealerSignerUnsealEdge {
+                    link: link_name.as_str(),
+                    sealer_instance: link.to.as_str(),
+                    signer_instance: link.from.as_str(),
+                });
+            }
+        }
+        edges
+    }
+}
+
 /// The **sealed-signer composition-closure rule** (the "signer-key unlock" owner decision):
 /// when `[serve.signer]` is a SEALED key source (`sealed_signer == true` — a `boatramp:<name>`
 /// or `path:` reference the signer resolves NOT inline), a `token.signer` instance cannot hold
@@ -1978,30 +2110,42 @@ pub fn check_sealed_signer_closure(
 /// link's bytes THROUGH the secret-blind root. A **key-material-bearing** link relayed that way would
 /// carry KEK-unsealed PLAINTEXT key material through the root's address space, breaking the "root holds
 /// no secret" invariant. This lint REFUSES exactly that, plus (belt-and-suspenders) a VM key holder
-/// that is not self-sufficient for its own unlock:
+/// that is not self-sufficient for its own unlock, plus (the companion scope lint) any VM instance
+/// outside the approved first-cut scope:
 ///
-/// - [`CompositionViolation::VmKeyMaterialLinkRelayedThroughRoot`] — a key-material-bearing link (a
-///   `secrets.sealer` ↔ `token.signer` unseal unlock, the edge
-///   `boatramp::privsep::compute_unseal_allowlists` enumerates; OR a [`LinkPurpose::AuthorityServe`]
-///   link whose single crown-jewel endpoint holds `secrets.sealer`) connects two DIFFERENT instances
-///   where at least one is [`InstanceSubstrate::Vm`].
-/// - [`CompositionViolation::VmKeyHolderNotSelfSufficient`] — a [`InstanceSubstrate::Vm`] instance
-///   holds a group-A crown jewel but does not co-reside the `secrets.sealer` that unlocks it.
+/// - **Tier 1** [`CompositionViolation::VmKeyMaterialLinkRelayedThroughRoot`] — a key-material-bearing
+///   link connects two DIFFERENT instances where at least one is [`InstanceSubstrate::Vm`].
+///   Key-material-bearing is EITHER: (clause 1) a `secrets.sealer` ↔ `token.signer` unseal-unlock edge
+///   — the edge set DERIVED from the shared [`PrivsepConfig::sealer_signer_unseal_edges`] predicate
+///   `boatramp::privsep::compute_unseal_allowlists` also derives from, so the two cannot drift
+///   (obligation (a)) — gated on `sealed_signer`; OR (clause 2) a SERVE-DESIGNATED link whose sole
+///   crown-jewel endpoint holds `secrets.sealer` — GENERALIZED (obligation (c)) to the full
+///   `boatramp::privsep::compute_authority_serve_links` designation shape (not a relay, exactly one
+///   crown-jewel endpoint holding the sealer, and either `AuthorityServe`-marked OR `Unspecified` with
+///   a non-listener peer), so an Unspecified-purpose sealer→VM serve link is caught too.
+/// - **Tier 2** [`CompositionViolation::VmKeyHolderNotSelfSufficient`] — a [`InstanceSubstrate::Vm`]
+///   instance holds a group-A crown jewel but does not co-reside the `secrets.sealer` that unlocks it.
+/// - **Tier 3** [`CompositionViolation::VmInstanceOutsideApprovedScope`] — the companion scope lint
+///   (obligation (b)): a VM instance must be EITHER a key-free listener-only parser frontend (P3) OR a
+///   co-located sealer bundle holding only group-A keys (P1); a key-free backend/exec/control instance
+///   in a VM (which the tiers above alone would ALLOW) is refused fail-closed. The
+///   crown-jewel-without-sealer shape is left to Tier 2, so each refuse maps to exactly one variant.
 ///
 /// Two capabilities on the SAME instance share one guest (an intra-guest socketpair the root never
 /// relays — design P1), so a co-located `secrets.sealer`+`token.signer` VM is ACCEPTED; a key-free VM
 /// parser frontend (design P3) is ACCEPTED. It is a PURE, AST/topology-level predicate over the
 /// resolved [`PrivsepConfig`] — never a parse of link traffic or a text marker — reusing only existing
-/// predicates ([`HostAuthority::is_crown_jewel`], [`InstanceSubstrate::Vm`], and the sealer↔signer edge
-/// detection [`check_sealed_signer_closure`] / `compute_unseal_allowlists` already share).
+/// predicates ([`HostAuthority::is_crown_jewel`], [`HostAuthority::is_listener`],
+/// [`InstanceSubstrate::Vm`], and the shared [`PrivsepConfig::sealer_signer_unseal_edges`] /
+/// serve-designation shape the root's `compute_*` helpers also use).
 ///
 /// `sealed_signer` is the same node-global "`[serve.signer]` is the sealed variant" fact
 /// [`check_sealed_signer_closure`] takes (the caller derives it from the resolved `ServerConfig`, since
-/// this wasm-clean types layer does not see `AuthSignerConfig`). It gates the
-/// `secrets.sealer`↔`token.signer` UNSEAL edge (an AwsKms/ambient/absent signer unseals nothing over a
-/// link); an explicit `AuthorityServe`-to-sealer link and the second-tier VM-key-holder scope check
-/// stand on the topology ALONE. Kept SEPARATE from [`check_composition_closure`] so its signature and
-/// callers stay pure over [`PrivsepConfig`].
+/// this wasm-clean types layer does not see `AuthSignerConfig`). It gates ONLY the
+/// `secrets.sealer`↔`token.signer` UNSEAL edge (clause 1 — an AwsKms/ambient/absent signer unseals
+/// nothing over a link); the generalized serve-designation clause (clause 2), the Tier-2 key-holder
+/// check, and the Tier-3 scope check all stand on the topology ALONE. Kept SEPARATE from
+/// [`check_composition_closure`] so its signature and callers stay pure over [`PrivsepConfig`].
 pub fn check_vm_secret_blindness_closure(
     cfg: &PrivsepConfig,
     sealed_signer: bool,
@@ -2018,6 +2162,25 @@ pub fn check_vm_secret_blindness_closure(
             .get(label)
             .is_some_and(|i| i.capabilities.contains(&authority))
     };
+    let any_listener = |label: &str| -> bool {
+        cfg.instances
+            .get(label)
+            .is_some_and(|i| i.capabilities.iter().any(|a| a.is_listener()))
+    };
+
+    // Clause (1)'s edge set — the `secrets.sealer`↔`token.signer` unseal-unlock links — derived from
+    // the SINGLE shared predicate [`PrivsepConfig::sealer_signer_unseal_edges`] that the root's
+    // `compute_unseal_allowlists` also derives from, so the lint can never drift from (silently
+    // under-refuse) the unseal model (obligation (a)). Gated on a SEALED signer source (an
+    // inline/AwsKms signer unseals nothing over a link — the gate the types layer cannot see itself).
+    let unseal_edge_links: BTreeSet<&str> = if sealed_signer {
+        cfg.sealer_signer_unseal_edges()
+            .iter()
+            .map(|e| e.link)
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
 
     // --- Tier 1 (REFUSE): a key-material-bearing link root-relayed across a VM boundary. ---
     for (link_name, link) in &cfg.links {
@@ -2029,19 +2192,11 @@ pub fn check_vm_secret_blindness_closure(
 
         // Key-material-bearing? (design §2.3)
         // (i) the `secrets.sealer`↔`token.signer` unseal unlock edge — exactly what
-        //     `compute_unseal_allowlists` enumerates — gated on a SEALED signer source (an
-        //     inline/AwsKms signer unseals nothing over a link); PLUS
-        // (ii) any `AuthorityServe` link whose SINGLE crown-jewel endpoint holds `secrets.sealer`
-        //     (an explicitly-marked key-material serve, which stands on the topology alone).
-        let unseal_edge = sealed_signer
-            && ((holds(&link.from, HostAuthority::SecretsSealer)
-                && holds(&link.to, HostAuthority::TokenSigner))
-                || (holds(&link.to, HostAuthority::SecretsSealer)
-                    && holds(&link.from, HostAuthority::TokenSigner)));
+        //     `compute_unseal_allowlists` enumerates, via the shared predicate above.
+        let unseal_edge = unseal_edge_links.contains(link_name.as_str());
 
-        // The crown-jewel endpoint(s) of this link. A well-formed `AuthorityServe` link has EXACTLY
-        // one (0/≥2 is already an `AuthorityServeLinkNotSingleCrownJewel` refusal); treat the link as
-        // key-material-bearing only when that single crown jewel is the sealer serving key material.
+        // The crown-jewel endpoint(s) of this link. A serve-designated link has EXACTLY one (0/≥2 is
+        // already an `AuthorityServeLinkNotSingleCrownJewel` refusal for a marked link).
         let crown_endpoints: Vec<&str> = [link.from.as_str(), link.to.as_str()]
             .into_iter()
             .filter(|ep| {
@@ -2050,11 +2205,27 @@ pub fn check_vm_secret_blindness_closure(
                     .is_some_and(|i| i.capabilities.iter().any(|a| a.is_crown_jewel()))
             })
             .collect();
-        let authority_serve_sealer = link.is_authority_serve()
+        // (ii) a serve-DESIGNATED link whose sole crown jewel is the sealer — GENERALIZED (clause 2,
+        //      obligation (c)) from the old `is_authority_serve()`-ONLY shape to the FULL
+        //      serve-designation shape `boatramp::privsep::compute_authority_serve_links` uses: NOT a
+        //      relay, EXACTLY ONE crown-jewel endpoint which holds `secrets.sealer`, AND either
+        //      explicitly `AuthorityServe`-marked OR `Unspecified` with a NON-listener peer (the
+        //      conservative inference — a listener peer is a client-fd splice, never an authority
+        //      serve). Stands on the topology ALONE (not `sealed_signer`-gated). This now also catches
+        //      an UNSPECIFIED-purpose sealer→VM serve link the `AuthorityServe`-only clause missed.
+        let serve_designated_sealer = !link.is_relay()
             && crown_endpoints.len() == 1
-            && holds(crown_endpoints[0], HostAuthority::SecretsSealer);
+            && holds(crown_endpoints[0], HostAuthority::SecretsSealer)
+            && {
+                let peer = if crown_endpoints[0] == link.from.as_str() {
+                    link.to.as_str()
+                } else {
+                    link.from.as_str()
+                };
+                link.is_authority_serve() || !any_listener(peer)
+            };
 
-        if !(unseal_edge || authority_serve_sealer) {
+        if !(unseal_edge || serve_designated_sealer) {
             continue;
         }
 
@@ -2102,6 +2273,56 @@ pub fn check_vm_secret_blindness_closure(
         if holds_crown_jewel && !co_resides_sealer {
             violations.push(CompositionViolation::VmKeyHolderNotSelfSufficient {
                 instance: name.clone(),
+            });
+        }
+    }
+
+    // --- Tier 3 (REFUSE, obligation (b)): the approved first-cut VM SCOPE
+    //     ("no-backends-in-VM / static-parser-frontends-or-co-located-sealer-only"). The S2 tiers
+    //     above alone would ALLOW a key-free backend/exec/control instance in a VM; this companion
+    //     scope lint fail-closes that gap. An in-scope VM is EXACTLY one of:
+    //       - P3, a key-free parser FRONTEND: holds no crown jewel AND every capability is a `listen.*`
+    //         parser surface; or
+    //       - P1, a co-located sealer BUNDLE: holds `secrets.sealer` AND holds ONLY group-A crown-jewel
+    //         key authorities.
+    //     Anything else is refused. The crown-jewel-without-sealer shape is OWNED by Tier 2
+    //     (`VmKeyHolderNotSelfSufficient`), so it is excluded here to avoid double-reporting the same
+    //     instance — each refuse shape maps to exactly one variant. ---
+    for (name, inst) in &cfg.instances {
+        if inst.substrate != InstanceSubstrate::Vm {
+            continue;
+        }
+        let held: BTreeSet<HostAuthority> = inst.capabilities.iter().copied().collect();
+        let holds_sealer = held.contains(&HostAuthority::SecretsSealer);
+        let holds_crown_jewel = held.iter().any(|a| a.is_crown_jewel());
+        // Tier 2 owns "a VM crown-jewel holder without its co-located sealer"; don't double-report.
+        if holds_crown_jewel && !holds_sealer {
+            continue;
+        }
+        let in_scope = if holds_sealer {
+            // P1 — a co-located sealer bundle may hold ONLY group-A crown-jewel key authorities.
+            held.iter().all(|a| a.is_crown_jewel())
+        } else {
+            // P3 — a key-free parser frontend may hold ONLY `listen.*` parser surfaces. (An empty set
+            // is a `ZeroCapabilityInstance` refusal from the base lint, not an in-scope VM here.)
+            held.iter().all(|a| a.is_listener())
+        };
+        if !in_scope {
+            let disallowed: Vec<HostAuthority> = held
+                .iter()
+                .copied()
+                .filter(|a| {
+                    if holds_sealer {
+                        !a.is_crown_jewel()
+                    } else {
+                        !a.is_listener()
+                    }
+                })
+                .collect();
+            violations.push(CompositionViolation::VmInstanceOutsideApprovedScope {
+                instance: name.clone(),
+                holds_sealer,
+                disallowed,
             });
         }
     }
@@ -3834,5 +4055,257 @@ mod tests {
         check_composition_closure(&clean_composition()).expect("base composition lint unchanged");
         check_sealed_signer_closure(&split_signer_composition(), true)
             .expect("sealed-signer lint unchanged");
+    }
+
+    // ---- Obligation (a): the shared sealer↔signer unseal-edge predicate (the single source of truth
+    // the lint's clause 1 and `compute_unseal_allowlists` both derive from — no drift). ----
+
+    #[test]
+    fn sealer_signer_unseal_edges_enumerate_only_cross_instance_sealer_signer_links() {
+        // The shared predicate yields exactly the cross-instance sealer↔signer links, naming the sealer
+        // SOURCE end and the signer RECEIVER end; it ignores self-links and non-key links.
+        let cfg = split_signer_composition();
+        let edges = cfg.sealer_signer_unseal_edges();
+        assert_eq!(edges.len(), 1, "exactly the `to-signer` edge: {edges:?}");
+        assert_eq!(edges[0].link, "to-signer");
+        assert_eq!(edges[0].sealer_instance, "sealer");
+        assert_eq!(edges[0].signer_instance, "signer");
+        // `clean_composition`'s signer holds BOTH sealer+signer (resolves in-process, no cross link),
+        // so there is NO cross-instance unseal edge to enumerate.
+        assert!(
+            clean_composition().sealer_signer_unseal_edges().is_empty(),
+            "a co-resident sealer+signer has no cross-instance unseal edge"
+        );
+    }
+
+    // ---- Obligation (c): clause 2 GENERALIZED from `AuthorityServe`-only to the full
+    // serve-designation shape, so an Unspecified-purpose sealer→VM serve link is caught too. ----
+
+    /// A minimal 2-instance VM topology: a `sealer` (VM, holding only `secrets.sealer` → self-sufficient,
+    /// so Tiers 2 & 3 stay silent) and a `peer` linked to it with the given purpose + capabilities.
+    fn sealer_vm_with_peer(purpose: LinkPurpose, peer_caps: &[HostAuthority]) -> PrivsepConfig {
+        let mut instances = BTreeMap::new();
+        instances.insert("sealer".to_string(), inst(&[HostAuthority::SecretsSealer]));
+        instances.insert("peer".to_string(), inst(peer_caps));
+        let mut links = BTreeMap::new();
+        links.insert(
+            "serve".to_string(),
+            PrivsepLink {
+                from: "peer".to_string(),
+                to: "sealer".to_string(),
+                transport: LinkTransport::Local,
+                purpose,
+            },
+        );
+        let mut cfg = PrivsepConfig {
+            instances,
+            links,
+            supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
+        };
+        set_substrate(&mut cfg, "sealer", InstanceSubstrate::Vm);
+        cfg
+    }
+
+    #[test]
+    fn vm_clause2_refuses_an_unspecified_sealer_serve_link_crossing_a_vm_boundary() {
+        // An UNSPECIFIED link whose SOLE crown jewel is the sealer and whose peer is NON-listener is
+        // serve-DESIGNATED by `compute_authority_serve_links`' conservative inference — the sealer would
+        // serve seal/unseal key material over it, and across a VM boundary the secret-blind root relays
+        // that key material. The OLD `is_authority_serve()`-only clause 2 missed this; the generalized
+        // clause catches it, standing on the topology ALONE (`sealed_signer = false`).
+        let cfg = sealer_vm_with_peer(LinkPurpose::Unspecified, &[HostAuthority::ControlAdminApi]);
+        let err = check_vm_secret_blindness_closure(&cfg, false).expect_err(
+            "an Unspecified sealer-serve link across a VM boundary must refuse (clause 2)",
+        );
+        assert_eq!(
+            err.violations.len(),
+            1,
+            "exactly the generalized Tier-1 refusal: {err}"
+        );
+        match &err.violations[0] {
+            CompositionViolation::VmKeyMaterialLinkRelayedThroughRoot {
+                link,
+                sealer_instance,
+                signer_instance,
+                vm_endpoints,
+            } => {
+                assert_eq!(link, "serve");
+                assert_eq!(sealer_instance, "sealer");
+                assert_eq!(signer_instance, "peer");
+                assert_eq!(vm_endpoints, &vec!["sealer".to_string()]);
+            }
+            other => panic!("wrong variant / wrong reason: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_clause2_does_not_over_fire_on_a_relay_or_a_listener_peer() {
+        // The generalization faithfully MIRRORS `compute_authority_serve_links` — it must not over-fire:
+        // (a) a `Relay`-marked sealer link is a client-fd serving SPLICE, never a key-material serve;
+        // (b) an `Unspecified` sealer→LISTENER-frontend link is a client-fd splice too (the inference
+        //     excludes a listener peer). Neither carries key material, so both are ACCEPTED even though
+        //     they cross the VM boundary.
+        check_vm_secret_blindness_closure(
+            &sealer_vm_with_peer(LinkPurpose::Relay, &[HostAuthority::ControlAdminApi]),
+            false,
+        )
+        .expect("a relay sealer link is a serving splice, never a key-material serve");
+        check_vm_secret_blindness_closure(
+            &sealer_vm_with_peer(LinkPurpose::Unspecified, &[HostAuthority::ListenHttpParse]),
+            false,
+        )
+        .expect("an Unspecified sealer→listener-frontend link is a client-fd splice, not a serve");
+    }
+
+    // ---- Obligation (b): the companion VM SCOPE lint (Tier 3) — a VM must be a key-free listener-only
+    // parser frontend (P3) or a co-located sealer bundle (P1); anything else is refused fail-closed. ----
+
+    #[test]
+    fn vm_scope_refuses_a_key_free_backend_in_a_vm() {
+        // The gap the S2 Tiers 1+2 alone did NOT close: a key-free BACKEND instance in a VM. The
+        // companion scope lint REFUSES it (`clean_composition`'s `data` holds the four backends — no
+        // key, no listener). `sealed_signer` is irrelevant (no key link here).
+        let mut cfg = clean_composition();
+        set_substrate(&mut cfg, "data", InstanceSubstrate::Vm);
+        let err = check_vm_secret_blindness_closure(&cfg, false)
+            .expect_err("a key-free backend instance in a VM is outside the approved scope");
+        assert_eq!(
+            err.violations.len(),
+            1,
+            "exactly the Tier-3 scope refusal: {err}"
+        );
+        match &err.violations[0] {
+            CompositionViolation::VmInstanceOutsideApprovedScope {
+                instance,
+                holds_sealer,
+                disallowed,
+            } => {
+                assert_eq!(instance, "data");
+                assert!(!*holds_sealer, "a backend instance holds no sealer");
+                assert!(disallowed.contains(&HostAuthority::BackendKv));
+                assert!(
+                    disallowed.iter().all(|a| !a.is_listener()),
+                    "the disallowed set is the non-listener authorities to move off the VM"
+                );
+            }
+            other => panic!("wrong variant / wrong reason: {other:?}"),
+        }
+        // The base composition-closure lint is unaffected by substrate — still valid (no regression).
+        check_composition_closure(&cfg).expect("base composition lint still passes");
+    }
+
+    #[test]
+    fn vm_scope_refuses_a_key_free_exec_and_control_instance_in_a_vm() {
+        // Likewise a key-free exec/control instance in a VM (`clean_composition`'s `compute` holds
+        // `exec.compute` + `control.admin-api` — key-free, not listener-only).
+        let mut cfg = clean_composition();
+        set_substrate(&mut cfg, "compute", InstanceSubstrate::Vm);
+        let err = check_vm_secret_blindness_closure(&cfg, false)
+            .expect_err("a key-free exec/control instance in a VM is outside the approved scope");
+        assert_eq!(err.violations.len(), 1, "{err}");
+        match &err.violations[0] {
+            CompositionViolation::VmInstanceOutsideApprovedScope {
+                instance,
+                holds_sealer,
+                disallowed,
+            } => {
+                assert_eq!(instance, "compute");
+                assert!(!*holds_sealer);
+                assert!(disallowed.contains(&HostAuthority::ExecCompute));
+                assert!(disallowed.contains(&HostAuthority::ControlAdminApi));
+            }
+            other => panic!("wrong variant / wrong reason: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_scope_refuses_a_sealer_bundle_polluted_with_a_backend() {
+        // P1 is a co-located sealer bundle holding ONLY group-A keys. A sealer VM that ALSO holds a
+        // backend credential is outside scope (no-backends-in-VM) — the `holds_sealer` arm of the scope
+        // variant (distinct message from the key-free arm).
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "bundle".to_string(),
+            inst(&[
+                HostAuthority::SecretsSealer,
+                HostAuthority::TokenSigner,
+                HostAuthority::BackendKv,
+            ]),
+        );
+        let mut cfg = PrivsepConfig {
+            instances,
+            links: BTreeMap::new(),
+            supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
+        };
+        set_substrate(&mut cfg, "bundle", InstanceSubstrate::Vm);
+        let err = check_vm_secret_blindness_closure(&cfg, true)
+            .expect_err("a sealer bundle in a VM may not hold a backend credential");
+        assert_eq!(err.violations.len(), 1, "{err}");
+        match &err.violations[0] {
+            CompositionViolation::VmInstanceOutsideApprovedScope {
+                instance,
+                holds_sealer,
+                disallowed,
+            } => {
+                assert_eq!(instance, "bundle");
+                assert!(*holds_sealer, "it IS a sealer bundle (just a polluted one)");
+                assert_eq!(disallowed, &vec![HostAuthority::BackendKv]);
+            }
+            other => panic!("wrong variant / wrong reason: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_scope_leaves_the_non_co_located_key_holder_to_tier2() {
+        // Partition proof: a VM holding a crown jewel without its sealer is Tier 2
+        // (`VmKeyHolderNotSelfSufficient`); Tier 3 must NOT also report it, so each refuse shape maps to
+        // exactly one variant.
+        let mut cfg = split_signer_composition();
+        set_substrate(&mut cfg, "signer", InstanceSubstrate::Vm);
+        let err = check_vm_secret_blindness_closure(&cfg, false)
+            .expect_err("a VM key holder without its sealer must refuse");
+        assert_eq!(
+            err.violations.len(),
+            1,
+            "exactly the Tier-2 refusal, not also a scope refusal: {err}"
+        );
+        assert!(
+            matches!(
+                &err.violations[0],
+                CompositionViolation::VmKeyHolderNotSelfSufficient { instance } if instance == "signer"
+            ),
+            "the key holder is Tier 2's variant: {err}"
+        );
+        assert!(
+            !err.violations.iter().any(|v| matches!(
+                v,
+                CompositionViolation::VmInstanceOutsideApprovedScope { .. }
+            )),
+            "Tier 3 must NOT double-report the key-holder shape: {err}"
+        );
+    }
+
+    #[test]
+    fn vm_scope_allows_p1_and_p3_and_every_non_vm_topology() {
+        // ALLOW cases, scope-framed: P1 (a co-located sealer+signer bundle in a VM) and P3 (a key-free
+        // listener-only parser frontend in a VM) both pass the whole VM lint; and with NO VM instance,
+        // Tier 3 is a structural no-op across the shipped fixtures (belt with the existing no-op test).
+        let mut p1 = clean_composition(); // `signer` = all six crown jewels (incl. sealer)
+        set_substrate(&mut p1, "signer", InstanceSubstrate::Vm);
+        check_vm_secret_blindness_closure(&p1, true).expect("P1 co-located sealer bundle in a VM");
+
+        let mut p3 = clean_composition(); // `parser` = listen.public-tls + listen.http-parse only
+        set_substrate(&mut p3, "parser", InstanceSubstrate::Vm);
+        check_vm_secret_blindness_closure(&p3, true)
+            .expect("P3 key-free listener-only VM frontend");
+
+        for sealed in [false, true] {
+            check_vm_secret_blindness_closure(&clean_composition(), sealed)
+                .expect("no VM ⇒ Tier 3 is a no-op");
+            check_vm_secret_blindness_closure(&split_signer_composition(), sealed)
+                .expect("no VM ⇒ Tier 3 is a no-op");
+        }
     }
 }

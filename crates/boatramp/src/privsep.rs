@@ -287,15 +287,18 @@ where
     let sealed_signer = privsep_resolve::sealed_signer_key_ref(cfg).is_some();
     check_sealed_signer_closure(privsep, sealed_signer)?;
 
-    // 2b-vm. VM secret-blindness closure (S2 — `DESIGN-privsep-phase3-vm-derisk.md` §2.3): a
-    //     key-material-bearing link (a `secrets.sealer`↔`token.signer` unseal unlock, or an
-    //     `AuthorityServe`-to-sealer link) relayed across a `substrate: Vm` boundary would route
-    //     KEK-unsealed plaintext through the SECRET-BLIND root's vsock relay; and a VM key holder must
-    //     be self-sufficient for its own unlock (co-reside its sealer) or hold no key. Structural,
-    //     fail-closed, same error surface as the main lint. A no-op on any composition with NO
-    //     `substrate: Vm` instance (a VM is itself an unwired follow-on substrate, refused at
-    //     supervise), so this changes no running composition — it refuses an unsafe VM key topology
-    //     at the composition gate, before any transport exists.
+    // 2b-vm. VM secret-blindness + scope closure (S2 — `DESIGN-privsep-phase3-vm-derisk.md` §2.3): a
+    //     key-material-bearing link (a `secrets.sealer`↔`token.signer` unseal unlock, OR a
+    //     serve-designated-to-sealer link — now the FULL `compute_authority_serve_links` shape, not
+    //     `AuthorityServe`-only) relayed across a `substrate: Vm` boundary would route KEK-unsealed
+    //     plaintext through the SECRET-BLIND root's vsock relay (Tier 1); a VM key holder must be
+    //     self-sufficient for its own unlock — co-reside its sealer or hold no key (Tier 2); and a VM
+    //     instance must stay WITHIN the approved scope — a key-free listener-only parser frontend (P3)
+    //     or a co-located sealer bundle (P1), never a key-free backend/exec/control instance (Tier 3,
+    //     the companion scope lint). Structural, fail-closed, same error surface as the main lint. A
+    //     no-op on any composition with NO `substrate: Vm` instance (a VM is itself an unwired follow-on
+    //     substrate, refused at supervise), so this changes no running composition — it refuses an
+    //     unsafe VM topology at the composition gate, before any transport exists.
     check_vm_secret_blindness_closure(privsep, sealed_signer)?;
 
     // 2c. Per-tenant scale-to-zero policy (design §Phase-4 WS-C): fail-closed BEFORE any spawn when
@@ -935,32 +938,16 @@ fn compute_unseal_allowlists(
     let Some(key_ref) = privsep_resolve::sealed_signer_key_ref(config) else {
         return out;
     };
-    let holds = |label: &str, authority: HostAuthority| -> bool {
-        privsep
-            .instances
-            .get(label)
-            .is_some_and(|i| i.capabilities.contains(&authority))
-    };
-    for (link_name, link) in &privsep.links {
-        // A self-link, or a link between two instances that are the same label, wires nothing.
-        if link.from == link.to {
-            continue;
-        }
-        // The SEALER end of a sealer↔(separate)signer link may unseal the signer key ref over it.
-        if holds(&link.from, HostAuthority::SecretsSealer)
-            && holds(&link.to, HostAuthority::TokenSigner)
-        {
-            out.entry(link.from.clone())
-                .or_default()
-                .allow(link_name.clone(), key_ref.to_string());
-        }
-        if holds(&link.to, HostAuthority::SecretsSealer)
-            && holds(&link.from, HostAuthority::TokenSigner)
-        {
-            out.entry(link.to.clone())
-                .or_default()
-                .allow(link_name.clone(), key_ref.to_string());
-        }
+    // Derive the sealer↔signer unseal edges from the SINGLE shared predicate in `boatramp-types` that
+    // the S2 VM secret-blindness lint (`check_vm_secret_blindness_closure` clause 1) ALSO derives from
+    // — so the root's allowlist wiring and the lint's key-link edge set can never drift (a widening of
+    // the unseal model mirrors into both at once). The SEALER end of each edge may unseal the signer
+    // key ref over that link; the signer end is the asker and gets no allowlist. The
+    // `unseal_allowlist_and_s2_lint_share_one_edge_set` test locks this lockstep.
+    for edge in privsep.sealer_signer_unseal_edges() {
+        out.entry(edge.sealer_instance.to_string())
+            .or_default()
+            .allow(edge.link.to_string(), key_ref.to_string());
     }
     out
 }
@@ -4265,6 +4252,76 @@ mod tests {
         assert!(
             compute_unseal_allowlists(&cfg).is_empty(),
             "a co-resident signer+sealer needs no root-wired cross-link allowlist"
+        );
+    }
+
+    #[test]
+    fn unseal_allowlist_and_s2_lint_share_one_edge_set() {
+        // Obligation (a) LOCKSTEP drift-guard: `compute_unseal_allowlists` (the root's per-link unseal
+        // wiring) and the S2 VM secret-blindness lint's clause-1 edge set are BOTH derived from the one
+        // shared `PrivsepConfig::sealer_signer_unseal_edges` predicate, so a future widening of the
+        // unseal model cannot be mirrored into one but not the other (silently under-refusing in the
+        // lint). This asserts they enumerate the SAME set of links on a topology seeded with decoys
+        // that MUST be excluded: an `AuthorityServe` minting link (frontend→signer, not a sealer edge)
+        // and a `sealer→data` link (data holds no `token.signer`).
+        let mut p = split_signer_privsep();
+        p.instances.insert(
+            "frontend".to_string(),
+            inst(&[HostAuthority::ListenPublicTls], &["to-mint"]),
+        );
+        p.links.insert(
+            "to-mint".to_string(),
+            PrivsepLink {
+                from: "frontend".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::AuthorityServe,
+            },
+        );
+        p.instances
+            .get_mut("sealer")
+            .unwrap()
+            .links
+            .push("sealer-data".to_string());
+        p.links.insert(
+            "sealer-data".to_string(),
+            PrivsepLink {
+                from: "sealer".to_string(),
+                to: "data".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
+            },
+        );
+
+        let mut cfg = cfg_with(Some(p));
+        cfg.serve.as_mut().unwrap().signer = Some(config::AuthSignerConfig::Sealed {
+            key_ref: "path:/srv/node/secrets/signer.sealed".to_string(),
+        });
+
+        // The shared predicate's edge set — exactly what the S2 lint's clause 1 keys off.
+        let predicate_links: BTreeSet<String> = cfg
+            .privsep
+            .as_ref()
+            .unwrap()
+            .sealer_signer_unseal_edges()
+            .iter()
+            .map(|e| e.link.to_string())
+            .collect();
+        // The set `compute_unseal_allowlists` actually wires onto the sealer end(s).
+        let allowlist_links: BTreeSet<String> = compute_unseal_allowlists(&cfg)
+            .values()
+            .flat_map(|a| a.by_link.keys().cloned())
+            .collect();
+
+        assert_eq!(
+            predicate_links, allowlist_links,
+            "the S2 lint clause-1 edge set and compute_unseal_allowlists must enumerate the SAME links"
+        );
+        // And it is EXACTLY the real sealer↔signer unseal edge — the decoys are excluded on both sides.
+        assert_eq!(
+            predicate_links,
+            BTreeSet::from(["to-signer".to_string()]),
+            "only the real sealer↔signer unseal edge, never the mint/decoy links"
         );
     }
 
