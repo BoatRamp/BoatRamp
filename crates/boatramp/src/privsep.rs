@@ -57,7 +57,7 @@ use std::path::{Path, PathBuf};
 
 use boatramp_core::privsep::{
     CompositionReport, HostAuthority, InstanceSubstrate, LinkPurpose, PrivsepInstanceConfig,
-    check_composition_closure, check_sealed_signer_closure,
+    check_composition_closure, check_sealed_signer_closure, check_vm_secret_blindness_closure,
 };
 use boatramp_node::privsep_resolve::{self, SecretBlindReport};
 use serde::{Deserialize, Serialize};
@@ -286,6 +286,17 @@ where
     //     surface as the main lint.
     let sealed_signer = privsep_resolve::sealed_signer_key_ref(cfg).is_some();
     check_sealed_signer_closure(privsep, sealed_signer)?;
+
+    // 2b-vm. VM secret-blindness closure (S2 — `DESIGN-privsep-phase3-vm-derisk.md` §2.3): a
+    //     key-material-bearing link (a `secrets.sealer`↔`token.signer` unseal unlock, or an
+    //     `AuthorityServe`-to-sealer link) relayed across a `substrate: Vm` boundary would route
+    //     KEK-unsealed plaintext through the SECRET-BLIND root's vsock relay; and a VM key holder must
+    //     be self-sufficient for its own unlock (co-reside its sealer) or hold no key. Structural,
+    //     fail-closed, same error surface as the main lint. A no-op on any composition with NO
+    //     `substrate: Vm` instance (a VM is itself an unwired follow-on substrate, refused at
+    //     supervise), so this changes no running composition — it refuses an unsafe VM key topology
+    //     at the composition gate, before any transport exists.
+    check_vm_secret_blindness_closure(privsep, sealed_signer)?;
 
     // 2c. Per-tenant scale-to-zero policy (design §Phase-4 WS-C): fail-closed BEFORE any spawn when
     //     the composition declares a per-tenant template, so a misconfigured policy (e.g. a 0

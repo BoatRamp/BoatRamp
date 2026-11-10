@@ -1292,6 +1292,46 @@ pub enum CompositionViolation {
         /// The offending per-tenant template instance label.
         instance: String,
     },
+    /// A **key-material-bearing** link — the `secrets.sealer` ↔ `token.signer` unseal unlock link (the
+    /// edge `boatramp::privsep::compute_unseal_allowlists` wires an unseal allowlist onto), or a
+    /// [`LinkPurpose::AuthorityServe`] link whose SINGLE crown-jewel endpoint holds `secrets.sealer` —
+    /// connects two DIFFERENT instances where AT LEAST ONE is [`InstanceSubstrate::Vm`]. A VM guest has
+    /// its OWN kernel, so the `local` fd-passed `socketpair(2)` (the shape the root creates but never
+    /// reads) cannot cross the hypervisor boundary; the link must become a vsock byte-relay, and the
+    /// natural relay — the one the root runs because it owns the topology — copies the link's bytes
+    /// THROUGH the secret-blind root. The KEK-unsealed PLAINTEXT key material would then transit the
+    /// root's address space, breaking the "root holds no secret / no key material transits the root"
+    /// invariant. Fail-closed ([`check_vm_secret_blindness_closure`], design
+    /// `DESIGN-privsep-phase3-vm-derisk.md` §2.3 / S2).
+    ///
+    /// *Remedy named in the error:* CO-LOCATE `secrets.sealer` and `token.signer` on ONE instance (the
+    /// unlock resolves in-process / over an intra-guest socketpair the root never relays — design P1),
+    /// keep BOTH endpoints off the VM substrate, or (a later-cut option, not wired in the first cut)
+    /// wire the sealer itself as the host-side vsock endpoint so the root wires-but-does-not-relay the
+    /// key link (design P2).
+    VmKeyMaterialLinkRelayedThroughRoot {
+        /// The offending link name.
+        link: String,
+        /// The endpoint holding `secrets.sealer` (the key-material SOURCE).
+        sealer_instance: String,
+        /// The other endpoint — the `token.signer` / caller that would RECEIVE the unsealed key
+        /// material over the root-relayed link.
+        signer_instance: String,
+        /// Which endpoint(s) are [`InstanceSubstrate::Vm`] — the boundary the link is relayed across.
+        vm_endpoints: Vec<String>,
+    },
+    /// A [`InstanceSubstrate::Vm`] instance holds a group-A crown-jewel KEY authority but does NOT
+    /// co-reside the `secrets.sealer` that would unlock it, so its key unlock could only arrive over a
+    /// cross-boundary link the secret-blind root relays — the approved first-cut
+    /// "key-free-OR-co-located" VM scope violated directly. Fail-closed, the belt-and-suspenders
+    /// companion to [`CompositionViolation::VmKeyMaterialLinkRelayedThroughRoot`]
+    /// ([`check_vm_secret_blindness_closure`], design §2.3): a VM instance must either hold NO group-A
+    /// key authority (a key-free static parser frontend / compute instance — design P3), or co-reside
+    /// the `secrets.sealer` that unlocks it (design P1 — the key conversation never leaves the guest).
+    VmKeyHolderNotSelfSufficient {
+        /// The offending VM instance label (holds ≥1 group-A crown jewel but not `secrets.sealer`).
+        instance: String,
+    },
 }
 
 impl std::fmt::Display for CompositionViolation {
@@ -1421,6 +1461,30 @@ impl std::fmt::Display for CompositionViolation {
                  defeating FailNodeClosed). Use `substrate: os-process` for the template, or keep \
                  `container` only on static (boot-forked) instances, until the deferred pid-ns-init \
                  container-worker model lands"
+            ),
+            Self::VmKeyMaterialLinkRelayedThroughRoot {
+                link,
+                sealer_instance,
+                signer_instance,
+                vm_endpoints,
+            } => write!(
+                f,
+                "link {link:?} carries KEK-unsealed key material (secrets.sealer {sealer_instance:?} \
+                 ↔ token.signer {signer_instance:?}) across a VM boundary (vm endpoint(s) [{}]) — a VM \
+                 guest has its own kernel, so this link becomes a vsock byte-relay through the \
+                 SECRET-BLIND root, and the plaintext key material would transit the root's memory, \
+                 breaking the root-holds-no-secret invariant; co-locate `secrets.sealer` and \
+                 `token.signer` on ONE instance (intra-guest socketpair, never relayed), keep both off \
+                 the VM substrate, or (later cut) wire the sealer as the host-side vsock endpoint",
+                vm_endpoints.join(", ")
+            ),
+            Self::VmKeyHolderNotSelfSufficient { instance } => write!(
+                f,
+                "VM instance {instance:?} holds a group-A crown-jewel key authority but does not \
+                 co-reside the `secrets.sealer` that unlocks it — its key unlock could only arrive \
+                 over a cross-boundary link the secret-blind root relays; a VM instance must either \
+                 hold NO group-A key authority (a key-free parser frontend / compute instance) or \
+                 co-reside its `secrets.sealer` (the key conversation then never leaves the guest)"
             ),
         }
     }
@@ -1891,6 +1955,153 @@ pub fn check_sealed_signer_closure(
         if !linked {
             violations.push(CompositionViolation::SealedSignerUnlinkedToSealer {
                 signer_instance: signer.clone(),
+            });
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(CompositionError { violations })
+    }
+}
+
+/// The **VM secret-blindness composition-closure rule** (design `DESIGN-privsep-phase3-vm-derisk.md`
+/// §2.3 / S2): a fail-closed, STRUCTURAL guard that preserves the secret-blind-root invariant across
+/// the [`InstanceSubstrate::Vm`] boundary. Run IN THE ROOT, before any spawn, alongside
+/// [`check_composition_closure`] and [`check_sealed_signer_closure`] — the root surfaces either refusal
+/// identically.
+///
+/// A VM guest has its OWN kernel, so the `local` fd-passed `socketpair(2)` the root creates but never
+/// reads cannot cross the hypervisor boundary: any link with a VM endpoint must become a vsock
+/// byte-relay, and the natural relay — the one the root runs because it owns the topology — copies the
+/// link's bytes THROUGH the secret-blind root. A **key-material-bearing** link relayed that way would
+/// carry KEK-unsealed PLAINTEXT key material through the root's address space, breaking the "root holds
+/// no secret" invariant. This lint REFUSES exactly that, plus (belt-and-suspenders) a VM key holder
+/// that is not self-sufficient for its own unlock:
+///
+/// - [`CompositionViolation::VmKeyMaterialLinkRelayedThroughRoot`] — a key-material-bearing link (a
+///   `secrets.sealer` ↔ `token.signer` unseal unlock, the edge
+///   `boatramp::privsep::compute_unseal_allowlists` enumerates; OR a [`LinkPurpose::AuthorityServe`]
+///   link whose single crown-jewel endpoint holds `secrets.sealer`) connects two DIFFERENT instances
+///   where at least one is [`InstanceSubstrate::Vm`].
+/// - [`CompositionViolation::VmKeyHolderNotSelfSufficient`] — a [`InstanceSubstrate::Vm`] instance
+///   holds a group-A crown jewel but does not co-reside the `secrets.sealer` that unlocks it.
+///
+/// Two capabilities on the SAME instance share one guest (an intra-guest socketpair the root never
+/// relays — design P1), so a co-located `secrets.sealer`+`token.signer` VM is ACCEPTED; a key-free VM
+/// parser frontend (design P3) is ACCEPTED. It is a PURE, AST/topology-level predicate over the
+/// resolved [`PrivsepConfig`] — never a parse of link traffic or a text marker — reusing only existing
+/// predicates ([`HostAuthority::is_crown_jewel`], [`InstanceSubstrate::Vm`], and the sealer↔signer edge
+/// detection [`check_sealed_signer_closure`] / `compute_unseal_allowlists` already share).
+///
+/// `sealed_signer` is the same node-global "`[serve.signer]` is the sealed variant" fact
+/// [`check_sealed_signer_closure`] takes (the caller derives it from the resolved `ServerConfig`, since
+/// this wasm-clean types layer does not see `AuthSignerConfig`). It gates the
+/// `secrets.sealer`↔`token.signer` UNSEAL edge (an AwsKms/ambient/absent signer unseals nothing over a
+/// link); an explicit `AuthorityServe`-to-sealer link and the second-tier VM-key-holder scope check
+/// stand on the topology ALONE. Kept SEPARATE from [`check_composition_closure`] so its signature and
+/// callers stay pure over [`PrivsepConfig`].
+pub fn check_vm_secret_blindness_closure(
+    cfg: &PrivsepConfig,
+    sealed_signer: bool,
+) -> Result<(), CompositionError> {
+    let mut violations = Vec::new();
+
+    let is_vm = |label: &str| -> bool {
+        cfg.instances
+            .get(label)
+            .is_some_and(|i| i.substrate == InstanceSubstrate::Vm)
+    };
+    let holds = |label: &str, authority: HostAuthority| -> bool {
+        cfg.instances
+            .get(label)
+            .is_some_and(|i| i.capabilities.contains(&authority))
+    };
+
+    // --- Tier 1 (REFUSE): a key-material-bearing link root-relayed across a VM boundary. ---
+    for (link_name, link) in &cfg.links {
+        // An unhosted endpoint is already a `LinkEndpointUnhosted` refusal from
+        // `check_composition_closure`; skip so we neither double-report nor read a missing instance.
+        if !cfg.instances.contains_key(&link.from) || !cfg.instances.contains_key(&link.to) {
+            continue;
+        }
+
+        // Key-material-bearing? (design §2.3)
+        // (i) the `secrets.sealer`↔`token.signer` unseal unlock edge — exactly what
+        //     `compute_unseal_allowlists` enumerates — gated on a SEALED signer source (an
+        //     inline/AwsKms signer unseals nothing over a link); PLUS
+        // (ii) any `AuthorityServe` link whose SINGLE crown-jewel endpoint holds `secrets.sealer`
+        //     (an explicitly-marked key-material serve, which stands on the topology alone).
+        let unseal_edge = sealed_signer
+            && ((holds(&link.from, HostAuthority::SecretsSealer)
+                && holds(&link.to, HostAuthority::TokenSigner))
+                || (holds(&link.to, HostAuthority::SecretsSealer)
+                    && holds(&link.from, HostAuthority::TokenSigner)));
+
+        // The crown-jewel endpoint(s) of this link. A well-formed `AuthorityServe` link has EXACTLY
+        // one (0/≥2 is already an `AuthorityServeLinkNotSingleCrownJewel` refusal); treat the link as
+        // key-material-bearing only when that single crown jewel is the sealer serving key material.
+        let crown_endpoints: Vec<&str> = [link.from.as_str(), link.to.as_str()]
+            .into_iter()
+            .filter(|ep| {
+                cfg.instances
+                    .get(*ep)
+                    .is_some_and(|i| i.capabilities.iter().any(|a| a.is_crown_jewel()))
+            })
+            .collect();
+        let authority_serve_sealer = link.is_authority_serve()
+            && crown_endpoints.len() == 1
+            && holds(crown_endpoints[0], HostAuthority::SecretsSealer);
+
+        if !(unseal_edge || authority_serve_sealer) {
+            continue;
+        }
+
+        // Root-relayed cross-boundary? Two capabilities on the SAME instance share one guest (an
+        // intra-guest socketpair, never relayed); a link between DIFFERENT instances where either is a
+        // VM crosses the hypervisor boundary and is relayed by the root.
+        let cross_boundary = link.from != link.to && (is_vm(&link.from) || is_vm(&link.to));
+        if !cross_boundary {
+            continue;
+        }
+
+        // Name the sealer SOURCE endpoint and the receiving (signer / caller) endpoint for the remedy.
+        let (sealer_instance, signer_instance) = if holds(&link.from, HostAuthority::SecretsSealer)
+        {
+            (link.from.clone(), link.to.clone())
+        } else {
+            (link.to.clone(), link.from.clone())
+        };
+        let mut vm_endpoints: Vec<String> = Vec::new();
+        if is_vm(&link.from) {
+            vm_endpoints.push(link.from.clone());
+        }
+        if is_vm(&link.to) {
+            vm_endpoints.push(link.to.clone());
+        }
+
+        violations.push(CompositionViolation::VmKeyMaterialLinkRelayedThroughRoot {
+            link: link_name.clone(),
+            sealer_instance,
+            signer_instance,
+            vm_endpoints,
+        });
+    }
+
+    // --- Tier 2 (REFUSE): a VM instance must hold NO group-A key authority, OR co-reside the sealer
+    //     that unlocks it — the first-cut "key-free-OR-co-located" scope, enforced directly. (A VM
+    //     holding ONLY `secrets.sealer` co-resides its own sealer and is self-sufficient; a serve it
+    //     makes ACROSS a boundary is caught by Tier 1, not here.) ---
+    for (name, inst) in &cfg.instances {
+        if inst.substrate != InstanceSubstrate::Vm {
+            continue;
+        }
+        let holds_crown_jewel = inst.capabilities.iter().any(|a| a.is_crown_jewel());
+        let co_resides_sealer = inst.capabilities.contains(&HostAuthority::SecretsSealer);
+        if holds_crown_jewel && !co_resides_sealer {
+            violations.push(CompositionViolation::VmKeyHolderNotSelfSufficient {
+                instance: name.clone(),
             });
         }
     }
@@ -3426,5 +3637,202 @@ mod tests {
             err.to_string().contains("unknown host authority")
                 || err.to_string().contains("secrets.sealr")
         );
+    }
+
+    // ---- S2: VM secret-blindness composition-closure lint (`check_vm_secret_blindness_closure`) ----
+    //
+    // Tier 1 REFUSES a key-material-bearing link (a `secrets.sealer`↔`token.signer` unseal unlock, or
+    // an `AuthorityServe` link whose single crown jewel is the sealer) root-relayed across a VM
+    // boundary — the KEK-unsealed plaintext would transit the secret-blind root's vsock relay. Tier 2
+    // REFUSES a VM instance that holds a group-A key authority without co-residing its sealer (the
+    // first-cut "key-free-OR-co-located" scope). Both are PURE over the resolved PrivsepConfig.
+
+    /// Mark one instance's isolation substrate.
+    fn set_substrate(cfg: &mut PrivsepConfig, instance: &str, substrate: InstanceSubstrate) {
+        cfg.instances.get_mut(instance).unwrap().substrate = substrate;
+    }
+
+    #[test]
+    fn vm_refuses_sealer_signer_unlock_link_crossing_a_vm_boundary() {
+        // `split_signer_composition`: `sealer` (secrets.sealer + 4 other jewels) and `signer`
+        // (token.signer alone) on DIFFERENT instances, joined by the `to-signer` unseal link. Put the
+        // SEALER in a VM: the sealer co-resides its own KEK so Tier 2 stays silent (clean Tier-1
+        // isolation), but the unseal unlock link now crosses the hypervisor boundary → the root would
+        // relay KEK-unsealed key material.
+        let mut cfg = split_signer_composition();
+        set_substrate(&mut cfg, "sealer", InstanceSubstrate::Vm);
+
+        let err = check_vm_secret_blindness_closure(&cfg, true)
+            .expect_err("a sealer↔signer unseal link across a VM boundary must refuse");
+        assert_eq!(err.violations.len(), 1, "exactly the Tier-1 refusal: {err}");
+        match &err.violations[0] {
+            CompositionViolation::VmKeyMaterialLinkRelayedThroughRoot {
+                link,
+                sealer_instance,
+                signer_instance,
+                vm_endpoints,
+            } => {
+                assert_eq!(link, "to-signer");
+                assert_eq!(sealer_instance, "sealer");
+                assert_eq!(signer_instance, "signer");
+                assert_eq!(vm_endpoints, &vec!["sealer".to_string()]);
+            }
+            other => panic!("wrong variant / wrong reason: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_unseal_link_refusal_is_gated_on_a_sealed_signer() {
+        // The SAME topology (sealer in a VM, linked to a separate signer) is a Tier-1 no-op when the
+        // signer is NOT sealed — an AwsKms/ambient/inline signer unseals nothing over the link, so no
+        // key material would cross. (The sealer-in-VM self-resides its KEK ⇒ Tier 2 silent too.)
+        let mut cfg = split_signer_composition();
+        set_substrate(&mut cfg, "sealer", InstanceSubstrate::Vm);
+        check_vm_secret_blindness_closure(&cfg, false)
+            .expect("a non-sealed signer crosses no key material — the unseal edge is gated");
+    }
+
+    #[test]
+    fn vm_refuses_an_authority_serve_to_sealer_link_even_when_unsealed() {
+        // The design's SECOND key-material-bearing clause: an explicit `AuthorityServe` link whose
+        // single crown-jewel endpoint IS the sealer stands on the topology ALONE (NOT gated on
+        // `sealed_signer`). `sealer` serves the authority grammar to a key-free `frontend` listener in
+        // a VM → the serve response (key material) would cross the root-relayed boundary.
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "frontend".to_string(),
+            inst(&[
+                HostAuthority::ListenPublicTls,
+                HostAuthority::ListenHttpParse,
+            ]),
+        );
+        // The sole crown-jewel endpoint is `secrets.sealer` (exactly one ⇒ a well-formed authority-serve
+        // link, not an `AuthorityServeLinkNotSingleCrownJewel`).
+        instances.insert("sealer".to_string(), inst(&[HostAuthority::SecretsSealer]));
+        let mut links = BTreeMap::new();
+        links.insert(
+            "serve".to_string(),
+            PrivsepLink {
+                from: "frontend".to_string(),
+                to: "sealer".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::AuthorityServe,
+            },
+        );
+        let mut cfg = PrivsepConfig {
+            instances,
+            links,
+            supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
+        };
+        // The VM endpoint is the KEY-FREE frontend (so Tier 2 stays silent — it holds no crown jewel).
+        set_substrate(&mut cfg, "frontend", InstanceSubstrate::Vm);
+
+        // `sealed_signer = false`: the authority-serve-to-sealer clause is topology-only.
+        let err = check_vm_secret_blindness_closure(&cfg, false)
+            .expect_err("an authority-serve-to-sealer link across a VM boundary must refuse");
+        assert_eq!(err.violations.len(), 1, "exactly the Tier-1 refusal: {err}");
+        match &err.violations[0] {
+            CompositionViolation::VmKeyMaterialLinkRelayedThroughRoot {
+                link,
+                sealer_instance,
+                signer_instance,
+                vm_endpoints,
+            } => {
+                assert_eq!(link, "serve");
+                assert_eq!(sealer_instance, "sealer");
+                assert_eq!(signer_instance, "frontend");
+                assert_eq!(vm_endpoints, &vec!["frontend".to_string()]);
+            }
+            other => panic!("wrong variant / wrong reason: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_refuses_a_key_holder_without_its_co_resident_sealer() {
+        // Tier 2, ISOLATED: put the key-holding `signer` (token.signer, no secrets.sealer) in a VM and
+        // pass `sealed_signer = false` so the Tier-1 unseal edge does NOT fire — proving Tier 2 stands
+        // on the topology alone: a VM key holder that does not co-reside its sealer is refused outright
+        // (the "key-free-OR-co-located" first-cut scope).
+        let mut cfg = split_signer_composition();
+        set_substrate(&mut cfg, "signer", InstanceSubstrate::Vm);
+
+        let err = check_vm_secret_blindness_closure(&cfg, false)
+            .expect_err("a VM instance holding token.signer without its sealer must refuse");
+        assert_eq!(err.violations.len(), 1, "exactly the Tier-2 refusal: {err}");
+        match &err.violations[0] {
+            CompositionViolation::VmKeyHolderNotSelfSufficient { instance } => {
+                assert_eq!(instance, "signer");
+            }
+            other => panic!("wrong variant / wrong reason: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_both_tiers_fire_for_a_sealed_key_holder_in_a_vm() {
+        // When the KEY-HOLDING signer is in a VM AND sealed, BOTH tiers fire and compose: Tier 1 (the
+        // unseal link crosses to the VM) and Tier 2 (the VM holds token.signer without its sealer).
+        let mut cfg = split_signer_composition();
+        set_substrate(&mut cfg, "signer", InstanceSubstrate::Vm);
+        let err = check_vm_secret_blindness_closure(&cfg, true)
+            .expect_err("a sealed key holder in a VM trips both tiers");
+        assert!(
+            err.violations.iter().any(|v| matches!(
+                v,
+                CompositionViolation::VmKeyMaterialLinkRelayedThroughRoot { signer_instance, .. }
+                    if signer_instance == "signer"
+            )),
+            "Tier 1 (key-material link relayed) must fire: {err}"
+        );
+        assert!(
+            err.violations.iter().any(|v| matches!(
+                v,
+                CompositionViolation::VmKeyHolderNotSelfSufficient { instance }
+                    if instance == "signer"
+            )),
+            "Tier 2 (key holder not self-sufficient) must fire: {err}"
+        );
+    }
+
+    #[test]
+    fn vm_allows_the_p1_co_located_sealer_and_signer_in_one_vm() {
+        // P1: secrets.sealer + token.signer (+ every other jewel) co-located on ONE instance — their
+        // unlock is an intra-guest socketpair the root never relays. Put that whole crown-jewel
+        // instance in a VM: the key conversation never leaves the guest, so the lint ALLOWS it, and the
+        // base composition-closure lint still passes (no regression).
+        let mut cfg = clean_composition();
+        set_substrate(&mut cfg, "signer", InstanceSubstrate::Vm);
+        check_vm_secret_blindness_closure(&cfg, true)
+            .expect("a co-located sealer+signer in one VM is self-sufficient (P1)");
+        check_composition_closure(&cfg).expect("the base composition-closure lint still passes");
+    }
+
+    #[test]
+    fn vm_allows_a_key_free_vm_parser_frontend() {
+        // P3: a key-free VM instance — `parser` holds only group-C listeners (no crown jewel, in no key
+        // link), the conservative default. The lint ALLOWS it; the base lint still passes.
+        let mut cfg = clean_composition();
+        set_substrate(&mut cfg, "parser", InstanceSubstrate::Vm);
+        check_vm_secret_blindness_closure(&cfg, true)
+            .expect("a key-free VM parser frontend is allowed (P3)");
+        check_composition_closure(&cfg).expect("the base composition-closure lint still passes");
+    }
+
+    #[test]
+    fn vm_lint_is_a_noop_on_existing_non_vm_topologies() {
+        // No regression: with NO substrate:Vm instance anywhere, BOTH tiers are a structural no-op —
+        // for a sealed signer AND a non-sealed one — across the shipped fixtures.
+        for sealed in [false, true] {
+            check_vm_secret_blindness_closure(&clean_composition(), sealed).unwrap_or_else(|e| {
+                panic!("clean (all OsProcess) must pass (sealed={sealed}): {e}")
+            });
+            check_vm_secret_blindness_closure(&split_signer_composition(), sealed).unwrap_or_else(
+                |e| panic!("split-signer (all OsProcess) must pass (sealed={sealed}): {e}"),
+            );
+        }
+        // The existing closure checks are unmodified and keep passing.
+        check_composition_closure(&clean_composition()).expect("base composition lint unchanged");
+        check_sealed_signer_closure(&split_signer_composition(), true)
+            .expect("sealed-signer lint unchanged");
     }
 }
