@@ -2294,6 +2294,17 @@ Drop a login role from a managed database (the role + its sealed credential)
 | `<NAME>` | — | — | — | The login role name (as given to `db ensure user`) |
 | `--database <DATABASE>` | — | — | — | The managed database whose server the role lives on |
 
+#### `boatramp db drop database`
+
+HARD-DROP a managed database — the database + its role + sealed credential (Shared), or the dedicated server workload + credential (Single). IRREVERSIBLE (no soft-delete grace window): the explicit operator teardown, and the recovery path for a managed database ORPHANED by a failed `project sync` or an older `project rm` (which could leave it with no CLI path to reach it). Idempotent on an already-absent database. Requires `-y/--yes` — there is no interactive prompt, and the server independently re-confirms the name
+
+**Usage:** `boatramp db drop database [OPTIONS] [NAME]`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `[NAME]` | — | `default` | — | The database binding name (defaults to the project's `default` database) |
+| `-y, --yes` | — | — | — | Confirm the IRREVERSIBLE drop (required — there is no interactive prompt) |
+
 ### `boatramp db restart`
 
 Restart a managed database (`Project·Admin`): stop it so the reconcile loop relaunches it, applying any restart-requiring config change staged on the declaration in the process (e.g. a flipped `delta_capture`, which needs `wal_level=logical`/`--log-bin` in the launch argv to take effect). The explicit restart path a `restart_policy: manual` config change needs (see `db status`'s "pending restart" signal), and a general lever to bounce a database that needs no config change at all
@@ -2957,6 +2968,8 @@ Idempotent, selective, coherence-preserving project SYNC (the successor to `impo
 | `-y, --yes` | — | — | — | Confirm a mutating `--apply`. Required for `--apply` (there is no interactive prompt) |
 | `--clone-source-token-file <PATH>` | — | — | — | Path to a file holding the SOURCE node's Project-Admin token — required for a cross-node (URL `--from`) `--apply` (reads + streams the source). Falls back to `BOATRAMP_CLONE_SOURCE_TOKEN`. Never passed as a bare CLI argument |
 | `--allow-domain-cutover` | — | — | — | Intend a cross-node DOMAIN CUTOVER. Carrying `--include-domains` from a URL (cross-node) source is refused without this flag: the dest node's host-uniqueness guard is same-node only and cannot see whether the remote source still LIVE-owns the host, so a carry could create a second simultaneously-live owner. Pass this only when the operator has taken the source down (DR) or is deliberately yielding the host (blue-green cutover) |
+| `--continue-on-error <KINDS>` | — | — | — | Blob-transfer robustness — GET THE TRANSFER THROUGH past a per-blob FAILURE instead of aborting the whole multi-GB run: forgive the listed error kinds (warn, record, skip that one blob, then continue). The operative kind for a big blob move is `backend` (a blob target-write that survived the S3 backend's own bounded retries — e.g. a sustained Tigris `503 SlowDown` under a write storm); bare `--continue-on-error` forgives every kind, `--continue-on-error=backend` only that one. Each skipped blob lands in a skip MANIFEST the run reports, for an `--only-blobs` repair. PARITY with `project import --clone-from`'s flag; the value is forwarded verbatim to the data-plane clone the node runs. Default off (a transient S3 fault aborts the whole run — the pre-fix behaviour) |
+| `--only-blobs <MANIFEST>` | — | — | — | Blob-transfer robustness — REPAIR: re-stream ONLY the blob keys named in this skip MANIFEST (the file a prior `--continue-on-error` run's report named), restoring nothing else from the data plane. The blobs are pulled again from the source over the SAME streaming clone path (no local copy, no spool); the rest of the sync plan is idempotent, so a repair re-run is a no-op except for the named blobs. PARITY with `project import --clone-from --only-blobs` |
 
 ## `boatramp dns`
 
