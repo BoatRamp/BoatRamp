@@ -246,3 +246,7 @@ hex.workspace = true
 # Parse a resumable delta MANIFEST + rewrite a crafted member's `{size,sha256}` meta in the
 # pg WAL true-delta live gate (project_export_roundtrip.rs).
 serde_json.workspace = true
+# The in-process fault-injecting S3 reverse proxy in the blob-transfer robustness live gate
+# (`tests/sync_blob_robustness_live.rs`): it forwards SigV4-signed requests to the real MinIO and
+# injects a `503 SlowDown` on the poisoned key. Only used by that `--features s3` gate.
+reqwest.workspace = true
