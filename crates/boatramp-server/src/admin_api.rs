@@ -2265,6 +2265,13 @@ pub(super) struct DropDatabaseQuery {
     /// stray `DELETE` can never satisfy.
     #[serde(default)]
     confirm: Option<String>,
+    /// `?orphan=true` ⇒ the UNDECLARED-ORPHAN recovery path: hard-drop the derived database even when
+    /// NO binding is declared (a prior failed `project sync` / `project rm` left it orphaned, so the
+    /// normal declared drop `NotDeclared`s it). Reconstructs the managed Shared-Postgres derivation
+    /// from `(project, name)` — never a raw name — and drops the DB + its `…_owner` + login roles +
+    /// credentials. Default `false` ⇒ the declared-binding drop.
+    #[serde(default)]
+    orphan: bool,
 }
 
 /// `DELETE /api/projects/{proj}/databases/{name}` — **HARD-DROP** a managed database
@@ -2302,10 +2309,19 @@ pub(super) async fn drop_database(
     let Some(declare) = declare else {
         return declare_unavailable();
     };
-    match declare
-        .drop_database(project.as_ref().as_str(), &name)
-        .await
-    {
+    // `?orphan=true` routes to the UNDECLARED-ORPHAN hard-drop (reconstructs the derived names from
+    // `(project, name)` so a database with NO declared binding is still reachable); otherwise the
+    // normal declared-binding drop (which `NotDeclared`s an undeclared name).
+    let result = if q.orphan {
+        declare
+            .drop_orphan_database(project.as_ref().as_str(), &name)
+            .await
+    } else {
+        declare
+            .drop_database(project.as_ref().as_str(), &name)
+            .await
+    };
+    match result {
         Ok(outcome) => (
             StatusCode::OK,
             Json(serde_json::json!({

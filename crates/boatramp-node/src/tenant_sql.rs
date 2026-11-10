@@ -1049,6 +1049,123 @@ pub async fn deprovision_tenant(
     Ok(())
 }
 
+/// HARD-drop an ORPHANED Shared-Postgres managed tenant BY IDENTITY — the operator
+/// `db drop database --orphan` recovery verb for a tenant whose declaration is GONE but whose
+/// physical database a prior failed `project sync` / `project rm` left behind, so the normal
+/// declared deprovision ([`deprovision_tenant`]) cannot reach it (no declared binding to resolve).
+///
+/// DATA-LOSS-SENSITIVE + tenancy-sensitive — flagged for Security review. The hard scoping is
+/// STRUCTURAL, not a string check: EVERY name (`compute`, the physical database, the login + owner
+/// roles, the sealed credential keys) is DERIVED from `(binding, project)` through the SAME
+/// `tenant_names` / credential-key helpers provisioning used — NEVER from an operator-supplied raw
+/// name — so this can only ever target THIS project's own derived database within the node's managed
+/// derived-name namespace. An arbitrary / foreign / system database name is unreachable by
+/// construction (the caller names `(project, binding)`, and the physical name is computed here). The
+/// reserved default tenant is refused (its database IS the single-tenant install). Idempotent: every
+/// DROP is `IF EXISTS`, so clearing an already-absent orphan is a clean no-op.
+///
+/// Unlike [`deprovision_tenant`]'s immediate Shared cell (which drops only the DB + login role and
+/// LEAKS the `_owner` role), this ALSO drops the per-tenant OWNER (`…_owner`) role — the orphaned
+/// owner the task requires cleared — best-effort (a role still owning other objects, e.g. shared
+/// across the tenant's other bindings on the same server, is LEFT INTACT and logged, never force-
+/// dropped). Returns the derived physical database name that was targeted.
+///
+/// Scoped to Shared Postgres (the construens per-tenant-db orphan shape): a Single tenant's isolation
+/// unit is a whole dedicated container (torn down via the compute surface, not a DB drop), and MySQL
+/// has no separate owner role; both are refused here with a clear message.
+pub async fn hard_drop_orphan_tenant(
+    deploy: &DeployStore,
+    kv: &Arc<dyn KvStore>,
+    envelope: &Arc<dyn KeyEnvelope>,
+    binding: &ExternalDatabaseConfig,
+    project: &str,
+) -> Result<String, String> {
+    let Some(compute) = binding.compute.as_deref().filter(|c| !c.is_empty()) else {
+        return Err("orphan drop: binding is not a managed (compute-backed) database".to_string());
+    };
+    let Some(kind) = ExternalSqlKind::parse(&binding.kind) else {
+        return Err(format!("orphan drop: unparsable engine {:?}", binding.kind));
+    };
+    if kind != ExternalSqlKind::Postgres {
+        return Err(
+            "orphan drop (`db drop database --orphan`) supports Shared Postgres managed databases \
+             only; a MySQL or Single/dedicated tenant is torn down via its normal delete path"
+                .to_string(),
+        );
+    }
+    if !matches!(binding.tenant, TenantIsolation::Shared) {
+        return Err(
+            "orphan drop supports Shared-tenancy managed databases only (a Single/dedicated tenant's \
+             isolation unit is a whole container, dropped via the compute surface)"
+                .to_string(),
+        );
+    }
+    let (tenant_ident_raw, is_default) = tenant_key(binding.tenant_scope, project, "");
+    if is_default {
+        return Err(
+            "the reserved `default` tenant's database is the single-tenant install and cannot be \
+             orphan-dropped"
+                .to_string(),
+        );
+    }
+    let database = binding.database.as_deref().unwrap_or_default();
+    let superuser = binding.user.as_deref().unwrap_or_default();
+    let ident = sanitize_ident(&tenant_ident_raw);
+    let names = tenant_names(binding.tenant, compute, database, &tenant_ident_raw, false);
+    let creds = ManagedSqlCredentials::new(kv.clone(), envelope.clone());
+    let admin = shared_admin_backend(deploy, &creds, kind, compute, superuser).await?;
+
+    // 1. Terminate any lingering sessions on the orphan, then HARD-drop the database (fatal: the
+    //    whole point is to clear the name so a re-sync's CREATE/rename lands). `IF EXISTS` ⇒ a clean
+    //    no-op on an already-absent orphan (idempotent).
+    // The physical name is a `sanitize_ident` output (safe `[a-z0-9_]` charset); the single-quote
+    // doubling is defensive belt-and-suspenders for the terminate-sweep literal.
+    let db_lit = format!("'{}'", names.database.replace('\'', "''"));
+    let db_id = boatramp_storage::tenant_provision::quote_ident(kind, &names.database);
+    admin
+        .run_script(&format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = {db_lit} AND pid <> pg_backend_pid();"
+        ))
+        .await
+        .map_err(|e| format!("orphan drop: terminate sessions on {}: {e}", names.database))?;
+    admin
+        .run_script(&format!("DROP DATABASE IF EXISTS {db_id};"))
+        .await
+        .map_err(|e| format!("orphan drop: DROP DATABASE {}: {e}", names.database))?;
+
+    // 2. Best-effort: drop the per-tenant login + OWNER roles (the owner the immediate deprovision
+    //    cell leaks). A role still owning other objects / granted elsewhere (e.g. shared across this
+    //    tenant's other bindings on the same server) makes `DROP ROLE` error — that is EXPECTED and
+    //    NON-fatal: we never force-drop a role still in use; it is left intact and logged.
+    for role in [&names.role, &names.owner_role] {
+        let role_id = boatramp_storage::tenant_provision::quote_ident(kind, role);
+        if let Err(e) = admin
+            .run_script(&format!("DROP ROLE IF EXISTS {role_id};"))
+            .await
+        {
+            tracing::info!(
+                role = %role,
+                error = %e,
+                "orphan drop: per-tenant role left intact (still owns objects / shared across the \
+                 tenant's bindings) — not force-dropped"
+            );
+        }
+    }
+
+    // 3. Best-effort: delete the sealed per-tenant credentials (login + owner). Keeping them would
+    //    only leave dead KV entries; a failure here never blocks the drop.
+    let login_cred = credential_workload_key(compute, &ident);
+    let owner_cred = owner_credential_workload_key(compute, &ident);
+    for cred in [&login_cred, &owner_cred] {
+        if let Err(e) = creds.delete(project, cred).await {
+            tracing::info!(cred = %cred, error = %e, "orphan drop: sealed credential delete skipped");
+        }
+    }
+
+    Ok(names.database)
+}
+
 /// The **pure** decision of how a delete tears a tenant down — the engine/cell split
 /// (see the module matrix), with no IO so it is fully unit-testable. Returns `None`
 /// for a binding this module doesn't own (bring-your-own `url_env`, unparsable

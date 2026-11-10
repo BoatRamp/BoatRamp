@@ -861,6 +861,71 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         .map_err(DeclareError::Other)?;
         Ok(DropDatabaseOutcome { database: physical })
     }
+
+    async fn drop_orphan_database(
+        &self,
+        project: &str,
+        name: &str,
+    ) -> Result<boatramp_core::sql::DropDatabaseOutcome, DeclareError> {
+        use boatramp_core::sql::DropDatabaseOutcome;
+        boatramp_core::project::validate_resource_name("project", project)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        boatramp_core::project::validate_resource_name("database", name)
+            .map_err(|e| DeclareError::Other(e.to_string()))?;
+        // CATASTROPHIC-DROP GUARD (same as the declared drop): the reserved `default` project's
+        // database IS the single-tenant install — never droppable.
+        if project == boatramp_core::project::DEFAULT_PROJECT {
+            return Err(DeclareError::Other(
+                "the reserved `default` project's managed database is the single-tenant install \
+                 and cannot be dropped"
+                    .to_string(),
+            ));
+        }
+        // Resolve a binding if one STILL exists (a node-static or project-declared one) — then this
+        // is an explicit operator hard-drop of a declared Shared-Postgres binding. When NONE resolves
+        // (the UNDECLARED ORPHAN — construens's "no CLI path" case), RECONSTRUCT the managed
+        // Shared-Postgres/Project default from `(project, name)` — the shape the declarative front
+        // door creates — so the hard drop derives the SAME physical names provisioning did. A
+        // bring-your-own (`url_env`/`password_env`) binding is the operator's OWN database, refused.
+        let binding = match resolve_binding(&self.static_dbs, &self.deploy, project, name).await? {
+            Some(b) if b.is_managed_credential() => b,
+            Some(_) => {
+                return Err(DeclareError::Other(format!(
+                    "database {name:?} is a bring-your-own (external-URL) binding — its database is \
+                     the operator's own, not a boatramp-managed orphan to drop"
+                )));
+            }
+            None => ExternalDatabaseConfig {
+                kind: "postgres".to_string(),
+                compute: Some(derived_workload(project, name)),
+                database: Some(name.to_string()),
+                user: Some(name.to_string()),
+                tenant: TenantIsolation::Shared,
+                tenant_scope: TenantScope::Project,
+                ..Default::default()
+            },
+        };
+        if matches!(binding.tenant_scope, TenantScope::Site) {
+            return Err(DeclareError::Other(format!(
+                "database {name:?} is site-scoped; `db drop database --orphan` is project-level — a \
+                 site's managed database is torn down when its site is deleted"
+            )));
+        }
+        // STRUCTURAL HARD-SCOPE: every physical name derives from `(project, binding)` inside
+        // `hard_drop_orphan_tenant` — never an operator-supplied raw name — so this can only ever
+        // drop THIS project's own derived database. Idempotent (`IF EXISTS`); drops the DB + its
+        // `…_owner` + login roles + sealed credentials.
+        let physical = crate::tenant_sql::hard_drop_orphan_tenant(
+            &self.deploy,
+            &self.kv,
+            &self.envelope,
+            &binding,
+            project,
+        )
+        .await
+        .map_err(DeclareError::Other)?;
+        Ok(DropDatabaseOutcome { database: physical })
+    }
 }
 
 #[cfg(test)]

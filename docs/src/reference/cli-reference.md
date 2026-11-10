@@ -2304,6 +2304,7 @@ HARD-DROP a managed database — the database + its role + sealed credential (Sh
 | --- | --- | --- | --- | --- |
 | `[NAME]` | — | `default` | — | The database binding name (defaults to the project's `default` database) |
 | `-y, --yes` | — | — | — | Confirm the IRREVERSIBLE drop (required — there is no interactive prompt) |
+| `--orphan` | — | — | — | Clear an UNDECLARED ORPHAN: hard-drop the derived managed database even when NO binding is declared (a prior failed `project sync` / `project rm` left it orphaned, so the normal drop reports it is not declared). The physical database + its `_owner`/login roles + credentials are derived from `(project, name)` server-side (never a raw name) and dropped. Shared-Postgres only. Idempotent on an already-absent orphan |
 
 ### `boatramp db restart`
 
