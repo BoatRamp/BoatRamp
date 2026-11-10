@@ -86,6 +86,9 @@ pub enum Error {
         /// Per-item reasons, one per line.
         detail: String,
     },
+    /// `--only-blobs <MANIFEST>` could not be read or parsed (blob-transfer robustness repair).
+    #[error("reading the --only-blobs skip manifest failed: {0}")]
+    OnlyBlobsManifest(String),
 }
 
 /// `project sync` module result; `Err` is [`Error`].
@@ -211,6 +214,27 @@ pub struct SyncArgs {
     /// (DR) or is deliberately yielding the host (blue-green cutover).
     #[arg(long)]
     allow_domain_cutover: bool,
+
+    /// Blob-transfer robustness — GET THE TRANSFER THROUGH past a per-blob FAILURE instead of
+    /// aborting the whole multi-GB run: forgive the listed error kinds (warn, record, skip that one
+    /// blob, then continue). The operative kind for a big blob move is `backend` (a blob
+    /// target-write that survived the S3 backend's own bounded retries — e.g. a sustained Tigris
+    /// `503 SlowDown` under a write storm); bare `--continue-on-error` forgives every kind,
+    /// `--continue-on-error=backend` only that one. Each skipped blob lands in a skip MANIFEST the
+    /// run reports, for an `--only-blobs` repair. PARITY with `project import --clone-from`'s flag;
+    /// the value is forwarded verbatim to the data-plane clone the node runs. Default off (a
+    /// transient S3 fault aborts the whole run — the pre-fix behaviour).
+    #[arg(long = "continue-on-error", value_name = "KINDS", num_args = 0..=1,
+          require_equals = true, default_missing_value = "all")]
+    continue_on_error: Option<String>,
+
+    /// Blob-transfer robustness — REPAIR: re-stream ONLY the blob keys named in this skip MANIFEST
+    /// (the file a prior `--continue-on-error` run's report named), restoring nothing else from the
+    /// data plane. The blobs are pulled again from the source over the SAME streaming clone path (no
+    /// local copy, no spool); the rest of the sync plan is idempotent, so a repair re-run is a no-op
+    /// except for the named blobs. PARITY with `project import --clone-from --only-blobs`.
+    #[arg(long = "only-blobs", value_name = "MANIFEST")]
+    only_blobs: Option<PathBuf>,
 }
 
 impl SyncArgs {
@@ -680,6 +704,21 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
     };
     let source_token = source_token.ok_or(Error::MissingSourceToken)?;
 
+    // `--only-blobs <MANIFEST>` repair: read the skip manifest LOCALLY and extract its TARGET blob
+    // keys (the node re-streams exactly these through the data-plane clone). Same core type + reader
+    // as `project import --clone-from --only-blobs`, so a manifest round-trips between the two
+    // surfaces.
+    let only_blob_keys = match &args.only_blobs {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| Error::OnlyBlobsManifest(format!("{}: {e}", path.display())))?;
+            let manifest = boatramp_core::project_export::SkipManifest::from_json(&bytes)
+                .map_err(Error::OnlyBlobsManifest)?;
+            manifest.blob_keys().into_iter().collect::<Vec<_>>()
+        }
+        None => Vec::new(),
+    };
+
     let mut exec = CliSyncExecutor {
         dest_cp,
         source_cp,
@@ -698,11 +737,17 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
         strict: selection.strict,
         data_transferred: false,
         kv_skip_notes: Vec::new(),
+        continue_on_error: args.continue_on_error.clone(),
+        only_blob_keys,
+        data_skip_notes: Vec::new(),
     };
     let applied = apply_sync(&plan, &mut exec).await?;
     // Surface any KV-stratum records the dest skipped-and-reported (PLAN rule 3) in the operator
     // notes (under `--strict` a skip already aborted the run inside `carry_kv_stratum`).
     notes.append(&mut exec.kv_skip_notes);
+    // Surface any BLOBS the data-plane clone skipped-and-recorded under `--continue-on-error` (the
+    // transient-S3-fault ride-past) — the DISTINCT "applied WITH skips" outcome a human/CI gates on.
+    notes.append(&mut exec.data_skip_notes);
     Ok(SyncReport {
         plan,
         notes,
@@ -758,6 +803,20 @@ struct CliSyncExecutor {
     /// KV-stratum records the dest skipped-and-reported under the default (non-strict) posture,
     /// drained into the operator report by `run()`.
     kv_skip_notes: Vec<String>,
+    /// Blob-transfer robustness (`--continue-on-error`): the raw error-tolerance value forwarded
+    /// verbatim to the data-plane clone, so a per-blob `backend` fault (a sustained S3 `503 SlowDown`
+    /// that outlived the backend's retries) is skipped-and-recorded instead of aborting the run.
+    /// `None` ⇒ off (hard-fail the first fault — the pre-fix behaviour).
+    continue_on_error: Option<String>,
+    /// Blob-transfer robustness (`--only-blobs` REPAIR): the TARGET blob keys to re-stream
+    /// EXCLUSIVELY through the data-plane clone (parsed from a prior run's skip manifest). Empty ⇒
+    /// transfer the whole data plane.
+    only_blob_keys: Vec<String>,
+    /// Blobs the data-plane clone SKIPPED-and-reported under a `--continue-on-error` policy (one note
+    /// per skipped blob + the node-side skip-manifest path), drained into the operator report by
+    /// `run()` so a human/CI sees the DISTINCT "applied WITH skips" outcome and can run the
+    /// `--only-blobs` repair.
+    data_skip_notes: Vec<String>,
 }
 
 /// MEDIUM-2 (cross-tenant path-traversal guard): validate a SOURCE-derived resource `name` BEFORE
@@ -804,7 +863,19 @@ impl CliSyncExecutor {
         // The choice is the pure `data_clone_request` so the cross-node gate drives the EXACT same
         // decision over the real wire.
         let req = project_sync::data_clone_request(self.dest_absent);
-        self.dest_cp
+        // Blob-transfer robustness: thread the `--continue-on-error` / `--only-blobs` policy into the
+        // SAME data-plane clone the transport already rides (consolidate, don't parallelise — the
+        // robustness is the clone's reusable `MismatchFlags` unit, injected here, never mirrored). A
+        // transient S3 fault mid-transfer (the construens `503 SlowDown` after 27 GB) is then
+        // skipped-and-recorded instead of aborting the whole multi-GB run; `--only-blobs` re-streams
+        // exactly the recorded set.
+        let mismatch = client::MismatchFlags {
+            continue_on_error: self.continue_on_error.clone(),
+            only_blobs: self.only_blob_keys.clone(),
+            ..Default::default()
+        };
+        let outcome = self
+            .dest_cp
             .project_clone_from(
                 &self.target,
                 &self.source_url,
@@ -822,13 +893,41 @@ impl CliSyncExecutor {
                 // target (construens acceptance bar D). `carry_kv_stratum` carries the control plane
                 // selectively instead (honouring --exclude-domains + the --identity-fresh domain drop).
                 req.skip_control_plane_kv,
-                client::MismatchFlags::default(),
+                mismatch,
             )
             .await
             .map_err(|e| SyncApplyError::Transfer {
                 piece: "data",
                 message: e.to_string(),
             })?;
+        // Surface a data-plane clone that completed WITH forgiven per-blob skips as the DISTINCT
+        // "applied WITH skips" outcome (never a silent success): one note per skipped blob + the
+        // node-side skip-manifest path, so a human/CI gates on it and can run the `--only-blobs`
+        // repair. A clean clone adds nothing.
+        if let client::CloneOutcome::Applied { report, .. } = &outcome
+            && report.completed_with_skips()
+        {
+            for s in &report.skipped {
+                self.data_skip_notes.push(format!(
+                    "blob SKIPPED during the data-plane transfer ({}): {} — {}",
+                    s.kind, s.key, s.reason
+                ));
+            }
+            let repair = match &report.skip_manifest {
+                Some(path) => format!(
+                    "the node wrote a skip manifest at `{path}` — repair with `project sync … \
+                     --apply --continue-on-error=backend --only-blobs <manifest>` (the listed blobs \
+                     re-stream; the rest of the plan is an idempotent no-op)"
+                ),
+                None => "repair with `project sync … --apply --continue-on-error=backend \
+                         --only-blobs <manifest>` built from the skipped keys above"
+                    .to_string(),
+            };
+            self.data_skip_notes.push(format!(
+                "{} blob(s) were skipped-and-recorded; {repair}",
+                report.skipped.len()
+            ));
+        }
         self.data_transferred = true;
         Ok(())
     }
@@ -1148,6 +1247,9 @@ mod tests {
             strict: false,
             data_transferred: false,
             kv_skip_notes: Vec::new(),
+            continue_on_error: None,
+            only_blob_keys: Vec::new(),
+            data_skip_notes: Vec::new(),
         }
     }
 
@@ -1163,6 +1265,169 @@ mod tests {
         assert!(matches!(err, SyncApplyError::Unsupported(_)));
         // Both included → the guard passes (the network call is what would then run).
         assert!(dummy_exec(true, true).pg_included && dummy_exec(true, true).blobs_included);
+    }
+
+    /// Blob-transfer robustness — the `--continue-on-error[=KINDS]` flag parses with clone parity:
+    /// bare ⇒ `all`, `=backend` ⇒ the one kind, absent ⇒ `None` (off); `--only-blobs <MANIFEST>`
+    /// takes a path. The value is forwarded VERBATIM (the node parses kinds fail-closed).
+    #[test]
+    fn continue_on_error_and_only_blobs_flags_parse() {
+        let base = [
+            "sync",
+            "--from",
+            "https://p.example",
+            "--include-pg",
+            "--include-blobs",
+        ];
+        let with = |extra: &[&str]| {
+            let mut v = base.to_vec();
+            v.extend_from_slice(extra);
+            parse(&v).expect("parses")
+        };
+        // Absent ⇒ off.
+        assert_eq!(with(&[]).continue_on_error, None);
+        assert!(with(&[]).only_blobs.is_none());
+        // Bare `--continue-on-error` ⇒ the default-missing `all`.
+        assert_eq!(
+            with(&["--continue-on-error"]).continue_on_error.as_deref(),
+            Some("all")
+        );
+        // `=backend` ⇒ exactly that value, forwarded verbatim.
+        assert_eq!(
+            with(&["--continue-on-error=backend"])
+                .continue_on_error
+                .as_deref(),
+            Some("backend")
+        );
+        // `--only-blobs <path>` captures the manifest path.
+        assert_eq!(
+            with(&["--only-blobs", "/tmp/skip.json"])
+                .only_blobs
+                .as_deref(),
+            Some(std::path::Path::new("/tmp/skip.json"))
+        );
+    }
+
+    /// WIRING GATE (the load-bearing proof of the SYNC fix): `project sync`'s data-plane transfer
+    /// THREADS `--continue-on-error` + `--only-blobs` into the SAME `clone/from` request the
+    /// transport already rides — so a transient S3 fault mid-transfer is forgiven instead of aborting
+    /// the whole run. A recording mock `/clone/from` node asserts the request body carries
+    /// `continue_on_error:"backend"` + the `only_blobs` keys, and that a clone that completed WITH
+    /// forgiven skips surfaces as DISTINCT operator notes (never a silent success).
+    ///
+    /// MUTATION: the pre-fix executor hard-coded `MismatchFlags::default()` (both off) — that body
+    /// carries NO `continue_on_error` and NO `only_blobs`, so this gate goes RED, proving the
+    /// threading is load-bearing.
+    #[tokio::test]
+    async fn sync_data_transfer_threads_continue_on_error_and_surfaces_skips() {
+        use axum::response::IntoResponse;
+        use boatramp_core::project_export::{CloneEvent, ClonePlan, ImportReport, SkippedBlob};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+        async fn handler(
+            axum::extract::State(seen): axum::extract::State<Arc<Mutex<Vec<serde_json::Value>>>>,
+            req: axum::extract::Request,
+        ) -> axum::response::Response {
+            let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            seen.lock().unwrap().push(v);
+            // An NDJSON apply stream: a Plan, then a terminal Report that COMPLETED WITH ONE SKIP
+            // (the forgiven-backend-fault outcome the client renders as "applied with skips").
+            let plan = ClonePlan {
+                source_project: "src".into(),
+                target_project: "dst".into(),
+                data_only: true,
+                blobs_total: 2,
+                blobs_to_transfer: 2,
+                ..Default::default()
+            };
+            let report = ImportReport {
+                blobs: 1,
+                skipped: vec![SkippedBlob {
+                    key: "hblob/dst/web/assets/poison.jpg".into(),
+                    kind: "backend".into(),
+                    reason: "503 SlowDown (survived the backend's retries)".into(),
+                }],
+                skip_manifest: Some("/var/lib/boatramp/skip-abc.json".into()),
+                ..Default::default()
+            };
+            let ndjson = format!(
+                "{}\n{}\n",
+                serde_json::to_string(&CloneEvent::Plan(plan)).unwrap(),
+                serde_json::to_string(&CloneEvent::Report(report)).unwrap(),
+            );
+            ndjson.into_response()
+        }
+
+        let app = axum::Router::new()
+            .route(
+                "/api/projects/{target}/clone/from",
+                axum::routing::post(handler),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        let mut exec = CliSyncExecutor {
+            dest_cp: ControlPlane::new(base.clone(), client::http_client(None), "dst".into()),
+            source_cp: ControlPlane::new(base.clone(), client::http_client(None), "src".into()),
+            target: "dst".into(),
+            source_url: base.clone(),
+            source_project: "src".into(),
+            source_token: b"srctok".to_vec(),
+            source_dbs: Vec::new(),
+            pg_included: true,
+            blobs_included: true,
+            strict: false,
+            dest_absent: false,
+            data_transferred: false,
+            kv_skip_notes: Vec::new(),
+            continue_on_error: Some("backend".to_string()),
+            only_blob_keys: vec!["hblob/dst/web/assets/poison.jpg".to_string()],
+            data_skip_notes: Vec::new(),
+        };
+
+        exec.transfer_data().await.expect("data transfer ok");
+
+        // The request body THREADED the robustness policy into the clone (the fix).
+        let body = &seen.lock().unwrap()[0];
+        assert_eq!(
+            body["continue_on_error"], "backend",
+            "sync must forward --continue-on-error to the data-plane clone: {body}"
+        );
+        assert_eq!(
+            body["only_blobs"][0], "hblob/dst/web/assets/poison.jpg",
+            "sync must forward --only-blobs to the data-plane clone: {body}"
+        );
+        // And it is a DataPlane + ShadowSwap data-only overwrite (unchanged sync semantics).
+        assert_eq!(body["data_only"], true);
+        assert_eq!(body["overwrite"], true);
+        assert_eq!(body["managed_restore"], "shadow-swap");
+
+        // A clone that completed WITH forgiven skips surfaced the DISTINCT outcome (not a silent OK):
+        // one note per skipped blob + a repair note naming the node-side manifest + --only-blobs.
+        assert!(
+            exec.data_skip_notes
+                .iter()
+                .any(|n| n.contains("hblob/dst/web/assets/poison.jpg") && n.contains("backend")),
+            "the skipped blob must surface as an operator note: {:?}",
+            exec.data_skip_notes
+        );
+        assert!(
+            exec.data_skip_notes
+                .iter()
+                .any(|n| n.contains("--only-blobs") && n.contains("skip-abc.json")),
+            "a repair note must name the manifest + --only-blobs: {:?}",
+            exec.data_skip_notes
+        );
     }
 
     /// The selective control-plane KV-stratum carry is now WIRED over the node-side endpoint: the
@@ -1265,6 +1530,9 @@ mod tests {
             strict: false,
             data_transferred: false,
             kv_skip_notes: Vec::new(),
+            continue_on_error: None,
+            only_blob_keys: Vec::new(),
+            data_skip_notes: Vec::new(),
         };
 
         let mut excludes = BTreeSet::new();
@@ -1351,6 +1619,9 @@ mod tests {
             strict: true, // <-- strict
             data_transferred: false,
             kv_skip_notes: Vec::new(),
+            continue_on_error: None,
+            only_blob_keys: Vec::new(),
+            data_skip_notes: Vec::new(),
         };
         let err = exec
             .carry_kv_stratum(Piece::History, &[], &BTreeSet::new())
@@ -1462,6 +1733,9 @@ mod tests {
             strict: false,
             data_transferred: false,
             kv_skip_notes: Vec::new(),
+            continue_on_error: None,
+            only_blob_keys: Vec::new(),
+            data_skip_notes: Vec::new(),
         };
 
         let cfg = boatramp_core::config::SiteConfig::default();

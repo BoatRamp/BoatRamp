@@ -970,6 +970,68 @@ jobs:
           grep -q 'CONCURRENT-COLD FAN-OUT OK' fanout.log \
             || { echo "::error::blob cold fan-out never reached the success marker (silent skip or serialization?)" >&2; exit 1; }
 
+  # Tier — `project sync` BLOB-TRANSFER ROBUSTNESS (the construens cross-node incident). A real
+  # cross-node sync of ~42 GB transferred ~27 GB of blobs then ABORTED on a single Tigris
+  # `503 SlowDown` the dest's S3 backend returned under the write storm, because `project sync` had
+  # NO blob-robustness. The fix unifies sync onto the clone's `--continue-on-error=backend` +
+  # `--only-blobs` repair. This gate reproduces the SHAPE on our own rig: a many-blob set written
+  # through the REAL `aws_sdk_s3` client → a fault-injecting reverse PROXY (in the test) → a REAL
+  # S3-compatible store (SeaweedFS) that returns a real HTTP `503 SlowDown` on a chosen mid-stream
+  # blob. It asserts the restore ABORTS without the fix (continue_on_error OFF), RIDES PAST with it
+  # (skip-and-record), and that an `--only-blobs` repair lands ALL blobs byte-for-byte (zero loss).
+  # (SeaweedFS — MinIO's open-source server/client are archived + unpullable.)
+  sync-blob-503-ride-past:
+    name: project sync blob-transfer robustness — mid-stream 503 ride-past (SeaweedFS)
+    runs-on: ubuntu-latest
+    env:
+      # SeaweedFS S3 runs anonymous (no SigV4 verify), but the aws_sdk client still signs, so give it
+      # dummy static creds. The gate's dest store points at the IN-TEST proxy, which forwards here.
+      AWS_ACCESS_KEY_ID: anykey
+      AWS_SECRET_ACCESS_KEY: anysecret
+      AWS_REGION: us-east-1
+      BOATRAMP_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+      BOATRAMP_TEST_S3_BUCKET: boatramp
+      # Realistic-but-CI-friendly blob set (the ride-past logic holds at any scale; the
+      # construens-preview SCALE is run on the lighthouse rig, hundreds of blobs / GB-ish).
+      BOATRAMP_SYNC_GATE_BLOBS: "50"
+      BOATRAMP_SYNC_GATE_BLOB_KB: "512"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-sync-blob-503
+
+      - name: Start a real S3-compatible store (SeaweedFS) + create the bucket
+        run: |
+          set -o pipefail
+          docker run -d --name seaweed -p 8333:8333 chrislusf/seaweedfs:latest \
+            server -s3 -ip.bind=0.0.0.0 -s3.port=8333
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/ 2>/dev/null || echo 000)
+            [ "$code" = "200" ] && { echo "seaweedfs s3 ready"; break; }
+            sleep 1
+          done
+          # CreateBucket (anonymous, path-style).
+          curl -sf -X PUT http://127.0.0.1:8333/boatramp >/dev/null && echo "bucket created"
+
+      - name: A mid-transfer 503 must be RIDDEN PAST, not abort the run (hard gate)
+        run: |
+          set -o pipefail
+          # The REAL aws_sdk_s3 write path → in-test fault proxy (real HTTP 503 SlowDown on a
+          # mid-stream blob) → SeaweedFS. Arm A (no continue-on-error) ABORTS; Arm B
+          # (continue-on-error=backend) RIDES PAST with a skip-and-record; Arm C (--only-blobs
+          # repair) lands the recorded blob; the zero-loss read-back proves every blob intact. The
+          # marker prints ONLY after all three arms + the read-back hold.
+          cargo test -p boatramp-node --features project-export,s3 \
+            --test sync_blob_robustness_live \
+            sync_blob_transfer_rides_past_a_mid_stream_503_slowdown \
+            -- --ignored --nocapture 2>&1 | tee sync-blob-503.log
+          grep -qE 'test result: ok' sync-blob-503.log \
+            || { echo "::error::sync blob-transfer robustness gate did not pass (a failure or silent skip)" >&2; exit 1; }
+          grep -q 'SYNC BLOB ROBUSTNESS 503 RIDE-PAST OK' sync-blob-503.log \
+            || { echo "::error::sync blob-transfer robustness never reached the success marker (silent skip, or the mid-stream 503 was not ridden past / a blob was lost)" >&2; exit 1; }
+
   docker-compute-net:
     name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability + managed-DB alias upgrade heal
     # The docker compute backend puts every long-lived workload on its per-project user-defined
