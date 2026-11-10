@@ -52,8 +52,8 @@ use std::sync::Arc;
 use boatramp_core::sql::{SqlBackend, SqlValue};
 use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 use boatramp_storage::tenant_provision::{
-    force_rls_event_trigger_ddl, grant_app_role_ddl, provision_ddl, tenant_owner_role_name,
-    tenant_role_name,
+    RLS_ENABLE_NOT_FORCE_COUNT_SQL, force_rls_event_trigger_ddl, force_rls_sweep_ddl,
+    grant_app_role_ddl, provision_ddl, tenant_owner_role_name, tenant_role_name,
 };
 
 const DB: &str = "rlsnonowner_appdb";
@@ -388,11 +388,18 @@ fn su_to_db(su_url: &str, db: &str) -> String {
 ///     the owner's `ENABLE` table to `FORCE` on `ALTER TABLE … ENABLE`; serving AS the OWNER role is
 ///     then confined by `FORCE` (ZERO foreign bytes). This is the owner the Phase-2 operate-as-owner
 ///     dynamic role also acts as.
-///   * **(c) MUTATION (owner-serving with FORCE absent)** — drop the trigger + `ALTER TABLE … NO
-///     FORCE` on the owner-posture DB, and the OWNER serving role LEAKS BOTH tenants' rows. This is
-///     precisely the state the node guard (`owner_serving_without_force`, enforced in both
-///     `build_backend` and `connection_parts`) REFUSES fail-closed — proving FORCE is load-bearing
-///     for the owner posture and the invariant is not vacuous.
+///   * **(c) FORCE is load-bearing** — drop the trigger + `ALTER TABLE … NO FORCE` on the
+///     owner-posture DB, and the OWNER serving role LEAKS BOTH tenants' rows: owner-serving is sound
+///     only while FORCE is live. (The node posture guard keeps the owner identity off the serving
+///     path except under `serve_as: owner`.)
+///   * **(d) the Security FINDING 1 leak window + its fix — a POSTURE FLIP onto a POPULATED DB.** The
+///     FORCE-on-ENABLE trigger is non-retroactive, so flipping a DB with PRE-EXISTING `ENABLE`-only
+///     tables to `serve_as: owner` (or a cross-posture clone/sync) would leave them un-`FORCE`d and
+///     the owner serving role LEAKS. Proven here: the pre-existing table leaks under the owner
+///     identity; installing the trigger ALONE does NOT fix it (non-retroactive); the owner-posture
+///     provision's retroactive [`force_rls_sweep_ddl`] FORCEs it + the [`RLS_ENABLE_NOT_FORCE_COUNT_SQL`]
+///     assert reads ZERO → the owner then sees ONLY its own tenant's row (zero foreign bytes), so
+///     owner-serving ⟺ FORCE is ACTUALLY LIVE, not merely posture-declared.
 ///
 /// Requires `BOATRAMP_TEST_PG_URL` = a superuser Postgres URL (skips cleanly when unset). Prints
 /// `MANAGED RLS SERVE-AS POSTURE OK [postgres]` on success.
@@ -576,11 +583,12 @@ async fn serve_as_posture_drives_force_install_and_confines_each_posture() {
     );
 
     // =====================================================================
-    // ARM (c) — MUTATION: owner-serving with FORCE somehow ABSENT ⇒ the cross-tenant leak the node
-    // guard refuses. Drop the trigger + un-FORCE the table, then the OWNER serving role LEAKS both
-    // rows. The node's `owner_serving_without_force` guard (build_backend + connection_parts) refuses
-    // to serve the owner role in exactly this FORCE-absent state — so this leaking state is never
-    // reachable through the serving path; here we PROVE it would leak, so the invariant is not vacuous.
+    // ARM (c) — FORCE is load-bearing: with FORCE absent the owner serving role LEAKS. Drop the
+    // trigger + un-FORCE the table; the OWNER serving role then sees BOTH rows. This proves the
+    // owner posture is sound ONLY while FORCE is live — the reason the `serve_as: owner` provision
+    // installs the trigger AND (arm d) FORCE-sweeps + asserts, and the reason the node's posture
+    // guard keeps the owner identity off the serving path except under `serve_as: owner`. It does
+    // NOT by itself show the guard catches a FORCE-absent-under-owner state — arm (d) does that.
     // =====================================================================
     for stmt in [
         "DROP EVENT TRIGGER IF EXISTS boatramp_force_rls_trg",
@@ -599,8 +607,100 @@ async fn serve_as_posture_drives_force_install_and_confines_each_posture() {
     assert_eq!(
         probe(&ow_leak, "SELECT count(*)::int FROM t").await,
         "2",
-        "MUTATION PROOF: with FORCE absent the OWNER serving role LEAKS BOTH tenants' rows — \
-         exactly the state owner_serving_without_force refuses fail-closed (owner-serving ⟺ FORCE)"
+        "LOAD-BEARING PROOF: with FORCE absent the OWNER serving role LEAKS BOTH tenants' rows — \
+         owner-serving is sound only while FORCE is live"
+    );
+
+    // =====================================================================
+    // ARM (d) — the Security FINDING 1 leak window + its fix: a POSTURE FLIP onto a POPULATED DB.
+    // NO_DB already holds a PRE-EXISTING ENABLE-only table `t` (2 tenants' rows), created under the
+    // non-owner posture in arm (a). Now flip it to `serve_as: owner` and reproduce the review's leak:
+    //   1. Before anything, the NO_OWNER role (the owner serving identity after the flip) LEAKS both
+    //      rows — `t` is ENABLE-not-FORCE, and ENABLE does not bind the owner.
+    //   2. Installing the FORCE trigger ALONE does NOT fix it — the trigger is non-retroactive, so
+    //      the pre-existing `t` stays ENABLE-not-FORCE and the owner STILL leaks. (The gap.)
+    //   3. The owner-posture provision's retroactive `force_rls_sweep_ddl` FORCEs `t`, and the
+    //      `RLS_ENABLE_NOT_FORCE_COUNT_SQL` assert backstop reads ZERO — now the owner sees ONLY its
+    //      own tenant's row (zero foreign bytes). owner-serving ⟺ FORCE is ACTUALLY LIVE.
+    // =====================================================================
+    su.run_script(&format!(
+        "ALTER ROLE \"{NO_OWNER}\" SET \"{TENANT_GUC}\" = '{TENANT}'"
+    ))
+    .await
+    .unwrap();
+    // (1) the reachable leak the posture guard alone would permit.
+    let no_owner_serving = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, NO_OWNER, PW, NO_DB)),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(&no_owner_serving, "SELECT count(*)::int FROM t").await,
+        "2",
+        "FLIP LEAK WINDOW: a pre-existing ENABLE-only table served as owner leaks BOTH tenants' rows"
+    );
+    // (2) the trigger ALONE is non-retroactive — the pre-existing table is untouched, still leaks.
+    for stmt in force_rls_event_trigger_ddl(k, NO_OWNER) {
+        su_no
+            .run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("flip trigger install `{stmt}`: {e}"));
+    }
+    assert_eq!(
+        probe(
+            &su_no,
+            "SELECT relforcerowsecurity::text FROM pg_class WHERE relname = 't'"
+        )
+        .await,
+        "false",
+        "the event trigger is NON-RETROACTIVE — a pre-existing ENABLE table stays un-FORCED"
+    );
+    let no_owner_still = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, NO_OWNER, PW, NO_DB)),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(&no_owner_still, "SELECT count(*)::int FROM t").await,
+        "2",
+        "trigger-only is NOT enough: the pre-existing table still leaks under the owner identity"
+    );
+    // (3) the owner-posture provision's RETROACTIVE sweep + the fail-closed assert — the fix.
+    for stmt in force_rls_sweep_ddl(k) {
+        su_no
+            .run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("force sweep `{stmt}`: {e}"));
+    }
+    assert_eq!(
+        probe(&su_no, RLS_ENABLE_NOT_FORCE_COUNT_SQL).await,
+        "0",
+        "after the sweep the fail-closed assert reads ZERO ENABLE-not-FORCE tables (provision would \
+         otherwise REFUSE)"
+    );
+    assert_eq!(
+        probe(
+            &su_no,
+            "SELECT relforcerowsecurity::text FROM pg_class WHERE relname = 't'"
+        )
+        .await,
+        "true",
+        "the retroactive sweep FORCEd the pre-existing table"
+    );
+    let no_owner_fixed = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, NO_OWNER, PW, NO_DB)),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(&no_owner_fixed, "SELECT count(*)::int FROM t").await,
+        "1",
+        "FIX: after the owner-posture retroactive FORCE-sweep, the owner sees ONLY its own tenant's \
+         row (ZERO foreign bytes) — owner-serving ⟺ FORCE is actually live even after a posture flip"
+    );
+    assert_eq!(
+        probe(&no_owner_fixed, "SELECT tenant::text FROM t").await,
+        TENANT
     );
 
     // --- teardown (best-effort) ---

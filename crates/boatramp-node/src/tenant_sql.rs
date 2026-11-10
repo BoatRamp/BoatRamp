@@ -87,15 +87,16 @@ use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
-use boatramp_core::sql::{DeclareError, RestartOutcome, SqlBackend, SqlError};
+use boatramp_core::sql::{DeclareError, RestartOutcome, SqlBackend, SqlError, SqlValue};
 use boatramp_storage::ExternalSqlKind;
 use boatramp_storage::sql_compute::{
     ComputeEndpointResolver, ComputeResolvedSqlBackend, SESSION_KEY_PROJECT, SESSION_KEY_SITE,
 };
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use boatramp_storage::tenant_provision::{
-    force_rls_event_trigger_ddl, grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl,
-    sanitize_ident, soft_deprovision_ddl, tenant_db_name, tenant_owner_role_name, tenant_role_name,
+    RLS_ENABLE_NOT_FORCE_COUNT_SQL, force_rls_event_trigger_ddl, force_rls_sweep_ddl,
+    grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl, sanitize_ident,
+    soft_deprovision_ddl, tenant_db_name, tenant_owner_role_name, tenant_role_name,
 };
 
 use crate::config::{ExternalDatabaseConfig, ServeAs, TenantIsolation, TenantScope};
@@ -808,6 +809,48 @@ async fn provision_shared(
                 .run_script(&stmt)
                 .await
                 .map_err(|e| format!("provision tenant-db DDL on {}: {e}", names.database))?;
+        }
+
+        // `serve_as: owner` FORCE-LIVE invariant (Security FINDING 1) — owner-posture ONLY
+        // (`install_force_rls` ⟺ `serve_as: owner`), so it NEVER touches the non-owner / REPLICATE
+        // path (construens's deliberate ENABLE-not-FORCE shape stays byte-identical). The event
+        // trigger installed above is SURGICAL / non-retroactive — it FORCEs only tables created or
+        // altered AFTER install. A posture flip onto a POPULATED database, or a cross-posture
+        // clone/sync (a non-owner source's ENABLE-only tables landing here), would otherwise leave
+        // PRE-EXISTING ENABLE-only tables un-FORCED while the owner-serving role serves them, and
+        // plain ENABLE does NOT bind the owner ⇒ within-app cross-tenant leak. So: (1) retroactively
+        // FORCE-sweep every existing ENABLE-not-FORCE table, then (2) hard-assert ZERO remain —
+        // REFUSE fail-closed if any slipped past the sweep. This makes owner-serving ⟺ FORCE
+        // ACTUALLY LIVE (not merely posture-declared); it runs here (a DB connection exists), never
+        // in `connection_parts` (which composes the DSN before the DB may be up).
+        if install_force_rls {
+            for stmt in force_rls_sweep_ddl(kind) {
+                tenant_admin
+                    .run_script(&stmt)
+                    .await
+                    .map_err(|e| format!("force-rls sweep on {}: {e}", names.database))?;
+            }
+            let rows = tenant_admin
+                .run_query(RLS_ENABLE_NOT_FORCE_COUNT_SQL)
+                .await
+                .map_err(|e| format!("force-rls assert query on {}: {e}", names.database))?;
+            let remaining = match rows.rows.into_iter().flatten().next() {
+                Some(SqlValue::Integer(n)) => n,
+                other => {
+                    return Err(format!(
+                        "force-rls assert on {}: unexpected count cell {other:?}",
+                        names.database
+                    ));
+                }
+            };
+            if remaining != 0 {
+                return Err(format!(
+                    "serve_as: owner FORCE-live invariant violated on {}: {remaining} RLS-enabled \
+                     table(s) remain ENABLE-but-NOT-FORCE after the FORCE-sweep — the owner-serving \
+                     role could bypass their row-level security; refusing to provision (fail-closed)",
+                    names.database
+                ));
+            }
         }
     }
     Ok(())

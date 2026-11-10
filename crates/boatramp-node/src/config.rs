@@ -2222,9 +2222,12 @@ pub struct ExternalDatabaseConfig {
     ///   (`force_rls_event_trigger_ddl`) so RLS binds the owner. Choose it only for a self-migrating app
     ///   that must own its schema on its serving DSN.
     ///
-    /// The serving path enforces the coupling fail-closed: an owner serving role is refused unless this
-    /// posture (which installs `FORCE`) is declared — the invariant **owner-serving ⟺ `FORCE` present**
-    /// (see [`NodeTenantSqlResolver::build_backend`](crate::tenant_sql)). **Ignored** outside the
+    /// The invariant **owner-serving ⟺ `FORCE` present** is enforced in two coupled places: the
+    /// serving-path guard ([`NodeTenantSqlResolver::build_backend`](crate::tenant_sql)) refuses an owner
+    /// serving role unless this `serve_as: owner` posture is declared, and — because the FORCE-on-ENABLE
+    /// trigger is non-retroactive — the owner-posture **provision** additionally FORCE-sweeps every
+    /// pre-existing `ENABLE`-only table and hard-asserts none remain un-`FORCE`d (fail-closed), so
+    /// `FORCE` is actually live before the owner is ever served. **Ignored** outside the
     /// `Shared` + `rls_session` + Postgres cell: a `Single`/dedicated app owns its whole database and
     /// serves as that owner with no RLS; the reserved `default` tenant serves as its plain configured
     /// user; MySQL has no owner/runtime RLS split.

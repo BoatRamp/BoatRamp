@@ -218,10 +218,13 @@ a request**, and — mechanically — whether boatramp installs the `FORCE ROW L
   binds the owner too. Choose it only for a self-migrating app that must own its schema on its
   serving DSN.
 
-The serving path enforces the coupling **fail-closed**: an owner serving role is refused unless this
-binding declared `serve_as: "owner"` (the posture that installs `FORCE`) — the invariant
-**owner-serving ⟺ `FORCE` present**, so an owner identity can never reach the serving path without
-the `FORCE` that keeps RLS enforced. `serve_as` is **ignored** outside the shared + `rls_session` +
+The invariant **owner-serving ⟺ `FORCE` present** is enforced **fail-closed** in two coupled places:
+the serving-path guard refuses an owner serving role unless this binding declared `serve_as: "owner"`
+(the posture that installs `FORCE`); and, because the FORCE-on-ENABLE trigger only upgrades tables
+created/altered *after* it is installed, the owner-posture **provision** additionally FORCE-sweeps
+every pre-existing `ENABLE`-only table and refuses if any table is still `ENABLE`-but-not-`FORCE` —
+so `FORCE` is actually live (not merely posture-declared) before the owner is ever served, even after
+a posture flip onto a populated database or a cross-posture clone. `serve_as` is **ignored** outside the shared + `rls_session` +
 Postgres cell (a `tenant: single`/dedicated app owns its whole database; the reserved `default`
 tenant serves as its plain user; MySQL has no owner/runtime split). The migration/DDL identity
 (`migration_url_env`, `{{sql.migration_dsn}}`) is always the owner role, regardless of `serve_as`.
