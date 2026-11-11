@@ -30,12 +30,12 @@ FIRECRACKER="${FIRECRACKER:-$(command -v firecracker)}"
 
 echo "## 1. musl static-PIE boatramp (the guest own-binary-as-init payload)"
 cargo zigbuild --release --target "$TARGET" -p boatramp \
-  --no-default-features --features fs,slatedb,sandbox 2>&1 | tail -3 || exit 1
+  --no-default-features --features fs,sandbox 2>&1 | tail -3 || exit 1
 GUEST_BIN="$REPO/target/$TARGET/release/boatramp"
 
-echo "## 2. NON-PIE init shim (overriding the workspace static-PIE musl config for this one binary)"
-( cd crates/boatramp && RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static" \
-    cargo zigbuild --release --target "$TARGET" --bin boatramp-privsep-vm-shim ) 2>&1 | tail -3 || exit 1
+echo "## 2. NON-PIE init shim (a standalone libc-only crate; dedicated non-PIE RUSTFLAGS override)"
+RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static" \
+  cargo zigbuild --release --target "$TARGET" -p boatramp-privsep-vm-shim 2>&1 | tail -3 || exit 1
 SHIM_BIN="$REPO/target/$TARGET/release/boatramp-privsep-vm-shim"
 
 echo "## 3. classify the ELF shapes (payload must be static-PIE DYN, shim must be non-PIE EXEC)"
@@ -57,7 +57,7 @@ export BOATRAMP_PRIVSEP_VM_GUEST_BIN="$GUEST_BIN"
 export RUST_LOG="${RUST_LOG:-boatramp=info}"
 
 cargo test --release --target "$TARGET" -p boatramp \
-  --no-default-features --features fs,slatedb,sandbox \
+  --no-default-features --features fs,sandbox \
   --test privsep_vm_live -- --ignored --nocapture 2>&1 | tee /tmp/privsep-vm-scoped-live.log
 rc=${PIPESTATUS[0]}
 

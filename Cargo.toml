@@ -46,6 +46,9 @@ members = [
   "crates/boatramp-mcp",
   "crates/boatramp-node",
   "crates/boatramp",
+  # The non-PIE microVM init shim for the scoped privsep VM substrate (own-binary-as-init, O3b). A
+  # standalone libc-only crate; MUST be built non-PIE for actual use (see its Cargo.toml).
+  "crates/boatramp-privsep-vm-shim",
   # The workspace dev-tool runner (`cargo xtask …`): houses `gen-docs`, the generated-docs
   # harness + CI drift gate. `publish = false` (a build/CI tool, never shipped); deliberately
   # NOT in the justfile `crate_order`.

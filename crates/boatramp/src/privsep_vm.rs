@@ -30,9 +30,10 @@
 //!   ([`crate::privsep::run_vm_guest`]), so the guest kernel MUST clear the Landlock floor. The
 //!   in-guest profile is defense-in-depth UNDER the hypervisor wall (design §5).
 //!
-//! The non-PIE init shim (`src/bin/privsep_vm_shim.rs`) is PID 1 (own-binary-as-init needs a non-PIE
-//! PID 1; a static-PIE #GP-faults on an old minimal guest kernel — O3b): it mounts `/proc,/sys,/dev`
-//! then `execve`s the static-PIE `boatramp __vm-guest` (keeping the payload's ASLR — de-risk §1.4).
+//! The non-PIE init shim (the standalone `boatramp-privsep-vm-shim` crate) is PID 1 (own-binary-as-init
+//! needs a non-PIE PID 1; a static-PIE #GP-faults on an old minimal guest kernel — O3b): it mounts
+//! `/proc,/sys,/dev` then `execve`s the static-PIE `boatramp __vm-guest` (keeping the payload's ASLR —
+//! de-risk §1.4).
 
 use std::path::PathBuf;
 

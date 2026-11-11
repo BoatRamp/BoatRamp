@@ -1,6 +1,6 @@
 //! `boatramp-privsep-vm-shim` — the **non-PIE init shim** for the scoped privsep VM substrate
-//! (own-binary-as-init, design `DESIGN-privsep-phase3-vm-derisk.md` §1, the O3b hypothesis validated
-//! live on firecracker + `/dev/kvm`).
+//! (own-binary-as-init, `crates/boatramp/DESIGN-privsep-phase3-vm-derisk.md` §1, the O3b hypothesis
+//! validated live on firecracker + `/dev/kvm`).
 //!
 //! It is PID 1 inside the microVM (booted `rdinit=/init`): it mounts `/proc`, `/sys`, `/dev`, then
 //! `execve`s the real static-PIE `boatramp __vm-guest`. Why a shim at all: boatramp's shipped musl
@@ -13,8 +13,8 @@
 //!
 //! Built NON-PIE in a dedicated invocation (`RUSTFLAGS="-C target-feature=+crt-static -C
 //! relocation-model=static"`), which OVERRIDES the workspace static-PIE musl config for this one
-//! binary — the same recipe the bench `guest/build-initrd.sh` uses for its guest init. Depends on
-//! nothing but `libc` + `std` so it stays tiny and self-contained.
+//! binary — the same recipe the bench `guest/build-initrd.sh` uses for its guest init. A standalone
+//! crate depending on nothing but `libc` + `std`, so it stays tiny and self-contained.
 
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
@@ -28,8 +28,8 @@ fn main() -> std::process::ExitCode {
     // SAFETY: each call is a plain libc syscall with valid, fully-initialized arguments; this process
     // is PID 1 in a fresh microVM guest, so these mounts/execve touch only the guest's own namespaces.
     unsafe {
-        // Mount the pseudo-filesystems the guest serve needs: /proc (the Landlock ABI probe reads
-        // the kernel's own FS-ABI; sandbox self-checks read /proc/self), /sys, and a devtmpfs /dev.
+        // Mount the pseudo-filesystems the guest serve needs: /proc (the Landlock ABI probe reads the
+        // kernel's own FS-ABI; sandbox self-checks read /proc/self), /sys, and a devtmpfs /dev.
         libc::mount(
             cstr("proc").as_ptr(),
             cstr("/proc").as_ptr(),

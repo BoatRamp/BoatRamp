@@ -1,0 +1,33 @@
+# The non-PIE init shim for the scoped privsep VM substrate (own-binary-as-init, O3b). A STANDALONE
+# crate depending on nothing but `libc` + `std` — deliberately NOT a `[[bin]]` in the `boatramp`
+# package (that would link the whole lib + its C deps, and defeat the "tiny shim" goal). It is PID 1
+# inside the microVM: it mounts /proc,/sys,/dev then `execve`s the real static-PIE `boatramp
+# __vm-guest`.
+#
+# MUST be built NON-PIE (a static-PIE #GP-faults on an old minimal guest kernel as a DIRECT PID 1 —
+# O3b), overriding the workspace static-PIE musl config for this one binary:
+#   RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static" \
+#     cargo zigbuild --release --target x86_64-unknown-linux-musl -p boatramp-privsep-vm-shim
+# The default workspace build (static-PIE) also builds it, but that artifact is unused — the VM
+# substrate packs the NON-PIE build (see `docs/privsep-vm-scoped-repro/run.sh`).
+[package]
+name = "boatramp-privsep-vm-shim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "boatramp — non-PIE microVM init shim for the scoped privsep VM substrate (own-binary-as-init)"
+publish = false
+
+[[bin]]
+name = "boatramp-privsep-vm-shim"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -2068,6 +2068,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boatramp-privsep-vm-shim"
+version = "0.57.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "boatramp-rpktls"
 version = "0.57.0"
 dependencies = [
