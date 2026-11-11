@@ -217,11 +217,11 @@ mod imp {
             self.buf.extend_from_slice(name.as_bytes());
             self.buf.push(0);
             // Pad the (header+name) to a 4-byte boundary so file data starts aligned.
-            while self.buf.len() % 4 != 0 {
+            while !self.buf.len().is_multiple_of(4) {
                 self.buf.push(0);
             }
             self.buf.extend_from_slice(data);
-            while self.buf.len() % 4 != 0 {
+            while !self.buf.len().is_multiple_of(4) {
                 self.buf.push(0);
             }
         }
@@ -576,9 +576,12 @@ mod imp {
             if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
                 return Err(last_err("fcntl(F_SETFL, O_NONBLOCK)"));
             }
-            Ok(Self {
-                inner: tokio::io::unix::AsyncFd::new(fd)?,
-            })
+            // `AsyncFd::new` is deprecated for the general `AsRawFd` case (I/O-safety ergonomics), but
+            // here `fd` is an `OwnedFd` — the socket is owned for the adapter's whole life — so the
+            // construction is sound; allow the deprecation locally rather than churn the API.
+            #[allow(deprecated)]
+            let inner = tokio::io::unix::AsyncFd::new(fd)?;
+            Ok(Self { inner })
         }
     }
 

@@ -746,7 +746,7 @@ fn install_privsep_instance_profile(
     config: &ServerConfig,
     config_path: &Path,
     capabilities: &[HostAuthority],
-    sandbox: config::SandboxPosture,
+    sandbox: boatramp_core::privsep::SandboxPosture,
     label: &str,
 ) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
