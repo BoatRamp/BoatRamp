@@ -1263,8 +1263,13 @@
                     f"BOATRAMP_TEST_MYSQL_URL=mysql://root:mysql@{my_ip}:3306/mysql"
                 )
                 out = machine.succeed(
+                    # The serial (`--test-threads=1`, shared pg+mysql) live suite has grown to ~28
+                    # heavy provision/dump/restore gates — ~1267s on bare-metal lighthouse, and slower
+                    # nested in this QEMU VM (virtiofs + docker-in-VM pg/mysql). The old 1200s cap
+                    # timed out mid-suite; 3000s gives generous headroom plus room for future gates.
+                    # (Follow-up: split this suite across VM-gate legs if it keeps growing.)
                     f"{env} project_export_roundtrip --nocapture --test-threads=1 2>&1",
-                    timeout=1200,
+                    timeout=3000,
                 )
                 print(out)
 

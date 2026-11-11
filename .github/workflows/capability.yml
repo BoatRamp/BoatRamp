@@ -458,7 +458,7 @@ jobs:
           echo "mysql bridge IP: $MYIP"
           BOATRAMP_TEST_PG_URL="postgres://postgres:postgres@${PGIP}:5432/postgres" \
           BOATRAMP_TEST_MYSQL_URL="mysql://root:mysql@${MYIP}:3306/mysql" \
-            timeout -k 30 900 cargo test -p boatramp-node --features project-export,sql-delta-libsql \
+            timeout -k 30 1800 cargo test -p boatramp-node --features project-export,sql-delta-libsql \
             --test project_export_roundtrip \
             -- --test-threads=1 --nocapture 2>&1 | tee project-export.log
           # Cross-node SOURCE-VERSION-INDEPENDENCE gate (v0.59.2): drives the REAL boatramp-server
