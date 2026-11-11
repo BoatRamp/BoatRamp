@@ -5181,6 +5181,216 @@ async fn project_sync_orphan_drop_clears_object_owning_roles_live() {
     )
     .await;
 
+    // ===================================================================================
+    // SCENARIO C (SHARED — the PREFIX-COLLISION false positive the loose classifier missed): two
+    // co-located bindings on one server share ONE derived role; the LIVE sibling's operator-chosen
+    // logical db name is `<orphan-db-name>__old_x` — a PREFIX of the orphan's name plus an aside
+    // marker substring. The orphan's derived primary (`shc1_<ident>`) and the sibling's
+    // (`shc1__old_x_<ident>`) both sit at the 63-byte cap and share the `shc1` head, so the OLD loose
+    // `base.starts_with(pre)` test (AND a bare `bounded_aside_db_name` reconstruction, which at the cap
+    // collapses `base[..keep=4]` back onto `shc1`) classify the LIVE sibling as the orphan's own aside
+    // → unconditional `DROP DATABASE` → silent clobber of live data + its shared roles. The fix
+    // REJECTS it (the recovered suffix carries the sibling's tenant ident + digest — not an all-numeric
+    // aside distinguisher), so the sibling SURVIVES and the shared roles are RETAINED. This is the case
+    // Scenario B's non-prefix `shd1`/`shd2` pair cannot reach.
+    // ===================================================================================
+    let shar_c = format!("oor-sharc-{s}");
+    const C1: &str = "shc1b"; // orphan binding
+    const C2: &str = "shc2b"; // live sibling binding
+    const C_DB1: &str = "shc1"; // orphan logical db
+    const C_DB2: &str = "shc1__old_x"; // sibling logical db = <orphan db>__old_x (prefix + marker)
+    let c1 = mk(C_DB1);
+    let c2 = mk(C_DB2);
+    let databases_c = BTreeMap::from([(C1.to_string(), c1.clone()), (C2.to_string(), c2.clone())]);
+    let shar_c_ident = sanitize_ident(&shar_c);
+    let shared_owner_c = tenant_owner_role_name(COMPUTE, &shar_c_ident);
+    let shared_login_c = tenant_role_name(COMPUTE, &shar_c_ident);
+    let c1_db = tenant_db_name(C_DB1, &shar_c_ident);
+    let c2_db = tenant_db_name(C_DB2, &shar_c_ident);
+
+    // Precondition: the derived names really collide the way the loose classifier keyed on — both at
+    // the 63-byte cap, sharing the `shc1` head, with the sibling carrying `__old_` right after it.
+    assert_eq!(
+        c1_db.len(),
+        63,
+        "orphan derived db must sit AT the 63-byte cap"
+    );
+    assert_eq!(
+        c2_db.len(),
+        63,
+        "sibling derived db must sit AT the 63-byte cap"
+    );
+    assert!(
+        c1_db.starts_with("shc1") && c2_db.starts_with("shc1") && c2_db.contains("__old_"),
+        "fixture precondition: the sibling carries the `__old_` marker over the orphan's shared prefix \
+         (c1_db={c1_db}, c2_db={c2_db})"
+    );
+
+    for db in [&c1_db, &c2_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    provision_tenant(&deploy, &kv, &envelope, &c1, &shar_c, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision C1 (orphan): {e}"));
+    provision_tenant(&deploy, &kv, &envelope, &c2, &shar_c, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision C2 (live sibling): {e}"));
+
+    // Both derived DBs are owned by the SAME shared owner role (precondition for the guard, and the
+    // reason the orphan drop even enumerates the sibling's db as a role dependency).
+    let (_c, c_both_owned) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT count(*) FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE r.rolname='{shared_owner_c}' AND d.datname IN ('{c1_db}','{c2_db}')"),
+    )
+    .await;
+    assert_eq!(
+        c_both_owned.trim(),
+        "2",
+        "precondition: both co-located bindings' dbs are owned by the ONE shared owner role"
+    );
+
+    // Seed the LIVE sibling (C2) with its secret — an owner-owned object a naive clobber would destroy.
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &c2_db),
+        &format!("SET ROLE \"{shared_owner_c}\"; CREATE TABLE live_secret_c(v text); INSERT INTO live_secret_c VALUES ('DO-NOT-CLOBBER-C'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed C2 live secret: {o}");
+
+    let declare_c = NodeManagedDbDeclare::new(
+        databases_c.clone(),
+        deploy.clone(),
+        kv.clone(),
+        envelope.clone(),
+        DeclareQuota::from_config(None, None),
+        BackendRegistry::new(),
+    );
+    // Orphan-drop C1 — the shared roles own C2's LIVE db, whose derived name is a PREFIX + marker of
+    // C1's. The fixed classifier must NOT mistake it for an aside; the guard must LEAVE the roles.
+    let drop_c = declare_c.drop_orphan_database(&shar_c, C1).await.expect(
+        "orphan drop of C1 must succeed (dropping ITS db, LEAVING the shared roles + sibling)",
+    );
+    assert_eq!(
+        drop_c.database, c1_db,
+        "C1 orphan drop targets C1's derived db"
+    );
+
+    // (C) C1's own db is dropped (always correct).
+    let (_c, c1_gone) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{c1_db}'"),
+    )
+    .await;
+    assert!(c1_gone.trim().is_empty(), "C1's derived db must be dropped");
+
+    // (C) MUTATION WITNESS — the core of this arm: the LIVE sibling's db SURVIVES. With the OLD loose
+    // `is_orphan_aside` (or a bare reconstruction), `is_orphan_aside(c1_db, c2_db)` is TRUE at the cap,
+    // so C2's db is `DROP DATABASE`d here → this assertion FAILS (silent data loss caught).
+    let (_c, c2_present) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{c2_db}'"),
+    )
+    .await;
+    assert!(
+        !c2_present.trim().is_empty(),
+        "the LIVE sibling's db (name = orphan-db + `__old_x`) MUST SURVIVE the orphan drop — the \
+         prefix-collision false positive this fix closes (without it, it is silently DROPped)"
+    );
+
+    // (C) The shared roles are LEFT intact + SURFACED in retained_roles (the HARD GUARD fired).
+    let (_c, c_roles_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT rolname FROM pg_roles WHERE rolname IN ('{shared_owner_c}','{shared_login_c}') ORDER BY 1"),
+    )
+    .await;
+    let mut c_present: Vec<&str> = c_roles_after
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    c_present.sort_unstable();
+    assert_eq!(
+        c_present,
+        {
+            let mut e = vec![shared_login_c.as_str(), shared_owner_c.as_str()];
+            e.sort_unstable();
+            e
+        },
+        "the guard must LEAVE both shared roles intact (the prefix-collision sibling still uses them)"
+    );
+    let mut c_retained = drop_c.retained_roles.clone();
+    c_retained.sort();
+    let mut c_expect_retained = vec![shared_login_c.clone(), shared_owner_c.clone()];
+    c_expect_retained.sort();
+    assert_eq!(
+        c_retained, c_expect_retained,
+        "the drop outcome MUST SURFACE the retained shared roles: got {:?}",
+        drop_c.retained_roles
+    );
+
+    // (C) ZERO FOREIGN BYTES + FULLY FUNCTIONAL: the sibling's secret row is intact and the shared
+    // owner role can still write + read it end-to-end (the db + its roles are untouched).
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &c2_db),
+        &format!("SET ROLE \"{shared_owner_c}\"; INSERT INTO live_secret_c VALUES ('STILL-WORKS-C'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(
+        c, 0,
+        "the surviving sibling must remain fully functional (owner write): {o}"
+    );
+    let (_c, c_rows) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &c2_db),
+        "SELECT v FROM live_secret_c ORDER BY v",
+    )
+    .await;
+    assert_eq!(
+        c_rows.trim(),
+        "DO-NOT-CLOBBER-C\nSTILL-WORKS-C",
+        "the sibling's secret row MUST be intact (zero foreign bytes) and the db fully functional"
+    );
+
+    // cleanup C (now the sibling is disposable, its roles no longer shared → drops cleanly).
+    let _ = declare_c.drop_orphan_database(&shar_c, C2).await;
+    for db in [&c1_db, &c2_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    for role in [&shared_owner_c, &shared_login_c] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP ROLE IF EXISTS \"{role}\""),
+        )
+        .await;
+    }
+
     println!("PROJECT SYNC ORPHAN DROP OWNING-ROLES OK");
 }
 

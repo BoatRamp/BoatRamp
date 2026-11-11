@@ -1247,35 +1247,73 @@ pub struct HardDropOutcome {
 
 /// The transient-copy name markers the managed-pg paths use when they rename a tenant's derived
 /// database aside: the soft-delete tombstone (`__deleted_<unixts>`), the shadow-swap rename-aside
-/// (`__old_<suffix>`), and the restore shadow (`__shadow_<suffix>`). A database carrying one of
-/// these whose pre-marker text is a PREFIX of the tenant's derived name is an ASIDE OF THAT TENANT —
-/// part of the orphan's own disposable data. A live SIBLING binding's database is a markerless
-/// PRIMARY derived name (a distinct `tenant_db_name`), so it never matches — the basis of the HARD
-/// GUARD's foreign-vs-own classification.
+/// (`__old_<nanos>_<pid>`), and the restore shadow (`__shadow_<nanos>_<pid>`). An aside of a tenant
+/// is composed SOLELY by [`boatramp_storage::tenant_provision::bounded_aside_db_name`] from that
+/// tenant's own derived name + a marker + a numeric distinguisher; [`is_orphan_aside`] classifies by
+/// inverting that constructor exactly. A live SIBLING binding's database is a distinct derived
+/// PRIMARY (`tenant_db_name`), so it never reconstructs — the basis of the HARD GUARD's
+/// foreign-vs-own classification.
 const ORPHAN_ASIDE_MARKERS: [&str; 3] = ["__deleted_", "__old_", "__shadow_"];
 
 /// Whether `candidate` is a bounded aside database of the derived primary `base` (see
-/// [`ORPHAN_ASIDE_MARKERS`]). Bounded-truncation aware (a `base` at the 63-byte `NAMEDATALEN` cap
-/// keeps only a PREFIX of itself before the marker), so we require the pre-marker text to be a
-/// NON-EMPTY prefix of `base` — which BOTH the full (`pre == base`) and the truncated
-/// (`pre == base[..k]`) aside forms satisfy — never equality to the whole candidate. A markerless
-/// primary (a live sibling's own derived DB) and any aside of a DIFFERENT derived base (whose
-/// pre-marker text starts with a different base) both fail the check, so neither is ever mistaken
-/// for this orphan's own data. Pure (no IO) so it is unit-testable.
+/// [`ORPHAN_ASIDE_MARKERS`]) — the DATA-LOSS-sensitive classifier the role-sharing guard relies on to
+/// tell THIS orphan's own disposable asides from a FOREIGN live sibling binding's database (misreading
+/// a live sibling as an aside hands it to [`drop_orphan_aside_db`]'s unconditional `DROP DATABASE`).
+///
+/// A genuine aside is produced SOLELY by
+/// [`boatramp_storage::tenant_provision::bounded_aside_db_name`] (EVERY aside — the soft-delete
+/// `tenant_sql` rename, the shadow/old `project_export` renames — composes through it), so we classify
+/// by INVERTING that constructor EXACTLY, never by a loose prefix test. For each marker occurrence at
+/// `pos` (we scan EVERY occurrence, since `base` itself may contain a marker substring) let
+/// `suffix = candidate[pos + marker.len()..]` and accept only if
+/// `candidate == bounded_aside_db_name(base, marker, suffix)`.
+///
+/// Reconstruction ALONE is not sufficient at the 63-byte `NAMEDATALEN` cap. A derived name routinely
+/// sits AT 63 bytes (`sanitize_ident`: 37-byte body + `_` + 25-char digest), and the constructor's
+/// truncation branch then keeps only `base[..keep]` with `keep = 63 − marker.len() − suffix.len()`. A
+/// live sibling whose operator-chosen logical name is `<orphan-logical><marker><tail>` (e.g. orphan
+/// `shd1`, sibling `shd1__old_x`) derives a 63-byte PRIMARY carrying the marker near its START; the
+/// suffix extracted there is LONG, forcing a tiny `keep` that collapses `base[..keep]` back onto the
+/// short shared prefix so the reconstruction MATCHES — misclassifying the LIVE sibling as a droppable
+/// aside (silent data loss). So we additionally require the recovered `suffix` to be a GENUINE aside
+/// distinguisher (see [`is_genuine_aside_suffix`]): the aside generators emit only a decimal timestamp
+/// (`now_unix_secs()`) or `<nanos>_<pid>` (`shadow_suffix()`) — ASCII digits and `_` only — whereas a
+/// sibling's derived-name tail always carries the tenant ident (which always contains a letter) plus a
+/// 25-char base-36 digest, so it can NEVER be all-numeric. This closes the collapse SOUNDLY while
+/// still accepting every genuine short-form AND cap-truncated aside. Pure (no IO) so it is
+/// unit-testable.
 fn is_orphan_aside(base: &str, candidate: &str) -> bool {
     if candidate == base {
         return false; // the primary itself (already dropped), not an aside.
     }
     for marker in ORPHAN_ASIDE_MARKERS {
-        if let Some(pos) = candidate.find(marker) {
-            let pre = &candidate[..pos];
+        // Scan EVERY occurrence of the marker: the genuine split point may not be the first one
+        // (e.g. `base` itself contains a marker substring), and the aside markers never overlap.
+        let mut from = 0;
+        while let Some(rel) = candidate[from..].find(marker) {
+            let pos = from + rel;
             let suffix = &candidate[pos + marker.len()..];
-            if !pre.is_empty() && !suffix.is_empty() && base.starts_with(pre) {
+            if is_genuine_aside_suffix(suffix)
+                && candidate
+                    == boatramp_storage::tenant_provision::bounded_aside_db_name(
+                        base, marker, suffix,
+                    )
+            {
                 return true;
             }
+            from = pos + 1; // advance past this occurrence to find the next.
         }
     }
     false
+}
+
+/// Whether `suffix` is a genuine aside distinguisher — a decimal timestamp (`now_unix_secs()`) or a
+/// `<nanos>_<pid>` process token (`shadow_suffix()`): non-empty, ASCII digits and `_` ONLY. This is
+/// the soundness guard that stops a LIVE sibling binding's derived-name tail — which always carries
+/// the tenant ident's letters plus a 25-char base-36 digest, so is never all-numeric — from being
+/// reconstructed as a droppable aside at the 63-byte `NAMEDATALEN` cap (see [`is_orphan_aside`]).
+fn is_genuine_aside_suffix(suffix: &str) -> bool {
+    !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit() || b == b'_')
 }
 
 /// Whether a Postgres role exists (via the superuser/maintenance connection) — so an already-absent
@@ -1302,6 +1340,7 @@ async fn role_exists(admin: &ComputeResolvedSqlBackend, role: &str) -> Result<bo
 ///      carry the containing db in `dbid`, so a naive `JOIN … ON d.oid = s.dbid` SILENTLY DROPS them —
 ///      the blind spot this arm closes by joining the OBJECT (`d.oid = s.objid`).
 ///   3. `pg_database.datdba = role` — ownership, belt-and-suspenders over (2)'s ownership row.
+///
 /// Excludes the maintenance database and the already-dropped `primary` (never a live sibling binding).
 /// A name here that is NOT a [bounded aside](is_orphan_aside) of `primary` is a FOREIGN (live sibling)
 /// database, so the role must be LEFT intact.
@@ -1388,6 +1427,7 @@ async fn drop_orphan_aside_db(
 ///   under-reported), LEAVE the role (`false`) — fail-safe, the live binding is untouched. If they are
 ///   all this orphan's OWN asides (a transient read earlier missed one), DROP those and retry the
 ///   `DROP ROLE` ONCE; still refused ⇒ LEAVE it (`false`) rather than error.
+///
 /// It NEVER runs a blanket `DROP OWNED` (which would REVOKE a live binding's privileges on shared
 /// objects) and NEVER drops a foreign database — so a live binding can never be clobbered here.
 async fn clear_exclusive_role(
@@ -2601,25 +2641,77 @@ mod tests {
 
     #[test]
     fn is_orphan_aside_classifies_asides_vs_live_siblings() {
+        use boatramp_storage::tenant_provision::bounded_aside_db_name;
+
         let base = "appdb_proj_1a2b3c4d5e6f7g8h9i0j";
-        // Genuine asides of THIS orphan (the full, untruncated forms) — IN SCOPE.
+        // Genuine SHORT-FORM asides of THIS orphan (base fully present) — IN SCOPE. Each distinguisher
+        // is a GENUINE one the aside generators emit: a unix timestamp (`now_unix_secs()`) or
+        // `<nanos>_<pid>` (`shadow_suffix()`) — ASCII digits and `_` only.
         assert!(is_orphan_aside(
             base,
             &format!("{base}__deleted_1794417073")
         ));
-        assert!(is_orphan_aside(base, &format!("{base}__old_9f3a1b")));
-        assert!(is_orphan_aside(base, &format!("{base}__shadow_123_45")));
-        // A BOUNDED-TRUNCATED aside (a 63-byte base keeps only a PREFIX before the marker) — still
-        // IN SCOPE (the pre-marker text is a prefix of `base`).
+        assert!(is_orphan_aside(base, &format!("{base}__old_1700000000_42")));
         assert!(is_orphan_aside(
             base,
-            &format!("{}__deleted_1794417073", &base[..18])
+            &format!("{base}__shadow_1700000000_42")
+        ));
+
+        // A GENUINE cap-truncated aside: a 63-byte base overflows `NAMEDATALEN`, so the constructor
+        // keeps only `base[..keep]` before the marker. We build it through the SAME constructor the
+        // production paths use, so the classifier's inverse must accept it (don't regress real
+        // aside-clearing). Assert the base really sits at the cap and the aside really was truncated.
+        let base63 = tenant_db_name(
+            "appdb",
+            &sanitize_ident("some-long-tenant-name-for-the-cap"),
+        );
+        assert_eq!(base63.len(), 63, "fixture base must sit AT the 63-byte cap");
+        let truncated = bounded_aside_db_name(&base63, "__deleted_", "1794417073");
+        assert_eq!(truncated.len(), 63);
+        assert_ne!(
+            truncated,
+            format!("{base63}__deleted_1794417073"),
+            "fixture must be a GENUINELY truncated aside (base prefix cut), not the short form"
+        );
+        assert!(is_orphan_aside(&base63, &truncated));
+
+        // ===== THE ADVERSARIAL LIVE-SIBLING FALSE POSITIVE (the DATA-LOSS defect this fix closes) =====
+        // A co-located sibling binding whose operator-chosen logical db name is `<orphan>__old_x`
+        // derives a 63-byte PRIMARY that carries the `__old_` marker right after the shared `shd1`
+        // prefix. The OLD loose `base.starts_with(pre)` test (and a bare `bounded_aside_db_name`
+        // reconstruction, which at the cap collapses `base[..keep=4]` onto `shd1`) both classify this
+        // LIVE sibling as an aside → unconditional `DROP DATABASE` → silent clobber. The fix REJECTS
+        // it: the recovered suffix carries the sibling's tenant ident (letters) + digest, so it is not
+        // a genuine all-numeric aside distinguisher.
+        let sib_ident = sanitize_ident("oor-shar-ab12cd34");
+        let orphan_db = tenant_db_name("shd1", &sib_ident);
+        let sibling_db = tenant_db_name("shd1__old_x", &sib_ident);
+        assert_eq!(orphan_db.len(), 63);
+        assert_eq!(sibling_db.len(), 63);
+        assert!(
+            sibling_db.contains("__old_") && orphan_db.starts_with("shd1"),
+            "fixture precondition: the sibling carries the marker over the orphan's shared prefix \
+             (what the OLD loose check keyed on)"
+        );
+        assert!(
+            !is_orphan_aside(&orphan_db, &sibling_db),
+            "a LIVE sibling binding's derived PRIMARY must NEVER be classified as the orphan's aside \
+             (it would be DROPped — silent data loss); this is the fix's core invariant"
+        );
+        // Same shape for the `__deleted_` and `__shadow_` markers (all three aside markers).
+        assert!(!is_orphan_aside(
+            &tenant_db_name("shd1", &sib_ident),
+            &tenant_db_name("shd1__deleted_9", &sib_ident)
+        ));
+        assert!(!is_orphan_aside(
+            &tenant_db_name("shd1", &sib_ident),
+            &tenant_db_name("shd1__shadow_z", &sib_ident)
         ));
 
         // A live SIBLING binding's PRIMARY derived db (markerless, different base) — FOREIGN: the
         // guard must NEVER classify it as this orphan's own (force-clearing would clobber live data).
         assert!(!is_orphan_aside(base, "otherdb_proj_zz9y8x7w6v5u4t3s2r1q"));
-        // A sibling binding's own ASIDE (marker present, but a DIFFERENT derived base) — FOREIGN.
+        // A sibling binding's own ASIDE (marker + numeric suffix, but a DIFFERENT derived base) — FOREIGN.
         assert!(!is_orphan_aside(
             base,
             "otherdb_proj_zz9y8x7w__deleted_1794417073"
@@ -2630,6 +2722,9 @@ mod tests {
         assert!(!is_orphan_aside(base, &format!("{base}__deleted_")));
         // Empty pre-marker (marker at the very start) — never this orphan's.
         assert!(!is_orphan_aside(base, "__deleted_1794417073"));
+        // A non-numeric distinguisher (letters) is NOT a genuine aside suffix even if it would
+        // reconstruct — the soundness guard that rejects the live-sibling tail above.
+        assert!(!is_orphan_aside(base, &format!("{base}__deleted_abc123")));
     }
 
     #[test]
