@@ -1276,12 +1276,13 @@ const ORPHAN_ASIDE_MARKERS: [&str; 3] = ["__deleted_", "__old_", "__shadow_"];
 /// suffix extracted there is LONG, forcing a tiny `keep` that collapses `base[..keep]` back onto the
 /// short shared prefix so the reconstruction MATCHES — misclassifying the LIVE sibling as a droppable
 /// aside (silent data loss). So we additionally require the recovered `suffix` to be a GENUINE aside
-/// distinguisher (see [`is_genuine_aside_suffix`]): the aside generators emit only a decimal timestamp
-/// (`now_unix_secs()`) or `<nanos>_<pid>` (`shadow_suffix()`) — ASCII digits and `_` only — whereas a
-/// sibling's derived-name tail always carries the tenant ident (which always contains a letter) plus a
-/// 25-char base-36 digest, so it can NEVER be all-numeric. This closes the collapse SOUNDLY while
-/// still accepting every genuine short-form AND cap-truncated aside. Pure (no IO) so it is
-/// unit-testable.
+/// distinguisher (see [`is_genuine_aside_suffix`]): the aside generators emit only a bounded decimal
+/// timestamp (`now_unix_secs()`, a `u64`) or `<nanos>_<pid>` (`shadow_suffix()`), so each field is a
+/// decimal shorter than the FIXED 25-char base-36 digest that ALWAYS trails a sibling's derived name
+/// (zero-padded, so the digest can itself be all-decimal — a loose `[0-9_]*` test would be unsound).
+/// Because that 25-char digit run is always the suffix's trailing field and 25 exceeds the genuine
+/// field widths, a live sibling is rejected with probability 1 while every genuine short-form AND
+/// cap-truncated aside is still accepted. Pure (no IO) so it is unit-testable.
 fn is_orphan_aside(base: &str, candidate: &str) -> bool {
     if candidate == base {
         return false; // the primary itself (already dropped), not an aside.
@@ -1307,13 +1308,41 @@ fn is_orphan_aside(base: &str, candidate: &str) -> bool {
     false
 }
 
-/// Whether `suffix` is a genuine aside distinguisher — a decimal timestamp (`now_unix_secs()`) or a
-/// `<nanos>_<pid>` process token (`shadow_suffix()`): non-empty, ASCII digits and `_` ONLY. This is
-/// the soundness guard that stops a LIVE sibling binding's derived-name tail — which always carries
-/// the tenant ident's letters plus a 25-char base-36 digest, so is never all-numeric — from being
+/// Whether `suffix` matches EXACTLY one of the two shapes the aside generators emit, with each field
+/// width bounded to its generator's integer type:
+///   * `now_unix_secs()` — a bare `u64` decimal (≤ 20 digits, no separator); or
+///   * `shadow_suffix()` = `format!("{nanos}_{pid}")` — `nanos` (`u128`) `_` `pid` (`u32`, ≤ 10 digits).
+///
+/// This is the SOUNDNESS guard that stops a LIVE sibling binding's derived-name tail from being
 /// reconstructed as a droppable aside at the 63-byte `NAMEDATALEN` cap (see [`is_orphan_aside`]).
+///
+/// Why bounding the TRAILING field below 25 is both necessary and sufficient: a derived name ALWAYS
+/// ends in `_` + a FIXED-WIDTH 25-char base-36 digest (`to_base36` zero-pads to
+/// [`boatramp_storage::tenant_provision::HASH_B36_LEN`]), and that digest CAN be all-decimal (e.g.
+/// `to_base36(5)` = 24 `0`s + `5`). Whatever split the cap-collapse forces, that 25-char digit run is
+/// the suffix's trailing (or sole) `_`-delimited field. Because 25 exceeds BOTH the single-field bound
+/// (20) and the `<nanos>_<pid>` trailing bound (10), a sibling's all-decimal digest can never
+/// masquerade as a genuine distinguisher — rejected with probability 1 — while every genuine timestamp
+/// (`secs` ≤ 20 digits, `pid` ≤ 10) still matches. The earlier loose `[0-9_]*` test was UNSOUND: an
+/// all-decimal digest passed it, so a grind-crafted sibling could be `DROP`ped (Security re-review
+/// FINDING 1). `nanos` is left generously bounded — soundness rests only on the trailing field, since
+/// the 25-char digest can only ever land as the trailing run of a derived name.
 fn is_genuine_aside_suffix(suffix: &str) -> bool {
-    !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit() || b == b'_')
+    // A non-empty run of ASCII decimal digits no longer than `max_len`.
+    fn bounded_decimal(s: &str, max_len: usize) -> bool {
+        !s.is_empty() && s.len() <= max_len && s.bytes().all(|b| b.is_ascii_digit())
+    }
+    // Form 1 — `now_unix_secs()`: a bare u64 decimal, no separator (`u64::MAX` is 20 digits).
+    if bounded_decimal(suffix, 20) {
+        return true;
+    }
+    // Form 2 — `shadow_suffix()`: `<nanos>_<pid>`, exactly one `_`, `pid` a `u32` (≤ 10 digits). A
+    // suffix with two or more `_` fails here (the `pid` slice then still contains a `_`, so it is not
+    // a bounded decimal), as does any suffix whose trailing field is the 25-char digest.
+    match suffix.split_once('_') {
+        Some((nanos, pid)) => bounded_decimal(nanos, 39) && bounded_decimal(pid, 10),
+        None => false,
+    }
 }
 
 /// Whether a Postgres role exists (via the superuser/maintenance connection) — so an already-absent
@@ -2725,6 +2754,62 @@ mod tests {
         // A non-numeric distinguisher (letters) is NOT a genuine aside suffix even if it would
         // reconstruct — the soundness guard that rejects the live-sibling tail above.
         assert!(!is_orphan_aside(base, &format!("{base}__deleted_abc123")));
+
+        // ===== THE ALL-DECIMAL-DIGEST BYPASS (Security re-review FINDING 1) =====
+        // `to_base36` ZERO-PADS every derived-name digest to a fixed 25 chars, so the digest CAN be
+        // all decimal (e.g. `to_base36(5)` = 24 `0`s + `5`) — no letter to rely on. A live sibling
+        // whose digest is all-decimal has a cap-collapse suffix that is entirely `[0-9_]`, so the
+        // loose `[0-9_]*` guard this fix replaced would have PASSED it → unconditional `DROP DATABASE`
+        // on a live sibling. Grinding SHA-256 to a real all-decimal digest in a test is ~2^46, so we
+        // hand-craft the exact 63-byte name shape. Preconditions prove the suffix is all-numeric (the
+        // old guard's blind spot) AND that a BARE reconstruction collapses onto the shared prefix and
+        // MATCHES — so the suffix grammar is the SOLE thing standing between this live sibling and the
+        // DROP.
+        let orphan63 = "shd1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_1a2b3c4d5e6f7g8h9i0jq9z8y";
+        let sibling_all_decimal = "shd1__old_000000000000000000000000000_1234567890123456789012345";
+        assert_eq!(
+            orphan63.len(),
+            63,
+            "fixture orphan must sit AT the 63-byte cap"
+        );
+        assert_eq!(
+            sibling_all_decimal.len(),
+            63,
+            "fixture sibling must sit AT the 63-byte cap (body 37 + `_` + 25-char all-decimal digest)"
+        );
+        let adversarial_suffix = &sibling_all_decimal["shd1__old_".len()..];
+        assert!(
+            adversarial_suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b'_'),
+            "precondition: the recovered suffix is entirely [0-9_] — exactly what the loose guard accepted"
+        );
+        assert_eq!(
+            bounded_aside_db_name(orphan63, "__old_", adversarial_suffix),
+            sibling_all_decimal,
+            "precondition: a BARE reconstruction collapses `base[..keep]` onto the shared `shd1` prefix \
+             and MATCHES — reconstruction alone is fooled, so the suffix grammar is load-bearing"
+        );
+        assert!(
+            !is_orphan_aside(orphan63, sibling_all_decimal),
+            "a live sibling whose 25-char digest is ALL DECIMAL must STILL be rejected (re-review \
+             FINDING 1): the 25-char digit run exceeds the genuine distinguisher field widths, so it \
+             is not a genuine aside suffix"
+        );
+        // Direct guard-level checks: the fixed-width digest run always overflows the field bounds,
+        // while every genuine distinguisher the generators emit is accepted.
+        assert!(!is_genuine_aside_suffix("1234567890123456789012345")); // 25-digit digest, sole field
+        assert!(!is_genuine_aside_suffix(
+            "000000000000000000000000000_1234567890123456789012345"
+        )); // trailing 25-digit digest
+        assert!(is_genuine_aside_suffix("1794417073")); // now_unix_secs()
+        assert!(is_genuine_aside_suffix("18446744073709551615")); // u64::MAX secs (20 digits)
+        assert!(is_genuine_aside_suffix("1700000000000000000_4194967")); // <nanos>_<pid>
+        assert!(is_genuine_aside_suffix("1700000000000000000_4294967295")); // pid = u32::MAX (10 digits)
+        assert!(!is_genuine_aside_suffix("1700000000000000000_42949672950")); // pid 11 digits > u32 width
+        assert!(!is_genuine_aside_suffix("123_456_789")); // two `_` — not a `<nanos>_<pid>` token
+        assert!(!is_genuine_aside_suffix("")); // empty — no distinguisher
+        assert!(!is_genuine_aside_suffix("abc123")); // letters — never a genuine suffix
     }
 
     #[test]
