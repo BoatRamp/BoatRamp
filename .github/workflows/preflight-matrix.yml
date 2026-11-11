@@ -405,18 +405,19 @@ jobs:
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
 
-          # HARD gate: the file's 25 live/always-on tests (incl. the v0.59.1 managed-pg
+          # HARD gate: the file's 26 live/always-on tests (incl. the v0.59.1 managed-pg
           # `project_sync_managed_pg_shadow_land_live` gate + the v0.59.2 Shared rls_session
           # force-RLS REPLICATE gate + the idempotency/orphan-recovery gate + the undeclared-orphan
-          # reconcile gate) + the 2 pure-unit tests (URL-parser, WAL-render-inertness) = 27 must ALL
+          # reconcile gate + the orphan-drop owning-roles/role-sharing-guard gate) + the 2 pure-unit
+          # tests (URL-parser, WAL-render-inertness) = 28 must ALL
           # actually run (both live DBs reachable, docker usable
           # for the ephemeral client containers) — a self-skip (unset env / unreachable docker) still
           # prints `test result: ok`, so require the exact passed-count AND every one of the file's
           # success markers below. (The libsql true-delta + its CHAIN gate are
           # `#[cfg(feature = "sql-delta-libsql")]`, NOT compiled in this `--features project-export`
           # build, so they are NOT in this count — they gate in capability.yml.)
-          grep -qE 'test result: ok\. 27 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 27 tests (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 28 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 28 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
@@ -476,6 +477,14 @@ jobs:
           # Self-skip trap → gate on marker.
           grep -q 'PROJECT SYNC UNDECLARED ORPHAN RECONCILE OK' project-export-live.log \
             || { echo "::error::undeclared-orphan reconcile gate never reached its marker (silent skip, a populated orphan was silently clobbered instead of preserved, the full shadow-swap restore failed to land, or the orphan-drop verb broke)" >&2; exit 1; }
+          # ORPHAN-DROP clears OBJECT-OWNING derived roles + the role-sharing HARD GUARD (construens's
+          # 6th layer): `db drop database --orphan` FORCE-clears an orphan's exclusively-owned
+          # object-owning `_owner`/login roles (+ its own `__deleted_` aside db a prior failed sync
+          # left behind) so a fresh re-sync LANDS; and a role SHARED with a still-live sibling binding
+          # is LEFT intact + surfaced (its DROP OWNED would clobber the live binding — mutation-proven
+          # both ways, zero foreign bytes). Self-skip trap → gate on marker.
+          grep -q 'PROJECT SYNC ORPHAN DROP OWNING-ROLES OK' project-export-live.log \
+            || { echo "::error::orphan-drop owning-roles gate never reached its marker (silent skip, an object-owning derived role leaked un-cleared, or a role shared with a live binding was force-cleared — DATA-LOSS risk)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK' project-export-live.log \
             || { echo "::error::live mysql triggers/routines/events carry + DEFINER re-point gate never reached its marker (silent skip, or a carried object was not re-pointed to the tenant role)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT MYSQL VIEW-NAME INJECTION REFUSED OK' project-export-live.log \

@@ -2324,6 +2324,12 @@ pub struct DropDatabaseOutcome {
     /// The derived physical database name the drop targeted (e.g. `appdb_<tenant-digest>` on Shared,
     /// or the plain configured name inside the dedicated server on Single).
     pub database: String,
+    /// Per-tenant derived roles (`_owner`/login) that the `--orphan` hard-drop deliberately LEFT
+    /// intact because they are SHARED with a still-live sibling binding (they own/are-granted on a
+    /// database OUTSIDE this orphan's own derived namespace) — force-clearing them would clobber the
+    /// live binding's objects. Empty on the normal path (no sharing, or the non-orphan drop). Surfaced
+    /// so an operator sees exactly which roles were preserved and why (DATA-LOSS-safety fail-safe).
+    pub retained_roles: Vec<String>,
 }
 
 /// The outcome of [`ManagedDbDeclare::restart`]: which server workload was restarted,

@@ -1810,7 +1810,7 @@ impl ControlPlane {
     /// derived database even when no binding is declared (the derivation is reconstructed server-side
     /// from `(project, name)`, never a raw name). Returns the derived PHYSICAL database name the
     /// server dropped (for operator confirmation).
-    pub async fn drop_database(&self, name: &str, orphan: bool) -> Result<String> {
+    pub async fn drop_database(&self, name: &str, orphan: bool) -> Result<(String, Vec<String>)> {
         let seg = project_seg(&self.project, "databases");
         let Self {
             http: client,
@@ -1829,10 +1829,23 @@ impl ControlPlane {
             .error_for_status()?
             .json()
             .await?;
-        Ok(v.get("physical")
+        let physical = v
+            .get("physical")
             .and_then(|p| p.as_str())
             .unwrap_or(name)
-            .to_string())
+            .to_string();
+        // Per-tenant roles the server deliberately LEFT (shared with a live sibling binding) — a
+        // data-loss-safety fail-safe; absent on the clean path.
+        let retained_roles = v
+            .get("retained_roles")
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((physical, retained_roles))
     }
 
     /// Clear the project's tenancy schema (revert to legacy `Uniform` scoping).

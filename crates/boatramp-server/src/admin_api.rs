@@ -2327,6 +2327,10 @@ pub(super) async fn drop_database(
             Json(serde_json::json!({
                 "database": name,
                 "physical": outcome.database,
+                // Per-tenant derived roles the `--orphan` drop deliberately LEFT because they are
+                // shared with a still-live sibling binding (force-clearing them would clobber the
+                // live binding's data). Empty on the clean path — a data-loss-safety fail-safe.
+                "retained_roles": outcome.retained_roles,
             })),
         )
             .into_response(),

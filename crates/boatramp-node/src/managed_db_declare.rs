@@ -859,7 +859,10 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         )
         .await
         .map_err(DeclareError::Other)?;
-        Ok(DropDatabaseOutcome { database: physical })
+        Ok(DropDatabaseOutcome {
+            database: physical,
+            retained_roles: Vec::new(),
+        })
     }
 
     async fn drop_orphan_database(
@@ -915,7 +918,7 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         // `hard_drop_orphan_tenant` — never an operator-supplied raw name — so this can only ever
         // drop THIS project's own derived database. Idempotent (`IF EXISTS`); drops the DB + its
         // `…_owner` + login roles + sealed credentials.
-        let physical = crate::tenant_sql::hard_drop_orphan_tenant(
+        let outcome = crate::tenant_sql::hard_drop_orphan_tenant(
             &self.deploy,
             &self.kv,
             &self.envelope,
@@ -924,7 +927,10 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         )
         .await
         .map_err(DeclareError::Other)?;
-        Ok(DropDatabaseOutcome { database: physical })
+        Ok(DropDatabaseOutcome {
+            database: outcome.database,
+            retained_roles: outcome.retained_roles,
+        })
     }
 }
 

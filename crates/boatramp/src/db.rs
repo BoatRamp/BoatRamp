@@ -234,8 +234,15 @@ pub enum DbOutput {
         existed: bool,
     },
     /// `db drop database <name> -y` — the managed database was hard-dropped. `physical` is the
-    /// derived cluster database name the server actually dropped.
-    DropDatabase { name: String, physical: String },
+    /// derived cluster database name the server actually dropped. `retained_roles` (on `--orphan`
+    /// only) names any per-tenant derived role the drop deliberately LEFT because it is shared with a
+    /// still-live sibling binding — a data-loss-safety fail-safe surfaced to the operator.
+    DropDatabase {
+        name: String,
+        physical: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained_roles: Vec<String>,
+    },
     /// `db restart [--db <name>]` — the database was restarted; `config_applied` is
     /// whether a pending config change (e.g. a flipped `delta_capture`) was adopted in
     /// the process, `replicas_restarted` how many running replicas were stopped for
@@ -456,7 +463,11 @@ impl crate::output::Rendered for DbOutput {
                 }
                 Ok(())
             }
-            Self::DropDatabase { name, physical } => {
+            Self::DropDatabase {
+                name,
+                physical,
+                retained_roles,
+            } => {
                 writeln!(w, "dropped managed database `{name}`")?;
                 if physical != name {
                     writeln!(w, "  physical database: {physical}")?;
@@ -464,7 +475,17 @@ impl crate::output::Rendered for DbOutput {
                 writeln!(
                     w,
                     "  this was IRREVERSIBLE — the database and its data are gone"
-                )
+                )?;
+                if !retained_roles.is_empty() {
+                    writeln!(
+                        w,
+                        "  retained {} per-tenant role(s) shared with a still-live binding (NOT \
+                         dropped, to preserve the live binding's data): {}",
+                        retained_roles.len(),
+                        retained_roles.join(", ")
+                    )?;
+                }
+                Ok(())
             }
             Self::Restart {
                 name,
@@ -564,10 +585,11 @@ async fn ensure_user(
 /// `db drop database <name> -y [--orphan]` — hard-drop the managed database (+ roles + credential).
 /// With `orphan`, drops an UNDECLARED orphan whose binding is gone (derived server-side).
 async fn drop_database(cp: &ControlPlane, name: &str, orphan: bool) -> Result<DbOutput> {
-    let physical = cp.drop_database(name, orphan).await?;
+    let (physical, retained_roles) = cp.drop_database(name, orphan).await?;
     Ok(DbOutput::DropDatabase {
         name: name.to_string(),
         physical,
+        retained_roles,
     })
 }
 

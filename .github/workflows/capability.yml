@@ -561,6 +561,13 @@ jobs:
           # (the "no CLI path" case) + its `_owner` role, refusing the reserved default project.
           grep -q 'PROJECT SYNC UNDECLARED ORPHAN RECONCILE OK' project-export.log \
             || { echo "::error::undeclared-orphan reconcile gate never reached its marker (silent skip, a populated orphan was silently clobbered instead of preserved, the full shadow-swap restore failed to land, or the orphan-drop verb broke)" >&2; exit 1; }
+          # ORPHAN-DROP clears OBJECT-OWNING derived roles + the role-sharing HARD GUARD (construens's
+          # 6th layer): `db drop database --orphan` FORCE-clears an orphan's exclusively-owned
+          # object-owning `_owner`/login roles (+ its own `__deleted_` aside db) so a fresh re-sync
+          # LANDS; a role SHARED with a still-live sibling binding is LEFT intact + surfaced (its DROP
+          # OWNED would clobber the live binding — mutation-proven both ways). Self-skip trap → marker.
+          grep -q 'PROJECT SYNC ORPHAN DROP OWNING-ROLES OK' project-export.log \
+            || { echo "::error::orphan-drop owning-roles gate never reached its marker (silent skip, an object-owning derived role leaked un-cleared, or a role shared with a live binding was force-cleared — DATA-LOSS risk)" >&2; exit 1; }
           # Managed MySQL carries triggers/stored routines/events across the shadow+swap, restored as
           # a non-SUPER user and RE-POINTED to the tenant's own role post-swap (the DEFINER-handling
           # seam). Gate on its marker so a skip or a regression (a carried object NOT re-pointed, or

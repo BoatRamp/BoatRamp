@@ -1065,10 +1065,19 @@ pub async fn deprovision_tenant(
 /// DROP is `IF EXISTS`, so clearing an already-absent orphan is a clean no-op.
 ///
 /// Unlike [`deprovision_tenant`]'s immediate Shared cell (which drops only the DB + login role and
-/// LEAKS the `_owner` role), this ALSO drops the per-tenant OWNER (`…_owner`) role — the orphaned
-/// owner the task requires cleared — best-effort (a role still owning other objects, e.g. shared
-/// across the tenant's other bindings on the same server, is LEFT INTACT and logged, never force-
-/// dropped). Returns the derived physical database name that was targeted.
+/// LEAKS the `_owner` role), this FULLY clears the per-tenant derived OWNER (`…_owner`) + login roles
+/// — even when they still OWN OBJECTS the single-name `DROP DATABASE` cannot reach (a `__deleted_` /
+/// `__old_` aside a prior failed sync left behind, owner-owned: the construens v0.59.4 sixth-layer
+/// wall, where a plain `DROP ROLE` errors "cannot be dropped because some objects depend on it —
+/// owner of database <aside>", leaking the roles + the aside). It does so DATA-LOSS-SAFELY: a role is
+/// force-cleared ONLY when it belongs EXCLUSIVELY to THIS orphan (owns/is-granted on nothing but this
+/// orphan's own derived database + bounded asides of it). A role SHARED with a STILL-LIVE sibling
+/// binding (per-tenant roles are per-`(tenant, server)`, so a tenant with several bindings on one
+/// shared server shares ONE owner + ONE login role, granted on each of its databases) is LEFT INTACT
+/// and surfaced in the returned [`retained_roles`](HardDropOutcome::retained_roles) — never force-
+/// cleared, because force-clearing it would destroy the live binding's objects (the HARD GUARD).
+///
+/// Returns the derived physical database name that was targeted + the roles deliberately retained.
 ///
 /// Scoped to Shared Postgres (the construens per-tenant-db orphan shape): a Single tenant's isolation
 /// unit is a whole dedicated container (torn down via the compute surface, not a DB drop), and MySQL
@@ -1079,7 +1088,7 @@ pub async fn hard_drop_orphan_tenant(
     envelope: &Arc<dyn KeyEnvelope>,
     binding: &ExternalDatabaseConfig,
     project: &str,
-) -> Result<String, String> {
+) -> Result<HardDropOutcome, String> {
     let Some(compute) = binding.compute.as_deref().filter(|c| !c.is_empty()) else {
         return Err("orphan drop: binding is not a managed (compute-backed) database".to_string());
     };
@@ -1134,36 +1143,300 @@ pub async fn hard_drop_orphan_tenant(
         .await
         .map_err(|e| format!("orphan drop: DROP DATABASE {}: {e}", names.database))?;
 
-    // 2. Best-effort: drop the per-tenant login + OWNER roles (the owner the immediate deprovision
-    //    cell leaks). A role still owning other objects / granted elsewhere (e.g. shared across this
-    //    tenant's other bindings on the same server) makes `DROP ROLE` error — that is EXPECTED and
-    //    NON-fatal: we never force-drop a role still in use; it is left intact and logged.
+    // 2. FULLY clear the per-tenant derived roles (login + owner), DATA-LOSS-SAFELY. The immediate
+    //    declared drop merely `DROP ROLE IF EXISTS`es them, which ERRORS (and is best-effort-skipped)
+    //    the moment a role still OWNS OBJECTS the single-name `DROP DATABASE` above did not reach — a
+    //    `__deleted_`/`__old_` aside a prior failed sync left behind, owner-owned (construens's
+    //    sixth-layer wall), so the roles + that aside LEAK. We clear them properly, but ONLY when
+    //    they belong EXCLUSIVELY to THIS orphan.
+    //
+    //    THE HARD GUARD (fail-safe; the DATA-LOSS-sensitive seam a Security review gates): the derived
+    //    login/owner roles are per-`(tenant, SERVER)`, so a tenant with SEVERAL bindings on one shared
+    //    server shares ONE login + ONE owner role, granted on EACH of its databases. A role that also
+    //    owns / is granted on a database OUTSIDE this orphan's own derived namespace is therefore
+    //    SHARED with a STILL-LIVE sibling binding — force-clearing it would destroy the live binding's
+    //    objects. So: enumerate (COMPREHENSIVELY) every database each role still depends on; if ANY is a
+    //    FOREIGN database (not this orphan's own derived DB or a bounded aside of it), LEAVE every role
+    //    intact + surface it, and NEVER force-clear. Otherwise every dependency is this orphan's own
+    //    disposable data, so DROP the orphan's own aside databases and `DROP ROLE` each role —
+    //    [`clear_exclusive_role`], a SELF-GUARDING `DROP ROLE` that Postgres refuses the moment a live
+    //    dependency remains, so it can never force past one (it then LEAVES the role, never a blanket
+    //    `DROP OWNED` that would revoke a live binding's shared-object privileges, never a foreign
+    //    database dropped). Every name is STRUCTURAL (derived for, or read from the cluster for, THIS
+    //    tenant's own roles) and the aside classifier only ever matches a
+    //    `<this-orphan-derived-prefix><aside-marker><suffix>` name, so this can only ever touch THIS
+    //    orphan's own databases.
+    let maint_db = maintenance_database(kind);
+    let mut existing_roles: Vec<&String> = Vec::new();
+    let mut asides_to_drop: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut shared_with_live = false;
     for role in [&names.role, &names.owner_role] {
-        let role_id = boatramp_storage::tenant_provision::quote_ident(kind, role);
-        if let Err(e) = admin
-            .run_script(&format!("DROP ROLE IF EXISTS {role_id};"))
-            .await
-        {
-            tracing::info!(
-                role = %role,
-                error = %e,
-                "orphan drop: per-tenant role left intact (still owns objects / shared across the \
-                 tenant's bindings) — not force-dropped"
-            );
+        if role.is_empty() || !role_exists(&admin, role).await? {
+            continue; // idempotent: an already-absent role is a clean skip.
+        }
+        existing_roles.push(role);
+        for db in role_dependency_databases(&admin, role, &names.database, maint_db).await? {
+            if is_orphan_aside(&names.database, &db) {
+                asides_to_drop.insert(db);
+            } else {
+                shared_with_live = true;
+                tracing::warn!(
+                    role = %role,
+                    foreign_db = %db,
+                    orphan = %names.database,
+                    "orphan drop: per-tenant derived role is SHARED with a live binding (owns/depends \
+                     on a database outside this orphan's derived namespace) — LEFT intact, not force-\
+                     dropped (force-clearing it would clobber the live binding's data)"
+                );
+            }
+        }
+    }
+
+    let mut retained_roles: Vec<String> = Vec::new();
+    if shared_with_live {
+        // Fail-safe: a role entangled with a live sibling binding is LEFT whole (the roles AND their
+        // asides), so a live binding's data can never be clobbered. Surfaced to the operator.
+        retained_roles = existing_roles.iter().map(|r| (*r).clone()).collect();
+    } else {
+        // Every enumerated dependency is this orphan's own disposable data. Drop its aside databases
+        // FIRST (so the owner no longer owns them), then clear each role. A `DROP ROLE` is SELF-
+        // GUARDING — Postgres REFUSES to drop a role any object still depends on — so attempting it
+        // can NEVER force past a live dependency. [`clear_exclusive_role`] uses exactly that: it
+        // `DROP ROLE`s, and only if that still fails (a dependency the aside-drop did not reach — a
+        // live sibling the enumeration under-reported, or an aside a transient read missed) does it
+        // re-examine; it NEVER runs a blanket `DROP OWNED` (which would revoke a LIVE binding's
+        // privileges on shared objects) and NEVER drops a foreign database, so a live binding can
+        // never be clobbered even if the proactive classification was wrong.
+        for aside in &asides_to_drop {
+            drop_orphan_aside_db(&admin, kind, aside).await?;
+        }
+        for role in &existing_roles {
+            if !clear_exclusive_role(&admin, kind, role, &names.database, maint_db).await? {
+                retained_roles.push((*role).clone());
+            }
         }
     }
 
     // 3. Best-effort: delete the sealed per-tenant credentials (login + owner). Keeping them would
-    //    only leave dead KV entries; a failure here never blocks the drop.
-    let login_cred = credential_workload_key(compute, &ident);
-    let owner_cred = owner_credential_workload_key(compute, &ident);
-    for cred in [&login_cred, &owner_cred] {
-        if let Err(e) = creds.delete(project, cred).await {
-            tracing::info!(cred = %cred, error = %e, "orphan drop: sealed credential delete skipped");
+    //    only leave dead KV entries; a failure here never blocks the drop. (We keep the sealed creds
+    //    for any role we deliberately RETAINED — a live sibling still resolves them.)
+    if retained_roles.is_empty() {
+        let login_cred = credential_workload_key(compute, &ident);
+        let owner_cred = owner_credential_workload_key(compute, &ident);
+        for cred in [&login_cred, &owner_cred] {
+            if let Err(e) = creds.delete(project, cred).await {
+                tracing::info!(cred = %cred, error = %e, "orphan drop: sealed credential delete skipped");
+            }
         }
     }
 
-    Ok(names.database)
+    Ok(HardDropOutcome {
+        database: names.database,
+        retained_roles,
+    })
+}
+
+/// The outcome of [`hard_drop_orphan_tenant`]: the derived physical database that was dropped, plus
+/// any per-tenant derived roles deliberately RETAINED because they are shared with a still-live
+/// sibling binding (the HARD GUARD — see that function). `retained_roles` is empty on the clean path.
+#[derive(Debug, Clone)]
+pub struct HardDropOutcome {
+    pub database: String,
+    pub retained_roles: Vec<String>,
+}
+
+/// The transient-copy name markers the managed-pg paths use when they rename a tenant's derived
+/// database aside: the soft-delete tombstone (`__deleted_<unixts>`), the shadow-swap rename-aside
+/// (`__old_<suffix>`), and the restore shadow (`__shadow_<suffix>`). A database carrying one of
+/// these whose pre-marker text is a PREFIX of the tenant's derived name is an ASIDE OF THAT TENANT —
+/// part of the orphan's own disposable data. A live SIBLING binding's database is a markerless
+/// PRIMARY derived name (a distinct `tenant_db_name`), so it never matches — the basis of the HARD
+/// GUARD's foreign-vs-own classification.
+const ORPHAN_ASIDE_MARKERS: [&str; 3] = ["__deleted_", "__old_", "__shadow_"];
+
+/// Whether `candidate` is a bounded aside database of the derived primary `base` (see
+/// [`ORPHAN_ASIDE_MARKERS`]). Bounded-truncation aware (a `base` at the 63-byte `NAMEDATALEN` cap
+/// keeps only a PREFIX of itself before the marker), so we require the pre-marker text to be a
+/// NON-EMPTY prefix of `base` — which BOTH the full (`pre == base`) and the truncated
+/// (`pre == base[..k]`) aside forms satisfy — never equality to the whole candidate. A markerless
+/// primary (a live sibling's own derived DB) and any aside of a DIFFERENT derived base (whose
+/// pre-marker text starts with a different base) both fail the check, so neither is ever mistaken
+/// for this orphan's own data. Pure (no IO) so it is unit-testable.
+fn is_orphan_aside(base: &str, candidate: &str) -> bool {
+    if candidate == base {
+        return false; // the primary itself (already dropped), not an aside.
+    }
+    for marker in ORPHAN_ASIDE_MARKERS {
+        if let Some(pos) = candidate.find(marker) {
+            let pre = &candidate[..pos];
+            let suffix = &candidate[pos + marker.len()..];
+            if !pre.is_empty() && !suffix.is_empty() && base.starts_with(pre) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether a Postgres role exists (via the superuser/maintenance connection) — so an already-absent
+/// derived role is a clean, idempotent skip rather than an error.
+async fn role_exists(admin: &ComputeResolvedSqlBackend, role: &str) -> Result<bool, String> {
+    let role_lit = format!("'{}'", role.replace('\'', "''"));
+    let rows = admin
+        .run_query(&format!(
+            "SELECT 1 FROM pg_roles WHERE rolname = {role_lit}"
+        ))
+        .await
+        .map_err(|e| format!("orphan drop: probe role {role}: {e}"))?;
+    Ok(!rows.rows.is_empty())
+}
+
+/// Every database (by name) that `role` still OWNS or holds objects/privileges in — the full set of
+/// databases the role is entangled with — read COMPREHENSIVELY from the cluster via the superuser/
+/// maintenance connection, so NO entanglement is missed (a miss on a FOREIGN database would let the
+/// guard force-clear a role shared with a live binding — the DATA-LOSS hazard). Three sources, combined:
+///   1. `pg_shdepend` with `dbid <> 0` — objects/ACLs INSIDE a database (its `dbid` is that database).
+///   2. `pg_shdepend` with `dbid = 0 AND classid = 'pg_database'` — database-level dependencies that
+///      Postgres records as SHARED (`dbid = 0`) with the DATABASE as the referenced object: both a
+///      database's OWNERSHIP and `GRANT … ON DATABASE … TO <role>` (CONNECT/TEMP/ALL). These do NOT
+///      carry the containing db in `dbid`, so a naive `JOIN … ON d.oid = s.dbid` SILENTLY DROPS them —
+///      the blind spot this arm closes by joining the OBJECT (`d.oid = s.objid`).
+///   3. `pg_database.datdba = role` — ownership, belt-and-suspenders over (2)'s ownership row.
+/// Excludes the maintenance database and the already-dropped `primary` (never a live sibling binding).
+/// A name here that is NOT a [bounded aside](is_orphan_aside) of `primary` is a FOREIGN (live sibling)
+/// database, so the role must be LEFT intact.
+async fn role_dependency_databases(
+    admin: &ComputeResolvedSqlBackend,
+    role: &str,
+    primary: &str,
+    maint_db: &str,
+) -> Result<Vec<String>, String> {
+    let role_lit = format!("'{}'", role.replace('\'', "''"));
+    let maint_lit = format!("'{}'", maint_db.replace('\'', "''"));
+    let primary_lit = format!("'{}'", primary.replace('\'', "''"));
+    let sql = format!(
+        "SELECT DISTINCT dn FROM ( \
+           SELECT d.datname AS dn FROM pg_shdepend s \
+             JOIN pg_database d ON d.oid = s.dbid \
+            WHERE s.refobjid = (SELECT oid FROM pg_roles WHERE rolname = {role_lit}) \
+              AND s.dbid <> 0 \
+           UNION \
+           SELECT d.datname FROM pg_shdepend s \
+             JOIN pg_database d ON d.oid = s.objid \
+            WHERE s.refobjid = (SELECT oid FROM pg_roles WHERE rolname = {role_lit}) \
+              AND s.dbid = 0 AND s.classid = 'pg_database'::regclass \
+           UNION \
+           SELECT d2.datname FROM pg_database d2 \
+            WHERE d2.datdba = (SELECT oid FROM pg_roles WHERE rolname = {role_lit}) \
+         ) q WHERE dn NOT IN ({maint_lit}, {primary_lit})"
+    );
+    let rows = admin
+        .run_query(&sql)
+        .await
+        .map_err(|e| format!("orphan drop: enumerate role deps {role}: {e}"))?;
+    Ok(rows
+        .rows
+        .into_iter()
+        .filter_map(|r| match r.into_iter().next() {
+            Some(SqlValue::Text(s)) => Some(s),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Whether a Postgres error is "role cannot be dropped because some objects depend on it" (SQLSTATE
+/// `2BP01`, `DependentObjectsStillExist`) — the signal that a `DROP ROLE` was correctly REFUSED
+/// because the role still owns objects / holds grants. It is the SELF-GUARD that makes attempting a
+/// `DROP ROLE` safe: a refusal is caught (the role is LEFT intact), never forced past.
+fn is_role_has_dependents_error(err: &SqlError) -> bool {
+    let m = err.to_string().to_ascii_lowercase();
+    m.contains("cannot be dropped because") && m.contains("depend")
+}
+
+/// Terminate sessions on, then `DROP DATABASE IF EXISTS`, one of THIS ORPHAN'S OWN aside databases
+/// (a `<orphan-derived-prefix><aside-marker><suffix>` name — see [`is_orphan_aside`], the only names
+/// ever passed here). Fatal on failure: clearing the orphan means its asides must go.
+async fn drop_orphan_aside_db(
+    admin: &ComputeResolvedSqlBackend,
+    kind: ExternalSqlKind,
+    aside: &str,
+) -> Result<(), String> {
+    let aside_lit = format!("'{}'", aside.replace('\'', "''"));
+    let aside_id = boatramp_storage::tenant_provision::quote_ident(kind, aside);
+    admin
+        .run_script(&format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = {aside_lit} AND pid <> pg_backend_pid();"
+        ))
+        .await
+        .map_err(|e| format!("orphan drop: terminate sessions on aside {aside}: {e}"))?;
+    admin
+        .run_script(&format!("DROP DATABASE IF EXISTS {aside_id};"))
+        .await
+        .map_err(|e| format!("orphan drop: DROP DATABASE aside {aside}: {e}"))?;
+    Ok(())
+}
+
+/// Fully clear an EXCLUSIVELY-owned per-tenant derived `role` DATA-LOSS-SAFELY, returning `true` if it
+/// was dropped and `false` if it was deliberately LEFT intact (a live dependency we must not force
+/// past). The orphan's own aside databases have already been dropped by the caller, so for a truly
+/// exclusive role the `DROP ROLE` just succeeds. A `DROP ROLE` is SELF-GUARDING (Postgres refuses to
+/// drop a role any object still depends on), so this can never force past a live dependency:
+/// - `DROP ROLE` succeeds ⇒ cleared (`true`).
+/// - `DROP ROLE` is REFUSED for a dependency ⇒ the aside-drop did not reach everything the role is
+///   tied to. RE-ENUMERATE its databases: if ANY is FOREIGN (a live sibling the proactive scan
+///   under-reported), LEAVE the role (`false`) — fail-safe, the live binding is untouched. If they are
+///   all this orphan's OWN asides (a transient read earlier missed one), DROP those and retry the
+///   `DROP ROLE` ONCE; still refused ⇒ LEAVE it (`false`) rather than error.
+/// It NEVER runs a blanket `DROP OWNED` (which would REVOKE a live binding's privileges on shared
+/// objects) and NEVER drops a foreign database — so a live binding can never be clobbered here.
+async fn clear_exclusive_role(
+    admin: &ComputeResolvedSqlBackend,
+    kind: ExternalSqlKind,
+    role: &str,
+    primary: &str,
+    maint_db: &str,
+) -> Result<bool, String> {
+    let role_id = boatramp_storage::tenant_provision::quote_ident(kind, role);
+    let drop_sql = format!("DROP ROLE IF EXISTS {role_id};");
+    match admin.run_script(&drop_sql).await {
+        Ok(()) => return Ok(true),
+        Err(e) if is_role_has_dependents_error(&e) => {} // still tied to something — examine below.
+        Err(e) => return Err(format!("orphan drop: DROP ROLE {role}: {e}")),
+    }
+    // Still has dependents. Re-enumerate: a FOREIGN database ⇒ shared with a live binding ⇒ LEAVE.
+    let deps = role_dependency_databases(admin, role, primary, maint_db).await?;
+    for db in &deps {
+        if !is_orphan_aside(primary, db) {
+            tracing::warn!(
+                role = %role,
+                foreign_db = %db,
+                orphan = %primary,
+                "orphan drop: per-tenant derived role is SHARED with a live binding — LEFT intact, \
+                 not force-dropped (its objects/grants on the live binding must not be clobbered)"
+            );
+            return Ok(false);
+        }
+    }
+    // Only this orphan's OWN asides remain — drop them and retry the DROP ROLE once.
+    for db in &deps {
+        drop_orphan_aside_db(admin, kind, db).await?;
+    }
+    match admin.run_script(&drop_sql).await {
+        Ok(()) => Ok(true),
+        Err(e) if is_role_has_dependents_error(&e) => {
+            // Fail-safe: still refused after clearing every aside we can see — LEAVE it rather than
+            // error (we never force-drop a role with a live dependency). Surfaced to the operator.
+            tracing::warn!(
+                role = %role,
+                orphan = %primary,
+                "orphan drop: per-tenant derived role still has a live dependency after clearing the \
+                 orphan's own asides — LEFT intact, not force-dropped (fail-safe)"
+            );
+            Ok(false)
+        }
+        Err(e) => Err(format!("orphan drop: DROP ROLE {role}: {e}")),
+    }
 }
 
 /// The **pure** decision of how a delete tears a tenant down — the engine/cell split
@@ -2322,6 +2595,41 @@ mod tests {
     fn maintenance_database_per_engine() {
         assert_eq!(maintenance_database(ExternalSqlKind::Postgres), "postgres");
         assert_eq!(maintenance_database(ExternalSqlKind::Mysql), "mysql");
+    }
+
+    // ---- orphan-drop aside classifier (the DATA-LOSS-sensitive role-sharing guard) -------------
+
+    #[test]
+    fn is_orphan_aside_classifies_asides_vs_live_siblings() {
+        let base = "appdb_proj_1a2b3c4d5e6f7g8h9i0j";
+        // Genuine asides of THIS orphan (the full, untruncated forms) — IN SCOPE.
+        assert!(is_orphan_aside(
+            base,
+            &format!("{base}__deleted_1794417073")
+        ));
+        assert!(is_orphan_aside(base, &format!("{base}__old_9f3a1b")));
+        assert!(is_orphan_aside(base, &format!("{base}__shadow_123_45")));
+        // A BOUNDED-TRUNCATED aside (a 63-byte base keeps only a PREFIX before the marker) — still
+        // IN SCOPE (the pre-marker text is a prefix of `base`).
+        assert!(is_orphan_aside(
+            base,
+            &format!("{}__deleted_1794417073", &base[..18])
+        ));
+
+        // A live SIBLING binding's PRIMARY derived db (markerless, different base) — FOREIGN: the
+        // guard must NEVER classify it as this orphan's own (force-clearing would clobber live data).
+        assert!(!is_orphan_aside(base, "otherdb_proj_zz9y8x7w6v5u4t3s2r1q"));
+        // A sibling binding's own ASIDE (marker present, but a DIFFERENT derived base) — FOREIGN.
+        assert!(!is_orphan_aside(
+            base,
+            "otherdb_proj_zz9y8x7w__deleted_1794417073"
+        ));
+        // The primary itself (already dropped) is not an aside.
+        assert!(!is_orphan_aside(base, base));
+        // Marker present but empty distinguisher — not a valid aside.
+        assert!(!is_orphan_aside(base, &format!("{base}__deleted_")));
+        // Empty pre-marker (marker at the very start) — never this orphan's.
+        assert!(!is_orphan_aside(base, "__deleted_1794417073"));
     }
 
     #[test]

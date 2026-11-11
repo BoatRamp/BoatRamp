@@ -4639,6 +4639,551 @@ async fn project_sync_undeclared_orphan_reconcile_live() {
     println!("PROJECT SYNC UNDECLARED ORPHAN RECONCILE OK");
 }
 
+/// **Live ORPHAN-DROP clears OBJECT-OWNING derived roles + role-sharing SAFETY GUARD gate** (Tier-2 /
+/// nightly — needs a Docker daemon AND real Postgres). The SIXTH-layer construens failure (v0.59.4
+/// acceptance): `db drop database --orphan` dropped the physical DB but LEFT the tenant's per-tenant
+/// derived roles (`_owner` + login) because they still OWN OBJECTS the single derived-name drop can
+/// NOT reach — a `__deleted_` aside a prior failed sync left behind, owner-owned. A plain `DROP ROLE`
+/// then errors ("role cannot be dropped because some objects depend on it — owner of database
+/// <aside>") and is best-effort-skipped, so the roles + the orphaned aside LEAK. This gate reproduces
+/// that EXACT tangled shape on real pg and proves, DATA-LOSS-SAFELY, with CONTENT checks:
+///
+/// A (EXCLUSIVE): a tenant whose `_owner`/login roles own ONLY its own derived DB + a `__deleted_`
+///    aside. `db drop database --orphan` now FORCE-clears those exclusively-owned object-owning roles
+///    (drop the orphan's own aside DBs + `DROP OWNED` + `DROP ROLE`). MUTATION WITNESS: WITHOUT the
+///    fix both roles AND the aside survive the drop (the construens leak); with it they are gone. A
+///    fresh re-sync into the SAME identity then LANDS end-to-end (source rows present, content-checked)
+///    — the tenant recovers on a clean, un-tangled identity.
+///
+/// B (SHARED — the HARD GUARD): a tenant with TWO bindings on the SAME shared server sharing ONE
+///    `_owner`/login role, one binding LIVE. Orphan-dropping the OTHER binding must LEAVE the shared
+///    roles intact (their `DROP OWNED` would destroy the LIVE sibling's objects) and SURFACE them in
+///    the drop outcome. MUTATION WITNESS: the live sibling's db + its secret row survive the orphan
+///    drop UNCHANGED (a naive force-clear would clobber them — zero foreign bytes), and the outcome
+///    reports the retained roles.
+///
+/// ≥2 tenants, each a SEPARATE physical db. Emits `PROJECT SYNC ORPHAN DROP OWNING-ROLES OK`.
+#[tokio::test]
+async fn project_sync_orphan_drop_clears_object_owning_roles_live() {
+    use boatramp_core::compute::{
+        BackendRegistry, Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase,
+        Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_core::sql::ManagedDbDeclare;
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_db_declare::{DeclareQuota, NodeManagedDbDeclare};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (orphan owning-roles gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (orphan owning-roles gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-oor-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+
+    let seal_and_seed = |compute: String| {
+        let (kv, deploy, envelope, su_pw, host) = (
+            kv.clone(),
+            deploy.clone(),
+            envelope.clone(),
+            su_pw.clone(),
+            host.clone(),
+        );
+        async move {
+            let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+            kv.put(
+                &format!("managed-sql-cred/{DEFAULT_PROJECT}/{compute}"),
+                sealed,
+            )
+            .await
+            .expect("pre-seal superuser credential");
+            deploy
+                .set_replica_state(
+                    ProjectRef::DEFAULT,
+                    &ObservedInstance {
+                        handle: InstanceHandle {
+                            project: DEFAULT_PROJECT.to_string(),
+                            workload: compute.clone(),
+                            replica: 0,
+                            backend_ref: "test-external-pg".to_string(),
+                        },
+                        node: 0,
+                        backend: "external".to_string(),
+                        endpoint: Endpoint {
+                            scheme: Scheme::Http,
+                            host: host.clone(),
+                            port,
+                        },
+                        region: None,
+                        healthy: true,
+                        started_at: None,
+                        phase: ReplicaPhase::Running,
+                        readiness: Readiness::Provisioned,
+                        data_dir: None,
+                        snapshot: None,
+                        active_spec: None,
+                    },
+                )
+                .await
+                .expect("seed healthy replica");
+        }
+    };
+    seal_and_seed(COMPUTE.to_string()).await;
+
+    // ===== SCENARIO A (EXCLUSIVE) =====
+    const EXCL_BINDING: &str = "oorapp";
+    const EXCL_DB: &str = "oorx";
+    let src = format!("oor-src-{s}");
+    let orphan = format!("oor-excl-{s}");
+
+    let binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(EXCL_DB.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        rls_session: true,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(EXCL_BINDING.to_string(), binding.clone())]);
+    let db_name = |p: &str| tenant_db_name(EXCL_DB, &sanitize_ident(p));
+    let src_db = db_name(&src);
+    let orphan_db = db_name(&orphan);
+    let owner_role = tenant_owner_role_name(COMPUTE, &sanitize_ident(&orphan));
+    let login_role = tenant_role_name(COMPUTE, &sanitize_ident(&orphan));
+    let aside_db = bounded_aside_db_name(&orphan_db, "__deleted_", &format!("{s}"));
+
+    for db in [&src_db, &orphan_db, &aside_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+
+    for p in [&src, &orphan] {
+        provision_tenant(&deploy, &kv, &envelope, &binding, p, "")
+            .await
+            .unwrap_or_else(|e| panic!("provision {p}: {e}"));
+    }
+
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &src_db),
+        "CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES ('A','src-a'),('B','src-b');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed src: {o}");
+
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &orphan_db),
+        &format!("SET ROLE \"{owner_role}\"; CREATE TABLE owned_in_live(i int); INSERT INTO owned_in_live VALUES (1); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed orphan live owner table: {o}");
+
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{aside_db}\" OWNER \"{owner_role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create owner-owned aside: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &aside_db),
+        &format!("GRANT CONNECT ON DATABASE \"{aside_db}\" TO \"{login_role}\"; ALTER DEFAULT PRIVILEGES FOR ROLE \"{owner_role}\" IN SCHEMA public GRANT SELECT ON TABLES TO \"{login_role}\"; SET ROLE \"{owner_role}\"; CREATE TABLE owned_in_aside(i int); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed owner-owned aside objects: {o}");
+
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-oor-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-oor-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases.clone(), deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false)
+        .with_trusted_extensions(vec![]);
+    let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+    driver
+        .export(
+            &src,
+            &ExportOptions {
+                scope: BundleScope::Full,
+                managed_restore: ManagedRestore::ShadowSwap,
+                include_identity: false,
+                transport_key: None,
+                delta: None,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("export source tenant");
+    let bundle = sink.into_inner();
+
+    // Precondition (proves the construens tangle EXISTS): the owner role owns the aside db — so a
+    // plain `DROP ROLE` would error, and the un-fixed orphan drop leaks the roles + the aside.
+    let (_c, owns) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT d.datname FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE r.rolname='{owner_role}' ORDER BY 1"),
+    )
+    .await;
+    assert!(
+        owns.lines().any(|l| l.trim() == aside_db),
+        "precondition: the orphan's _owner role must OWN the `__deleted_` aside db (the construens \
+         tangle the single-name drop can't reach), owned dbs were {owns:?}"
+    );
+
+    let declare = NodeManagedDbDeclare::new(
+        databases.clone(),
+        deploy.clone(),
+        kv.clone(),
+        envelope.clone(),
+        DeclareQuota::from_config(None, None),
+        BackendRegistry::new(),
+    );
+    let drop_res = declare
+        .drop_orphan_database(&orphan, EXCL_BINDING)
+        .await
+        .expect("`db drop database --orphan` MUST clear the orphan (object-owning roles and all)");
+    assert_eq!(
+        drop_res.database, orphan_db,
+        "orphan drop targets the DERIVED physical name"
+    );
+    assert!(
+        drop_res.retained_roles.is_empty(),
+        "an EXCLUSIVELY-owned orphan has NO role shared with a live binding, so NONE is retained: {:?}",
+        drop_res.retained_roles
+    );
+
+    // (A) MUTATION WITNESS: the object-owning derived roles are now GONE (without the fix they
+    // survive, un-droppable, because they own the aside — the construens leak).
+    let (_c, roles_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT rolname FROM pg_roles WHERE rolname IN ('{owner_role}','{login_role}') ORDER BY 1"),
+    )
+    .await;
+    assert!(
+        roles_after.trim().is_empty(),
+        "the orphan's object-owning `_owner` + login roles MUST be cleared by `--orphan` (WITHOUT \
+         the fix they leak, un-droppable because they own the aside): still present [{roles_after}]"
+    );
+    // (A) MUTATION WITNESS: the owner-owned aside db is dropped too (its leak is what kept the role).
+    let (_c, aside_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{aside_db}'"),
+    )
+    .await;
+    assert!(
+        aside_after.trim().is_empty(),
+        "the orphan's own `__deleted_` aside db MUST be dropped (the exclusively-owned disposable \
+         data that kept the roles un-droppable): still present"
+    );
+    // Idempotent: a second orphan drop on the now-cleared identity is a clean no-op.
+    declare
+        .drop_orphan_database(&orphan, EXCL_BINDING)
+        .await
+        .expect("orphan drop must be idempotent on an already-cleared identity");
+
+    // (A) End-to-end RECOVERY: a fresh re-sync into the SAME identity LANDS the source rows (the
+    // tenant recovers on a clean, un-tangled identity — no leftover role/aside collision).
+    let mut body = futures::io::Cursor::new(bundle.clone());
+    driver
+        .import(
+            &orphan,
+            &mut body,
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                skip_control_plane_kv: true,
+                expected_managed_restore: Some(ManagedRestore::ShadowSwap),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("fresh re-sync into the cleared orphan identity MUST LAND (no 'already exists'): {e}")
+        });
+    let (_c, got) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &orphan_db),
+        "SELECT tid || ':' || v FROM marker ORDER BY tid",
+    )
+    .await;
+    assert_eq!(
+        got, "A:src-a\nB:src-b",
+        "the re-sync into the cleared identity must land the SOURCE rows end-to-end"
+    );
+
+    for db in [&src_db, &orphan_db, &aside_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP ROLE IF EXISTS \"{owner_role}\""),
+    )
+    .await;
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP ROLE IF EXISTS \"{login_role}\""),
+    )
+    .await;
+
+    // ===================================================================================
+    // SCENARIO B (SHARED — the HARD GUARD): two bindings on one server share ONE derived role; one
+    // LIVE. Orphan-dropping the other must LEAVE the shared roles (their DROP OWNED would clobber the
+    // live sibling) and preserve the live binding's data — zero foreign bytes.
+    // ===================================================================================
+    let shar = format!("oor-shar-{s}");
+    const B1: &str = "shb1";
+    const B2: &str = "shb2";
+    const DB1: &str = "shd1";
+    const DB2: &str = "shd2";
+    let mk = |database: &str| ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(database.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        rls_session: true,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let b1 = mk(DB1);
+    let b2 = mk(DB2);
+    let databases_b = BTreeMap::from([(B1.to_string(), b1.clone()), (B2.to_string(), b2.clone())]);
+    let shar_ident = sanitize_ident(&shar);
+    // The ONE owner + login role both bindings share (per `(tenant, server)`).
+    let shared_owner = tenant_owner_role_name(COMPUTE, &shar_ident);
+    let shared_login = tenant_role_name(COMPUTE, &shar_ident);
+    let b1_db = tenant_db_name(DB1, &shar_ident);
+    let b2_db = tenant_db_name(DB2, &shar_ident);
+
+    for db in [&b1_db, &b2_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    provision_tenant(&deploy, &kv, &envelope, &b1, &shar, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision B1: {e}"));
+    provision_tenant(&deploy, &kv, &envelope, &b2, &shar, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision B2: {e}"));
+
+    // Both derived DBs are owned by the SAME shared owner role (precondition for the guard).
+    let (_c, both_owned) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT count(*) FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE r.rolname='{shared_owner}' AND d.datname IN ('{b1_db}','{b2_db}')"),
+    )
+    .await;
+    assert_eq!(
+        both_owned.trim(),
+        "2",
+        "precondition: both bindings' dbs are owned by the ONE shared owner role"
+    );
+
+    // Seed the LIVE sibling (B2) with its secret + an owner-owned object (what a naive force-clear of
+    // the shared owner would DESTROY).
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &b2_db),
+        &format!("SET ROLE \"{shared_owner}\"; CREATE TABLE live_secret(v text); INSERT INTO live_secret VALUES ('DO-NOT-CLOBBER'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed B2 live secret: {o}");
+
+    let declare_b = NodeManagedDbDeclare::new(
+        databases_b.clone(),
+        deploy.clone(),
+        kv.clone(),
+        envelope.clone(),
+        DeclareQuota::from_config(None, None),
+        BackendRegistry::new(),
+    );
+    // Orphan-drop B1 — the shared roles own B2's LIVE db, so the guard must LEAVE them.
+    let drop_b = declare_b
+        .drop_orphan_database(&shar, B1)
+        .await
+        .expect("orphan drop of B1 must succeed (dropping its db, LEAVING the shared roles)");
+    assert_eq!(
+        drop_b.database, b1_db,
+        "B1 orphan drop targets B1's derived db"
+    );
+
+    // (B) B1's db is dropped (the orphan binding's own db — always correct).
+    let (_c, b1_gone) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{b1_db}'"),
+    )
+    .await;
+    assert!(b1_gone.trim().is_empty(), "B1's derived db must be dropped");
+
+    // (B) HARD GUARD: the SHARED roles are LEFT intact + SURFACED in retained_roles.
+    let (_c, shared_roles_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT rolname FROM pg_roles WHERE rolname IN ('{shared_owner}','{shared_login}') ORDER BY 1"),
+    )
+    .await;
+    let mut present: Vec<&str> = shared_roles_after
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    present.sort_unstable();
+    assert_eq!(
+        present,
+        {
+            let mut e = vec![shared_login.as_str(), shared_owner.as_str()];
+            e.sort_unstable();
+            e
+        },
+        "the HARD GUARD must LEAVE both shared roles intact (a live sibling binding still uses them)"
+    );
+    let mut retained = drop_b.retained_roles.clone();
+    retained.sort();
+    let mut expect_retained = vec![shared_login.clone(), shared_owner.clone()];
+    expect_retained.sort();
+    assert_eq!(
+        retained, expect_retained,
+        "the drop outcome MUST SURFACE the retained shared roles: got {:?}",
+        drop_b.retained_roles
+    );
+
+    // (B) MUTATION WITNESS (zero data loss): the LIVE sibling's db + its secret survive UNCHANGED (a
+    // naive force-clear of the shared owner would have `DROP OWNED`-destroyed them).
+    let (_c, live) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &b2_db),
+        "SELECT v FROM live_secret",
+    )
+    .await;
+    assert_eq!(
+        live.trim(),
+        "DO-NOT-CLOBBER",
+        "the live sibling binding's data MUST be preserved (the shared-role guard never force-clears)"
+    );
+
+    // cleanup B (now B2 is disposable, its roles no longer shared → drops cleanly).
+    let _ = declare_b.drop_orphan_database(&shar, B2).await;
+    for db in [&b1_db, &b2_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP ROLE IF EXISTS \"{shared_owner}\""),
+    )
+    .await;
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP ROLE IF EXISTS \"{shared_login}\""),
+    )
+    .await;
+
+    println!("PROJECT SYNC ORPHAN DROP OWNING-ROLES OK");
+}
+
 /// **Live managed-MySQL triggers/routines/events carry + DEFINER re-point gate** (Tier-2 / nightly —
 /// needs a Docker daemon AND a MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE
 /// DATABASE`). Self-skips.
