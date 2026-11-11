@@ -1308,27 +1308,32 @@ fn is_orphan_aside(base: &str, candidate: &str) -> bool {
     false
 }
 
-/// Whether `suffix` matches EXACTLY one of the two shapes the aside generators emit, with each field
-/// width bounded to its generator's integer type:
+/// Whether `suffix` matches EXACTLY one of the two shapes the aside generators emit, with EVERY field
+/// width bounded BELOW the fixed 25-char digest length:
 ///   * `now_unix_secs()` — a bare `u64` decimal (≤ 20 digits, no separator); or
-///   * `shadow_suffix()` = `format!("{nanos}_{pid}")` — `nanos` (`u128`) `_` `pid` (`u32`, ≤ 10 digits).
+///   * `shadow_suffix()` = `format!("{nanos}_{pid}")` — `nanos` `_` `pid`, each a bounded decimal.
 ///
 /// This is the SOUNDNESS guard that stops a LIVE sibling binding's derived-name tail from being
 /// reconstructed as a droppable aside at the 63-byte `NAMEDATALEN` cap (see [`is_orphan_aside`]).
 ///
-/// Why bounding the TRAILING field below 25 is both necessary and sufficient: a derived name ALWAYS
-/// ends in `_` + a FIXED-WIDTH 25-char base-36 digest (`to_base36` zero-pads to
+/// Why bounding EVERY field below 25 is both necessary and sufficient: a derived name ALWAYS ends in
+/// `_` + a FIXED-WIDTH 25-char base-36 digest (`to_base36` zero-pads to
 /// [`boatramp_storage::tenant_provision::HASH_B36_LEN`]), and that digest CAN be all-decimal (e.g.
-/// `to_base36(5)` = 24 `0`s + `5`). Whatever split the cap-collapse forces, that 25-char digit run is
-/// the suffix's trailing (or sole) `_`-delimited field. Because 25 exceeds BOTH the single-field bound
-/// (20) and the `<nanos>_<pid>` trailing bound (10), a sibling's all-decimal digest can never
-/// masquerade as a genuine distinguisher — rejected with probability 1 — while every genuine timestamp
-/// (`secs` ≤ 20 digits, `pid` ≤ 10) still matches. The earlier loose `[0-9_]*` test was UNSOUND: an
-/// all-decimal digest passed it, so a grind-crafted sibling could be `DROP`ped (Security re-review
-/// FINDING 1). `nanos` is left generously bounded — soundness rests only on the trailing field, since
-/// the 25-char digest can only ever land as the trailing run of a derived name.
+/// `to_base36(5)` = 24 `0`s + `5`). Whatever split the cap-collapse forces, that 25-char digit run is a
+/// `_`-delimited field of the recovered suffix. Because 25 exceeds EVERY field bound here (single-field
+/// 20; `<nanos>_<pid>` → 20 and 10), a sibling's all-decimal digest can never masquerade as a genuine
+/// distinguisher — rejected with probability 1 — while every genuine timestamp (`secs` ≤ 20 digits,
+/// `nanos` ≤ 20 digits until ~year 5141, `pid` ≤ 10) still matches. The earlier loose `[0-9_]*` test
+/// was UNSOUND: an all-decimal digest passed it, so a grind-crafted sibling could be `DROP`ped
+/// (Security re-review FINDING 1).
+///
+/// Today the digest is always the suffix's TRAILING field, so bounding only the trailing field would
+/// suffice; bounding `nanos` too (defense in depth, no false-negative since genuine `nanos` is ≤ 20
+/// digits for ~3000 years) keeps the guard sound even if a future name producer ever appended a
+/// trailing numeric field AFTER the digest — closing the one latent forward-invariant the audit flagged.
 fn is_genuine_aside_suffix(suffix: &str) -> bool {
-    // A non-empty run of ASCII decimal digits no longer than `max_len`.
+    // A non-empty run of ASCII decimal digits no longer than `max_len`. Every call site below bounds
+    // `max_len` BELOW the fixed 25-char digest length, so no digest run can satisfy any field.
     fn bounded_decimal(s: &str, max_len: usize) -> bool {
         !s.is_empty() && s.len() <= max_len && s.bytes().all(|b| b.is_ascii_digit())
     }
@@ -1336,11 +1341,12 @@ fn is_genuine_aside_suffix(suffix: &str) -> bool {
     if bounded_decimal(suffix, 20) {
         return true;
     }
-    // Form 2 — `shadow_suffix()`: `<nanos>_<pid>`, exactly one `_`, `pid` a `u32` (≤ 10 digits). A
-    // suffix with two or more `_` fails here (the `pid` slice then still contains a `_`, so it is not
-    // a bounded decimal), as does any suffix whose trailing field is the 25-char digest.
+    // Form 2 — `shadow_suffix()`: `<nanos>_<pid>`, exactly one `_`, `pid` a `u32` (≤ 10 digits) and
+    // `nanos` an `as_nanos()` value (≤ 20 digits until ~year 5141 = 10^20 ns after the epoch). A suffix
+    // with two or more `_` fails here (the `pid` slice then still contains a `_`, so it is not a
+    // bounded decimal), as does any suffix carrying the 25-char digest at EITHER field.
     match suffix.split_once('_') {
-        Some((nanos, pid)) => bounded_decimal(nanos, 39) && bounded_decimal(pid, 10),
+        Some((nanos, pid)) => bounded_decimal(nanos, 20) && bounded_decimal(pid, 10),
         None => false,
     }
 }
@@ -2810,6 +2816,12 @@ mod tests {
         assert!(!is_genuine_aside_suffix("123_456_789")); // two `_` — not a `<nanos>_<pid>` token
         assert!(!is_genuine_aside_suffix("")); // empty — no distinguisher
         assert!(!is_genuine_aside_suffix("abc123")); // letters — never a genuine suffix
+        // FORWARD-INVARIANT PIN (audit informational #1): no current producer appends a numeric field
+        // AFTER the 25-char digest, but if one ever did, the digest must not masquerade as the LEADING
+        // `nanos` field with a short trailing field. Bounding `nanos` ≤ 20 (< 25) rejects it. This also
+        // guards against regressing the `nanos` bound back to ≥ 25 (which would reopen the bypass).
+        assert!(!is_genuine_aside_suffix("1234567890123456789012345_42")); // digest(25) _ shard(2)
+        assert!(!is_genuine_aside_suffix("123456789012345678901_4")); // 21-digit leading field (> 20)
     }
 
     #[test]
