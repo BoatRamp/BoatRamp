@@ -793,7 +793,7 @@ mod imp {
                 assert_eq!(&hdr[0..6], b"070701", "newc magic at offset {off}");
                 // Every field after the magic is 8 ASCII hex digits.
                 assert!(
-                    hdr[6..110].iter().all(|b| b.is_ascii_hexdigit()),
+                    hdr[6..110].iter().all(u8::is_ascii_hexdigit),
                     "header fields are 8-hex at offset {off}"
                 );
                 let namesize =
