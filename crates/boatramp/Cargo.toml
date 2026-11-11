@@ -52,6 +52,17 @@ harness = false
 name = "privsep-vsock-guest"
 path = "benches/privsep_crossing/vsock_guest_main.rs"
 
+# The non-PIE init shim for the scoped privsep VM substrate (own-binary-as-init, O3b). PID 1 inside
+# the microVM: mounts /proc,/sys,/dev then `execve`s the real static-PIE `boatramp __vm-guest`. Built
+# NON-PIE in a dedicated invocation (`RUSTFLAGS="-C target-feature=+crt-static -C
+# relocation-model=static"` — overriding the workspace static-PIE musl config for this one binary),
+# the same recipe the bench `guest/build-initrd.sh` uses, and packed into the guest initramfs as
+# /init. Depends on nothing but `libc` + `std`. Compiles everywhere (a non-Linux stub exits); only
+# ever BOOTED as a microVM guest's PID 1 on linux-musl.
+[[bin]]
+name = "boatramp-privsep-vm-shim"
+path = "src/bin/privsep_vm_shim.rs"
+
 [features]
 # Batteries-included by policy: the **default build enables every non-conflicting
 # feature**, so a plain `cargo build`, the Nix/OCI images, and the release binaries

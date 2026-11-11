@@ -718,14 +718,44 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
 
     // Step 3 (design §2.1): install the per-capability seccomp/Landlock profile BEFORE the
     // runtime, fail-closed `Enforced` fleetwide. Done on THIS single main thread so every Tokio
-    // worker thread later inherits the domain via `clone`.
-    let cwd = std::env::current_dir().map_err(|e| fail(format!("cwd: {e}")))?;
-    let data_dir = normalized_data_dir(&config, &cwd);
+    // worker thread later inherits the domain via `clone`. The SAME install the VM guest frontend
+    // runs ([`run_vm_guest`]), extracted so the two cannot drift (the load-bearing wall).
+    install_privsep_instance_profile(
+        &config,
+        config_path,
+        &inst.capabilities,
+        inst.sandbox,
+        label,
+    )
+    .map_err(fail)?;
+
+    // Steps 5-6 (design §2.1): open the instance's links over the inherited socketpair fds, then
+    // serve its slice. The materialization gate (above) is the construction wall; the link
+    // mediation + the profile are the other two defence-in-depth layers.
+    let fds = PrivsepChildFds::from_env().map_err(fail)?;
+    instance_serve::run(label, &gate, &fds, &config, config_path).map_err(|e| fail(e).into())
+}
+
+/// Install THIS instance's per-capability seccomp/Landlock profile, fail-closed `Enforced` fleetwide
+/// (design §2 F6 / inv7) — the load-bearing privsep wall. Extracted from [`run_instance`] so the
+/// host-side instance ([`run_instance`]) and the VM-guest frontend ([`run_vm_guest`]) install the
+/// EXACT same wall from the EXACT same inputs (the "unify, don't parallelize" discipline). Must run on
+/// the single main thread BEFORE any Tokio runtime, so every later worker thread inherits the domain
+/// via `clone`. Returns the human reason on any refusal (the caller fails the node closed).
+fn install_privsep_instance_profile(
+    config: &ServerConfig,
+    config_path: &Path,
+    capabilities: &[HostAuthority],
+    sandbox: config::SandboxPosture,
+    label: &str,
+) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let data_dir = normalized_data_dir(config, &cwd);
     // Pre-create this instance's OWN state subtrees so the derivation's `fs::canonicalize` resolves
     // them (Contract #1): a holder's grant canonicalizes through any symlink before the Landlock
     // wall (which this instance has not yet installed) goes up. Best-effort — a path that cannot be
     // created stays lexical and is still leak-checked lexically.
-    let held_set: BTreeSet<HostAuthority> = inst.capabilities.iter().copied().collect();
+    let held_set: BTreeSet<HostAuthority> = capabilities.iter().copied().collect();
     for dir in boatramp_server::sandbox::instance_backend_state_grants(&held_set, &data_dir) {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::debug!(?dir, error = %e, "[privsep] could not pre-create own state dir (will stay lexical)");
@@ -737,13 +767,13 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
     // (`std::env::current_exe()`) and fail CLOSED on a resolve error (the node refuses to serve);
     // a non-`exec.compute` instance needs no execute grant, so it is not resolved and stays `None`.
     let exec_self = if held_set.contains(&HostAuthority::ExecCompute) {
-        Some(std::env::current_exe().map_err(|e| fail(format!("resolving current exe: {e}")))?)
+        Some(std::env::current_exe().map_err(|e| format!("resolving current exe: {e}"))?)
     } else {
         None
     };
     let inputs = privsep_resolve::build_instance_sandbox_inputs(
-        &config,
-        &inst.capabilities,
+        config,
+        capabilities,
         config_path,
         &cwd,
         exec_self.as_deref(),
@@ -759,16 +789,16 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
         config::SandboxPosture::Off | config::SandboxPosture::Permissive
     );
     let install_plan =
-        boatramp_server::sandbox::privsep_install_plan(inst.sandbox, node_allows_unsandboxed)
-            .map_err(|e| fail(e.to_string()))?;
+        boatramp_server::sandbox::privsep_install_plan(sandbox, node_allows_unsandboxed)
+            .map_err(|e| e.to_string())?;
     match install_plan {
         boatramp_server::sandbox::PrivsepInstallPlan::InstallEnforced(posture) => {
             let profile = boatramp_server::sandbox::derive_profile(&held_set, posture, &inputs)
-                .map_err(|e| fail(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             let status = boatramp_server::sandbox::install_derived(&profile);
             // Fail-closed FLEETWIDE: anything less than `Enforced` refuses (design §2 F6 / inv7).
             let status = boatramp_server::sandbox::enforce_privsep_status(status)
-                .map_err(|e| fail(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             tracing::info!(
                 instance = %label,
                 ?status,
@@ -786,12 +816,81 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
             );
         }
     }
+    Ok(())
+}
 
-    // Steps 5-6 (design §2.1): open the instance's links over the inherited socketpair fds, then
-    // serve its slice. The materialization gate (above) is the construction wall; the link
-    // mediation + the profile are the other two defence-in-depth layers.
-    let fds = PrivsepChildFds::from_env().map_err(fail)?;
-    instance_serve::run(label, &gate, &fds, &config, config_path).map_err(|e| fail(e).into())
+/// The scoped privsep VM substrate's IN-GUEST frontend entry (`boatramp __vm-guest`): the static-PIE
+/// `boatramp` the non-PIE init shim `execve`d as the microVM guest's PID 1 (own-binary-as-init, O3b).
+/// It serves a **static-parser frontend** slice behind the hypervisor wall, carrying ZERO key material
+/// (the scoped first cut — `crates/boatramp/DESIGN-privsep-phase3-vm.md`). Flow (the host-model split,
+/// self-contained in the guest):
+/// 1. read its non-secret descriptor (label + vsock port) from the packed `/privsep-vm-guest.json`;
+/// 2. resolve its slice from the packed real config — the SAME [`resolve_instance_slice`] a host-side
+///    instance uses — and build the materialization gate;
+/// 3. **bind + listen AF_VSOCK BEFORE the wall** (the per-capability profile denies `bind`; the host
+///    model has the root bind — inside the guest there is no root, so the guest binds pre-wall and only
+///    `accept`s after, self-contained);
+/// 4. install its fail-closed `Enforced` profile (S4 — the SAME [`install_privsep_instance_profile`]
+///    wall; the guest kernel MUST clear the `MIN_LANDLOCK_ABI` floor or this refuses);
+/// 5. serve relayed client connections over vsock with the real HTTP stack (never returns — as PID 1 a
+///    fatal error powers the guest off so the host trips `FailNodeClosed`).
+#[cfg(target_os = "linux")]
+pub fn run_vm_guest() -> Result<(), CliError> {
+    crate::init_tracing();
+    scrub_own_environ();
+    if !cfg!(all(target_os = "linux", feature = "sandbox")) {
+        return Err(PrivsepError::UnsupportedPlatform.into());
+    }
+    let descriptor = crate::privsep_vm::read_guest_descriptor().map_err(|reason| {
+        PrivsepError::InstanceServe {
+            label: "<vm-guest>".to_string(),
+            reason,
+        }
+    })?;
+    let label = descriptor.label;
+    let fail = |reason: String| PrivsepError::InstanceServe {
+        label: label.clone(),
+        reason,
+    };
+
+    let config = ServerConfig::load(Path::new(crate::privsep_vm::GUEST_CONFIG_PATH), None)
+        .map_err(PrivsepError::from)?;
+    let inst = resolve_instance_slice(&config, &label)?;
+    // Scope guard (defense in depth behind the root's pre-spawn lint): the guest frontend must be a
+    // key-free static-parser frontend (the lint's P3). A guest shipped outside scope refuses rather
+    // than serve.
+    if !crate::privsep_vm::is_scoped_static_parser_frontend(&inst.capabilities) {
+        return Err(fail(
+            "the scoped VM substrate serves ONLY a key-free static-parser frontend (a group-C \
+             listener-only slice); this slice is out of scope — refusing fail-closed"
+                .to_string(),
+        )
+        .into());
+    }
+    let _gate = MaterializationGate::new(&inst.capabilities);
+
+    // (3) Bind the vsock listener BEFORE the profile (the profile denies `bind`).
+    let listener = crate::privsep_vm::vsock_bind_listen(descriptor.vsock_port)
+        .map_err(|e| fail(format!("binding the guest vsock listener: {e}")))?;
+    tracing::info!(
+        instance = %label,
+        port = descriptor.vsock_port,
+        "[privsep] VM guest: AF_VSOCK bound + listening (pre-wall); installing the Enforced profile next"
+    );
+
+    // (4) Install the fail-closed Enforced profile — the SAME wall a host-side instance installs (S4).
+    install_privsep_instance_profile(
+        &config,
+        Path::new(crate::privsep_vm::GUEST_CONFIG_PATH),
+        &inst.capabilities,
+        inst.sandbox,
+        &label,
+    )
+    .map_err(fail)?;
+
+    // (5) Serve relayed client connections over vsock, behind the hypervisor + per-capability walls.
+    //     Diverges (`!`) — as PID 1 it never returns; it coerces to this fn's `Result` return type.
+    crate::privsep_vm::guest_accept_serve_loop(listener, &label)
 }
 
 // =============================================================================
@@ -898,21 +997,53 @@ fn instance_listener_addr(
 /// wall, and a `backend.*` instance keeps host-net egress; pid-ns isolation is a deferred increment). [`InstanceSubstrate::Vm`] stays the reported
 /// follow-on: a VM has its OWN kernel, so the `local` socketpair cannot cross (unlike Container on one
 /// shared kernel — design-note §2a); it needs a vsock re-plumb of the whole link transport. Until then
-/// `Vm` is refused fail-closed, naming the backend it reuses — never silently downgraded to an OS
-/// process (which would discard the operator's chosen isolation wall). Pure (host-testable).
-fn resolve_spawn_backend(label: &str, substrate: InstanceSubstrate) -> Result<(), PrivsepError> {
+/// `Vm` stays refused fail-closed at the operator-facing spawn gate, with a message that names WHICH
+/// blocker applies:
+/// - A key-free **static-parser frontend** (a group-C `listen.*`-only slice — the lint's P3;
+///   [`crate::privsep_vm::is_scoped_static_parser_frontend`]) is exactly the owner-greenlit scoped
+///   first cut. Its substrate MECHANISM is BUILT + live-gated ([`crate::privsep_vm`], the shim, the
+///   `__vm-guest` serve, the lighthouse serve gate), but the operator-facing SUPERVISE wiring is gated
+///   on the **S1 relay-placement** decision: the host client-byte relay (design §1c Model A) needs
+///   `accept4`/`connect`/`read`/`write`, which the secret-blind root's networkless TCB-floor
+///   self-profile (`derive_root_profile` — `ROOT_NET_STRIP`) forbids, so running the relay in the root
+///   widens that floor (new TCB — a Security call), and running it in a separate least-authority
+///   process is the alternative. Until the owner/Security ratify the placement, the frontend is not
+///   operator-launched (never silently downgraded to an OS process, which would discard the wall).
+/// - Any OTHER VM shape — a co-located sealer bundle (P1, which needs the owner-GATED vsock key-relay,
+///   design §3 / S2), a backend, an exec/control instance — is outside the approved scope entirely.
+///
+/// Pure (host-testable).
+fn resolve_spawn_backend(
+    label: &str,
+    substrate: InstanceSubstrate,
+    capabilities: &[HostAuthority],
+) -> Result<(), PrivsepError> {
     if substrate.is_wired() {
         return Ok(());
+    }
+    if matches!(substrate, InstanceSubstrate::Vm) {
+        let reason = if crate::privsep_vm::is_scoped_static_parser_frontend(capabilities) {
+            "it IS the owner-greenlit scoped shape (a key-free static-parser frontend), and the VM \
+             substrate MECHANISM is built + live-gated — but the operator-facing supervise wiring is \
+             gated on the S1 relay-placement decision (the host client-byte relay needs socket \
+             syscalls the secret-blind root's networkless self-profile forbids)"
+        } else {
+            "it is NOT a key-free static-parser frontend (a group-C `listen.*`-only slice), so it is \
+             outside the approved scope entirely — a co-located sealer bundle / backend / exec/control \
+             instance in a VM needs the owner-GATED vsock key-relay (design §3 / S2)"
+        };
+        return Err(PrivsepError::Supervise(format!(
+            "instance {label:?} selects the vm substrate: {reason}. Refusing fail-closed rather than \
+             silently downgrading to an OS process (which would discard the chosen isolation wall); \
+             use `substrate: OsProcess` or `substrate: Container`"
+        )));
     }
     let backend = substrate.compute_plane_backend().unwrap_or("(none)");
     Err(PrivsepError::Supervise(format!(
         "instance {label:?} selects the {:?} isolation substrate, whose spawn backend is not wired in \
-         this cut (it reuses {backend} — a reported follow-on; a VM has its own kernel, so the `local` \
-         socketpair cannot cross and the whole link transport needs a vsock re-plumb). Refusing \
-         fail-closed rather than silently downgrading to an OS process (which would discard the \
-         chosen isolation wall); use `substrate: OsProcess` or `substrate: Container` until the {} \
-         backend lands",
-        substrate.tag(),
+         this cut (it reuses {backend} — a reported follow-on). Refusing fail-closed rather than \
+         silently downgrading to an OS process (which would discard the chosen isolation wall); use \
+         `substrate: OsProcess` or `substrate: Container`",
         substrate.tag(),
     )))
 }
@@ -2010,12 +2141,14 @@ mod supervise {
 
         // Phase-3 spawn-backend dispatch (design §7 "substrate is a spawn backend"): resolve EACH
         // instance's isolation substrate BEFORE wiring/binding/spawning anything. OS-process + the
-        // Phase-3 namespace/cgroup Container backend are WIRED; `Vm` is refused fail-closed here
-        // (never a partial spawn, never a silent downgrade) until its vsock-crossing wiring lands.
-        // Container reuses the SAME fork+exec below — it only adds the child-side `unshare` in
-        // `spawn_wired_instance`'s `pre_exec` (design-note Option C / §8).
+        // Phase-3 namespace/cgroup Container backend are WIRED; `Vm` is refused fail-closed here (the
+        // scoped VM substrate MECHANISM is built + live-gated, but the operator-facing supervise wiring
+        // is gated on the S1 relay-placement decision — the host client-byte relay cannot run inside the
+        // secret-blind root's networkless self-profile; see `resolve_spawn_backend`). Container reuses
+        // the SAME fork+exec below — it only adds the child-side `unshare` in `spawn_wired_instance`'s
+        // `pre_exec` (design-note Option C / §8).
         for (label, inst) in &privsep.instances {
-            super::resolve_spawn_backend(label, inst.substrate)?;
+            super::resolve_spawn_backend(label, inst.substrate, &inst.capabilities)?;
         }
 
         // Phase-4 WS-C: per-tenant TEMPLATE instances are NOT forked at boot and their links are NOT
@@ -4566,28 +4699,54 @@ mod tests {
     fn resolve_spawn_backend_wires_os_process_and_container_and_refuses_vm() {
         // OS-process is the Phase-1 wired backend; Container is the Phase-3 wired backend (the SIMPLE
         // model — the SAME fork+exec, with the child unsharing NS/IPC/UTS/CGROUP in its pre_exec).
-        resolve_spawn_backend("frontend", InstanceSubstrate::OsProcess)
-            .expect("os-process is a wired spawn backend");
-        resolve_spawn_backend("core", InstanceSubstrate::Container)
-            .expect("container is now a wired spawn backend (Phase-3 simple model)");
-        // Both wired substrates report `is_wired()`.
+        resolve_spawn_backend(
+            "frontend",
+            InstanceSubstrate::OsProcess,
+            &[HostAuthority::ListenHttpParse],
+        )
+        .expect("os-process is a wired spawn backend");
+        resolve_spawn_backend(
+            "core",
+            InstanceSubstrate::Container,
+            &[HostAuthority::BackendKv],
+        )
+        .expect("container is now a wired spawn backend (Phase-3 simple model)");
         assert!(InstanceSubstrate::OsProcess.is_wired());
         assert!(InstanceSubstrate::Container.is_wired());
-        // VM stays refused fail-closed: its own kernel means the `local` socketpair cannot cross, so
-        // it needs a vsock re-plumb (a reported follow-on). The refusal names its reuse backend + the
-        // wired fallbacks, and stays fail-closed (never a silent OS-process downgrade).
         assert!(!InstanceSubstrate::Vm.is_wired());
-        let v = resolve_spawn_backend("edge-vm", InstanceSubstrate::Vm).unwrap_err();
-        let PrivsepError::Supervise(vm) = &v else {
-            panic!("vm must be refused as a Supervise error, got {v:?}");
+
+        // A VM that IS the owner-greenlit scoped shape — a key-free static-parser frontend — is refused
+        // at the OPERATOR gate pending the S1 relay-placement decision (the mechanism is built +
+        // live-gated), fail-closed, offering the wired fallbacks. Never a silent OS-process downgrade.
+        let scoped = resolve_spawn_backend(
+            "edge-vm",
+            InstanceSubstrate::Vm,
+            &[HostAuthority::ListenHttpParse],
+        )
+        .unwrap_err();
+        let PrivsepError::Supervise(s) = &scoped else {
+            panic!("vm must be refused as a Supervise error, got {scoped:?}");
         };
         assert!(
-            vm.contains("firecracker") && vm.contains("fail-closed"),
-            "vm refusal must name its reuse backend + stay fail-closed, got {vm:?}"
+            s.contains("S1") && s.contains("fail-closed"),
+            "the scoped-frontend VM refusal must name the S1 relay-placement gate + stay fail-closed: {s:?}"
         );
         assert!(
-            vm.contains("OsProcess") && vm.contains("Container"),
-            "vm refusal must offer the wired OsProcess/Container fallbacks, got {vm:?}"
+            s.contains("OsProcess") && s.contains("Container"),
+            "the refusal must offer the wired OsProcess/Container fallbacks: {s:?}"
+        );
+
+        // A VM that is NOT a key-free static-parser frontend (it holds a backend credential) is OUTSIDE
+        // the approved scope entirely — it needs the owner-GATED vsock key-relay.
+        let oos =
+            resolve_spawn_backend("bad-vm", InstanceSubstrate::Vm, &[HostAuthority::BackendKv])
+                .unwrap_err();
+        let PrivsepError::Supervise(o) = &oos else {
+            panic!("vm must be refused as a Supervise error, got {oos:?}");
+        };
+        assert!(
+            o.contains("key-relay") && o.contains("fail-closed"),
+            "the out-of-scope VM refusal must name the owner-gated key-relay + stay fail-closed: {o:?}"
         );
     }
 

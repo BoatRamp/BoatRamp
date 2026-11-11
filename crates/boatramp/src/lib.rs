@@ -69,6 +69,10 @@ mod db;
 #[cfg(feature = "acme-dns")]
 mod on_demand_tls;
 mod privsep;
+// The scoped privsep VM substrate (firecracker/Linux, static-parser-frontends-only). `pub` so the
+// lighthouse live serve gate (`tests/privsep_vm_live.rs`) can drive the real host launcher; the
+// cpio/vsock/relay internals stay private inside its `imp` module.
+pub mod privsep_vm;
 // `boatramp kv repair`: offline WAL-tail repair for the SlateDB control-plane store.
 // Gated on `slatedb` (it operates on the SlateDB store).
 #[cfg(feature = "slatedb")]
@@ -402,6 +406,16 @@ fn run() -> Result<(), CliError> {
     #[cfg(target_os = "macos")]
     if std::env::args().nth(1).as_deref() == Some(boatramp_vz::VZ_RUN_SUBCOMMAND) {
         return run_vz_worker(std::env::args().nth(2));
+    }
+    // A re-exec'd `boatramp __vm-guest` is the scoped privsep VM substrate's IN-GUEST frontend: the
+    // static-PIE `boatramp` the non-PIE init shim `execve`d as the microVM guest's PID 1. It reads its
+    // own label/port from the packed /privsep-vm-guest.json, resolves its slice from the packed config,
+    // installs its fail-closed `Enforced` profile (S4), binds AF_VSOCK, and serves relayed client
+    // connections. Handled HERE in the pre-runtime single-threaded window (the profile installs on the
+    // main thread before any runtime), matching `argv[1]` EXACTLY. Linux-only (AF_VSOCK + the guest).
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("__vm-guest") {
+        return privsep::run_vm_guest();
     }
     // A re-exec'd `boatramp __root` / `boatramp __instance <label>` is the privsep Phase-1 root
     // supervisor / feature-instance (design F10). Handled HERE, in the same pre-runtime
