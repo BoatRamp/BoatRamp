@@ -51,6 +51,10 @@ controllen = "controllen"
 # / `mis-key`) in the privsep per-tenant routing comments (`privsep_tenant.rs`). A valid English
 # prefix describing a routing/keying error, not a typo of "miss"/"mist".
 mis = "mis"
+# `Inh` = the `CapInh` field of `/proc/<pid>/status` (the Linux capability Inheritable set),
+# grepped alongside `CapPrm`/`CapEff`/`CapBnd` in the privsep VM live gate's capability-drop
+# assertion (`Cap(Inh|Prm|Eff|Bnd)`). A kernel field name, not a typo of "In".
+Inh = "Inh"
 
 [files]
 # Lockfiles and vendored third-party WIT (upstream WASI definitions, copied
