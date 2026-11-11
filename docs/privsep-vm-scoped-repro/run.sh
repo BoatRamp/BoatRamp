@@ -48,8 +48,11 @@ cargo build --release --target "$TARGET" -p boatramp \
 GUEST_BIN="$REPO/target/$TARGET/release/boatramp"
 
 echo "## 2. NON-PIE init shim (a standalone libc-only crate; dedicated non-PIE RUSTFLAGS override)"
+# `cargo zigbuild` (NOT `cargo build`) so zig provides the musl CRT without colliding with rustc's
+# self-contained `crt1.o` under `+crt-static` (a bare `cargo build` + zig-cc fails: "duplicate symbol
+# _start"). The shim has no C deps, so zigbuild needs no musl C compiler here.
 RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static" \
-  cargo build --release --target "$TARGET" -p boatramp-privsep-vm-shim 2>&1 | tail -3 || exit 1
+  cargo zigbuild --release --target "$TARGET" -p boatramp-privsep-vm-shim 2>&1 | tail -3 || exit 1
 SHIM_BIN="$REPO/target/$TARGET/release/boatramp-privsep-vm-shim"
 
 echo "## 3. classify the ELF shapes (payload must be static-PIE DYN, shim must be non-PIE EXEC)"

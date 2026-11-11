@@ -767,6 +767,57 @@ mod imp {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Cpio;
+
+        /// Pure CI gate for the in-process newc cpio writer (no KVM needed): every entry's header is
+        /// exactly 110 bytes, aligned to 4, with the magic + the TRAILER. This catches a mis-sized
+        /// header (the live gate once found a 115-byte header) in CI, not only on a real boot.
+        #[test]
+        fn cpio_newc_headers_are_110_bytes_aligned_and_terminated() {
+            let mut cpio = Cpio::new();
+            cpio.dir("proc");
+            cpio.chardev("dev/console", 5, 1);
+            cpio.file("init", 0o755, b"a non-trivial payload of some length");
+            let image = cpio.finish();
+
+            // Walk the archive, validating each 110-byte newc header, its field widths, and 4-byte
+            // alignment, until the TRAILER.
+            let mut off = 0usize;
+            let mut saw_trailer = false;
+            let mut entries = 0usize;
+            while off + 110 <= image.len() {
+                let hdr = &image[off..off + 110];
+                assert_eq!(&hdr[0..6], b"070701", "newc magic at offset {off}");
+                // Every field after the magic is 8 ASCII hex digits.
+                assert!(
+                    hdr[6..110].iter().all(|b| b.is_ascii_hexdigit()),
+                    "header fields are 8-hex at offset {off}"
+                );
+                let namesize =
+                    usize::from_str_radix(std::str::from_utf8(&hdr[94..102]).unwrap(), 16).unwrap();
+                let filesize =
+                    usize::from_str_radix(std::str::from_utf8(&hdr[54..62]).unwrap(), 16).unwrap();
+                let name = &image[off + 110..off + 110 + namesize - 1]; // minus the NUL
+                if name == b"TRAILER!!!" {
+                    saw_trailer = true;
+                    break;
+                }
+                entries += 1;
+                // Name (padded to 4 after the 110-byte header), then data (padded to 4).
+                let after_name = off + 110 + namesize;
+                let data_start = after_name.div_ceil(4) * 4;
+                assert!(data_start.is_multiple_of(4), "data starts 4-aligned");
+                let next = (data_start + filesize).div_ceil(4) * 4;
+                assert!(next.is_multiple_of(4), "next entry 4-aligned");
+                off = next;
+            }
+            assert!(saw_trailer, "the archive ends with a TRAILER!!! entry");
+            assert_eq!(entries, 3, "proc dir + console dev + init file");
+        }
+    }
 }
 
 // ---- host-facing re-exports (Linux) ----
