@@ -206,12 +206,20 @@ mod imp {
             let ino = self.ino;
             self.ino += 1;
             let namesize = name.len() + 1; // includes the trailing NUL
-            // newc header: "070701" + 13 × 8-hex fields.
+            // newc header: "070701" (magic) + 13 × 8-hex fields, each written explicitly:
+            // ino, mode, uid=0, gid=0, nlink, mtime=0, filesize, devmajor=0, devminor=0,
+            // rdevmajor, rdevminor, namesize, check=0. Total = 6 + 13*8 = 110 bytes.
             let header = format!(
-                "070701{ino:08x}{mode:08x}00000000000000000000{nlink:08x}00000000{size:08x}00000000000000000{rmaj:08x}{rmin:08x}{namesize:08x}00000000",
+                "070701{ino:08x}{mode:08x}{uid:08x}{gid:08x}{nlink:08x}{mtime:08x}{size:08x}{devmaj:08x}{devmin:08x}{rmaj:08x}{rmin:08x}{namesize:08x}{check:08x}",
+                uid = 0u32,
+                gid = 0u32,
+                mtime = 0u32,
                 size = data.len() as u32,
+                devmaj = 0u32,
+                devmin = 0u32,
                 rmaj = rdev.0,
                 rmin = rdev.1,
+                check = 0u32,
             );
             debug_assert_eq!(header.len(), 110, "newc header is 110 bytes");
             self.buf.extend_from_slice(header.as_bytes());
@@ -331,7 +339,12 @@ mod imp {
         guest_cid: u32,
     ) -> io::Result<BootedVm> {
         verify_guest_kernel(&assets.guest_kernel, assets.guest_kernel_sha256.as_deref())?;
-        let uds_path = work_dir.join("vsock.sock");
+        // The vsock UDS path must fit `sockaddr_un.sun_path` (SUN_LEN ≈ 108 bytes) — a deep work_dir
+        // would overflow it — so the UDS lives at a SHORT unique path under the runtime temp dir, while
+        // the (long-path-tolerant) initramfs / config / console stay in `work_dir`.
+        let uds_path =
+            std::env::temp_dir().join(format!("brvsk-{}-{}.sock", guest_cid, std::process::id()));
+        let _ = std::fs::remove_file(&uds_path); // a stale socket from a prior run would block the bind
         let config_path = work_dir.join("firecracker.json");
         // Raw firecracker machine config: kernel + initrd + vsock, `drives: []`, no
         // `network-interfaces` (the production `FcMachine` has no initrd/vsock fields; the bench

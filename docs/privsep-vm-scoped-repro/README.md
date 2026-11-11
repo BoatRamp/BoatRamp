@@ -23,7 +23,8 @@ and adds the transport proof (the vsock relay + guest serve + HTTP 200 end-to-en
 
 ## Prerequisites (lighthouse-only)
 
-- `/dev/kvm` + `firecracker` (nixpkgs#firecracker 1.13.x accepts the bzImage directly).
+- `/dev/kvm` + `firecracker` (nixpkgs#firecracker 1.13.x). Firecracker's x86_64 loader needs the
+  UNCOMPRESSED `vmlinux` ELF — a bzImage fails with "Invalid Elf magic number".
 - A **Landlock-V5** guest kernel — kernel **>= 6.10** with `CONFIG_SECURITY_LANDLOCK=y`. This is the
   privsep profile's `MIN_LANDLOCK_ABI = ABI::V5` floor
   (`crates/boatramp-server/src/sandbox.rs`). **The firecracker CI kernels (<= 6.1, Landlock ABI <= V2)
@@ -36,7 +37,7 @@ and adds the transport proof (the vsock relay + guest serve + HTTP 200 end-to-en
   curl -fsSLo fc-base.config \
     https://raw.githubusercontent.com/firecracker-microvm/firecracker/v1.13.1/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config
   printf 'CONFIG_SECURITY=y\nCONFIG_SECURITYFS=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM="landlock,yama,bpf"\n' >> fc-base.config
-  nix-build kernel.nix -o kernel-result        # -> kernel-result/bzImage
+  nix-build kernel.nix -o kernel-result        # -> kernel-result/vmlinux (the uncompressed ELF firecracker needs)
   ```
 
 ## Run
@@ -45,7 +46,7 @@ and adds the transport proof (the vsock relay + guest serve + HTTP 200 end-to-en
 # on lighthouse, from the repo root, inside the agent scratch clone:
 nix shell nixpkgs#rustup nixpkgs#cargo-zigbuild nixpkgs#zig nixpkgs#firecracker \
           nixpkgs#binutils nixpkgs#gcc nixpkgs#pkg-config nixpkgs#openssl --command \
-  env GUEST_KERNEL=$PWD/kbuild/kernel-result/bzImage \
+  env GUEST_KERNEL=$PWD/kbuild/kernel-result/vmlinux \
   bash docs/privsep-vm-scoped-repro/run.sh
 ```
 

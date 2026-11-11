@@ -8,7 +8,12 @@
 #
 # Prereq: `fc-base.config` in the same dir = the firecracker CI config + the Landlock lines (see README).
 #
-#   nix-build kernel.nix -o kernel-result     # -> kernel-result/bzImage (firecracker 1.13.x boots it)
+#   nix-build kernel.nix -o kernel-result     # -> kernel-result/vmlinux (the uncompressed ELF)
+#
+# Firecracker's x86_64 ELF loader needs the UNCOMPRESSED `vmlinux` (a bzImage fails with "Invalid Elf
+# magic number"). nixpkgs' default installPhase keeps only the bzImage, so — like boatramp's own
+# `boatramp-vmlinux` flake derivation — copy `$buildRoot/vmlinux` out in postInstall (CONFIG_MODULES=n,
+# so nixpkgs drops it otherwise).
 let
   pkgs = import <nixpkgs> { };
 in
@@ -22,4 +27,7 @@ in
     # not a correctness one — does not affect output bytes).
     requiredSystemFeatures = [ ];
     buildFlags = (old.buildFlags or [ ]) ++ [ "vmlinux" ];
+    postInstall = (old.postInstall or "") + ''
+      cp "$buildRoot/vmlinux" "$out/vmlinux"
+    '';
   })
