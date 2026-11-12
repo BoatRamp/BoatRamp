@@ -1263,7 +1263,7 @@
                     f"BOATRAMP_TEST_MYSQL_URL=mysql://root:mysql@{my_ip}:3306/mysql"
                 )
                 out = machine.succeed(
-                    # The serial (`--test-threads=1`, shared pg+mysql) live suite has grown to ~28
+                    # The serial (`--test-threads=1`, shared pg+mysql) live suite has grown to ~30
                     # heavy provision/dump/restore gates — ~1267s on bare-metal lighthouse, and slower
                     # nested in this QEMU VM (virtiofs + docker-in-VM pg/mysql). The old 1200s cap
                     # timed out mid-suite; 3000s gives generous headroom plus room for future gates.
@@ -1277,7 +1277,7 @@
                 # docker usable for the ephemeral client containers) — a self-skip still prints
                 # `ok`, so require the exact passed count AND every success marker, exactly like
                 # the host-runner job's grep gate.
-                assert re.search(r"test result: ok\. 28 passed", out), "not all 28 tests ran (silent skip?)"
+                assert re.search(r"test result: ok\. 30 passed", out), "not all 30 tests ran (silent skip?)"
                 for marker in [
                     "PROJECT EXPORT ROUNDTRIP OK",
                     "PROJECT EXPORT PG CHUNKED SHADOW OK",
@@ -1302,6 +1302,8 @@
                     "PROJECT SYNC IDEMPOTENCY ORPHAN OK",
                     "PROJECT SYNC UNDECLARED ORPHAN RECONCILE OK",
                     "PROJECT SYNC ORPHAN DROP OWNING-ROLES OK",
+                    "PROJECT SYNC COLLIDING ORPHAN RECONCILE ROLES OK",
+                    "PROJECT SYNC TENANCY MISMATCH FAIL-CLOSED OK",
                     "PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK",
                     "PROJECT EXPORT MYSQL VIEW-NAME INJECTION REFUSED OK",
                 ]:

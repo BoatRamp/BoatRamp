@@ -405,19 +405,20 @@ jobs:
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
 
-          # HARD gate: the file's 26 live/always-on tests (incl. the v0.59.1 managed-pg
+          # HARD gate: the file's 28 live/always-on tests (incl. the v0.59.1 managed-pg
           # `project_sync_managed_pg_shadow_land_live` gate + the v0.59.2 Shared rls_session
           # force-RLS REPLICATE gate + the idempotency/orphan-recovery gate + the undeclared-orphan
-          # reconcile gate + the orphan-drop owning-roles/role-sharing-guard gate) + the 2 pure-unit
-          # tests (URL-parser, WAL-render-inertness) = 28 must ALL
+          # reconcile gate + the orphan-drop owning-roles/role-sharing-guard gate + the v0.59.6
+          # colliding-orphan role-untangle gate + the cross-node tenancy-mismatch fail-closed gate)
+          # + the 2 pure-unit tests (URL-parser, WAL-render-inertness) = 30 must ALL
           # actually run (both live DBs reachable, docker usable
           # for the ephemeral client containers) — a self-skip (unset env / unreachable docker) still
           # prints `test result: ok`, so require the exact passed-count AND every one of the file's
           # success markers below. (The libsql true-delta + its CHAIN gate are
           # `#[cfg(feature = "sql-delta-libsql")]`, NOT compiled in this `--features project-export`
           # build, so they are NOT in this count — they gate in capability.yml.)
-          grep -qE 'test result: ok\. 28 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 28 tests (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 30 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 30 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
@@ -485,6 +486,18 @@ jobs:
           # both ways, zero foreign bytes). Self-skip trap → gate on marker.
           grep -q 'PROJECT SYNC ORPHAN DROP OWNING-ROLES OK' project-export-live.log \
             || { echo "::error::orphan-drop owning-roles gate never reached its marker (silent skip, an object-owning derived role leaked un-cleared, or a role shared with a live binding was force-cleared — DATA-LOSS risk)" >&2; exit 1; }
+          # COLLIDING-ORPHAN role-untangle on the EXISTING-dest re-sync (v0.59.6): a `project sync`
+          # into a Shared tenant whose derived roles a prior failed swap left tangled with a stray
+          # `__old_` aside LANDS the restore AND clears the stray aside (untangles the reused roles,
+          # data-loss-safe) — and the shared-with-live fail-safe LEAVES a role shared with a live
+          # sibling (its data survives, zero foreign bytes). Self-skip trap → gate on marker.
+          grep -q 'PROJECT SYNC COLLIDING ORPHAN RECONCILE ROLES OK' project-export-live.log \
+            || { echo "::error::colliding-orphan role-untangle gate never reached its marker (silent skip, the stray swap-aside leaked un-cleared on the existing-dest re-sync, or a role shared with a live sibling was force-cleared — DATA-LOSS risk)" >&2; exit 1; }
+          # CROSS-NODE TENANCY-MISMATCH fail-closed (v0.59.6, I2 DATA-LOSS corner): a Single/dedicated-
+          # framed (chunked) managed member applied into a SHARED tenant cell is REFUSED fail-closed,
+          # so a populated Shared occupant is NEVER clobbered (zero foreign bytes). Self-skip → marker.
+          grep -q 'PROJECT SYNC TENANCY MISMATCH FAIL-CLOSED OK' project-export-live.log \
+            || { echo "::error::tenancy-mismatch fail-closed gate never reached its marker (silent skip, or a chunked member clobbered a Shared occupant instead of being refused — cross-tenancy DATA-LOSS)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT MYSQL ROUTINES+TRIGGERS OK' project-export-live.log \
             || { echo "::error::live mysql triggers/routines/events carry + DEFINER re-point gate never reached its marker (silent skip, or a carried object was not re-pointed to the tenant role)" >&2; exit 1; }
           grep -q 'PROJECT EXPORT MYSQL VIEW-NAME INJECTION REFUSED OK' project-export-live.log \

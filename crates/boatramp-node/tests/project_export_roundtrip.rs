@@ -5394,6 +5394,890 @@ async fn project_sync_orphan_drop_clears_object_owning_roles_live() {
     println!("PROJECT SYNC ORPHAN DROP OWNING-ROLES OK");
 }
 
+/// **Live COLLIDING-ORPHAN reconcile + role-untangle on the EXISTING-dest (fresh_dest=false) re-sync
+/// gate** (Tier-2 / nightly — needs a Docker daemon AND real Postgres). The construens re-sync gap the
+/// v0.59.4 fresh-dest reconcile did NOT cover: a prior FAILED/crashed sync swap leaves the managed DB
+/// orphaned at the derived target name WITH a stray `__old_` aside db its derived roles still OWN; a
+/// fresh `project sync` into the SAME identity is an EXISTING-dest incremental mirror
+/// (`skip_control_plane_kv = false` ⇒ `fresh_dest = false`), on which the sidecar shadow-restore's
+/// fresh-dest reconcile does NOT fire — so the swap lands the restore but LEAVES the orphan's stray
+/// aside + its tangled roles (the leak), and a later clean lifecycle (`db drop database`, a tenancy
+/// change) hits an un-droppable, object-owning role. This gate reproduces that EXACT shape on real pg
+/// and proves, with CONTENT checks:
+///
+/// A (DISPOSABLE, same-identity re-sync): the orphan at the derived target name is OWNED BY the derived
+///    owner role, holds an owner-owned table, AND the derived owner role ALSO owns a stray `__old_`
+///    aside db (owner-owned object inside) — the construens tangle a plain `DROP ROLE` would refuse.
+///    The existing-dest re-sync RECONCILES the colliding orphan: the restore LANDS (source rows
+///    present), the derived roles are REUSED (same-identity re-provision), and the stray aside is
+///    CLEARED so the roles own ONLY the restored live db — no leak. MUTATION WITNESS: WITHOUT the fix
+///    the sync completes but the stray `__old_` aside + the role tangle SURVIVE (leaked).
+///
+/// B (SHARED — the HARD GUARD / fail-safe): the orphan's derived roles are SHARED with a LIVE sibling
+///    binding on the same server (they own the sibling's live db too). The re-sync reconcile must LEAVE
+///    the shared roles AND the orphan's own stray aside fully intact (force-clearing would risk the
+///    live sibling's data) — the `shared_with_live` fail-safe. MUTATION WITNESS: the live sibling's db +
+///    its secret row survive the re-sync UNCHANGED (zero foreign bytes).
+///
+/// ≥2 tenants, each a SEPARATE physical db. Emits `PROJECT SYNC COLLIDING ORPHAN RECONCILE ROLES OK`.
+#[tokio::test]
+async fn project_sync_colliding_orphan_reconcile_roles_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (colliding-orphan reconcile gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (colliding-orphan reconcile gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-corph-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+
+    let seal_and_seed = |compute: String| {
+        let (kv, deploy, envelope, su_pw, host) = (
+            kv.clone(),
+            deploy.clone(),
+            envelope.clone(),
+            su_pw.clone(),
+            host.clone(),
+        );
+        async move {
+            let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+            kv.put(
+                &format!("managed-sql-cred/{DEFAULT_PROJECT}/{compute}"),
+                sealed,
+            )
+            .await
+            .expect("pre-seal superuser credential");
+            deploy
+                .set_replica_state(
+                    ProjectRef::DEFAULT,
+                    &ObservedInstance {
+                        handle: InstanceHandle {
+                            project: DEFAULT_PROJECT.to_string(),
+                            workload: compute.clone(),
+                            replica: 0,
+                            backend_ref: "test-external-pg".to_string(),
+                        },
+                        node: 0,
+                        backend: "external".to_string(),
+                        endpoint: Endpoint {
+                            scheme: Scheme::Http,
+                            host: host.clone(),
+                            port,
+                        },
+                        region: None,
+                        healthy: true,
+                        started_at: None,
+                        phase: ReplicaPhase::Running,
+                        readiness: Readiness::Provisioned,
+                        data_dir: None,
+                        snapshot: None,
+                        active_spec: None,
+                    },
+                )
+                .await
+                .expect("seed healthy replica");
+        }
+    };
+    seal_and_seed(COMPUTE.to_string()).await;
+
+    // ===== SCENARIO A (DISPOSABLE, same-identity existing-dest re-sync) =====
+    const A_BINDING: &str = "corphapp";
+    const A_DB: &str = "corph";
+    let src = format!("corph-src-{s}");
+    let dest = format!("corph-dest-{s}");
+
+    let binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(A_DB.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        rls_session: true,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let databases = BTreeMap::from([(A_BINDING.to_string(), binding.clone())]);
+    let db_name = |p: &str| tenant_db_name(A_DB, &sanitize_ident(p));
+    let src_db = db_name(&src);
+    let dest_db = db_name(&dest);
+    let owner_role = tenant_owner_role_name(COMPUTE, &sanitize_ident(&dest));
+    let login_role = tenant_role_name(COMPUTE, &sanitize_ident(&dest));
+    // A genuine transient swap-aside of the dest's derived name (the junk a prior FAILED/crashed swap
+    // leaves): `<dest-db>__old_<nanos>_<pid>` — classified as this orphan's OWN disposable aside.
+    let stray_aside = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}1_7"));
+
+    for db in [&src_db, &dest_db, &stray_aside] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+
+    for p in [&src, &dest] {
+        provision_tenant(&deploy, &kv, &envelope, &binding, p, "")
+            .await
+            .unwrap_or_else(|e| panic!("provision {p}: {e}"));
+    }
+
+    // Seed: SOURCE rows.
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &src_db),
+        "CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES ('A','src-a'),('B','src-b');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed src: {o}");
+
+    // The orphan at the derived target name: a table OWNED BY the derived owner role (so DROP ROLE
+    // would be refused until the objects are handled), + a stray `__old_` aside the SAME owner role
+    // owns (an owner-owned object inside it) — the construens tangle a prior failed sync left behind.
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &dest_db),
+        &format!("SET ROLE \"{owner_role}\"; CREATE TABLE owned_live(i int); INSERT INTO owned_live VALUES (1); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed orphan owner-owned live table: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{stray_aside}\" OWNER \"{owner_role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create owner-owned stray aside: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &stray_aside),
+        &format!("SET ROLE \"{owner_role}\"; CREATE TABLE owned_in_aside(i int); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed stray aside owner object: {o}");
+
+    // Precondition (the tangle EXISTS): the owner role owns BOTH the live dest db AND the stray aside.
+    let (_c, owns_pre) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT count(*) FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE r.rolname='{owner_role}' AND d.datname IN ('{dest_db}','{stray_aside}')"),
+    )
+    .await;
+    assert_eq!(
+        owns_pre.trim(),
+        "2",
+        "precondition: the derived owner role must own BOTH the live orphan db AND the stray `__old_` aside (the construens tangle)"
+    );
+
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-corph-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-corph-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases.clone(), deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false)
+        .with_trusted_extensions(vec![]);
+
+    let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+    driver
+        .export(
+            &src,
+            &ExportOptions {
+                scope: BundleScope::DataPlane,
+                managed_restore: ManagedRestore::ShadowSwap,
+                include_identity: false,
+                transport_key: None,
+                delta: None,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("export source tenant");
+    let bundle = sink.into_inner();
+
+    // THE RE-SYNC: an EXISTING-dest incremental mirror (`skip_control_plane_kv = false` ⇒
+    // fresh_dest = false) — the path construens's re-sync took (NOT the explicit `--orphan`).
+    let mut body = futures::io::Cursor::new(bundle.clone());
+    driver
+        .import(
+            &dest,
+            &mut body,
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                skip_control_plane_kv: false,
+                expected_managed_restore: Some(ManagedRestore::ShadowSwap),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "existing-dest re-sync into a colliding orphan MUST LAND (reconcile + restore): {e}"
+            )
+        });
+
+    // (A1) The restore LANDED: the SOURCE rows are present + correct on the live dest db.
+    let live = conn(&superuser, &su_pw, &host, port, &dest_db);
+    let (_c, got) = psql(
+        backend.as_ref(),
+        &image,
+        &live,
+        "SELECT tid || ':' || v FROM marker ORDER BY tid",
+    )
+    .await;
+    assert_eq!(
+        got, "A:src-a\nB:src-b",
+        "the existing-dest re-sync must land the SOURCE rows in the live dest db (end-to-end on real pg)"
+    );
+
+    // (A2) MUTATION WITNESS: the stray `__old_` aside is CLEARED — WITHOUT the fix the fresh-dest
+    // reconcile does not fire on this path, so the aside + the role tangle SURVIVE (leaked).
+    let (_c, aside_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{stray_aside}'"),
+    )
+    .await;
+    assert!(
+        aside_after.trim().is_empty(),
+        "the orphan's stray `__old_` aside db MUST be cleared by the re-sync reconcile (WITHOUT the \
+         fix it LEAKS — the role-tangle construens hit): still present"
+    );
+
+    // (A3) The derived roles are REUSED (same-identity re-provision), and now own ONLY the restored
+    // live db — the tangle is gone (no stray aside left for them to own).
+    let (_c, owns_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT d.datname FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE r.rolname='{owner_role}' ORDER BY 1"),
+    )
+    .await;
+    let owned: Vec<&str> = owns_after
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        owned,
+        vec![dest_db.as_str()],
+        "after the reconcile the derived owner role must own ONLY the restored live db (the stray \
+         aside is gone, the tangle cleared): owns {owned:?}"
+    );
+    let (_c, roles_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT count(*) FROM pg_roles WHERE rolname IN ('{owner_role}','{login_role}')"),
+    )
+    .await;
+    assert_eq!(
+        roles_after.trim(),
+        "2",
+        "the derived owner + login roles are REUSED by the same-identity re-provision (still present)"
+    );
+
+    for db in [&src_db, &dest_db, &stray_aside] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+
+    // ===== SCENARIO B (SHARED — the HARD GUARD / fail-safe) =====
+    // Two bindings on the SAME server share ONE derived owner/login role (per `(tenant, server)`); one
+    // binding LIVE. The re-sync reconcile of the OTHER must LEAVE the shared roles AND the orphan's own
+    // stray aside intact (force-clearing would risk the live sibling) — zero foreign bytes.
+    let shar = format!("corph-shar-{s}");
+    let shar_src = format!("corph-sharsrc-{s}");
+    const B1: &str = "cshb1";
+    const B2: &str = "cshb2";
+    const DB1: &str = "cshd1";
+    const DB2: &str = "cshd2";
+    let mk = |database: &str| ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(database.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        rls_session: true,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let b1 = mk(DB1);
+    let b2 = mk(DB2);
+    let shar_ident = sanitize_ident(&shar);
+    let shared_owner = tenant_owner_role_name(COMPUTE, &shar_ident);
+    let shared_login = tenant_role_name(COMPUTE, &shar_ident);
+    let b1_db = tenant_db_name(DB1, &shar_ident);
+    let b2_db = tenant_db_name(DB2, &shar_ident);
+    let b1_stray = bounded_aside_db_name(&b1_db, "__old_", &format!("{s}2_9"));
+    // Source for re-syncing B1 (same binding name so the member resolves to B1 on import).
+    let shar_src_ident = sanitize_ident(&shar_src);
+    let b1_src_db = tenant_db_name(DB1, &shar_src_ident);
+
+    for db in [&b1_db, &b2_db, &b1_stray, &b1_src_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    // Provision the two bindings on `shar` (shared roles own both dbs) + the source's B1.
+    provision_tenant(&deploy, &kv, &envelope, &b1, &shar, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision B1: {e}"));
+    provision_tenant(&deploy, &kv, &envelope, &b2, &shar, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision B2: {e}"));
+    provision_tenant(&deploy, &kv, &envelope, &b1, &shar_src, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision B1 source: {e}"));
+
+    // Seed the LIVE sibling (B2) with its secret + an owner-owned object (what a naive force-clear of
+    // the shared owner would destroy).
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &b2_db),
+        &format!("SET ROLE \"{shared_owner}\"; CREATE TABLE live_secret(v text); INSERT INTO live_secret VALUES ('DO-NOT-CLOBBER'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed B2 live secret: {o}");
+    // Seed the source B1 rows + a stray `__old_` aside of B1 the SHARED owner owns (the tangle).
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &b1_src_db),
+        "CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES ('A','b1-a');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed B1 source: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{b1_stray}\" OWNER \"{shared_owner}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create B1 stray aside owned by the shared owner: {o}");
+
+    // SOURCE export driver: ONLY binding B1 (so exporting `shar_src` dumps just B1, not an
+    // unprovisioned B2).
+    let databases_src = BTreeMap::from([(B1.to_string(), b1.clone())]);
+    let op_src_b: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases_src.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work_src_b = std::env::temp_dir().join(format!("boatramp-corph-bsrc-work-{s}"));
+    std::fs::create_dir_all(&work_src_b).unwrap();
+    let blobs_src_b: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-corph-bsrc-blobs-{s}")),
+    ));
+    let src_driver_b = NodeProjectExport::new(
+        databases_src.clone(),
+        deploy.clone(),
+        kv.clone(),
+        blobs_src_b,
+        work_src_b,
+    )
+    .with_managed_pg(backend.clone(), envelope.clone(), op_src_b, false)
+    .with_trusted_extensions(vec![]);
+
+    // The re-sync (import) driver for `shar` (binding map carries B1; B2 is live in pg).
+    let databases_b = BTreeMap::from([(B1.to_string(), b1.clone()), (B2.to_string(), b2.clone())]);
+    let op_b: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases_b.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work_b = std::env::temp_dir().join(format!("boatramp-corph-b-work-{s}"));
+    std::fs::create_dir_all(&work_b).unwrap();
+    let blobs_b: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-corph-b-blobs-{s}")),
+    ));
+    let driver_b = NodeProjectExport::new(
+        databases_b.clone(),
+        deploy.clone(),
+        kv.clone(),
+        blobs_b,
+        work_b,
+    )
+    .with_managed_pg(backend.clone(), envelope.clone(), op_b, false)
+    .with_trusted_extensions(vec![]);
+
+    // Export B1 from the source project, import into `shar` (existing-dest re-sync of B1).
+    let mut sink_b = futures::io::Cursor::new(Vec::<u8>::new());
+    src_driver_b
+        .export(
+            &shar_src,
+            &ExportOptions {
+                scope: BundleScope::DataPlane,
+                managed_restore: ManagedRestore::ShadowSwap,
+                include_identity: false,
+                transport_key: None,
+                delta: None,
+            },
+            &mut sink_b,
+        )
+        .await
+        .expect("export B1 source");
+    let bundle_b = sink_b.into_inner();
+    let mut body_b = futures::io::Cursor::new(bundle_b.clone());
+    driver_b
+        .import(
+            &shar,
+            &mut body_b,
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                skip_control_plane_kv: false,
+                expected_managed_restore: Some(ManagedRestore::ShadowSwap),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("re-sync of B1 (shared-role tenant) MUST LAND: {e}"));
+
+    // (B1) The LIVE sibling's db + its secret survive the re-sync UNCHANGED (zero foreign bytes).
+    let (_c, live_secret) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &b2_db),
+        "SELECT v FROM live_secret",
+    )
+    .await;
+    assert_eq!(
+        live_secret.trim(),
+        "DO-NOT-CLOBBER",
+        "the live sibling binding's data MUST be preserved across the re-sync (the shared-role \
+         fail-safe never force-clears)"
+    );
+    // (B2) The shared roles survive intact (a live sibling still uses them).
+    let (_c, shared_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "SELECT count(*) FROM pg_roles WHERE rolname IN ('{shared_owner}','{shared_login}')"
+        ),
+    )
+    .await;
+    assert_eq!(
+        shared_after.trim(),
+        "2",
+        "the shared owner + login roles MUST be LEFT intact (shared with a live sibling)"
+    );
+    // (B3) The fail-safe LEFT the orphan's own stray aside too (the guard aborts the untangle when a
+    // role is shared with a live sibling — it never force-touches anything).
+    let (_c, b1_stray_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{b1_stray}'"),
+    )
+    .await;
+    assert_eq!(
+        b1_stray_after.trim(),
+        "1",
+        "the shared-with-live fail-safe must LEAVE even the orphan's own stray aside intact (never \
+         force-clear a role entangled with a live sibling)"
+    );
+
+    // cleanup B
+    for db in [&b1_db, &b2_db, &b1_stray, &b1_src_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    for r in [&shared_owner, &shared_login, &owner_role, &login_role] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP ROLE IF EXISTS \"{r}\""),
+        )
+        .await;
+    }
+
+    println!("PROJECT SYNC COLLIDING ORPHAN RECONCILE ROLES OK");
+}
+
+/// **Live CROSS-NODE TENANCY-MISMATCH fail-closed gate (I2 — DATA-LOSS corner)** (Tier-2 / nightly —
+/// needs a Docker daemon AND real Postgres). A cross-node `project sync` whose SOURCE framed the
+/// managed member as Single/dedicated (the CHUNKED streamed-shadow path) while the TARGET binding
+/// resolves the SAME binding name to a SHARED tenant cell. The chunked import path has NO fresh-dest
+/// reconcile and resolves the TARGET's binding, so without a guard it would atomic-swap the chunked
+/// dump into the Shared derived target name — CLOBBERING a POPULATED Shared occupant (its data gone,
+/// no recoverable tombstone), bypassing the Shared occupant-reconcile entirely. This gate reproduces
+/// the mismatch on real pg and proves the FAIL-CLOSED guard: the import is REFUSED and the populated
+/// Shared occupant's data survives UNCHANGED. MUTATION WITNESS: WITHOUT the guard the chunked swap
+/// lands and the occupant's secret row is CLOBBERED (zero → gone). Emits
+/// `PROJECT SYNC TENANCY MISMATCH FAIL-CLOSED OK`.
+#[tokio::test]
+async fn project_sync_tenancy_mismatch_fail_closed_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{
+        sanitize_ident, tenant_db_name, tenant_owner_role_name,
+    };
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (tenancy-mismatch fail-closed gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!(
+                "SKIP: no reachable Docker daemon (tenancy-mismatch fail-closed gate not run)"
+            );
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BINDING: &str = "tmmapp";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-tmm-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("seal su");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed replica");
+
+    // SOURCE project = the reserved default (a Single/dedicated tenant there resolves the base shared
+    // `pg` workload — already seeded — so the dedicated-export side needs no extra per-project replica;
+    // the mismatch under test is purely the chunked FRAMING vs the Shared TARGET).
+    let src = DEFAULT_PROJECT.to_string();
+    let dest = format!("tmm-dest-{s}");
+
+    // SOURCE: a Single/dedicated binding → the managed member is framed CHUNKED on export.
+    let src_dd = format!("tmm_src_dd_{s}");
+    let src_binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(src_dd.clone()),
+        user: Some(superuser.clone()),
+        // tenant = Single, tenant_scope = Project (dedicated) by default.
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    // TARGET: the SAME binding name resolves to a SHARED tenant cell (the mismatch).
+    const TGT_DB: &str = "tmmshared";
+    let tgt_binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(TGT_DB.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        rls_session: true,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let tgt_db = tenant_db_name(TGT_DB, &sanitize_ident(&dest));
+    let tgt_owner = tenant_owner_role_name(COMPUTE, &sanitize_ident(&dest));
+
+    for db in [&src_dd, &tgt_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+
+    // Provision the SOURCE dedicated db (create it + seed source rows).
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{src_dd}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create src dedicated db: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &src_dd),
+        "CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES ('A','src-a');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed src dedicated: {o}");
+
+    // Provision the TARGET Shared tenant + seed a POPULATED occupant (the data a mismatch must NOT
+    // clobber).
+    provision_tenant(&deploy, &kv, &envelope, &tgt_binding, &dest, "")
+        .await
+        .expect("provision target Shared tenant");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &tgt_db),
+        &format!("SET ROLE \"{tgt_owner}\"; CREATE TABLE occupant(v text); INSERT INTO occupant VALUES ('SHARED-OCCUPANT-SECRET'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed populated Shared occupant: {o}");
+
+    // SOURCE driver (Single binding) → export a DataPlane+ShadowSwap bundle (CHUNKED member).
+    let src_dbs = BTreeMap::from([(BINDING.to_string(), src_binding.clone())]);
+    let src_op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        src_dbs.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let src_work = std::env::temp_dir().join(format!("boatramp-tmm-src-work-{s}"));
+    std::fs::create_dir_all(&src_work).unwrap();
+    let src_blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-tmm-src-blobs-{s}")),
+    ));
+    let src_driver =
+        NodeProjectExport::new(src_dbs, deploy.clone(), kv.clone(), src_blobs, src_work)
+            .with_managed_pg(backend.clone(), envelope.clone(), src_op, false)
+            .with_trusted_extensions(vec![]);
+    let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+    src_driver
+        .export(
+            &src,
+            &ExportOptions {
+                scope: BundleScope::DataPlane,
+                managed_restore: ManagedRestore::ShadowSwap,
+                include_identity: false,
+                transport_key: None,
+                delta: None,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("export Single source (chunked member)");
+    let bundle = sink.into_inner();
+
+    // TARGET driver (SHARED binding, SAME binding name) imports the chunked member → the mismatch.
+    let tgt_dbs = BTreeMap::from([(BINDING.to_string(), tgt_binding.clone())]);
+    let tgt_op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        tgt_dbs.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let tgt_work = std::env::temp_dir().join(format!("boatramp-tmm-tgt-work-{s}"));
+    std::fs::create_dir_all(&tgt_work).unwrap();
+    let tgt_blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-tmm-tgt-blobs-{s}")),
+    ));
+    let tgt_driver =
+        NodeProjectExport::new(tgt_dbs, deploy.clone(), kv.clone(), tgt_blobs, tgt_work)
+            .with_managed_pg(backend.clone(), envelope.clone(), tgt_op, false)
+            .with_trusted_extensions(vec![]);
+
+    let mut body = futures::io::Cursor::new(bundle.clone());
+    let import_result = tgt_driver
+        .import(
+            &dest,
+            &mut body,
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                skip_control_plane_kv: false,
+                expected_managed_restore: Some(ManagedRestore::ShadowSwap),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    // MUTATION WITNESS (zero foreign bytes — the PRIMARY data-loss assertion): the populated Shared
+    // occupant's secret survives UNCHANGED. WITHOUT the guard the chunked swap replaces the whole
+    // derived db, so the `occupant` table is GONE (this query then errors ≠ the secret) — silent
+    // cross-tenancy data loss. (`-v ON_ERROR_STOP=1` surfaces the missing table as a clear failure.)
+    let (_c, occupant) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &tgt_db),
+        "SELECT v FROM occupant",
+    )
+    .await;
+    assert_eq!(
+        occupant.trim(),
+        "SHARED-OCCUPANT-SECRET",
+        "the populated Shared occupant's data MUST survive the mismatch UNCHANGED (WITHOUT the guard \
+         the chunked swap CLOBBERS it — silent cross-tenancy data loss): got [{occupant}]"
+    );
+
+    // FAIL-CLOSED: the tenancy mismatch is REFUSED (never clobbers the Shared occupant).
+    assert!(
+        import_result.is_err(),
+        "a Single/dedicated-framed (chunked) managed member applied into a SHARED tenant cell is a \
+         tenancy mismatch and MUST be REFUSED fail-closed (WITHOUT the guard the chunked swap clobbers \
+         the Shared occupant): import unexpectedly succeeded"
+    );
+
+    // cleanup
+    for db in [&src_dd, &tgt_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP ROLE IF EXISTS \"{tgt_owner}\""),
+    )
+    .await;
+
+    println!("PROJECT SYNC TENANCY MISMATCH FAIL-CLOSED OK");
+}
+
 /// **Live managed-MySQL triggers/routines/events carry + DEFINER re-point gate** (Tier-2 / nightly —
 /// needs a Docker daemon AND a MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE
 /// DATABASE`). Self-skips.

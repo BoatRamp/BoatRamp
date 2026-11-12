@@ -2943,6 +2943,28 @@ impl ProjectExport for NodeProjectExport {
                                             return Err(e);
                                         }
                                     };
+                                    // I2 FAIL-CLOSED (v0.59.6, cross-node tenancy mismatch —
+                                    // DATA-LOSS corner): reaching the CHUNKED streamed-shadow path
+                                    // means the SOURCE framed this member Single/dedicated
+                                    // (`managed_member_chunked` is keyed on the source's non-Shared
+                                    // tenancy). If the TARGET binding instead resolves to a SHARED
+                                    // tenant cell (`shared_reprovision` is `Some`), the two nodes
+                                    // DISAGREE on tenancy, and applying the chunked dump here would
+                                    // atomic-swap into the Shared derived name WITHOUT the Shared
+                                    // occupant-reconcile the sidecar path runs — CLOBBERING a
+                                    // populated Shared occupant (silent cross-tenancy data loss). The
+                                    // shadow is not created yet, so REFUSE now rather than clobber;
+                                    // the source + target must agree on the binding's tenancy.
+                                    if plan.shared_reprovision.is_some() {
+                                        let _ = reply.send(Err(()));
+                                        return Err(Perr::Other(format!(
+                                            "import: tenancy mismatch for database {db:?} — a \
+                                             Single/dedicated-framed (chunked) managed member cannot \
+                                             be applied into a SHARED tenant cell (refusing to clobber \
+                                             the Shared occupant); the source and target nodes must \
+                                             agree on the binding's tenancy"
+                                        )));
+                                    }
                                     // TRUSTED DDL (superuser/maint): mint the ephemeral NON-SUPERUSER
                                     // role + the shadow it owns + pre-create the allowlisted exts.
                                     if let Err(e) = self.pg_create_shadow(&plan, &stage_dir).await {
@@ -5944,6 +5966,48 @@ impl NodeProjectExport {
                 .await
         {
             return Err(e);
+        }
+        // COLLIDING-ORPHAN ROLE-TANGLE reconcile (v0.59.6, construens's sixth-layer leak on the
+        // EXISTING-dest path): the fresh-dest reconcile above only fires on the absent-dest path and
+        // only PRESERVES a populated occupant. A prior FAILED/crashed swap can leave the Shared
+        // tenant's derived roles tangled with stray TRANSIENT `__old_`/`__shadow_` aside databases
+        // they still own; the existing-dest incremental mirror's swap lands the restore but LEAVES
+        // that tangle (the roles are REUSED, but they keep owning disposable junk → a later clean
+        // lifecycle hits an un-droppable object-owning role). Untangle it here on BOTH paths, reusing
+        // `hard_drop_orphan_tenant`'s EXACT reconciliation core: drop ONLY this tenant's own transient
+        // swap asides (never a grace `__deleted_` tombstone, never a foreign live-sibling db), leaving
+        // the reused roles + the live db intact (the swap owns the live db). Best-effort: a cleanup
+        // failure is logged but never fails an otherwise-successful restore. No-op off the Shared cell.
+        if plan.shared_reprovision.is_some()
+            && let Some(envelope) = self.envelope.as_ref()
+        {
+            match crate::tenant_sql::untangle_colliding_orphan_roles(
+                &self.deploy,
+                &self.kv,
+                envelope,
+                cfg,
+                project,
+            )
+            .await
+            {
+                Ok(cleared) if !cleared.is_empty() => {
+                    tracing::info!(
+                        database = %db,
+                        cleared_asides = ?cleared,
+                        "sync reconcile: cleared stray transient swap-aside databases a prior failed \
+                         sync left owned by this tenant's derived roles (untangled for a clean restore)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        database = %db,
+                        error = %e,
+                        "sync reconcile: could not untangle the orphan's stray swap asides (the \
+                         restore still proceeds; a later `db drop database --orphan` can clear them)"
+                    );
+                }
+            }
         }
         // TRUSTED DDL (superuser/maint): mint the ephemeral NON-SUPERUSER role + the shadow it owns +
         // (Shared) the REVOKE-PUBLIC lockdown + pre-create the allow-listed extensions.
