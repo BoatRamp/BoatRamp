@@ -8673,10 +8673,23 @@ exit $RC
             // clobber — mirroring the streaming-arm guard and mysql's `allow_shared = false` refusal.
             //
             // NB: no colliding-orphan role-tangle UNTANGLE is run here (unlike the Shared sidecar
-            // path): the role tangle is a Shared-tenant-only concern (Single/dedicated tenants have
-            // no derived owner/login roles), and pg delta is Single-only, so a legitimate Shared
-            // same-identity delta sync never reaches this seam — the ONLY Shared target here is the
-            // I2 mismatch, which this guard refuses before any mutation.
+            // path). The role tangle is a Shared-tenant-only concern (Single/dedicated tenants have no
+            // derived owner/login roles), and THE GUARD BELOW REFUSES EVERY Shared target before the
+            // shadow+swap — so no Shared shadow+swap is ever reached on this delta path, hence no
+            // tangle can be created or persist and an untangle would be dead code. (A Shared binding
+            // CAN route here: `plan_delta_export` keeps a full-dump FALLBACK for any non-capture-
+            // eligible member — i.e. every Shared binding — inside a `delta=Some` bundle, which
+            // `import_delta_chain` sends to this seam; it is REFUSED by the guard, NOT absent.)
+            // ⚠️ DO NOT relax this guard to admit a legitimate Shared→Shared delta (e.g. by
+            // distinguishing source framing) WITHOUT also running `untangle_colliding_orphan_roles`
+            // here first — relaxing it re-exposes the Shared shadow+swap and the role-tangle leak this
+            // guard currently forecloses.
+            //
+            // KNOWN LIMITATION (v0.59.6, fail-closed, non-data-loss): this refuses a legitimate
+            // Shared→Shared INCREMENTAL-delta sync (its full-dump fallback lands here), which the
+            // streaming sidecar path instead handles via the untangle. The operator falls back to a
+            // full (non-delta) sync, which works. Follow-up: route a Shared full-dump-fallback member
+            // in a delta chain to the sidecar reconcile path rather than a blanket refuse.
             if plan.shared_reprovision.is_some() {
                 return Err(Perr::Other(format!(
                     "import: tenancy mismatch for database {db:?} — a Single/dedicated-framed \
