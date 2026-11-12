@@ -6278,6 +6278,645 @@ async fn project_sync_tenancy_mismatch_fail_closed_live() {
     println!("PROJECT SYNC TENANCY MISMATCH FAIL-CLOSED OK");
 }
 
+/// **Live DELTA-PATH cross-node TENANCY-MISMATCH fail-closed gate (I2 on the pg WAL true-delta chain)**
+/// (Tier-2 / nightly — needs a Docker daemon AND real Postgres with `wal_level=logical`). The SECOND
+/// managed-pg shadow+swap seam, parallel to the streaming import arm: `restore_pg_true_delta_in_chain`
+/// (reached via `import_resumable_dir` → `import_delta_chain` when the manifest declares a delta)
+/// builds the SAME non-superuser shadow, restores a base dump, replays the WAL deltas, and atomically
+/// swaps — but on the current branch it had NO I2 tenancy-mismatch guard (the only guard was on the
+/// streaming arm). A cross-node `project sync` whose SOURCE framed the member Single/dedicated (pg
+/// true-delta capture is Single-ONLY — `pg_capture_eligible` excludes Shared) while the TARGET resolves
+/// the SAME binding name to a SHARED tenant cell would therefore atomic-swap the delta restore into the
+/// Shared derived name, CLOBBERING a populated Shared occupant (silent cross-tenancy data loss),
+/// bypassing the Shared occupant-reconcile. This gate reproduces the mismatch on real pg and proves the
+/// FAIL-CLOSED guard on the delta path: the import is REFUSED and the populated Shared occupant's data
+/// survives UNCHANGED. MUTATION WITNESS: WITHOUT the guard the delta swap lands and the occupant's row
+/// is CLOBBERED (its table gone). Emits `PROJECT SYNC DELTA TENANCY MISMATCH FAIL-CLOSED OK`.
+#[tokio::test]
+async fn project_sync_delta_tenancy_mismatch_fail_closed_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::fs::FsStorage;
+    use boatramp_storage::tenant_provision::{
+        sanitize_ident, tenant_db_name, tenant_owner_role_name,
+    };
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (delta tenancy-mismatch gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (delta tenancy-mismatch gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BINDING: &str = "dtmmapp";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+    let (_c, wal_level) = psql(backend.as_ref(), &image, &maint, "SHOW wal_level").await;
+    if wal_level.trim() != "logical" {
+        eprintln!("SKIP: test pg is not wal_level=logical (delta tenancy-mismatch gate not run)");
+        return;
+    }
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let td = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    let deploy = DeployStore::new(blobs.clone(), kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.unwrap();
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .unwrap();
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: String::new(),
+                },
+                node: 0,
+                backend: "docker".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // SOURCE: a Single/dedicated binding with delta_capture → a real pg WAL delta chain on export.
+    let src_dd = format!("dtmm_src_dd_{s}");
+    let src_binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(src_dd.clone()),
+        user: Some(superuser.clone()),
+        delta_capture: true,
+        // tenant = Single, tenant_scope = Project (dedicated) by default.
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    // TARGET: the SAME binding name resolves to a SHARED tenant cell (the mismatch).
+    let dest = format!("dtmm-dest-{s}");
+    const TGT_DB: &str = "dtmmshared";
+    let tgt_binding = ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(TGT_DB.into()),
+        user: Some(superuser.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        rls_session: true,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let tgt_db = tenant_db_name(TGT_DB, &sanitize_ident(&dest));
+    let tgt_owner = tenant_owner_role_name(COMPUTE, &sanitize_ident(&dest));
+
+    for db in [&src_dd, &tgt_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    // Create + seed the SOURCE dedicated db.
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{src_dd}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create src dedicated db: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &src_dd),
+        "CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES ('A','src-a');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed src dedicated: {o}");
+
+    // Provision the TARGET Shared tenant + seed a POPULATED occupant (what a mismatch must NOT clobber).
+    provision_tenant(&deploy, &kv, &envelope, &tgt_binding, &dest, "")
+        .await
+        .expect("provision target Shared tenant");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &tgt_db),
+        &format!("SET ROLE \"{tgt_owner}\"; CREATE TABLE occupant(v text); INSERT INTO occupant VALUES ('SHARED-OCCUPANT-SECRET'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed populated Shared occupant: {o}");
+
+    // SOURCE driver (Single binding, delta_capture) with a resumable base dir.
+    let resumable = td.path().join("resumable");
+    let src_dbs = BTreeMap::from([(BINDING.to_string(), src_binding.clone())]);
+    let src_op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        src_dbs.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let src_work = td.path().join("src-work");
+    std::fs::create_dir_all(&src_work).unwrap();
+    let src_driver =
+        NodeProjectExport::new(src_dbs, deploy.clone(), kv.clone(), blobs.clone(), src_work)
+            .with_managed_pg(backend.clone(), envelope.clone(), src_op, false)
+            .with_trusted_extensions(vec![])
+            .with_resumable_base(Some(resumable.clone()));
+
+    // BASE export (creates the capture slot + the full dump), then mutate, then an INCREMENTAL delta
+    // export (drains the slot into a PgWalDelta member) → a real delta chain with manifest.delta=Some.
+    let full = ExportOptions {
+        scope: BundleScope::Full,
+        managed_restore: ManagedRestore::ShadowSwap,
+        include_identity: false,
+        transport_key: None,
+        delta: None,
+    };
+    src_driver
+        .export_resumable(DEFAULT_PROJECT, &full, "base")
+        .await
+        .expect("base resumable export");
+    let (c, _o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &src_dd),
+        "INSERT INTO marker VALUES ('B','src-b');",
+    )
+    .await;
+    assert_eq!(c, 0, "mutate src for the delta");
+    let delta_opts = ExportOptions {
+        scope: BundleScope::Full,
+        managed_restore: ManagedRestore::ShadowSwap,
+        include_identity: false,
+        transport_key: None,
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Incremental,
+            base_reference: "base".to_string(),
+        }),
+    };
+    src_driver
+        .export_resumable(DEFAULT_PROJECT, &delta_opts, "d1")
+        .await
+        .expect("incremental delta export");
+    // Confirm it really is a WAL delta chain (not a full-dump fallback) — so the import routes to
+    // `restore_pg_true_delta_in_chain`, the seam under test.
+    let d1_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d1").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert!(
+        d1_manifest.delta.is_some(),
+        "the d1 manifest must declare a delta (so the import takes the delta-chain restore path)"
+    );
+
+    // TARGET driver (SHARED binding, SAME binding name), SAME resumable dir → import the delta chain.
+    let tgt_dbs = BTreeMap::from([(BINDING.to_string(), tgt_binding.clone())]);
+    let tgt_op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        tgt_dbs.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let tgt_work = td.path().join("tgt-work");
+    std::fs::create_dir_all(&tgt_work).unwrap();
+    let tgt_driver =
+        NodeProjectExport::new(tgt_dbs, deploy.clone(), kv.clone(), blobs.clone(), tgt_work)
+            .with_managed_pg(backend.clone(), envelope.clone(), tgt_op, false)
+            .with_trusted_extensions(vec![])
+            .with_resumable_base(Some(resumable.clone()));
+
+    let import_result = tgt_driver
+        .import_resumable(
+            &dest,
+            "d1",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                expected_managed_restore: Some(ManagedRestore::ShadowSwap),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    // MUTATION WITNESS (zero foreign bytes — PRIMARY data-loss assertion): the populated Shared
+    // occupant's secret survives UNCHANGED. WITHOUT the delta-path guard the delta swap replaces the
+    // whole derived db, so the `occupant` table is GONE (this query then errors ≠ the secret).
+    let (_c, occupant) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &tgt_db),
+        "SELECT v FROM occupant",
+    )
+    .await;
+    assert_eq!(
+        occupant.trim(),
+        "SHARED-OCCUPANT-SECRET",
+        "the populated Shared occupant's data MUST survive the delta mismatch UNCHANGED (WITHOUT the \
+         delta-path guard the WAL-delta swap CLOBBERS it — silent cross-tenancy data loss): got [{occupant}]"
+    );
+    // FAIL-CLOSED: the mismatch is REFUSED on the delta path too.
+    assert!(
+        import_result.is_err(),
+        "a Single/dedicated-framed (delta-chain) managed member applied into a SHARED tenant cell is a \
+         tenancy mismatch and MUST be REFUSED fail-closed on the DELTA path (WITHOUT the guard the \
+         delta swap clobbers the Shared occupant): import unexpectedly succeeded"
+    );
+
+    // cleanup
+    for db in [&src_dd, &tgt_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    let _ = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP ROLE IF EXISTS \"{tgt_owner}\""),
+    )
+    .await;
+
+    println!("PROJECT SYNC DELTA TENANCY MISMATCH FAIL-CLOSED OK");
+}
+
+/// **Live mysql BINLOG-DELTA cross-node TENANCY-MISMATCH already-refused PROOF gate** (Tier-2 /
+/// nightly — needs a Docker daemon AND a binlog-on + GTID MySQL). The mysql analogue of the pg
+/// delta-path I2 corner. UNLIKE pg, the mysql binlog-delta restore (`restore_mysql_true_delta_in_chain`)
+/// ALREADY passes `allow_shared = false` to `mysql_shadow_plan`, which REFUSES a Shared target before
+/// any shadow is created (mysql binlog capture is Single/dedicated-only too). This gate PROVES that
+/// existing protection is real and reachable — not an empty claim: a Single/dedicated-framed mysql
+/// binlog-delta chain applied into a SHARED mysql tenant cell is REFUSED, and the populated Shared
+/// occupant's data survives UNCHANGED (zero foreign bytes). So the mysql delta path needs NO new guard
+/// (pg's new delta-path guard brings pg to parity). Emits
+/// `PROJECT SYNC MYSQL DELTA TENANCY MISMATCH REFUSED OK`.
+#[tokio::test]
+async fn project_sync_mysql_delta_tenancy_mismatch_refused_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_delta::{DeltaMode, DeltaRequest};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::fs::FsStorage;
+    use boatramp_storage::tenant_provision::{sanitize_ident, tenant_db_name};
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_MYSQL_URL") else {
+        eprintln!(
+            "SKIP: BOATRAMP_TEST_MYSQL_URL unset (mysql delta tenancy-mismatch gate not run)"
+        );
+        return;
+    };
+    let Some((user, password, host, port, _db)) = parse_mysql_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_MYSQL_URL is not a mysql URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!(
+                "SKIP: no reachable Docker daemon (mysql delta tenancy-mismatch gate not run)"
+            );
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "mysql";
+    const BINDING: &str = "dmtmmapp";
+    let s = now_suffix();
+    let maint = MysqlConnection {
+        host: host.clone(),
+        port,
+        user: user.clone(),
+        password: password.clone(),
+        database: String::new(),
+        connect_timeout_secs: 10,
+        ephemeral_network: None,
+    };
+    let (code, _o) = mysql_run(backend.as_ref(), "mysql:8.0", &maint, None, "SELECT 1").await;
+    assert_eq!(code, 0, "mysql reachable; is the DSN right?");
+    // binlog must be on for a true binlog-delta (else the export falls back to a full dump and the
+    // import takes the sidecar path, not the delta path under test).
+    let (_c, logbin) = mysql_run(
+        backend.as_ref(),
+        "mysql:8.0",
+        &maint,
+        None,
+        "SELECT @@log_bin",
+    )
+    .await;
+    if logbin.trim() != "1" {
+        eprintln!("SKIP: test mysql has log_bin off (mysql delta tenancy-mismatch gate not run)");
+        return;
+    }
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let td = tempfile::tempdir().unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(FsStorage::new(td.path().join("blobs")));
+    let deploy = DeployStore::new(blobs.clone(), kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([9u8; 32]));
+    let sealed = envelope.wrap(password.as_bytes()).await.unwrap();
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .unwrap();
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: String::new(),
+                },
+                node: 0,
+                backend: "docker".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // SOURCE: a Single/dedicated mysql binding with delta_capture (binlog).
+    let src_dd = format!("dmtmm_src_{s}");
+    let src_binding = ExternalDatabaseConfig {
+        kind: "mysql".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(src_dd.clone()),
+        user: Some(user.clone()),
+        delta_capture: true,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    // TARGET: the SAME binding name resolves to a SHARED mysql tenant cell (the mismatch).
+    let dest = format!("dmtmm-dest-{s}");
+    const TGT_DB: &str = "dmtmmshared";
+    let tgt_binding = ExternalDatabaseConfig {
+        kind: "mysql".into(),
+        compute: Some(COMPUTE.into()),
+        database: Some(TGT_DB.into()),
+        user: Some(user.clone()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    };
+    let tgt_db = tenant_db_name(TGT_DB, &sanitize_ident(&dest));
+
+    for db in [&src_dd, &tgt_db] {
+        let _ = mysql_run(
+            backend.as_ref(),
+            "mysql:8.0",
+            &maint,
+            None,
+            &format!("DROP DATABASE IF EXISTS `{db}`"),
+        )
+        .await;
+    }
+    // Create + seed the SOURCE dedicated db.
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        "mysql:8.0",
+        &maint,
+        None,
+        &format!("CREATE DATABASE `{src_dd}`"),
+    )
+    .await;
+    assert_eq!(c, 0, "create src mysql db: {o}");
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        "mysql:8.0",
+        &maint,
+        Some(&src_dd),
+        "CREATE TABLE marker(tid varchar(8), v varchar(32)); INSERT INTO marker VALUES ('A','src-a');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed src mysql: {o}");
+
+    // Provision the TARGET Shared mysql tenant + seed a POPULATED occupant.
+    provision_tenant(&deploy, &kv, &envelope, &tgt_binding, &dest, "")
+        .await
+        .expect("provision target Shared mysql tenant");
+    let (c, o) = mysql_run(
+        backend.as_ref(),
+        "mysql:8.0",
+        &maint,
+        Some(&tgt_db),
+        "CREATE TABLE occupant(v varchar(64)); INSERT INTO occupant VALUES ('SHARED-OCCUPANT-SECRET');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed populated Shared mysql occupant: {o}");
+
+    // SOURCE driver with a resumable base dir → base + incremental binlog delta.
+    let resumable = td.path().join("resumable");
+    let src_dbs = BTreeMap::from([(BINDING.to_string(), src_binding.clone())]);
+    let src_op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        src_dbs.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let src_work = td.path().join("src-work");
+    std::fs::create_dir_all(&src_work).unwrap();
+    let src_driver =
+        NodeProjectExport::new(src_dbs, deploy.clone(), kv.clone(), blobs.clone(), src_work)
+            .with_managed_pg(backend.clone(), envelope.clone(), src_op, false)
+            .with_resumable_base(Some(resumable.clone()));
+
+    let full = ExportOptions {
+        scope: BundleScope::Full,
+        managed_restore: ManagedRestore::ShadowSwap,
+        include_identity: false,
+        transport_key: None,
+        delta: None,
+    };
+    src_driver
+        .export_resumable(DEFAULT_PROJECT, &full, "base")
+        .await
+        .expect("base resumable export (mysql)");
+    let (c, _o) = mysql_run(
+        backend.as_ref(),
+        "mysql:8.0",
+        &maint,
+        Some(&src_dd),
+        "INSERT INTO marker VALUES ('B','src-b');",
+    )
+    .await;
+    assert_eq!(c, 0, "mutate src mysql for the delta");
+    let delta_opts = ExportOptions {
+        scope: BundleScope::Full,
+        managed_restore: ManagedRestore::ShadowSwap,
+        include_identity: false,
+        transport_key: None,
+        delta: Some(DeltaRequest {
+            mode: DeltaMode::Incremental,
+            base_reference: "base".to_string(),
+        }),
+    };
+    src_driver
+        .export_resumable(DEFAULT_PROJECT, &delta_opts, "d1")
+        .await
+        .expect("incremental binlog delta export");
+    let d1_manifest: project_bundle::StreamManifest =
+        serde_json::from_slice(&std::fs::read(resumable.join("d1").join("MANIFEST")).unwrap())
+            .unwrap();
+    assert!(
+        d1_manifest.delta.is_some(),
+        "the d1 manifest must declare a delta (so the import takes the mysql delta-chain restore path)"
+    );
+
+    // TARGET driver (SHARED binding), SAME resumable dir → import the binlog-delta chain.
+    let tgt_dbs = BTreeMap::from([(BINDING.to_string(), tgt_binding.clone())]);
+    let tgt_op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        tgt_dbs.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let tgt_work = td.path().join("tgt-work");
+    std::fs::create_dir_all(&tgt_work).unwrap();
+    let tgt_driver =
+        NodeProjectExport::new(tgt_dbs, deploy.clone(), kv.clone(), blobs.clone(), tgt_work)
+            .with_managed_pg(backend.clone(), envelope.clone(), tgt_op, false)
+            .with_resumable_base(Some(resumable.clone()));
+
+    let import_result = tgt_driver
+        .import_resumable(
+            &dest,
+            "d1",
+            ImportOptions {
+                apply: true,
+                overwrite: true,
+                force: true,
+                expected_managed_restore: Some(ManagedRestore::ShadowSwap),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    // ALREADY REFUSED (allow_shared=false): the mismatch is rejected before any shadow is created.
+    assert!(
+        import_result.is_err(),
+        "a Single/dedicated-framed (binlog-delta) mysql member applied into a SHARED tenant cell MUST \
+         be REFUSED (mysql_shadow_plan allow_shared=false) — the EXISTING protection the pg guard mirrors"
+    );
+    // MUTATION WITNESS (zero foreign bytes): the populated Shared occupant's secret survives UNCHANGED.
+    let (_c, occupant) = mysql_run(
+        backend.as_ref(),
+        "mysql:8.0",
+        &maint,
+        Some(&tgt_db),
+        "SELECT v FROM occupant",
+    )
+    .await;
+    assert_eq!(
+        occupant.trim(),
+        "SHARED-OCCUPANT-SECRET",
+        "the populated Shared mysql occupant's data MUST survive the refused mismatch UNCHANGED: got [{occupant}]"
+    );
+
+    // cleanup
+    for db in [&src_dd, &tgt_db] {
+        let _ = mysql_run(
+            backend.as_ref(),
+            "mysql:8.0",
+            &maint,
+            None,
+            &format!("DROP DATABASE IF EXISTS `{db}`"),
+        )
+        .await;
+    }
+
+    println!("PROJECT SYNC MYSQL DELTA TENANCY MISMATCH REFUSED OK");
+}
+
 /// **Live managed-MySQL triggers/routines/events carry + DEFINER re-point gate** (Tier-2 / nightly —
 /// needs a Docker daemon AND a MySQL server whose DSN user can `CREATE USER`/`GRANT`/`CREATE
 /// DATABASE`). Self-skips.

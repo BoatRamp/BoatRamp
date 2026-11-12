@@ -579,6 +579,16 @@ jobs:
           # a populated Shared occupant is NEVER clobbered. Self-skip trap → marker.
           grep -q 'PROJECT SYNC TENANCY MISMATCH FAIL-CLOSED OK' project-export.log \
             || { echo "::error::tenancy-mismatch fail-closed gate never reached its marker (silent skip, or a chunked member clobbered a Shared occupant instead of being refused — cross-tenancy DATA-LOSS)" >&2; exit 1; }
+          # DELTA-path cross-node tenancy-mismatch fail-closed (v0.59.6, I2 on the pg WAL true-delta
+          # shadow+swap seam): a Single/dedicated-framed delta-chain member applied into a SHARED cell is
+          # REFUSED fail-closed, so a populated Shared occupant is NEVER clobbered. Self-skip → marker.
+          grep -q 'PROJECT SYNC DELTA TENANCY MISMATCH FAIL-CLOSED OK' project-export.log \
+            || { echo "::error::delta-path tenancy-mismatch fail-closed gate never reached its marker (silent skip, or a WAL-delta member clobbered a Shared occupant — cross-tenancy DATA-LOSS on the delta path)" >&2; exit 1; }
+          # mysql binlog-delta tenancy-mismatch already-refused PROOF (v0.59.6): the EXISTING
+          # allow_shared=false refuses a Single-framed binlog-delta into a SHARED cell, occupant survives.
+          # Self-skip → marker.
+          grep -q 'PROJECT SYNC MYSQL DELTA TENANCY MISMATCH REFUSED OK' project-export.log \
+            || { echo "::error::mysql binlog-delta tenancy-mismatch proof gate never reached its marker (silent skip, or the allow_shared=false protection regressed — a mysql binlog-delta clobbered a Shared occupant)" >&2; exit 1; }
           # Managed MySQL carries triggers/stored routines/events across the shadow+swap, restored as
           # a non-SUPER user and RE-POINTED to the tenant's own role post-swap (the DEFINER-handling
           # seam). Gate on its marker so a skip or a regression (a carried object NOT re-pointed, or

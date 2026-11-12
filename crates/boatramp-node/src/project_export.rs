@@ -8662,6 +8662,29 @@ exit $RC
                 })?
                 .clone();
             let plan = self.pg_shadow_plan(project, &db, &cfg).await?;
+            // I2 FAIL-CLOSED (v0.59.6, cross-node tenancy mismatch — DATA-LOSS corner, on the SECOND
+            // managed-pg shadow+swap seam): reaching the pg WAL true-delta restore means the SOURCE
+            // framed this member Single/dedicated — pg true-delta capture is Single-ONLY
+            // (`pg_capture_eligible` excludes Shared). If the TARGET binding instead resolves to a
+            // SHARED tenant cell (`shared_reprovision` is `Some`), the nodes DISAGREE on tenancy, and
+            // the atomic swap below would land the delta restore into the Shared derived name WITHOUT
+            // the Shared occupant-reconcile — CLOBBERING a populated Shared occupant (silent
+            // cross-tenancy data loss). The shadow is not created yet, so REFUSE now rather than
+            // clobber — mirroring the streaming-arm guard and mysql's `allow_shared = false` refusal.
+            //
+            // NB: no colliding-orphan role-tangle UNTANGLE is run here (unlike the Shared sidecar
+            // path): the role tangle is a Shared-tenant-only concern (Single/dedicated tenants have
+            // no derived owner/login roles), and pg delta is Single-only, so a legitimate Shared
+            // same-identity delta sync never reaches this seam — the ONLY Shared target here is the
+            // I2 mismatch, which this guard refuses before any mutation.
+            if plan.shared_reprovision.is_some() {
+                return Err(Perr::Other(format!(
+                    "import: tenancy mismatch for database {db:?} — a Single/dedicated-framed \
+                     (WAL true-delta) managed member cannot be applied into a SHARED tenant cell \
+                     (refusing to clobber the Shared occupant); the source and target nodes must \
+                     agree on the binding's tenancy"
+                )));
+            }
             if let Err(e) = self.pg_create_shadow(&plan, stage_dir).await {
                 self.pg_drop_shadow(&plan, stage_dir).await;
                 return Err(e);
