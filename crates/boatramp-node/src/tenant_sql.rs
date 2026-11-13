@@ -95,8 +95,8 @@ use boatramp_storage::sql_compute::{
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use boatramp_storage::tenant_provision::{
     RLS_ENABLE_NOT_FORCE_COUNT_SQL, force_rls_event_trigger_ddl, force_rls_sweep_ddl,
-    grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl, sanitize_ident,
-    soft_deprovision_ddl, tenant_db_name, tenant_owner_role_name, tenant_role_name,
+    grant_app_role_ddl, provision_ddl, sanitize_ident, soft_deprovision_ddl, tenant_db_name,
+    tenant_owner_role_name, tenant_role_name,
 };
 
 use crate::config::{ExternalDatabaseConfig, ServeAs, TenantIsolation, TenantScope};
@@ -1533,7 +1533,14 @@ enum DbClear {
 ///   * POPULATED ⇒ SOFT-DEPROVISION: rename `db` aside ([`rename_db_aside`]) to a collision-free
 ///     recoverable `__deleted_<ts>` grace tombstone of `derived_primary` (the tenant's derived live
 ///     name — so the tombstone is recognized as THIS orphan's own aside), FREEING `db`'s name →
-///     [`DbClear::Preserved`]. A mid-restore failure then never loses the only data copy.
+///     [`DbClear::Preserved`]. A mid-restore failure then never loses the only data copy. A KV
+///     [`Tombstone`](tenant_tombstone::Tombstone) record is ALSO written for the EXISTING grace reaper
+///     ([`spawn_tenant_tombstone_reaper`]) so a self-heal-minted tombstone is auto-reclaimed after its
+///     grace window + is [`recover_tenant`]-restorable UNIFORMLY (never a `__deleted_` db the reaper
+///     ignores → unbounded disk growth). The record is superuser-OWNED — role + cred_workload are
+///     EMPTY (step D reassigns the db to the superuser; the derived roles + their creds belong to the
+///     REPROVISIONED LIVE tenant, so the reaper/recover must NOT touch them — they skip an empty
+///     role/cred, [`hard_drop_tombstone`] / [`recover_tenant`]).
 ///
 /// NEVER gated on `--drop-soft-deleted` (that flag governs only PRE-EXISTING `__deleted_` tombstones —
 /// FINDING 3). Every name is STRUCTURAL (the derived live name + a bounded aside of it), never
@@ -1542,10 +1549,12 @@ enum DbClear {
 async fn clear_db_dataloss_safe(
     admin: &ComputeResolvedSqlBackend,
     deploy: &DeployStore,
+    kv: &Arc<dyn KvStore>,
     creds: &ManagedSqlCredentials,
     kind: ExternalSqlKind,
     compute: &str,
     superuser: &str,
+    project: &str,
     derived_primary: &str,
     db: &str,
 ) -> Result<DbClear, String> {
@@ -1576,6 +1585,25 @@ async fn clear_db_dataloss_safe(
         ts = ts.saturating_add(1);
     };
     rename_db_aside(admin, kind, db, &tombstone).await?;
+    // Unify the tombstone lifecycle: register this self-heal-minted `__deleted_` with the EXISTING KV
+    // grace reaper (the ONLY other minter is `deprovision_tenant`). Same record shape + helper; the
+    // reaper reclaims it once `delete_after` passes and `recover_tenant` restores it uniformly. The
+    // grace is the deprovision DEFAULT window; role + cred_workload are EMPTY (superuser-owned — no
+    // dedicated role/cred to drop; the derived roles + creds are the reprovisioned LIVE tenant's).
+    let record = tenant_tombstone::Tombstone {
+        version: 1,
+        project: project.to_string(),
+        renamed_db: tombstone.clone(),
+        original_db: derived_primary.to_string(),
+        role: String::new(),
+        engine: "postgres".to_string(),
+        compute: compute.to_string(),
+        superuser: superuser.to_string(),
+        cred_workload: String::new(),
+        deleted_at: ts,
+        delete_after: ts.saturating_add(DEFAULT_DEPROVISION_GRACE_SECS),
+    };
+    tenant_tombstone::put(kv, &record).await?;
     Ok(DbClear::Preserved(tombstone))
 }
 
@@ -2009,10 +2037,12 @@ pub async fn untangle_colliding_orphan_roles(
             match clear_db_dataloss_safe(
                 &admin,
                 deploy,
+                kv,
                 &creds,
                 kind,
                 compute,
                 superuser,
+                project,
                 &names.database,
                 aside,
             )
@@ -2054,10 +2084,12 @@ pub async fn untangle_colliding_orphan_roles(
     match clear_db_dataloss_safe(
         &admin,
         deploy,
+        kv,
         &creds,
         kind,
         compute,
         superuser,
+        project,
         &names.database,
         &names.database,
     )
@@ -2242,11 +2274,27 @@ pub async fn recover_tenant(
         &ts.superuser,
     )
     .await?;
-    for stmt in recover_soft_deprovision_ddl(&ts.renamed_db, &ts.original_db, &ts.role) {
+    // Rename the renamed-aside db back to its original name (always). Reactivate the login role ONLY
+    // for a deprovision tombstone that owns one; a SELF-HEAL-minted tombstone is superuser-owned with
+    // an EMPTY role (the derived roles are the reprovisioned LIVE tenant's — `ALTER ROLE "" LOGIN`
+    // would error and there is nothing to reactivate), so the role step is skipped.
+    let renamed_id =
+        boatramp_storage::tenant_provision::quote_ident(ExternalSqlKind::Postgres, &ts.renamed_db);
+    let original_id =
+        boatramp_storage::tenant_provision::quote_ident(ExternalSqlKind::Postgres, &ts.original_db);
+    admin
+        .run_script(&format!(
+            "ALTER DATABASE {renamed_id} RENAME TO {original_id};"
+        ))
+        .await
+        .map_err(|e| format!("recover {}: {e}", ts.original_db))?;
+    if !ts.role.is_empty() {
+        let role_id =
+            boatramp_storage::tenant_provision::quote_ident(ExternalSqlKind::Postgres, &ts.role);
         admin
-            .run_script(&stmt)
+            .run_script(&format!("ALTER ROLE {role_id} LOGIN;"))
             .await
-            .map_err(|e| format!("recover {}: {e}", ts.original_db))?;
+            .map_err(|e| format!("recover role {}: {e}", ts.role))?;
     }
     tenant_tombstone::delete(kv, &ts).await?;
     Ok(true)
@@ -2455,22 +2503,33 @@ async fn hard_drop_tombstone(
         &ts.superuser,
     )
     .await?;
-    // DROP the RENAMED database + the role (IF EXISTS-guarded, so re-runnable).
-    for stmt in boatramp_storage::tenant_provision::deprovision_ddl(
-        ExternalSqlKind::Postgres,
-        &ts.renamed_db,
-        &ts.role,
-    ) {
+    // DROP the RENAMED database (IF EXISTS-guarded, so re-runnable). The per-tenant role + sealed
+    // credential are dropped ONLY for a deprovision tombstone that OWNS them (role / cred_workload
+    // set). A SELF-HEAL-minted tombstone is superuser-OWNED with EMPTY role + cred_workload (the
+    // derived roles + creds belong to the REPROVISIONED LIVE tenant) — dropping those would clobber the
+    // live tenant, so they are skipped. Same record shape, one reaper path: the empty fields are the
+    // "no dedicated role/cred" signal.
+    let db_id =
+        boatramp_storage::tenant_provision::quote_ident(ExternalSqlKind::Postgres, &ts.renamed_db);
+    admin
+        .run_script(&format!("DROP DATABASE IF EXISTS {db_id};"))
+        .await
+        .map_err(|e| format!("reap {}: {e}", ts.renamed_db))?;
+    if !ts.role.is_empty() {
+        let role_id =
+            boatramp_storage::tenant_provision::quote_ident(ExternalSqlKind::Postgres, &ts.role);
         admin
-            .run_script(&stmt)
+            .run_script(&format!("DROP ROLE IF EXISTS {role_id};"))
             .await
-            .map_err(|e| format!("reap {}: {e}", ts.renamed_db))?;
+            .map_err(|e| format!("reap role {}: {e}", ts.role))?;
     }
     // Now the credential can go (recovery is no longer possible), then the tombstone.
-    creds
-        .delete(&ts.project, &ts.cred_workload)
-        .await
-        .map_err(|e| format!("reap credential {}: {e}", ts.cred_workload))?;
+    if !ts.cred_workload.is_empty() {
+        creds
+            .delete(&ts.project, &ts.cred_workload)
+            .await
+            .map_err(|e| format!("reap credential {}: {e}", ts.cred_workload))?;
+    }
     tenant_tombstone::delete(kv, ts).await
 }
 
@@ -2483,8 +2542,9 @@ fn due_tombstones(all: Vec<Tombstone>, now: u64) -> Vec<Tombstone> {
 
 /// Select the tombstones due at wall-clock `now` and hard-drop each, best-effort
 /// (log-and-continue). Returns the number reaped. Split from the spawn loop with an
-/// explicit `now` so due-selection is unit-testable without a live clock.
-async fn reap_due(
+/// explicit `now` so due-selection is unit-testable (and live-gate-drivable) without a
+/// live clock — pass a far-future `now` to reap every tombstone regardless of its grace.
+pub async fn reap_due(
     deploy: &DeployStore,
     kv: &Arc<dyn KvStore>,
     envelope: &Arc<dyn KeyEnvelope>,
@@ -4173,6 +4233,7 @@ mod tests {
         assert!(!recovered, "recovering an absent tombstone is a no-op");
 
         // The reverse DDL a present tombstone would emit: RENAME back + LOGIN, in order.
+        use boatramp_storage::tenant_provision::recover_soft_deprovision_ddl;
         let ddl = recover_soft_deprovision_ddl("appdb__deleted_1", "appdb", "appdb_role");
         assert!(ddl[0].contains("RENAME TO \"appdb\""), "renames back");
         assert!(ddl[1].contains("LOGIN") && !ddl[1].contains("NOLOGIN"));

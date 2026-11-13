@@ -7647,12 +7647,19 @@ impl NodeProjectExport {
                                     .await
                                     .unwrap_or(true)
                             {
+                                // Left IN PLACE (not renamed) — deliberately NOT recorded in the KV
+                                // grace reaper here: the boot sweep lacks the (project,binding) context
+                                // to derive the tenant identity, and the clean path is that the next
+                                // `project sync` self-heal's step A renames this populated `__old_` to a
+                                // proper `__deleted_` tombstone AND writes its KV reaper record
+                                // (`clear_db_dataloss_safe`), unifying it into the tracked lifecycle.
+                                // Preserving-in-place loses nothing in the meantime (the data stays).
                                 tracing::warn!(
                                     database = %name,
                                     "startup sweep: a POPULATED `__old_` swap-aside may be the only \
                                      copy of tenant data (crash mid-swap) — PRESERVED in place, NOT \
-                                     dropped (a later sync self-heal / `db drop database --orphan` \
-                                     reconciles it)"
+                                     dropped (the next sync self-heal reconciles it to a tracked \
+                                     `__deleted_` tombstone; `db drop database --orphan` also clears it)"
                                 );
                                 continue;
                             }

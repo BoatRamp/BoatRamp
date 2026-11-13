@@ -7768,6 +7768,353 @@ async fn project_sync_startup_sweep_preserves_populated_old_live() {
     println!("PROJECT SYNC STARTUP SWEEP PRESERVES POPULATED OLD OK");
 }
 
+/// **Live SELF-HEAL tombstone — grace-REAPED + RECOVERABLE** (v0.59.7 — lifecycle unification;
+/// Tier-2 / nightly). The `__deleted_<ts>` tombstones the self-heal MINTS (`clear_db_dataloss_safe`)
+/// must join the SAME KV grace-reaper lifecycle as `deprovision_tenant`'s soft-delete tombstones —
+/// otherwise a self-heal-minted `__deleted_` db is never auto-reclaimed (unbounded disk growth) and
+/// `recover_tenant` can't restore it uniformly. This gate drives the REAL heal, then proves both ends
+/// of the lifecycle on real pg16:
+///   (a) the EXISTING reaper (`reap_due`) reclaims the self-heal tombstone once due — the DB is dropped
+///       AND its KV record deleted (superuser-owned: no derived role/cred is touched);
+///   (b) within the grace window `recover_tenant` restores it (renames it back to the live name once
+///       the name is freed), bringing the preserved rows back.
+///
+/// MUTATION WITNESS: omit the `tenant_tombstone::put` in `clear_db_dataloss_safe` → no KV record →
+/// `reap_due` never reclaims the tombstone (its DB survives) — RED. Emits
+/// `PROJECT SYNC SELF-HEAL TOMBSTONE REAPED+RECOVERED OK`.
+#[tokio::test]
+async fn project_sync_self_heal_tombstone_reaped_recovered_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_node::tenant_sql::{
+        SelfHealReport, provision_tenant, reap_due, recover_tenant, untangle_colliding_orphan_roles,
+    };
+    use boatramp_node::tenant_tombstone;
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (tombstone reaped+recovered gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (tombstone reaped+recovered gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BASE: &str = "shd";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shrp-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([16u8; 32]));
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("pre-seal su");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed replica");
+
+    let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+    let db_exists_q = |db: String| {
+        let (b, i, m) = (backend.clone(), image.clone(), maint.clone());
+        async move {
+            let (_c, o) = psql(
+                b.as_ref(),
+                &i,
+                &m,
+                &format!("SELECT 1 FROM pg_database WHERE datname='{db}'"),
+            )
+            .await;
+            o.trim().to_string()
+        }
+    };
+
+    // Mint a self-heal tombstone for `dest` (populated orphan + an empty `__old_` trigger), returning
+    // (dest_db, tombstone_name). Shared by both sub-scenarios.
+    let mint = |dest: String, seedval: &str| {
+        let (backend, image, su, supw, host, maint, deploy, kv, envelope, binding) = (
+            backend.clone(),
+            image.clone(),
+            superuser.clone(),
+            su_pw.clone(),
+            host.clone(),
+            maint.clone(),
+            deploy.clone(),
+            kv.clone(),
+            envelope.clone(),
+            binding.clone(),
+        );
+        let seedval = seedval.to_string();
+        async move {
+            let ident = sanitize_ident(&dest);
+            let dest_db = tenant_db_name(BASE, &ident);
+            let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+            let login_role = tenant_role_name(COMPUTE, &ident);
+            let old_stray = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}7_8"));
+            for db in [&dest_db, &old_stray] {
+                let _ = psql(
+                    backend.as_ref(),
+                    &image,
+                    &maint,
+                    &format!("DROP DATABASE IF EXISTS \"{db}\""),
+                )
+                .await;
+            }
+            provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
+                .await
+                .unwrap_or_else(|e| panic!("provision {dest}: {e}"));
+            let (c, o) = psql(
+                backend.as_ref(),
+                &image,
+                &conn(&su, &supw, &host, port, &dest_db),
+                &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('{seedval}'); RESET ROLE;"),
+            )
+            .await;
+            assert_eq!(c, 0, "seed orphan: {o}");
+            let (c, o) = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("CREATE DATABASE \"{old_stray}\" OWNER \"{owner_role}\""),
+            )
+            .await;
+            assert_eq!(c, 0, "create __old_ trigger: {o}");
+            let report = untangle_colliding_orphan_roles(
+                &deploy, &kv, &envelope, &binding, &dest, false, false,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("self-heal {dest}: {e}"));
+            let preserved = match report {
+                SelfHealReport::Healed {
+                    preserved_tombstones,
+                    ..
+                } => preserved_tombstones,
+                other => panic!("expected Healed for {dest}, got {other:?}"),
+            };
+            assert_eq!(
+                preserved.len(),
+                1,
+                "exactly one minted tombstone for {dest}: {preserved:?}"
+            );
+            (
+                dest_db,
+                owner_role,
+                login_role,
+                preserved.into_iter().next().unwrap(),
+            )
+        }
+    };
+
+    // ===== (a) REAPER reclaims a self-heal tombstone once due =====
+    {
+        let dest = format!("shrp-reap-rrrrrrrrrrrrrrrrrrrr-{s}");
+        let (dest_db, owner_role, login_role, tomb) = mint(dest.clone(), "reap-keep").await;
+        // The KV grace record was written (the lifecycle-unification fix) — the reaper's input.
+        let rec = tenant_tombstone::get(&kv, &dest, &tomb)
+            .await
+            .expect("get tombstone record");
+        assert!(
+            rec.is_some(),
+            "a self-heal-minted tombstone MUST have a KV grace-reaper record (lifecycle unification)"
+        );
+        let rec = rec.unwrap();
+        assert!(
+            rec.role.is_empty() && rec.cred_workload.is_empty(),
+            "self-heal tombstone is superuser-owned: no derived role/cred"
+        );
+        assert_eq!(
+            db_exists_q(tomb.clone()).await,
+            "1",
+            "the tombstone db exists before reaping"
+        );
+
+        // Drive the REAL reaper with a far-future `now` so the tombstone is due regardless of grace.
+        let reaped = reap_due(&deploy, &kv, &envelope, u64::MAX).await;
+        assert!(
+            reaped >= 1,
+            "the reaper must reclaim at least the self-heal tombstone"
+        );
+
+        // (MUTATION WITNESS) with the KV record written, the reaper DROPPED the tombstone db + deleted
+        // the record. Omitting the `tenant_tombstone::put` → no record → reaper never reclaims (RED).
+        assert_eq!(
+            db_exists_q(tomb.clone()).await,
+            "",
+            "the reaper MUST drop the self-heal tombstone db once due"
+        );
+        assert!(
+            tenant_tombstone::get(&kv, &dest, &tomb)
+                .await
+                .expect("re-get")
+                .is_none(),
+            "the reaper must delete the KV tombstone record"
+        );
+        // The reaper NEVER touched the reprovisioned LIVE tenant (its db + roles survive).
+        assert_eq!(
+            db_exists_q(dest_db.clone()).await,
+            "1",
+            "the live tenant db must survive the reap"
+        );
+        let (_c, roles) = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!(
+                "SELECT count(*) FROM pg_roles WHERE rolname IN ('{owner_role}','{login_role}')"
+            ),
+        )
+        .await;
+        assert_eq!(
+            roles.trim(),
+            "2",
+            "the live tenant's derived roles must survive the reap (empty-field skip)"
+        );
+
+        for db in [&dest_db, &tomb] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            )
+            .await;
+        }
+        for r in [&owner_role, &login_role] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP ROLE IF EXISTS \"{r}\""),
+            )
+            .await;
+        }
+    }
+
+    // ===== (b) recover_tenant restores a self-heal tombstone within the grace window =====
+    {
+        let dest = format!("shrp-rec-ssssssssssssssssssss-{s}");
+        let (dest_db, owner_role, login_role, tomb) = mint(dest.clone(), "recover-me").await;
+        // Free the derived name (an operator clearing the post-sync data before recovering the pre-sync
+        // copy): recover renames the tombstone back onto it.
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE \"{dest_db}\""),
+        )
+        .await;
+        let recovered = recover_tenant(&deploy, &kv, &envelope, &dest, &tomb)
+            .await
+            .unwrap_or_else(|e| panic!("recover_tenant: {e}"));
+        assert!(
+            recovered,
+            "recover_tenant must restore a present self-heal tombstone"
+        );
+        // The preserved rows are back at the live name, and the KV record is consumed.
+        let (_c, rows) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &dest_db),
+            "SELECT v FROM precious",
+        )
+        .await;
+        assert_eq!(
+            rows.trim(),
+            "recover-me",
+            "recover_tenant must bring the preserved rows back to the live name"
+        );
+        assert!(
+            tenant_tombstone::get(&kv, &dest, &tomb)
+                .await
+                .expect("re-get")
+                .is_none(),
+            "recover_tenant must consume (delete) the KV tombstone record"
+        );
+
+        for db in [&dest_db, &tomb] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            )
+            .await;
+        }
+        for r in [&owner_role, &login_role] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP ROLE IF EXISTS \"{r}\""),
+            )
+            .await;
+        }
+    }
+
+    println!("PROJECT SYNC SELF-HEAL TOMBSTONE REAPED+RECOVERED OK");
+}
+
 /// **Live CROSS-NODE TENANCY-MISMATCH fail-closed gate (I2 — DATA-LOSS corner)** (Tier-2 / nightly —
 /// needs a Docker daemon AND real Postgres). A cross-node `project sync` whose SOURCE framed the
 /// managed member as Single/dedicated (the CHUNKED streamed-shadow path) while the TARGET binding

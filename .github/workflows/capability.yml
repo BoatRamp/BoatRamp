@@ -592,6 +592,8 @@ jobs:
             || { echo "::error::sync self-heal drop-soft-deleted keeps-orphan gate never reached its marker (silent skip, or --drop-soft-deleted HARD-DROPPED the populated live orphan — FINDING 3)" >&2; exit 1; }
           grep -q 'PROJECT SYNC STARTUP SWEEP PRESERVES POPULATED OLD OK' project-export.log \
             || { echo "::error::startup-sweep preserve gate never reached its marker (silent skip, or the boot sweep HARD-DROPPED a populated __old_ — FINDING 1 via the sweep)" >&2; exit 1; }
+          grep -q 'PROJECT SYNC SELF-HEAL TOMBSTONE REAPED+RECOVERED OK' project-export.log \
+            || { echo "::error::self-heal tombstone reaped+recovered gate never reached its marker (silent skip, or a self-heal-minted __deleted_ was NOT registered with the grace reaper)" >&2; exit 1; }
           # CROSS-NODE TENANCY-MISMATCH fail-closed (v0.59.6, I2 DATA-LOSS corner): a Single/dedicated-
           # framed (chunked) managed member applied into a SHARED tenant cell is REFUSED fail-closed, so
           # a populated Shared occupant is NEVER clobbered. Self-skip trap → marker.
