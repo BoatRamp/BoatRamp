@@ -93,14 +93,11 @@ The selectable pieces:
 | content-addressed blobs | `blobs` | carried (integrity/delta) |
 | site configs | `sites` | carried; the `domains` field is **rewritten** (see below) |
 | domain layer (domains field + verification/alias records) | `domains` | carried if included, else the target's are preserved |
-| imperative project settings | `settings` | carried¹ |
+| imperative project settings | `settings` | carried |
 | declarative managed-database bindings | `databases` | carried |
-| GraphQL registry + APQ safelist | `graphql` | carried¹ |
-| runtime deploy history / current pointers | `history` | carried¹ |
+| GraphQL registry + APQ safelist | `graphql` | carried |
+| runtime deploy history / current pointers | `history` | carried |
 | KEK-sealed secrets | `secrets` | dropped under `--identity fresh`; the target re-provisions its own |
-
-¹ `settings`, `graphql`, and `history` are **not carried over the CLI yet** — see
-[Known limitations](#known-limitations).
 
 **Excluded pieces are preserved verbatim.** `sync` never reads, writes, or prunes an excluded
 piece on the target. This is what makes the staging pattern safe: `--exclude-domains` carries
@@ -181,18 +178,32 @@ By default `sync` converges every coherent item and *reports* the incoherent one
 skipped count CI can gate on). Pass **`--strict`** to flip skip → refuse-the-whole-run for
 automation that wants all-or-nothing.
 
+## Self-heal a prior-failed managed-DB sync
+
+If a previous `project sync --apply` into a Shared-Postgres tenant failed partway, it can leave a
+role "tangle" — the tenant's derived roles still owning a stray orphan database, grace tombstones,
+and non-DB objects. A subsequent `--apply` now **self-heals** that tangle with zero operator
+intervention (no `db drop --orphan`, no manual SQL): it reconciles the derived roles, clears the
+orphan data-loss-safely, and reprovisions the tenant fresh so the restore lands clean. A healthy
+re-sync is unaffected — the heal fires only on a detected tangle.
+
+By default the heal **preserves** any `__deleted_` grace tombstone: it reassigns the tombstone to
+the stable superuser so its grace-recoverable data survives while the derived roles drop cleanly,
+and the tombstone is reclaimed on the normal grace schedule (`deprovision_grace_secs`, floored to
+the 7-day default for a crash-recovery tombstone so a failed restore stays recoverable). Pass
+**`--drop-soft-deleted`** to instead **destroy** those tombstones — a deliberate data-loss opt-in
+that has no effect on a healthy sync.
+
 ## Known limitations
 
 - **`pg` and `blobs` travel together.** The data-only transport carries managed-DB contents
   and blobs as one unit, so a `pg`-only or `blobs`-only selection is **refused** (it would
   carry the excluded half) — include or exclude **both**.
-- **`settings`, `graphql`, and `history` cannot be carried over the CLI yet.** There is no
-  per-key admin KV API and the whole-slice clone is not piece-selective. A dry-run shows these
-  pieces honestly as "NOT carried"; an `--apply` that includes one is **refused up front**
-  (fail-fast — never a half-sync). Carry them with a full
-  [`project import --clone-from`](./clone-project.md#streaming-clone-pull-from-a-live-source-node),
-  or exclude them and let the target's own `apply` bring them. A node-side selective-sync
-  endpoint is the planned follow-up.
+- **`settings`, `graphql`, and `history` carry over the CLI (since v0.58.0).** The node-side
+  selective-sync KV endpoint (`GET`/`POST /api/project-kv-stratum`) lands each slice
+  record-by-record, reporting any entries it skips; a dry-run shows them as "carried". (By
+  contrast `pg`/`blobs` travel as the single data unit above, and `secrets` re-provision on the
+  target — those three are not individually CLI-carryable.)
 - **A cross-node managed-DB sync needs v0.59.1+ at both ends.** The `managed_restore` wire field
   that selects the safe shadow+swap restore is **silently ignored by a pre-0.59.1 node**, which
   falls back to the old coupling and refuses the managed member as before. The degradation is

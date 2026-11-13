@@ -985,7 +985,8 @@ restarts. There is deliberately **no `db create`**: the manifest is the sole aut
 surface (a create verb would compete as a second source of truth). The read verbs
 (`ls`/`get`/`status`) are `Project·Read`; the provisioning verbs (`ensure database`,
 `ensure user`, `drop user`) re-run an idempotent action against an **already-declared**
-database and gate at `Project·Admin`. Takes the common `--server` flag.
+database and gate at `Project·Admin`. The separate **destructive** `drop database` (see the
+table) tears one down. Takes the common `--server` flag.
 
 | Sub-action | Description |
 | --- | --- |
@@ -995,6 +996,7 @@ database and gate at `Project·Admin`. Takes the common `--server` flag.
 | `ensure database <name>` | Idempotently (re-)provision an already-declared database — e.g. force the default-project database setup to run now rather than waiting for the first binding. `Project·Admin`. |
 | `ensure user <name> <user>` | Idempotently provision a login role `<user>` on the managed database `<name>`. By default the host mints + seals the password; `--password-secret <secret>` binds a **bring-your-own** password from a sealed secret instead. On a shared cluster the role name is per-tenant-qualified so it can't collide across tenants. `Project·Admin`. |
 | `drop user <name> <user>` | Drop the login role `<user>` on `<name>` (idempotent — absent is still success). `Project·Admin`. |
+| `drop database <name> -y [--orphan]` | **Destructive** teardown of a managed database (requires `-y`). `--orphan` drops an **undeclared** orphan database left by a prior failed sync/`rm` (one the manifest no longer declares) — the imperative escape hatch when you deliberately want to clear a broken tenant by hand rather than let a re-`sync` self-heal it. `Project·Admin`. |
 | `restart [--db <name>]` | Restart a **dedicated, project-scoped** managed database — stop its replica so the reconcile loop relaunches it fresh (same data volume), applying any **pending** restart-requiring config change (e.g. a flipped `delta_capture`) in the process. `--db` defaults to `default`. A shared-tenant/site-scoped/BYO binding is refused. Prints the workload, whether a pending change was applied, and replicas stopped. `Project·Admin`. |
 
 The global `--output-format json` emits the raw record instead of the human table.

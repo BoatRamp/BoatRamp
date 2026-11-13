@@ -196,7 +196,8 @@ role name is per-tenant-qualified, so the same `<user>` in two tenants can't col
 These are `Project·Admin`.
 
 To declare, change, or tear down a database itself, edit the manifest and `apply` (or
-use the imperative teardown verb) — not this command.
+use the imperative teardown verb `boatramp db drop database <name> -y`, with `--orphan`
+for an undeclared orphan left by a prior failed sync/`rm`) — not this command.
 
 ### Restart a managed database (and apply a pending config change)
 
