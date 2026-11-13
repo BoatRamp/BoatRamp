@@ -1277,7 +1277,7 @@
                 # docker usable for the ephemeral client containers) — a self-skip still prints
                 # `ok`, so require the exact passed count AND every success marker, exactly like
                 # the host-runner job's grep gate.
-                assert re.search(r"test result: ok\. 38 passed", out), "not all 38 tests ran (silent skip?)"
+                assert re.search(r"test result: ok\. 41 passed", out), "not all 41 tests ran (silent skip?)"
                 for marker in [
                     "PROJECT EXPORT ROUNDTRIP OK",
                     "PROJECT EXPORT PG CHUNKED SHADOW OK",
@@ -1309,6 +1309,9 @@
                     "PROJECT SYNC SELF-HEAL DROP-SOFT-DELETED KEEPS ORPHAN OK",
                     "PROJECT SYNC STARTUP SWEEP PRESERVES POPULATED OLD OK",
                     "PROJECT SYNC SELF-HEAL TOMBSTONE REAPED+RECOVERED OK",
+                    "PROJECT SYNC SELF-HEAL TOMBSTONE CONFIGURED GRACE OK",
+                    "PROJECT SYNC SELF-HEAL RECOVER OCCUPIED CLEAR OK",
+                    "PROJECT SYNC BOOT-PRESERVED OLD TRACKED NEXT SYNC OK",
                     "PROJECT SYNC TENANCY MISMATCH FAIL-CLOSED OK",
                     "PROJECT SYNC DELTA TENANCY MISMATCH FAIL-CLOSED OK",
                     "PROJECT SYNC MYSQL DELTA TENANCY MISMATCH REFUSED OK",

@@ -405,24 +405,25 @@ jobs:
           docker rm -f brexport-pg >/dev/null 2>&1 || true
           docker rm -f brexport-mysql >/dev/null 2>&1 || true
 
-          # HARD gate: the file's 36 live/always-on tests (incl. the v0.59.1 managed-pg
+          # HARD gate: the file's 39 live/always-on tests (incl. the v0.59.1 managed-pg
           # `project_sync_managed_pg_shadow_land_live` gate + the v0.59.2 Shared rls_session
           # force-RLS REPLICATE gate + the idempotency/orphan-recovery gate + the undeclared-orphan
           # reconcile gate + the orphan-drop owning-roles/role-sharing-guard gate + the v0.59.6
           # colliding-orphan role-untangle gate + the v0.59.7 self-heal-tangle gate + the v0.59.7
           # self-heal restore-FAILURE recoverability gate + the 3 v0.59.7 Security-finding gates
           # (absent-primary recoverable · drop-soft-deleted keeps-orphan · startup-sweep preserve ·
-          # tombstone reaped+recovered) + the cross-node tenancy-mismatch fail-closed gate +
+          # tombstone reaped+recovered · configured-grace · recover-occupied-clear · boot-preserved-
+          # tracked-next-sync) + the cross-node tenancy-mismatch fail-closed gate +
           # the DELTA-path tenancy-mismatch fail-closed gate + the mysql binlog-delta mismatch-refused
-          # gate) + the 2 pure-unit tests (URL-parser, WAL-render-inertness) = 38 must ALL
+          # gate) + the 2 pure-unit tests (URL-parser, WAL-render-inertness) = 41 must ALL
           # actually run (both live DBs reachable, docker usable
           # for the ephemeral client containers) — a self-skip (unset env / unreachable docker) still
           # prints `test result: ok`, so require the exact passed-count AND every one of the file's
           # success markers below. (The libsql true-delta + its CHAIN gate are
           # `#[cfg(feature = "sql-delta-libsql")]`, NOT compiled in this `--features project-export`
           # build, so they are NOT in this count — they gate in capability.yml.)
-          grep -qE 'test result: ok\. 38 passed' project-export-live.log \
-            || { echo "::error::project export/import live suite did not pass all 38 tests (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 41 passed' project-export-live.log \
+            || { echo "::error::project export/import live suite did not pass all 41 tests (silent skip or failure?)" >&2; exit 1; }
 
           # --- live pg (needs BOATRAMP_TEST_PG_URL + docker) ---
           grep -q 'PROJECT EXPORT ROUNDTRIP OK' project-export-live.log \
@@ -534,6 +535,16 @@ jobs:
           # `recover_tenant` restores it within the window.
           grep -q 'PROJECT SYNC SELF-HEAL TOMBSTONE REAPED+RECOVERED OK' project-export-live.log \
             || { echo "::error::self-heal tombstone reaped+recovered gate never reached its marker (silent skip, or a self-heal-minted __deleted_ was NOT registered with the grace reaper — unbounded disk growth / non-uniform recovery)" >&2; exit 1; }
+          # SELF-HEAL tombstone CONFIGURED grace (v0.59.7 OBS 1): a self-heal tombstone's reaper window
+          # = the operator-configured deprovision_grace_secs, not the hardcoded 7-day default.
+          grep -q 'PROJECT SYNC SELF-HEAL TOMBSTONE CONFIGURED GRACE OK' project-export-live.log \
+            || { echo "::error::self-heal configured-grace gate never reached its marker (silent skip, or a self-heal tombstone used the hardcoded default grace instead of the configured one — OBS 1)" >&2; exit 1; }
+          # SELF-HEAL recover on an OCCUPIED name fails CLEARLY + fail-closed (v0.59.7 OBS 2).
+          grep -q 'PROJECT SYNC SELF-HEAL RECOVER OCCUPIED CLEAR OK' project-export-live.log \
+            || { echo "::error::self-heal recover-occupied gate never reached its marker (silent skip, or the occupied-name recover returned an opaque error / clobbered the live db — OBS 2)" >&2; exit 1; }
+          # BOOT-preserved populated __old_ TRACKED on the next sync + grace-reaped (v0.59.7 OBS 3b).
+          grep -q 'PROJECT SYNC BOOT-PRESERVED OLD TRACKED NEXT SYNC OK' project-export-live.log \
+            || { echo "::error::boot-preserved-tracked gate never reached its marker (silent skip, or a boot-preserved populated __old_ was NOT converted to a tracked+reaped tombstone by the next sync — OBS 3)" >&2; exit 1; }
           # CROSS-NODE TENANCY-MISMATCH fail-closed (v0.59.6, I2 DATA-LOSS corner): a Single/dedicated-
           # framed (chunked) managed member applied into a SHARED tenant cell is REFUSED fail-closed,
           # so a populated Shared occupant is NEVER clobbered (zero foreign bytes). Self-skip → marker.

@@ -1184,6 +1184,18 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
                 .serve
                 .as_ref()
                 .and_then(|s| s.resumable_export_dir.clone()),
+        )
+        // Security OBS 1: the managed-pg self-heal stamps the OPERATOR-configured deprovision grace
+        // (same config the deprovisioner reads, same default) onto any KV grace tombstone it mints,
+        // so a self-heal tombstone's reaper window matches the operator's deprovision soft-delete
+        // window rather than the hardcoded default.
+        .with_deprovision_grace(
+            config
+                .handlers
+                .as_ref()
+                .and_then(|h| h.bindings.sql.as_ref())
+                .and_then(|sql| sql.deprovision_grace_secs)
+                .unwrap_or(crate::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS),
         );
         // Operator digest-pin / override for the ephemeral SQL-client images (the `pg_dump`/
         // `mysqldump`/`psql` one-shots), so a `pgvector/pgvector:pg16@sha256:<hex>` ref can be

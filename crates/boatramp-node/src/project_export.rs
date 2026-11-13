@@ -801,6 +801,11 @@ pub struct NodeProjectExport {
     /// shadow while it exists and prove a sibling can never CONNECT to it. The hold is a plain
     /// `tokio::time::sleep` that owns no DB connection; it changes no DDL and no statement order.
     shadow_restore_test_delay_ms: u64,
+    /// The operator-configured soft-delete grace window (`handlers.bindings.sql.deprovision_grace_secs`,
+    /// default [`DEFAULT_DEPROVISION_GRACE_SECS`](crate::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS))
+    /// stamped onto a KV grace tombstone the managed-pg self-heal mints for a preserved populated
+    /// orphan/`__old_` (Security OBS 1 — matches the deprovision soft-delete window, not a hardcode).
+    deprovision_grace_secs: u64,
 }
 
 impl NodeProjectExport {
@@ -836,7 +841,20 @@ impl NodeProjectExport {
             trusted_extensions: Vec::new(),
             resumable_base: None,
             shadow_restore_test_delay_ms: 0,
+            deprovision_grace_secs: crate::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS,
         }
+    }
+
+    /// Set the soft-delete grace window (`handlers.bindings.sql.deprovision_grace_secs`, default
+    /// [`DEFAULT_DEPROVISION_GRACE_SECS`](crate::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS)) the
+    /// managed-pg self-heal stamps onto a KV grace tombstone it mints for a preserved populated
+    /// orphan/`__old_` — so a self-heal tombstone's reaper window matches the operator's configured
+    /// deprovision grace rather than the hardcoded default (Security OBS 1). Threaded from the node
+    /// wiring, which reads the same config the deprovisioner does.
+    #[must_use]
+    pub fn with_deprovision_grace(mut self, secs: u64) -> Self {
+        self.deprovision_grace_secs = secs;
+        self
     }
 
     /// TEST-ONLY: hold the SHARED pg shadow in existence for `ms` milliseconds inside
@@ -6001,6 +6019,7 @@ impl NodeProjectExport {
                 project,
                 fresh_dest,
                 drop_soft_deleted,
+                self.deprovision_grace_secs,
             )
             .await
             .map_err(|e| {

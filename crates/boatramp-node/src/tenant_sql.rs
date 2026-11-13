@@ -1555,6 +1555,7 @@ async fn clear_db_dataloss_safe(
     compute: &str,
     superuser: &str,
     project: &str,
+    grace_secs: u64,
     derived_primary: &str,
     db: &str,
 ) -> Result<DbClear, String> {
@@ -1588,8 +1589,10 @@ async fn clear_db_dataloss_safe(
     // Unify the tombstone lifecycle: register this self-heal-minted `__deleted_` with the EXISTING KV
     // grace reaper (the ONLY other minter is `deprovision_tenant`). Same record shape + helper; the
     // reaper reclaims it once `delete_after` passes and `recover_tenant` restores it uniformly. The
-    // grace is the deprovision DEFAULT window; role + cred_workload are EMPTY (superuser-owned — no
-    // dedicated role/cred to drop; the derived roles + creds are the reprovisioned LIVE tenant's).
+    // grace is the OPERATOR-CONFIGURED `deprovision_grace_secs` (threaded in — NOT the hardcoded
+    // default; Security OBS 1), matching the deprovision soft-delete window. role + cred_workload are
+    // EMPTY (superuser-owned — no dedicated role/cred to drop; the derived roles + creds are the
+    // reprovisioned LIVE tenant's).
     let record = tenant_tombstone::Tombstone {
         version: 1,
         project: project.to_string(),
@@ -1601,7 +1604,7 @@ async fn clear_db_dataloss_safe(
         superuser: superuser.to_string(),
         cred_workload: String::new(),
         deleted_at: ts,
-        delete_after: ts.saturating_add(DEFAULT_DEPROVISION_GRACE_SECS),
+        delete_after: ts.saturating_add(grace_secs),
     };
     tenant_tombstone::put(kv, &record).await?;
     Ok(DbClear::Preserved(tombstone))
@@ -1945,6 +1948,7 @@ pub enum SelfHealReport {
 /// reconciled later by [`hard_drop_orphan_tenant`] / the grace reaper. A clean no-op /
 /// [`NotApplicable`](SelfHealReport::NotApplicable) for any binding that is not an applicable
 /// Shared-Postgres non-default managed tenant.
+#[allow(clippy::too_many_arguments)]
 pub async fn untangle_colliding_orphan_roles(
     deploy: &DeployStore,
     kv: &Arc<dyn KvStore>,
@@ -1953,6 +1957,7 @@ pub async fn untangle_colliding_orphan_roles(
     project: &str,
     fresh_dest: bool,
     drop_soft_deleted: bool,
+    grace_secs: u64,
 ) -> Result<SelfHealReport, String> {
     let Some(compute) = binding.compute.as_deref().filter(|c| !c.is_empty()) else {
         return Ok(SelfHealReport::NotApplicable);
@@ -2043,6 +2048,7 @@ pub async fn untangle_colliding_orphan_roles(
                 compute,
                 superuser,
                 project,
+                grace_secs,
                 &names.database,
                 aside,
             )
@@ -2090,6 +2096,7 @@ pub async fn untangle_colliding_orphan_roles(
         compute,
         superuser,
         project,
+        grace_secs,
         &names.database,
         &names.database,
     )
@@ -2287,7 +2294,25 @@ pub async fn recover_tenant(
             "ALTER DATABASE {renamed_id} RENAME TO {original_id};"
         ))
         .await
-        .map_err(|e| format!("recover {}: {e}", ts.original_db))?;
+        .map_err(|e| {
+            // FAIL-CLOSED + ACTIONABLE (Security OBS 2): the commonest recover failure is the live
+            // name being OCCUPIED — a self-heal already reprovisioned a live tenant there (the sync
+            // that replaced the orphan landed). The rename refuses rather than clobber; surface a
+            // clear, actionable message (the raw Postgres `database "…" already exists` is opaque)
+            // naming WHERE the data still lives. The tombstone + its data are UNTOUCHED (no clobber).
+            if is_database_exists_error(&e) {
+                format!(
+                    "cannot auto-recover {renamed}: the live database {live:?} is OCCUPIED (a \
+                     reprovisioned tenant already landed there), so recovery will not clobber it. The \
+                     preserved data remains recoverable at {renamed:?} — drop/rename the live database \
+                     first and retry, or dump {renamed:?} directly.",
+                    renamed = ts.renamed_db,
+                    live = ts.original_db,
+                )
+            } else {
+                format!("recover {}: {e}", ts.original_db)
+            }
+        })?;
     if !ts.role.is_empty() {
         let role_id =
             boatramp_storage::tenant_provision::quote_ident(ExternalSqlKind::Postgres, &ts.role);

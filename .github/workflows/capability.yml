@@ -594,6 +594,12 @@ jobs:
             || { echo "::error::startup-sweep preserve gate never reached its marker (silent skip, or the boot sweep HARD-DROPPED a populated __old_ — FINDING 1 via the sweep)" >&2; exit 1; }
           grep -q 'PROJECT SYNC SELF-HEAL TOMBSTONE REAPED+RECOVERED OK' project-export.log \
             || { echo "::error::self-heal tombstone reaped+recovered gate never reached its marker (silent skip, or a self-heal-minted __deleted_ was NOT registered with the grace reaper)" >&2; exit 1; }
+          grep -q 'PROJECT SYNC SELF-HEAL TOMBSTONE CONFIGURED GRACE OK' project-export.log \
+            || { echo "::error::self-heal configured-grace gate never reached its marker (silent skip, or a self-heal tombstone used the hardcoded default grace — OBS 1)" >&2; exit 1; }
+          grep -q 'PROJECT SYNC SELF-HEAL RECOVER OCCUPIED CLEAR OK' project-export.log \
+            || { echo "::error::self-heal recover-occupied gate never reached its marker (silent skip, or the occupied-name recover returned an opaque error / clobbered — OBS 2)" >&2; exit 1; }
+          grep -q 'PROJECT SYNC BOOT-PRESERVED OLD TRACKED NEXT SYNC OK' project-export.log \
+            || { echo "::error::boot-preserved-tracked gate never reached its marker (silent skip, or a boot-preserved populated __old_ was NOT tracked+reaped by the next sync — OBS 3)" >&2; exit 1; }
           # CROSS-NODE TENANCY-MISMATCH fail-closed (v0.59.6, I2 DATA-LOSS corner): a Single/dedicated-
           # framed (chunked) managed member applied into a SHARED tenant cell is REFUSED fail-closed, so
           # a populated Shared occupant is NEVER clobbered. Self-skip trap → marker.

@@ -6959,10 +6959,18 @@ async fn project_sync_self_heal_restore_failure_recoverable_live() {
 
     // DRIVE THE REAL HEAL, then STOP (the restore does NOT follow — the exact "restore failed after
     // the heal" window). Existing-dest (fresh_dest=false), default preserve (drop_soft_deleted=false).
-    let report =
-        untangle_colliding_orphan_roles(&deploy, &kv, &envelope, &binding, &dest, false, false)
-            .await
-            .unwrap_or_else(|e| panic!("self-heal MUST succeed: {e}"));
+    let report = untangle_colliding_orphan_roles(
+        &deploy,
+        &kv,
+        &envelope,
+        &binding,
+        &dest,
+        false,
+        false,
+        boatramp_node::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("self-heal MUST succeed: {e}"));
     let preserved = match report {
         SelfHealReport::Healed {
             preserved_tombstones,
@@ -7249,12 +7257,18 @@ async fn project_sync_self_heal_absent_primary_recoverable_live() {
     .await;
 
     // DRIVE THE REAL HEAL — must NOT abort on the absent primary.
-    let report =
-        untangle_colliding_orphan_roles(&deploy, &kv, &envelope, &binding, &dest, false, false)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("self-heal MUST NOT abort on an absent primary (FINDING 2): {e}")
-            });
+    let report = untangle_colliding_orphan_roles(
+        &deploy,
+        &kv,
+        &envelope,
+        &binding,
+        &dest,
+        false,
+        false,
+        boatramp_node::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("self-heal MUST NOT abort on an absent primary (FINDING 2): {e}"));
     let preserved = match report {
         SelfHealReport::Healed {
             preserved_tombstones,
@@ -7485,10 +7499,18 @@ async fn project_sync_self_heal_drop_soft_deleted_keeps_orphan_live() {
     assert_eq!(c, 0, "create __old_ stray: {o}");
 
     // DRIVE THE REAL HEAL with `--drop-soft-deleted` SET.
-    let report =
-        untangle_colliding_orphan_roles(&deploy, &kv, &envelope, &binding, &dest, false, true)
-            .await
-            .unwrap_or_else(|e| panic!("self-heal (drop-soft-deleted) MUST succeed: {e}"));
+    let report = untangle_colliding_orphan_roles(
+        &deploy,
+        &kv,
+        &envelope,
+        &binding,
+        &dest,
+        false,
+        true,
+        boatramp_node::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("self-heal (drop-soft-deleted) MUST succeed: {e}"));
     let preserved = match report {
         SelfHealReport::Healed {
             preserved_tombstones,
@@ -7941,7 +7963,14 @@ async fn project_sync_self_heal_tombstone_reaped_recovered_live() {
             .await;
             assert_eq!(c, 0, "create __old_ trigger: {o}");
             let report = untangle_colliding_orphan_roles(
-                &deploy, &kv, &envelope, &binding, &dest, false, false,
+                &deploy,
+                &kv,
+                &envelope,
+                &binding,
+                &dest,
+                false,
+                false,
+                boatramp_node::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS,
             )
             .await
             .unwrap_or_else(|e| panic!("self-heal {dest}: {e}"));
@@ -8113,6 +8142,693 @@ async fn project_sync_self_heal_tombstone_reaped_recovered_live() {
     }
 
     println!("PROJECT SYNC SELF-HEAL TOMBSTONE REAPED+RECOVERED OK");
+}
+
+/// **Live SELF-HEAL tombstone honours the CONFIGURED grace** (v0.59.7 — Security OBS 1; Tier-2 /
+/// nightly). A self-heal-minted `__deleted_` tombstone's KV grace record must use the operator's
+/// configured `deprovision_grace_secs`, not the hardcoded 7-day default — so its reaper window matches
+/// the deprovision soft-delete window. This gate drives the REAL heal with a NON-default grace and
+/// asserts the minted record's `delete_after - deleted_at` equals exactly that configured value.
+/// MUTATION WITNESS: reverting to the `DEFAULT_DEPROVISION_GRACE_SECS` constant → the delta is 7 days,
+/// not the configured grace → RED. Emits `PROJECT SYNC SELF-HEAL TOMBSTONE CONFIGURED GRACE OK`.
+#[tokio::test]
+async fn project_sync_self_heal_tombstone_configured_grace_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_node::tenant_sql::{
+        DEFAULT_DEPROVISION_GRACE_SECS, SelfHealReport, provision_tenant,
+        untangle_colliding_orphan_roles,
+    };
+    use boatramp_node::tenant_tombstone;
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (configured-grace gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (configured-grace gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BASE: &str = "shd";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shg1-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([17u8; 32]));
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("pre-seal su");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed replica");
+
+    let dest = format!("shg1-cfggrace-gggggggggggggggggg-{s}");
+    let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+    let ident = sanitize_ident(&dest);
+    let dest_db = tenant_db_name(BASE, &ident);
+    let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+    let login_role = tenant_role_name(COMPUTE, &ident);
+    let old_stray = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}1_2"));
+
+    for db in [&dest_db, &old_stray] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision: {e}"));
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &dest_db),
+        &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('g'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed orphan: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{old_stray}\" OWNER \"{owner_role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create __old_ trigger: {o}");
+
+    // A NON-default configured grace (1 hour) — distinct from the 7-day default.
+    const CONFIGURED_GRACE: u64 = 3600;
+    assert_ne!(
+        CONFIGURED_GRACE, DEFAULT_DEPROVISION_GRACE_SECS,
+        "fixture must differ from the default"
+    );
+    let report = untangle_colliding_orphan_roles(
+        &deploy,
+        &kv,
+        &envelope,
+        &binding,
+        &dest,
+        false,
+        false,
+        CONFIGURED_GRACE,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("self-heal: {e}"));
+    let tomb = match report {
+        SelfHealReport::Healed {
+            preserved_tombstones,
+            ..
+        } => {
+            assert_eq!(preserved_tombstones.len(), 1, "one minted tombstone");
+            preserved_tombstones.into_iter().next().unwrap()
+        }
+        other => panic!("expected Healed, got {other:?}"),
+    };
+    let rec = tenant_tombstone::get(&kv, &dest, &tomb)
+        .await
+        .expect("get")
+        .expect("record present");
+    // MUTATION WITNESS: the grace window reflects the CONFIGURED value, not the 7-day constant.
+    assert_eq!(
+        rec.delete_after - rec.deleted_at,
+        CONFIGURED_GRACE,
+        "the self-heal tombstone's grace window MUST be the OPERATOR-configured grace ({CONFIGURED_GRACE}s), \
+         not the {DEFAULT_DEPROVISION_GRACE_SECS}s default (Security OBS 1)"
+    );
+
+    for db in [&dest_db, &old_stray, &tomb] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    for r in [&owner_role, &login_role] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP ROLE IF EXISTS \"{r}\""),
+        )
+        .await;
+    }
+    println!("PROJECT SYNC SELF-HEAL TOMBSTONE CONFIGURED GRACE OK");
+}
+
+/// **Live SELF-HEAL recover on an OCCUPIED live name fails CLEARLY + fail-closed** (v0.59.7 — Security
+/// OBS 2; Tier-2 / nightly). After a self-heal lands, the live name is OCCUPIED by the reprovisioned
+/// tenant, so `recover_tenant` of the preserved tombstone cannot rename back — it must REFUSE (never
+/// clobber the live db) with a CLEAR, actionable message (not a raw Postgres `already exists`). This
+/// gate drives the real heal to mint a tombstone, then calls `recover_tenant` against the occupied
+/// name and asserts (1) a clear error naming where the data still lives, and (2) the tombstone data
+/// SURVIVES untouched (fail-closed). MUTATION WITNESS: reverting the error wrap → the raw opaque PG
+/// error (no "cannot auto-recover") → RED. Emits `PROJECT SYNC SELF-HEAL RECOVER OCCUPIED CLEAR OK`.
+#[tokio::test]
+async fn project_sync_self_heal_recover_occupied_clear_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_node::tenant_sql::{
+        DEFAULT_DEPROVISION_GRACE_SECS, SelfHealReport, provision_tenant, recover_tenant,
+        untangle_colliding_orphan_roles,
+    };
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (recover-occupied gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (recover-occupied gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BASE: &str = "shd";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shg2-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([18u8; 32]));
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("pre-seal su");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed replica");
+
+    let dest = format!("shg2-recocc-hhhhhhhhhhhhhhhhhh-{s}");
+    let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+    let ident = sanitize_ident(&dest);
+    let dest_db = tenant_db_name(BASE, &ident);
+    let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+    let login_role = tenant_role_name(COMPUTE, &ident);
+    let old_stray = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}5_6"));
+
+    for db in [&dest_db, &old_stray] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision: {e}"));
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &dest_db),
+        &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('occ'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed orphan: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{old_stray}\" OWNER \"{owner_role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create __old_ trigger: {o}");
+
+    let report = untangle_colliding_orphan_roles(
+        &deploy,
+        &kv,
+        &envelope,
+        &binding,
+        &dest,
+        false,
+        false,
+        DEFAULT_DEPROVISION_GRACE_SECS,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("self-heal: {e}"));
+    let tomb = match report {
+        SelfHealReport::Healed {
+            preserved_tombstones,
+            ..
+        } => preserved_tombstones.into_iter().next().unwrap(),
+        other => panic!("expected Healed, got {other:?}"),
+    };
+    // The live name is now OCCUPIED (reprovisioned). recover_tenant must REFUSE with a clear message.
+    let err = recover_tenant(&deploy, &kv, &envelope, &dest, &tomb)
+        .await
+        .expect_err("recover MUST refuse an occupied live name (fail-closed)");
+    assert!(
+        err.contains("cannot auto-recover") && err.to_lowercase().contains("occupied"),
+        "the occupied-name recover error MUST be clear + actionable (Security OBS 2), got: {err}"
+    );
+    // FAIL-CLOSED: the tombstone + its data SURVIVE untouched (no clobber), and the live db is intact.
+    let (_c, rows) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &tomb),
+        "SELECT v FROM precious",
+    )
+    .await;
+    assert_eq!(
+        rows.trim(),
+        "occ",
+        "the preserved tombstone's data MUST survive the refused recover (fail-closed)"
+    );
+    let (_c, live) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{dest_db}'"),
+    )
+    .await;
+    assert_eq!(
+        live.trim(),
+        "1",
+        "the occupied live db is untouched by the refused recover"
+    );
+
+    for db in [&dest_db, &old_stray, &tomb] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    for r in [&owner_role, &login_role] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP ROLE IF EXISTS \"{r}\""),
+        )
+        .await;
+    }
+    println!("PROJECT SYNC SELF-HEAL RECOVER OCCUPIED CLEAR OK");
+}
+
+/// **Live boot-preserved populated `__old_` is TRACKED on the next sync** (v0.59.7 — Security OBS 3,
+/// approach (b); Tier-2 / nightly). The node-startup sweep PRESERVES a populated `__old_` in place but
+/// deliberately does NOT KV-track it (the global sweep cannot attribute a `LIKE`-found `__old_` to its
+/// owning project — the project is a non-reversible digest in the derived name — so a boot KV record's
+/// project key could not match the next sync's, and a reap-only record would have no recover path
+/// while risking reaping the only data copy; see `sweep_stale_sql_shadows`). This gate proves the
+/// reconciliation is nonetheless robust + bounded: a subsequent `project sync` self-heal CONVERTS the
+/// boot-preserved populated `__old_` into a TRACKED `__deleted_` grace tombstone (KV reaper record),
+/// which the grace reaper then reclaims. MUTATION WITNESS: omitting the KV `put` in
+/// `clear_db_dataloss_safe` → the converted tombstone is untracked → the reaper never reclaims it →
+/// RED. Emits `PROJECT SYNC BOOT-PRESERVED OLD TRACKED NEXT SYNC OK`.
+#[tokio::test]
+async fn project_sync_boot_preserved_old_tracked_next_sync_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::{
+        DEFAULT_DEPROVISION_GRACE_SECS, SelfHealReport, provision_tenant, reap_due,
+        untangle_colliding_orphan_roles,
+    };
+    use boatramp_node::tenant_tombstone;
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (boot-preserved tracked gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (boot-preserved tracked gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BASE: &str = "shd";
+    const BINDING: &str = "shbp";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shbp-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([19u8; 32]));
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("pre-seal su");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed replica");
+
+    let dest = format!("shbp-track-jjjjjjjjjjjjjjjjjj-{s}");
+    let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+    let databases = BTreeMap::from([(BINDING.to_string(), binding.clone())]);
+    let ident = sanitize_ident(&dest);
+    let dest_db = tenant_db_name(BASE, &ident);
+    let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+    let login_role = tenant_role_name(COMPUTE, &ident);
+    let pop_old = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}9_8"));
+
+    for db in [&dest_db, &pop_old] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision: {e}"));
+    // A POPULATED `__old_` owned by the derived owner (a crash-mid-swap artifact).
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{pop_old}\" OWNER \"{owner_role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create populated __old_: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &pop_old),
+        "CREATE TABLE precious(v text); INSERT INTO precious VALUES ('boot-keep');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed __old_ rows: {o}");
+
+    // (1) BOOT SWEEP preserves the populated `__old_` in place + does NOT KV-track it.
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-shbp-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shbp-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases.clone(), deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false)
+        .with_trusted_extensions(vec![]);
+    driver.sweep_stale_sql_shadows(&dest).await;
+    let (_c, old_after_sweep) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{pop_old}'"),
+    )
+    .await;
+    assert_eq!(
+        old_after_sweep.trim(),
+        "1",
+        "the boot sweep must PRESERVE the populated `__old_` in place"
+    );
+    let tomb_records_before: usize = tenant_tombstone::list(&kv).await.expect("list").len();
+    assert_eq!(
+        tomb_records_before, 0,
+        "the boot sweep must NOT KV-track it (context-less — approach b)"
+    );
+
+    // (2) NEXT SYNC self-heal converts the preserved `__old_` into a TRACKED `__deleted_` tombstone.
+    let report = untangle_colliding_orphan_roles(
+        &deploy,
+        &kv,
+        &envelope,
+        &binding,
+        &dest,
+        false,
+        false,
+        DEFAULT_DEPROVISION_GRACE_SECS,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("next-sync self-heal: {e}"));
+    let tomb = match report {
+        SelfHealReport::Healed {
+            preserved_tombstones,
+            ..
+        } => preserved_tombstones.into_iter().next().unwrap(),
+        other => panic!("expected Healed, got {other:?}"),
+    };
+    // The `__old_` is converted (renamed away) and now tracked by a KV reaper record with the rows.
+    let (_c, old_gone) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{pop_old}'"),
+    )
+    .await;
+    assert_eq!(
+        old_gone.trim(),
+        "",
+        "the next sync must convert (rename) the preserved `__old_`"
+    );
+    assert!(
+        tenant_tombstone::get(&kv, &dest, &tomb)
+            .await
+            .expect("get")
+            .is_some(),
+        "the converted tombstone MUST be KV-tracked by the next sync (approach b: bounded via the sync)"
+    );
+    let (_c, rows) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &tomb),
+        "SELECT v FROM precious",
+    )
+    .await;
+    assert_eq!(
+        rows.trim(),
+        "boot-keep",
+        "the preserved data survives the conversion"
+    );
+
+    // (3) Now grace-reaped: the reaper reclaims the tracked tombstone once due. (MUTATION: omit the KV
+    //     put in the conversion → untracked → reaper never reclaims → RED.)
+    let reaped = reap_due(&deploy, &kv, &envelope, u64::MAX).await;
+    assert!(
+        reaped >= 1,
+        "the reaper must reclaim the now-tracked tombstone"
+    );
+    let (_c, tomb_gone) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{tomb}'"),
+    )
+    .await;
+    assert_eq!(
+        tomb_gone.trim(),
+        "",
+        "the boot-preserved `__old_`, once tracked, is grace-reaped — disk accumulation bounded"
+    );
+
+    for db in [&dest_db, &pop_old, &tomb] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    for r in [&owner_role, &login_role] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP ROLE IF EXISTS \"{r}\""),
+        )
+        .await;
+    }
+    println!("PROJECT SYNC BOOT-PRESERVED OLD TRACKED NEXT SYNC OK");
 }
 
 /// **Live CROSS-NODE TENANCY-MISMATCH fail-closed gate (I2 — DATA-LOSS corner)** (Tier-2 / nightly —
