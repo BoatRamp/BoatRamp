@@ -8144,13 +8144,18 @@ async fn project_sync_self_heal_tombstone_reaped_recovered_live() {
     println!("PROJECT SYNC SELF-HEAL TOMBSTONE REAPED+RECOVERED OK");
 }
 
-/// **Live SELF-HEAL tombstone honours the CONFIGURED grace** (v0.59.7 — Security OBS 1; Tier-2 /
-/// nightly). A self-heal-minted `__deleted_` tombstone's KV grace record must use the operator's
-/// configured `deprovision_grace_secs`, not the hardcoded 7-day default — so its reaper window matches
-/// the deprovision soft-delete window. This gate drives the REAL heal with a NON-default grace and
-/// asserts the minted record's `delete_after - deleted_at` equals exactly that configured value.
-/// MUTATION WITNESS: reverting to the `DEFAULT_DEPROVISION_GRACE_SECS` constant → the delta is 7 days,
-/// not the configured grace → RED. Emits `PROJECT SYNC SELF-HEAL TOMBSTONE CONFIGURED GRACE OK`.
+/// **Live SELF-HEAL tombstone grace: honour LONGER, FLOOR shorter** (v0.59.7 — Security OBS 1 + its
+/// E1 re-review; Tier-2 / nightly). A self-heal-minted `__deleted_` tombstone is a CRASH-RECOVERY
+/// artifact (it may hold the tenant's only surviving copy if the restore then fails), so its retention
+/// is `max(configured_grace, DEFAULT)`: an operator-configured grace LONGER than the default is HONOURED
+/// (OBS 1's intent — drop the artificial 7d cap), but a SHORTER one — crucially
+/// `deprovision_grace_secs = 0` — is FLOORED to the proven-safe default, so the tombstone is never
+/// immediately due and the reaper can never reclaim the sole copy within a tick of a failed restore
+/// (the E1 window OBS 1 briefly reopened). This gate drives the REAL heal three times and asserts
+/// (i) a 2×default grace is honoured exactly, (ii) grace=0 is floored to the default AND the minted
+/// tombstone is NOT due within an hourly tick, (iii) a small grace is floored to the default. MUTATION
+/// WITNESS: removing the `.max(DEFAULT_DEPROVISION_GRACE_SECS)` floor → grace=0 ⇒ delta 0 ⇒ immediately
+/// due (would reap the sole copy) → RED. Emits `PROJECT SYNC SELF-HEAL TOMBSTONE CONFIGURED GRACE OK`.
 #[tokio::test]
 async fn project_sync_self_heal_tombstone_configured_grace_live() {
     use boatramp_core::compute::{
@@ -8245,101 +8250,151 @@ async fn project_sync_self_heal_tombstone_configured_grace_live() {
         .await
         .expect("seed replica");
 
-    let dest = format!("shg1-cfggrace-gggggggggggggggggg-{s}");
     let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
-    let ident = sanitize_ident(&dest);
-    let dest_db = tenant_db_name(BASE, &ident);
-    let owner_role = tenant_owner_role_name(COMPUTE, &ident);
-    let login_role = tenant_role_name(COMPUTE, &ident);
-    let old_stray = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}1_2"));
-
-    for db in [&dest_db, &old_stray] {
-        let _ = psql(
-            backend.as_ref(),
-            &image,
-            &maint,
-            &format!("DROP DATABASE IF EXISTS \"{db}\""),
-        )
-        .await;
-    }
-    provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
-        .await
-        .unwrap_or_else(|e| panic!("provision: {e}"));
-    let (c, o) = psql(
-        backend.as_ref(),
-        &image,
-        &conn(&superuser, &su_pw, &host, port, &dest_db),
-        &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('g'); RESET ROLE;"),
-    )
-    .await;
-    assert_eq!(c, 0, "seed orphan: {o}");
-    let (c, o) = psql(
-        backend.as_ref(),
-        &image,
-        &maint,
-        &format!("CREATE DATABASE \"{old_stray}\" OWNER \"{owner_role}\""),
-    )
-    .await;
-    assert_eq!(c, 0, "create __old_ trigger: {o}");
-
-    // A NON-default configured grace (1 hour) — distinct from the 7-day default.
-    const CONFIGURED_GRACE: u64 = 3600;
-    assert_ne!(
-        CONFIGURED_GRACE, DEFAULT_DEPROVISION_GRACE_SECS,
-        "fixture must differ from the default"
-    );
-    let report = untangle_colliding_orphan_roles(
-        &deploy,
-        &kv,
-        &envelope,
-        &binding,
-        &dest,
-        false,
-        false,
-        CONFIGURED_GRACE,
-    )
-    .await
-    .unwrap_or_else(|e| panic!("self-heal: {e}"));
-    let tomb = match report {
-        SelfHealReport::Healed {
-            preserved_tombstones,
-            ..
-        } => {
-            assert_eq!(preserved_tombstones.len(), 1, "one minted tombstone");
-            preserved_tombstones.into_iter().next().unwrap()
+    // Mint a self-heal tombstone for a fresh tenant with the given configured grace, returning its KV
+    // record. Seeds a populated orphan + an empty `__old_` trigger, heals, then cleans up the physical
+    // dbs/roles (the KV record stays in the MemoryKv for the caller to inspect).
+    let mint_with_grace = {
+        let (backend, image, su, supw, host, maint, deploy, kv, envelope, binding) = (
+            backend.clone(),
+            image.clone(),
+            superuser.clone(),
+            su_pw.clone(),
+            host.clone(),
+            maint.clone(),
+            deploy.clone(),
+            kv.clone(),
+            envelope.clone(),
+            binding.clone(),
+        );
+        move |suffix: &'static str, grace: u64| {
+            let (backend, image, su, supw, host, maint, deploy, kv, envelope, binding) = (
+                backend.clone(),
+                image.clone(),
+                su.clone(),
+                supw.clone(),
+                host.clone(),
+                maint.clone(),
+                deploy.clone(),
+                kv.clone(),
+                envelope.clone(),
+                binding.clone(),
+            );
+            async move {
+                let dest = format!("shg1-{suffix}-ggggggggggg-{s}");
+                let ident = sanitize_ident(&dest);
+                let dest_db = tenant_db_name(BASE, &ident);
+                let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+                let login_role = tenant_role_name(COMPUTE, &ident);
+                let old_stray = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}1_2"));
+                for db in [&dest_db, &old_stray] {
+                    let _ = psql(
+                        backend.as_ref(),
+                        &image,
+                        &maint,
+                        &format!("DROP DATABASE IF EXISTS \"{db}\""),
+                    )
+                    .await;
+                }
+                provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
+                    .await
+                    .unwrap_or_else(|e| panic!("provision {dest}: {e}"));
+                let (c, o) = psql(
+                    backend.as_ref(),
+                    &image,
+                    &conn(&su, &supw, &host, port, &dest_db),
+                    &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('g'); RESET ROLE;"),
+                )
+                .await;
+                assert_eq!(c, 0, "seed orphan {dest}: {o}");
+                let (c, o) = psql(
+                    backend.as_ref(),
+                    &image,
+                    &maint,
+                    &format!("CREATE DATABASE \"{old_stray}\" OWNER \"{owner_role}\""),
+                )
+                .await;
+                assert_eq!(c, 0, "create __old_ trigger {dest}: {o}");
+                let report = untangle_colliding_orphan_roles(
+                    &deploy, &kv, &envelope, &binding, &dest, false, false, grace,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("self-heal {dest}: {e}"));
+                let tomb = match report {
+                    SelfHealReport::Healed {
+                        preserved_tombstones,
+                        ..
+                    } => {
+                        assert_eq!(
+                            preserved_tombstones.len(),
+                            1,
+                            "one minted tombstone for {dest}"
+                        );
+                        preserved_tombstones.into_iter().next().unwrap()
+                    }
+                    other => panic!("expected Healed for {dest}, got {other:?}"),
+                };
+                let rec = tenant_tombstone::get(&kv, &dest, &tomb)
+                    .await
+                    .expect("get")
+                    .expect("record present");
+                for db in [&dest_db, &old_stray, &tomb] {
+                    let _ = psql(
+                        backend.as_ref(),
+                        &image,
+                        &maint,
+                        &format!("DROP DATABASE IF EXISTS \"{db}\""),
+                    )
+                    .await;
+                }
+                for r in [&owner_role, &login_role] {
+                    let _ = psql(
+                        backend.as_ref(),
+                        &image,
+                        &maint,
+                        &format!("DROP ROLE IF EXISTS \"{r}\""),
+                    )
+                    .await;
+                }
+                rec
+            }
         }
-        other => panic!("expected Healed, got {other:?}"),
     };
-    let rec = tenant_tombstone::get(&kv, &dest, &tomb)
-        .await
-        .expect("get")
-        .expect("record present");
-    // MUTATION WITNESS: the grace window reflects the CONFIGURED value, not the 7-day constant.
+
+    // (i) A LONGER-than-default configured grace is HONOURED exactly (OBS 1's real intent — the 7d cap
+    //     is gone).
+    let longer = 2 * DEFAULT_DEPROVISION_GRACE_SECS;
+    let rec_longer = mint_with_grace("longer", longer).await;
     assert_eq!(
-        rec.delete_after - rec.deleted_at,
-        CONFIGURED_GRACE,
-        "the self-heal tombstone's grace window MUST be the OPERATOR-configured grace ({CONFIGURED_GRACE}s), \
-         not the {DEFAULT_DEPROVISION_GRACE_SECS}s default (Security OBS 1)"
+        rec_longer.delete_after - rec_longer.deleted_at,
+        longer,
+        "a configured grace LONGER than the default MUST be honoured (OBS 1): no artificial cap"
     );
 
-    for db in [&dest_db, &old_stray, &tomb] {
-        let _ = psql(
-            backend.as_ref(),
-            &image,
-            &maint,
-            &format!("DROP DATABASE IF EXISTS \"{db}\""),
-        )
-        .await;
-    }
-    for r in [&owner_role, &login_role] {
-        let _ = psql(
-            backend.as_ref(),
-            &image,
-            &maint,
-            &format!("DROP ROLE IF EXISTS \"{r}\""),
-        )
-        .await;
-    }
+    // (ii) grace = 0 is FLOORED to the default (E1 safety) and the minted crash tombstone is NOT due
+    //      within an hourly reaper tick — so a failed restore can never have its sole surviving copy
+    //      reaped out from under it. MUTATION WITNESS: dropping the `.max(DEFAULT)` floor → delta 0 →
+    //      due at `deleted_at` → both asserts RED.
+    let rec_zero = mint_with_grace("zero", 0).await;
+    assert_eq!(
+        rec_zero.delete_after - rec_zero.deleted_at,
+        DEFAULT_DEPROVISION_GRACE_SECS,
+        "deprovision_grace_secs=0 MUST be FLOORED to the default for a self-heal CRASH tombstone \
+         (Security re-review: a 0 grace would make it immediately due → reap the sole copy = E1)"
+    );
+    assert!(
+        !rec_zero.is_due(rec_zero.deleted_at.saturating_add(3600)),
+        "the floored grace=0 crash tombstone MUST NOT be due within an hourly reaper tick"
+    );
+
+    // (iii) a SMALL (sub-default) configured grace is likewise FLOORED to the default.
+    let rec_small = mint_with_grace("small", 60).await;
+    assert_eq!(
+        rec_small.delete_after - rec_small.deleted_at,
+        DEFAULT_DEPROVISION_GRACE_SECS,
+        "a sub-default configured grace MUST be FLOORED to the default for a self-heal crash tombstone"
+    );
+
     println!("PROJECT SYNC SELF-HEAL TOMBSTONE CONFIGURED GRACE OK");
 }
 

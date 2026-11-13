@@ -1588,11 +1588,20 @@ async fn clear_db_dataloss_safe(
     rename_db_aside(admin, kind, db, &tombstone).await?;
     // Unify the tombstone lifecycle: register this self-heal-minted `__deleted_` with the EXISTING KV
     // grace reaper (the ONLY other minter is `deprovision_tenant`). Same record shape + helper; the
-    // reaper reclaims it once `delete_after` passes and `recover_tenant` restores it uniformly. The
-    // grace is the OPERATOR-CONFIGURED `deprovision_grace_secs` (threaded in — NOT the hardcoded
-    // default; Security OBS 1), matching the deprovision soft-delete window. role + cred_workload are
-    // EMPTY (superuser-owned — no dedicated role/cred to drop; the derived roles + creds are the
-    // reprovisioned LIVE tenant's).
+    // reaper reclaims it once `delete_after` passes and `recover_tenant` restores it uniformly.
+    //
+    // RETENTION FLOOR (Security re-review — E1 under OBS 1): this is a CRASH-RECOVERY artifact, NOT an
+    // intentional deprovision — it may hold the tenant's ONLY surviving copy if the subsequent restore
+    // fails. So its retention is `max(configured_grace, DEFAULT)`: an operator-configured grace LONGER
+    // than the default is honored (OBS 1's real intent — drop the artificial 7d CAP), but a configured
+    // grace SHORTER than the default — crucially `deprovision_grace_secs = 0` — is FLOORED to the
+    // 1033b4cc-proven-safe default window, so `delete_after` is never `ts` (immediately due) and the
+    // hourly reaper can never reclaim the sole copy within a tick of a failed restore. (The
+    // INTENTIONAL-deprovision path honors grace=0 as an immediate HARD-drop with NO tombstone — see
+    // `plan_deprovision`; this floor applies ONLY to the self-heal crash tombstone.) role +
+    // cred_workload are EMPTY (superuser-owned — no dedicated role/cred to drop; the derived roles +
+    // creds are the reprovisioned LIVE tenant's).
+    let retention = grace_secs.max(DEFAULT_DEPROVISION_GRACE_SECS);
     let record = tenant_tombstone::Tombstone {
         version: 1,
         project: project.to_string(),
@@ -1604,7 +1613,7 @@ async fn clear_db_dataloss_safe(
         superuser: superuser.to_string(),
         cred_workload: String::new(),
         deleted_at: ts,
-        delete_after: ts.saturating_add(grace_secs),
+        delete_after: ts.saturating_add(retention),
     };
     tenant_tombstone::put(kv, &record).await?;
     Ok(DbClear::Preserved(tombstone))
