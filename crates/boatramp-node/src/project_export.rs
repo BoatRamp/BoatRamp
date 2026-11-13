@@ -5982,7 +5982,9 @@ impl NodeProjectExport {
         // re-sync is a cheap NO-OP that REUSES the stable roles; a detected EXCLUSIVE tangle on the
         // existing-dest path (`fresh_dest = false` — construens's shape) is fully healed — each
         // `__deleted_` tombstone PRESERVED (reassigned to the superuser) by default or DROPPED under
-        // `--drop-soft-deleted`, the orphan db dropped, BOTH derived roles dropped + reprovisioned
+        // `--drop-soft-deleted`, the live orphan db cleared DATA-LOSS-SAFELY (a POPULATED orphan
+        // soft-deprovisioned to a recoverable `__deleted_` tombstone — never clobbered-and-empty if the
+        // restore then fails, E1; an EMPTY one hard-dropped), BOTH derived roles dropped + reprovisioned
         // fresh. The `shared_with_live` HARD GUARD leaves a role shared with a live sibling fully
         // intact. FATAL on error: a detected tangle MUST self-heal, so a failure aborts the restore
         // (the operator sees it rather than a silently half-healed state) — it runs BEFORE any shadow
@@ -7631,6 +7633,29 @@ impl NodeProjectExport {
                         .await
                     {
                         for name in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                            // `__shadow_` is incoming-restore SCRATCH (never the only copy of tenant
+                            // data) → safe hard-drop. A `__old_` is a swap RENAME-ASIDE of the live db:
+                            // a crash between `pg_swap_shadow`'s renames can leave a POPULATED `__old_`
+                            // as the ONLY data copy, so dropping it here loses it (Security review
+                            // FINDING 1). PRESERVE a populated `__old_` in place (a later `project sync`
+                            // self-heal / `db drop database --orphan` reconciles it to a recoverable
+                            // tombstone); only an EMPTY `__old_` is swept. Fail-CLOSED: if the
+                            // populated-ness probe fails, assume POPULATED (preserve) — never drop blind.
+                            if name.contains("__old_")
+                                && self
+                                    .pg_db_has_user_tables(&plan, name, &session)
+                                    .await
+                                    .unwrap_or(true)
+                            {
+                                tracing::warn!(
+                                    database = %name,
+                                    "startup sweep: a POPULATED `__old_` swap-aside may be the only \
+                                     copy of tenant data (crash mid-swap) — PRESERVED in place, NOT \
+                                     dropped (a later sync self-heal / `db drop database --orphan` \
+                                     reconciles it)"
+                                );
+                                continue;
+                            }
                             let q = quote_ident(ExternalSqlKind::Postgres, name);
                             if self
                                 .pg_run_ddl(

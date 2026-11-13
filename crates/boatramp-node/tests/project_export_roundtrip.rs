@@ -6774,6 +6774,1000 @@ async fn project_sync_self_heal_tangle_live() {
     println!("PROJECT SYNC SELF-HEAL TANGLE OK");
 }
 
+/// **Live SELF-HEAL restore-FAILURE recoverability** (v0.59.7 — Security review E1, DATA-LOSS corner;
+/// Tier-2 / nightly, needs Docker + real Postgres). The sync self-heal CLEARS the live orphan db
+/// BEFORE the shadow-swap restore lands; a mid-restore failure tears the shadow down and leaves live
+/// UNTOUCHED, so hard-dropping a POPULATED orphan up front would leave the tenant with NEITHER the
+/// source (didn't land) NOR the orphan (dropped) — unrecoverable data loss + an empty live name. This
+/// gate drives the REAL heal (`untangle_colliding_orphan_roles` — the EXACT reconcile the sidecar
+/// restore runs, called directly here so the restore does NOT follow: the precise "restore failed
+/// after the heal" window) on a POPULATED-orphan tangle and proves the fail-safe:
+///   - the orphan's PRE-HEAL rows SURVIVE in a RECOVERABLE `__deleted_` grace tombstone (reassigned to
+///     the superuser, divorced from the dropped derived roles — droppable later via
+///     `db drop database --orphan`);
+///   - the live name is a FRESH reprovisioned db (not left absent/empty-and-unrecoverable);
+///   - the stray aside is cleared and the derived roles are reprovisioned FRESH.
+///
+/// MUTATION WITNESS: the pre-fix heal HARD-DROPS the live orphan, so its rows are GONE — there is no
+/// recoverable tombstone and the `precious` row check FAILS (RED on the current branch tip).
+/// Emits `PROJECT SYNC SELF-HEAL RESTORE-FAILURE RECOVERABLE OK`.
+#[tokio::test]
+async fn project_sync_self_heal_restore_failure_recoverable_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_node::tenant_sql::{
+        SelfHealReport, provision_tenant, untangle_colliding_orphan_roles,
+    };
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (self-heal restore-failure gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (self-heal restore-failure gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BASE: &str = "shd";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shselfef-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([12u8; 32]));
+
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("pre-seal superuser credential");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed healthy replica");
+
+    let dest = format!("shself-ef-eeeeeeeeeeeeeeeeeeee-{s}");
+    let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+    let ident = sanitize_ident(&dest);
+    let dest_db = tenant_db_name(BASE, &ident);
+    assert_eq!(
+        dest_db.len(),
+        63,
+        "the orphan db must sit AT the 63-byte cap (construens shape) — got {}",
+        dest_db.len()
+    );
+    let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+    let login_role = tenant_role_name(COMPUTE, &ident);
+    // A stray TRANSIENT `__old_` aside the owner owns — the detected tangle that makes the heal FIRE
+    // (without a stray object a healthy live db is a cheap NoOp and the heal never touches it).
+    let stray_old = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}1_7"));
+
+    for db in [&dest_db, &stray_old] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision dest: {e}"));
+
+    // POPULATED orphan: real tenant rows owned by the derived owner (what a hard-drop would clobber).
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &dest_db),
+        &format!(
+            "SET ROLE \"{owner_role}\"; CREATE TABLE precious(id int, v text); \
+             INSERT INTO precious VALUES (1,'keep-a'),(2,'keep-b'); RESET ROLE;"
+        ),
+    )
+    .await;
+    assert_eq!(c, 0, "seed populated orphan: {o}");
+    // Stray `__old_` aside owned by the owner (the tangle trigger).
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{stray_old}\" OWNER \"{owner_role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create stray __old_ aside: {o}");
+
+    // Precondition: orphan is populated + the owner owns the stray aside (the detected tangle).
+    let (_c, pre_rows) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &dest_db),
+        "SELECT count(*) FROM precious",
+    )
+    .await;
+    assert_eq!(
+        pre_rows.trim(),
+        "2",
+        "precondition: the orphan holds real rows"
+    );
+    let (_c, owner_oid_before) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT oid FROM pg_roles WHERE rolname='{owner_role}'"),
+    )
+    .await;
+    assert!(!owner_oid_before.trim().is_empty());
+
+    // DRIVE THE REAL HEAL, then STOP (the restore does NOT follow — the exact "restore failed after
+    // the heal" window). Existing-dest (fresh_dest=false), default preserve (drop_soft_deleted=false).
+    let report =
+        untangle_colliding_orphan_roles(&deploy, &kv, &envelope, &binding, &dest, false, false)
+            .await
+            .unwrap_or_else(|e| panic!("self-heal MUST succeed: {e}"));
+    let preserved = match report {
+        SelfHealReport::Healed {
+            preserved_tombstones,
+            ..
+        } => preserved_tombstones,
+        other => panic!("expected a Healed report on the detected tangle, got {other:?}"),
+    };
+    assert_eq!(
+        preserved.len(),
+        1,
+        "the POPULATED orphan must be soft-deprovisioned to exactly ONE recoverable `__deleted_` \
+         tombstone (not hard-dropped): preserved={preserved:?}"
+    );
+    let orphan_tomb = &preserved[0];
+
+    // (E1 MUTATION WITNESS) the orphan's PRE-HEAL rows are RECOVERABLE in the grace tombstone. On the
+    // pre-fix hard-drop heal the tombstone does not exist and `precious` is GONE → this is RED.
+    let (_c, exists) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{orphan_tomb}'"),
+    )
+    .await;
+    assert_eq!(
+        exists.trim(),
+        "1",
+        "the recoverable orphan tombstone must exist"
+    );
+    let (_c, rows) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, orphan_tomb),
+        "SELECT id || ':' || v FROM precious ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows, "1:keep-a\n2:keep-b",
+        "the POPULATED orphan's rows MUST survive recoverably in the grace tombstone — a mid-restore \
+         failure after the heal must NOT leave them clobbered (Security review E1)"
+    );
+    let (_c, tomb_owner) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT r.rolname FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE d.datname='{orphan_tomb}'"),
+    )
+    .await;
+    assert_eq!(
+        tomb_owner.trim(),
+        superuser,
+        "the recovered orphan tombstone is reassigned to the stable superuser (divorced from the \
+         dropped derived roles so DROP ROLE succeeded)"
+    );
+
+    // the live name is a FRESH reprovisioned db (not left absent/unrecoverable).
+    let (_c, live_exists) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{dest_db}'"),
+    )
+    .await;
+    assert_eq!(
+        live_exists.trim(),
+        "1",
+        "the live name must be reprovisioned fresh, not left absent"
+    );
+    // stray aside cleared; roles reprovisioned fresh (the heal fully ran).
+    let (_c, stray_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{stray_old}'"),
+    )
+    .await;
+    assert_eq!(
+        stray_after.trim(),
+        "",
+        "the stray `__old_` aside must be cleared"
+    );
+    let (_c, owner_oid_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT oid FROM pg_roles WHERE rolname='{owner_role}'"),
+    )
+    .await;
+    assert_ne!(
+        owner_oid_after.trim(),
+        owner_oid_before.trim(),
+        "the derived roles must be reprovisioned FRESH (new OID) — the heal fully completed"
+    );
+
+    for db in [&dest_db, &stray_old, &orphan_tomb.to_string()] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    for r in [&owner_role, &login_role] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP ROLE IF EXISTS \"{r}\""),
+        )
+        .await;
+    }
+
+    println!("PROJECT SYNC SELF-HEAL RESTORE-FAILURE RECOVERABLE OK");
+}
+
+/// **Live SELF-HEAL — ABSENT primary + POPULATED `__old_` recoverable** (v0.59.7 — Security review
+/// FINDING 2 regression + FINDING 1; Tier-2 / nightly). A crash BETWEEN `pg_swap_shadow`'s renames can
+/// leave the derived live name FREE (absent) while a POPULATED `__old_` swap-aside holds the only copy
+/// of the tenant's data. The pre-fix heal (step C) fail-CONNECTED on the absent primary → FATAL abort
+/// (FINDING 2 — wedges every retry, forcing operator `db drop database --orphan`), and step A
+/// hard-dropped the populated `__old_` (FINDING 1 — the only copy lost). This gate drives the REAL heal
+/// (`untangle_colliding_orphan_roles`) on that exact state and proves ZERO-operator self-heal:
+///   - the heal does NOT abort on the absent primary (existence-guarded — FINDING 2);
+///   - the populated `__old_`'s rows SURVIVE in a recoverable `__deleted_` tombstone (FINDING 1);
+///   - the live name is reprovisioned fresh and both derived roles are reprovisioned (new OIDs).
+///
+/// MUTATION WITNESS: reverting the step-C existence guard aborts the heal (FINDING 2); reverting the
+/// `__old_` data-loss-safe clear hard-drops the only copy (FINDING 1). Emits
+/// `PROJECT SYNC SELF-HEAL ABSENT-PRIMARY RECOVERABLE OK`.
+#[tokio::test]
+async fn project_sync_self_heal_absent_primary_recoverable_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_node::tenant_sql::{
+        SelfHealReport, provision_tenant, untangle_colliding_orphan_roles,
+    };
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (absent-primary recoverable gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (absent-primary recoverable gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BASE: &str = "shd";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shf2-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([13u8; 32]));
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("pre-seal su");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed replica");
+
+    let dest = format!("shself-f2-ffffffffffffffffffff-{s}");
+    let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+    let ident = sanitize_ident(&dest);
+    let dest_db = tenant_db_name(BASE, &ident);
+    let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+    let login_role = tenant_role_name(COMPUTE, &ident);
+    let old_aside = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}3_9"));
+
+    for db in [&dest_db, &old_aside] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision: {e}"));
+    // POPULATED `__old_` owned by the derived owner — the ONLY copy of the data after the crash.
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{old_aside}\" OWNER \"{owner_role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create __old_: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &old_aside),
+        "CREATE TABLE precious(id int, v text); INSERT INTO precious VALUES (1,'crash-a'),(2,'crash-b');",
+    )
+    .await;
+    assert_eq!(c, 0, "seed __old_ rows: {o}");
+    // SIMULATE the crash-between-swap-renames state: the live primary is GONE.
+    let (c, _o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("DROP DATABASE \"{dest_db}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "drop primary (simulate crash)");
+
+    let (_c, prim) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{dest_db}'"),
+    )
+    .await;
+    assert_eq!(prim.trim(), "", "precondition: the live primary is ABSENT");
+    let (_c, owner_oid_before) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT oid FROM pg_roles WHERE rolname='{owner_role}'"),
+    )
+    .await;
+
+    // DRIVE THE REAL HEAL — must NOT abort on the absent primary.
+    let report =
+        untangle_colliding_orphan_roles(&deploy, &kv, &envelope, &binding, &dest, false, false)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("self-heal MUST NOT abort on an absent primary (FINDING 2): {e}")
+            });
+    let preserved = match report {
+        SelfHealReport::Healed {
+            preserved_tombstones,
+            ..
+        } => preserved_tombstones,
+        other => panic!("expected Healed, got {other:?}"),
+    };
+    assert_eq!(
+        preserved.len(),
+        1,
+        "the POPULATED `__old_` must be preserved as exactly ONE recoverable tombstone (FINDING 1): {preserved:?}"
+    );
+    let tomb = &preserved[0];
+    let (_c, rows) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, tomb),
+        "SELECT id || ':' || v FROM precious ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows, "1:crash-a\n2:crash-b",
+        "the populated `__old_`'s rows MUST survive recoverably (FINDING 1)"
+    );
+    let (_c, tomb_owner) = psql(backend.as_ref(), &image, &maint, &format!("SELECT r.rolname FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE d.datname='{tomb}'")).await;
+    assert_eq!(
+        tomb_owner.trim(),
+        superuser,
+        "the recovered tombstone is reassigned to the superuser"
+    );
+    let (_c, old_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{old_aside}'"),
+    )
+    .await;
+    assert_eq!(
+        old_after.trim(),
+        "",
+        "the `__old_` name is freed (renamed to the tombstone)"
+    );
+    let (_c, live_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{dest_db}'"),
+    )
+    .await;
+    assert_eq!(
+        live_after.trim(),
+        "1",
+        "the live name is reprovisioned fresh"
+    );
+    let (_c, owner_oid_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT oid FROM pg_roles WHERE rolname='{owner_role}'"),
+    )
+    .await;
+    assert_ne!(
+        owner_oid_after.trim(),
+        owner_oid_before.trim(),
+        "roles reprovisioned fresh"
+    );
+
+    for db in [&dest_db, &old_aside, &tomb.to_string()] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    for r in [&owner_role, &login_role] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP ROLE IF EXISTS \"{r}\""),
+        )
+        .await;
+    }
+    println!("PROJECT SYNC SELF-HEAL ABSENT-PRIMARY RECOVERABLE OK");
+}
+
+/// **Live SELF-HEAL — `--drop-soft-deleted` must NOT lose the live orphan** (v0.59.7 — Security review
+/// FINDING 3; Tier-2 / nightly). `--drop-soft-deleted` means "dispose of PRE-EXISTING grace
+/// `__deleted_` tombstones," NOT "accept losing the live orphan." The pre-fix heal hard-dropped the
+/// POPULATED live orphan under the flag (reopening E1 — a restore failure then loses it). This gate
+/// drives the REAL heal with the flag SET on a populated live orphan + a stray `__old_` trigger and
+/// proves the live orphan is STILL soft-deprovisioned to a recoverable tombstone (not clobbered).
+/// MUTATION WITNESS: reverting FINDING 3 (flag ⇒ hard-drop the populated orphan) loses the data — no
+/// recoverable tombstone. Emits `PROJECT SYNC SELF-HEAL DROP-SOFT-DELETED KEEPS ORPHAN OK`.
+#[tokio::test]
+async fn project_sync_self_heal_drop_soft_deleted_keeps_orphan_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_node::tenant_sql::{
+        SelfHealReport, provision_tenant, untangle_colliding_orphan_roles,
+    };
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (drop-soft-deleted keeps-orphan gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!(
+                "SKIP: no reachable Docker daemon (drop-soft-deleted keeps-orphan gate not run)"
+            );
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BASE: &str = "shd";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shf3-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([14u8; 32]));
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("pre-seal su");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed replica");
+
+    let dest = format!("shself-f3-gggggggggggggggggggg-{s}");
+    let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+    let ident = sanitize_ident(&dest);
+    let dest_db = tenant_db_name(BASE, &ident);
+    let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+    let login_role = tenant_role_name(COMPUTE, &ident);
+    let old_stray = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}4_9"));
+
+    for db in [&dest_db, &old_stray] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
+        .await
+        .unwrap_or_else(|e| panic!("provision: {e}"));
+    // POPULATED LIVE orphan — rows `--drop-soft-deleted` must NOT clobber.
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &dest_db),
+        &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(id int, v text); INSERT INTO precious VALUES (1,'live-a'),(2,'live-b'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed live orphan: {o}");
+    // EMPTY `__old_` stray owned by the owner — the detected-tangle trigger.
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{old_stray}\" OWNER \"{owner_role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create __old_ stray: {o}");
+
+    // DRIVE THE REAL HEAL with `--drop-soft-deleted` SET.
+    let report =
+        untangle_colliding_orphan_roles(&deploy, &kv, &envelope, &binding, &dest, false, true)
+            .await
+            .unwrap_or_else(|e| panic!("self-heal (drop-soft-deleted) MUST succeed: {e}"));
+    let preserved = match report {
+        SelfHealReport::Healed {
+            preserved_tombstones,
+            ..
+        } => preserved_tombstones,
+        other => panic!("expected Healed, got {other:?}"),
+    };
+    assert_eq!(
+        preserved.len(),
+        1,
+        "even under `--drop-soft-deleted` the POPULATED live orphan must be PRESERVED as a recoverable \
+         tombstone (FINDING 3): {preserved:?}"
+    );
+    let tomb = &preserved[0];
+    let (_c, rows) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, tomb),
+        "SELECT id || ':' || v FROM precious ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows, "1:live-a\n2:live-b",
+        "the live orphan's rows MUST survive recoverably even under `--drop-soft-deleted` (FINDING 3: \
+         the flag disposes of PRE-EXISTING tombstones, NEVER the live orphan)"
+    );
+
+    for db in [&dest_db, &old_stray, &tomb.to_string()] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    for r in [&owner_role, &login_role] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP ROLE IF EXISTS \"{r}\""),
+        )
+        .await;
+    }
+    println!("PROJECT SYNC SELF-HEAL DROP-SOFT-DELETED KEEPS ORPHAN OK");
+}
+
+/// **Live STARTUP SWEEP preserves a POPULATED `__old_`** (v0.59.7 — Security review FINDING 1, boot
+/// sweep locus; Tier-2 / nightly). The node-startup `sweep_stale_sql_shadows` cleans crash-left
+/// `*__shadow_*`/`*__old_*` dbs. A `__shadow_` is incoming-restore SCRATCH (safe hard-drop), but a
+/// POPULATED `__old_` swap-aside may be the ONLY copy of tenant data (crash mid-swap), so the pre-fix
+/// unconditional DROP lost it. This gate seeds a POPULATED `__old_`, an EMPTY `__old_`, and a
+/// `__shadow_`, runs the REAL sweep, and proves: the populated `__old_` SURVIVES (rows intact) while
+/// the empty `__old_` + the `__shadow_` are swept. MUTATION WITNESS: reverting the sweep's
+/// populated-preserve drops the populated `__old_` (rows gone). Emits
+/// `PROJECT SYNC STARTUP SWEEP PRESERVES POPULATED OLD OK`.
+#[tokio::test]
+async fn project_sync_startup_sweep_preserves_populated_old_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name,
+    };
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (startup-sweep preserve gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (startup-sweep preserve gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BASE: &str = "shd";
+    const BINDING: &str = "shswp";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shswp-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([15u8; 32]));
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("pre-seal su");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed replica");
+
+    let proj = format!("shswp-hhhhhhhhhhhhhhhhhhhh-{s}");
+    let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+    let databases = BTreeMap::from([(BINDING.to_string(), binding.clone())]);
+    let dest_db = tenant_db_name(BASE, &sanitize_ident(&proj));
+    let pop_old = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}a1_1"));
+    let empty_old = bounded_aside_db_name(&dest_db, "__old_", &format!("{s}b2_2"));
+    let shadow = bounded_aside_db_name(&dest_db, "__shadow_", &format!("{s}c3_3"));
+
+    for db in [&pop_old, &empty_old, &shadow, &dest_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    // POPULATED `__old_` (the only copy of tenant data after a crash mid-swap).
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{pop_old}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create populated __old_: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &pop_old),
+        "CREATE TABLE precious(id int); INSERT INTO precious VALUES (1),(2),(3);",
+    )
+    .await;
+    assert_eq!(c, 0, "seed populated __old_ rows: {o}");
+    // EMPTY `__old_` + `__shadow_` scratch (both must be swept).
+    let (c, _o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{empty_old}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create empty __old_");
+    let (c, _o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{shadow}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create __shadow_");
+
+    let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+        databases.clone(),
+        kv.clone(),
+        Some(envelope.clone()),
+        deploy.clone(),
+    ));
+    let work = std::env::temp_dir().join(format!("boatramp-shswp-work-{s}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let blobs: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shswp-blobs-{s}")),
+    ));
+    let driver = NodeProjectExport::new(databases.clone(), deploy.clone(), kv.clone(), blobs, work)
+        .with_managed_pg(backend.clone(), envelope.clone(), op, false)
+        .with_trusted_extensions(vec![]);
+
+    // RUN THE REAL STARTUP SWEEP.
+    driver.sweep_stale_sql_shadows(&proj).await;
+
+    // The POPULATED `__old_` SURVIVES with its rows (FINDING 1 — never the only copy dropped).
+    let (_c, pop_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{pop_old}'"),
+    )
+    .await;
+    assert_eq!(
+        pop_after.trim(),
+        "1",
+        "the startup sweep MUST PRESERVE a POPULATED `__old_` (it may be the only copy of tenant data) \
+         — not drop it (FINDING 1)"
+    );
+    let (_c, rows) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &pop_old),
+        "SELECT count(*) FROM precious",
+    )
+    .await;
+    assert_eq!(rows.trim(), "3", "the preserved `__old_`'s rows are intact");
+    // The EMPTY `__old_` + the `__shadow_` scratch are swept.
+    let (_c, empty_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{empty_old}'"),
+    )
+    .await;
+    assert_eq!(
+        empty_after.trim(),
+        "",
+        "an EMPTY `__old_` is swept (nothing to lose)"
+    );
+    let (_c, shadow_after) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{shadow}'"),
+    )
+    .await;
+    assert_eq!(
+        shadow_after.trim(),
+        "",
+        "a `__shadow_` restore-scratch db is swept"
+    );
+
+    for db in [&pop_old, &empty_old, &shadow, &dest_db] {
+        let _ = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+        )
+        .await;
+    }
+    println!("PROJECT SYNC STARTUP SWEEP PRESERVES POPULATED OLD OK");
+}
+
 /// **Live CROSS-NODE TENANCY-MISMATCH fail-closed gate (I2 — DATA-LOSS corner)** (Tier-2 / nightly —
 /// needs a Docker daemon AND real Postgres). A cross-node `project sync` whose SOURCE framed the
 /// managed member as Single/dedicated (the CHUNKED streamed-shadow path) while the TARGET binding

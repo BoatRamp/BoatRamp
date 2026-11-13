@@ -581,6 +581,17 @@ jobs:
           # fail-safe intact. Self-skip trap → marker.
           grep -q 'PROJECT SYNC SELF-HEAL TANGLE OK' project-export.log \
             || { echo "::error::sync self-heal-tangle gate never reached its marker (silent skip, the tangle was not self-healed — roles left reused/un-dropped, the tombstone clobbered or left owner-owned, a clean re-sync churned roles, or a live sibling was force-cleared — DATA-LOSS risk)" >&2; exit 1; }
+          # SELF-HEAL restore-FAILURE recoverability (v0.59.7, Security review E1): a POPULATED orphan is
+          # soft-deprovisioned to a recoverable `__deleted_` tombstone before the restore lands, so a
+          # mid-restore failure never clobbers it. Self-skip trap → marker.
+          grep -q 'PROJECT SYNC SELF-HEAL RESTORE-FAILURE RECOVERABLE OK' project-export.log \
+            || { echo "::error::sync self-heal restore-failure recoverability gate never reached its marker (silent skip, or a populated orphan was HARD-DROPPED before the restore landed — unrecoverable DATA-LOSS, Security review E1)" >&2; exit 1; }
+          grep -q 'PROJECT SYNC SELF-HEAL ABSENT-PRIMARY RECOVERABLE OK' project-export.log \
+            || { echo "::error::sync self-heal absent-primary gate never reached its marker (silent skip, the heal ABORTED on an absent primary — FINDING 2, or a populated __old_ was hard-dropped — FINDING 1)" >&2; exit 1; }
+          grep -q 'PROJECT SYNC SELF-HEAL DROP-SOFT-DELETED KEEPS ORPHAN OK' project-export.log \
+            || { echo "::error::sync self-heal drop-soft-deleted keeps-orphan gate never reached its marker (silent skip, or --drop-soft-deleted HARD-DROPPED the populated live orphan — FINDING 3)" >&2; exit 1; }
+          grep -q 'PROJECT SYNC STARTUP SWEEP PRESERVES POPULATED OLD OK' project-export.log \
+            || { echo "::error::startup-sweep preserve gate never reached its marker (silent skip, or the boot sweep HARD-DROPPED a populated __old_ — FINDING 1 via the sweep)" >&2; exit 1; }
           # CROSS-NODE TENANCY-MISMATCH fail-closed (v0.59.6, I2 DATA-LOSS corner): a Single/dedicated-
           # framed (chunked) managed member applied into a SHARED tenant cell is REFUSED fail-closed, so
           # a populated Shared occupant is NEVER clobbered. Self-skip trap → marker.

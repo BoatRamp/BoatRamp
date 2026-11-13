@@ -1361,6 +1361,13 @@ async fn role_exists(admin: &ComputeResolvedSqlBackend, role: &str) -> Result<bo
 /// Excludes the maintenance database and the already-dropped `primary` (never a live sibling binding).
 /// A name here that is NOT a [bounded aside](is_orphan_aside) of `primary` is a FOREIGN (live sibling)
 /// database, so the role must be LEFT intact.
+///
+/// CAVEAT (Security review note): this enumerates DATABASE-scoped entanglements only. A role that
+/// out-of-band owned a shared TABLESPACE, or held a membership in a still-live role, would NOT be
+/// surfaced here and so would not trip the `shared_with_live` fail-safe. boatramp never grants a
+/// derived per-tenant role a tablespace or a cross-role membership (provisioning mints only the
+/// per-`(tenant, server)` login + owner roles and grants on the tenant's OWN database/objects), so
+/// there is no such entanglement to miss today; a future producer that did would need this widened.
 async fn role_dependency_databases(
     admin: &ComputeResolvedSqlBackend,
     role: &str,
@@ -1409,9 +1416,12 @@ fn is_role_has_dependents_error(err: &SqlError) -> bool {
     m.contains("cannot be dropped because") && m.contains("depend")
 }
 
-/// Terminate sessions on, then `DROP DATABASE IF EXISTS`, one of THIS ORPHAN'S OWN aside databases
-/// (a `<orphan-derived-prefix><aside-marker><suffix>` name — see [`is_orphan_aside`], the only names
-/// ever passed here). Fatal on failure: clearing the orphan means its asides must go.
+/// Terminate sessions on, then `DROP DATABASE IF EXISTS`, THIS ORPHAN'S OWN database by name — either
+/// a bounded aside (`<orphan-derived-prefix><aside-marker><suffix>` — see [`is_orphan_aside`]) OR the
+/// orphan's live PRIMARY itself (the self-heal's step 2 hard-drops an EMPTY primary through here; a
+/// POPULATED primary never reaches this — it is soft-deprovisioned to a recoverable tombstone). Every
+/// name passed here is STRUCTURAL (derived for, or a classifier-matched aside of, THIS tenant), never
+/// dump/guest content. Fatal on failure: clearing the orphan means the targeted db must go.
 async fn drop_orphan_aside_db(
     admin: &ComputeResolvedSqlBackend,
     kind: ExternalSqlKind,
@@ -1431,6 +1441,142 @@ async fn drop_orphan_aside_db(
         .await
         .map_err(|e| format!("orphan drop: DROP DATABASE aside {aside}: {e}"))?;
     Ok(())
+}
+
+/// Whether a database exists (by name) via the superuser/maintenance connection — so the self-heal can
+/// pick a collision-free `__deleted_` tombstone name when it renames a populated orphan aside.
+async fn db_exists(admin: &ComputeResolvedSqlBackend, db: &str) -> Result<bool, String> {
+    let db_lit = format!("'{}'", db.replace('\'', "''"));
+    let rows = admin
+        .run_query(&format!(
+            "SELECT 1 FROM pg_database WHERE datname = {db_lit}"
+        ))
+        .await
+        .map_err(|e| format!("self-heal: probe database {db}: {e}"))?;
+    Ok(!rows.rows.is_empty())
+}
+
+/// Whether a database holds any USER object (table/partition/matview/sequence/foreign-table or a large
+/// object) — the POPULATED-vs-EMPTY classifier the self-heal uses to decide whether the live orphan is
+/// disposable (EMPTY ⇒ hard-drop; POPULATED ⇒ soft-deprovision to a recoverable tombstone). Mirrors the
+/// restore path's [`pg_db_has_user_tables`](crate::project_export) count EXACTLY (same catalog filter)
+/// so both the fresh-dest occupant reconcile and the self-heal make the identical fail-safe call.
+/// `admin_on_db` MUST already be connected to the database being probed. FAIL-CLOSED: an unparsable
+/// count errors (never a silent "empty" that would license a clobber).
+async fn db_has_user_tables(admin_on_db: &ComputeResolvedSqlBackend) -> Result<bool, String> {
+    let rows = admin_on_db
+        .run_query(
+            "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+             AND c.relkind IN ('r', 'p', 'm', 'S', 'f')) \
+             + (SELECT count(*) FROM pg_largeobject_metadata)",
+        )
+        .await
+        .map_err(|e| format!("self-heal: probe user objects: {e}"))?;
+    match rows.rows.into_iter().flatten().next() {
+        Some(SqlValue::Integer(n)) => Ok(n > 0),
+        Some(SqlValue::Text(s)) => s
+            .trim()
+            .parse::<i64>()
+            .map(|n| n > 0)
+            .map_err(|_| format!("self-heal: unparsable user-object count {s:?} (fail-closed)")),
+        other => Err(format!(
+            "self-heal: unexpected user-object count cell {other:?} (fail-closed)"
+        )),
+    }
+}
+
+/// Terminate sessions on `from`, then `ALTER DATABASE from RENAME TO to` — the self-heal's
+/// soft-deprovision of a POPULATED live orphan (frees the derived target name while PRESERVING the
+/// data under the `__deleted_` tombstone `to`). Both names are STRUCTURAL (the derived live name + a
+/// bounded `__deleted_` aside of it), never dump/guest content.
+async fn rename_db_aside(
+    admin: &ComputeResolvedSqlBackend,
+    kind: ExternalSqlKind,
+    from: &str,
+    to: &str,
+) -> Result<(), String> {
+    let from_lit = format!("'{}'", from.replace('\'', "''"));
+    let from_id = boatramp_storage::tenant_provision::quote_ident(kind, from);
+    let to_id = boatramp_storage::tenant_provision::quote_ident(kind, to);
+    admin
+        .run_script(&format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = {from_lit} AND pid <> pg_backend_pid();"
+        ))
+        .await
+        .map_err(|e| format!("self-heal: terminate sessions on {from}: {e}"))?;
+    admin
+        .run_script(&format!("ALTER DATABASE {from_id} RENAME TO {to_id};"))
+        .await
+        .map_err(|e| format!("self-heal: rename populated orphan {from} aside to {to}: {e}"))?;
+    Ok(())
+}
+
+/// The disposition [`clear_db_dataloss_safe`] took on a database it was asked to clear.
+enum DbClear {
+    /// The database did not exist — a clean no-op (the derived name is already free).
+    Absent,
+    /// The database was EMPTY (no user objects) — hard-dropped (nothing to lose).
+    Dropped,
+    /// The database was POPULATED — renamed aside to this recoverable `__deleted_` grace tombstone
+    /// (its data PRESERVED; the caller reassigns it to the superuser).
+    Preserved(String),
+}
+
+/// Clear a database the derived roles own, DATA-LOSS-SAFELY — the shared core of the self-heal's live
+/// orphan handling AND its populated-`__old_` handling (Security review E1 + FINDING 1/2/3), mirroring
+/// the fresh-dest occupant invariant [`crate::project_export`]'s `pg_reconcile_fresh_dest_occupant`:
+///   * ABSENT (`db` does not exist) ⇒ [`DbClear::Absent`] — a clean no-op, NEVER a fail-connect abort
+///     (FINDING 2: a crash can legitimately leave the derived name free).
+///   * EMPTY (no user objects) ⇒ hard-drop ([`drop_orphan_aside_db`]) → [`DbClear::Dropped`].
+///   * POPULATED ⇒ SOFT-DEPROVISION: rename `db` aside ([`rename_db_aside`]) to a collision-free
+///     recoverable `__deleted_<ts>` grace tombstone of `derived_primary` (the tenant's derived live
+///     name — so the tombstone is recognized as THIS orphan's own aside), FREEING `db`'s name →
+///     [`DbClear::Preserved`]. A mid-restore failure then never loses the only data copy.
+///
+/// NEVER gated on `--drop-soft-deleted` (that flag governs only PRE-EXISTING `__deleted_` tombstones —
+/// FINDING 3). Every name is STRUCTURAL (the derived live name + a bounded aside of it), never
+/// dump/guest content.
+#[allow(clippy::too_many_arguments)]
+async fn clear_db_dataloss_safe(
+    admin: &ComputeResolvedSqlBackend,
+    deploy: &DeployStore,
+    creds: &ManagedSqlCredentials,
+    kind: ExternalSqlKind,
+    compute: &str,
+    superuser: &str,
+    derived_primary: &str,
+    db: &str,
+) -> Result<DbClear, String> {
+    if !db_exists(admin, db).await? {
+        return Ok(DbClear::Absent);
+    }
+    let populated = {
+        let on_db =
+            shared_admin_backend_for_db(deploy, creds, kind, compute, superuser, db).await?;
+        db_has_user_tables(&on_db).await?
+    };
+    if !populated {
+        drop_orphan_aside_db(admin, kind, db).await?;
+        return Ok(DbClear::Dropped);
+    }
+    // Pick a collision-free `__deleted_<ts>` tombstone name (bump the ts past any existing one, so two
+    // populated things preserved in the same second — orphan + a populated `__old_` — never collide).
+    let mut ts = now_unix_secs();
+    let tombstone = loop {
+        let cand = boatramp_storage::tenant_provision::bounded_aside_db_name(
+            derived_primary,
+            "__deleted_",
+            &ts.to_string(),
+        );
+        if !db_exists(admin, &cand).await? {
+            break cand;
+        }
+        ts = ts.saturating_add(1);
+    };
+    rename_db_aside(admin, kind, db, &tombstone).await?;
+    Ok(DbClear::Preserved(tombstone))
 }
 
 /// Fully clear an EXCLUSIVELY-owned per-tenant derived `role` DATA-LOSS-SAFELY, returning `true` if it
@@ -1716,10 +1862,12 @@ pub enum SelfHealReport {
     /// FAIL-SAFE: the derived roles are SHARED with a still-live sibling binding — LEFT fully intact
     /// (roles + asides + tombstone), the live sibling's data never touched (the HARD GUARD).
     SharedWithLive { roles: Vec<String> },
-    /// FULL SELF-HEAL of an EXCLUSIVE tangle: the orphan's stray asides were cleared, each `__deleted_`
-    /// grace tombstone PRESERVED (reassigned to the superuser) unless `drop_soft_deleted`, the live
-    /// orphan db dropped, BOTH derived roles DROPPED + their sealed credentials deleted, and the tenant
-    /// REPROVISIONED fresh — so the subsequent shadow-swap restore lands clean.
+    /// FULL SELF-HEAL of an EXCLUSIVE tangle: the orphan's stray asides were cleared; each `__deleted_`
+    /// grace tombstone PRESERVED (reassigned to the superuser) unless `drop_soft_deleted`; the live
+    /// orphan db cleared DATA-LOSS-SAFELY (a POPULATED orphan SOFT-DEPROVISIONED to a recoverable
+    /// `__deleted_` tombstone — `preserved_tombstones` — so a mid-restore failure never clobbers it; an
+    /// EMPTY orphan hard-dropped); BOTH derived roles DROPPED + their sealed credentials deleted; and
+    /// the tenant REPROVISIONED fresh — so the subsequent shadow-swap restore lands clean.
     Healed {
         cleared_asides: Vec<String>,
         preserved_tombstones: Vec<String>,
@@ -1739,21 +1887,36 @@ pub enum SelfHealReport {
 /// credential churn, no reprovision. The aggressive heal fires ONLY on broken state.
 ///
 /// On a DETECTED EXCLUSIVE tangle (existing-dest path, `fresh_dest = false` — where construens's
-/// re-sync landed), it reuses [`hard_drop_orphan_tenant`]'s shared tangle-reconciliation core and:
-///   1. PRESERVES each `__deleted_` grace tombstone by default — [`reassign_aside_to_owner`] moves it
-///      from the derived roles to the stable superuser (its data SURVIVES) so the roles drop cleanly.
-///      `drop_soft_deleted` (the `--drop-soft-deleted` opt-in) instead DROPS the tombstone.
-///   2. DROPS the live orphan db (the shadow-swap restore will recreate + land the source into it),
-///      freeing the roles of their last ownership so a `DROP ROLE` succeeds.
-///   3. DROPS the remaining disposable asides AND BOTH derived roles via the shared core
-///      ([`reconcile_derived_role_tangle`] with `drop_roles = true`), deletes their sealed credentials,
-///      and REPROVISIONS the tenant fresh — new roles, fresh credentials, a clean empty live db.
+/// re-sync landed), it reuses [`hard_drop_orphan_tenant`]'s shared tangle-reconciliation primitives
+/// ([`classify_role_tangle`], [`drop_orphan_aside_db`], [`clear_exclusive_role`]) in an ORDER chosen so
+/// `REASSIGN OWNED`'s greedy shared-object sweep never touches a disposable aside:
+///   A. Clears the TRANSIENT swap-scratch asides FIRST: `__shadow_` (incoming restore scratch) is a
+///      safe hard-drop; a POPULATED `__old_` (a crash between the swap renames can leave it the ONLY
+///      data copy) is soft-deprovisioned to a recoverable tombstone, an EMPTY one hard-dropped
+///      ([`clear_db_dataloss_safe`] — FINDING 1).
+///   B. The EXISTING `__deleted_` grace tombstones: DROP under `--drop-soft-deleted` (pre-existing
+///      soft-deleted data ONLY — never the live orphan / a populated `__old_`), else PRESERVE.
+///   C. CLEARS the live orphan db DATA-LOSS-SAFELY ([`clear_db_dataloss_safe`], Security review E1) —
+///      the restore has NOT landed yet and a mid-restore failure leaves live untouched, so a POPULATED
+///      orphan is SOFT-DEPROVISIONED (renamed to a recoverable `__deleted_` tombstone, mirroring the
+///      fresh-dest invariant `pg_reconcile_fresh_dest_occupant`), an EMPTY one hard-dropped, and an
+///      ABSENT one (a crash freed the name — FINDING 2) a clean skip, NOT a fail-connect abort. NEVER
+///      gated on `--drop-soft-deleted` (FINDING 3 — the flag must not cause live-data loss).
+///   D. REASSIGNS every PRESERVED tombstone (+ its inner objects) to the stable superuser
+///      ([`reassign_aside_to_owner`] — its data SURVIVES while the roles are divorced from it). Done
+///      AFTER (A) so the sweep touches only the tombstones.
+///   E. DROPS BOTH derived roles ([`clear_exclusive_role`], self-guarding), then deletes their sealed
+///      credentials and REPROVISIONS the tenant fresh — new roles, fresh credentials, a clean empty
+///      live db — so the subsequent shadow-swap restore lands clean.
 ///
 /// FAIL-SAFE (HARD, unchanged): a role SHARED with a still-live sibling binding is LEFT fully intact
 /// ([`SharedWithLive`](SelfHealReport::SharedWithLive)) — the restore still proceeds, the live sibling
-/// never clobbered. On the FRESH-dest path the LIGHT untangle is kept (the fresh-dest occupant
-/// reconcile already preserved the occupant). A clean no-op / [`NotApplicable`](SelfHealReport::NotApplicable)
-/// for any binding that is not an applicable Shared-Postgres non-default managed tenant.
+/// never clobbered. On the FRESH-dest path the LIGHT untangle is kept BY DESIGN (E3, known-safe
+/// divergence): the fresh-dest occupant reconcile already preserved the occupant, and a role left
+/// REUSED there may still own a grace `__deleted_` tombstone — intentional grace-preservation,
+/// reconciled later by [`hard_drop_orphan_tenant`] / the grace reaper. A clean no-op /
+/// [`NotApplicable`](SelfHealReport::NotApplicable) for any binding that is not an applicable
+/// Shared-Postgres non-default managed tenant.
 pub async fn untangle_colliding_orphan_roles(
     deploy: &DeployStore,
     kv: &Arc<dyn KvStore>,
@@ -1821,56 +1984,114 @@ pub async fn untangle_colliding_orphan_roles(
     }
 
     // EXCLUSIVE TANGLE on the existing-dest re-sync → FULL SELF-HEAL.
-    // (1) PRESERVE each `__deleted_` grace tombstone FIRST (reassign to the superuser + DROP OWNED),
-    //     unless `--drop-soft-deleted` (then it is dropped below with the transient asides). Done
-    //     before any drop so the only must-survive data is divorced from the roles up front.
+    //
+    // ORDERING is load-bearing (Security review E1 + the REASSIGN-OWNED global sweep): `REASSIGN OWNED
+    // BY <role>` is GREEDY — it reassigns EVERY object the role owns, INCLUDING every shared database
+    // (so reassigning ONE tombstone to the superuser sweeps ALL of the role's databases). So the
+    // disposable TRANSIENT asides must be DROPPED FIRST (step A), before any reassign (step D) can
+    // sweep them to the superuser and leave them un-cleared.
     let mut preserved_tombstones: Vec<String> = Vec::new();
     let mut dropped_tombstones: Vec<String> = Vec::new();
+    let mut cleared_asides: Vec<String> = Vec::new();
+
+    // (A) Clear the disposable TRANSIENT swap-scratch asides FIRST — before the reassign sweep below,
+    //     which would otherwise reassign them to the superuser (never cleared). `__shadow_` is incoming
+    //     restore SCRATCH (never the only copy of tenant data) → always a safe hard-drop. `__old_` is a
+    //     swap RENAME-ASIDE of the live db — a crash between `pg_swap_shadow`'s renames can leave a
+    //     POPULATED `__old_` as the ONLY data copy, so it is cleared DATA-LOSS-SAFELY (Security review
+    //     FINDING 1): EMPTY → hard-drop, POPULATED → soft-deprovision to a recoverable `__deleted_`
+    //     tombstone (preserved, reassigned to the superuser in step D).
+    for aside in &class.own_asides {
+        if is_orphan_aside_markers(&names.database, aside, &["__shadow_"]) {
+            drop_orphan_aside_db(&admin, kind, aside).await?;
+            cleared_asides.push(aside.clone());
+        } else if is_orphan_aside_markers(&names.database, aside, &["__old_"]) {
+            match clear_db_dataloss_safe(
+                &admin,
+                deploy,
+                &creds,
+                kind,
+                compute,
+                superuser,
+                &names.database,
+                aside,
+            )
+            .await?
+            {
+                DbClear::Dropped => cleared_asides.push(aside.clone()),
+                DbClear::Preserved(tomb) => preserved_tombstones.push(tomb),
+                DbClear::Absent => {}
+            }
+        }
+    }
+
+    // (B) The EXISTING `__deleted_` grace tombstones: DROP under `--drop-soft-deleted` (the operator's
+    //     deliberate disposal of PRE-EXISTING soft-deleted data), else mark to PRESERVE (reassigned to
+    //     the superuser in step D). The flag governs ONLY these pre-existing tombstones — NEVER the live
+    //     orphan or a populated `__old_` (Security review FINDING 3: the flag must not cause live-data
+    //     loss on a restore failure).
     for aside in &class.own_asides {
         if is_orphan_aside_markers(&names.database, aside, &["__deleted_"]) {
             if drop_soft_deleted {
+                drop_orphan_aside_db(&admin, kind, aside).await?;
                 dropped_tombstones.push(aside.clone());
             } else {
-                reassign_aside_to_owner(
-                    deploy, &creds, kind, compute, superuser, superuser, aside, &roles,
-                )
-                .await?;
                 preserved_tombstones.push(aside.clone());
             }
         }
     }
-    // (2) DROP the live orphan db so the derived roles can be DROP ROLE'd — the shadow-swap restore
-    //     recreates + lands the source into the target name. (Mirror of `hard_drop_orphan_tenant`'s
-    //     terminate+drop step via the shared `drop_orphan_aside_db` terminate+DROP DATABASE helper.)
-    drop_orphan_aside_db(&admin, kind, &names.database).await?;
-    // (3) Drop the remaining disposable asides (transient always; + `__deleted_` iff `--drop-soft-
-    //     deleted`) AND DROP ROLE both derived roles — via the SHARED core.
-    let clear_markers: &[&str] = if drop_soft_deleted {
-        &ORPHAN_ASIDE_MARKERS
-    } else {
-        &TRANSIENT_ASIDE_MARKERS
-    };
-    let outcome = reconcile_derived_role_tangle(
+
+    // (C) Clear the live orphan db — DATA-LOSS-SAFELY, mirroring the fresh-dest occupant invariant
+    //     (`pg_reconcile_fresh_dest_occupant`). The restore has NOT landed yet; a mid-restore failure
+    //     tears the shadow down leaving live untouched, so HARD-dropping a POPULATED orphan here would
+    //     leave the tenant with NEITHER the source NOR the orphan — unrecoverable (Security review E1).
+    //     ALWAYS data-loss-safe (NEVER gated on `--drop-soft-deleted` — FINDING 3) and EXISTENCE-guarded
+    //     (an ABSENT primary — a crash left the derived name free + a populated `__old_` — is a clean
+    //     skip, NOT a fail-connect abort — FINDING 2): ABSENT → skip (reprovision recreates it); EMPTY →
+    //     hard-drop (the swap recreates); POPULATED → soft-deprovision to a recoverable `__deleted_`
+    //     tombstone (freeing the derived name for the restore), preserved so a failed restore is
+    //     recoverable.
+    match clear_db_dataloss_safe(
         &admin,
+        deploy,
+        &creds,
         kind,
-        &roles,
+        compute,
+        superuser,
         &names.database,
-        maint_db,
-        clear_markers,
-        true,
+        &names.database,
     )
-    .await?;
-    if !outcome.retained_roles.is_empty() {
-        // The roles should own NOTHING now (primary dropped, tombstone reassigned/dropped, transient
-        // asides cleared). A still-refused DROP ROLE means an unexpected live dependency — surface it
-        // (FATAL) rather than leave a half-healed tenant.
-        return Err(format!(
-            "self-heal: derived roles {:?} still have a live dependency after clearing the orphan's \
-             own objects — refusing to proceed (the tangle is not fully self-healed)",
-            outcome.retained_roles
-        ));
+    .await?
+    {
+        DbClear::Preserved(tomb) => preserved_tombstones.push(tomb),
+        DbClear::Dropped | DbClear::Absent => {}
     }
-    // (4) Delete the sealed per-tenant credentials so the reprovision mints FRESH ones.
+
+    // (D) REASSIGN every PRESERVED tombstone (+ its inner objects) to the stable superuser, DIVORCING
+    //     the derived roles (REASSIGN OWNED + DROP OWNED, per tombstone — the first call's REASSIGN
+    //     sweeps the shared db ownerships, each call reassigns its own db's LOCAL objects). Now the
+    //     transient asides are already gone (A), so the sweep touches ONLY the tombstones.
+    for tomb in &preserved_tombstones {
+        reassign_aside_to_owner(
+            deploy, &creds, kind, compute, superuser, superuser, tomb, &roles,
+        )
+        .await?;
+    }
+
+    // (E) DROP ROLE both derived roles — they now own NOTHING (transients dropped, tombstones
+    //     reassigned/dropped, the live orphan renamed-aside/dropped). The self-guarding
+    //     [`clear_exclusive_role`] refuses a DROP ROLE with a live dependency, so a still-entangled
+    //     role surfaces (FATAL) rather than leaving a half-healed tenant.
+    for role in &class.existing_roles {
+        if !clear_exclusive_role(&admin, kind, role, &names.database, maint_db).await? {
+            return Err(format!(
+                "self-heal: derived role {role:?} still has a live dependency after clearing the \
+                 orphan's own objects — refusing to proceed (the tangle is not fully self-healed)"
+            ));
+        }
+    }
+
+    // (F) Delete the sealed per-tenant credentials so the reprovision mints FRESH ones.
     let login_cred = credential_workload_key(compute, &ident);
     let owner_cred = owner_credential_workload_key(compute, &ident);
     for cred in [&login_cred, &owner_cred] {
@@ -1878,11 +2099,11 @@ pub async fn untangle_colliding_orphan_roles(
             tracing::info!(cred = %cred, error = %e, "self-heal: sealed credential delete skipped");
         }
     }
-    // (5) REPROVISION fresh — new roles + fresh credentials + a clean empty live db — so the
+    // (G) REPROVISION fresh — new roles + fresh credentials + a clean empty live db — so the
     //     subsequent shadow-swap restore lands clean.
     provision_tenant(deploy, kv, envelope, binding, project, "").await?;
     Ok(SelfHealReport::Healed {
-        cleared_asides: outcome.cleared_asides,
+        cleared_asides,
         preserved_tombstones,
         dropped_tombstones,
         roles_reprovisioned: class.existing_roles,
