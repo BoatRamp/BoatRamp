@@ -235,6 +235,16 @@ pub struct SyncArgs {
     /// except for the named blobs. PARITY with `project import --clone-from --only-blobs`.
     #[arg(long = "only-blobs", value_name = "MANIFEST")]
     only_blobs: Option<PathBuf>,
+
+    /// Managed-DB self-heal (DATA-LOSS opt-in): when a `project sync --apply` SELF-HEALS a prior-failed
+    /// managed-DB sync TANGLE (a Shared-Postgres tenant whose derived roles still own stray
+    /// orphan/tombstone/non-DB objects), additionally DESTROY the `__deleted_` grace TOMBSTONE(s) the
+    /// heal would otherwise PRESERVE. By default the heal PRESERVES each tombstone (reassigns it to the
+    /// stable superuser so its grace-recoverable data survives while the derived roles drop cleanly);
+    /// pass this only to deliberately discard that soft-deleted data. Has NO effect on a healthy sync
+    /// (the heal does not fire) — it only sharpens the recovery of an already-broken tenant.
+    #[arg(long = "drop-soft-deleted")]
+    drop_soft_deleted: bool,
 }
 
 impl SyncArgs {
@@ -739,6 +749,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
         kv_skip_notes: Vec::new(),
         continue_on_error: args.continue_on_error.clone(),
         only_blob_keys,
+        drop_soft_deleted: args.drop_soft_deleted,
         data_skip_notes: Vec::new(),
     };
     let applied = apply_sync(&plan, &mut exec).await?;
@@ -812,6 +823,10 @@ struct CliSyncExecutor {
     /// EXCLUSIVELY through the data-plane clone (parsed from a prior run's skip manifest). Empty ⇒
     /// transfer the whole data plane.
     only_blob_keys: Vec<String>,
+    /// Managed-DB self-heal (`--drop-soft-deleted`): on a self-heal of a prior-failed sync tangle,
+    /// additionally DESTROY the `__deleted_` grace tombstone(s) instead of preserving them. DATA-LOSS
+    /// opt-in; forwarded verbatim to the node's managed-DB sidecar restore reconcile.
+    drop_soft_deleted: bool,
     /// Blobs the data-plane clone SKIPPED-and-reported under a `--continue-on-error` policy (one note
     /// per skipped blob + the node-side skip-manifest path), drained into the operator report by
     /// `run()` so a human/CI sees the DISTINCT "applied WITH skips" outcome and can run the
@@ -893,6 +908,9 @@ impl CliSyncExecutor {
                 // target (construens acceptance bar D). `carry_kv_stratum` carries the control plane
                 // selectively instead (honouring --exclude-domains + the --identity-fresh domain drop).
                 req.skip_control_plane_kv,
+                // Managed-DB self-heal (`--drop-soft-deleted`): forward the DATA-LOSS opt-in verbatim
+                // to the node's sidecar restore reconcile (default false ⇒ grace tombstones preserved).
+                self.drop_soft_deleted,
                 mismatch,
             )
             .await
@@ -1249,6 +1267,7 @@ mod tests {
             kv_skip_notes: Vec::new(),
             continue_on_error: None,
             only_blob_keys: Vec::new(),
+            drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
         }
     }
@@ -1392,6 +1411,7 @@ mod tests {
             kv_skip_notes: Vec::new(),
             continue_on_error: Some("backend".to_string()),
             only_blob_keys: vec!["hblob/dst/web/assets/poison.jpg".to_string()],
+            drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
         };
 
@@ -1532,6 +1552,7 @@ mod tests {
             kv_skip_notes: Vec::new(),
             continue_on_error: None,
             only_blob_keys: Vec::new(),
+            drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
         };
 
@@ -1621,6 +1642,7 @@ mod tests {
             kv_skip_notes: Vec::new(),
             continue_on_error: None,
             only_blob_keys: Vec::new(),
+            drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
         };
         let err = exec
@@ -1735,6 +1757,7 @@ mod tests {
             kv_skip_notes: Vec::new(),
             continue_on_error: None,
             only_blob_keys: Vec::new(),
+            drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
         };
 

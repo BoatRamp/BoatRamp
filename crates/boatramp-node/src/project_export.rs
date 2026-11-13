@@ -4376,6 +4376,7 @@ impl NodeProjectExport {
                                 temp,
                                 stage_dir,
                                 opts.skip_control_plane_kv,
+                                opts.drop_soft_deleted,
                             )
                             .await?;
                         }
@@ -5945,6 +5946,7 @@ impl NodeProjectExport {
     /// maintenance connection runs ONLY our own trusted scaffolding DDL (create shadow + eph role,
     /// pre-create allow-listed extensions, the atomic swap, Shared re-provision) — never a byte of
     /// the dump. Any create/restore/swap failure tears the shadow down and leaves live untouched.
+    #[allow(clippy::too_many_arguments)]
     async fn pg_sidecar_shadow_restore(
         &self,
         project: &str,
@@ -5953,6 +5955,7 @@ impl NodeProjectExport {
         temp: &Path,
         stage_dir: &Path,
         fresh_dest: bool,
+        drop_soft_deleted: bool,
     ) -> Result<(), Perr> {
         let plan = self.pg_shadow_plan(project, db, cfg).await?;
         // FAIL-SAFE fresh-dest reconciliation (construens undeclared-orphan, DATA-LOSS-SENSITIVE):
@@ -5967,46 +5970,82 @@ impl NodeProjectExport {
         {
             return Err(e);
         }
-        // COLLIDING-ORPHAN ROLE-TANGLE reconcile (v0.59.6, construens's sixth-layer leak on the
-        // EXISTING-dest path): the fresh-dest reconcile above only fires on the absent-dest path and
-        // only PRESERVES a populated occupant. A prior FAILED/crashed swap can leave the Shared
-        // tenant's derived roles tangled with stray TRANSIENT `__old_`/`__shadow_` aside databases
-        // they still own; the existing-dest incremental mirror's swap lands the restore but LEAVES
-        // that tangle (the roles are REUSED, but they keep owning disposable junk → a later clean
-        // lifecycle hits an un-droppable object-owning role). Untangle it here on BOTH paths, reusing
-        // `hard_drop_orphan_tenant`'s EXACT reconciliation core: drop ONLY this tenant's own transient
-        // swap asides (never a grace `__deleted_` tombstone, never a foreign live-sibling db), leaving
-        // the reused roles + the live db intact (the swap owns the live db). Best-effort: a cleanup
-        // failure is logged but never fails an otherwise-successful restore. No-op off the Shared cell.
+        // COLLIDING-ORPHAN ROLE-TANGLE SELF-HEAL (v0.59.7; evolves the v0.59.6 light untangle —
+        // construens's requirement that `project sync --apply` fully self-heals any prior-failed
+        // managed-DB sync state with ZERO operator intervention). The fresh-dest reconcile above only
+        // fires on the absent-dest path and only PRESERVES a populated occupant. A prior FAILED/crashed
+        // sync can leave the Shared tenant's derived roles TANGLED — owning stray databases (a
+        // `__deleted_` grace tombstone, `__old_`/`__shadow_` swap-scratch asides) and/or NON-DB objects
+        // beyond the live db — which a later clean lifecycle then hits as an un-droppable,
+        // object-owning role. `untangle_colliding_orphan_roles` self-heals it (reusing
+        // `hard_drop_orphan_tenant`'s EXACT reconciliation core): GATED on DETECTING a tangle, a healthy
+        // re-sync is a cheap NO-OP that REUSES the stable roles; a detected EXCLUSIVE tangle on the
+        // existing-dest path (`fresh_dest = false` — construens's shape) is fully healed — each
+        // `__deleted_` tombstone PRESERVED (reassigned to the superuser) by default or DROPPED under
+        // `--drop-soft-deleted`, the orphan db dropped, BOTH derived roles dropped + reprovisioned
+        // fresh. The `shared_with_live` HARD GUARD leaves a role shared with a live sibling fully
+        // intact. FATAL on error: a detected tangle MUST self-heal, so a failure aborts the restore
+        // (the operator sees it rather than a silently half-healed state) — it runs BEFORE any shadow
+        // is created, so live is untouched on abort. No-op off the Shared cell.
         if plan.shared_reprovision.is_some()
             && let Some(envelope) = self.envelope.as_ref()
         {
-            match crate::tenant_sql::untangle_colliding_orphan_roles(
+            use crate::tenant_sql::SelfHealReport;
+            let report = crate::tenant_sql::untangle_colliding_orphan_roles(
                 &self.deploy,
                 &self.kv,
                 envelope,
                 cfg,
                 project,
+                fresh_dest,
+                drop_soft_deleted,
             )
             .await
-            {
-                Ok(cleared) if !cleared.is_empty() => {
+            .map_err(|e| {
+                Perr::Other(format!(
+                    "sync self-heal of the managed-DB tangle on {db:?} failed — refusing to proceed \
+                     (the restore is aborted with live untouched so the operator sees the tangle \
+                     rather than a silently half-healed tenant): {e}"
+                ))
+            })?;
+            match report {
+                SelfHealReport::Healed {
+                    ref cleared_asides,
+                    ref preserved_tombstones,
+                    ref dropped_tombstones,
+                    ref roles_reprovisioned,
+                } => {
                     tracing::info!(
                         database = %db,
-                        cleared_asides = ?cleared,
-                        "sync reconcile: cleared stray transient swap-aside databases a prior failed \
-                         sync left owned by this tenant's derived roles (untangled for a clean restore)"
+                        cleared_asides = ?cleared_asides,
+                        preserved_tombstones = ?preserved_tombstones,
+                        dropped_tombstones = ?dropped_tombstones,
+                        roles_reprovisioned = ?roles_reprovisioned,
+                        "sync self-heal: a prior-failed sync left this tenant's derived roles tangled \
+                         with stray objects — dropped + reprovisioned the roles fresh, cleared the \
+                         stray asides, and reconciled the orphan (grace tombstones preserved unless \
+                         --drop-soft-deleted); the restore lands clean"
                     );
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
+                SelfHealReport::LightUntangle { ref cleared_asides }
+                    if !cleared_asides.is_empty() =>
+                {
+                    tracing::info!(
                         database = %db,
-                        error = %e,
-                        "sync reconcile: could not untangle the orphan's stray swap asides (the \
-                         restore still proceeds; a later `db drop database --orphan` can clear them)"
+                        cleared_asides = ?cleared_asides,
+                        "sync reconcile (fresh-dest): cleared stray transient swap-aside databases a \
+                         prior failed sync left owned by this tenant's derived roles"
                     );
                 }
+                SelfHealReport::SharedWithLive { ref roles } => {
+                    tracing::info!(
+                        database = %db,
+                        retained_roles = ?roles,
+                        "sync self-heal: the tenant's derived roles are SHARED with a live sibling \
+                         binding — LEFT intact (the fail-safe never force-clears a live binding's data)"
+                    );
+                }
+                _ => {}
             }
         }
         // TRUSTED DDL (superuser/maint): mint the ephemeral NON-SUPERUSER role + the shadow it owns +

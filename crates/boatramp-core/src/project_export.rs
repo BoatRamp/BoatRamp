@@ -695,6 +695,15 @@ pub struct ImportOptions {
     /// guard — it only SKIPS a member; the managed-overlay RCE guard and the fresh-identity drop are
     /// unaffected (with the slice skipped there is nothing source-sealed to drop).
     pub skip_control_plane_kv: bool,
+    /// `project sync --drop-soft-deleted`: when the managed-DB sidecar restore SELF-HEALS a
+    /// prior-failed sync TANGLE (a Shared-Postgres tenant whose derived roles still own stray
+    /// orphan/tombstone/non-DB objects), additionally DROP the `__deleted_` grace TOMBSTONE(s) the
+    /// heal would otherwise PRESERVE. Default `false` ⇒ the heal PRESERVES each tombstone (reassigns
+    /// it from the derived role to the stable superuser so the role can drop cleanly while the
+    /// grace-recoverable data survives); `true` is the operator's deliberate opt-in to DESTROY the
+    /// soft-deleted data. DATA-LOSS-sensitive. Scoped to the self-heal path — it NEVER destroys a
+    /// tombstone on a healthy (un-tangled) sync, where the heal does not fire at all.
+    pub drop_soft_deleted: bool,
 }
 
 impl std::fmt::Debug for ImportOptions {
@@ -718,6 +727,7 @@ impl std::fmt::Debug for ImportOptions {
             )
             .field("expected_managed_restore", &self.expected_managed_restore)
             .field("skip_control_plane_kv", &self.skip_control_plane_kv)
+            .field("drop_soft_deleted", &self.drop_soft_deleted)
             .finish()
     }
 }

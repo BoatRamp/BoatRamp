@@ -1121,6 +1121,10 @@ impl ControlPlane {
         // DATA-PLANE-ONLY CLAMP: apply the managed-DB members of a FULL bundle but SKIP its
         // control-plane KV slice (so the source's domain layer never lands). Set on an absent-dest sync.
         skip_control_plane_kv: bool,
+        // Managed-DB self-heal (`--drop-soft-deleted`): on a self-heal of a prior-failed sync tangle,
+        // additionally DESTROY the `__deleted_` grace tombstone(s) rather than preserving them.
+        // DATA-LOSS opt-in; default false. Forwarded to the node's sidecar restore reconcile.
+        drop_soft_deleted: bool,
         mismatch: MismatchFlags,
     ) -> Result<CloneOutcome> {
         use boatramp_core::project_export::{CloneEvent, ClonePlan};
@@ -1146,6 +1150,7 @@ impl ControlPlane {
             "skip_any_blob_mismatch": mismatch.skip_any_blob,
             "only_blobs": mismatch.only_blobs,
             "skip_control_plane_kv": skip_control_plane_kv,
+            "drop_soft_deleted": drop_soft_deleted,
         });
         if let Some(sp) = source_project {
             body["source_project"] = serde_json::Value::String(sp.to_string());

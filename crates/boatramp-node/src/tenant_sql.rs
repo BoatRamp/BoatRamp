@@ -1504,6 +1504,66 @@ struct RoleTangleOutcome {
     cleared_asides: Vec<String>,
 }
 
+/// The READ-ONLY classification of a derived-role tangle — the shared DETECTION the role-tangle
+/// reconcile ([`reconcile_derived_role_tangle`]) AND the sync-path self-heal
+/// ([`untangle_colliding_orphan_roles`]) both drive off, so the DATA-LOSS-sensitive own-vs-foreign
+/// decision lives in ONE place (never a copied second scan). Pure reads (`role_exists` +
+/// `role_dependency_databases` + the pure [`is_orphan_aside`] classifier), no mutation — so a caller
+/// can DETECT a tangle and DECIDE what to do before touching anything.
+struct RoleTangleClass {
+    /// The subset of `roles` that actually EXIST (an already-absent role is a clean skip).
+    existing_roles: Vec<String>,
+    /// TRUE iff any role owns/depends on a database OUTSIDE this orphan's own derived namespace — a
+    /// still-live SIBLING binding (the HARD GUARD trips: leave everything).
+    shared_with_live: bool,
+    /// Every database (besides `primary` + the maintenance db) the roles own/depend on that IS one of
+    /// `primary`'s own [`ORPHAN_ASIDE_MARKERS`] asides (a tombstone / swap-scratch db) — this orphan's
+    /// own disposable-or-preservable data.
+    own_asides: std::collections::BTreeSet<String>,
+}
+
+/// Classify the derived roles' entanglement (read-only — see [`RoleTangleClass`]). Enumerates
+/// COMPREHENSIVELY every database each role still owns/depends on (EXCLUDING `primary` + the
+/// maintenance db) and splits them into THIS orphan's own [bounded asides](is_orphan_aside) vs a
+/// FOREIGN live-sibling database (the fail-safe trigger).
+async fn classify_role_tangle(
+    admin: &ComputeResolvedSqlBackend,
+    roles: &[&str],
+    primary: &str,
+    maint_db: &str,
+) -> Result<RoleTangleClass, String> {
+    let mut existing_roles: Vec<String> = Vec::new();
+    let mut own_asides: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut shared_with_live = false;
+    for role in roles.iter().copied() {
+        if role.is_empty() || !role_exists(admin, role).await? {
+            continue; // idempotent: an already-absent role is a clean skip.
+        }
+        existing_roles.push(role.to_string());
+        for db in role_dependency_databases(admin, role, primary, maint_db).await? {
+            if is_orphan_aside(primary, &db) {
+                own_asides.insert(db);
+            } else {
+                shared_with_live = true;
+                tracing::warn!(
+                    role = %role,
+                    foreign_db = %db,
+                    orphan = %primary,
+                    "role-tangle classify: per-tenant derived role is SHARED with a live binding \
+                     (owns/depends on a database outside this orphan's derived namespace) — the \
+                     reconcile/self-heal LEAVES it intact (force-clearing would clobber the live \
+                     binding's data)"
+                );
+            }
+        }
+    }
+    Ok(RoleTangleClass {
+        existing_roles,
+        shared_with_live,
+        own_asides,
+    })
+}
+
 /// The SHARED CORE of the derived-role tangle reconciliation — used by BOTH the explicit `--orphan`
 /// teardown ([`hard_drop_orphan_tenant`]) and the sync-path colliding-orphan reconcile
 /// ([`untangle_colliding_orphan_roles`]) so the DATA-LOSS-sensitive classification + fail-safe exist
@@ -1533,41 +1593,14 @@ async fn reconcile_derived_role_tangle(
     clear_markers: &[&str],
     drop_roles: bool,
 ) -> Result<RoleTangleOutcome, String> {
-    let mut existing_roles: Vec<&str> = Vec::new();
-    let mut asides_to_drop: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut shared_with_live = false;
-    for role in roles.iter().copied() {
-        if role.is_empty() || !role_exists(admin, role).await? {
-            continue; // idempotent: an already-absent role is a clean skip.
-        }
-        existing_roles.push(role);
-        for db in role_dependency_databases(admin, role, primary, maint_db).await? {
-            if is_orphan_aside(primary, &db) {
-                // THIS orphan's own aside — drop it only if its marker is disposable in this context
-                // (the sync path leaves a grace `__deleted_` tombstone by passing the transient set).
-                if is_orphan_aside_markers(primary, &db, clear_markers) {
-                    asides_to_drop.insert(db);
-                }
-            } else {
-                shared_with_live = true;
-                tracing::warn!(
-                    role = %role,
-                    foreign_db = %db,
-                    orphan = %primary,
-                    "role-tangle reconcile: per-tenant derived role is SHARED with a live binding \
-                     (owns/depends on a database outside this orphan's derived namespace) — LEFT \
-                     intact, not force-cleared (force-clearing it would clobber the live binding's data)"
-                );
-            }
-        }
-    }
+    let class = classify_role_tangle(admin, roles, primary, maint_db).await?;
 
-    if shared_with_live {
+    if class.shared_with_live {
         // HARD GUARD / fail-safe: a role entangled with a live sibling binding is LEFT WHOLE (the
         // roles AND their asides), so a live binding's data can never be clobbered. Surfaced to the
         // caller as retained.
         return Ok(RoleTangleOutcome {
-            retained_roles: existing_roles.iter().map(|r| (*r).to_string()).collect(),
+            retained_roles: class.existing_roles,
             cleared_asides: Vec::new(),
         });
     }
@@ -1576,75 +1609,284 @@ async fn reconcile_derived_role_tangle(
     // databases FIRST (so the owner no longer owns them), then — iff teardown — clear each role. A
     // `DROP ROLE` is SELF-GUARDING (Postgres refuses to drop a role any object still depends on), so
     // it can NEVER force past a live dependency; [`clear_exclusive_role`] uses exactly that and NEVER
-    // runs a blanket `DROP OWNED` nor drops a foreign database.
-    let cleared_asides: Vec<String> = asides_to_drop.iter().cloned().collect();
+    // runs a blanket `DROP OWNED` nor drops a foreign database. Only asides whose marker is disposable
+    // in THIS context are dropped (the sync path leaves a grace `__deleted_` tombstone by passing the
+    // transient set).
+    let asides_to_drop: Vec<String> = class
+        .own_asides
+        .iter()
+        .filter(|db| is_orphan_aside_markers(primary, db, clear_markers))
+        .cloned()
+        .collect();
     for aside in &asides_to_drop {
         drop_orphan_aside_db(admin, kind, aside).await?;
     }
     let mut retained_roles: Vec<String> = Vec::new();
     if drop_roles {
-        for role in &existing_roles {
+        for role in &class.existing_roles {
             if !clear_exclusive_role(admin, kind, role, primary, maint_db).await? {
-                retained_roles.push((*role).to_string());
+                retained_roles.push(role.clone());
             }
         }
     }
     Ok(RoleTangleOutcome {
         retained_roles,
-        cleared_asides,
+        cleared_asides: asides_to_drop,
     })
 }
 
-/// SYNC-path colliding-orphan role-tangle reconcile (v0.59.6). On a `project sync` into a Shared
-/// managed-pg tenant whose derived roles a PRIOR failed/crashed swap left tangled with stray TRANSIENT
-/// swap-aside databases (`__old_`/`__shadow_` of this tenant's own derived name, owner-owned — the
-/// construens leak the v0.59.4 FRESH-dest reconcile did not reach on the existing-dest incremental
-/// mirror), UNTANGLE the roles DATA-LOSS-SAFELY: drop ONLY this tenant's own transient swap-aside
-/// databases (NEVER a grace `__deleted_` tombstone, NEVER a foreign live-sibling database), and LEAVE
-/// the derived roles THEMSELVES intact (the same-identity re-sync REUSES them) and the live db
-/// untouched (the swap owns it). Reuses [`hard_drop_orphan_tenant`]'s exact tangle-reconciliation core
-/// and the shared-with-live fail-safe (the `drop_roles = false` seam). A clean no-op for any binding
-/// that is not an applicable Shared-Postgres non-default managed tenant, so it is safe to call
-/// unconditionally on the Shared sidecar restore path. Returns the aside databases it cleared.
+/// PRESERVE one of THIS orphan's own aside databases (a grace `__deleted_` tombstone) across the
+/// self-heal: fully DIVORCE the derived `roles` from it so a later `DROP ROLE` succeeds WITHOUT
+/// dropping the aside — its grace-recoverable data survives. Connected to the aside, `REASSIGN OWNED
+/// BY <roles> TO <maint_owner>` transfers every object the roles own there (and the aside DATABASE
+/// itself — a shared object) to the stable superuser/maintenance owner, then `DROP OWNED BY <roles>`
+/// revokes any residual privileges GRANTED to the roles there (so no `pg_shdepend` ACL row keeps the
+/// role un-droppable). A belt-and-suspenders `ALTER DATABASE … OWNER` re-asserts the datdba. Every
+/// name is STRUCTURAL (the derived role names + a bounded-aside name the classifier already matched),
+/// never operator/dump content; `maint_owner` is the configured superuser (never dropped). This is
+/// the ONLY place the self-heal runs `DROP OWNED`, and only in the EXCLUSIVE-tangle branch (a role
+/// shared with a live sibling never reaches here — the HARD GUARD leaves everything), so it can never
+/// revoke a live binding's shared-object privileges.
+#[allow(clippy::too_many_arguments)]
+async fn reassign_aside_to_owner(
+    deploy: &DeployStore,
+    creds: &ManagedSqlCredentials,
+    kind: ExternalSqlKind,
+    compute: &str,
+    superuser: &str,
+    maint_owner: &str,
+    aside: &str,
+    roles: &[&str],
+) -> Result<(), String> {
+    // Connect to the aside itself — REASSIGN/DROP OWNED act on the CURRENT database's objects (plus
+    // shared objects for REASSIGN), so they must run connected to the aside being preserved.
+    let aside_admin =
+        shared_admin_backend_for_db(deploy, creds, kind, compute, superuser, aside).await?;
+    let present: Vec<&str> = {
+        let mut v = Vec::new();
+        for role in roles.iter().copied() {
+            if !role.is_empty() && role_exists(&aside_admin, role).await? {
+                v.push(role);
+            }
+        }
+        v
+    };
+    if present.is_empty() {
+        return Ok(()); // nothing owns it (idempotent)
+    }
+    let roles_list = present
+        .iter()
+        .map(|r| boatramp_storage::tenant_provision::quote_ident(kind, r))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let owner_id = boatramp_storage::tenant_provision::quote_ident(kind, maint_owner);
+    aside_admin
+        .run_script(&format!("REASSIGN OWNED BY {roles_list} TO {owner_id};"))
+        .await
+        .map_err(|e| format!("self-heal: REASSIGN OWNED on tombstone {aside}: {e}"))?;
+    aside_admin
+        .run_script(&format!("DROP OWNED BY {roles_list};"))
+        .await
+        .map_err(|e| format!("self-heal: DROP OWNED on tombstone {aside}: {e}"))?;
+    // Belt-and-suspenders: re-assert the aside DATABASE's owner (REASSIGN OWNED above already moved
+    // the shared db object, but an explicit ALTER is unambiguous and idempotent).
+    let aside_id = boatramp_storage::tenant_provision::quote_ident(kind, aside);
+    aside_admin
+        .run_script(&format!("ALTER DATABASE {aside_id} OWNER TO {owner_id};"))
+        .await
+        .map_err(|e| format!("self-heal: ALTER DATABASE OWNER on tombstone {aside}: {e}"))?;
+    Ok(())
+}
+
+/// The outcome of the SYNC-path self-heal ([`untangle_colliding_orphan_roles`]) — a legible report
+/// for the restore path's logging + the FATAL decision (any `Err` aborts the restore so a detected
+/// tangle can never be left half-healed silently).
+#[derive(Debug, Clone)]
+pub enum SelfHealReport {
+    /// Not an applicable Shared-Postgres non-default managed tenant — a clean no-op.
+    NotApplicable,
+    /// A HEALTHY tenant (the derived roles own no stray object beyond the live db) — the roles are
+    /// REUSED untouched (no drop, no credential churn, no reprovision). The gating that keeps a clean
+    /// re-sync cheap.
+    NoOp,
+    /// FRESH-dest path: the LIGHT v0.59.4/v0.59.6 untangle (drop stray TRANSIENT swap-asides, reuse
+    /// roles) — the fresh-dest occupant reconcile already preserved the occupant, so the aggressive
+    /// drop+reprovision heal is reserved for the EXISTING-dest construens recovery.
+    LightUntangle { cleared_asides: Vec<String> },
+    /// FAIL-SAFE: the derived roles are SHARED with a still-live sibling binding — LEFT fully intact
+    /// (roles + asides + tombstone), the live sibling's data never touched (the HARD GUARD).
+    SharedWithLive { roles: Vec<String> },
+    /// FULL SELF-HEAL of an EXCLUSIVE tangle: the orphan's stray asides were cleared, each `__deleted_`
+    /// grace tombstone PRESERVED (reassigned to the superuser) unless `drop_soft_deleted`, the live
+    /// orphan db dropped, BOTH derived roles DROPPED + their sealed credentials deleted, and the tenant
+    /// REPROVISIONED fresh — so the subsequent shadow-swap restore lands clean.
+    Healed {
+        cleared_asides: Vec<String>,
+        preserved_tombstones: Vec<String>,
+        dropped_tombstones: Vec<String>,
+        roles_reprovisioned: Vec<String>,
+    },
+}
+
+/// SYNC-path colliding-orphan **SELF-HEAL** (v0.59.7; evolves the v0.59.6 light untangle). On a
+/// `project sync --apply` into a Shared managed-pg tenant whose derived roles a PRIOR failed/crashed
+/// sync left TANGLED — owning stray databases (a `__deleted_` grace tombstone, `__old_`/`__shadow_`
+/// swap-scratch asides) and/or NON-DB objects beyond the live db — FULLY self-heal the tangle with
+/// ZERO operator intervention (no `db drop --orphan`, no manual SQL), the construens requirement.
+///
+/// GATED on DETECTING a tangle ([`classify_role_tangle`]). A HEALTHY re-sync (the roles own no stray
+/// object) is a cheap [`NoOp`](SelfHealReport::NoOp): the stable roles are REUSED — no DROP ROLE, no
+/// credential churn, no reprovision. The aggressive heal fires ONLY on broken state.
+///
+/// On a DETECTED EXCLUSIVE tangle (existing-dest path, `fresh_dest = false` — where construens's
+/// re-sync landed), it reuses [`hard_drop_orphan_tenant`]'s shared tangle-reconciliation core and:
+///   1. PRESERVES each `__deleted_` grace tombstone by default — [`reassign_aside_to_owner`] moves it
+///      from the derived roles to the stable superuser (its data SURVIVES) so the roles drop cleanly.
+///      `drop_soft_deleted` (the `--drop-soft-deleted` opt-in) instead DROPS the tombstone.
+///   2. DROPS the live orphan db (the shadow-swap restore will recreate + land the source into it),
+///      freeing the roles of their last ownership so a `DROP ROLE` succeeds.
+///   3. DROPS the remaining disposable asides AND BOTH derived roles via the shared core
+///      ([`reconcile_derived_role_tangle`] with `drop_roles = true`), deletes their sealed credentials,
+///      and REPROVISIONS the tenant fresh — new roles, fresh credentials, a clean empty live db.
+///
+/// FAIL-SAFE (HARD, unchanged): a role SHARED with a still-live sibling binding is LEFT fully intact
+/// ([`SharedWithLive`](SelfHealReport::SharedWithLive)) — the restore still proceeds, the live sibling
+/// never clobbered. On the FRESH-dest path the LIGHT untangle is kept (the fresh-dest occupant
+/// reconcile already preserved the occupant). A clean no-op / [`NotApplicable`](SelfHealReport::NotApplicable)
+/// for any binding that is not an applicable Shared-Postgres non-default managed tenant.
 pub async fn untangle_colliding_orphan_roles(
     deploy: &DeployStore,
     kv: &Arc<dyn KvStore>,
     envelope: &Arc<dyn KeyEnvelope>,
     binding: &ExternalDatabaseConfig,
     project: &str,
-) -> Result<Vec<String>, String> {
+    fresh_dest: bool,
+    drop_soft_deleted: bool,
+) -> Result<SelfHealReport, String> {
     let Some(compute) = binding.compute.as_deref().filter(|c| !c.is_empty()) else {
-        return Ok(Vec::new());
+        return Ok(SelfHealReport::NotApplicable);
     };
     let Some(kind) = ExternalSqlKind::parse(&binding.kind) else {
-        return Ok(Vec::new());
+        return Ok(SelfHealReport::NotApplicable);
     };
     // Scoped to the Shared-Postgres non-default cell (the only cell with a per-tenant-db + derived
     // owner/login roles that a stray aside can tangle); every other binding is a clean no-op.
     if kind != ExternalSqlKind::Postgres || !matches!(binding.tenant, TenantIsolation::Shared) {
-        return Ok(Vec::new());
+        return Ok(SelfHealReport::NotApplicable);
     }
     let (tenant_ident_raw, is_default) = tenant_key(binding.tenant_scope, project, "");
     if is_default {
-        return Ok(Vec::new());
+        return Ok(SelfHealReport::NotApplicable);
     }
     let database = binding.database.as_deref().unwrap_or_default();
     let superuser = binding.user.as_deref().unwrap_or_default();
+    let ident = sanitize_ident(&tenant_ident_raw);
     let names = tenant_names(binding.tenant, compute, database, &tenant_ident_raw, false);
     let creds = ManagedSqlCredentials::new(kv.clone(), envelope.clone());
     let admin = shared_admin_backend(deploy, &creds, kind, compute, superuser).await?;
     let maint_db = maintenance_database(kind);
+    let roles = [names.role.as_str(), names.owner_role.as_str()];
+
+    // DETECT (read-only): classify the roles' entanglement.
+    let class = classify_role_tangle(&admin, &roles, &names.database, maint_db).await?;
+    if class.existing_roles.is_empty() || (class.own_asides.is_empty() && !class.shared_with_live) {
+        // HEALTHY / roles absent — REUSE the stable roles, touch nothing (the gating that keeps a
+        // clean re-sync cheap: no DROP ROLE, no credential churn, no reprovision).
+        return Ok(SelfHealReport::NoOp);
+    }
+    if class.shared_with_live {
+        // FAIL-SAFE HARD GUARD: a role entangled with a live sibling binding is LEFT WHOLE.
+        return Ok(SelfHealReport::SharedWithLive {
+            roles: class.existing_roles,
+        });
+    }
+
+    // FRESH-dest path: keep the LIGHT v0.59.4/v0.59.6 untangle (drop stray transient swap-asides,
+    // REUSE roles) — the fresh-dest occupant reconcile already preserved the occupant, so the
+    // aggressive drop+reprovision heal is reserved for the EXISTING-dest construens recovery below.
+    if fresh_dest {
+        let outcome = reconcile_derived_role_tangle(
+            &admin,
+            kind,
+            &roles,
+            &names.database,
+            maint_db,
+            &TRANSIENT_ASIDE_MARKERS,
+            false,
+        )
+        .await?;
+        return Ok(SelfHealReport::LightUntangle {
+            cleared_asides: outcome.cleared_asides,
+        });
+    }
+
+    // EXCLUSIVE TANGLE on the existing-dest re-sync → FULL SELF-HEAL.
+    // (1) PRESERVE each `__deleted_` grace tombstone FIRST (reassign to the superuser + DROP OWNED),
+    //     unless `--drop-soft-deleted` (then it is dropped below with the transient asides). Done
+    //     before any drop so the only must-survive data is divorced from the roles up front.
+    let mut preserved_tombstones: Vec<String> = Vec::new();
+    let mut dropped_tombstones: Vec<String> = Vec::new();
+    for aside in &class.own_asides {
+        if is_orphan_aside_markers(&names.database, aside, &["__deleted_"]) {
+            if drop_soft_deleted {
+                dropped_tombstones.push(aside.clone());
+            } else {
+                reassign_aside_to_owner(
+                    deploy, &creds, kind, compute, superuser, superuser, aside, &roles,
+                )
+                .await?;
+                preserved_tombstones.push(aside.clone());
+            }
+        }
+    }
+    // (2) DROP the live orphan db so the derived roles can be DROP ROLE'd — the shadow-swap restore
+    //     recreates + lands the source into the target name. (Mirror of `hard_drop_orphan_tenant`'s
+    //     terminate+drop step via the shared `drop_orphan_aside_db` terminate+DROP DATABASE helper.)
+    drop_orphan_aside_db(&admin, kind, &names.database).await?;
+    // (3) Drop the remaining disposable asides (transient always; + `__deleted_` iff `--drop-soft-
+    //     deleted`) AND DROP ROLE both derived roles — via the SHARED core.
+    let clear_markers: &[&str] = if drop_soft_deleted {
+        &ORPHAN_ASIDE_MARKERS
+    } else {
+        &TRANSIENT_ASIDE_MARKERS
+    };
     let outcome = reconcile_derived_role_tangle(
         &admin,
         kind,
-        &[names.role.as_str(), names.owner_role.as_str()],
+        &roles,
         &names.database,
         maint_db,
-        &TRANSIENT_ASIDE_MARKERS,
-        false,
+        clear_markers,
+        true,
     )
     .await?;
-    Ok(outcome.cleared_asides)
+    if !outcome.retained_roles.is_empty() {
+        // The roles should own NOTHING now (primary dropped, tombstone reassigned/dropped, transient
+        // asides cleared). A still-refused DROP ROLE means an unexpected live dependency — surface it
+        // (FATAL) rather than leave a half-healed tenant.
+        return Err(format!(
+            "self-heal: derived roles {:?} still have a live dependency after clearing the orphan's \
+             own objects — refusing to proceed (the tangle is not fully self-healed)",
+            outcome.retained_roles
+        ));
+    }
+    // (4) Delete the sealed per-tenant credentials so the reprovision mints FRESH ones.
+    let login_cred = credential_workload_key(compute, &ident);
+    let owner_cred = owner_credential_workload_key(compute, &ident);
+    for cred in [&login_cred, &owner_cred] {
+        if let Err(e) = creds.delete(project, cred).await {
+            tracing::info!(cred = %cred, error = %e, "self-heal: sealed credential delete skipped");
+        }
+    }
+    // (5) REPROVISION fresh — new roles + fresh credentials + a clean empty live db — so the
+    //     subsequent shadow-swap restore lands clean.
+    provision_tenant(deploy, kv, envelope, binding, project, "").await?;
+    Ok(SelfHealReport::Healed {
+        cleared_asides: outcome.cleared_asides,
+        preserved_tombstones,
+        dropped_tombstones,
+        roles_reprovisioned: class.existing_roles,
+    })
 }
 
 /// The **pure** decision of how a delete tears a tenant down — the engine/cell split

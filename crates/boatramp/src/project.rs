@@ -1219,6 +1219,9 @@ pub async fn run(
                         // operator asked for the whole project); only `project sync` clamps to
                         // data-plane-only to keep its selective control-plane contract.
                         false,
+                        // Managed-DB self-heal tombstone disposal is a `project sync` opt-in only; a
+                        // plain `project clone` always PRESERVES a grace tombstone (default false).
+                        false,
                         mismatch,
                     )
                     .await?;

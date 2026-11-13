@@ -5979,6 +5979,801 @@ async fn project_sync_colliding_orphan_reconcile_roles_live() {
     println!("PROJECT SYNC COLLIDING ORPHAN RECONCILE ROLES OK");
 }
 
+/// Build a Shared-Postgres managed binding for the self-heal tangle gate (a project-scoped tenant,
+/// `rls_session`, per-tenant owner + login roles) — the construens cell the self-heal targets.
+fn mk_shared_binding(
+    superuser: &str,
+    compute: &str,
+    database: &str,
+) -> boatramp_node::config::ExternalDatabaseConfig {
+    use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
+    ExternalDatabaseConfig {
+        kind: "postgres".into(),
+        compute: Some(compute.into()),
+        database: Some(database.into()),
+        user: Some(superuser.to_string()),
+        tenant: TenantIsolation::Shared,
+        tenant_scope: TenantScope::Project,
+        rls_session: true,
+        connect_timeout_secs: Some(10),
+        ..Default::default()
+    }
+}
+
+/// **Live SELF-HEAL of a prior-failed managed-DB sync TANGLE** (v0.59.7 — Tier-2 / nightly; needs a
+/// Docker daemon AND real Postgres). The construens requirement: `project sync --apply` must FULLY
+/// SELF-HEAL from any prior-failed Shared-Postgres managed-DB sync state with ZERO operator
+/// intervention — no `db drop --orphan`, no manual SQL. This gate reproduces construens's EXACT
+/// live-queried tangle on real pg16 and proves the sidecar restore self-heals it end-to-end:
+///
+/// THE TANGLE (seeded exactly): a Shared non-default tenant whose prior sync failed, leaving
+///   - the orphan DB at the derived target name, AT the 63-byte pg cap, OWNED BY the derived OWNER
+///     role (with an owner-owned AND a login-owned table inside);
+///   - a `__deleted_` grace TOMBSTONE whose name is the orphan name TRUNCATED to fit 63 bytes then
+///     `__deleted_<ts>` appended (a `bounded_aside_db_name` cap-collapse output), OWNED BY the OWNER
+///     role, carrying grace-recoverable data + an owner-owned AND a login-owned table;
+///   - TWO derived roles: the OWNER owns BOTH databases (orphan + tombstone); the LOGIN owns NO
+///     database (`datdba` null) but owns NON-DB objects (tables) inside both.
+///
+/// A (DEFAULT — preserve the tombstone): `project sync --apply` (no flag) self-heals with ZERO manual
+///    steps — the restore LANDS (source rows present), BOTH derived roles are DROPPED + reprovisioned
+///    FRESH (new OIDs), the orphan is reconciled, AND the `__deleted_` tombstone SURVIVES, REASSIGNED
+///    to the stable superuser with its grace data intact. MUTATION WITNESS: on current main the sync
+///    completes but the roles are REUSED (OIDs unchanged) and the tombstone stays OWNED BY the derived
+///    owner (never reassigned) — the tangle survives.
+///
+/// B (EXPLICIT FLAG — destroy the tombstone): the SAME tangle + `--drop-soft-deleted`
+///    (`drop_soft_deleted = true`) additionally DROPS the `__deleted_` tombstone; the rest self-heals
+///    identically. The operator's deliberate opt-in to destroy soft-deleted data.
+///
+/// C (HEALTHY NO-OP — the heal is gated on broken state only): a CLEAN tenant re-sync (no stray
+///    ownership) drops/rotates NOTHING — the derived roles are REUSED (OIDs UNCHANGED), no tombstone
+///    is created, and the restore lands. MUTATION WITNESS: if the heal fired on a clean sync the role
+///    OIDs would change (credential churn) — they must not.
+///
+/// D (FAIL-SAFE — never clobber a live sibling): the orphan's derived roles are SHARED with a LIVE
+///    sibling binding on the same server. The heal LEAVES the shared roles (OIDs UNCHANGED), their
+///    tombstone, and the live sibling's data fully intact (zero foreign bytes) — the `shared_with_live`
+///    HARD GUARD. MUTATION WITNESS: a naive force-heal would DROP the shared roles / clobber the live
+///    sibling's secret.
+///
+/// ≥2 tenants, each a SEPARATE physical db. Emits `PROJECT SYNC SELF-HEAL TANGLE OK`.
+#[tokio::test]
+async fn project_sync_self_heal_tangle_live() {
+    use boatramp_core::compute::{
+        Endpoint, InstanceHandle, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::envelope::KeyEnvelope;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::{DEFAULT_PROJECT, ProjectRef};
+    use boatramp_core::project_export::{
+        BundleScope, ExportOptions, ImportOptions, ManagedRestore, ProjectExport,
+    };
+    use boatramp_node::config::ExternalDatabaseConfig;
+    use boatramp_node::managed_sql::NodeOperatorSql;
+    use boatramp_node::project_export::NodeProjectExport;
+    use boatramp_node::tenant_sql::provision_tenant;
+    use boatramp_storage::tenant_provision::{
+        bounded_aside_db_name, sanitize_ident, tenant_db_name, tenant_owner_role_name,
+        tenant_role_name,
+    };
+    use std::collections::BTreeMap;
+
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL unset (self-heal tangle gate not run)");
+        return;
+    };
+    let Some((superuser, su_pw, host, port, _db)) = parse_pg_url(&url) else {
+        eprintln!("SKIP: BOATRAMP_TEST_PG_URL is not a postgres URL");
+        return;
+    };
+    let backend = match DockerBackend::connect() {
+        Ok(b) if b.reachable().await => b,
+        _ => {
+            eprintln!("SKIP: no reachable Docker daemon (self-heal tangle gate not run)");
+            return;
+        }
+    };
+    let backend: Arc<dyn ComputeBackend> = Arc::new(backend);
+
+    const COMPUTE: &str = "pg";
+    const BASE: &str = "shd";
+    let s = now_suffix();
+    let maint = conn(&superuser, &su_pw, &host, port, "postgres");
+    let (code, ver) = psql(
+        backend.as_ref(),
+        "postgres:16",
+        &maint,
+        "SHOW server_version_num",
+    )
+    .await;
+    assert_eq!(code, 0, "version detect; is the DSN reachable?");
+    let image = pg_client_image_for_server_version(&ver).expect("client image");
+
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let storage: Arc<dyn boatramp_core::Storage> = Arc::new(boatramp_storage::FsStorage::new(
+        std::env::temp_dir().join(format!("boatramp-shself-{s}")),
+    ));
+    let deploy = DeployStore::new(storage, kv.clone());
+    let envelope: Arc<dyn KeyEnvelope> =
+        Arc::new(boatramp_server::envelope::LocalKek::from_bytes([11u8; 32]));
+
+    // Seal the superuser credential + seed a healthy replica so the node's resolver reaches the DSN.
+    let sealed = envelope.wrap(su_pw.as_bytes()).await.expect("seal su pw");
+    kv.put(
+        &format!("managed-sql-cred/{DEFAULT_PROJECT}/{COMPUTE}"),
+        sealed,
+    )
+    .await
+    .expect("pre-seal superuser credential");
+    deploy
+        .set_replica_state(
+            ProjectRef::DEFAULT,
+            &ObservedInstance {
+                handle: InstanceHandle {
+                    project: DEFAULT_PROJECT.to_string(),
+                    workload: COMPUTE.to_string(),
+                    replica: 0,
+                    backend_ref: "test-external-pg".to_string(),
+                },
+                node: 0,
+                backend: "external".to_string(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: host.clone(),
+                    port,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase: ReplicaPhase::Running,
+                readiness: Readiness::Provisioned,
+                data_dir: None,
+                snapshot: None,
+                active_spec: None,
+            },
+        )
+        .await
+        .expect("seed healthy replica");
+
+    // A one-cell scalar probe on the maintenance connection (owned clones ⇒ reusable `Fn`).
+    let scalar = {
+        let (b, c, i) = (backend.clone(), maint.clone(), image.clone());
+        move |sql: String| {
+            let (b, c, i) = (b.clone(), c.clone(), i.clone());
+            async move {
+                let (_code, out) = psql(b.as_ref(), &i, &c, &sql).await;
+                out.trim().to_string()
+            }
+        }
+    };
+    let role_oid = |role: &str| scalar(format!("SELECT oid FROM pg_roles WHERE rolname='{role}'"));
+    let db_owner = |db: &str| {
+        scalar(format!(
+            "SELECT r.rolname FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE d.datname='{db}'"
+        ))
+    };
+    let db_exists = |db: &str| scalar(format!("SELECT 1 FROM pg_database WHERE datname='{db}'"));
+
+    // Seed the EXACT tangle into an ALREADY-PROVISIONED dest tenant (roles + live db exist): orphan
+    // objects (owner-owned + login-owned table), a truncated-name `__deleted_` tombstone owned by the
+    // owner, carrying grace data + an owner-owned + a login-owned table. Returns the derived names.
+    let seed_tangle = {
+        let (b, i, su, supw, host, maint) = (
+            backend.clone(),
+            image.clone(),
+            superuser.clone(),
+            su_pw.clone(),
+            host.clone(),
+            maint.clone(),
+        );
+        move |dest: String, ts: u64| {
+            let (b, i, su, supw, host, maint) = (
+                b.clone(),
+                i.clone(),
+                su.clone(),
+                supw.clone(),
+                host.clone(),
+                maint.clone(),
+            );
+            async move {
+                let ident = sanitize_ident(&dest);
+                let dest_db = tenant_db_name(BASE, &ident);
+                assert_eq!(
+                    dest_db.len(),
+                    63,
+                    "the derived orphan db must sit AT the 63-byte pg cap to exercise the tombstone \
+                     cap-collapse (gap #2) — got {} bytes: {dest_db}",
+                    dest_db.len()
+                );
+                let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+                let login_role = tenant_role_name(COMPUTE, &ident);
+                let tombstone = bounded_aside_db_name(&dest_db, "__deleted_", &ts.to_string());
+                assert!(
+                    tombstone.len() <= 63 && tombstone.ends_with(&format!("__deleted_{ts}")),
+                    "tombstone must be a cap-bounded `__deleted_` aside: {tombstone}"
+                );
+                // Orphan D: owner-owned + login-owned table (login owns NON-DB objects inside D).
+                let destc = conn(&su, &supw, &host, port, &dest_db);
+                let (c, o) = psql(
+                    b.as_ref(),
+                    &i,
+                    &destc,
+                    &format!(
+                        "SET ROLE \"{owner_role}\"; CREATE TABLE owned_live(i int); INSERT INTO owned_live VALUES(1); RESET ROLE; \
+                         GRANT CREATE ON SCHEMA public TO \"{login_role}\"; \
+                         SET ROLE \"{login_role}\"; CREATE TABLE login_live(i int); RESET ROLE;"
+                    ),
+                )
+                .await;
+                assert_eq!(c, 0, "seed orphan objects: {o}");
+                // Tombstone T: owner-owned db with grace data + an owner-owned + a login-owned table.
+                let _ = psql(
+                    b.as_ref(),
+                    &i,
+                    &maint,
+                    &format!("DROP DATABASE IF EXISTS \"{tombstone}\""),
+                )
+                .await;
+                let (c, o) = psql(
+                    b.as_ref(),
+                    &i,
+                    &maint,
+                    &format!("CREATE DATABASE \"{tombstone}\" OWNER \"{owner_role}\""),
+                )
+                .await;
+                assert_eq!(c, 0, "create tombstone db: {o}");
+                let tombc = conn(&su, &supw, &host, port, &tombstone);
+                let (c, o) = psql(
+                    b.as_ref(),
+                    &i,
+                    &tombc,
+                    &format!(
+                        "GRANT CREATE ON SCHEMA public TO \"{owner_role}\", \"{login_role}\"; \
+                         SET ROLE \"{owner_role}\"; \
+                         CREATE TABLE grace(v text); INSERT INTO grace VALUES('GRACE-RECOVERABLE'); \
+                         CREATE TABLE owned_in_tomb(i int); RESET ROLE; \
+                         SET ROLE \"{login_role}\"; CREATE TABLE login_in_tomb(i int); RESET ROLE;"
+                    ),
+                )
+                .await;
+                assert_eq!(c, 0, "seed tombstone objects: {o}");
+                (dest_db, tombstone, owner_role, login_role)
+            }
+        }
+    };
+
+    // Build a sync driver for a given databases map + tag (clones the shared node state per call).
+    let make_driver = {
+        let (kv, deploy, envelope, backend) = (
+            kv.clone(),
+            deploy.clone(),
+            envelope.clone(),
+            backend.clone(),
+        );
+        move |databases: BTreeMap<String, ExternalDatabaseConfig>, tag: &'static str| {
+            let op: Arc<dyn boatramp_core::sql::OperatorSql> = Arc::new(NodeOperatorSql::new(
+                databases.clone(),
+                kv.clone(),
+                Some(envelope.clone()),
+                deploy.clone(),
+            ));
+            let work = std::env::temp_dir().join(format!("boatramp-shself-{tag}-work-{s}"));
+            std::fs::create_dir_all(&work).unwrap();
+            let blobs: Arc<dyn boatramp_core::Storage> =
+                Arc::new(boatramp_storage::FsStorage::new(
+                    std::env::temp_dir().join(format!("boatramp-shself-{tag}-blobs-{s}")),
+                ));
+            NodeProjectExport::new(databases, deploy.clone(), kv.clone(), blobs, work)
+                .with_managed_pg(backend.clone(), envelope.clone(), op, false)
+                .with_trusted_extensions(vec![])
+        }
+    };
+
+    let export_opts = || ExportOptions {
+        scope: BundleScope::DataPlane,
+        managed_restore: ManagedRestore::ShadowSwap,
+        include_identity: false,
+        transport_key: None,
+        delta: None,
+    };
+    let import_opts = |drop_soft_deleted: bool| ImportOptions {
+        apply: true,
+        overwrite: true,
+        skip_control_plane_kv: false,
+        expected_managed_restore: Some(ManagedRestore::ShadowSwap),
+        drop_soft_deleted,
+        ..Default::default()
+    };
+
+    // =====================================================================================
+    // SCENARIO A (DEFAULT — the construens tangle, preserve the tombstone)
+    // =====================================================================================
+    {
+        const BINDING: &str = "shselfa";
+        let src = format!("shself-src-a-{s}");
+        let dest = format!("shself-dest-a-aaaaaaaaaaaaaaaaaaaa-{s}");
+        let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+        let databases = BTreeMap::from([(BINDING.to_string(), binding.clone())]);
+        let src_db = tenant_db_name(BASE, &sanitize_ident(&src));
+
+        for p in [&src, &dest] {
+            provision_tenant(&deploy, &kv, &envelope, &binding, p, "")
+                .await
+                .unwrap_or_else(|e| panic!("provision {p}: {e}"));
+        }
+        let (dest_db, tombstone, owner_role, login_role) =
+            seed_tangle(dest.clone(), 1_794_321_365 + (s % 1_000_000)).await;
+        let (c, o) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &src_db),
+            "CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES('A','src-a'),('B','src-b');",
+        )
+        .await;
+        assert_eq!(c, 0, "seed src: {o}");
+
+        // Precondition: the tangle EXISTS. Owner owns BOTH orphan + tombstone; login owns NO db but
+        // owns non-DB objects inside the orphan.
+        let owns_dbs = scalar(format!(
+            "SELECT count(*) FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE r.rolname='{owner_role}' AND d.datname IN ('{dest_db}','{tombstone}')"
+        ))
+        .await;
+        assert_eq!(
+            owns_dbs, "2",
+            "precondition: owner must own BOTH orphan + tombstone"
+        );
+        let login_owns_db = scalar(format!(
+            "SELECT count(*) FROM pg_database WHERE datdba=(SELECT oid FROM pg_roles WHERE rolname='{login_role}')"
+        ))
+        .await;
+        assert_eq!(login_owns_db, "0", "precondition: login owns NO database");
+        let (_c, login_objs) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &dest_db),
+            &format!("SELECT count(*) FROM pg_class WHERE relowner=(SELECT oid FROM pg_roles WHERE rolname='{login_role}') AND relkind='r'"),
+        )
+        .await;
+        assert_ne!(
+            login_objs.trim(),
+            "0",
+            "precondition: login owns non-DB objects inside the orphan"
+        );
+
+        let owner_oid_before = role_oid(&owner_role).await;
+        let login_oid_before = role_oid(&login_role).await;
+        assert!(!owner_oid_before.is_empty() && !login_oid_before.is_empty());
+
+        // THE SELF-HEAL SYNC — existing-dest re-sync (skip_control_plane_kv=false ⇒ fresh_dest=false),
+        // the path construens's re-sync took. NO flag (default preserve).
+        let driver = make_driver(databases.clone(), "a");
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        driver
+            .export(&src, &export_opts(), &mut sink)
+            .await
+            .expect("export source");
+        let bundle = sink.into_inner();
+        let mut body = futures::io::Cursor::new(bundle.clone());
+        driver
+            .import(&dest, &mut body, import_opts(false))
+            .await
+            .unwrap_or_else(|e| panic!("self-heal sync into the construens tangle MUST LAND: {e}"));
+
+        // (A1) restore LANDED: source rows present on the live dest.
+        let (_c, got) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &dest_db),
+            "SELECT tid||':'||v FROM marker ORDER BY tid",
+        )
+        .await;
+        assert_eq!(
+            got, "A:src-a\nB:src-b",
+            "the self-heal restore must land the SOURCE rows"
+        );
+
+        // (A2) MUTATION WITNESS — the tombstone SURVIVES, REASSIGNED to the stable superuser.
+        assert_eq!(
+            db_exists(&tombstone).await,
+            "1",
+            "the `__deleted_` tombstone must SURVIVE (default preserve)"
+        );
+        assert_eq!(
+            db_owner(&tombstone).await,
+            superuser,
+            "MUTATION WITNESS: the tombstone must be REASSIGNED to the stable superuser (on main it \
+             stays owned by the derived owner — the tangle survives)"
+        );
+        // (A3) the tombstone's grace data is intact.
+        let (_c, grace) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &tombstone),
+            "SELECT v FROM grace",
+        )
+        .await;
+        assert_eq!(
+            grace.trim(),
+            "GRACE-RECOVERABLE",
+            "the tombstone's grace data must survive intact"
+        );
+
+        // (A4) MUTATION WITNESS — BOTH derived roles DROPPED + reprovisioned FRESH (new OIDs).
+        let owner_oid_after = role_oid(&owner_role).await;
+        let login_oid_after = role_oid(&login_role).await;
+        assert!(
+            !owner_oid_after.is_empty() && !login_oid_after.is_empty(),
+            "roles must be reprovisioned (present)"
+        );
+        assert_ne!(
+            owner_oid_after, owner_oid_before,
+            "MUTATION WITNESS: the OWNER role must be DROPPED + reprovisioned FRESH (new OID); on main \
+             it is reused (OID unchanged)"
+        );
+        assert_ne!(
+            login_oid_after, login_oid_before,
+            "MUTATION WITNESS: the LOGIN role must be DROPPED + reprovisioned FRESH (new OID); on main \
+             it is reused (OID unchanged)"
+        );
+
+        // (A5) the fresh owner owns ONLY the restored live db (not the tombstone anymore).
+        let owns_after = scalar(format!(
+            "SELECT coalesce(string_agg(d.datname,',' ORDER BY d.datname),'') FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE r.rolname='{owner_role}'"
+        ))
+        .await;
+        assert_eq!(
+            owns_after, dest_db,
+            "after the heal the fresh owner must own ONLY the restored live db"
+        );
+
+        for db in [&src_db, &dest_db, &tombstone] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            )
+            .await;
+        }
+        for r in [&owner_role, &login_role] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP ROLE IF EXISTS \"{r}\""),
+            )
+            .await;
+        }
+    }
+
+    // =====================================================================================
+    // SCENARIO B (EXPLICIT FLAG — same tangle + `--drop-soft-deleted`: destroy the tombstone)
+    // =====================================================================================
+    {
+        const BINDING: &str = "shselfb";
+        let src = format!("shself-src-b-{s}");
+        let dest = format!("shself-dest-b-bbbbbbbbbbbbbbbbbbbb-{s}");
+        let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+        let databases = BTreeMap::from([(BINDING.to_string(), binding.clone())]);
+        let src_db = tenant_db_name(BASE, &sanitize_ident(&src));
+
+        for p in [&src, &dest] {
+            provision_tenant(&deploy, &kv, &envelope, &binding, p, "")
+                .await
+                .unwrap_or_else(|e| panic!("provision {p}: {e}"));
+        }
+        let (dest_db, tombstone, owner_role, login_role) =
+            seed_tangle(dest.clone(), 1_794_000_001 + (s % 1_000_000)).await;
+        let (c, o) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &src_db),
+            "CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES('A','src-b-a');",
+        )
+        .await;
+        assert_eq!(c, 0, "seed src b: {o}");
+        let owner_oid_before = role_oid(&owner_role).await;
+
+        let driver = make_driver(databases.clone(), "b");
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        driver
+            .export(&src, &export_opts(), &mut sink)
+            .await
+            .expect("export b");
+        let bundle = sink.into_inner();
+        let mut body = futures::io::Cursor::new(bundle.clone());
+        driver
+            .import(&dest, &mut body, import_opts(true)) // --drop-soft-deleted
+            .await
+            .unwrap_or_else(|e| panic!("self-heal sync (drop-soft-deleted) MUST LAND: {e}"));
+
+        let (_c, got) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &dest_db),
+            "SELECT tid||':'||v FROM marker ORDER BY tid",
+        )
+        .await;
+        assert_eq!(
+            got, "A:src-b-a",
+            "the drop-soft-deleted heal must land the source rows"
+        );
+        // MUTATION WITNESS: with the flag the tombstone is DROPPED.
+        assert_eq!(
+            db_exists(&tombstone).await,
+            "",
+            "with `--drop-soft-deleted` the `__deleted_` tombstone must be DROPPED"
+        );
+        assert_ne!(
+            role_oid(&owner_role).await,
+            owner_oid_before,
+            "flag path: owner role still reprovisioned fresh"
+        );
+
+        for db in [&src_db, &dest_db, &tombstone] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            )
+            .await;
+        }
+        for r in [&owner_role, &login_role] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP ROLE IF EXISTS \"{r}\""),
+            )
+            .await;
+        }
+    }
+
+    // =====================================================================================
+    // SCENARIO C (HEALTHY NO-OP — a clean re-sync drops/rotates NOTHING)
+    // =====================================================================================
+    {
+        const BINDING: &str = "shselfc";
+        let src = format!("shself-src-c-{s}");
+        let dest = format!("shself-dest-c-cccccccccccccccccccc-{s}");
+        let binding = mk_shared_binding(&superuser, COMPUTE, BASE);
+        let databases = BTreeMap::from([(BINDING.to_string(), binding.clone())]);
+        let src_db = tenant_db_name(BASE, &sanitize_ident(&src));
+        let ident = sanitize_ident(&dest);
+        let dest_db = tenant_db_name(BASE, &ident);
+        let owner_role = tenant_owner_role_name(COMPUTE, &ident);
+        let login_role = tenant_role_name(COMPUTE, &ident);
+
+        for p in [&src, &dest] {
+            provision_tenant(&deploy, &kv, &envelope, &binding, p, "")
+                .await
+                .unwrap_or_else(|e| panic!("provision {p}: {e}"));
+        }
+        // dest carries live data, NO stray ownership (a healthy tenant).
+        let (c, o) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &dest_db),
+            &format!("SET ROLE \"{owner_role}\"; CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES('X','old'); RESET ROLE;"),
+        )
+        .await;
+        assert_eq!(c, 0, "seed clean dest: {o}");
+        let (c, o) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &src_db),
+            "CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES('X','new');",
+        )
+        .await;
+        assert_eq!(c, 0, "seed clean src: {o}");
+
+        let owner_oid_before = role_oid(&owner_role).await;
+        let login_oid_before = role_oid(&login_role).await;
+
+        let driver = make_driver(databases.clone(), "c");
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        driver
+            .export(&src, &export_opts(), &mut sink)
+            .await
+            .expect("export c");
+        let bundle = sink.into_inner();
+        let mut body = futures::io::Cursor::new(bundle.clone());
+        driver
+            .import(&dest, &mut body, import_opts(false))
+            .await
+            .unwrap_or_else(|e| panic!("clean re-sync MUST LAND: {e}"));
+
+        let (_c, got) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &dest_db),
+            "SELECT v FROM marker ORDER BY tid",
+        )
+        .await;
+        assert_eq!(
+            got.trim(),
+            "new",
+            "the clean re-sync must land the source rows"
+        );
+        // MUTATION WITNESS (gating): roles REUSED — OIDs UNCHANGED, no heal, no churn.
+        assert_eq!(
+            role_oid(&owner_role).await,
+            owner_oid_before,
+            "HEALTHY NO-OP: a clean re-sync must REUSE the owner role (OID unchanged — no drop/churn)"
+        );
+        assert_eq!(
+            role_oid(&login_role).await,
+            login_oid_before,
+            "HEALTHY NO-OP: a clean re-sync must REUSE the login role (OID unchanged — no drop/churn)"
+        );
+        // No tombstone was conjured by a clean re-sync.
+        let tomb_like = scalar(format!(
+            "SELECT count(*) FROM pg_database WHERE datname LIKE '{prefix}%__deleted_%'",
+            prefix = &dest_db[..dest_db.len().min(40)]
+        ))
+        .await;
+        assert_eq!(
+            tomb_like, "0",
+            "a clean re-sync must not conjure a `__deleted_` tombstone"
+        );
+
+        for db in [&src_db, &dest_db] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            )
+            .await;
+        }
+        for r in [&owner_role, &login_role] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP ROLE IF EXISTS \"{r}\""),
+            )
+            .await;
+        }
+    }
+
+    // =====================================================================================
+    // SCENARIO D (FAIL-SAFE — shared-with-live: never clobber a live sibling)
+    // =====================================================================================
+    {
+        let shar = format!("shself-shar-d-dddddddddddddddddddd-{s}");
+        let shar_src = format!("shself-sharsrc-d-{s}");
+        const D1: &str = "shselfd1";
+        const D2: &str = "shselfd2";
+        const DB1: &str = "shdd1";
+        const DB2: &str = "shdd2";
+        let d1 = mk_shared_binding(&superuser, COMPUTE, DB1);
+        let d2 = mk_shared_binding(&superuser, COMPUTE, DB2);
+        let shar_ident = sanitize_ident(&shar);
+        let shared_owner = tenant_owner_role_name(COMPUTE, &shar_ident);
+        let shared_login = tenant_role_name(COMPUTE, &shar_ident);
+        let d1_db = tenant_db_name(DB1, &shar_ident);
+        let d2_db = tenant_db_name(DB2, &shar_ident);
+        let d1_tomb = bounded_aside_db_name(
+            &d1_db,
+            "__deleted_",
+            &format!("{}", 1_793_000_001 + (s % 1_000_000)),
+        );
+        let d1_src_db = tenant_db_name(DB1, &sanitize_ident(&shar_src));
+
+        provision_tenant(&deploy, &kv, &envelope, &d1, &shar, "")
+            .await
+            .unwrap_or_else(|e| panic!("provision D1: {e}"));
+        provision_tenant(&deploy, &kv, &envelope, &d2, &shar, "")
+            .await
+            .unwrap_or_else(|e| panic!("provision D2: {e}"));
+        provision_tenant(&deploy, &kv, &envelope, &d1, &shar_src, "")
+            .await
+            .unwrap_or_else(|e| panic!("provision D1 src: {e}"));
+
+        // Live sibling D2: a secret the shared owner owns (what a naive force-heal would destroy).
+        let (c, o) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &d2_db),
+            &format!("SET ROLE \"{shared_owner}\"; CREATE TABLE live_secret(v text); INSERT INTO live_secret VALUES('DO-NOT-CLOBBER'); RESET ROLE;"),
+        )
+        .await;
+        assert_eq!(c, 0, "seed D2 live secret: {o}");
+        // Source D1 rows + a `__deleted_` tombstone of D1 the SHARED owner owns (the tangle).
+        let (c, o) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &d1_src_db),
+            "CREATE TABLE marker(tid text, v text); INSERT INTO marker VALUES('A','d1-a');",
+        )
+        .await;
+        assert_eq!(c, 0, "seed D1 src: {o}");
+        let (c, o) = psql(
+            backend.as_ref(),
+            &image,
+            &maint,
+            &format!("CREATE DATABASE \"{d1_tomb}\" OWNER \"{shared_owner}\""),
+        )
+        .await;
+        assert_eq!(c, 0, "create D1 tombstone owned by the shared owner: {o}");
+
+        let shared_owner_oid_before = role_oid(&shared_owner).await;
+
+        let src_driver = make_driver(BTreeMap::from([(D1.to_string(), d1.clone())]), "dsrc");
+        let driver = make_driver(
+            BTreeMap::from([(D1.to_string(), d1.clone()), (D2.to_string(), d2.clone())]),
+            "d",
+        );
+
+        let mut sink = futures::io::Cursor::new(Vec::<u8>::new());
+        src_driver
+            .export(&shar_src, &export_opts(), &mut sink)
+            .await
+            .expect("export D1 src");
+        let bundle = sink.into_inner();
+        let mut body = futures::io::Cursor::new(bundle.clone());
+        driver
+            .import(&shar, &mut body, import_opts(false))
+            .await
+            .unwrap_or_else(|e| panic!("re-sync of D1 (shared-role tenant) MUST LAND: {e}"));
+
+        // (D1) the live sibling's data survives UNCHANGED (zero foreign bytes).
+        let (_c, live_secret) = psql(
+            backend.as_ref(),
+            &image,
+            &conn(&superuser, &su_pw, &host, port, &d2_db),
+            "SELECT v FROM live_secret",
+        )
+        .await;
+        assert_eq!(
+            live_secret.trim(),
+            "DO-NOT-CLOBBER",
+            "the live sibling's data MUST be preserved (fail-safe)"
+        );
+        // (D2) the shared roles are LEFT intact — OIDs UNCHANGED (never force-dropped).
+        assert_eq!(
+            role_oid(&shared_owner).await,
+            shared_owner_oid_before,
+            "the shared owner role MUST be LEFT intact (OID unchanged) — a live sibling still uses it"
+        );
+        assert!(
+            !role_oid(&shared_login).await.is_empty(),
+            "the shared login role must remain present"
+        );
+        // (D3) the fail-safe LEFT the orphan's own tombstone too (never force-touched).
+        assert_eq!(
+            db_exists(&d1_tomb).await,
+            "1",
+            "the shared-with-live fail-safe must LEAVE the tombstone intact"
+        );
+
+        for db in [&d1_db, &d2_db, &d1_tomb, &d1_src_db] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            )
+            .await;
+        }
+        for r in [&shared_owner, &shared_login] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP ROLE IF EXISTS \"{r}\""),
+            )
+            .await;
+        }
+    }
+
+    println!("PROJECT SYNC SELF-HEAL TANGLE OK");
+}
+
 /// **Live CROSS-NODE TENANCY-MISMATCH fail-closed gate (I2 — DATA-LOSS corner)** (Tier-2 / nightly —
 /// needs a Docker daemon AND real Postgres). A cross-node `project sync` whose SOURCE framed the
 /// managed member as Single/dedicated (the CHUNKED streamed-shadow path) while the TARGET binding

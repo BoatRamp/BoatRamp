@@ -3535,6 +3535,11 @@ pub(super) struct ProjectImportQuery {
     /// `project sync` clone sets it; the control plane is carried by sync's selective KV-stratum path.
     #[serde(default)]
     skip_control_plane_kv: bool,
+    /// Managed-DB self-heal (`--drop-soft-deleted`): on a self-heal of a prior-failed managed-DB sync
+    /// tangle, additionally DESTROY the `__deleted_` grace tombstone(s) rather than preserving them.
+    /// DATA-LOSS opt-in; default `false` ⇒ the heal preserves each tombstone.
+    #[serde(default)]
+    drop_soft_deleted: bool,
     /// RESUMABLE mode (T3): a relative directory NAME under the node's configured
     /// `[serve] resumable_export_dir` base to import from (the output of a resumable
     /// export), instead of a streamed request body. Host-confined under the base.
@@ -3699,6 +3704,7 @@ pub(super) async fn project_import(
         only_blobs: parse_only_blobs(q.only_blobs.as_deref()),
         expected_managed_restore,
         skip_control_plane_kv: q.skip_control_plane_kv,
+        drop_soft_deleted: q.drop_soft_deleted,
     };
     // RESUMABLE mode (T3): import from a node-local member-object directory (the output of a
     // resumable export) named relative to the configured base — no request body. The host
@@ -3975,6 +3981,11 @@ pub(super) struct CloneFromRequest {
     /// selective KV-stratum path. Default `false` ⇒ a full bundle imports its control-plane slice.
     #[serde(default)]
     skip_control_plane_kv: bool,
+    /// Managed-DB self-heal (`project sync --drop-soft-deleted`): on a self-heal of a prior-failed
+    /// managed-DB sync tangle, additionally DESTROY the `__deleted_` grace tombstone(s) rather than
+    /// preserving them. DATA-LOSS opt-in; default `false` ⇒ the heal preserves each tombstone.
+    #[serde(default)]
+    drop_soft_deleted: bool,
 }
 
 /// TARGET — the clone ORCHESTRATOR (`POST /api/projects/<target>/clone/from`, `Project·Admin`):
@@ -4130,6 +4141,9 @@ pub(super) async fn clone_from(
         // DATA still lands). `project sync` sets it on an absent-dest clone so the source's domain
         // layer never carries onto the fresh target.
         req.skip_control_plane_kv,
+        // Managed-DB self-heal (`--drop-soft-deleted`): forward the DATA-LOSS opt-in to the sidecar
+        // restore reconcile (default false ⇒ grace tombstones preserved).
+        req.drop_soft_deleted,
         CloneMismatchPolicy {
             enumerate: req.enumerate_mismatches,
             skip: req.skip_member_mismatch,
@@ -4364,6 +4378,9 @@ async fn orchestrate_clone(
     // DATA-PLANE-ONLY CLAMP: apply the managed-DB members of a full bundle but skip its control-plane
     // KV slice (the absent-dest sync path — keeps the source domain layer off the fresh target).
     skip_control_plane_kv: bool,
+    // Managed-DB self-heal (`--drop-soft-deleted`): on a self-heal of a prior-failed sync tangle,
+    // additionally DESTROY the `__deleted_` grace tombstone(s) rather than preserving them. DATA-LOSS.
+    drop_soft_deleted: bool,
     mismatch: CloneMismatchPolicy,
 ) -> Response {
     // 1. Manifest (cheap LIST).
@@ -4423,6 +4440,7 @@ async fn orchestrate_clone(
         only_blobs: mismatch.only_blobs.clone(),
         expected_managed_restore,
         skip_control_plane_kv,
+        drop_soft_deleted,
     };
     clone_progress_response(cap, target, plan, reader, opts)
 }
@@ -7728,6 +7746,7 @@ mod tests {
             false, // force
             None,  // expected_managed_restore
             false, // skip_control_plane_kv
+            false, // drop_soft_deleted
             CloneMismatchPolicy::default(),
         )
         .await;
@@ -7783,6 +7802,7 @@ mod tests {
             false, // force
             None,  // expected_managed_restore
             false, // skip_control_plane_kv
+            false, // drop_soft_deleted
             CloneMismatchPolicy::default(),
         )
         .await;
@@ -7849,6 +7869,7 @@ mod tests {
             false,
             None,  // expected_managed_restore
             false, // skip_control_plane_kv
+            false, // drop_soft_deleted
             CloneMismatchPolicy::default(),
         )
         .await;

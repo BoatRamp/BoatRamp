@@ -574,6 +574,13 @@ jobs:
           # shared-with-live fail-safe LEAVING a role shared with a live sibling. Self-skip trap → marker.
           grep -q 'PROJECT SYNC COLLIDING ORPHAN RECONCILE ROLES OK' project-export.log \
             || { echo "::error::colliding-orphan role-untangle gate never reached its marker (silent skip, the stray swap-aside leaked un-cleared on the existing-dest re-sync, or a role shared with a live sibling was force-cleared — DATA-LOSS risk)" >&2; exit 1; }
+          # SELF-HEAL of a prior-failed managed-DB sync TANGLE (v0.59.7): `project sync --apply` into the
+          # construens tangle self-heals with ZERO operator steps — restore lands, both derived roles
+          # dropped + reprovisioned fresh, the `__deleted_` tombstone preserved (reassigned to superuser)
+          # or dropped under --drop-soft-deleted, a clean re-sync a cheap no-op, the shared-with-live
+          # fail-safe intact. Self-skip trap → marker.
+          grep -q 'PROJECT SYNC SELF-HEAL TANGLE OK' project-export.log \
+            || { echo "::error::sync self-heal-tangle gate never reached its marker (silent skip, the tangle was not self-healed — roles left reused/un-dropped, the tombstone clobbered or left owner-owned, a clean re-sync churned roles, or a live sibling was force-cleared — DATA-LOSS risk)" >&2; exit 1; }
           # CROSS-NODE TENANCY-MISMATCH fail-closed (v0.59.6, I2 DATA-LOSS corner): a Single/dedicated-
           # framed (chunked) managed member applied into a SHARED tenant cell is REFUSED fail-closed, so
           # a populated Shared occupant is NEVER clobbered. Self-skip trap → marker.
