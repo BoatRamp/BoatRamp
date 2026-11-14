@@ -1139,8 +1139,11 @@ async fn tcp_egress_allowed(allowlist: &[String], addr: SocketAddr) -> bool {
 /// here because `boatramp-handlers` does not depend on `boatramp-types`.
 ///
 /// **Empty allowlist ⇒ `false`** (deny-all, fail-closed). A malformed entry (no `:port`, non-numeric
-/// port) simply never matches — nothing default-opens. This answers ONLY the name-membership
-/// question; the caller ([`resolve_and_gate_tcp_egress`]) still applies the `is_global_ip` SSRF floor
+/// port) simply never matches here — nothing default-opens; such an entry is ALSO rejected loudly at
+/// deploy by the matching lint `boatramp_types::config::validate_dynamic_egress_entry` (the two MUST
+/// agree on `host-glob:port` syntax — that lint rejects exactly the shapes this matcher silently
+/// drops). This answers ONLY the name-membership question; the caller ([`resolve_and_gate_tcp_egress`])
+/// still applies the `is_global_ip` SSRF floor
 /// to every RESOLVED address and the one-shot DNS-rebind choke (resolve once, connect to a pinned
 /// address). An IP-literal `host` is deliberately NOT matched here (it has no name to glob — that is
 /// the static [`tcp_egress_allowed`] path's concern), so the dynamic list can never widen reach to a

@@ -207,6 +207,7 @@ Matched after redirects, before static lookup. See
 | `invoke_targets` | list\<string\> | `[]` | Function names this handler may call via the `invoke` import — see [invoke_targets](#invoke_targets). |
 | `upload_containers` | list\<string\> | `[]` | Blob containers this handler may mint an S3 upload credential for via a [`blob-upload`](#imports) import — see [upload_containers](#upload_containers). Deny-by-default (empty ⇒ mint nothing). |
 | `egress_allowlist` | list\<string\> | `[]` | `host:port` / `ip:port` / `CIDR:port` targets this handler may dial via the [`wasi:sockets`](#imports) import — see [egress_allowlist](#egress_allowlist). Deny-by-default (empty ⇒ reach nothing). |
+| `dynamic_egress_hosts` | list\<string\> | `[]` | `host-glob:port` targets this handler may dial by NAME at runtime via the host-mediated [`wasi:sockets`](#imports) import (`connect-tls`) — see [dynamic_egress_hosts](#dynamic_egress_hosts). Deny-by-default; HTTPS-only; gated by the posture `allow_guest_dynamic_egress`. |
 | `dns_publish_zones` | list\<string\> | `[]` | Zone-suffix globs this handler may WRITE DNS records under via the [`dns-publish`](#imports) import — see [dns_publish_zones](#dns_publish_zones). Deny-by-default (empty ⇒ write nothing). |
 | `dns_publish_ns_targets` | list\<string\> | `[]` | Nameserver-target globs a sub-zone `NS` record this handler writes may delegate to — see [dns_publish_ns_targets](#dns_publish_ns_targets). Only consulted for a non-apex `NS` record when the node posture `guest_dns_publish_ns` is `allowlist`. |
 | `tenancy` | Tenancy? | `None` (inherit site) | Per-handler in-site [tenancy decision](./siteconfig.md#handlerstenancy) for this route, overriding the site-level ceiling. Absent ⇒ inherit the site decision. When present it must **narrow within** the site ceiling — a widening is refused fail-closed at bind. Same canonical RON shape as the site's, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own", write: "own")`. A `scoped` tenancy may add `exceed_site_ceiling: true` to deliberately **exceed** the ceiling (an authorized [inline exception](../how-to/tenant-isolation.md#an-unscoped-all-route-under-an-own-site-authorized-exception)) — takes effect only when the site sets [`allow_ceiling_exceptions`](./siteconfig.md#handlersallow_ceiling_exceptions) and (for `all`) the operator posture permits cross-tenant; otherwise the deploy is refused with a message naming the route. |
@@ -234,7 +235,7 @@ rejected at validate.
 | `admin:domains` / `admin:email` / `admin:site` / `admin:secrets` | A guest project-self-config surface via `boatramp:handlers/admin`. Each is a **specific** surface grant (a bare `admin` and `admin:*` are deliberately not accepted — deny-by-default, least-privilege) and is additionally gated by the matching `allow_guest_admin_*` posture knob (all off under `multi-tenant`). |
 | `session` | A duplex/resumable [session](#sessions) route's per-frame session binding. Accepted in `imports` but advertised only when the host is built with the `session` feature (the `requires` ABI gate enforces host support at activation). |
 | `tenancy` | Host-verify a guest-presented token to seal an async-lane producer context (`boatramp:handlers/tenancy` `present-token`). Accepted in `imports` but advertised only when the host is built with the `messaging` feature. |
-| `wasi:sockets` | Host-mediated outbound TCP `connect` (`boatramp:handlers/tcp-egress`) — never a raw socket. Gated by the per-handler [`egress_allowlist`](#egress_allowlist) (empty ⇒ deny-all) **and** the node posture `allow_guest_tcp_egress` (off under `multi-tenant`); the dial is connect-only and still SSRF-floored even against an allowlisted target. Advertised Experimental. |
+| `wasi:sockets` | Host-mediated outbound TCP `connect` (`boatramp:handlers/tcp-egress`) — never a raw socket. Gated by the per-handler [`egress_allowlist`](#egress_allowlist) (empty ⇒ deny-all) **and** the node posture `allow_guest_tcp_egress` (off under `multi-tenant`); the dial is connect-only and still SSRF-floored even against an allowlisted target. The SAME grant also drives the **runtime-resolved-host** dial via [`dynamic_egress_hosts`](#dynamic_egress_hosts) (gated by the separate posture `allow_guest_dynamic_egress`, HTTPS-only). Advertised Experimental. |
 | `dns-resolve` | Host-side MX/address resolution (`boatramp:handlers/dns-resolve`, `resolve-mx`/`resolve-addr`) without holding `wasi:sockets`. Gated by the same `allow_guest_tcp_egress` posture as `wasi:sockets`; results are SSRF-floored. Advertised Experimental. |
 | `dns-publish` | Host-side DNS **write** (`boatramp:handlers/dns-publish`) — the guest NAMES a zone/record and the host performs the mutation through a host-held provider credential (the guest never holds a zone-write token). Three-layer fail-closed gate: the node posture `allow_guest_dns_publish` (**off** in every built-in profile), the per-handler [`dns_publish_zones`](#dns_publish_zones) writable-zone allowlist (empty ⇒ deny-all), and a per-invocation rate budget + audit log. A sub-zone `NS` record's target is additionally checked against [`dns_publish_ns_targets`](#dns_publish_ns_targets) when the node posture `guest_dns_publish_ns` is `allowlist`. Advertised Experimental. |
 | `wasi:io`, `wasi:clocks`, `wasi:random`, `wasi:logging` | Standard host facilities (`wasi:logging` messages are captured into the site's logs alongside stdout/stderr). |
@@ -294,6 +295,41 @@ the SSRF floor unless the posture also allows private egress. Only consulted whe
 handlers: [ (route: "/api", component: "api.wasm", imports: ["wasi:sockets"], egress_allowlist: ["db.internal:5432"]) ],
 ```
 
+### `dynamic_egress_hosts`
+
+The deny-by-default allowlist for a **runtime-resolved host** the guest dials by NAME
+through the host-mediated [`wasi:sockets`](#imports) `tcp-egress` capability (BR-REQ-2).
+Unlike [`egress_allowlist`](#egress_allowlist) — which matches a *resolved peer IP* against a
+fixed deploy-time list — this matches the HOSTNAME the guest supplies at `connect-tls` time
+against operator-authored `host-glob:port` globs, so a per-tenant host **not known at deploy**
+(e.g. a per-tenant OIDC issuer like a tenant's Okta org) is reachable without widening the IP
+list. The specific host is resolved at runtime (from the guest's own per-tenant config); only
+the glob pattern is configured here.
+
+Entry syntax is `<host-glob>:<port>` with the same globbing as a DNS zone / gateway host:
+`oauth2.googleapis.com:443` (exact), `*.okta.com:443` (one label), `**.okta.com:443` (any
+depth), `**:443` (anything). A malformed entry (missing/non-numeric port, empty host-glob, a
+`*.`/`**.` with no suffix) is **rejected loudly at `apply`/`validate`**, not silently ignored.
+It is **HTTPS-only** (consulted ONLY on the implicit-TLS `connect-tls` dial — a plaintext dial
+never uses it), keeps the SSRF floor (every resolved address must be globally routable unless
+the posture allows private egress) and the one-shot DNS-rebind choke (resolve once, connect to
+a pinned address), and is only consulted when `imports` declares `wasi:sockets` **and** the node
+posture `allow_guest_dynamic_egress` is on (empty ⇒ deny-all).
+
+> **Operator caveats.** (1) A `**` entry allows **any** global host on that port — a footgun;
+> scope as tightly as the IdP allows. (2) The match is on the host NAME FAMILY, not a single IP:
+> a suffix like `*.okta.com` makes **every** org under that multi-tenant IdP reachable (it does
+> not pin to a specific tenant's IP). Prefer the most specific host you can.
+
+Honored on **handler, consumer, session, and standalone-function** components alike — a session
+component's guest gets the SAME gated egress (static `egress_allowlist` + this runtime-host list)
+a handler does, through the same `resolve_and_gate_tcp_egress` gate.
+
+```ron
+handlers: [ (route: "/sso/callback", component: "sso.wasm", imports: ["wasi:sockets"],
+             dynamic_egress_hosts: ["oauth2.googleapis.com:443", "www.googleapis.com:443", "*.okta.com:443"]) ],
+```
+
 ### `dns_publish_zones`
 
 The deny-by-default **writable-zone allowlist** (globs) for the gated
@@ -344,6 +380,7 @@ A component invoked once per message on a topic. See
 | `imports` | list\<string\> | Requested capabilities. |
 | `upload_containers` | list\<string\> | Blob containers this consumer may mint an S3 upload credential for via a [`blob-upload`](#imports) import — same deny-by-default allowlist and host-forced [`{tenant}` template](#upload_containers) as a handler's. |
 | `egress_allowlist` | list\<string\> | Outbound-TCP targets this consumer may dial via [`wasi:sockets`](#imports) — same deny-by-default [allowlist](#egress_allowlist) as a handler's. |
+| `dynamic_egress_hosts` | list\<string\> | Runtime-resolved `host-glob:port` targets this consumer may dial by NAME — same deny-by-default [allowlist](#dynamic_egress_hosts) as a handler's (HTTPS-only, posture `allow_guest_dynamic_egress`). |
 | `dns_publish_zones` | list\<string\> | Zone-suffix globs this consumer may WRITE DNS records under via [`dns-publish`](#imports) — same deny-by-default [allowlist](#dns_publish_zones) as a handler's. |
 | `dns_publish_ns_targets` | list\<string\> | Nameserver-target globs a sub-zone `NS` record this consumer writes may delegate to — see [dns_publish_ns_targets](#dns_publish_ns_targets). |
 | `group` | string | Consumer group. Empty (default) = the competing-consumer **work-queue** (one consumer handles each message); a non-empty name = a durable **fan-out** subscriber that receives *every* message on its own cursor, independent of other groups. |
@@ -391,6 +428,7 @@ backchannel.
 | `env` | map\<string, string\> | `{}` | Static environment variables (never secrets). |
 | `invoke_targets` | list\<string\> | `[]` | Function names the session may call via `invoke` (same contract as a handler's [`invoke_targets`](#invoke_targets)). |
 | `egress_allowlist` | list\<string\> | `[]` | Outbound-TCP targets the session may dial via [`wasi:sockets`](#imports) — same deny-by-default [allowlist](#egress_allowlist) as a handler's. (Distinct from a `[serve.listeners.<name>]` TCP listener's own `egress_allowlist`, which gates that listener's `promote-connection` escalation instead.) |
+| `dynamic_egress_hosts` | list\<string\> | `[]` | Runtime-resolved `host-glob:port` targets this session may dial by NAME — same deny-by-default [allowlist](#dynamic_egress_hosts) as a handler's (HTTPS-only, posture `allow_guest_dynamic_egress`). A session gets the SAME gated egress a handler does. |
 | `dns_publish_zones` | list\<string\> | `[]` | Zone-suffix globs the session may WRITE DNS records under via [`dns-publish`](#imports) — same deny-by-default [allowlist](#dns_publish_zones) as a handler's. |
 | `dns_publish_ns_targets` | list\<string\> | `[]` | Nameserver-target globs a sub-zone `NS` record the session writes may delegate to — see [dns_publish_ns_targets](#dns_publish_ns_targets). |
 | `tenancy` | Tenancy? | `None` (plain) | In-site [tenancy decision](./siteconfig.md#handlerstenancy) for this session's `sql`/`orm`. Resolved once at **open** from the verified source and carried across every re-entry, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own", write: "own")`. |

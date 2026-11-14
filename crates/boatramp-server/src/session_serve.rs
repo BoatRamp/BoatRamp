@@ -223,6 +223,27 @@ fn session_scope(project: &str, site: &str, preview: Option<&str>) -> String {
     boatramp_core::project::ProjectRef::new(project).qualified(&base)
 }
 
+/// Carry a session component's outbound-TCP allowlists into its synthesized `FunctionConfig`
+/// (BR-REQ-2 session egress PARITY): the static `egress_allowlist` and the runtime-host
+/// `dynamic_egress_hosts`, returned verbatim so `build_function_bindings` attaches them onto the
+/// session's `Bindings` (on the `wasi:sockets` grant) and the engine's `TcpEgressHost` runs the SAME
+/// `resolve_and_gate_tcp_egress` gate a handler's dial gets. Factored out of the `dispatch_session`
+/// synthesis so it is the ONE seam a test drives, and so it can carry the anti-hollow MUTATION:
+/// `BOATRAMP_TCPEGRESS_MUTATION=drop_session_egress` (test builds only — `#[cfg(test)]`, dead in a
+/// shipped build) reverts BOTH to deny-all, re-introducing the `..Default::default()` no-op, so the CI
+/// gate `session_egress_parity_gate` goes RED when the session's allowlist is ignored — proving the
+/// threading is load-bearing.
+pub(crate) fn session_egress_fields(
+    egress_allowlist: &[String],
+    dynamic_egress_hosts: &[String],
+) -> (Vec<String>, Vec<String>) {
+    #[cfg(test)]
+    if std::env::var("BOATRAMP_TCPEGRESS_MUTATION").ok().as_deref() == Some("drop_session_egress") {
+        return (Vec::new(), Vec::new());
+    }
+    (egress_allowlist.to_vec(), dynamic_egress_hosts.to_vec())
+}
+
 /// Open (or resume) a session's **outbound** SSE stream. `GET` half of a session route.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn serve_session_open(
@@ -580,6 +601,17 @@ pub(super) async fn dispatch_session_post(
     // the session controller scoped to this `(project, id)` so `send`/`checkpoint`/`close` reach the
     // store.
     let scope = session_scope(project, site, preview);
+    // BR-REQ-2 session egress PARITY: carry the session's own outbound-TCP allowlists so a session
+    // guest's gated `wasi:sockets`/`tcp-egress` `connect-tls` reaches EXACTLY what a handler's does —
+    // `build_function_bindings` attaches these onto the `Bindings` (on the `wasi:sockets` grant) and the
+    // engine's `TcpEgressHost` then runs the SAME `resolve_and_gate_tcp_egress` gate (static IP
+    // `egress_allowlist` + the `is_global_ip` SSRF floor + the `allow_guest_tcp_egress` /
+    // `allow_guest_dynamic_egress` postures + the `dynamic_egress_hosts` runtime-host validation). A
+    // plain `..Default::default()` would silently drop both into deny-all — the no-op this wiring
+    // resolves. `session_egress_fields` carries them through, and its MUTATION seam (`drop_session_egress`,
+    // test/gate only) re-introduces the drop so the CI gate proves this threading is load-bearing.
+    let (egress_allowlist, dynamic_egress_hosts) =
+        session_egress_fields(&session.egress_allowlist, &session.dynamic_egress_hosts);
     let fn_config = boatramp_core::function::FunctionConfig {
         imports: session.imports.clone(),
         limits: session.limits.clone(),
@@ -587,6 +619,8 @@ pub(super) async fn dispatch_session_post(
         invoke_targets: session.invoke_targets.clone(),
         tenancy: session.tenancy.clone(),
         token_claims: session.token_claims.clone(),
+        egress_allowlist,
+        dynamic_egress_hosts,
         ..Default::default()
     };
     let project_ref = boatramp_core::project::ProjectRef::new(project);
