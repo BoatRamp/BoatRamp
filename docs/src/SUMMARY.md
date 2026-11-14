@@ -66,6 +66,7 @@
   - [Ingest large uploads over S3 (blob-ingress)](./how-to/blob-ingress.md)
 - [Containers & microVMs]()
   - [Run a container or microVM](./how-to/compute.md)
+  - [Write a native compute worker](./how-to/native-compute-worker.md)
   - [Scale compute to zero](./how-to/scale-to-zero.md)
   - [Diagnose & work around compute issues](./how-to/diagnose-compute.md)
 - [Networking & gateway]()
