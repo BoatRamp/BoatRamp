@@ -902,20 +902,6 @@ async fn put_object(
         Ok(v) => v,
         Err(r) => return r,
     };
-    // Ensure the container MARKER exists so a worker-written container is first-class for a guest
-    // `wasi:blobstore` handler (whose `get-container` probes the marker). The marker key is composed
-    // from the SAME token-confined prefix as the object (see `authorize`), so it can never escape the
-    // token's own site/container. Done BEFORE the object write so the container is defined whenever
-    // the object lands; idempotent (probe-then-write) so an existing container's marker/creation-time
-    // is never clobbered and honest PUTs avoid a redundant write. A genuine backend fault surfaces.
-    // The `skip_marker` mutation seam (test / `compute-blob-shim-gate-mutation` only; a dead `None`
-    // in ships) neuters this ensure so the CI gate proves it load-bearing (a guest `get-container`
-    // then fails with `no such container`).
-    if blob_mutation().as_deref() != Some("skip_marker")
-        && let Err(err) = ensure_container_marker(&*storage, &marker_key).await
-    {
-        return storage_fault("put", &marker_key, err);
-    }
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -933,6 +919,23 @@ async fn put_object(
         && len > cap
     {
         return oversize(cap);
+    }
+    // Ensure the container MARKER exists so a worker-written container is first-class for a guest
+    // `wasi:blobstore` handler (whose `get-container` probes the marker). The marker key is composed
+    // from the SAME token-confined prefix as the object (see `authorize`), so it can never escape the
+    // token's own site/container. Done AFTER the up-front honest-`Content-Length` cap check (so a PUT
+    // rejected 413 on declared size leaves NO empty container behind) but BEFORE the object write (so
+    // the container is defined whenever the object lands). A dishonest Content-Length that only trips
+    // the streaming cap below can still leave the marker — an accepted edge (same keyspace; the worker
+    // could create the container anyway), not worth complicating the path. Idempotent (probe-then-
+    // write) so an existing container's marker/creation-time is never clobbered and honest PUTs avoid
+    // a redundant write. A genuine backend fault surfaces. The `skip_marker` mutation seam (test /
+    // `compute-blob-shim-gate-mutation` only; a dead `None` in ships) neuters this ensure so the CI
+    // gate proves it load-bearing (a guest `get-container` then fails with `no such container`).
+    if blob_mutation().as_deref() != Some("skip_marker")
+        && let Err(err) = ensure_container_marker(&*storage, &marker_key).await
+    {
+        return storage_fault("put", &marker_key, err);
     }
     // Streaming enforcement for a chunked / Content-Length-lying client: count bytes as they
     // arrive and abort the stream once the cap is crossed (the object is never fully buffered).
@@ -1571,6 +1574,43 @@ mod tests {
             markers,
             vec!["hblob/default/api/assets/.boatramp-container".to_string()],
             "a marker exists ONLY under the token's own site/container (no cross-container leak)"
+        );
+
+        // Marker ORDERING: a PUT rejected 413 up front on an honest over-cap `Content-Length` leaves
+        // NO marker — the marker-ensure runs only AFTER that fast-path check, so an oversized PUT does
+        // not create an empty container. (A small-cap shim + fresh store so the marker cannot pre-exist.)
+        let capped = BlobShim::new().with_max_object_bytes(4);
+        let cap_store: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        // Build the resolver inline (the `resolver` helper is shadowed by the local above).
+        let cap_resolver = BlobShimResolver::new(
+            Arc::new(GlobalBlobBackend::new(cap_store.clone())),
+            capped.clone(),
+            "http://10.0.0.1:8082".to_string(),
+            [9u8; 32],
+        );
+        let cap_env = cap_resolver
+            .resolve("default", "api", 0, &[blob_binding("assets")])
+            .await;
+        let cap_token = cap_env
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let oversize_put = Request::builder()
+            .method("PUT")
+            .uri("/assets/too-big.bin")
+            .header("authorization", format!("Bearer {cap_token}"))
+            .header("content-length", "999")
+            .body(Body::from(Vec::new()))
+            .unwrap();
+        let resp = capped.router().oneshot(oversize_put).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            cap_store
+                .head("hblob/default/api/assets/.boatramp-container")
+                .await
+                .is_err(),
+            "a PUT rejected 413 up front on Content-Length must leave no container marker"
         );
 
         println!("COMPUTE BLOB-SHIM SCOPED OK");
