@@ -58,8 +58,10 @@ mod generated_list {
 use generated_list::boatramp::handlers::blob_list;
 
 /// Marker object that records a container's existence (and creation time). Kept
-/// out of `list-objects` results.
-const MARKER: &str = ".boatramp-container";
+/// out of `list-objects` results. `pub` so the compute blob-shim (a SEPARATE crate whose
+/// PUT ensures this marker, and an OPTIONAL dependency — it cannot import this unconditionally)
+/// can cross-check its own copy of the string against this authoritative one in its gate.
+pub const MARKER: &str = ".boatramp-container";
 
 /// The reserved host-internal object namespace. NO guest object can start with this (the write side
 /// `validate_object_key` rejects `.boatramp*`); it holds the container [`MARKER`] and host-internal
@@ -1053,6 +1055,69 @@ pub async fn read_object_through_guest_binding(
         .unwrap_or(0);
     if size == 0 {
         // A present-but-empty object: consume a zero-length read rather than an inverted range.
+        let iv = host
+            .get_data(Resource::new_own(rep), object.to_string(), 0, 0)
+            .await?;
+        let bytes = host.incoming_value_consume_sync(iv).await?;
+        return Ok(if bytes.len() == 1 { Vec::new() } else { bytes });
+    }
+    let iv = host
+        .get_data(Resource::new_own(rep), object.to_string(), 0, size - 1)
+        .await?;
+    host.incoming_value_consume_sync(iv).await
+}
+
+/// **Test-support / gate helper.** Read an object back through the FULL guest `wasi:blobstore`
+/// CONTAINER handoff: `get-container(name)` → `container.has-object(key)` → `container.get-data(key)`,
+/// over a [`BlobBinding`] confined to `hblob/{site}/`. Unlike [`read_object_through_guest_binding`]
+/// (which builds the container handle DIRECTLY, deliberately skipping the marker probe), this drives
+/// the REAL [`get_container`](blobstore::blobstore::Host::get_container), whose [`marker_exists`] probe
+/// returns `no such container` when the `{prefix}{MARKER}` object is absent — so it fails exactly as a
+/// real guest would unless the container is FIRST-CLASS (its MARKER present). Proves the compute
+/// blob-shim PUT's marker-ensure makes a worker-written container openable by a `wasi:blobstore`
+/// handler. Returns the object bytes (errors if the container can't be opened or the object is absent).
+/// `#[doc(hidden)]` — for the live gate + integration tests only.
+#[doc(hidden)]
+pub async fn read_object_through_guest_container(
+    storage: Arc<dyn Storage>,
+    site: &str,
+    container: &str,
+    object: &str,
+) -> Result<Vec<u8>, String> {
+    use blobstore::blobstore::Host as _;
+    use blobstore::container::HostContainer as _;
+    use blobstore::types::HostIncomingValue as _;
+    let binding = BlobBinding {
+        storage,
+        prefix: format!("hblob/{site}/"),
+        max_bytes: 0,
+        // Single-tenant / unconstrained open: this helper proves the shared-namespace handoff, not
+        // the open-time allowlist (that is exercised by the tenancy gates in this module's tests).
+        tenant: None,
+        containers: Vec::new(),
+        multi_tenant: false,
+        pass_unresolved: false,
+    };
+    let mut table = ResourceTable::new();
+    let mut host = BlobHost::new(&mut table, Some(&binding));
+    // Open the container through the REAL `get_container` — this is the marker probe that an
+    // object-only (marker-less) worker write makes FAIL with `no such container`.
+    let handle = host.get_container(container.to_string()).await?;
+    let rep = handle.rep();
+    if !host
+        .has_object(Resource::new_own(rep), object.to_string())
+        .await?
+    {
+        return Err(format!("has-object is false for {container}/{object}"));
+    }
+    let size = binding
+        .storage
+        .head(&format!("hblob/{site}/{container}/{object}"))
+        .await
+        .map_err(estr)?
+        .size
+        .unwrap_or(0);
+    if size == 0 {
         let iv = host
             .get_data(Resource::new_own(rep), object.to_string(), 0, 0)
             .await?;
