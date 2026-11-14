@@ -304,6 +304,20 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
         name: "orm-own-pref",
         lifecycle: Experimental,
     });
+    // The `count-distinct` aggregate (`count(DISTINCT col)`) — the APPEND-ONLY sixth variant of the
+    // `orm.agg` enum (see `world.wit`). The host's `to_core_agg` lowers it unconditionally (no cargo
+    // gate, a pure AST render), so — like `orm-vector` / `orm-own-pref` — it is advertised whenever
+    // the handler engine is compiled. Registering the token is what lets a guest that emits the
+    // variant declare `requires = ["count-distinct"]` and have a host *predating* the variant refuse
+    // the deploy cleanly (via `unmet_requires`), instead of the guest misreading the unknown enum
+    // ordinal at runtime. Its ABSENCE was the gap: the variant shipped with no advertised token, so
+    // the append-only comment's "checked at deploy" promise could not actually engage. Purely
+    // additive — advertising a token forces no requirement on anyone (the gate is opt-in via the
+    // guest's own `requires`), exactly like its siblings. Experimental until the shape settles.
+    f.push(CapabilityFeature {
+        name: "count-distinct",
+        lifecycle: Experimental,
+    });
     f.push(CapabilityFeature {
         name: "streaming",
         lifecycle: Stable,
@@ -999,6 +1013,11 @@ mod tests {
         );
         assert!(host.contains(&"orm-vector"));
         assert!(host.contains(&"orm-own-pref"));
+        // The `count-distinct` aggregate variant is lowered unconditionally, so (like the two
+        // ORM features above) its token is advertised whenever handlers are compiled. Its presence
+        // is what makes a guest's `requires = ["count-distinct"]` admissible on a host that has the
+        // variant and refused cleanly on one predating it (instead of a runtime enum misread).
+        assert!(host.contains(&"count-distinct"));
         // The correlated roll-up is cargo-gated: advertised iff this build enabled it.
         assert_eq!(
             host.contains(&"orm-subquery"),
@@ -1052,6 +1071,10 @@ mod tests {
         );
         assert_eq!(
             lifecycle("orm-own-pref"),
+            Some(super::Lifecycle::Experimental)
+        );
+        assert_eq!(
+            lifecycle("count-distinct"),
             Some(super::Lifecycle::Experimental)
         );
         // `wasi:sockets` is advertised Experimental (NOT the blanket-Stable KNOWN_IMPORTS lifecycle).
