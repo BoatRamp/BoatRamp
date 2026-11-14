@@ -289,6 +289,14 @@ When membership can't reduce to a claim or a SQL predicate, hand the decision to
   authz: guest_mediated( handler: "stream-authorizer" ) ),
 ```
 
+`handler` is the **bare name of a deployed top-level function** — the per-subscribe invoke target the
+host calls. It is **not** a route path and **not** `<site>/<name>`: it is resolved through the invoke
+runtime (the same name space as [`boatramp function deploy <name> <component.wasm>`](./functions.md)
+or a top-level `functions:` block in [`boatramp apply`](./apply.md)), never a site
+`routing.handlers` route (a routed handler has no invocable function record). **Deploy the authorizer
+function before activating the stream** — activation refuses a stream whose `handler` resolves to no
+function, so a misconfigured name fails loudly at deploy, not silently per subscribe.
+
 The host invokes the `stream-authorizer` function with the connection's request (and, when
 `token_claims` is set, the host-verified principal as the `x-boatramp-stream-principal` header); the
 function returns the topic set to grant (`["shared/abc/events"]` or `{"topics": […]}`) or a non-2xx to

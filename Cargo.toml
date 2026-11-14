@@ -66,6 +66,7 @@ exclude = [
   "examples/handlers/session-greet",
   "examples/handlers/session-imap-bridge",
   "examples/handlers/invoke-caller",
+  "examples/handlers/stream-authz",
   "examples/handlers/graphql-run-caller",
   "examples/handlers/graphql-accounts",
   "examples/handlers/graphql-reviews",

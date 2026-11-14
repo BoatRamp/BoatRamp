@@ -2216,6 +2216,49 @@ impl HandlerRuntime {
         let Some(inner) = self.inner.as_ref() else {
             return Ok(());
         };
+        // Stream guest-mediated authz deploy-order gate (stream-authz hardening, FIX-B): a
+        // `guest_mediated` stream names a TOP-LEVEL function as its per-subscribe authorizer, which
+        // the serve path resolves through the INVOKE runtime
+        // (`deploy.get_function(project, handler)` → the function's active component). It is NOT a
+        // site route — a `routing.handlers` handler has no invocable function record. If the named
+        // function is not deployed (or has no resolvable active version), EVERY subscribe silently
+        // 503s per-request; catch it LOUDLY at activation instead, fail-closed. The check mirrors the
+        // exact runtime resolution the serve path performs (`FunctionInvoker::invoke`'s two
+        // `InvokeError::NotFound` arms: a missing record, OR an unresolvable `active`). Run BEFORE the
+        // handlers/consumers early-return so a stream-only deploy is covered too — a stream's
+        // authorizer is a top-level function, never one of this manifest's `handlers`.
+        {
+            use boatramp_core::config::StreamAuthz;
+            let project_ref = boatramp_core::project::ProjectRef::new(project);
+            for stream in &manifest.config.streams {
+                let Some(StreamAuthz::GuestMediated { handler, .. }) = &stream.authz else {
+                    continue;
+                };
+                let name = handler.trim();
+                let resolvable = match deploy.get_function(project_ref, name).await {
+                    Ok(Some(f)) => f.resolve(&f.active).is_some(),
+                    Ok(None) => false,
+                    Err(err) => {
+                        return Err(format!(
+                            "stream {:?} is `guest_mediated` but its authorizer function {name:?} \
+                             could not be resolved: {err}",
+                            stream.route
+                        ));
+                    }
+                };
+                if !resolvable {
+                    return Err(format!(
+                        "stream {:?} is `guest_mediated` but its authorizer function {name:?} is not \
+                         deployed (or has no active version). `handler` is the BARE NAME of a \
+                         TOP-LEVEL function — the invoke target the host calls per subscribe — not a \
+                         route path and not `<site>/<name>`. Deploy the authorizer FIRST (`boatramp \
+                         function deploy {name} <component.wasm>`, or a top-level `functions:` block), \
+                         then activate this deployment.",
+                        stream.route
+                    ));
+                }
+            }
+        }
         // Consumer-only deploys must be prechecked too: skip only
         // when neither handlers nor consumers ship.
         if manifest.config.handlers.is_empty() && manifest.config.consumers.is_empty() {
@@ -7312,6 +7355,198 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&sql_dir);
         println!("STREAM SQL-MEMBERSHIP OK");
+    }
+
+    /// stream-authz hardening — the GUEST-MEDIATED stream authorizer end-to-end, over the REAL invoke
+    /// runtime + a REAL compiled guest (`stream-authz.wasm`), plus the deploy-order activation gate.
+    /// Three properties, all mutation-sensitive:
+    ///
+    /// 1. **Real resolution + confinement.** `authorize_stream_topics` resolves the stream's
+    ///    `handler` (the bare top-level function name) through the invoke runtime, runs the guest,
+    ///    and CONFINES the returned topic set to the declared `topics` template. The guest returns
+    ///    three topics (`shared/abc/events`, `shared/abc/secret`, `evil/abc/events`); only the first
+    ///    matches `shared/{mailbox}/events`, so the grant is EXACTLY `["shared/abc/events"]` — the
+    ///    over-broad `secret` tail and `evil` namespace are clamped, never widened. Dropping the
+    ///    confinement filter ⇒ three topics ⇒ this assertion goes RED.
+    /// 2. **No oracle.** The guest refuses the `deny` scope with a non-2xx ⇒ the host returns the
+    ///    SAME `403` + generic body a non-member gets (no existence/authorization oracle). And a
+    ///    `token_claims`-bearing stream with NO bearer is `401` before the guest is ever invoked.
+    /// 3. **Deploy-order gate (FIX-B).** `precheck_activation` refuses to activate a stream whose
+    ///    `handler` names no resolvable top-level function (a typo, or a routed-handler name with no
+    ///    function record), with a LOUD, speaking error — not a silent per-subscribe 503. A deployed
+    ///    authorizer activates cleanly. Reverting FIX-B ⇒ the missing-authorizer manifest activates
+    ///    ⇒ this assertion goes RED.
+    ///
+    /// Not `#[ignore]`d: no libsql/socket — a wasm-engine `--lib` test runs on the normal merge gate
+    /// (and the CI `guest-mediated stream-authz` step greps `GUEST-MEDIATED STREAM-AUTHZ OK`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guest_mediated_stream_authz_resolves_confines_and_gates() {
+        use boatramp_core::config::{
+            DeployConfig, HandlerGraphqlTokenClaims, StreamAuthz, StreamConfig,
+        };
+        use boatramp_core::deploy::{DeployStore, Manifest, sha256_hex};
+        use boatramp_core::function::{Function, FunctionVersion, Lifecycle, Owner};
+        use boatramp_handlers::{HandlerEngine, Limits};
+        use futures::StreamExt;
+
+        // A REAL compiled guest authorizer: returns a topics JSON array keyed off the last path
+        // segment (the `{mailbox}` capture), or a 403 for the `deny` scope. Built from
+        // `examples/handlers/stream-authz` (`cargo build --release --target wasm32-wasip2`), prebuilt
+        // + committed so this runs with no wasm toolchain.
+        const STREAM_AUTHZ: &[u8] = include_bytes!("../tests/fixtures/stream-authz.wasm");
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        // Deploy the authorizer as a TOP-LEVEL function (the invoke name space — NOT a site route).
+        let hash = sha256_hex(STREAM_AUTHZ);
+        let blob: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(STREAM_AUTHZ)) })
+                .boxed();
+        deploy.put_blob(&hash, blob).await.unwrap();
+        let function = Function {
+            name: "stream-authz".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: Default::default(),
+        };
+        deploy
+            .put_function(ProjectRef::DEFAULT, &function)
+            .await
+            .unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, None, None);
+        rt.set_invoker(deploy.clone());
+        let inner = rt.inner.as_ref().unwrap();
+
+        let stream = StreamConfig {
+            route: "/events/shared/:mailbox".into(),
+            topics: vec!["shared/{mailbox}/events".into()],
+            websocket: false,
+            publish_topic: None,
+            authz: Some(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: "stream-authz".into(),
+            }),
+        };
+
+        // (1) Real resolution + confinement: the guest grants three topics; only the one matching the
+        // declared template survives. If the confinement filter were dropped, this would be 3 topics.
+        let (topics, _params) = crate::stream::authorize_stream_topics(
+            inner,
+            "default",
+            "streamsite",
+            &stream,
+            "/events/shared/abc",
+            None,
+        )
+        .await
+        .expect("guest-mediated authz resolves + grants the in-template topic");
+        assert_eq!(
+            topics,
+            vec!["shared/abc/events".to_string()],
+            "the host CONFINES the guest's returned topics to the declared template — the \
+             out-of-template `shared/abc/secret` and `evil/abc/events` are clamped, never widened"
+        );
+
+        // (2) No oracle: the guest refuses the `deny` scope (non-2xx) ⇒ the SAME 403 + generic body a
+        // non-member gets.
+        let err = crate::stream::authorize_stream_topics(
+            inner,
+            "default",
+            "streamsite",
+            &stream,
+            "/events/shared/deny",
+            None,
+        )
+        .await
+        .expect_err("a guest refusal (non-2xx) denies");
+        assert_eq!(
+            err.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a guest refusal maps to 403"
+        );
+        let body = axum::body::to_bytes(err.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"not authorized for this stream scope\n",
+            "the 403 body is the generic non-member message — no existence/authorization oracle"
+        );
+
+        // (2b) A `token_claims`-bearing guest-mediated stream with NO bearer is 401 BEFORE the guest
+        // is ever invoked (the host verifies the principal first).
+        let stream_tok = StreamConfig {
+            authz: Some(StreamAuthz::GuestMediated {
+                token_claims: Some(HandlerGraphqlTokenClaims {
+                    issuer: "https://idp.example".into(),
+                    jwks_env: Some("IDP_JWKS".into()),
+                    ..Default::default()
+                }),
+                handler: "stream-authz".into(),
+            }),
+            ..stream.clone()
+        };
+        let err = crate::stream::authorize_stream_topics(
+            inner,
+            "default",
+            "streamsite",
+            &stream_tok,
+            "/events/shared/abc",
+            None,
+        )
+        .await
+        .expect_err("no bearer on a token_claims stream is refused");
+        assert_eq!(
+            err.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "no bearer ⇒ 401 before the guest runs"
+        );
+
+        // (3) Deploy-order gate (FIX-B): activating a guest-mediated stream whose `handler` names no
+        // resolvable function is refused LOUDLY — not a silent per-subscribe 503.
+        let manifest = |handler: &str| Manifest {
+            config: DeployConfig {
+                streams: vec![StreamConfig {
+                    authz: Some(StreamAuthz::GuestMediated {
+                        token_claims: None,
+                        handler: handler.into(),
+                    }),
+                    ..stream.clone()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // A missing authorizer (a typo, or a routed-handler name with no function record) ⇒ refusal.
+        let refusal = rt
+            .precheck_activation(&deploy, &manifest("ghost-authz"), None, "default")
+            .await
+            .expect_err("activation refuses a stream whose authorizer is not deployed");
+        assert!(
+            refusal.contains("ghost-authz") && refusal.contains("guest_mediated"),
+            "the refusal names the missing function + the cause: {refusal}"
+        );
+        assert!(
+            refusal.contains("function deploy") || refusal.contains("deploy the authorizer"),
+            "the refusal carries deploy-order guidance: {refusal}"
+        );
+        // The deployed authorizer activates cleanly (the check is not a blanket refusal).
+        rt.precheck_activation(&deploy, &manifest("stream-authz"), None, "default")
+            .await
+            .expect("a deployed authorizer passes the activation gate");
+
+        println!("GUEST-MEDIATED STREAM-AUTHZ OK");
     }
 
     /// libsql-backed subgraph function (`graphql-scope-probe`, whose `items` field is host-scoped via

@@ -325,8 +325,28 @@ impl DeployConfig {
                         }
                         if handler.trim().is_empty() {
                             return Err(ConfigError::parse(format!(
-                                "stream {} authz is `guest_mediated` but the handler route is empty",
+                                "stream {} authz is `guest_mediated` but the handler function name \
+                                 is empty — set it to the BARE NAME of a deployed top-level function",
                                 stream.route
+                            )));
+                        }
+                        // Early, offline shape-check (stream-authz hardening): `handler` is the BARE
+                        // NAME of a deployed top-level function — the per-subscribe invoke target —
+                        // NOT a route path and NOT `<site>/<name>`. Catch the common confusion (a
+                        // `/`-bearing route path like `/authz/stream`) here at `apply`/`validate`
+                        // time with a speaking message, instead of letting it reach the activation
+                        // resolve-gate (or, pre-hardening, a silent per-subscribe 503). A bare name
+                        // that is not yet deployed is NOT an offline error — the authorizer may be
+                        // pre-deployed; the server-side activation gate (which sees the deploy store)
+                        // is the authority on existence.
+                        if !crate::project::is_valid_resource_slug(handler.trim()) {
+                            return Err(ConfigError::parse(format!(
+                                "stream {} guest_mediated handler {handler:?} is not a valid function \
+                                 name — `handler` is the BARE NAME of a deployed top-level function \
+                                 (the per-subscribe invoke target), not a route path and not \
+                                 `<site>/<name>`. {}",
+                                stream.route,
+                                crate::project::INVALID_NAME_REASON
                             )));
                         }
                         // Sec MEDIUM-2: the host can't gate a route-param scope for a guest-mediated
@@ -1237,7 +1257,13 @@ pub enum StreamAuthz {
         /// from the raw request alone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_claims: Option<HandlerGraphqlTokenClaims>,
-        /// The guest handler route that authorizes the connection and returns its topic set.
+        /// The **bare name of a deployed TOP-LEVEL function** — the invoke target the host calls once
+        /// per subscribe to authorize the connection and return its topic set. This is NOT a route
+        /// path and NOT `<site>/<name>`: it is resolved through the invoke runtime (the same name
+        /// space `boatramp function deploy <name> <component.wasm>` and a top-level `functions:` block
+        /// write), never a site `routing.handlers` route (a routed handler has no invocable function
+        /// record). Deploy the authorizer function BEFORE activating the stream — activation refuses a
+        /// stream whose `handler` names no resolvable function (else every subscribe would 503).
         handler: String,
     },
 }
@@ -3031,15 +3057,20 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
         assert_eq!(reparsed, scoped, "scoped authz round-trips");
 
+        // `handler` is the BARE NAME of a deployed top-level function (the invoke target), never a
+        // route path — see `StreamAuthz::GuestMediated::handler`.
         let guest: StreamConfig = serde_json::from_str(
             r#"{"route":"/events/shared/:mailbox","topics":["shared/{mailbox}/events"],
-                "authz":{"guest_mediated":{"handler":"/authz/stream"}}}"#,
+                "authz":{"guest_mediated":{"handler":"stream-authz"}}}"#,
         )
         .unwrap();
         assert!(matches!(
-            guest.authz,
-            Some(StreamAuthz::GuestMediated { .. })
+            &guest.authz,
+            Some(StreamAuthz::GuestMediated { handler, .. }) if handler == "stream-authz"
         ));
+        let reparsed: StreamConfig =
+            serde_json::from_str(&serde_json::to_string(&guest).unwrap()).unwrap();
+        assert_eq!(reparsed, guest, "guest-mediated authz round-trips");
 
         // Absent authz ⇒ None (backward-compatible broadcast).
         let plain: StreamConfig =
@@ -3118,6 +3149,33 @@ mod tests {
             .is_err(),
             "empty guest handler rejected"
         );
+
+        // stream-authz hardening: `handler` is the BARE NAME of a top-level function, not a route
+        // path — a `/`-bearing value (the tokenfield "treated it as a route" mistake) is rejected
+        // offline at apply/validate time, before it reaches the activation resolve-gate.
+        assert!(
+            mk(stream(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: "/authz/stream".into(),
+            }))
+            .is_err(),
+            "a route-path guest handler is rejected (must be a bare function name)"
+        );
+        assert!(
+            mk(stream(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: "console/stream-authz".into(),
+            }))
+            .is_err(),
+            "a `<site>/<name>` guest handler is rejected (must be a bare function name)"
+        );
+        // A valid bare function name passes the offline shape-check (existence is the activation
+        // gate's job — the authorizer may be pre-deployed).
+        mk(stream(StreamAuthz::GuestMediated {
+            token_claims: None,
+            handler: "stream-authz".into(),
+        }))
+        .expect("a bare function-name guest handler passes the offline shape-check");
     }
 
     // Security-review MEDIUM-1 / MEDIUM-2 / LOW-3 — the apply-time coverage + JWKS-source gates.
