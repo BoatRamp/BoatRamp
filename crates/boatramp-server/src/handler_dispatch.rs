@@ -9,9 +9,11 @@ use super::*;
 
 /// The host-set request header carrying a plain handler's VERIFIED caller identity for the opt-in
 /// [`HandlerConfig::verify_caller`](boatramp_core::config::HandlerConfig::verify_caller) path: the
-/// verified JWT claims (`sub` + scalar claims) as compact JSON. The host is the SOLE writer — any
-/// client-supplied value is stripped before dispatch (for EVERY handler, opting in or not), so a
-/// guest can trust it iff its route declared `verify_caller`. Lowercase + valid, so
+/// verified JWT claims (every claim from the verified token, incl. `sub`) as compact JSON. The host
+/// is the SOLE writer platform-wide — any client/guest-supplied value is stripped at the
+/// dispatch entry (for EVERY handler, opting in or not) AND at the invoke-request builders
+/// ([`crate::function_runtime`] `prepare_invoke_request` / `build_internal_request`), so a guest can
+/// trust it iff its route declared `verify_caller`. Lowercase + valid, so
 /// [`HeaderName::from_static`] never panics on it. Mirrors the stream lane's
 /// `x-boatramp-stream-principal` precedent.
 #[cfg(feature = "handlers")]
@@ -1614,8 +1616,9 @@ pub(super) fn set_forwarded_headers(request: &mut Request, client_ip: IpAddr) {
 /// Opt-in host-verified caller: verify the request's `Authorization` bearer against `cfg` (the SAME
 /// app-bearer verifier the GraphQL data connector + scoped streams use —
 /// [`crate::graphql_data::token::verified_claims`]) and, on success, FORWARD the verified claims
-/// (`sub` + scalar claims) to the guest as the host-set `x-boatramp-verified-claims` request header
-/// (compact JSON). Fail-closed, matching the stream lane ([`verify_stream_bearer`]): a MISSING /
+/// (every claim from the verified token, incl. `sub`) to the guest as the host-set
+/// `x-boatramp-verified-claims` request header (compact JSON). Fail-closed, matching the stream lane
+/// ([`verify_stream_bearer`]): a MISSING /
 /// INVALID / EXPIRED / WRONG-ISSUER / FORGED bearer → `Err(401)` so the dispatcher rejects the
 /// request BEFORE the guest runs. The host is the sole writer of the header — this re-strips any
 /// client-supplied value first (defense-in-depth over the unconditional strip at dispatch entry), so
@@ -5190,7 +5193,7 @@ mod consumer_dns_resolve_tests {
 /// SYNC/HTTP-lane host logic directly (there is no guest in this seam — the wasm bridge forwards
 /// every request header to the guest exactly as it already does for `X-Forwarded-*`), with the REAL
 /// [`crate::graphql_data::token`] verifier over an Ed25519 JWKS. (1) A valid token forwards the
-/// verified identity (`sub` + scalar claims) as compact JSON, and a client-supplied SPOOF of the
+/// verified identity (every claim from the verified token, incl. `sub`) as compact JSON, and a client-supplied SPOOF of the
 /// header is overwritten by the verified value (never trusted). (2) A tampered-sig / expired /
 /// wrong-issuer / missing bearer is REJECTED 401 and NO verified header is left on the request
 /// (fail-closed — the guest, downstream, never runs).

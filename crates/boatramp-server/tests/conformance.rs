@@ -10933,6 +10933,227 @@ async fn verify_caller_forwards_verified_sub_and_fails_closed_before_guest() {
     println!("VERIFY-CALLER E2E OK");
 }
 
+/// F1 gate (Security review): observe the GUEST-VISIBLE `x-boatramp-verified-claims` header end to
+/// end, via the `http-200` fixture's `/echo-header` branch (which reflects the header the guest
+/// actually received). This is the mutation-resistant proof of the SOLE-WRITER invariant for the
+/// majority (NON-opting) path: the unconditional strip at dispatch entry is the only thing that
+/// makes it safe for a non-opting guest to trust the header, and nothing else observes it (the
+/// host-seam unit test and the kv-counter e2e both re-strip via the helper / can't echo headers).
+///
+/// (1) A NON-opting route: a client-supplied spoof NEVER reaches the guest (body shows
+/// `verified-claims=ABSENT`) — delete the entry strip and this turns RED. The raw bearer is
+/// preserved. (2) An opting route: the guest RECEIVES the host-forwarded VERIFIED claims (sub=u42),
+/// and a client spoof is OVERWRITTEN by the verified value, never passed through. (3) An opting
+/// route with a bad token: 401, and the guest never ran (no echo body). Marker
+/// `VERIFY-CALLER HEADER-VISIBILITY OK`.
+#[cfg(all(feature = "handlers", feature = "oidc"))]
+#[tokio::test]
+async fn verify_caller_strip_and_forward_are_visible_to_the_guest() {
+    use base64::Engine;
+    use boatramp_core::config::{HandlerConfig, HandlerGraphqlTokenClaims, HandlersSiteConfig};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+    const ISS: &str = "https://idp.test";
+
+    let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+    let b64url = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let jwks = serde_json::json!({ "keys": [ {
+        "kty": "OKP", "crv": "Ed25519", "kid": "app",
+        "x": b64url(key.verifying_key().as_bytes()),
+    } ] })
+    .to_string();
+    let sign = |iss: &str, exp: i64| {
+        use ed25519_dalek::Signer;
+        let header = b64url(
+            serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": "app" })
+                .to_string()
+                .as_bytes(),
+        );
+        let payload = b64url(
+            serde_json::json!({ "iss": iss, "exp": exp, "sub": "u42" })
+                .to_string()
+                .as_bytes(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        format!(
+            "{signing_input}.{}",
+            b64url(&key.sign(signing_input.as_bytes()).to_bytes())
+        )
+    };
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    let hash = sha256_hex(HTTP_200);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+
+    // Deploy http-200 on `/echo-header` for a site, with an optional `verify_caller`.
+    let deploy_site = |site: &'static str, verify: Option<HandlerGraphqlTokenClaims>| {
+        let deploy = deploy.clone();
+        let hash = hash.clone();
+        async move {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "c.wasm".to_string(),
+                FileEntry {
+                    hash: hash.clone(),
+                    size: HTTP_200.len() as u64,
+                    content_type: None,
+                    variants: BTreeMap::new(),
+                },
+            );
+            let manifest = Manifest {
+                files,
+                config: DeployConfig {
+                    handlers: vec![HandlerConfig {
+                        verify_caller: verify,
+                        no_secrets: false,
+                        secrets: Vec::new(),
+                        tenancy: None,
+                        token_claims: None,
+                        route: "/echo-header".to_string(),
+                        methods: Vec::new(),
+                        component: "c.wasm".to_string(),
+                        imports: Vec::new(),
+                        streaming: false,
+                        limits: None,
+                        env: BTreeMap::new(),
+                        invoke_targets: Vec::new(),
+                        stats_topics: Vec::new(),
+                        tenant_secret_names: Vec::new(),
+                        upload_containers: Vec::new(),
+                        blobstore_containers: Vec::new(),
+                        egress_allowlist: Vec::new(),
+                        dns_publish_zones: Vec::new(),
+                        dns_publish_ns_targets: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let id = deploy.put_manifest(&manifest).await.unwrap();
+            deploy
+                .activate(ProjectRef::DEFAULT, site, &id)
+                .await
+                .unwrap();
+            deploy
+                .set_site_config(
+                    ProjectRef::DEFAULT,
+                    site,
+                    &SiteConfig {
+                        handlers: Some(HandlersSiteConfig {
+                            enabled: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    let verify_cfg = HandlerGraphqlTokenClaims {
+        issuer: ISS.to_string(),
+        jwks_env: Some("VC_JWKS".to_string()),
+        ..Default::default()
+    };
+    deploy_site("vc-secure", Some(verify_cfg)).await;
+    deploy_site("vc-plain", None).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, None, None);
+    runtime.set_env_source(Arc::new(
+        boatramp_core::env::MapEnv::new().with("VC_JWKS", jwks.clone()),
+    ));
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // GET /echo-header on a site, with optional bearer + optional client spoof of the trusted header.
+    let call =
+        |app: axum::Router, site: &str, bearer: Option<String>, spoof: Option<&'static str>| {
+            let uri = format!("/_sites/{site}/echo-header");
+            async move {
+                let mut b = Request::builder().method("GET").uri(uri);
+                if let Some(t) = bearer {
+                    b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+                }
+                if let Some(s) = spoof {
+                    b = b.header("x-boatramp-verified-claims", s);
+                }
+                let mut req = b.body(Body::empty()).unwrap();
+                req.extensions_mut()
+                    .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                (status, String::from_utf8_lossy(&body).to_string())
+            }
+        };
+
+    let valid = sign(ISS, 4_102_444_800);
+    let tampered = format!("{valid}x");
+
+    // (2)+(overwrite) opting route, valid token, AND a client spoof: the guest must receive the
+    // VERIFIED claims (sub=u42), never the attacker's spoof.
+    let (st, body) = call(
+        app.clone(),
+        "vc-secure",
+        Some(valid.clone()),
+        Some(r#"{"sub":"attacker"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "valid opting request is served: {body}");
+    assert!(
+        body.contains(r#""sub":"u42""#),
+        "the guest received the host-forwarded VERIFIED claims: {body}"
+    );
+    assert!(
+        !body.contains("attacker"),
+        "the client spoof was overwritten by the verified value, not forwarded: {body}"
+    );
+
+    // (3) opting route, bad token: 401 and the guest never ran (no echo body).
+    let (st, body) = call(app.clone(), "vc-secure", Some(tampered), None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "a bad token is rejected");
+    assert!(
+        !body.contains("verified-claims="),
+        "the guest never ran on a rejected token (no echo): {body}"
+    );
+
+    // (1) THE F1 MUTATION GATE — a NON-opting route with a client spoof: the guest must see
+    // `verified-claims=ABSENT` (the entry strip removed it). Delete the dispatch-entry strip and the
+    // guest would echo the spoof here, turning this RED. The raw bearer is preserved untouched.
+    let (st, body) = call(
+        app.clone(),
+        "vc-plain",
+        Some("not-a-jwt".to_string()),
+        Some(r#"{"sub":"attacker"}"#),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a non-opting route still serves: {body}"
+    );
+    assert!(
+        body.contains("verified-claims=ABSENT"),
+        "a non-opting guest must NEVER receive a client-supplied verified-claims header: {body}"
+    );
+    assert!(
+        !body.contains("attacker"),
+        "the client spoof must not reach a non-opting guest: {body}"
+    );
+    assert!(
+        body.contains("authorization=Bearer not-a-jwt"),
+        "the raw bearer reaches the non-opting guest unchanged: {body}"
+    );
+
+    println!("VERIFY-CALLER HEADER-VISIBILITY OK");
+}
+
 // ---- 0.2.0 project-scoped API ---------------------------------------------
 
 /// A `/api/projects/<proj>/…` request operates on that project's data, and the

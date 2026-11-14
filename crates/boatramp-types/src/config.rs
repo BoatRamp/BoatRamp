@@ -962,7 +962,7 @@ pub struct HandlerConfig {
     /// verifier the GraphQL data connector ([`HandlerGraphqlDataConfig::claims_from_token`]) and
     /// scoped streams use, JWKS-sourced, algorithm pinned to the key type (incl. OKP→EdDSA),
     /// `iss`/`exp`/`nbf`/`aud`-checked, fail-closed — BEFORE the guest runs, and forwards the
-    /// VERIFIED claims (`sub` + scalar claims) to the guest as the host-set
+    /// VERIFIED claims (every claim from the verified token — `sub` and all the rest) to the guest as the host-set
     /// `x-boatramp-verified-claims` request header (compact JSON). This lets a plain routed
     /// `wasi:http` handler receive a trustworthy caller identity instead of hand-rolling JWT crypto.
     ///
@@ -1976,6 +1976,19 @@ impl HandlerGraphqlTokenClaims {
                     sw.issuer
                 )));
             }
+        }
+        // A single-issuer form that names a JWKS source MUST also set a non-empty `issuer`. Without
+        // it the verifier pins `set_issuer(&[""])` and EVERY token fails the `iss` check at runtime —
+        // a config that deploys clean then silently 401s ALL traffic (the loud-deploy-vs-silent-deny
+        // anti-pattern). Scoped to the single-issuer form (the multi-issuer form legitimately leaves
+        // `issuer` empty and pins per-verified-`iss`); also hardens the pre-existing `token_claims`.
+        if !multi && (self.jwks_env.is_some() || self.jwks_url.is_some()) && self.issuer.is_empty()
+        {
+            return Err(ConfigError::parse(
+                "token_claims: a single-issuer JWKS source (jwks_env/jwks_url) is set but `issuer` \
+                 is empty — set a non-empty `issuer` (the expected token `iss`), else every token \
+                 is rejected at runtime",
+            ));
         }
         if !multi {
             return Ok(());
