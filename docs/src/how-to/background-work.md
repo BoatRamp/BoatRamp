@@ -303,6 +303,12 @@ function returns the topic set to grant (`["shared/abc/events"]` or `{"topics": 
 refuse. The returned topics are **confined to the declared `topics` templates** — a guest chooses
 *which* declared scopes, never a new topic namespace.
 
+> The guest-mediated confinement matches a template segment **whole-segment only**: a `{name}`
+> placeholder must be an entire path segment (`shared/{mailbox}/events`). A *partial*-segment
+> template like `shared/mbx-{mailbox}/events` is treated as a **literal** (it does not
+> parameterize), so a guest can match it only by returning that exact literal string — write the
+> parameterized segment on its own (`shared/{mailbox}/events`), not embedded in a longer segment.
+
 > Scoped-stream bearer verification needs the `oidc` feature (like the data connector's token
 > claims); without it a scoped stream fails closed.
 

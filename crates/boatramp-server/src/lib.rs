@@ -2234,13 +2234,18 @@ impl HandlerRuntime {
                 let Some(StreamAuthz::GuestMediated { handler, .. }) = &stream.authz else {
                     continue;
                 };
-                let name = handler.trim();
-                let resolvable = match deploy.get_function(project_ref, name).await {
+                // Resolve the RAW handler — serve uses the EXACT KV key
+                // (`get_function(project, handler)`), never a trimmed one. A leading/trailing-
+                // whitespace value is rejected at validate (`DeployConfig::compile_check`), but
+                // precheck stays the fail-closed backstop here if a crafted manifest bypasses that,
+                // so it must match serve byte-for-byte — never trim (a trimmed check here that
+                // serve does not do would re-open the precheck-passes-but-serve-503 gap).
+                let resolvable = match deploy.get_function(project_ref, handler).await {
                     Ok(Some(f)) => f.resolve(&f.active).is_some(),
                     Ok(None) => false,
                     Err(err) => {
                         return Err(format!(
-                            "stream {:?} is `guest_mediated` but its authorizer function {name:?} \
+                            "stream {:?} is `guest_mediated` but its authorizer function {handler:?} \
                              could not be resolved: {err}",
                             stream.route
                         ));
@@ -2248,12 +2253,12 @@ impl HandlerRuntime {
                 };
                 if !resolvable {
                     return Err(format!(
-                        "stream {:?} is `guest_mediated` but its authorizer function {name:?} is not \
-                         deployed (or has no active version). `handler` is the BARE NAME of a \
+                        "stream {:?} is `guest_mediated` but its authorizer function {handler:?} is \
+                         not deployed (or has no active version). `handler` is the BARE NAME of a \
                          TOP-LEVEL function — the invoke target the host calls per subscribe — not a \
                          route path and not `<site>/<name>`. Deploy the authorizer FIRST (`boatramp \
-                         function deploy {name} <component.wasm>`, or a top-level `functions:` block), \
-                         then activate this deployment.",
+                         function deploy {handler} <component.wasm>`, or a top-level `functions:` \
+                         block), then activate this deployment.",
                         stream.route
                     ));
                 }
@@ -7545,6 +7550,23 @@ mod tests {
         rt.precheck_activation(&deploy, &manifest("stream-authz"), None, "default")
             .await
             .expect("a deployed authorizer passes the activation gate");
+
+        // (3b) Whitespace consistency (review LOW/N1): serve resolves the EXACT stored key, so a
+        // leading/trailing-whitespace handler must NOT be precheck-clean-then-serve-503. It is
+        // rejected at validate AND refused at precheck (the function is deployed as `stream-authz`,
+        // never ` stream-authz `) — the two agree with serve's exact-key lookup.
+        let padded = manifest(" stream-authz ");
+        assert!(
+            padded.config.compile_check().is_err(),
+            "a whitespace-padded guest handler is rejected at validate (not stored to 503 at serve)"
+        );
+        assert!(
+            rt.precheck_activation(&deploy, &padded, None, "default")
+                .await
+                .is_err(),
+            "precheck refuses a whitespace-padded handler too (exact-key resolve mirrors serve) — \
+             never precheck-clean-then-serve-503"
+        );
 
         println!("GUEST-MEDIATED STREAM-AUTHZ OK");
     }

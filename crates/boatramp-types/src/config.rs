@@ -330,6 +330,23 @@ impl DeployConfig {
                                 stream.route
                             )));
                         }
+                        // The serve path resolves `handler` as an EXACT KV key
+                        // (`get_function(project, handler)` — no trimming), so a leading/trailing-
+                        // whitespace value would pass a trimmed check yet 503 at serve. Reject it
+                        // here so offline validation, the activation resolve-gate, and serve all
+                        // agree on the exact stored name (the alternative — normalize-at-store —
+                        // doesn't fit: `compile_check` is read-only validation with no mutation seam
+                        // in the config flow).
+                        if handler != handler.trim() {
+                            return Err(ConfigError::parse(format!(
+                                "stream {} guest_mediated handler {handler:?} has leading or trailing \
+                                 whitespace — `handler` is the EXACT bare name of a deployed \
+                                 top-level function (resolved as an exact key at serve), so the \
+                                 stored value must match the deployed name byte-for-byte; remove the \
+                                 surrounding whitespace",
+                                stream.route
+                            )));
+                        }
                         // Early, offline shape-check (stream-authz hardening): `handler` is the BARE
                         // NAME of a deployed top-level function — the per-subscribe invoke target —
                         // NOT a route path and NOT `<site>/<name>`. Catch the common confusion (a
@@ -338,8 +355,9 @@ impl DeployConfig {
                         // resolve-gate (or, pre-hardening, a silent per-subscribe 503). A bare name
                         // that is not yet deployed is NOT an offline error — the authorizer may be
                         // pre-deployed; the server-side activation gate (which sees the deploy store)
-                        // is the authority on existence.
-                        if !crate::project::is_valid_resource_slug(handler.trim()) {
+                        // is the authority on existence. `handler` is already whitespace-trimmed here
+                        // (rejected just above), so the slug check runs on the exact stored value.
+                        if !crate::project::is_valid_resource_slug(handler) {
                             return Err(ConfigError::parse(format!(
                                 "stream {} guest_mediated handler {handler:?} is not a valid function \
                                  name — `handler` is the BARE NAME of a deployed top-level function \
@@ -3168,6 +3186,16 @@ mod tests {
             }))
             .is_err(),
             "a `<site>/<name>` guest handler is rejected (must be a bare function name)"
+        );
+        // A leading/trailing-whitespace handler is rejected at validate — serve resolves the EXACT
+        // key, so a trimmed-passes-but-serve-503 value must never store.
+        assert!(
+            mk(stream(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: " stream-authz ".into(),
+            }))
+            .is_err(),
+            "a whitespace-padded guest handler is rejected (serve uses the exact stored key)"
         );
         // A valid bare function name passes the offline shape-check (existence is the activation
         // gate's job — the authorizer may be pre-deployed).
