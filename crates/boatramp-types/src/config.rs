@@ -319,9 +319,20 @@ impl DeployConfig {
                     StreamAuthz::GuestMediated {
                         token_claims,
                         handler,
+                        max_topics_per_connection,
                     } => {
                         if let Some(tc) = token_claims {
                             tc.validate()?;
+                        }
+                        // A per-connection topic cap of 0 would refuse every connection — reject it
+                        // at validate (clearer than a silent deny-all). `None` = unlimited.
+                        if *max_topics_per_connection == Some(0) {
+                            return Err(ConfigError::parse(format!(
+                                "stream {} guest_mediated max_topics_per_connection is 0 — a 0 cap \
+                                 refuses every connection; omit it for unlimited, or set a positive \
+                                 cap",
+                                stream.route
+                            )));
                         }
                         if handler.trim().is_empty() {
                             return Err(ConfigError::parse(format!(
@@ -1283,6 +1294,17 @@ pub enum StreamAuthz {
         /// record). Deploy the authorizer function BEFORE activating the stream — activation refuses a
         /// stream whose `handler` names no resolvable function (else every subscribe would 503).
         handler: String,
+        /// **Opt-in per-connection cap** on how many distinct topics the guest authorizer may grant
+        /// one connection, enforced AFTER the returned set is confined to the declared `topics`
+        /// templates. `None` ⇒ **unlimited** (the default — existing deploys are unchanged). `Some(n)`
+        /// refuses the connection (fail-closed, before any subscribe) if the confined set exceeds `n`
+        /// — a defense-in-depth resource guard within the trusted-guest model, so a bug/compromise in
+        /// the authorizer can't fan one connection out to an unbounded number of hub subscriptions.
+        /// The host never silently truncates — an over-returning authorizer is loud. `Some(0)` is
+        /// nonsensical (it would refuse every connection) and is rejected at validate. Only meaningful
+        /// here: a `Scoped` stream's topic set is already host-bounded by its membership checks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_topics_per_connection: Option<u32>,
     },
 }
 
@@ -3082,13 +3104,44 @@ mod tests {
                 "authz":{"guest_mediated":{"handler":"stream-authz"}}}"#,
         )
         .unwrap();
+        // An omitted `max_topics_per_connection` ⇒ None (unlimited — back-compat for existing
+        // deploys, which carry no such field).
         assert!(matches!(
             &guest.authz,
-            Some(StreamAuthz::GuestMediated { handler, .. }) if handler == "stream-authz"
+            Some(StreamAuthz::GuestMediated {
+                handler,
+                max_topics_per_connection: None,
+                ..
+            }) if handler == "stream-authz"
         ));
         let reparsed: StreamConfig =
             serde_json::from_str(&serde_json::to_string(&guest).unwrap()).unwrap();
         assert_eq!(reparsed, guest, "guest-mediated authz round-trips");
+
+        // A present `max_topics_per_connection` round-trips (and `None` serializes away, so a capped
+        // config does not spuriously differ from an uncapped one).
+        let capped: StreamConfig = serde_json::from_str(
+            r#"{"route":"/events/shared/:mailbox","topics":["shared/{mailbox}/events"],
+                "authz":{"guest_mediated":{"handler":"stream-authz","max_topics_per_connection":4}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &capped.authz,
+            Some(StreamAuthz::GuestMediated {
+                max_topics_per_connection: Some(4),
+                ..
+            })
+        ));
+        let reparsed_cap: StreamConfig =
+            serde_json::from_str(&serde_json::to_string(&capped).unwrap()).unwrap();
+        assert_eq!(
+            reparsed_cap, capped,
+            "a capped guest-mediated authz round-trips"
+        );
+        assert_ne!(
+            capped, guest,
+            "a capped config differs from the uncapped one"
+        );
 
         // Absent authz ⇒ None (backward-compatible broadcast).
         let plain: StreamConfig =
@@ -3163,6 +3216,7 @@ mod tests {
             mk(stream(StreamAuthz::GuestMediated {
                 token_claims: None,
                 handler: String::new(),
+                max_topics_per_connection: None,
             }))
             .is_err(),
             "empty guest handler rejected"
@@ -3175,6 +3229,7 @@ mod tests {
             mk(stream(StreamAuthz::GuestMediated {
                 token_claims: None,
                 handler: "/authz/stream".into(),
+                max_topics_per_connection: None,
             }))
             .is_err(),
             "a route-path guest handler is rejected (must be a bare function name)"
@@ -3183,6 +3238,7 @@ mod tests {
             mk(stream(StreamAuthz::GuestMediated {
                 token_claims: None,
                 handler: "console/stream-authz".into(),
+                max_topics_per_connection: None,
             }))
             .is_err(),
             "a `<site>/<name>` guest handler is rejected (must be a bare function name)"
@@ -3193,6 +3249,7 @@ mod tests {
             mk(stream(StreamAuthz::GuestMediated {
                 token_claims: None,
                 handler: " stream-authz ".into(),
+                max_topics_per_connection: None,
             }))
             .is_err(),
             "a whitespace-padded guest handler is rejected (serve uses the exact stored key)"
@@ -3202,8 +3259,26 @@ mod tests {
         mk(stream(StreamAuthz::GuestMediated {
             token_claims: None,
             handler: "stream-authz".into(),
+            max_topics_per_connection: None,
         }))
         .expect("a bare function-name guest handler passes the offline shape-check");
+        // A `Some(0)` cap is nonsensical (refuses every connection) and is rejected at validate; a
+        // positive cap passes.
+        assert!(
+            mk(stream(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: "stream-authz".into(),
+                max_topics_per_connection: Some(0),
+            }))
+            .is_err(),
+            "max_topics_per_connection: Some(0) is rejected (would refuse every connection)"
+        );
+        mk(stream(StreamAuthz::GuestMediated {
+            token_claims: None,
+            handler: "stream-authz".into(),
+            max_topics_per_connection: Some(4),
+        }))
+        .expect("a positive per-connection topic cap is accepted");
     }
 
     // Security-review MEDIUM-1 / MEDIUM-2 / LOW-3 — the apply-time coverage + JWKS-source gates.
@@ -3294,6 +3369,7 @@ mod tests {
                 authz: Some(StreamAuthz::GuestMediated {
                     token_claims: None,
                     handler: "authz".into(),
+                    max_topics_per_connection: None,
                 }),
             })
             .is_err(),

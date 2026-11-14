@@ -303,6 +303,12 @@ function returns the topic set to grant (`["shared/abc/events"]` or `{"topics": 
 refuse. The returned topics are **confined to the declared `topics` templates** — a guest chooses
 *which* declared scopes, never a new topic namespace.
 
+Add an opt-in `max_topics_per_connection: <n>` to the `guest_mediated` block to cap how many
+(confined) topics one connection may be granted: a return exceeding the cap **refuses the connection**
+(a loud `502`, never a silent truncation), bounding how far a buggy or compromised authorizer can fan
+one connection out. Omit it for **unlimited** (the default — existing deploys are unchanged); a cap of
+`0` is rejected at validate.
+
 > The guest-mediated confinement matches a template segment **whole-segment only**: a `{name}`
 > placeholder must be an entire path segment (`shared/{mailbox}/events`). A *partial*-segment
 > template like `shared/mbx-{mailbox}/events` is treated as a **literal** (it does not

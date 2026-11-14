@@ -48,8 +48,24 @@ impl Guest for Component {
             return;
         }
 
-        // Grant three topics; only `shared/<mailbox>/events` matches the declared template — the
-        // other two (`.../secret`, `evil/...`) MUST be clamped by the host's confinement.
+        // "count<N>" mode: grant N DISTINCT in-template topics (`shared/c0/events` ..
+        // `shared/c{N-1}/events`, all matching the declared `shared/{mailbox}/events`), to exercise
+        // the per-connection topic cap — the confined set size is exactly N.
+        if let Some(n) = mailbox
+            .strip_prefix("count")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            let mut parts: Vec<String> = Vec::with_capacity(n);
+            for i in 0..n {
+                parts.push(format!("\"shared/c{i}/events\""));
+            }
+            let body = format!("[{}]", parts.join(","));
+            respond(outparam, 200, body.as_bytes());
+            return;
+        }
+
+        // Default: grant three topics; only `shared/<mailbox>/events` matches the declared template —
+        // the other two (`.../secret`, `evil/...`) MUST be clamped by the host's confinement.
         let body = format!(
             "[\"shared/{m}/events\",\"shared/{m}/secret\",\"evil/{m}/events\"]",
             m = mailbox

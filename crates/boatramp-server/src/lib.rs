@@ -7441,6 +7441,7 @@ mod tests {
             authz: Some(StreamAuthz::GuestMediated {
                 token_claims: None,
                 handler: "stream-authz".into(),
+                max_topics_per_connection: None,
             }),
         };
 
@@ -7499,6 +7500,7 @@ mod tests {
                     ..Default::default()
                 }),
                 handler: "stream-authz".into(),
+                max_topics_per_connection: None,
             }),
             ..stream.clone()
         };
@@ -7526,6 +7528,7 @@ mod tests {
                     authz: Some(StreamAuthz::GuestMediated {
                         token_claims: None,
                         handler: handler.into(),
+                        max_topics_per_connection: None,
                     }),
                     ..stream.clone()
                 }],
@@ -7551,7 +7554,7 @@ mod tests {
             .await
             .expect("a deployed authorizer passes the activation gate");
 
-        // (3b) Whitespace consistency (review LOW/N1): serve resolves the EXACT stored key, so a
+        // (3b) Whitespace consistency (review LOW): serve resolves the EXACT stored key, so a
         // leading/trailing-whitespace handler must NOT be precheck-clean-then-serve-503. It is
         // rejected at validate AND refused at precheck (the function is deployed as `stream-authz`,
         // never ` stream-authz `) — the two agree with serve's exact-key lookup.
@@ -7566,6 +7569,68 @@ mod tests {
                 .is_err(),
             "precheck refuses a whitespace-padded handler too (exact-key resolve mirrors serve) — \
              never precheck-clean-then-serve-503"
+        );
+
+        // (4) Opt-in per-connection topic cap (review N1): a cap of N enforced AFTER confinement.
+        // The guest's `count<N>` mode returns N DISTINCT in-template topics, so the confined set size
+        // is exactly N — exercising the cap boundary directly.
+        let stream_capped = StreamConfig {
+            authz: Some(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: "stream-authz".into(),
+                max_topics_per_connection: Some(3),
+            }),
+            ..stream.clone()
+        };
+        // (4a) cap = 3, guest returns 3 confined topics → the stream opens.
+        let (capped_ok, _p) = crate::stream::authorize_stream_topics(
+            inner,
+            "default",
+            "streamsite",
+            &stream_capped,
+            "/events/shared/count3",
+            None,
+        )
+        .await
+        .expect("a confined set at the cap (3 of 3) opens");
+        assert_eq!(
+            capped_ok.len(),
+            3,
+            "the full in-template set under the cap is granted: {capped_ok:?}"
+        );
+        // (4b) cap = 3, guest returns 4 confined topics → the connection is REFUSED (loud 502, not a
+        // silent truncate). Neutering the cap check would let this OPEN with 4 topics → RED.
+        let capped_err = crate::stream::authorize_stream_topics(
+            inner,
+            "default",
+            "streamsite",
+            &stream_capped,
+            "/events/shared/count4",
+            None,
+        )
+        .await
+        .expect_err("an over-cap return (4 > 3) refuses the connection");
+        assert_eq!(
+            capped_err.status(),
+            axum::http::StatusCode::BAD_GATEWAY,
+            "over-cap is a loud 502 (authorizer returned too many), not a 403 deny or a truncation"
+        );
+        // (4c) cap unset (None, the original `stream`) → a many-topic return still opens (back-compat,
+        // unlimited — existing deploys unchanged).
+        let (uncapped, _p) = crate::stream::authorize_stream_topics(
+            inner,
+            "default",
+            "streamsite",
+            &stream,
+            "/events/shared/count5",
+            None,
+        )
+        .await
+        .expect("cap None = unlimited (back-compat)");
+        assert_eq!(
+            uncapped.len(),
+            5,
+            "an unset cap grants the whole confined set: {uncapped:?}"
         );
 
         println!("GUEST-MEDIATED STREAM-AUTHZ OK");

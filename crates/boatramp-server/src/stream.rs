@@ -193,6 +193,7 @@ pub(super) async fn authorize_stream_topics(
         StreamAuthz::GuestMediated {
             token_claims,
             handler,
+            max_topics_per_connection,
         } => {
             // When `token_claims` is set the host verifies the principal first (401 on failure) and
             // forwards the verified claims to the guest; otherwise the guest authorizes from the raw
@@ -217,6 +218,7 @@ pub(super) async fn authorize_stream_topics(
                 bearer,
                 principal.as_ref(),
                 &stream.topics,
+                *max_topics_per_connection,
             )
             .await?;
             Ok((topics, params))
@@ -229,7 +231,12 @@ pub(super) async fn authorize_stream_topics(
 /// `token_claims` resolved one), and return the per-subscriber topic set it grants — CONFINED to the
 /// declared `topics` templates (the ceiling), so a compromised guest can only select declared scopes,
 /// never invent a new topic namespace. A non-2xx from the guest, or an invalid topic body, denies.
+///
+/// `max_topics` is the opt-in per-connection topic cap: when `Some(n)`, a confined set LARGER than
+/// `n` REFUSES the connection (fail-closed, before any subscribe) rather than silently truncating, so
+/// an over-returning authorizer is loud. `None` ⇒ unlimited (back-compat).
 #[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
 async fn guest_authorize_topics(
     inner: &Arc<HandlerRuntimeInner>,
     project: &str,
@@ -238,6 +245,7 @@ async fn guest_authorize_topics(
     bearer: Option<&str>,
     principal: Option<&serde_json::Map<String, serde_json::Value>>,
     templates: &[String],
+    max_topics: Option<u32>,
 ) -> Result<Vec<String>, Response> {
     let Some(invoker) = inner.invoker.get() else {
         return Err((
@@ -300,10 +308,25 @@ async fn guest_authorize_topics(
     };
     // Confine to the declared templates (the ceiling). A topic the operator never declared is dropped
     // (never a new namespace), so the resolved set is ⊆ what `topics` permits.
-    Ok(returned
+    let confined: Vec<String> = returned
         .into_iter()
         .filter(|t| templates.iter().any(|tmpl| topic_matches_template(tmpl, t)))
-        .collect())
+        .collect();
+    // Opt-in per-connection topic cap (N1): enforced AFTER confinement, on the IN-TEMPLATE set a
+    // trusted guest selected. An over-cap return REFUSES the connection (fail-closed, before any
+    // subscribe/hub-attach) — never a silent truncate, so a bug/compromise in the authorizer is
+    // loud. `None` ⇒ unlimited (unchanged for existing deploys). A 502 (not the 403 deny) marks this
+    // as an authorizer-returned-too-much condition, independent of the client's scope (no oracle).
+    if let Some(max) = max_topics
+        && confined.len() as u64 > u64::from(max)
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "guest stream authorizer returned more topics than max_topics_per_connection permits\n",
+        )
+            .into_response());
+    }
+    Ok(confined)
 }
 
 /// Parse a guest authorizer's topic set: a bare JSON array `["a","b"]` or `{"topics":["a","b"]}`.
