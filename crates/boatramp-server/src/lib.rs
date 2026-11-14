@@ -8737,6 +8737,7 @@ mod tests {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    verify_caller: None,
                     no_secrets: false,
                     tenancy: None,
                     token_claims: None,
@@ -8926,6 +8927,7 @@ mod tests {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    verify_caller: None,
                     no_secrets: false,
                     tenancy: None,
                     token_claims: None,

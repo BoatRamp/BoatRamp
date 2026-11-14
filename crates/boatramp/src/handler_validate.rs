@@ -866,6 +866,7 @@ mod imp {
 
             let config = DeployConfig {
                 handlers: vec![HandlerConfig {
+                    verify_caller: None,
                     tenancy: None,
                     token_claims: None,
                     no_secrets: false,

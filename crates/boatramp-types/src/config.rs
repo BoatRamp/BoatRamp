@@ -209,6 +209,20 @@ impl DeployConfig {
                     )));
                 }
             }
+            // Opt-in host-verified caller: the verifier config must be well-formed AND carry a usable
+            // JWKS source — without one, verification could never succeed and every request would 401
+            // at runtime, so catch it here (a loud deploy error, not a silent per-request deny — the
+            // scoped-stream `token_claims` LOW-3 precedent).
+            if let Some(vc) = &handler.verify_caller {
+                vc.validate()?;
+                if !token_claims_has_jwks_source(vc) {
+                    return Err(ConfigError::parse(format!(
+                        "handler {} verify_caller has no JWKS source (set `jwks_env` or `jwks_url`, \
+                         or the multi-issuer `issuer_trust` + `jwks`)",
+                        handler.route
+                    )));
+                }
+            }
         }
         for consumer in &self.consumers {
             if consumer.topic.is_empty() || consumer.component.is_empty() {
@@ -943,6 +957,27 @@ pub struct HandlerConfig {
     /// this handler's `tenancy` (or the inherited site tenancy) names a `token` source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_claims: Option<HandlerGraphqlTokenClaims>,
+    /// **Opt-in host-verified caller** (`PLAN-handler-verified-caller`): when set, the host verifies
+    /// the inbound `Authorization` bearer against this JWKS/issuer config — the SAME app-bearer
+    /// verifier the GraphQL data connector ([`HandlerGraphqlDataConfig::claims_from_token`]) and
+    /// scoped streams use, JWKS-sourced, algorithm pinned to the key type (incl. OKP→EdDSA),
+    /// `iss`/`exp`/`nbf`/`aud`-checked, fail-closed — BEFORE the guest runs, and forwards the
+    /// VERIFIED claims (`sub` + scalar claims) to the guest as the host-set
+    /// `x-boatramp-verified-claims` request header (compact JSON). This lets a plain routed
+    /// `wasi:http` handler receive a trustworthy caller identity instead of hand-rolling JWT crypto.
+    ///
+    /// **Fail-closed**, matching the stream lane: a declared verifier with a MISSING / INVALID /
+    /// EXPIRED / WRONG-ISSUER / FORGED bearer → `401` before the guest runs (the guest NEVER sees an
+    /// unverified caller). The host is the **sole writer** of `x-boatramp-verified-claims`: any
+    /// client-supplied value is stripped first (for every handler, opt-in or not), so a guest can
+    /// never be handed a spoofed one. **Absent ⇒ UNCHANGED, fully non-breaking**: the guest receives
+    /// the raw bearer untouched and verifies it itself (the app bearer stays opaque to boatramp).
+    ///
+    /// Distinct from [`token_claims`](Self::token_claims), which sources a `row_filter`/tenancy
+    /// claim from the token; `verify_caller` forwards the whole verified identity to a plain handler.
+    /// (Set it next to — or instead of — `token_claims`; they verify independently.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_caller: Option<HandlerGraphqlTokenClaims>,
 }
 
 /// Per-handler resource limits.
@@ -2461,6 +2496,7 @@ mod tests {
         use std::collections::BTreeMap;
         let config = DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 tenancy: None,
                 token_claims: None,
                 no_secrets: false,

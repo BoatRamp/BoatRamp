@@ -792,6 +792,7 @@ mod tests {
     fn handler_matching_respects_route_and_methods() {
         use crate::config::HandlerConfig;
         let handler = |route: &str, methods: &[&str]| HandlerConfig {
+            verify_caller: None,
             tenancy: None,
             token_claims: None,
             no_secrets: false,
@@ -836,6 +837,7 @@ mod tests {
     /// Build a minimal handler bound to `route` answering `methods`.
     fn mk_handler(route: &str, methods: &[&str]) -> crate::config::HandlerConfig {
         crate::config::HandlerConfig {
+            verify_caller: None,
             tenancy: None,
             token_claims: None,
             no_secrets: false,

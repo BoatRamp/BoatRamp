@@ -1560,6 +1560,7 @@ async fn handler_route_dispatches_through_engine() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            verify_caller: None,
             no_secrets: false,
             secrets: Vec::new(),
             tenancy: None,
@@ -1725,6 +1726,7 @@ async fn perf_host_await_overlap_repro() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            verify_caller: None,
             no_secrets: false,
             secrets: Vec::new(),
             tenancy: None,
@@ -1951,6 +1953,7 @@ async fn serve_admission_gate_bounds_concurrency() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    verify_caller: None,
                     no_secrets: false,
                     secrets: Vec::new(),
                     tenancy: None,
@@ -2169,6 +2172,7 @@ async fn latency_floor_repro() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    verify_caller: None,
                     no_secrets: false,
                     secrets: Vec::new(),
                     // Schema load at build_bindings is UNCONDITIONAL (runs every serve regardless of
@@ -2386,6 +2390,7 @@ async fn secret_resolution_floor_gate() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    verify_caller: None,
                     no_secrets,
                     secrets: Vec::new(),
                     tenancy: None,
@@ -2540,6 +2545,7 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            verify_caller: None,
             no_secrets: false,
             secrets: Vec::new(),
             tenancy: None,
@@ -4164,6 +4170,7 @@ async fn activation_during_traffic_drops_no_requests() {
         },
     );
     let handler = HandlerConfig {
+        verify_caller: None,
         no_secrets: false,
         secrets: Vec::new(),
         tenancy: None,
@@ -4336,6 +4343,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -4471,6 +4479,7 @@ async fn activation_refuses_broken_component() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -4718,6 +4727,7 @@ async fn activation_refuses_disallowed_import() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -4829,6 +4839,7 @@ async fn activation_refuses_oversized_component() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -4943,6 +4954,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -5081,6 +5093,7 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -5217,6 +5230,7 @@ async fn per_site_timeout_cap_applies() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -5596,6 +5610,7 @@ async fn graphql_subscription_scope_is_project_qualified_and_isolates_foreign_te
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -6071,6 +6086,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -6246,6 +6262,7 @@ async fn guest_logs_captured_and_served() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -6388,6 +6405,7 @@ async fn guest_logs_suppressed_when_capture_disabled() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -6592,6 +6610,7 @@ async fn handler_env_injected_host_env_not_inherited() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 tenancy: None,
                 token_claims: None,
@@ -6724,6 +6743,7 @@ async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    verify_caller: None,
                     no_secrets: false,
                     tenancy: None,
                     token_claims: None,
@@ -8284,6 +8304,7 @@ async fn mesh_dispatch(
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -8478,6 +8499,7 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -8670,6 +8692,7 @@ async fn gateway_admission_gate_bounds_concurrency() {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    verify_caller: None,
                     no_secrets: false,
                     secrets: Vec::new(),
                     tenancy: None,
@@ -8824,6 +8847,7 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -8962,6 +8986,7 @@ async fn graphql_edge_is_scoped_to_the_endpoint_route_not_the_whole_site() {
         },
     );
     let handler_on = |route: &str| HandlerConfig {
+        verify_caller: None,
         no_secrets: false,
         secrets: Vec::new(),
         tenancy: None,
@@ -9204,6 +9229,7 @@ async fn edge_visibility_hides_an_internal_op_from_the_external_edge() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -9428,6 +9454,7 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -9684,6 +9711,7 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -9839,6 +9867,7 @@ async fn graphql_data_connector_mutations_write_with_row_isolation() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -10063,6 +10092,7 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -10222,6 +10252,7 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -10480,6 +10511,7 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                verify_caller: None,
                 no_secrets: false,
                 secrets: Vec::new(),
                 tenancy: None,
@@ -10686,6 +10718,219 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
     );
 
     let _ = std::fs::remove_dir_all(&sql_dir);
+}
+
+/// End-to-end gate for the opt-in **host-verified caller** (`HandlerConfig::verify_caller`), driven
+/// through the real `router()` with an OBSERVABLE guest (`kv-counter`, which increments a per-site
+/// KV counter and echoes `hits=N`). Proves the SYNC/HTTP lane deliverable. (1) An opting-in route
+/// with a VALID app bearer runs the guest (`hits=1`). (2) A tampered-sig / expired / wrong-issuer /
+/// MISSING bearer is rejected `401` and the guest NEVER runs — witnessed by the counter: after the
+/// four rejections the next valid request is only `hits=2` (the guest advanced exactly on the two
+/// valid tokens, not the four bad ones), i.e. fail-closed BEFORE the guest, not merely a 401 wrapper
+/// around a guest that already ran. (3) A route that does NOT opt in still serves a guest handed the
+/// RAW (even non-JWT) bearer untouched (`hits=1`) — the non-breaking, app-bearer-opaque path is
+/// unchanged.
+///
+/// The verified claims (`sub` + scalars) the guest receives on the header are asserted by the
+/// companion host-seam unit test (`handler_dispatch::verify_caller_tests`), since the stock
+/// `kv-counter` fixture does not echo request headers. Marker `VERIFY-CALLER E2E OK`.
+#[cfg(all(feature = "handlers", feature = "oidc"))]
+#[tokio::test]
+async fn verify_caller_forwards_verified_sub_and_fails_closed_before_guest() {
+    use base64::Engine;
+    use boatramp_core::config::{HandlerConfig, HandlerGraphqlTokenClaims, HandlersSiteConfig};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+    const ISS: &str = "https://idp.test";
+
+    // The app IdP: a deterministic Ed25519 key, its JWKS mapped into a host env var, and a signer.
+    let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let b64url = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let jwks = serde_json::json!({ "keys": [ {
+        "kty": "OKP", "crv": "Ed25519", "kid": "app",
+        "x": b64url(key.verifying_key().as_bytes()),
+    } ] })
+    .to_string();
+    let sign = |iss: &str, exp: i64| {
+        use ed25519_dalek::Signer;
+        let header = b64url(
+            serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": "app" })
+                .to_string()
+                .as_bytes(),
+        );
+        let payload = b64url(
+            serde_json::json!({ "iss": iss, "exp": exp, "sub": "u42" })
+                .to_string()
+                .as_bytes(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        format!(
+            "{signing_input}.{}",
+            b64url(&key.sign(signing_input.as_bytes()).to_bytes())
+        )
+    };
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let hash = sha256_hex(KV_COUNTER);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(KV_COUNTER)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+
+    // Deploy `kv-counter` on `/me` for a site, with an optional `verify_caller`.
+    let deploy_site = |site: &'static str, verify: Option<HandlerGraphqlTokenClaims>| {
+        let deploy = deploy.clone();
+        let hash = hash.clone();
+        async move {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "c.wasm".to_string(),
+                FileEntry {
+                    hash: hash.clone(),
+                    size: KV_COUNTER.len() as u64,
+                    content_type: None,
+                    variants: BTreeMap::new(),
+                },
+            );
+            let manifest = Manifest {
+                files,
+                config: DeployConfig {
+                    handlers: vec![HandlerConfig {
+                        verify_caller: verify,
+                        no_secrets: false,
+                        secrets: Vec::new(),
+                        tenancy: None,
+                        token_claims: None,
+                        route: "/me".to_string(),
+                        methods: Vec::new(),
+                        component: "c.wasm".to_string(),
+                        imports: vec!["wasi:keyvalue".to_string()],
+                        streaming: false,
+                        limits: None,
+                        env: BTreeMap::new(),
+                        invoke_targets: Vec::new(),
+                        stats_topics: Vec::new(),
+                        tenant_secret_names: Vec::new(),
+                        upload_containers: Vec::new(),
+                        blobstore_containers: Vec::new(),
+                        egress_allowlist: Vec::new(),
+                        dns_publish_zones: Vec::new(),
+                        dns_publish_ns_targets: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let id = deploy.put_manifest(&manifest).await.unwrap();
+            deploy
+                .activate(ProjectRef::DEFAULT, site, &id)
+                .await
+                .unwrap();
+            deploy
+                .set_site_config(
+                    ProjectRef::DEFAULT,
+                    site,
+                    &SiteConfig {
+                        handlers: Some(HandlersSiteConfig {
+                            enabled: true,
+                            allow_imports: vec!["wasi:keyvalue".to_string()],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    let verify_cfg = HandlerGraphqlTokenClaims {
+        issuer: ISS.to_string(),
+        jwks_env: Some("VC_JWKS".to_string()),
+        ..Default::default()
+    };
+    // "secured" opts in to verify_caller; "plain" does not (raw-bearer passthrough).
+    deploy_site("secured", Some(verify_cfg)).await;
+    deploy_site("plain", None).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, None, None);
+    // The app IdP's JWKS is injected via a MapEnv (never the process environment).
+    runtime.set_env_source(Arc::new(
+        boatramp_core::env::MapEnv::new().with("VC_JWKS", jwks.clone()),
+    ));
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // Fire a GET at a site's `/me` with an optional bearer; return (status, body-string).
+    let call = |app: axum::Router, site: &str, bearer: Option<String>| {
+        let uri = format!("/_sites/{site}/me");
+        async move {
+            let mut b = Request::builder().method("GET").uri(uri);
+            if let Some(t) = bearer {
+                b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+            }
+            let mut req = b.body(Body::empty()).unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8_lossy(&body).to_string())
+        }
+    };
+
+    let valid = sign(ISS, 4_102_444_800); // 2100-01-01
+    let expired = sign(ISS, 1_000_000_000);
+    let wrong_iss = sign("https://evil.test", 4_102_444_800);
+    let tampered = format!("{valid}x");
+
+    // (1) opt-in + valid → the guest runs (hits=1).
+    let (st, body) = call(app.clone(), "secured", Some(valid.clone())).await;
+    assert_eq!(st, StatusCode::OK, "valid token is served: {body}");
+    assert_eq!(body, "hits=1\n", "the guest ran exactly once");
+
+    // (2) opt-in + each bad token → 401, and the guest must NOT run (counter stays at 1).
+    for (label, bearer) in [
+        ("missing bearer", None),
+        ("tampered signature", Some(tampered)),
+        ("expired", Some(expired)),
+        ("wrong issuer", Some(wrong_iss)),
+    ] {
+        let (st, body) = call(app.clone(), "secured", bearer).await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "{label} must be rejected 401 (got body: {body})"
+        );
+    }
+    // The witness: after four rejections, the next valid request is only hits=2 — so the guest
+    // advanced exactly on the two VALID tokens, never on the four rejected ones (fail-closed BEFORE
+    // the guest, not a 401 wrapped around a guest that already ran its side effect).
+    let (st, body) = call(app.clone(), "secured", Some(valid)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        body, "hits=2\n",
+        "the guest ran only on the two valid tokens — the four 401s never reached it"
+    );
+
+    // (3) a route that does NOT opt in serves the guest with the RAW (even non-JWT) bearer
+    // untouched — the non-breaking, app-bearer-opaque path is unchanged.
+    let (st, body) = call(app.clone(), "plain", Some("not-a-jwt".to_string())).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a non-opting handler still serves: {body}"
+    );
+    assert_eq!(
+        body, "hits=1\n",
+        "the non-opting guest ran, handed the raw bearer unchanged"
+    );
+
+    println!("VERIFY-CALLER E2E OK");
 }
 
 // ---- 0.2.0 project-scoped API ---------------------------------------------
