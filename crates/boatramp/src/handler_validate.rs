@@ -883,6 +883,7 @@ mod imp {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dynamic_egress_hosts: Vec::new(),
                     dns_publish_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],

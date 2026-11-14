@@ -599,6 +599,8 @@ pub(super) async fn dispatch_handler(
         &handler.blobstore_containers,
         // Per-handler outbound-TCP allowlist for the gated `wasi:sockets` capability: empty ⇒ deny-all.
         &handler.egress_allowlist,
+        // Per-handler DYNAMIC egress host allowlist for the runtime-resolved-host dial (BR-REQ-2).
+        &handler.dynamic_egress_hosts,
         // Per-handler `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
         &handler.dns_publish_zones,
         // Per-handler `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.
@@ -2308,6 +2310,13 @@ pub(super) async fn build_bindings(
     // `wasi:sockets` is granted (declared import + site allow); the engine's `socket_addr_check` then
     // enforces it connect-only + SSRF-floored, and ONLY when the node posture allows TCP egress.
     egress_allowlist: &[String],
+    // Per-component DYNAMIC egress host allowlist for the host-mediated `tcp-egress` runtime-resolved-
+    // host dial (BR-REQ-2): `host-glob:port` entries whose NAME a guest-supplied `connect-tls` host is
+    // matched against at runtime. Empty ⇒ deny-all (the runtime-host path is unavailable). Attached to
+    // the bindings ONLY when the host-mediated `tcp-egress` capability (the `wasi:sockets` grant) is
+    // granted; the engine then enforces it HTTPS-only + SSRF-floored + DNS-rebind-choked, and ONLY when
+    // the node posture `allow_guest_dynamic_egress` is on. Host config on the deploy record.
+    dynamic_egress_hosts: &[String],
     // Per-component writable-zone allowlist for the gated `dns-publish` capability (cap-req #24 WS3):
     // the authorized zone-suffix globs this component may WRITE DNS records under (own name only,
     // never the rdata target). Empty ⇒ deny-all (least-privilege). The binding is attached ONLY when
@@ -3200,6 +3209,13 @@ pub(super) async fn build_bindings(
     if granted("wasi:sockets") && !egress_allowlist.is_empty() {
         bindings = bindings.with_egress_allowlist(egress_allowlist.to_vec());
     }
+    // Attach the DYNAMIC egress host allowlist (BR-REQ-2) under the SAME host-mediated `tcp-egress`
+    // grant (the `wasi:sockets` grant — "no new grant kind"). Deny-by-default: ungranted or empty ⇒
+    // the runtime-host path stays deny-all; even granted + non-empty reaches nothing unless the node
+    // posture `allow_guest_dynamic_egress` is on (enforced HTTPS-only + SSRF-floored in the engine).
+    if granted("wasi:sockets") && !dynamic_egress_hosts.is_empty() {
+        bindings = bindings.with_dynamic_egress_hosts(dynamic_egress_hosts.to_vec());
+    }
     // Host-side DNS resolver (mailroom cap-req #20/#21, the resolver half of the egress story): attach
     // the shared hickory resolver ONLY when the component is granted `dns-resolve`. This is the SAME
     // wiring the function/listener lanes carry ([`build_function_bindings`]); without it a bus CONSUMER
@@ -3711,6 +3727,8 @@ impl ConsumerRebuild<'_> {
             self.upload_containers,
             self.blobstore_containers,
             self.egress_allowlist,
+            // DYNAMIC egress host allowlist (BR-REQ-2): empty for this test harness.
+            &[],
             self.dns_publish_zones,
             self.dns_publish_ns_targets,
             self.secret_allowlist,
@@ -5010,6 +5028,8 @@ mod consumer_dns_resolve_tests {
             &[],
             &[],
             &allow,
+            // dynamic_egress_hosts (BR-REQ-2): empty ⇒ the runtime-host path is deny-all here.
+            &[],
             // dns_publish_zones (cap-req #24 WS3): empty ⇒ deny-all (this test exercises egress only).
             &[],
             // dns_publish_ns_targets (MEDIUM-3): empty ⇒ deny-all under the `allowlist` NS posture.

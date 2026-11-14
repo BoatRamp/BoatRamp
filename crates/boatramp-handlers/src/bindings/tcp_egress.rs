@@ -796,8 +796,16 @@ pub struct TcpEgressHost<'a> {
     /// The node posture's `allow_guest_tcp_egress` — the EXACT SAME flag that gates the raw
     /// `wasi:sockets` capability. No new posture knob.
     enabled: bool,
+    /// The node posture's `allow_guest_dynamic_egress` (BR-REQ-2): gates the runtime-resolved-host
+    /// dial against `dynamic_hosts`. INDEPENDENT of `enabled` (a fleet may enable the hostname path
+    /// while the raw-IP static path stays off). Consulted ONLY on the `connect-tls` dial (HTTPS-only).
+    dynamic_enabled: bool,
     allow_private: bool,
     allowlist: Arc<[String]>,
+    /// The per-component `dynamic_egress_hosts` allowlist (BR-REQ-2): `host-glob:port` entries whose
+    /// NAME a guest-supplied `connect-tls` host is matched against (resolve-then-SSRF-floor still
+    /// applies). Empty ⇒ the runtime-host path is deny-all. Host-authoritative — never guest-supplied.
+    dynamic_hosts: Arc<[String]>,
     extra_roots: Arc<[rustls::pki_types::CertificateDer<'static>]>,
     connect_timeout: Duration,
     idle_timeout: Duration,
@@ -817,12 +825,27 @@ impl<'a> TcpEgressHost<'a> {
         Self {
             table,
             enabled,
+            // Deny-by-default (BR-REQ-2): the runtime-resolved-host path is off + empty until
+            // `with_dynamic` opts it in. Keeps `new`'s shape stable for the static-path call sites.
+            dynamic_enabled: false,
+            dynamic_hosts: Arc::from(Vec::new()),
             allow_private,
             allowlist,
             extra_roots,
             connect_timeout,
             idle_timeout,
         }
+    }
+
+    /// Layer the BR-REQ-2 dynamic (runtime-resolved-host) egress config onto this host: the posture
+    /// (`allow_guest_dynamic_egress`) + the per-component `dynamic_egress_hosts` allowlist. Off +
+    /// empty (the `new` default) ⇒ the runtime-host path stays deny-all; the static IP
+    /// `egress_allowlist` path is unaffected either way.
+    #[must_use]
+    pub fn with_dynamic(mut self, enabled: bool, hosts: Arc<[String]>) -> Self {
+        self.dynamic_enabled = enabled;
+        self.dynamic_hosts = hosts;
+        self
     }
 }
 
@@ -858,6 +881,11 @@ impl tcp_egress::Host for TcpEgressHost<'_> {
                 &self.allowlist,
                 self.allow_private,
                 self.enabled,
+                // The runtime-resolved-host (BR-REQ-2) allowlist + posture are consulted ONLY on this
+                // implicit-TLS dial — never on `connect_plaintext` below — so the dynamic capability is
+                // HTTPS-only.
+                &self.dynamic_hosts,
+                self.dynamic_enabled,
                 verify,
                 &self.extra_roots,
             ),
@@ -1136,15 +1164,27 @@ async fn dial_pipeline(
     allowlist: &[String],
     allow_private: bool,
     posture: bool,
+    // BR-REQ-2 runtime-resolved-host allowlist + its posture. The implicit-TLS dial is the ONLY place
+    // the dynamic path is consulted, so the dynamic-allowlisted-egress capability is HTTPS-only.
+    dynamic_hosts: &[String],
+    dynamic_posture: bool,
     verify: VerifyMode,
     extra_roots: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Result<DialedStream, EgressError> {
-    let checked = resolve_and_gate_tcp_egress(host, port, allowlist, allow_private, posture)
-        .await
-        .map_err(|e| match e {
-            TcpEgressResolveError::DnsFailure => EgressError::DnsFailure,
-            TcpEgressResolveError::RefusedByGate => EgressError::RefusedByGate,
-        })?;
+    let checked = resolve_and_gate_tcp_egress(
+        host,
+        port,
+        allowlist,
+        allow_private,
+        posture,
+        dynamic_hosts,
+        dynamic_posture,
+    )
+    .await
+    .map_err(|e| match e {
+        TcpEgressResolveError::DnsFailure => EgressError::DnsFailure,
+        TcpEgressResolveError::RefusedByGate => EgressError::RefusedByGate,
+    })?;
     // Security review M1: cap how many gate-checked candidates this dial ATTEMPTS — independent of
     // the shared time budget above, so a many-homed (or broad-CIDR-allowlisted) target can't fan
     // out an unbounded number of TCP SYNs for one guest call.
@@ -1154,7 +1194,11 @@ async fn dial_pipeline(
 
 /// Build B's plaintext counterpart to [`dial_pipeline`]: the SAME resolve + gate-check + connect
 /// pipeline, with NO handshake — the guest drives the plaintext protocol itself over the returned
-/// raw `TcpStream`'s (later-split) halves.
+/// raw `TcpStream`'s (later-split) halves. The BR-REQ-2 runtime-resolved-host allowlist is
+/// deliberately NOT consulted here (empty list + posture off are passed to the gate), so a
+/// dynamic-only host can NEVER be reached over plaintext — the dynamic-allowlisted-egress capability
+/// is HTTPS-only. This path keeps ONLY the static IP `egress_allowlist` (the existing STARTTLS/relay
+/// case).
 async fn dial_plaintext_pipeline(
     host: &str,
     port: u16,
@@ -1162,12 +1206,21 @@ async fn dial_plaintext_pipeline(
     allow_private: bool,
     posture: bool,
 ) -> Result<tokio::net::TcpStream, EgressError> {
-    let checked = resolve_and_gate_tcp_egress(host, port, allowlist, allow_private, posture)
-        .await
-        .map_err(|e| match e {
-            TcpEgressResolveError::DnsFailure => EgressError::DnsFailure,
-            TcpEgressResolveError::RefusedByGate => EgressError::RefusedByGate,
-        })?;
+    let checked = resolve_and_gate_tcp_egress(
+        host,
+        port,
+        allowlist,
+        allow_private,
+        posture,
+        // HTTPS-only: no dynamic runtime-host match on the plaintext dial.
+        &[],
+        false,
+    )
+    .await
+    .map_err(|e| match e {
+        TcpEgressResolveError::DnsFailure => EgressError::DnsFailure,
+        TcpEgressResolveError::RefusedByGate => EgressError::RefusedByGate,
+    })?;
     let candidates = &checked[..checked.len().min(MAX_DIAL_CANDIDATES)];
     connect_checked(candidates).await
 }
@@ -1264,6 +1317,12 @@ impl EgressDialer {
                         &self.allowlist,
                         self.allow_private,
                         self.enabled,
+                        // The promote-connection upstream dialer (cap-req #22) carries ONLY the static
+                        // egress config — the BR-REQ-2 dynamic runtime-host allowlist is per-invocation
+                        // handler config, not engine-level, so promote never reaches a dynamic-only
+                        // host (no new reach; fail-closed).
+                        &[],
+                        false,
                         VerifyMode::Strict,
                         &self.extra_roots,
                     ),
@@ -1810,18 +1869,34 @@ mod tests {
     #[tokio::test]
     async fn resolve_and_gate_returns_the_checked_concrete_address() {
         let allow = vec!["93.184.216.34:443".to_string()];
-        let checked =
-            crate::engine::resolve_and_gate_tcp_egress("93.184.216.34", 443, &allow, false, true)
-                .await
-                .expect("an allowlisted global literal must be checked-and-returned");
+        let checked = crate::engine::resolve_and_gate_tcp_egress(
+            "93.184.216.34",
+            443,
+            &allow,
+            false,
+            true,
+            // No dynamic runtime-host allowlist on this static-path assertion.
+            &[],
+            false,
+        )
+        .await
+        .expect("an allowlisted global literal must be checked-and-returned");
         assert_eq!(
             checked,
             vec!["93.184.216.34:443".parse::<std::net::SocketAddr>().unwrap()]
         );
 
         // A denied literal returns the typed refusal, not a silent empty success.
-        let denied =
-            crate::engine::resolve_and_gate_tcp_egress("10.0.0.5", 5432, &allow, false, true).await;
+        let denied = crate::engine::resolve_and_gate_tcp_egress(
+            "10.0.0.5",
+            5432,
+            &allow,
+            false,
+            true,
+            &[],
+            false,
+        )
+        .await;
         assert_eq!(denied, Err(TcpEgressResolveError::RefusedByGate));
     }
 

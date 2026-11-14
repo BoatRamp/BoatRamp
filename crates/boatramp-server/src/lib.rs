@@ -5867,6 +5867,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dynamic_egress_hosts: Vec::new(),
                     dns_publish_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                     topic: "orders/created".into(),
@@ -6043,6 +6044,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dynamic_egress_hosts: Vec::new(),
                     dns_publish_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],
@@ -6488,6 +6490,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dynamic_egress_hosts: Vec::new(),
                     dns_publish_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],
@@ -8754,6 +8757,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dynamic_egress_hosts: Vec::new(),
                     dns_publish_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],
@@ -8943,6 +8947,7 @@ mod tests {
                     upload_containers: Vec::new(),
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
+                    dynamic_egress_hosts: Vec::new(),
                     dns_publish_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],
@@ -9109,6 +9114,8 @@ mod tests {
                     &[],
                     // Outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
                     &[],
+                    // DYNAMIC egress host allowlist (BR-REQ-2): empty ⇒ runtime-host path deny-all.
+                    &[],
                     // `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
                     &[],
                     // `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.
@@ -9261,6 +9268,8 @@ mod tests {
                 // Plain-`wasi:blobstore` container allowlist (tenant confinement): empty ⇒ permissive here.
                 &[],
                 // Outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
+                &[],
+                // DYNAMIC egress host allowlist (BR-REQ-2): empty ⇒ runtime-host path deny-all.
                 &[],
                 // `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
                 &[],

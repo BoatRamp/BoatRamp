@@ -109,6 +109,8 @@ impl SecurityProfile {
                 allow_guest_self_egress: true,
                 allow_guest_egress_extra_ca: false,
                 allow_guest_tcp_egress: false,
+                // A new egress surface (BR-REQ-2): off under multi-tenant until the operator opts in.
+                allow_guest_dynamic_egress: false,
                 allow_guest_tcp_listener: false,
                 allow_guest_dns_publish: false,
                 // A multi-tenant guest may NOT delegate a sub-zone NS to any nameserver (MEDIUM-3).
@@ -146,6 +148,7 @@ impl SecurityProfile {
                 allow_guest_self_egress: true,
                 allow_guest_egress_extra_ca: true,
                 allow_guest_tcp_egress: true,
+                allow_guest_dynamic_egress: true,
                 allow_guest_tcp_listener: true,
                 // A new, security-sensitive zone-write surface: OFF even on single-tenant until the
                 // operator opts in explicitly (its Security review gates the broader default).
@@ -186,6 +189,7 @@ impl SecurityProfile {
                 allow_guest_self_egress: true,
                 allow_guest_egress_extra_ca: true,
                 allow_guest_tcp_egress: true,
+                allow_guest_dynamic_egress: true,
                 allow_guest_tcp_listener: true,
                 // Off even under dev — a guest `dns-publish` would mutate REAL external DNS (the
                 // provider credential is real); an operator opts in explicitly.
@@ -288,6 +292,15 @@ pub struct PostureOverrides {
     /// Off under `multi-tenant`; on under `single-tenant`/`dev`. See
     /// [`SecurityPosture::allow_guest_tcp_egress`].
     pub allow_guest_tcp_egress: Option<bool>,
+    /// Permit a guest's host-mediated `tcp-egress` dial to a **runtime-resolved host** validated
+    /// against a per-component, host-authoritative `dynamic_egress_hosts` allowlist (BR-REQ-2).
+    /// Off under `multi-tenant` (a new egress surface — operator opts in); on under
+    /// `single-tenant`/`dev`. INDEPENDENT of [`allow_guest_tcp_egress`](Self::allow_guest_tcp_egress):
+    /// the dynamic path validates the guest-supplied HOSTNAME against a host-authoritative glob
+    /// allowlist (not the static IP list), is HTTPS-only (the implicit-TLS `connect-tls` dial only),
+    /// and keeps every existing egress guard (SSRF floor + the one-shot DNS-rebind choke). See
+    /// [`SecurityPosture::allow_guest_dynamic_egress`].
+    pub allow_guest_dynamic_egress: Option<bool>,
     /// Permit host-owned inbound-TCP **listeners** to dispatch an accepted connection to a guest.
     /// Off under `multi-tenant`; on under `single-tenant`/`dev`. Independent of
     /// `allow_guest_tcp_egress` (inbound ≠ outbound). See
@@ -523,6 +536,11 @@ impl SecurityConfig {
             o.allow_guest_tcp_egress.is_some(),
         );
         row(
+            "allow_guest_dynamic_egress",
+            p.allow_guest_dynamic_egress.to_string(),
+            o.allow_guest_dynamic_egress.is_some(),
+        );
+        row(
             "allow_guest_tcp_listener",
             p.allow_guest_tcp_listener.to_string(),
             o.allow_guest_tcp_listener.is_some(),
@@ -700,6 +718,24 @@ pub struct SecurityPosture {
     /// unless [`allow_guest_private_egress`](Self::allow_guest_private_egress) is separately on. Any
     /// single wiring omission fails CLOSED.
     pub allow_guest_tcp_egress: bool,
+    /// Permit a **guest**'s host-mediated `tcp-egress` dial to a **runtime-resolved host** that is
+    /// validated against its per-component, host-authoritative `dynamic_egress_hosts` allowlist
+    /// (BR-REQ-2, the dynamic-allowlisted-egress capability). This is the runtime-host counterpart to
+    /// [`allow_guest_tcp_egress`](Self::allow_guest_tcp_egress)'s static deploy-time IP/CIDR/domain
+    /// list: instead of matching a resolved peer IP against a fixed deploy list, it matches the
+    /// guest-SUPPLIED HOSTNAME (resolved at runtime from the guest's own per-tenant config, e.g. a
+    /// per-tenant OIDC issuer) against an operator-authored host-glob allowlist (`*.okta.com:443`,
+    /// `oauth2.googleapis.com:443`). It is deliberately MORE constrained than the static path: it is
+    /// **HTTPS-only** (consulted ONLY on the implicit-TLS `connect-tls` dial — a `connect-plaintext`
+    /// dial never uses it), it keeps the **SSRF floor** (every resolved address must be globally
+    /// routable unless [`allow_guest_private_egress`](Self::allow_guest_private_egress) is on) and the
+    /// **one-shot DNS-rebind choke** (resolve once, gate each pinned candidate, connect only to a
+    /// pinned address). **Empty `dynamic_egress_hosts` ⇒ deny-all** (fail-closed). Off under
+    /// `multi-tenant` (a new egress surface — the operator opts in explicitly), on under
+    /// `single-tenant`/`dev`. INDEPENDENT of `allow_guest_tcp_egress` (a fleet may enable the
+    /// hostname-allowlisted dynamic path while keeping the raw-IP static path off). Any single wiring
+    /// omission fails CLOSED.
+    pub allow_guest_dynamic_egress: bool,
     /// Permit host-owned inbound-TCP **listeners** (`[serve.listeners.<name>]`) to dispatch an
     /// accepted connection to a guest `tcp-connection-handler` (`PLAN-handler-tcp-inbound`). Off under
     /// `multi-tenant` (deny-by-default: a new, unproven surface — an untrusted site writer would
@@ -898,6 +934,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_tcp_egress {
         base.allow_guest_tcp_egress = v;
+    }
+    if let Some(v) = o.allow_guest_dynamic_egress {
+        base.allow_guest_dynamic_egress = v;
     }
     if let Some(v) = o.allow_guest_tcp_listener {
         base.allow_guest_tcp_listener = v;

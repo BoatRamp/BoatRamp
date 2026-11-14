@@ -1725,6 +1725,14 @@ pub(super) async fn build_function_bindings(
     if granted("wasi:sockets") && !config.egress_allowlist.is_empty() {
         bindings = bindings.with_egress_allowlist(config.egress_allowlist.clone());
     }
+    // DYNAMIC egress host allowlist (BR-REQ-2): attach the function's `dynamic_egress_hosts` under the
+    // SAME host-mediated `tcp-egress` grant (the `wasi:sockets` grant — "no new grant kind"). Deny-by-
+    // default — ungranted or empty leaves the runtime-host path deny-all; even granted + non-empty
+    // reaches nothing unless the node posture `allow_guest_dynamic_egress` is on (the engine enforces
+    // it HTTPS-only + SSRF-floored + DNS-rebind-choked, identical to the site-handler lane).
+    if granted("wasi:sockets") && !config.dynamic_egress_hosts.is_empty() {
+        bindings = bindings.with_dynamic_egress_hosts(config.dynamic_egress_hosts.clone());
+    }
     // Host-side DNS resolver (mailroom cap-req #20, the resolver half of the egress story): attach the
     // shared hickory resolver ONLY when the component is granted `dns-resolve`. Deny-by-default — the
     // binding is absent otherwise; and even when granted it reaches nothing unless the node posture

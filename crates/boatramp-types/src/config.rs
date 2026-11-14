@@ -893,6 +893,29 @@ pub struct HandlerConfig {
     /// guest-supplied at runtime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-handler **dynamic egress host allowlist** for the host-mediated `tcp-egress` capability's
+    /// runtime-resolved-host dial (BR-REQ-2, the dynamic-allowlisted-egress capability). Each entry is
+    /// a `host-glob:port` target (`oauth2.googleapis.com:443`, `www.googleapis.com:443`,
+    /// `login.microsoftonline.com:443`, `*.okta.com:443`, `**.okta.com:443`): the HOSTNAME the guest
+    /// supplies at `connect-tls` time (resolved at RUNTIME from the guest's own per-tenant config, e.g.
+    /// a per-tenant OIDC issuer) is matched against these globs, case-insensitively, trailing dot
+    /// ignored (same globbing as [`crate::gateway::gateway_host_matches`]: exact, `*.suffix` one label,
+    /// `**.suffix` any depth). This is the RUNTIME-host counterpart to the static deploy-time
+    /// [`egress_allowlist`](Self::egress_allowlist) (which matches a resolved peer IP/CIDR/domain): it
+    /// matches the guest-NAMED host instead, so a per-tenant host not known at deploy (an Okta org)
+    /// can be reached without widening the IP list. **Host-authoritative** — the allowlist is this
+    /// deploy record's config, NEVER guest-supplied at runtime; the guest only names the host to reach.
+    /// **Empty ⇒ deny-all** (fail-closed). The dynamic dial keeps every egress guard: it is
+    /// **HTTPS-only** (consulted ONLY on the implicit-TLS `connect-tls` dial — a `connect-plaintext`
+    /// dial never uses it), SSRF-floored (every resolved address must be globally routable unless the
+    /// posture allows private egress), and DNS-rebind-choked (resolve once, gate each pinned
+    /// candidate, connect only to a pinned address). Only consulted when the component is granted the
+    /// host-mediated `tcp-egress` capability (the `wasi:sockets` grant) AND the node posture
+    /// [`allow_guest_dynamic_egress`](crate::security::SecurityPosture::allow_guest_dynamic_egress) is
+    /// on — with the posture off the runtime denies all (fail-closed). Host config on the deploy
+    /// record, never guest-supplied at runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_egress_hosts: Vec<String>,
     /// Per-handler **writable-zone allowlist** for the gated `dns-publish` capability (cap-req #24 WS3):
     /// the authorized zone suffixes (globs) this handler may WRITE DNS records under. The DNS analog of
     /// [`egress_allowlist`](Self::egress_allowlist) and least-privilege the same way: **empty ⇒
@@ -1098,6 +1121,13 @@ pub struct ConsumerConfig {
     /// (`allow_guest_tcp_egress`), SSRF-floored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-component **dynamic egress host allowlist** for this consumer's host-mediated `tcp-egress`
+    /// runtime-resolved-host dial (same contract as [`HandlerConfig::dynamic_egress_hosts`]): the
+    /// `host-glob:port` targets whose NAME the guest may dial via `connect-tls` at runtime,
+    /// host-authoritative, **empty ⇒ deny-all**, HTTPS-only + SSRF-floored + DNS-rebind-choked,
+    /// posture-gated by `allow_guest_dynamic_egress`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_egress_hosts: Vec<String>,
     /// Per-component **writable-zone allowlist** for the gated `dns-publish` capability (same contract
     /// as [`HandlerConfig::dns_publish_zones`]): the authorized zone-suffix globs this consumer may
     /// WRITE DNS records under (own name only, never the rdata target). **Empty ⇒ deny-all.**
@@ -1357,6 +1387,13 @@ pub struct SessionConfig {
     /// posture-gated (`allow_guest_tcp_egress`), SSRF-floored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-component **dynamic egress host allowlist** for this session component's host-mediated
+    /// `tcp-egress` runtime-resolved-host dial (same contract as
+    /// [`HandlerConfig::dynamic_egress_hosts`]): the `host-glob:port` targets whose NAME the guest may
+    /// dial via `connect-tls` at runtime, host-authoritative, **empty ⇒ deny-all**, HTTPS-only +
+    /// SSRF-floored + DNS-rebind-choked, posture-gated by `allow_guest_dynamic_egress`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_egress_hosts: Vec<String>,
     /// Per-component **writable-zone allowlist** for the gated `dns-publish` capability (same contract
     /// as [`HandlerConfig::dns_publish_zones`]): the authorized zone-suffix globs this session's
     /// component may WRITE DNS records under (own name only). **Empty ⇒ deny-all.** Posture-gated
@@ -2478,6 +2515,7 @@ mod tests {
                 upload_containers: Vec::new(),
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
+                dynamic_egress_hosts: Vec::new(),
                 dns_publish_zones: Vec::new(),
                 dns_publish_ns_targets: Vec::new(),
             }],

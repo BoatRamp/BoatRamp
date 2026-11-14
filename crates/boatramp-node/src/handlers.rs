@@ -218,6 +218,12 @@ pub async fn build_handler_runtime(
     // (`PLAN-handler-tcp-egress`). Off under multi-tenant; when off the engine installs no permissive
     // socket check, so every connect fails closed regardless of a handler's `egress_allowlist`.
     allow_guest_tcp_egress: bool,
+    // Posture: whether a guest's host-mediated `tcp-egress` dial may reach a RUNTIME-resolved host
+    // validated against its per-component `dynamic_egress_hosts` allowlist (BR-REQ-2). Off under
+    // multi-tenant (a new egress surface — operator opts in); when off the engine refuses every
+    // runtime-host dial. INDEPENDENT of `allow_guest_tcp_egress` (the static IP path): the dynamic
+    // path is HTTPS-only, hostname-allowlisted, SSRF-floored, and DNS-rebind-choked.
+    allow_guest_dynamic_egress: bool,
     // Posture: whether host-owned inbound-TCP listeners (`[serve.listeners.<name>]`) may dispatch an
     // accepted connection to a guest `tcp-connection-handler` (`PLAN-handler-tcp-inbound`). Off under
     // multi-tenant; when off the engine refuses every listener dispatch. INDEPENDENT of
@@ -511,6 +517,9 @@ pub async fn build_handler_runtime(
     .with_outbound_timeout(outbound_timeout)
     .with_private_egress(allow_guest_private_egress)
     .with_tcp_egress(allow_guest_tcp_egress)
+    // Posture gate for the runtime-resolved-host dynamic egress dial (BR-REQ-2). OFF under
+    // multi-tenant ⇒ fail-closed. INDEPENDENT of `with_tcp_egress` (the static IP path).
+    .with_dynamic_egress(allow_guest_dynamic_egress)
     .with_tcp_listener(allow_guest_tcp_listener)
     // Posture gate for the guest `dns-publish` write capability (cap-req #24 WS3). OFF by default ⇒
     // fail-closed `access-denied`. INDEPENDENT of the egress knobs.
@@ -1079,6 +1088,10 @@ pub async fn build_handler_runtime(
     // node.rs caller (the caller passes the posture value unconditionally); a lean
     // node has no guest TCP-egress to gate, so it is ignored.
     _allow_guest_tcp_egress: bool,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single node.rs caller
+    // (the caller passes the posture value unconditionally); a lean node has no guest `tcp-egress`
+    // dial to gate, so the BR-REQ-2 runtime-resolved-host posture is ignored.
+    _allow_guest_dynamic_egress: bool,
     // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single
     // node.rs caller (the caller passes the posture value unconditionally); a lean
     // node has no guest listener to dispatch, so it is ignored.

@@ -1020,6 +1020,8 @@ pub(super) async fn run_scheduler_tick(
                                 &consumer.blobstore_containers,
                                 // The consumer's outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
                                 &consumer.egress_allowlist,
+                                // The consumer's DYNAMIC egress host allowlist (runtime-resolved host, BR-REQ-2).
+                                &consumer.dynamic_egress_hosts,
                                 // The consumer's `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
                                 &consumer.dns_publish_zones,
                                 // The consumer's `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.
@@ -1524,6 +1526,8 @@ async fn fire_cron(
         &handler.blobstore_containers,
         // A cron-triggered handler inherits the matched handler's outbound-TCP `egress_allowlist`.
         &handler.egress_allowlist,
+        // …and its DYNAMIC egress host allowlist for the runtime-resolved-host dial (BR-REQ-2).
+        &handler.dynamic_egress_hosts,
         // …and its `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
         &handler.dns_publish_zones,
         // …and its `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.

@@ -187,6 +187,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let max_component_bytes = options.posture.max_component_bytes;
     let allow_guest_private_egress = options.posture.allow_guest_private_egress;
     let allow_guest_tcp_egress = options.posture.allow_guest_tcp_egress;
+    let allow_guest_dynamic_egress = options.posture.allow_guest_dynamic_egress;
     let allow_guest_tcp_listener = options.posture.allow_guest_tcp_listener;
     let allow_guest_dns_publish = options.posture.allow_guest_dns_publish;
     // Sub-zone `NS` delegation posture (Security review MEDIUM-3); mapped onto the handler-engine enum
@@ -315,6 +316,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         max_component_bytes,
         allow_guest_private_egress,
         allow_guest_tcp_egress,
+        allow_guest_dynamic_egress,
         allow_guest_tcp_listener,
         allow_guest_dns_publish,
         guest_dns_publish_ns,
