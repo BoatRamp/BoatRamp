@@ -98,6 +98,10 @@ struct StaticResolver {
     addrs: BTreeMap<String, Vec<IpAddr>>,
     /// name → MX records (sorted ascending by preference at build time).
     mx: BTreeMap<String, Vec<MxRecord>>,
+    /// name → TXT records, each entry one already-reassembled per-RR string (as `resolve_txt` returns
+    /// them — the chunk reassembly is a property of the record value, so the static map stores the
+    /// finished strings directly).
+    txt: BTreeMap<String, Vec<String>>,
     fallthrough: Option<Arc<dyn DnsResolver>>,
 }
 
@@ -109,6 +113,7 @@ impl StaticResolver {
     ) -> Self {
         let mut addrs: BTreeMap<String, Vec<IpAddr>> = BTreeMap::new();
         let mut mx: BTreeMap<String, Vec<MxRecord>> = BTreeMap::new();
+        let mut txt: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for rec in &cfg.records {
             let key = normalize_name(&rec.name);
             if !rec.addrs.is_empty() {
@@ -118,7 +123,7 @@ impl StaticResolver {
                     .extend(rec.addrs.iter().copied());
             }
             if !rec.mx.is_empty() {
-                let entry = mx.entry(key).or_default();
+                let entry = mx.entry(key.clone()).or_default();
                 for StaticMx {
                     preference,
                     exchange,
@@ -130,9 +135,15 @@ impl StaticResolver {
                     });
                 }
             }
-            // Only addr + MX are overridable, by design: the consumer-lane `DnsResolver` capability
-            // does exactly `resolve-addr` + `resolve-mx` (no `resolve-txt`), so no other record type
-            // is accepted — a type is added only if/when the capability gains a lookup for it.
+            if !rec.txt.is_empty() {
+                // Each configured TXT string is ALREADY one reassembled per-RR value (the operator
+                // writes the whole string); stored verbatim, returned as-is by `resolve_txt`.
+                txt.entry(key).or_default().extend(rec.txt.iter().cloned());
+            }
+            // addr + MX + TXT are the overridable record types, matching the consumer-lane
+            // `DnsResolver` capability's `resolve-addr` + `resolve-mx` + `resolve-txt` lookups; no
+            // other record type is accepted — a type is added only if/when the capability gains a
+            // lookup for it.
         }
         for records in mx.values_mut() {
             records.sort_by_key(|r| r.preference);
@@ -140,6 +151,7 @@ impl StaticResolver {
         Self {
             addrs,
             mx,
+            txt,
             fallthrough,
         }
     }
@@ -164,6 +176,17 @@ impl DnsResolver for StaticResolver {
         }
         match &self.fallthrough {
             Some(f) => f.resolve_addr(host).await,
+            None => Err(DnsResolveError::NotFound),
+        }
+    }
+
+    async fn resolve_txt(&self, name: &str) -> Result<Vec<String>, DnsResolveError> {
+        if let Some(records) = self.txt.get(&normalize_name(name)) {
+            // A configured (non-empty) TXT set answers authoritatively — no network.
+            return Ok(records.clone());
+        }
+        match &self.fallthrough {
+            Some(f) => f.resolve_txt(name).await,
             None => Err(DnsResolveError::NotFound),
         }
     }
@@ -219,6 +242,17 @@ fn validate_name(name: &str) -> Result<(), DnsResolveError> {
         ));
     }
     Ok(())
+}
+
+/// Reassemble ONE TXT RR's RFC 1035 ≤255-byte character-string chunks into its single logical value by
+/// concatenating them (lossy UTF-8, matching the domain-verify TXT reader). A value an authoritative
+/// server split across several chunks — e.g. a DKIM `p=` public key longer than 255 bytes — is thereby
+/// returned whole, as ONE string. The caller emits one of these per TXT RR.
+fn reassemble_txt_rr<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> String {
+    chunks
+        .into_iter()
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -277,6 +311,36 @@ impl DnsResolver for HickoryDnsResolver {
         }
         Ok(addrs)
     }
+
+    async fn resolve_txt(&self, name: &str) -> Result<Vec<String>, DnsResolveError> {
+        use hickory_resolver::proto::rr::RData;
+        let name = name.trim();
+        validate_name(name)?;
+        let lookup = match self.inner.txt_lookup(name).await {
+            Ok(l) => l,
+            Err(e) if e.is_no_records_found() => return Err(DnsResolveError::NotFound),
+            // COARSE reason (security-review LOW-1) — see `resolve_mx`.
+            Err(e) => {
+                tracing::debug!(error = %e, %name, "dns-resolve: txt lookup failed");
+                return Err(DnsResolveError::Failed("txt lookup failed".to_string()));
+            }
+        };
+        let records: Vec<String> = lookup
+            .answers()
+            .iter()
+            .filter_map(|r| match &r.data {
+                // One TXT RR may arrive as several ≤255-byte character-strings; reassemble each RR
+                // into ONE string (same move as the domain-verify resolver). hickory-proto 0.26
+                // exposes `txt_data` as a public field of `[Box<[u8]>]`.
+                RData::TXT(txt) => Some(reassemble_txt_rr(txt.txt_data.iter().map(|c| &c[..]))),
+                _ => None,
+            })
+            .collect();
+        if records.is_empty() {
+            return Err(DnsResolveError::NotFound);
+        }
+        Ok(records)
+    }
 }
 
 /// A resolver that always fails to build (the `OnceLock` init saw a broken DNS environment). Returns
@@ -292,6 +356,11 @@ impl DnsResolver for UnavailableResolver {
         ))
     }
     async fn resolve_addr(&self, _host: &str) -> Result<Vec<IpAddr>, DnsResolveError> {
+        Err(DnsResolveError::Failed(
+            "dns resolver unavailable".to_string(),
+        ))
+    }
+    async fn resolve_txt(&self, _name: &str) -> Result<Vec<String>, DnsResolveError> {
         Err(DnsResolveError::Failed(
             "dns resolver unavailable".to_string(),
         ))
@@ -329,6 +398,9 @@ mod tests {
         async fn resolve_addr(&self, _host: &str) -> Result<Vec<IpAddr>, DnsResolveError> {
             panic!("fallthrough resolver was consulted for a static-map hit");
         }
+        async fn resolve_txt(&self, _name: &str) -> Result<Vec<String>, DnsResolveError> {
+            panic!("fallthrough resolver was consulted for a static-map hit");
+        }
     }
 
     fn override_cfg() -> DnsResolveOverrideConfig {
@@ -353,6 +425,16 @@ mod tests {
                     addrs: vec![
                         "93.184.216.34".parse().unwrap(),
                         "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap(),
+                    ],
+                    ..Default::default()
+                },
+                StaticRecord {
+                    name: "multi.example.com".into(),
+                    // Two TXT RRs — an SPF string and a long DKIM `p=` key — each already one
+                    // reassembled per-RR value (see `resolve_txt`'s chunk reassembly).
+                    txt: vec![
+                        "v=spf1 include:_spf.example.com -all".into(),
+                        format!("v=DKIM1; k=rsa; p={}", "A".repeat(400)),
                     ],
                     ..Default::default()
                 },
@@ -435,6 +517,9 @@ mod tests {
             async fn resolve_addr(&self, _host: &str) -> Result<Vec<IpAddr>, DnsResolveError> {
                 Ok(vec!["203.0.113.7".parse().unwrap()])
             }
+            async fn resolve_txt(&self, _name: &str) -> Result<Vec<String>, DnsResolveError> {
+                Ok(vec!["v=spf1 -all".to_string()])
+            }
         }
         let resolver = StaticResolver::from_config(
             &override_cfg(),
@@ -444,6 +529,8 @@ mod tests {
         assert_eq!(mx[0].exchange, "fallthrough.example");
         let addrs = resolver.resolve_addr("other.example").await.unwrap();
         assert_eq!(addrs, vec!["203.0.113.7".parse::<IpAddr>().unwrap()]);
+        let txt = resolver.resolve_txt("other.example").await.unwrap();
+        assert_eq!(txt, vec!["v=spf1 -all".to_string()]);
     }
 
     /// `build_resolver(None)` is the DEFAULT path — a plain hickory system resolver, not a
@@ -477,5 +564,59 @@ mod tests {
         HickoryDnsResolver::build_with_upstream("127.0.0.1:5353")
             .expect("a syntactically valid upstream builds");
         assert!(HickoryDnsResolver::build_with_upstream("not-a-socket-addr").is_err());
+    }
+
+    /// GATE (mailroom #30) — the multi-chunk reassembly that `HickoryDnsResolver::resolve_txt` applies
+    /// to each TXT RR. A DKIM `p=` key longer than one RFC 1035 character-string arrives from the
+    /// authoritative server as several ≤255-byte chunks; reassembly must concatenate them into EXACTLY
+    /// one string, byte-for-byte, with no chunk dropped or reordered. Mutation-sensitive: take only the
+    /// first chunk, or join with a separator, and this goes RED. Deterministic — no network.
+    #[test]
+    fn reassemble_txt_rr_joins_multichunk_into_one_string() {
+        let whole = format!("v=DKIM1; k=rsa; p={}", "A".repeat(400));
+        let bytes = whole.as_bytes();
+        let (c1, c2) = bytes.split_at(255);
+        assert_eq!(
+            c1.len(),
+            255,
+            "first chunk is a full ≤255-byte character-string"
+        );
+        assert!(
+            !c2.is_empty(),
+            "the value genuinely spans more than one chunk"
+        );
+        assert_eq!(
+            reassemble_txt_rr([c1, c2]),
+            whole,
+            "the ≤255-byte chunks of one TXT RR reassemble into exactly one string"
+        );
+        // A single-chunk RR passes through unchanged.
+        assert_eq!(reassemble_txt_rr(["v=spf1 -all".as_bytes()]), "v=spf1 -all");
+    }
+
+    /// GATE (mailroom #30) — `resolve_txt` end-to-end over the static map (authoritative, no network):
+    /// a configured name returns each TXT RR as ONE list entry, verbatim and in order (the long DKIM
+    /// value is already one reassembled string); and a name that has OTHER records but no TXT is
+    /// per-type `not-found` (an empty answer, never a silent leak to a fallthrough).
+    #[tokio::test]
+    async fn resolve_txt_static_map_per_rr_and_absent_is_not_found() {
+        let resolver = StaticResolver::from_config(&override_cfg(), None);
+        let txt = resolver.resolve_txt("MULTI.Example.com.").await.unwrap();
+        assert_eq!(
+            txt,
+            vec![
+                "v=spf1 include:_spf.example.com -all".to_string(),
+                format!("v=DKIM1; k=rsa; p={}", "A".repeat(400)),
+            ],
+            "each TXT RR is one entry, verbatim, case- and trailing-dot-insensitive on the name"
+        );
+        // `example.com` has MX but no TXT ⇒ per-type not-found.
+        assert!(
+            matches!(
+                resolver.resolve_txt("example.com").await,
+                Err(DnsResolveError::NotFound)
+            ),
+            "a name with no TXT records is not-found"
+        );
     }
 }

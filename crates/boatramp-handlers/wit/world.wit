@@ -1743,8 +1743,9 @@ world tcp-connection-context-host {
 
 /// Value types + the host-side **DNS resolver** capability (`boatramp:handlers/dns-resolve`, mailroom
 /// cap-req #20): the DNS half of the egress story. `tcp-egress` (#15) dials a KNOWN host; this lets a
-/// guest FIND the host to dial — resolve a domain's MX records (which mail host to deliver to) or a
-/// hostname's addresses — WITHOUT the guest holding `wasi:sockets` or running a resolver itself. The
+/// guest FIND the host to dial — resolve a domain's MX records (which mail host to deliver to), a
+/// hostname's addresses, or a name's TXT records (SPF/DKIM/verification strings) — WITHOUT the guest
+/// holding `wasi:sockets` or running a resolver itself. The
 /// host does the lookup (with its own cache), so this is the guest-facing resolver `#02`'s verifier
 /// deliberately deferred ("a guest-facing DNS resolver is egress surface").
 ///
@@ -1790,6 +1791,14 @@ interface dns-resolve {
   /// SSRF-floored: a non-globally-routable address is dropped unless `allow_private_egress` is set, so
   /// an all-private answer returns `not-found` rather than leaking an internal target.
   resolve-addr: func(host: string) -> result<list<string>, dns-error>;
+
+  /// Resolve `name`'s TXT records, one reassembled string PER record: the host joins the RFC 1035
+  /// ≤255-byte character-string chunks of a SINGLE TXT RR into ONE value (so a long record — e.g. a
+  /// DKIM `p=` public key split across chunks — comes back whole), and returns one list entry per TXT
+  /// RR. A name with no TXT records is `not-found` (an empty answer, NOT an error). Egress-class and
+  /// budget-capped exactly like the siblings; NO SSRF floor applies — a TXT value is opaque text, not a
+  /// dialable address (the follow-on dial, if any, is itself the SSRF-floored `tcp-egress` connect).
+  resolve-txt: func(name: string) -> result<list<string>, dns-error>;
 }
 
 /// Import-only world for the `dns-resolve` host binding (the `DnsResolveHost` Host impl). Off by
