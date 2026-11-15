@@ -393,6 +393,8 @@ jobs:
           BOATRAMP_TEST_MYSQL_URL="mysql://root:mysql@${MYIP}:3306/mysql" \
             cargo test -p boatramp-node --features project-export \
             --test project_export_roundtrip \
+            --test construens_selfheal_empty_mirror_live \
+            --test construens_atomic_swap_live \
             -- --nocapture --test-threads=1 2>&1 | tee project-export-live.log
           # Cross-node SOURCE-VERSION-INDEPENDENCE gate (v0.59.2): the REAL clone/stream +
           # project-import handlers on a SOURCE + TARGET node, with the managed-restore signal on the
@@ -545,6 +547,14 @@ jobs:
           # BOOT-preserved populated __old_ TRACKED on the next sync + grace-reaped (v0.59.7 OBS 3b).
           grep -q 'PROJECT SYNC BOOT-PRESERVED OLD TRACKED NEXT SYNC OK' project-export-live.log \
             || { echo "::error::boot-preserved-tracked gate never reached its marker (silent skip, or a boot-preserved populated __old_ was NOT converted to a tracked+reaped tombstone by the next sync — OBS 3)" >&2; exit 1; }
+          # ATOMIC-SWAP self-heal (v0.59.8 — construens EMPTY-MIRROR fix): the self-heal no longer empties
+          # live up front; the atomic swap is the single destructive moment. Three mutation-proven gates.
+          grep -q 'CONSTRUENS SELFHEAL PRESERVES LIVE OK' project-export-live.log \
+            || { echo "::error::construens self-heal preserve-live gate never reached its marker (silent skip, or the self-heal EMPTIED the live db before a verified restore — the v0.59.7 empty-mirror DATA-LOSS defect reopened)" >&2; exit 1; }
+          grep -q 'CONSTRUENS EXISTING-DEST HEAL LANDS OK' project-export-live.log \
+            || { echo "::error::construens existing-dest heal gate never reached its marker (silent skip, or the one-shot recovery restore failed to land / did not preserve the prior data recoverably)" >&2; exit 1; }
+          grep -q 'CONSTRUENS RESTORE-FAIL LIVE INTACT OK' project-export-live.log \
+            || { echo "::error::construens restore-failure gate never reached its marker (silent skip, or a FAILED restore left the tenant on an emptied mirror instead of the original live db serving — the atomicity invariant broke)" >&2; exit 1; }
           # CROSS-NODE TENANCY-MISMATCH fail-closed (v0.59.6, I2 DATA-LOSS corner): a Single/dedicated-
           # framed (chunked) managed member applied into a SHARED tenant cell is REFUSED fail-closed,
           # so a populated Shared occupant is NEVER clobbered (zero foreign bytes). Self-skip → marker.

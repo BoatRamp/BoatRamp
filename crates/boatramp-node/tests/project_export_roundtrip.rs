@@ -6978,66 +6978,64 @@ async fn project_sync_self_heal_restore_failure_recoverable_live() {
         } => preserved_tombstones,
         other => panic!("expected a Healed report on the detected tangle, got {other:?}"),
     };
-    assert_eq!(
-        preserved.len(),
-        1,
-        "the POPULATED orphan must be soft-deprovisioned to exactly ONE recoverable `__deleted_` \
-         tombstone (not hard-dropped): preserved={preserved:?}"
+    // v0.59.8 NEW INVARIANT (atomic swap = single destructive moment): the self-heal DIVORCES the live
+    // db in place and NEVER tombstones/empties it (the empty stray `__old_` is hard-dropped, not
+    // tombstoned), so it mints NO `__deleted_` tombstone. The restore-failure recoverability property
+    // (Security review E1) is now preserved by a STRONGER mechanism — the original live db is left
+    // SERVING, so a restore that fails after the heal leaves the real rows in place (not merely
+    // recoverable in a tombstone). [CROSSWALK: E1 recoverability — OLD "populated orphan → recoverable
+    // `__deleted_` tombstone before restore" → NEW "populated live divorced IN PLACE, still serving;
+    // asserted here + the end-to-end restore-FAILURE gate `construens_restore_failure_leaves_live_serving`;
+    // the SUCCESSFUL-recovery-swap tombstone is asserted by `construens_existing_dest_heal_lands_live`.]
+    assert!(
+        preserved.is_empty(),
+        "v0.59.8: the self-heal must NOT mint a `__deleted_` tombstone of the live db (it divorces live \
+         in place; the empty stray `__old_` is hard-dropped): preserved={preserved:?}"
     );
-    let orphan_tomb = &preserved[0];
 
-    // (E1 MUTATION WITNESS) the orphan's PRE-HEAL rows are RECOVERABLE in the grace tombstone. On the
-    // pre-fix hard-drop heal the tombstone does not exist and `precious` is GONE → this is RED.
-    let (_c, exists) = psql(
+    // (E1 MUTATION WITNESS, new mechanism) the live db is PRESERVED IN PLACE, still holding its rows. On
+    // the pre-v0.59.8 up-front-empty heal the live rows are GONE → this is RED.
+    let (_c, live_rows) = psql(
         backend.as_ref(),
         &image,
-        &maint,
-        &format!("SELECT 1 FROM pg_database WHERE datname='{orphan_tomb}'"),
-    )
-    .await;
-    assert_eq!(
-        exists.trim(),
-        "1",
-        "the recoverable orphan tombstone must exist"
-    );
-    let (_c, rows) = psql(
-        backend.as_ref(),
-        &image,
-        &conn(&superuser, &su_pw, &host, port, orphan_tomb),
+        &conn(&superuser, &su_pw, &host, port, &dest_db),
         "SELECT id || ':' || v FROM precious ORDER BY id",
     )
     .await;
     assert_eq!(
-        rows, "1:keep-a\n2:keep-b",
-        "the POPULATED orphan's rows MUST survive recoverably in the grace tombstone — a mid-restore \
-         failure after the heal must NOT leave them clobbered (Security review E1)"
+        live_rows, "1:keep-a\n2:keep-b",
+        "the POPULATED live db MUST be preserved IN PLACE (still serving its rows) after the self-heal — \
+         a restore failure after the heal must NOT have emptied it (Security review E1, new mechanism)"
     );
-    let (_c, tomb_owner) = psql(
+    // the live db is divorced to the stable superuser (so DROP ROLE succeeded) but NOT renamed/emptied.
+    let (_c, live_owner) = psql(
         backend.as_ref(),
         &image,
         &maint,
-        &format!("SELECT r.rolname FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE d.datname='{orphan_tomb}'"),
+        &format!("SELECT r.rolname FROM pg_database d JOIN pg_roles r ON r.oid=d.datdba WHERE d.datname='{dest_db}'"),
     )
     .await;
     assert_eq!(
-        tomb_owner.trim(),
+        live_owner.trim(),
         superuser,
-        "the recovered orphan tombstone is reassigned to the stable superuser (divorced from the \
-         dropped derived roles so DROP ROLE succeeded)"
+        "the live db is divorced to the stable superuser IN PLACE (not renamed aside), so DROP ROLE \
+         succeeded while the data kept serving"
     );
-
-    // the live name is a FRESH reprovisioned db (not left absent/unrecoverable).
-    let (_c, live_exists) = psql(
+    // No `__deleted_` tombstone of the live was minted by the self-heal (that happens only at the swap).
+    let (_c, tomb_cnt) = psql(
         backend.as_ref(),
         &image,
         &maint,
-        &format!("SELECT 1 FROM pg_database WHERE datname='{dest_db}'"),
+        &format!(
+            "SELECT count(*) FROM pg_database WHERE datname LIKE '{p}%__deleted_%'",
+            p = &dest_db[..dest_db.len().min(40)]
+        ),
     )
     .await;
     assert_eq!(
-        live_exists.trim(),
-        "1",
-        "the live name must be reprovisioned fresh, not left absent"
+        tomb_cnt.trim(),
+        "0",
+        "the self-heal must mint NO live `__deleted_` tombstone before the swap"
     );
     // stray aside cleared; roles reprovisioned fresh (the heal fully ran).
     let (_c, stray_after) = psql(
@@ -7065,12 +7063,23 @@ async fn project_sync_self_heal_restore_failure_recoverable_live() {
         "the derived roles must be reprovisioned FRESH (new OID) — the heal fully completed"
     );
 
-    for db in [&dest_db, &stray_old, &orphan_tomb.to_string()] {
+    // cleanup: sweep the live db, the stray aside, and any `__deleted_` aside (defensive) + the roles.
+    let (_c, asides) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "SELECT datname FROM pg_database WHERE datname LIKE '{p}%'",
+            p = &dest_db[..dest_db.len().min(40)]
+        ),
+    )
+    .await;
+    for db in asides.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let _ = psql(
             backend.as_ref(),
             &image,
             &maint,
-            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            &format!("DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"),
         )
         .await;
     }
@@ -7497,6 +7506,17 @@ async fn project_sync_self_heal_drop_soft_deleted_keeps_orphan_live() {
     )
     .await;
     assert_eq!(c, 0, "create __old_ stray: {o}");
+    // A PRE-EXISTING `__deleted_` grace tombstone owned by the owner — the object `--drop-soft-deleted`
+    // governs (FINDING 3: the flag disposes of PRE-EXISTING tombstones, and NEVER the live orphan).
+    let pre_tomb = bounded_aside_db_name(&dest_db, "__deleted_", &format!("{s}99"));
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("CREATE DATABASE \"{pre_tomb}\" OWNER \"{owner_role}\""),
+    )
+    .await;
+    assert_eq!(c, 0, "create pre-existing __deleted_ tombstone: {o}");
 
     // DRIVE THE REAL HEAL with `--drop-soft-deleted` SET.
     let report = untangle_colliding_orphan_roles(
@@ -7511,39 +7531,70 @@ async fn project_sync_self_heal_drop_soft_deleted_keeps_orphan_live() {
     )
     .await
     .unwrap_or_else(|e| panic!("self-heal (drop-soft-deleted) MUST succeed: {e}"));
-    let preserved = match report {
+    let (dropped, preserved) = match report {
         SelfHealReport::Healed {
+            dropped_tombstones,
             preserved_tombstones,
             ..
-        } => preserved_tombstones,
+        } => (dropped_tombstones, preserved_tombstones),
         other => panic!("expected Healed, got {other:?}"),
     };
-    assert_eq!(
-        preserved.len(),
-        1,
-        "even under `--drop-soft-deleted` the POPULATED live orphan must be PRESERVED as a recoverable \
-         tombstone (FINDING 3): {preserved:?}"
+    // v0.59.8 FINDING 3 CROSSWALK — the flag governs ONLY pre-existing tombstones, NEVER the live orphan:
+    //   OLD: even under `--drop-soft-deleted` the POPULATED live orphan is PRESERVED as a tombstone.
+    //   NEW: the live orphan is DIVORCED IN PLACE (never emptied/tombstoned by the heal) regardless of
+    //        the flag, so its data keeps serving; the flag DROPS the PRE-EXISTING `__deleted_` tombstone.
+    // So the flag still never causes LIVE data loss (the FINDING-3 invariant) — now even more strongly.
+    assert!(
+        dropped.iter().any(|d| d == &pre_tomb),
+        "`--drop-soft-deleted` must DROP the PRE-EXISTING `__deleted_` tombstone: dropped={dropped:?}"
     );
-    let tomb = &preserved[0];
+    let (_c, pre_gone) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!("SELECT 1 FROM pg_database WHERE datname='{pre_tomb}'"),
+    )
+    .await;
+    assert_eq!(
+        pre_gone.trim(),
+        "",
+        "the pre-existing `__deleted_` tombstone must be gone under `--drop-soft-deleted`"
+    );
+    // The live orphan was NOT tombstoned by the heal (no live `__deleted_` minted) — it is preserved in
+    // place, still serving its rows. The flag never touched the live data (FINDING 3).
+    assert!(
+        preserved.is_empty(),
+        "the heal must not mint a live `__deleted_` tombstone (live is divorced in place): {preserved:?}"
+    );
     let (_c, rows) = psql(
         backend.as_ref(),
         &image,
-        &conn(&superuser, &su_pw, &host, port, tomb),
+        &conn(&superuser, &su_pw, &host, port, &dest_db),
         "SELECT id || ':' || v FROM precious ORDER BY id",
     )
     .await;
     assert_eq!(
         rows, "1:live-a\n2:live-b",
-        "the live orphan's rows MUST survive recoverably even under `--drop-soft-deleted` (FINDING 3: \
-         the flag disposes of PRE-EXISTING tombstones, NEVER the live orphan)"
+        "the live orphan's rows MUST still be SERVING in place even under `--drop-soft-deleted` \
+         (FINDING 3: the flag disposes of PRE-EXISTING tombstones, NEVER the live orphan's data)"
     );
 
-    for db in [&dest_db, &old_stray, &tomb.to_string()] {
+    let (_c, asides) = psql(
+        backend.as_ref(),
+        &image,
+        &maint,
+        &format!(
+            "SELECT datname FROM pg_database WHERE datname LIKE '{p}%'",
+            p = &dest_db[..dest_db.len().min(40)]
+        ),
+    )
+    .await;
+    for db in asides.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let _ = psql(
             backend.as_ref(),
             &image,
             &maint,
-            &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            &format!("DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"),
         )
         .await;
     }
@@ -7946,14 +7997,10 @@ async fn project_sync_self_heal_tombstone_reaped_recovered_live() {
             provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
                 .await
                 .unwrap_or_else(|e| panic!("provision {dest}: {e}"));
-            let (c, o) = psql(
-                backend.as_ref(),
-                &image,
-                &conn(&su, &supw, &host, port, &dest_db),
-                &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('{seedval}'); RESET ROLE;"),
-            )
-            .await;
-            assert_eq!(c, 0, "seed orphan: {o}");
+            // v0.59.8: the self-heal mints a recoverable `__deleted_` tombstone from a POPULATED `__old_`
+            // swap-aside (step A, via the SAME `register_crash_tombstone` lifecycle the atomic swap uses,
+            // `original_db` = the live name) and DIVORCES the live db in place (never empties it). So seed
+            // the preserved rows into the `__old_` aside.
             let (c, o) = psql(
                 backend.as_ref(),
                 &image,
@@ -7961,7 +8008,15 @@ async fn project_sync_self_heal_tombstone_reaped_recovered_live() {
                 &format!("CREATE DATABASE \"{old_stray}\" OWNER \"{owner_role}\""),
             )
             .await;
-            assert_eq!(c, 0, "create __old_ trigger: {o}");
+            assert_eq!(c, 0, "create populated __old_ aside: {o}");
+            let (c, o) = psql(
+                backend.as_ref(),
+                &image,
+                &conn(&su, &supw, &host, port, &old_stray),
+                &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('{seedval}'); RESET ROLE;"),
+            )
+            .await;
+            assert_eq!(c, 0, "seed populated __old_ aside: {o}");
             let report = untangle_colliding_orphan_roles(
                 &deploy,
                 &kv,
@@ -8299,14 +8354,8 @@ async fn project_sync_self_heal_tombstone_configured_grace_live() {
                 provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
                     .await
                     .unwrap_or_else(|e| panic!("provision {dest}: {e}"));
-                let (c, o) = psql(
-                    backend.as_ref(),
-                    &image,
-                    &conn(&su, &supw, &host, port, &dest_db),
-                    &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('g'); RESET ROLE;"),
-                )
-                .await;
-                assert_eq!(c, 0, "seed orphan {dest}: {o}");
+                // v0.59.8: mint the tombstone from a POPULATED `__old_` aside (step A, same
+                // `register_crash_tombstone` + grace-floor path the swap uses); live is divorced in place.
                 let (c, o) = psql(
                     backend.as_ref(),
                     &image,
@@ -8314,7 +8363,15 @@ async fn project_sync_self_heal_tombstone_configured_grace_live() {
                     &format!("CREATE DATABASE \"{old_stray}\" OWNER \"{owner_role}\""),
                 )
                 .await;
-                assert_eq!(c, 0, "create __old_ trigger {dest}: {o}");
+                assert_eq!(c, 0, "create populated __old_ aside {dest}: {o}");
+                let (c, o) = psql(
+                    backend.as_ref(),
+                    &image,
+                    &conn(&su, &supw, &host, port, &old_stray),
+                    &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('g'); RESET ROLE;"),
+                )
+                .await;
+                assert_eq!(c, 0, "seed populated __old_ aside {dest}: {o}");
                 let report = untangle_colliding_orphan_roles(
                     &deploy, &kv, &envelope, &binding, &dest, false, false, grace,
                 )
@@ -8519,14 +8576,9 @@ async fn project_sync_self_heal_recover_occupied_clear_live() {
     provision_tenant(&deploy, &kv, &envelope, &binding, &dest, "")
         .await
         .unwrap_or_else(|e| panic!("provision: {e}"));
-    let (c, o) = psql(
-        backend.as_ref(),
-        &image,
-        &conn(&superuser, &su_pw, &host, port, &dest_db),
-        &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('occ'); RESET ROLE;"),
-    )
-    .await;
-    assert_eq!(c, 0, "seed orphan: {o}");
+    // v0.59.8: the self-heal mints the recoverable `__deleted_` tombstone from a POPULATED `__old_`
+    // swap-aside (step A; `original_db` = the live name) and DIVORCES the live db in place. Seed the
+    // preserved rows into the `__old_` aside.
     let (c, o) = psql(
         backend.as_ref(),
         &image,
@@ -8534,7 +8586,15 @@ async fn project_sync_self_heal_recover_occupied_clear_live() {
         &format!("CREATE DATABASE \"{old_stray}\" OWNER \"{owner_role}\""),
     )
     .await;
-    assert_eq!(c, 0, "create __old_ trigger: {o}");
+    assert_eq!(c, 0, "create populated __old_ aside: {o}");
+    let (c, o) = psql(
+        backend.as_ref(),
+        &image,
+        &conn(&superuser, &su_pw, &host, port, &old_stray),
+        &format!("SET ROLE \"{owner_role}\"; CREATE TABLE precious(v text); INSERT INTO precious VALUES ('occ'); RESET ROLE;"),
+    )
+    .await;
+    assert_eq!(c, 0, "seed populated __old_ aside: {o}");
 
     let report = untangle_colliding_orphan_roles(
         &deploy,
@@ -8555,7 +8615,8 @@ async fn project_sync_self_heal_recover_occupied_clear_live() {
         } => preserved_tombstones.into_iter().next().unwrap(),
         other => panic!("expected Healed, got {other:?}"),
     };
-    // The live name is now OCCUPIED (reprovisioned). recover_tenant must REFUSE with a clear message.
+    // The live name is OCCUPIED (the self-heal preserved the live db in place). recover_tenant, which
+    // restores the tombstone onto its original (live) name, must REFUSE with a clear message.
     let err = recover_tenant(&deploy, &kv, &envelope, &dest, &tomb)
         .await
         .expect_err("recover MUST refuse an occupied live name (fail-closed)");
