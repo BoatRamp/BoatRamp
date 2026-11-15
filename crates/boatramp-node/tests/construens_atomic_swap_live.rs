@@ -254,6 +254,7 @@ async fn cleanup_tenant(
 
 /// Provision a Shared tenant, seed its live db with `seed_sql`, and fabricate the prior-failed TANGLE
 /// (a stray empty `__old_` aside owned by the derived owner role ⇒ the FULL existing-dest self-heal).
+#[allow(clippy::too_many_arguments)] // live-PG test harness: a params struct would only obscure the fixture
 async fn setup_prior_failed_dest(
     node: &Node,
     backend: &dyn ComputeBackend,
