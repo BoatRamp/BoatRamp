@@ -56,6 +56,24 @@ pub use http_egress_types::{Header, HttpError, Request, Response};
 /// exercise the cap cheaply.
 pub(crate) const DEFAULT_MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+/// EXPLICIT bound on the number of RESPONSE headers the host will parse (Security review N1): a
+/// hostile response head cannot OOM/hang the host because the host — not an implicit hyper default —
+/// sets this. Set on the `conn::http1` client builder via `max_headers`; an oversized header COUNT
+/// yields hyper's `Parse::TooLarge`, which this binding maps to `response-too-large`. The value
+/// matches hyper 1.10.1's own default (100) so legitimate IdP/JWKS responses are unaffected, but it is
+/// now boatramp-set + gate-asserted + pinned against a hyper default change (a future bump can't
+/// silently widen it). A JWKS / OIDC token / discovery response carries a handful of headers.
+pub(crate) const MAX_HTTP_RESPONSE_HEADERS: usize = 100;
+
+/// EXPLICIT bound on the RESPONSE HEAD buffer (status line + all header bytes) the host will buffer
+/// while parsing (Security review N1) — the companion to [`MAX_HTTP_RESPONSE_HEADERS`] that bounds a
+/// SINGLE oversized header LINE (or an oversized head overall), not just the header count. Set on the
+/// `conn::http1` client builder via `max_buf_size`; an oversized head yields hyper's `Parse::TooLarge`
+/// → `response-too-large`. The value matches hyper 1.10.1's own default (`8192 + 4096 * 100` ≈ 408
+/// KiB — hyper's `DEFAULT_MAX_BUFFER_SIZE`) so nothing legitimate regresses, but it is now boatramp-set
+/// rather than inherited silently. hyper's floor for this knob is 8192; this is well above it.
+pub(crate) const MAX_HTTP_HEAD_BYTES: usize = 8192 + 4096 * 100;
+
 /// Fixed, non-verbose reason strings (Security review L1 parity with `tcp-egress`): a raw
 /// `io::Error`/rustls `Display`/hyper error (which can echo OS-specific detail, or an internal
 /// address/port resolved from a domain allowlist entry) never reaches the guest.
@@ -241,6 +259,30 @@ fn response_cap(configured: usize) -> usize {
     configured
 }
 
+/// The effective RESPONSE-HEADER COUNT cap (N1), with the `skip_head_bound` anti-hollow mutation
+/// RAISING it (not to `usize::MAX` — hyper reserves a header buffer sized by this, so an unbounded
+/// value would itself OOM; a large-but-safe 100_000 is enough to admit the gate's oversized-head mock)
+/// so the CI gate can prove the EXPLICIT `max_headers` bound is load-bearing: with the bound lifted,
+/// the oversized-header response is accepted and the gate's "must error" assertion flips RED.
+fn head_header_cap() -> usize {
+    if httpegress_mutation().as_deref() == Some("skip_head_bound") {
+        #[cfg(any(test, feature = "tcpegress-gate-mutation"))]
+        return 100_000;
+    }
+    MAX_HTTP_RESPONSE_HEADERS
+}
+
+/// The effective RESPONSE-HEAD BUFFER cap (N1), raised by the SAME `skip_head_bound` mutation so an
+/// oversized single header LINE is also accepted under the mutation — the companion to
+/// [`head_header_cap`] for the head-byte bound (`max_buf_size`).
+fn head_buf_cap() -> usize {
+    if httpegress_mutation().as_deref() == Some("skip_head_bound") {
+        #[cfg(any(test, feature = "tcpegress-gate-mutation"))]
+        return 64 * 1024 * 1024;
+    }
+    MAX_HTTP_HEAD_BYTES
+}
+
 /// A host-dialed, (normally) TLS-terminated outbound connection ready for HTTP/1 framing.
 enum Dialed {
     Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
@@ -358,6 +400,19 @@ async fn round_trip(
     }
 }
 
+/// Map a hyper client error to the guest-visible `http-error`. A response-HEAD-too-large parse error
+/// (too many headers past `max_headers`, or a head past `max_buf_size`) is surfaced as the semantic
+/// `response-too-large` (the same outcome as an over-cap BODY), so a hostile head is refused with a
+/// clear reason rather than an opaque transport error; anything else is the generic `other` with a
+/// fixed, non-verbose reason (Security review L1 — never raw hyper/OS detail to the guest).
+fn map_hyper_error(err: hyper::Error) -> HttpError {
+    if err.is_parse_too_large() {
+        HttpError::ResponseTooLarge
+    } else {
+        HttpError::Other(REASON_CONNECTION_DROPPED.to_string())
+    }
+}
+
 /// The HTTP/1 client tail over an already-connected (TLS-terminated) stream: handshake, build the
 /// origin-form request (host-set `Host` + `Connection: close`, guest method/path/headers/body), send,
 /// and read the FULLY-BUFFERED response with a hard byte cap. `Connection: close` keeps it a single
@@ -373,10 +428,17 @@ where
 {
     use http_body_util::{Full, Limited};
 
+    // EXPLICIT response-head bounds (Security review N1): the "a hostile response head can't OOM/hang
+    // the host" property is boatramp-SET here, not inherited from a hyper default — an oversized header
+    // COUNT (`max_headers`) or an oversized head BYTE size (`max_buf_size`) yields hyper's
+    // `Parse::TooLarge`, which this binding maps to `response-too-large`. Pinned against a hyper
+    // default change; gate-asserted below. The bodies are separately capped by `Limited`.
     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+        .max_headers(head_header_cap())
+        .max_buf_size(head_buf_cap())
         .handshake::<_, Full<Bytes>>(io)
         .await
-        .map_err(|_| HttpError::Other(REASON_CONNECTION_DROPPED.to_string()))?;
+        .map_err(map_hyper_error)?;
     // Drive the connection concurrently for the duration of this single request/response. The handle
     // aborts the driver task when it drops (at function return), so neither a completed round trip nor
     // an early error (e.g. the response-size cap firing) leaves the connection task running.
@@ -409,10 +471,9 @@ where
         .body(Full::new(prepared.body))
         .map_err(|_| HttpError::InvalidRequest("invalid request".to_string()))?;
 
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|_| HttpError::Other(REASON_CONNECTION_DROPPED.to_string()))?;
+    // The response HEAD is parsed here; an oversized head (too many headers, or a head beyond the
+    // buffer) surfaces as a hyper `Parse::TooLarge`, mapped to `response-too-large` by `map_hyper_error`.
+    let resp = sender.send_request(req).await.map_err(map_hyper_error)?;
 
     let status = resp.status().as_u16();
     let headers: Vec<Header> = resp
@@ -456,11 +517,12 @@ where
 /// `cfg(test)` (this crate's own gate) or the `tcpegress-gate-mutation` feature (the SAME lane the
 /// `tcp-egress` gate mutations use); a shipped build has NEITHER, so the TLS wrap + the response cap
 /// below are unconditional and this is a dead `None`. Recognized values: `skip_tls_wrap` (hand back
-/// the raw TCP stream, so a REAL HTTPS round trip goes RED) and `skip_response_cap` (lift the byte
-/// cap, so the oversized-response refusal goes RED). The SHARED gate checks (posture / allowlist /
-/// SSRF) are proven RED by the EXISTING `BOATRAMP_TCPEGRESS_MUTATION` seam in
-/// `engine::resolve_and_gate_tcp_egress`, which this verb drives verbatim. NOT a backdoor — it only
-/// reads a test env var.
+/// the raw TCP stream, so a REAL HTTPS round trip goes RED), `skip_response_cap` (lift the body byte
+/// cap, so the oversized-BODY refusal goes RED), and `skip_head_bound` (raise the explicit
+/// `max_headers`/`max_buf_size` response-HEAD bounds (N1), so the oversized-HEAD refusal goes RED).
+/// The SHARED gate checks (posture / allowlist / SSRF) are proven RED by the EXISTING
+/// `BOATRAMP_TCPEGRESS_MUTATION` seam in `engine::resolve_and_gate_tcp_egress`, which this verb drives
+/// verbatim. NOT a backdoor — it only reads a test env var.
 #[cfg(any(test, feature = "tcpegress-gate-mutation"))]
 fn httpegress_mutation() -> Option<String> {
     std::env::var("BOATRAMP_HTTPEGRESS_MUTATION").ok()
@@ -572,6 +634,19 @@ mod tests {
             body
         )
         .into_bytes()
+    }
+
+    /// A 200 response whose HEAD carries `count` distinct headers — used to exceed the explicit
+    /// `max_headers` bound (N1). With `count` beyond the host's `MAX_HTTP_RESPONSE_HEADERS` the host's
+    /// head parse must refuse (hyper `Parse::TooLarge` → `response-too-large`) rather than OOM/hang.
+    fn many_header_response(count: usize) -> Vec<u8> {
+        let mut head =
+            String::from("HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n");
+        for i in 0..count {
+            head.push_str(&format!("x-pad-{i}: v\r\n"));
+        }
+        head.push_str("\r\nok");
+        head.into_bytes()
     }
 
     /// Build an `HttpEgressHost` with an EMPTY static IP allowlist (the tests exercise the DYNAMIC
@@ -750,6 +825,32 @@ mod tests {
             "a response over the byte cap must be refused, never truncated-and-returned"
         );
 
+        // (F) oversized response HEAD (N1): a response with more headers than the explicit
+        // `MAX_HTTP_RESPONSE_HEADERS` bound must be refused (hyper `Parse::TooLarge` →
+        // `response-too-large`) — NOT a hang, NOT OOM, NOT a success. Fresh server; the mock emits
+        // 100_000 - 1 fewer than the mutation cap (so the mutation admits it) but well over the 100
+        // real cap. `skip_head_bound` flips this to an Ok (proving the explicit `max_headers` is
+        // load-bearing, not an implicit hyper default).
+        let (ca3, chain3, key3) = ca_and_leaf();
+        let head_port = spawn_tls_http_server(chain3, key3, many_header_response(500)).await;
+        let mut head_host = host_with(
+            vec![format!("localhost:{head_port}")],
+            false,
+            true,
+            true,
+            vec![ca3],
+            DEFAULT_MAX_HTTP_RESPONSE_BYTES,
+        );
+        assert!(
+            matches!(
+                head_host
+                    .emit_http_dynamic("localhost".to_string(), head_port, simple_get())
+                    .await,
+                Err(HttpError::ResponseTooLarge)
+            ),
+            "a response head with more headers than the explicit cap must be refused (no OOM/hang)"
+        );
+
         println!("HTTP-EGRESS DYNAMIC GATE OK");
     }
 
@@ -785,7 +886,10 @@ mod tests {
         assert!(prepared.headers.get("host").is_none());
         assert!(prepared.headers.get("connection").is_none());
         assert_eq!(
-            prepared.headers.get("x-keep").map(http::HeaderValue::as_bytes),
+            prepared
+                .headers
+                .get("x-keep")
+                .map(http::HeaderValue::as_bytes),
             Some(b"yes".as_slice()),
             "a non-framing guest header is kept"
         );

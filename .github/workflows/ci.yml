@@ -741,8 +741,10 @@ jobs:
       # (`BOATRAMP_TCPEGRESS_MUTATION`: `admit_unallowlisted_dynamic` bypasses the hostname allowlist,
       # `drop_dynamic_posture` ignores the posture) AND the HTTP-specific seam
       # (`BOATRAMP_HTTPEGRESS_MUTATION`: `skip_tls_wrap` hands the raw TCP stream to the HTTP framer so a
-      # real HTTPS round trip breaks, `skip_response_cap` lifts the byte cap so the oversized-response
-      # refusal is lost) — EACH must FAIL the gate; a PASS-under-mutation (a hollow gate) fails the merge.
+      # real HTTPS round trip breaks, `skip_response_cap` lifts the body byte cap so the oversized-BODY
+      # refusal is lost, `skip_head_bound` raises the explicit `max_headers`/`max_buf_size` response-HEAD
+      # bounds (N1) so the oversized-HEAD refusal is lost) — EACH must FAIL the gate; a PASS-under-mutation
+      # (a hollow gate) fails the merge.
       - name: "http-egress dynamic gate (host-mediated HTTP to a runtime host, same gate as BR-REQ-2)"
         run: |
           set -eo pipefail
@@ -753,7 +755,7 @@ jobs:
           grep -q 'HTTP-EGRESS DYNAMIC GATE OK' http-egress.log \
             || { echo "::error::http-egress gate never reached its marker (a host-mediated HTTP egress regression)" >&2; exit 1; }
           # Mutation guard: each mutation (shared gate + http-specific seam) MUST fail the gate.
-          for mut in TCPEGRESS:admit_unallowlisted_dynamic TCPEGRESS:drop_dynamic_posture HTTPEGRESS:skip_tls_wrap HTTPEGRESS:skip_response_cap; do
+          for mut in TCPEGRESS:admit_unallowlisted_dynamic TCPEGRESS:drop_dynamic_posture HTTPEGRESS:skip_tls_wrap HTTPEGRESS:skip_response_cap HTTPEGRESS:skip_head_bound; do
             var="BOATRAMP_${mut%%:*}_MUTATION"; val="${mut##*:}"
             if env "$var=$val" cargo-zigbuild test --target x86_64-unknown-linux-musl \
               -p boatramp-handlers --features tcp-egress http_egress_dynamic_gate \
