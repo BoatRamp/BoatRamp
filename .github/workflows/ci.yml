@@ -2780,6 +2780,24 @@ jobs:
             || { echo "::error::scoped-stream SQL-membership gate did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'STREAM SQL-MEMBERSHIP OK' streammember.log \
             || { echo "::error::scoped-stream SQL-membership never reached its marker (a placeholder-bind regression, a cross-mailbox leak, or a skipped test)" >&2; exit 1; }
+      - name: Guest-mediated stream-authz resolve/confine + deploy-order gate (stream-authz hardening)
+        run: |
+          set -eo pipefail
+          # stream-authz hardening: a `guest_mediated` stream's `handler` is the BARE NAME of a
+          # TOP-LEVEL function resolved through the invoke runtime. Over a REAL compiled guest
+          # (`stream-authz.wasm`) the host (1) runs the authorizer and CONFINES its returned topic set
+          # to the declared template (an over-broad topic is clamped, never widened), (2) maps a guest
+          # refusal to the SAME 403 a non-member gets (no oracle) + a no-bearer token_claims stream to
+          # 401, and (3) REFUSES to activate a stream whose authorizer is not deployed (loud error, not
+          # a silent per-subscribe 503). Not ignored (runs on the merge gate too); this explicit step
+          # greps the marker so a confinement regression / a FIX-B revert / a silent skip fails here.
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc --lib \
+            guest_mediated_stream_authz_resolves_confines_and_gates \
+            -- --nocapture 2>&1 | tee streamauthz.log
+          grep -qE 'test result: ok\. 1 passed' streamauthz.log \
+            || { echo "::error::guest-mediated stream-authz gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'GUEST-MEDIATED STREAM-AUTHZ OK' streamauthz.log \
+            || { echo "::error::guest-mediated stream-authz never reached its marker (a confinement regression, a dropped deploy-order check, or a skipped test)" >&2; exit 1; }
       - name: Live present-token verify/seal/resolve chain + batch isolation (v0.4.7 Gap 3)
         run: |
           set -eo pipefail

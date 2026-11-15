@@ -289,11 +289,31 @@ When membership can't reduce to a claim or a SQL predicate, hand the decision to
   authz: guest_mediated( handler: "stream-authorizer" ) ),
 ```
 
+`handler` is the **bare name of a deployed top-level function** — the per-subscribe invoke target the
+host calls. It is **not** a route path and **not** `<site>/<name>`: it is resolved through the invoke
+runtime (the same name space as [`boatramp function deploy <name> <component.wasm>`](./functions.md)
+or a top-level `functions:` block in [`boatramp apply`](./apply.md)), never a site
+`routing.handlers` route (a routed handler has no invocable function record). **Deploy the authorizer
+function before activating the stream** — activation refuses a stream whose `handler` resolves to no
+function, so a misconfigured name fails loudly at deploy, not silently per subscribe.
+
 The host invokes the `stream-authorizer` function with the connection's request (and, when
 `token_claims` is set, the host-verified principal as the `x-boatramp-stream-principal` header); the
 function returns the topic set to grant (`["shared/abc/events"]` or `{"topics": […]}`) or a non-2xx to
 refuse. The returned topics are **confined to the declared `topics` templates** — a guest chooses
 *which* declared scopes, never a new topic namespace.
+
+Add an opt-in `max_topics_per_connection: <n>` to the `guest_mediated` block to cap how many
+(confined) topics one connection may be granted: a return exceeding the cap **refuses the connection**
+(a loud `502`, never a silent truncation), bounding how far a buggy or compromised authorizer can fan
+one connection out. Omit it for **unlimited** (the default — existing deploys are unchanged); a cap of
+`0` is rejected at validate.
+
+> The guest-mediated confinement matches a template segment **whole-segment only**: a `{name}`
+> placeholder must be an entire path segment (`shared/{mailbox}/events`). A *partial*-segment
+> template like `shared/mbx-{mailbox}/events` is treated as a **literal** (it does not
+> parameterize), so a guest can match it only by returning that exact literal string — write the
+> parameterized segment on its own (`shared/{mailbox}/events`), not embedded in a longer segment.
 
 > Scoped-stream bearer verification needs the `oidc` feature (like the data connector's token
 > claims); without it a scoped stream fails closed.

@@ -333,14 +333,63 @@ impl DeployConfig {
                     StreamAuthz::GuestMediated {
                         token_claims,
                         handler,
+                        max_topics_per_connection,
                     } => {
                         if let Some(tc) = token_claims {
                             tc.validate()?;
                         }
+                        // A per-connection topic cap of 0 would refuse every connection — reject it
+                        // at validate (clearer than a silent deny-all). `None` = unlimited.
+                        if *max_topics_per_connection == Some(0) {
+                            return Err(ConfigError::parse(format!(
+                                "stream {} guest_mediated max_topics_per_connection is 0 — a 0 cap \
+                                 refuses every connection; omit it for unlimited, or set a positive \
+                                 cap",
+                                stream.route
+                            )));
+                        }
                         if handler.trim().is_empty() {
                             return Err(ConfigError::parse(format!(
-                                "stream {} authz is `guest_mediated` but the handler route is empty",
+                                "stream {} authz is `guest_mediated` but the handler function name \
+                                 is empty — set it to the BARE NAME of a deployed top-level function",
                                 stream.route
+                            )));
+                        }
+                        // The serve path resolves `handler` as an EXACT KV key
+                        // (`get_function(project, handler)` — no trimming), so a leading/trailing-
+                        // whitespace value would pass a trimmed check yet 503 at serve. Reject it
+                        // here so offline validation, the activation resolve-gate, and serve all
+                        // agree on the exact stored name (the alternative — normalize-at-store —
+                        // doesn't fit: `compile_check` is read-only validation with no mutation seam
+                        // in the config flow).
+                        if handler != handler.trim() {
+                            return Err(ConfigError::parse(format!(
+                                "stream {} guest_mediated handler {handler:?} has leading or trailing \
+                                 whitespace — `handler` is the EXACT bare name of a deployed \
+                                 top-level function (resolved as an exact key at serve), so the \
+                                 stored value must match the deployed name byte-for-byte; remove the \
+                                 surrounding whitespace",
+                                stream.route
+                            )));
+                        }
+                        // Early, offline shape-check (stream-authz hardening): `handler` is the BARE
+                        // NAME of a deployed top-level function — the per-subscribe invoke target —
+                        // NOT a route path and NOT `<site>/<name>`. Catch the common confusion (a
+                        // `/`-bearing route path like `/authz/stream`) here at `apply`/`validate`
+                        // time with a speaking message, instead of letting it reach the activation
+                        // resolve-gate (or, pre-hardening, a silent per-subscribe 503). A bare name
+                        // that is not yet deployed is NOT an offline error — the authorizer may be
+                        // pre-deployed; the server-side activation gate (which sees the deploy store)
+                        // is the authority on existence. `handler` is already whitespace-trimmed here
+                        // (rejected just above), so the slug check runs on the exact stored value.
+                        if !crate::project::is_valid_resource_slug(handler) {
+                            return Err(ConfigError::parse(format!(
+                                "stream {} guest_mediated handler {handler:?} is not a valid function \
+                                 name — `handler` is the BARE NAME of a deployed top-level function \
+                                 (the per-subscribe invoke target), not a route path and not \
+                                 `<site>/<name>`. {}",
+                                stream.route,
+                                crate::project::INVALID_NAME_REASON
                             )));
                         }
                         // Sec MEDIUM-2: the host can't gate a route-param scope for a guest-mediated
@@ -1272,8 +1321,25 @@ pub enum StreamAuthz {
         /// from the raw request alone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_claims: Option<HandlerGraphqlTokenClaims>,
-        /// The guest handler route that authorizes the connection and returns its topic set.
+        /// The **bare name of a deployed TOP-LEVEL function** — the invoke target the host calls once
+        /// per subscribe to authorize the connection and return its topic set. This is NOT a route
+        /// path and NOT `<site>/<name>`: it is resolved through the invoke runtime (the same name
+        /// space `boatramp function deploy <name> <component.wasm>` and a top-level `functions:` block
+        /// write), never a site `routing.handlers` route (a routed handler has no invocable function
+        /// record). Deploy the authorizer function BEFORE activating the stream — activation refuses a
+        /// stream whose `handler` names no resolvable function (else every subscribe would 503).
         handler: String,
+        /// **Opt-in per-connection cap** on how many distinct topics the guest authorizer may grant
+        /// one connection, enforced AFTER the returned set is confined to the declared `topics`
+        /// templates. `None` ⇒ **unlimited** (the default — existing deploys are unchanged). `Some(n)`
+        /// refuses the connection (fail-closed, before any subscribe) if the confined set exceeds `n`
+        /// — a defense-in-depth resource guard within the trusted-guest model, so a bug/compromise in
+        /// the authorizer can't fan one connection out to an unbounded number of hub subscriptions.
+        /// The host never silently truncates — an over-returning authorizer is loud. `Some(0)` is
+        /// nonsensical (it would refuse every connection) and is rejected at validate. Only meaningful
+        /// here: a `Scoped` stream's topic set is already host-bounded by its membership checks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_topics_per_connection: Option<u32>,
     },
 }
 
@@ -3080,15 +3146,51 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
         assert_eq!(reparsed, scoped, "scoped authz round-trips");
 
+        // `handler` is the BARE NAME of a deployed top-level function (the invoke target), never a
+        // route path — see `StreamAuthz::GuestMediated::handler`.
         let guest: StreamConfig = serde_json::from_str(
             r#"{"route":"/events/shared/:mailbox","topics":["shared/{mailbox}/events"],
-                "authz":{"guest_mediated":{"handler":"/authz/stream"}}}"#,
+                "authz":{"guest_mediated":{"handler":"stream-authz"}}}"#,
+        )
+        .unwrap();
+        // An omitted `max_topics_per_connection` ⇒ None (unlimited — back-compat for existing
+        // deploys, which carry no such field).
+        assert!(matches!(
+            &guest.authz,
+            Some(StreamAuthz::GuestMediated {
+                handler,
+                max_topics_per_connection: None,
+                ..
+            }) if handler == "stream-authz"
+        ));
+        let reparsed: StreamConfig =
+            serde_json::from_str(&serde_json::to_string(&guest).unwrap()).unwrap();
+        assert_eq!(reparsed, guest, "guest-mediated authz round-trips");
+
+        // A present `max_topics_per_connection` round-trips (and `None` serializes away, so a capped
+        // config does not spuriously differ from an uncapped one).
+        let capped: StreamConfig = serde_json::from_str(
+            r#"{"route":"/events/shared/:mailbox","topics":["shared/{mailbox}/events"],
+                "authz":{"guest_mediated":{"handler":"stream-authz","max_topics_per_connection":4}}}"#,
         )
         .unwrap();
         assert!(matches!(
-            guest.authz,
-            Some(StreamAuthz::GuestMediated { .. })
+            &capped.authz,
+            Some(StreamAuthz::GuestMediated {
+                max_topics_per_connection: Some(4),
+                ..
+            })
         ));
+        let reparsed_cap: StreamConfig =
+            serde_json::from_str(&serde_json::to_string(&capped).unwrap()).unwrap();
+        assert_eq!(
+            reparsed_cap, capped,
+            "a capped guest-mediated authz round-trips"
+        );
+        assert_ne!(
+            capped, guest,
+            "a capped config differs from the uncapped one"
+        );
 
         // Absent authz ⇒ None (backward-compatible broadcast).
         let plain: StreamConfig =
@@ -3163,10 +3265,69 @@ mod tests {
             mk(stream(StreamAuthz::GuestMediated {
                 token_claims: None,
                 handler: String::new(),
+                max_topics_per_connection: None,
             }))
             .is_err(),
             "empty guest handler rejected"
         );
+
+        // stream-authz hardening: `handler` is the BARE NAME of a top-level function, not a route
+        // path — a `/`-bearing value (the tokenfield "treated it as a route" mistake) is rejected
+        // offline at apply/validate time, before it reaches the activation resolve-gate.
+        assert!(
+            mk(stream(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: "/authz/stream".into(),
+                max_topics_per_connection: None,
+            }))
+            .is_err(),
+            "a route-path guest handler is rejected (must be a bare function name)"
+        );
+        assert!(
+            mk(stream(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: "console/stream-authz".into(),
+                max_topics_per_connection: None,
+            }))
+            .is_err(),
+            "a `<site>/<name>` guest handler is rejected (must be a bare function name)"
+        );
+        // A leading/trailing-whitespace handler is rejected at validate — serve resolves the EXACT
+        // key, so a trimmed-passes-but-serve-503 value must never store.
+        assert!(
+            mk(stream(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: " stream-authz ".into(),
+                max_topics_per_connection: None,
+            }))
+            .is_err(),
+            "a whitespace-padded guest handler is rejected (serve uses the exact stored key)"
+        );
+        // A valid bare function name passes the offline shape-check (existence is the activation
+        // gate's job — the authorizer may be pre-deployed).
+        mk(stream(StreamAuthz::GuestMediated {
+            token_claims: None,
+            handler: "stream-authz".into(),
+            max_topics_per_connection: None,
+        }))
+        .expect("a bare function-name guest handler passes the offline shape-check");
+        // A `Some(0)` cap is nonsensical (refuses every connection) and is rejected at validate; a
+        // positive cap passes.
+        assert!(
+            mk(stream(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: "stream-authz".into(),
+                max_topics_per_connection: Some(0),
+            }))
+            .is_err(),
+            "max_topics_per_connection: Some(0) is rejected (would refuse every connection)"
+        );
+        mk(stream(StreamAuthz::GuestMediated {
+            token_claims: None,
+            handler: "stream-authz".into(),
+            max_topics_per_connection: Some(4),
+        }))
+        .expect("a positive per-connection topic cap is accepted");
     }
 
     // Security-review MEDIUM-1 / MEDIUM-2 / LOW-3 — the apply-time coverage + JWKS-source gates.
@@ -3257,6 +3418,7 @@ mod tests {
                 authz: Some(StreamAuthz::GuestMediated {
                     token_claims: None,
                     handler: "authz".into(),
+                    max_topics_per_connection: None,
                 }),
             })
             .is_err(),
