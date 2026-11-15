@@ -261,7 +261,14 @@ mod imp {
     /// name (empty ⇒ deny-all). Unlike #22 this IS a new grant kind + interface, so the host
     /// advertises the feature only under the `dns-publish` cargo feature and a pre-#24 host
     /// refuses a `requires = ["dns-publish"]` deploy loudly (rather than failing to link).
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 12, 0);
+    ///
+    /// `0.13.0` (mailroom cap-req #30): the `dns-resolve` capability gained `resolve-txt`
+    /// (`resolve-txt: func(name: string) -> result<list<string>, dns-error>`) alongside
+    /// `resolve-mx` / `resolve-addr`. It rides the EXISTING `dns-resolve` import/grant (no new
+    /// grant kind) and the same egress posture + budget gate, so a pre-#30 host that lacks the
+    /// function simply rejects the unknown func at link — the loud-fail the surface bump makes
+    /// visible. No SSRF floor (a TXT value is opaque text, not a dialable address).
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 13, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]

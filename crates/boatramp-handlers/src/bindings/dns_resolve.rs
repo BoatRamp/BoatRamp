@@ -13,8 +13,9 @@
 //! on RESOLVED ADDRESSES: [`resolve_addr`](DnsResolveHost::resolve_addr) drops every
 //! non-globally-routable address (via [`boatramp_core::access::is_global_ip`]) unless the operator
 //! also set `allow_private_egress`, so it can never be an oracle for the metadata endpoint / internal
-//! ranges. `resolve_mx` returns public MX hostnames; the follow-on dial to an MX host is itself the
-//! SSRF-floored `tcp-egress` connect.
+//! ranges. `resolve_mx` returns public MX hostnames and `resolve_txt` returns opaque TXT strings
+//! (neither is a dialable address, so no SSRF floor applies to them); the follow-on dial to an MX host
+//! is itself the SSRF-floored `tcp-egress` connect.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -58,6 +59,10 @@ pub trait DnsResolver: Send + Sync {
     async fn resolve_mx(&self, domain: &str) -> Result<Vec<MxRecord>, DnsResolveError>;
     /// Resolve `host`'s A/AAAA addresses (the SSRF floor is applied by the binding, not here).
     async fn resolve_addr(&self, host: &str) -> Result<Vec<IpAddr>, DnsResolveError>;
+    /// Resolve `name`'s TXT records, one reassembled string per RR (the backend joins each TXT RR's
+    /// RFC 1035 ≤255-byte character-string chunks into a single value). No SSRF floor applies — a TXT
+    /// value is opaque text, not an address — so the binding passes the list through unchanged.
+    async fn resolve_txt(&self, name: &str) -> Result<Vec<String>, DnsResolveError>;
 }
 
 /// The per-invocation `dns-resolve` grant: the server-provided resolver. `None` ⇒ not granted.
@@ -196,6 +201,17 @@ impl dns_resolve::Host for DnsResolveHost<'_> {
         }
         Ok(kept)
     }
+
+    async fn resolve_txt(&mut self, name: String) -> Result<Vec<String>, dns_resolve::DnsError> {
+        // Mirrors `resolve_mx`: same grant+posture admit, same budget spend. No SSRF floor — a TXT
+        // value is opaque text, not a dialable address — so the backend's already-reassembled per-RR
+        // strings (one list entry per TXT RR) pass straight through. A name with no TXT records is the
+        // backend's `NotFound`, surfaced as `not-found` by `map_error`.
+        let resolver = self.admit()?;
+        self.spend()?;
+        let records = resolver.resolve_txt(&name).await.map_err(map_error)?;
+        Ok(records)
+    }
 }
 
 /// Add the `dns-resolve` interface to `linker`, resolving the per-invocation [`DnsResolveHost`] view
@@ -221,6 +237,7 @@ mod tests {
     struct StubResolver {
         mx: Vec<MxRecord>,
         addrs: Vec<IpAddr>,
+        txt: Vec<String>,
     }
 
     #[async_trait::async_trait]
@@ -231,10 +248,26 @@ mod tests {
         async fn resolve_addr(&self, _host: &str) -> Result<Vec<IpAddr>, DnsResolveError> {
             Ok(self.addrs.clone())
         }
+        async fn resolve_txt(&self, _name: &str) -> Result<Vec<String>, DnsResolveError> {
+            Ok(self.txt.clone())
+        }
     }
 
     fn binding(mx: Vec<MxRecord>, addrs: Vec<IpAddr>) -> DnsResolveBinding {
-        DnsResolveBinding::new(Arc::new(StubResolver { mx, addrs }))
+        DnsResolveBinding::new(Arc::new(StubResolver {
+            mx,
+            addrs,
+            txt: vec![],
+        }))
+    }
+
+    /// A binding whose backend returns the given already-reassembled TXT strings (one per RR).
+    fn binding_txt(txt: Vec<String>) -> DnsResolveBinding {
+        DnsResolveBinding::new(Arc::new(StubResolver {
+            mx: vec![],
+            addrs: vec![],
+            txt,
+        }))
     }
 
     /// A fresh store-resident budget counter (what `HostState.dns_resolve_budget` holds).
@@ -252,6 +285,10 @@ mod tests {
         ));
         assert!(matches!(
             host.resolve_addr("example.com".into()).await,
+            Err(dns_resolve::DnsError::AccessDenied)
+        ));
+        assert!(matches!(
+            host.resolve_txt("example.com".into()).await,
             Err(dns_resolve::DnsError::AccessDenied)
         ));
     }
@@ -311,6 +348,32 @@ mod tests {
             host.resolve_addr("example.com".into()).await,
             Err(dns_resolve::DnsError::AccessDenied)
         ));
+        assert!(matches!(
+            host.resolve_txt("example.com".into()).await,
+            Err(dns_resolve::DnsError::AccessDenied)
+        ));
+    }
+
+    /// `resolve_txt` mirrors `resolve_mx`: with the grant present and the egress posture ON, the
+    /// backend's already-reassembled per-RR strings pass straight through, one list entry per TXT RR
+    /// (no SSRF floor, no reordering). Posture off / ungranted are covered by the denial tests above.
+    #[tokio::test]
+    async fn resolve_txt_passes_each_rr_through_when_admitted() {
+        // Two distinct TXT RRs (an SPF record and a long DKIM `p=` key the backend already joined from
+        // its ≤255-byte chunks) → two list entries, verbatim and in order.
+        let dkim = format!("v=DKIM1; k=rsa; p={}", "A".repeat(400));
+        let b = binding_txt(vec![
+            "v=spf1 include:_spf.example.com -all".to_string(),
+            dkim.clone(),
+        ]);
+        let bud = budget();
+        let mut host = DnsResolveHost::new(Some(&b), true, false, &bud);
+        let got = host.resolve_txt("example.com".into()).await.unwrap();
+        assert_eq!(
+            got,
+            vec!["v=spf1 include:_spf.example.com -all".to_string(), dkim],
+            "each TXT RR is one passed-through list entry"
+        );
     }
 
     #[tokio::test]
