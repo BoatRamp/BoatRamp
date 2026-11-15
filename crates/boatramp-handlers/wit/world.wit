@@ -2065,12 +2065,15 @@ interface dns-publish {
     akamai,
     /// DNSimple. Fields: `account_id`, `token` (required; the zone is the zone-root).
     dnsimple,
-    /// Google Cloud DNS. Fields: `project`, `access_token` (required; the zone is the zone-root). NB the
-    /// adapter authenticates with a short-lived OAuth `access_token`, not a long-lived service-account
-    /// JSON key.
+    /// Google Cloud DNS. Fields: `service_account_json` (a LONG-LIVED service-account JSON key; the
+    /// project is read from it), `managed_zone` (the GCP managed-zone RESOURCE name — GCP addresses a
+    /// zone by resource name, not the domain) — both required. No short-lived token is accepted: the host
+    /// exchanges the SA key for a cached short-lived access token ITSELF, host-side.
     gcp,
-    /// Azure DNS. Fields: `subscription_id`, `resource_group`, `access_token` (required; the zone is the
-    /// zone-root). The `access_token` is a short-lived AAD bearer token.
+    /// Azure DNS. Fields: `tenant_id`, `client_id`, `client_secret`, `subscription_id`, `resource_group`
+    /// — all required; a LONG-LIVED service principal. No short-lived token is accepted: the host runs the
+    /// AAD client-credentials exchange ITSELF, host-side. (`tenant_id`/`client_id`/`subscription_id` are
+    /// strict GUIDs; `tenant_id` fills a segment of the fixed AAD token-endpoint path.)
     azure,
     /// DigitalOcean. Fields: `token` (required; the zone is the zone-root domain).
     digitalocean,
