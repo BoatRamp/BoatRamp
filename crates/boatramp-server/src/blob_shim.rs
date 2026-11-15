@@ -89,6 +89,15 @@ const MAX_LIST_PAGE: u32 = 1000;
 /// listing hides ANY key whose path touches it. Mirrors the host `blob-list` binding's reserve.
 const RESERVED_PREFIX: &str = ".boatramp";
 
+/// The container MARKER object name. A boatramp "container" is a key prefix PLUS this marker object,
+/// so a `wasi:blobstore` handler's `get-container`/`container-exists` only admits a container whose
+/// marker is present. A shim PUT therefore ENSURES this marker (see [`put_object`]), making a
+/// worker-written container first-class for a guest handler. Kept byte-for-byte IDENTICAL to
+/// `boatramp_handlers`' own `MARKER`; it is duplicated (not imported) because `boatramp-handlers` is
+/// an OPTIONAL dependency while this module compiles unconditionally — the `compute_blob_shim_scoped_gate`
+/// asserts the two strings match under `--features handlers`, so a drift is caught, never silent.
+const CONTAINER_MARKER: &str = ".boatramp-container";
+
 /// A token-resolved blob capability: the site's [`Storage`] backend, the key prefix the
 /// token is confined to (`hblob/{project-qualified-site}/` — host-stamped, never
 /// client-supplied), and the one container it may touch when the binding named one.
@@ -681,20 +690,24 @@ impl IntoResponse for Denied {
 /// every HTTP method handler resolves its target through here, so the TESTED code is the
 /// ENFORCED code. Given the token-resolved `scope` (`None` ⇒ the bearer was
 /// missing/unknown) and the client-supplied `container` + object `key`, return the
-/// backend plus the FINAL storage key `hblob/{project-qualified-site}/{container}/{key}`,
-/// or a fail-closed [`Denied`].
+/// backend plus TWO keys composed under that one confined `hblob/{project-qualified-site}/
+/// {container}/` prefix — the FINAL object key `…/{container}/{key}` the op acts on, and the
+/// container MARKER key `…/{container}/.boatramp-container` a PUT ensures (GET/HEAD/DELETE ignore
+/// it) — or a fail-closed [`Denied`].
 ///
 /// The SITE is taken ONLY from `scope.site_prefix` (token-bound), never from any client
-/// field, so **cross-site is structurally impossible**. The three anti-hollow mutation
-/// seams (test / `compute-blob-shim-gate-mutation` only, compiled out of ships) each
-/// neuter ONE enforced check so the CI gate proves it load-bearing: `allow_cross_container`
-/// drops the container bind (i), `allow_traversal` drops the key screen (ii), and
-/// `admit_unmatched` (in [`BlobShim::authenticate`]) admits an unmatched token (iii).
+/// field, so **cross-site is structurally impossible**; the MARKER key, sharing the same
+/// confined prefix, is equally un-escapable. The three anti-hollow mutation seams HERE (test /
+/// `compute-blob-shim-gate-mutation` only, compiled out of ships) each neuter ONE enforced check
+/// so the CI gate proves it load-bearing: `allow_cross_container` drops the container bind (i),
+/// `allow_traversal` drops the key screen (ii), and `admit_unmatched` (in
+/// [`BlobShim::authenticate`]) admits an unmatched token (iii). A fourth seam, `skip_marker`, lives
+/// on the PUT path ([`put_object`]) and neuters the marker-ensure (iv).
 fn authorize(
     scope: Option<&BlobScope>,
     container: &str,
     key: &str,
-) -> Result<(Arc<dyn Storage>, String), Denied> {
+) -> Result<(Arc<dyn Storage>, String, String), Denied> {
     // (iii) authentication: no resolved scope ⇒ fail closed.
     let scope = scope.ok_or(Denied::Unauthenticated)?;
     // (i) cross-container: a container-bound token admits ONLY its container. The site is
@@ -717,11 +730,18 @@ fn authorize(
     if blob_mutation().as_deref() != Some("allow_traversal") {
         validate_object_key(key).map_err(|e| Denied::BadKey(e.to_string()))?;
     }
-    // Compose under the TOKEN's site prefix: `hblob/{qualified-site}/{container}/{key}` —
-    // the EXACT key a `wasi:blobstore` handler for this site reads/writes.
+    // Compose under the TOKEN's site prefix: the EXACT `hblob/{qualified-site}/{container}/`
+    // keyspace a `wasi:blobstore` handler for this site reads/writes. Both the object key and the
+    // container MARKER key are composed from this ONE confined prefix — `scope.site_prefix` is
+    // token-bound (never a client field) and `container` is bound (i) + validated above — so the
+    // marker a PUT ensures can NEVER land outside the token's own site/container (a bare `--bind
+    // blob` token stays within its `site_prefix`; a `--bind blob:<container>` token stays in its
+    // one container). Returned together so a later composition cannot drift from the enforced one.
+    let container_prefix = format!("{}{container}/", scope.site_prefix);
     Ok((
         scope.storage.clone(),
-        format!("{}{container}/{key}", scope.site_prefix),
+        format!("{container_prefix}{key}"),
+        format!("{container_prefix}{CONTAINER_MARKER}"),
     ))
 }
 
@@ -843,14 +863,17 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Authenticate the request's bearer token and authorize `(container, key)` to a
-/// confined storage key. The common prelude of every method handler.
+/// Authenticate the request's bearer token and authorize `(container, key)` to a confined
+/// storage key. The common prelude of every method handler. Returns `(storage, object_key,
+/// marker_key)` — the object key the op acts on, plus the container MARKER key the PUT path
+/// ensures (both composed under the token's own confined prefix by [`authorize`]); GET/HEAD/DELETE
+/// ignore the marker key.
 async fn resolve_target(
     shim: &BlobShim,
     headers: &HeaderMap,
     container: &str,
     key: &str,
-) -> Result<(Arc<dyn Storage>, String), Response> {
+) -> Result<(Arc<dyn Storage>, String, String), Response> {
     let token = bearer(headers);
     let scope = shim.authenticate(token.as_deref()).await;
     authorize(scope.as_ref(), container, key).map_err(axum::response::IntoResponse::into_response)
@@ -912,7 +935,7 @@ async fn get_object(
     headers: HeaderMap,
     Path((container, key)): Path<(String, String)>,
 ) -> Response {
-    let (storage, skey) = match resolve_target(&shim, &headers, &container, &key).await {
+    let (storage, skey, _) = match resolve_target(&shim, &headers, &container, &key).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -968,6 +991,37 @@ async fn get_object(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Ensure the container MARKER exists at `marker_key` (idempotent). A boatramp "container" is a key
+/// prefix PLUS this marker object, so a `wasi:blobstore` handler's `get-container`/`container-exists`
+/// only admits a container whose marker is present; a shim PUT ensures it so a worker-written
+/// container is first-class. Probes first so an existing container's marker (and the creation time it
+/// records) is never clobbered and an honest PUT skips a redundant write — `NotFound` means "write
+/// it", any other backend error propagates. The marker BODY matches what `wasi:blobstore`
+/// `create-container` writes — the container's creation time (unix seconds, decimal) — so a
+/// worker-created container's `container.info().created-at` reads a real timestamp. `marker_key` is
+/// ALREADY composed + confined by [`authorize`]; this function never composes a storage key.
+async fn ensure_container_marker(
+    storage: &dyn Storage,
+    marker_key: &str,
+) -> Result<(), StorageError> {
+    match storage.head(marker_key).await {
+        Ok(_) => Ok(()),
+        Err(StorageError::NotFound(_)) => {
+            let body = boatramp_core::time::now_unix().to_string();
+            let stream: ByteStream =
+                futures::stream::once(
+                    async move { Ok::<_, StorageError>(bytes::Bytes::from(body)) },
+                )
+                .boxed();
+            storage
+                .put(marker_key, stream, PutMeta::default())
+                .await
+                .map(|_| ())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// `PUT /{container}/{*key}`: stream the request body into the object, returning the
 /// object key on success.
 async fn put_object(
@@ -976,7 +1030,8 @@ async fn put_object(
     Path((container, key)): Path<(String, String)>,
     body: Body,
 ) -> Response {
-    let (storage, skey) = match resolve_target(&shim, &headers, &container, &key).await {
+    let (storage, skey, marker_key) = match resolve_target(&shim, &headers, &container, &key).await
+    {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -997,6 +1052,23 @@ async fn put_object(
         && len > cap
     {
         return oversize(cap);
+    }
+    // Ensure the container MARKER exists so a worker-written container is first-class for a guest
+    // `wasi:blobstore` handler (whose `get-container` probes the marker). The marker key is composed
+    // from the SAME token-confined prefix as the object (see `authorize`), so it can never escape the
+    // token's own site/container. Done AFTER the up-front honest-`Content-Length` cap check (so a PUT
+    // rejected 413 on declared size leaves NO empty container behind) but BEFORE the object write (so
+    // the container is defined whenever the object lands). A dishonest Content-Length that only trips
+    // the streaming cap below can still leave the marker — an accepted edge (same keyspace; the worker
+    // could create the container anyway), not worth complicating the path. Idempotent (probe-then-
+    // write) so an existing container's marker/creation-time is never clobbered and honest PUTs avoid
+    // a redundant write. A genuine backend fault surfaces. The `skip_marker` mutation seam (test /
+    // `compute-blob-shim-gate-mutation` only; a dead `None` in ships) neuters this ensure so the CI
+    // gate proves it load-bearing (a guest `get-container` then fails with `no such container`).
+    if blob_mutation().as_deref() != Some("skip_marker")
+        && let Err(err) = ensure_container_marker(&*storage, &marker_key).await
+    {
+        return storage_fault("put", &marker_key, err);
     }
     // Streaming enforcement for a chunked / Content-Length-lying client: count bytes as they
     // arrive and abort the stream once the cap is crossed (the object is never fully buffered).
@@ -1042,7 +1114,7 @@ async fn head_object(
     headers: HeaderMap,
     Path((container, key)): Path<(String, String)>,
 ) -> Response {
-    let (storage, skey) = match resolve_target(&shim, &headers, &container, &key).await {
+    let (storage, skey, _) = match resolve_target(&shim, &headers, &container, &key).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -1072,7 +1144,7 @@ async fn delete_object(
     headers: HeaderMap,
     Path((container, key)): Path<(String, String)>,
 ) -> Response {
-    let (storage, skey) = match resolve_target(&shim, &headers, &container, &key).await {
+    let (storage, skey, _) = match resolve_target(&shim, &headers, &container, &key).await {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -1143,8 +1215,9 @@ async fn list_objects(
 /// it goes RED: `allow_cross_container` (bypass the container bind — GET/PUT/… and LIST),
 /// `allow_traversal` (skip the object-key screen, and the LIST prefix screen),
 /// `admit_unmatched` (admit a missing/unknown token), `list_no_strip` (LIST returns the raw
-/// internal `hblob/{site}/{container}/…` key instead of the container-relative name). NOT a
-/// backdoor — it only reads a test env var.
+/// internal `hblob/{site}/{container}/…` key instead of the container-relative name),
+/// `skip_marker` (skip a PUT's container-marker ensure, so a worker-written container is not
+/// openable by a guest `get-container`). NOT a backdoor — it only reads a test env var.
 #[cfg(any(test, feature = "compute-blob-shim-gate-mutation"))]
 fn blob_mutation() -> Option<String> {
     std::env::var("BOATRAMP_COMPUTEBLOB_MUTATION").ok()
@@ -1514,12 +1587,15 @@ mod tests {
 
     /// **CI mutation gate** (PLAN-compute-bindings anti-hollow, marker `COMPUTE BLOB-SHIM
     /// SCOPED OK`). Drives the ENFORCED [`authorize`] / [`BlobShim::authenticate`] decision
-    /// across the three security dimensions + proves the SHARED-NAMESPACE property, and
-    /// prints the marker so the merge gate can assert it RAN. MUTATION-VERIFIED: the SAME
-    /// test re-run under each `BOATRAMP_COMPUTEBLOB_MUTATION` neuters ONE check and MUST
-    /// FAIL — `allow_cross_container` (i: a token scoped to one site/container reaches a
-    /// different container), `allow_traversal` (ii: a `../` key escapes the prefix),
-    /// `admit_unmatched` (iii: an unauthenticated/mismatched token is admitted).
+    /// across the three security dimensions + proves the SHARED-NAMESPACE property (including
+    /// that a shim PUT makes the container FIRST-CLASS — its MARKER ensured — so a guest
+    /// `get-container` → `has-object` → `get-data` reads a worker-written object), and prints
+    /// the marker so the merge gate can assert it RAN. MUTATION-VERIFIED: the SAME test re-run
+    /// under each `BOATRAMP_COMPUTEBLOB_MUTATION` neuters ONE check and MUST FAIL —
+    /// `allow_cross_container` (i: a token scoped to one site/container reaches a different
+    /// container), `allow_traversal` (ii: a `../` key escapes the prefix), `admit_unmatched`
+    /// (iii: an unauthenticated/mismatched token is admitted), `skip_marker` (iv: a PUT does
+    /// not ensure the container marker, so the worker-written container is not guest-openable).
     #[cfg(feature = "handlers")]
     #[tokio::test]
     async fn compute_blob_shim_scoped_gate() {
@@ -1555,9 +1631,19 @@ mod tests {
         // … while its own container composes the EXACT site-scoped key, and the composed
         // key ALWAYS begins with the token's own (never client-named) site prefix — so
         // cross-SITE is structurally impossible.
-        let (_, key) = authorize(Some(&scope), "assets", "k").expect("own container admitted");
+        let (_, key, marker_key) =
+            authorize(Some(&scope), "assets", "k").expect("own container admitted");
         assert_eq!(key, "hblob/default/api/assets/k");
         assert!(key.starts_with(&scope.site_prefix));
+        // The container MARKER a PUT ensures is composed from the SAME confined prefix as the object
+        // key — token-bound `site_prefix` + the bound/validated container — so it can never escape
+        // the token's own site/container.
+        assert_eq!(marker_key, "hblob/default/api/assets/.boatramp-container");
+        assert!(marker_key.starts_with(&scope.site_prefix));
+        assert_eq!(
+            marker_key,
+            format!("{}assets/{CONTAINER_MARKER}", scope.site_prefix)
+        );
 
         // ---- (ii) path-traversal confinement ------------------------------------------
         for bad in ["../escape", "a/../../b", "/abs", ".boatramp-container"] {
@@ -1624,6 +1710,119 @@ mod tests {
         assert_eq!(
             body, b"from-guest",
             "the shim reads what the guest binding wrote"
+        );
+
+        // ---- CONTAINER MARKER: a worker-written container is FIRST-CLASS for a guest handler ----
+        // The shim's own MARKER string must stay byte-identical to the one `boatramp-handlers`
+        // actually probes (it is an OPTIONAL dep, so the shim carries its own copy) — a drift would
+        // silently break `get-container` for every worker-written container.
+        assert_eq!(
+            CONTAINER_MARKER,
+            boatramp_handlers::CONTAINER_MARKER,
+            "the shim's container-marker string drifted from boatramp-handlers' authoritative one"
+        );
+
+        // A real shim PUT, then the FULL guest `wasi:blobstore` handoff that REQUIRES the marker:
+        // `get-container(container)` (marker probe) → `has-object(key)` → `get-data(key)`. Without
+        // the shim's marker-ensure this fails with `no such container` — the bug this fix closes, and
+        // the MUTATION that turns this gate RED (revert the marker-ensure ⇒ `get-container` errors).
+        let (status, _) = request(
+            &shim,
+            "PUT",
+            "/assets/job-42.bin",
+            Some(&token),
+            b"artifact-bytes",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let via_container = boatramp_handlers::read_object_through_guest_container(
+            storage.clone(),
+            "default/api",
+            "assets",
+            "job-42.bin",
+        )
+        .await
+        .expect(
+            "guest get-container → has-object → get-data of a shim-written object \
+             (the shim PUT must ensure the container marker)",
+        );
+        assert_eq!(
+            via_container, b"artifact-bytes",
+            "the worker-written object reads back through the full guest container handoff"
+        );
+
+        // The marker landed at EXACTLY the token-confined key, and its BODY matches what
+        // `create-container` writes — the container's creation time (decimal unix seconds) — so a
+        // worker-created container reports a real `created-at` to a guest handler.
+        let marker = storage
+            .get("hblob/default/api/assets/.boatramp-container")
+            .await
+            .expect("container marker written under the token's own site/container prefix");
+        let mut marker_body = marker.body;
+        let mut marker_bytes = Vec::new();
+        while let Some(chunk) = marker_body.next().await {
+            marker_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let created_at: u64 = String::from_utf8_lossy(&marker_bytes)
+            .parse()
+            .expect("marker body is a decimal unix-seconds creation time (create-container shape)");
+        assert!(created_at > 0, "the marker records a real creation time");
+
+        // Marker CONFINEMENT: a cross-container PUT is refused AND writes NO marker — the marker-ensure
+        // runs only AFTER `authorize` admits the container, so the fix never creates a marker for an
+        // unauthorized container, and the ONLY marker in the store is the token's own.
+        let (status, _) = request(&shim, "PUT", "/secrets/x", Some(&token), b"nope").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let mut markers: Vec<String> = storage
+            .list("hblob/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key)
+            .filter(|k| k.ends_with(CONTAINER_MARKER))
+            .collect();
+        markers.sort();
+        assert_eq!(
+            markers,
+            vec!["hblob/default/api/assets/.boatramp-container".to_string()],
+            "a marker exists ONLY under the token's own site/container (no cross-container leak)"
+        );
+
+        // Marker ORDERING: a PUT rejected 413 up front on an honest over-cap `Content-Length` leaves
+        // NO marker — the marker-ensure runs only AFTER that fast-path check, so an oversized PUT does
+        // not create an empty container. (A small-cap shim + fresh store so the marker cannot pre-exist.)
+        let capped = BlobShim::new().with_max_object_bytes(4);
+        let cap_store: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        // Build the resolver inline (the `resolver` helper is shadowed by the local above).
+        let cap_resolver = BlobShimResolver::new(
+            Arc::new(GlobalBlobBackend::new(cap_store.clone())),
+            capped.clone(),
+            "http://10.0.0.1:8082".to_string(),
+            [9u8; 32],
+        );
+        let cap_env = cap_resolver
+            .resolve("default", "api", 0, &[blob_binding("assets")])
+            .await;
+        let cap_token = cap_env
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let oversize_put = Request::builder()
+            .method("PUT")
+            .uri("/assets/too-big.bin")
+            .header("authorization", format!("Bearer {cap_token}"))
+            .header("content-length", "999")
+            .body(Body::from(Vec::new()))
+            .unwrap();
+        let resp = capped.router().oneshot(oversize_put).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            cap_store
+                .head("hblob/default/api/assets/.boatramp-container")
+                .await
+                .is_err(),
+            "a PUT rejected 413 up front on Content-Length must leave no container marker"
         );
 
         println!("COMPUTE BLOB-SHIM SCOPED OK");

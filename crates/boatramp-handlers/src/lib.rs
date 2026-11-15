@@ -54,6 +54,14 @@ pub use bindings::blob_upload::{
 #[cfg(feature = "engine")]
 #[doc(hidden)]
 pub use bindings::blobstore::read_object_through_guest_binding;
+// Compute blob-shim gate helpers: the FULL guest `wasi:blobstore` container handoff
+// (`get-container` → `has-object` → `get-data`, which PROBES the container MARKER), and the
+// authoritative MARKER string itself so the shim's duplicated copy can be cross-checked. `MARKER`
+// is re-exported (rather than imported into the shim) because `boatramp-handlers` is an OPTIONAL
+// dependency of the shim's crate, while the shim's PUT marker-ensure compiles unconditionally.
+#[cfg(feature = "engine")]
+#[doc(hidden)]
+pub use bindings::blobstore::{MARKER as CONTAINER_MARKER, read_object_through_guest_container};
 // PLAN-compute-bindings kv-shim gate helper: read a value back through the REAL guest
 // `wasi:keyvalue` read-path (proves the compute kv-shim's writes are guest-readable at the SAME
 // key). The keyvalue analogue of `read_object_through_guest_binding`. `#[doc(hidden)]` — for the
