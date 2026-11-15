@@ -696,6 +696,70 @@ jobs:
             fi
           done
 
+      # BR-REQ-2 DYNAMIC (runtime-resolved-host) EGRESS GATE (marker `DYNAMIC EGRESS GATE OK`). The
+      # dynamic-allowlisted-egress capability lets a guest's host-mediated `tcp-egress` `connect-tls`
+      # reach a RUNTIME-resolved host validated BY NAME against an operator-authored, host-authoritative
+      # per-component `dynamic_egress_hosts` glob allowlist — HTTPS-only (the implicit-TLS dial only),
+      # SSRF-floored (`is_global_ip` unless `allow_guest_private_egress`), DNS-rebind-choked (resolve
+      # once, pin, connect to the pinned addr via `resolve_and_gate_tcp_egress`), and fail-closed (empty
+      # allowlist / posture off ⇒ deny-all). This step drives the per-candidate dynamic decision
+      # `dynamic_connect_decision` (the runtime-host leg of the gate) and asserts the marker + pass
+      # count catch a silent skip/rename. MUTATION-VERIFIED: the SAME test re-run under each
+      # `BOATRAMP_TCPEGRESS_MUTATION` dynamic value neuters ONE check — `drop_dynamic_posture` (ignore
+      # the `allow_guest_dynamic_egress` posture), `admit_unallowlisted_dynamic` (bypass the hostname
+      # allowlist) — and MUST FAIL; a PASS-under-mutation (a hollow gate) fails the merge.
+      - name: "dynamic egress gate (runtime-host, hostname-allowlisted, posture-gated, SSRF-floored)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features engine dynamic_connect_decision_gates_posture_ssrf_and_name -- --nocapture 2>&1 | tee dyn-egress.log
+          grep -qE 'test result: ok\. 1 passed' dyn-egress.log \
+            || { echo "::error::dynamic-egress gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DYNAMIC EGRESS GATE OK' dyn-egress.log \
+            || { echo "::error::dynamic-egress gate never reached its marker (a runtime-host egress gate regression)" >&2; exit 1; }
+          # Mutation guard: each dynamic mutation MUST fail the gate (proving each check is load-bearing).
+          for mut in drop_dynamic_posture admit_unallowlisted_dynamic; do
+            if BOATRAMP_TCPEGRESS_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-handlers --features engine dynamic_connect_decision_gates_posture_ssrf_and_name \
+              -- --nocapture > "dyn-egress-mutation-$mut.log" 2>&1; then
+              echo "::error::dynamic-egress gate is HOLLOW — it passed under mutation '$mut' (a runtime-host egress security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "dynamic-egress mutation verified: '$mut' fails the gate as expected."
+            fi
+          done
+
+      # BR-REQ-2 SESSION egress PARITY GATE (marker `SESSION EGRESS PARITY OK`). A SESSION component now
+      # gets the SAME gated outbound egress a handler does: the session's synthesized `FunctionConfig`
+      # carries BOTH the static `egress_allowlist` and the runtime-host `dynamic_egress_hosts` through the
+      # REAL `session_serve::session_egress_fields` synthesis + the REAL `build_function_bindings`, so the
+      # engine's `TcpEgressHost` runs the IDENTICAL `resolve_and_gate_tcp_egress` gate a handler's dial
+      # gets. The dial-DECISION (allowlisted OK / non-allowlisted refused / SSRF floor / posture / dynamic
+      # HTTPS-only) is proven lane-agnostically by the `TCP-EGRESS ALLOWLIST OK` + `DYNAMIC EGRESS GATE OK`
+      # gates above (the session feeds the same Bindings into the same host); THIS step drives the real
+      # SERVER-side session binding-build and asserts the session's allowlist threads through — the wiring
+      # that feeds them. MUTATION-VERIFIED: re-run under `BOATRAMP_TCPEGRESS_MUTATION=drop_session_egress`,
+      # which reverts the synthesis to the old `..Default::default()` deny-all, and the gate MUST FAIL —
+      # proving the session's allowlist is load-bearing, not a silent no-op.
+      - name: "session egress parity gate (session gets the same gated egress as a handler)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features handlers,tcp-egress,session session_egress_parity_gate -- --nocapture 2>&1 | tee session-egress.log
+          grep -qE 'test result: ok\. 1 passed' session-egress.log \
+            || { echo "::error::session-egress parity gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'SESSION EGRESS PARITY OK' session-egress.log \
+            || { echo "::error::session-egress parity gate never reached its marker (a session-egress wiring regression)" >&2; exit 1; }
+          # Mutation guard: dropping the session allowlist MUST fail the gate (the threading is load-bearing).
+          if BOATRAMP_TCPEGRESS_MUTATION=drop_session_egress cargo-zigbuild test \
+            --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,tcp-egress,session \
+            session_egress_parity_gate -- --nocapture > session-egress-mutation.log 2>&1; then
+            echo "::error::session-egress parity gate is HOLLOW — it passed under 'drop_session_egress' (the session's egress allowlist is not actually threaded into its bindings; a silent no-op)" >&2
+            exit 1
+          else
+            echo "session-egress mutation verified: 'drop_session_egress' fails the gate as expected."
+          fi
+
       # PLAN-handler-tcp-egress TCP-EGRESS TLS-WRAP GATE (markers `TCP-EGRESS TLS WRAP OK` /
       # `TCP-EGRESS GATE REUSE OK` / `TCP-EGRESS GATE REUSE PLAINTEXT OK` / `TCP-EGRESS STARTTLS OK`
       # / `TCP-EGRESS STARTTLS OPPORTUNISTIC OK` / `TCP-EGRESS STARTTLS INJECTION SAFE`, mailroom

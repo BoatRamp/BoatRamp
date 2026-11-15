@@ -157,6 +157,16 @@ pub struct FunctionConfig {
     /// posture `allow_guest_tcp_egress` is on. Only consulted when `imports` contains `wasi:sockets`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-component **dynamic egress host allowlist** for this function's host-mediated `tcp-egress`
+    /// runtime-resolved-host dial (same contract as
+    /// [`crate::config::HandlerConfig::dynamic_egress_hosts`], BR-REQ-2): the `host-glob:port` targets
+    /// whose NAME the guest may dial via `connect-tls` at runtime (resolved from its own per-tenant
+    /// config, e.g. a per-tenant OIDC issuer), host-authoritative, **empty ⇒ deny-all**, HTTPS-only +
+    /// SSRF-floored + DNS-rebind-choked. Only consulted when the function is granted the host-mediated
+    /// `tcp-egress` capability (the `wasi:sockets` grant) AND the node posture
+    /// `allow_guest_dynamic_egress` is on (fail-closed otherwise).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_egress_hosts: Vec<String>,
     /// Per-component **writable-zone allowlist** for the gated `dns-publish` capability (same contract
     /// as [`crate::config::HandlerConfig::dns_publish_zones`]): the authorized zone-suffix globs this
     /// function may WRITE DNS records under (own name only, never the rdata target). **Empty ⇒
@@ -295,6 +305,8 @@ impl FunctionConfig {
             blobstore_containers: h.blobstore_containers.clone(),
             // Carry the handler's outbound-TCP `egress_allowlist` likewise (gated `wasi:sockets` parity).
             egress_allowlist: h.egress_allowlist.clone(),
+            // Carry the handler's DYNAMIC egress host allowlist likewise (BR-REQ-2 grant parity).
+            dynamic_egress_hosts: h.dynamic_egress_hosts.clone(),
             // Carry the handler's `dns-publish` writable-zone allowlist likewise (grant surface parity).
             dns_publish_zones: h.dns_publish_zones.clone(),
             // Carry the handler's `dns-publish` NS-target allowlist likewise (MEDIUM-3 grant parity).
@@ -330,6 +342,8 @@ impl FunctionConfig {
             blobstore_containers: c.blobstore_containers.clone(),
             // Carry the consumer's outbound-TCP `egress_allowlist` likewise (gated `wasi:sockets`).
             egress_allowlist: c.egress_allowlist.clone(),
+            // Carry the consumer's DYNAMIC egress host allowlist likewise (BR-REQ-2 grant parity).
+            dynamic_egress_hosts: c.dynamic_egress_hosts.clone(),
             // Carry the consumer's `dns-publish` writable-zone allowlist likewise.
             dns_publish_zones: c.dns_publish_zones.clone(),
             // Carry the consumer's `dns-publish` NS-target allowlist likewise (MEDIUM-3 grant parity).
@@ -1174,6 +1188,7 @@ mod tests {
             upload_containers: Vec::new(),
             blobstore_containers: Vec::new(),
             egress_allowlist: Vec::new(),
+            dynamic_egress_hosts: Vec::new(),
             dns_publish_zones: Vec::new(),
             dns_publish_ns_targets: Vec::new(),
         }
@@ -1218,6 +1233,7 @@ mod tests {
                 upload_containers: Vec::new(),
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
+                dynamic_egress_hosts: Vec::new(),
                 dns_publish_zones: Vec::new(),
                 dns_publish_ns_targets: Vec::new(),
             }],

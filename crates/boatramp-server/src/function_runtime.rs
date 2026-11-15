@@ -1725,6 +1725,14 @@ pub(super) async fn build_function_bindings(
     if granted("wasi:sockets") && !config.egress_allowlist.is_empty() {
         bindings = bindings.with_egress_allowlist(config.egress_allowlist.clone());
     }
+    // DYNAMIC egress host allowlist (BR-REQ-2): attach the function's `dynamic_egress_hosts` under the
+    // SAME host-mediated `tcp-egress` grant (the `wasi:sockets` grant — "no new grant kind"). Deny-by-
+    // default — ungranted or empty leaves the runtime-host path deny-all; even granted + non-empty
+    // reaches nothing unless the node posture `allow_guest_dynamic_egress` is on (the engine enforces
+    // it HTTPS-only + SSRF-floored + DNS-rebind-choked, identical to the site-handler lane).
+    if granted("wasi:sockets") && !config.dynamic_egress_hosts.is_empty() {
+        bindings = bindings.with_dynamic_egress_hosts(config.dynamic_egress_hosts.clone());
+    }
     // Host-side DNS resolver (mailroom cap-req #20, the resolver half of the egress story): attach the
     // shared hickory resolver ONLY when the component is granted `dns-resolve`. Deny-by-default — the
     // binding is absent otherwise; and even when granted it reaches nothing unless the node posture
@@ -3998,6 +4006,104 @@ mod blobstore_dimension0_tests {
             bindings.egress_allowlist().is_empty(),
             "an ungranted standalone function must carry NO socket allowlist (deny-all)"
         );
+    }
+
+    /// BR-REQ-2 SESSION egress PARITY gate (marker `SESSION EGRESS PARITY OK`). A session component
+    /// now gets the SAME gated egress a handler does: its synthesized `FunctionConfig` carries BOTH the
+    /// static `egress_allowlist` and the runtime-host `dynamic_egress_hosts` through the REAL
+    /// `session_serve::session_egress_fields` synthesis + the REAL `build_function_bindings`, so the
+    /// engine's `TcpEgressHost` runs the IDENTICAL `resolve_and_gate_tcp_egress` gate (static IP path +
+    /// `is_global_ip` SSRF floor + the `allow_guest_tcp_egress`/`allow_guest_dynamic_egress` postures +
+    /// the `dynamic_egress_hosts` runtime-host validation) a handler's dial gets — the dial-DECISION is
+    /// proven lane-agnostically by the handlers-crate `TCP-EGRESS ALLOWLIST OK` / `DYNAMIC EGRESS GATE OK`
+    /// gates (the session feeds the same Bindings into the same host); THIS proves the SERVER-side
+    /// threading that feeds them. MUTATION-VERIFIED: re-run under `BOATRAMP_TCPEGRESS_MUTATION=
+    /// drop_session_egress`, which reverts `session_egress_fields` to the old `..Default::default()`
+    /// deny-all, and the granted assertions below go RED — proving the session's allowlist is
+    /// load-bearing, not a silent no-op.
+    #[cfg(feature = "session")]
+    #[tokio::test]
+    async fn session_egress_parity_gate() {
+        let rt = runtime_with_site("shop", "blog").await;
+        let inner = rt.inner.as_ref().unwrap();
+
+        // Synthesize the session's FunctionConfig egress fields EXACTLY as `dispatch_session` does.
+        let (egress, dynamic) = crate::session_serve::session_egress_fields(
+            &[
+                "imap.example.com:993".to_string(),
+                "10.0.0.5:5432".to_string(),
+            ],
+            &["*.okta.com:443".to_string()],
+        );
+        let granted = FunctionConfig {
+            imports: vec!["wasi:sockets".into()],
+            egress_allowlist: egress,
+            dynamic_egress_hosts: dynamic,
+            ..Default::default()
+        };
+        let bindings = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/session/ws",
+            "session/ws",
+            &granted,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a wasi:sockets-granted session builds its bindings");
+
+        // PARITY: the session's static + dynamic allowlists thread verbatim into the Bindings the
+        // `TcpEgressHost` consumes. Under `drop_session_egress` these are empty → these go RED.
+        assert_eq!(
+            &*bindings.egress_allowlist(),
+            &[
+                "imap.example.com:993".to_string(),
+                "10.0.0.5:5432".to_string()
+            ],
+            "a session must carry its static egress_allowlist (handler parity)"
+        );
+        assert_eq!(
+            &*bindings.dynamic_egress_hosts(),
+            &["*.okta.com:443".to_string()],
+            "a session must carry its dynamic_egress_hosts (handler parity)"
+        );
+
+        // Deny-by-default: a session WITHOUT the `wasi:sockets` grant carries NO allowlist — the engine
+        // keeps the socket host deny-all, exactly like an ungranted handler/function.
+        let (e2, d2) = crate::session_serve::session_egress_fields(
+            &["imap.example.com:993".to_string()],
+            &["*.okta.com:443".to_string()],
+        );
+        let ungranted = FunctionConfig {
+            imports: vec![],
+            egress_allowlist: e2,
+            dynamic_egress_hosts: d2,
+            ..Default::default()
+        };
+        let b2 = build_function_bindings(
+            inner,
+            ProjectRef::new("shop"),
+            "shop/session/x",
+            "session/x",
+            &ungranted,
+            0,
+            &FnTenant::Background,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("an import-less session builds");
+        assert!(
+            b2.egress_allowlist().is_empty() && b2.dynamic_egress_hosts().is_empty(),
+            "an ungranted session must carry NO egress allowlist (deny-all)"
+        );
+
+        println!("SESSION EGRESS PARITY OK");
     }
 
     /// Item 1 — EDGE plumbing. Drives the REAL `make_scoped` (behind `scoped`/`scoped_with_pass`) →

@@ -521,6 +521,12 @@ struct HostState {
     /// new posture knob; `false` is the deny-by-default.
     #[cfg(feature = "tcp-egress")]
     tcp_egress_enabled: bool,
+    /// Whether this invocation's guest may dial a **runtime-resolved host** validated against its
+    /// per-component `dynamic_egress_hosts` allowlist via `tcp-egress` `connect-tls` (BR-REQ-2, copied
+    /// from the engine's `allow_dynamic_egress` posture — the `allow_guest_dynamic_egress` flag).
+    /// `false` is the deny-by-default. INDEPENDENT of `tcp_egress_enabled` (the static IP path).
+    #[cfg(feature = "tcp-egress")]
+    dynamic_egress_enabled: bool,
     /// Per-dial CONNECT timeout for `tcp-egress` (copied from the engine).
     #[cfg(feature = "tcp-egress")]
     tcp_egress_connect_timeout: Duration,
@@ -1118,6 +1124,127 @@ async fn tcp_egress_allowed(allowlist: &[String], addr: SocketAddr) -> bool {
     false
 }
 
+/// Whether the guest-SUPPLIED hostname `host` (+ `port`) is authorized by the per-component **dynamic
+/// egress host allowlist** (`dynamic_egress_hosts`, BR-REQ-2 — the dynamic-allowlisted-egress
+/// capability). Unlike [`tcp_egress_allowed`] — which matches a RESOLVED peer IP against the static
+/// deploy-time `egress_allowlist` — this matches the NAME the guest asked to reach against
+/// operator-authored `host-glob:port` entries, so a per-tenant host NOT known at deploy (e.g. an Okta
+/// org subdomain resolved at runtime from the guest's own per-tenant config) can be reached without
+/// widening the IP list.
+///
+/// Each entry is `<host-glob>:<port>`; the port must agree and the host-glob is matched
+/// case-insensitively with the SAME semantics as `boatramp_types::gateway::gateway_host_matches` / the
+/// `dns-publish` zone matcher (exact, `*.suffix` = one label, `**.suffix` = any depth, bare `**` =
+/// anything — the last is an operator footgun, as broad as plain `wasi:http` egress). Re-implemented
+/// here because `boatramp-handlers` does not depend on `boatramp-types`.
+///
+/// **Empty allowlist ⇒ `false`** (deny-all, fail-closed). A malformed entry (no `:port`, non-numeric
+/// port) simply never matches here — nothing default-opens; such an entry is ALSO rejected loudly at
+/// deploy by the matching lint `boatramp_types::config::validate_dynamic_egress_entry` (the two MUST
+/// agree on `host-glob:port` syntax — that lint rejects exactly the shapes this matcher silently
+/// drops). This answers ONLY the name-membership question; the caller ([`resolve_and_gate_tcp_egress`])
+/// still applies the `is_global_ip` SSRF floor
+/// to every RESOLVED address and the one-shot DNS-rebind choke (resolve once, connect to a pinned
+/// address). An IP-literal `host` is deliberately NOT matched here (it has no name to glob — that is
+/// the static [`tcp_egress_allowed`] path's concern), so the dynamic list can never widen reach to a
+/// raw IP.
+fn dynamic_egress_host_allowed(dynamic_hosts: &[String], host: &str, port: u16) -> bool {
+    // An IP literal never name-matches (names only; brackets tolerated on an IPv6 literal).
+    let host_raw = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host_raw.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+    let host_norm = host_raw.trim_end_matches('.').to_ascii_lowercase();
+    if host_norm.is_empty() {
+        return false;
+    }
+    for entry in dynamic_hosts {
+        // Split the REQUIRED trailing `:<port>` on the LAST colon. A host-glob carries no colon, but
+        // split-on-last is robust; a missing / non-numeric port is malformed ⇒ never matches.
+        let Some((glob, port_s)) = entry.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(entry_port) = port_s.trim().parse::<u16>() else {
+            continue;
+        };
+        if entry_port != port {
+            continue;
+        }
+        if dynamic_egress_host_matches(glob, &host_norm) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Host-glob match for [`dynamic_egress_host_allowed`]. Semantics match
+/// `boatramp_types::gateway::gateway_host_matches` (case-insensitive; `*.sfx` is a single label,
+/// `**.sfx` any depth incl. the apex, bare `**` anything). `host` MUST already be normalized
+/// (lowercased, no trailing dot, no brackets) by the caller — the matcher does NOT re-normalize it,
+/// so the string authorized here is byte-identical to the name the caller resolves + dials (it never
+/// authorizes a normalized *copy* of a different raw name); only the operator-configured `glob` is
+/// normalized (case + surrounding whitespace).
+fn dynamic_egress_host_matches(glob: &str, host: &str) -> bool {
+    let glob = glob.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if glob == "**" {
+        return true;
+    }
+    if let Some(suffix) = glob.strip_prefix("**.") {
+        return host == suffix || host.ends_with(&format!(".{suffix}"));
+    }
+    if let Some(suffix) = glob.strip_prefix("*.") {
+        return match host.strip_suffix(&format!(".{suffix}")) {
+            Some(label) => !label.is_empty() && !label.contains('.'),
+            None => false,
+        };
+    }
+    glob == host
+}
+
+/// The RUNTIME-host leg of the `tcp-egress` gate (BR-REQ-2): whether a resolved candidate `addr`,
+/// reached via a `connect-tls` dial to a guest-supplied hostname that already matched the
+/// per-component `dynamic_egress_hosts` allowlist (`name_allowlisted`), is permitted. Mirrors
+/// [`tcp_connect_decision`]'s structure for the STATIC IP path, but keyed on the DYNAMIC posture +
+/// the pre-computed name match rather than the IP-allowlist:
+/// 1. **posture** — `dynamic_posture` is on (`allow_guest_dynamic_egress`).
+/// 2. **SSRF floor** — the peer is globally routable unless `allow_private` is separately on (the
+///    SAME `is_global_ip` predicate the static path + `wasi:http` egress use — one SSRF source of
+///    truth, never forked).
+/// 3. **name-allowlist** — the guest-supplied hostname matched a `dynamic_egress_hosts` glob.
+///
+/// connect-only is implicit: this is only ever evaluated for a `connect-tls` candidate (the dynamic
+/// path is NEVER consulted on the `connect-plaintext` dial, so the capability is HTTPS-only). The
+/// `tcpegress_mutation()` seam (test/`tcpegress-gate-mutation` only) neuters exactly one check so the
+/// CI gate proves each is load-bearing: `drop_dynamic_posture` ignores (1), `admit_unallowlisted_dynamic`
+/// bypasses (3); a shipped build evaluates all three (the SSRF floor is gate-proven by `is_global_ip`'s
+/// own tests, so it carries no mutation here).
+fn dynamic_connect_decision(
+    addr: SocketAddr,
+    allow_private: bool,
+    dynamic_posture: bool,
+    name_allowlisted: bool,
+) -> bool {
+    let mutation = tcpegress_mutation();
+    let mutating = |m: &str| mutation.as_deref() == Some(m);
+
+    // (1) Dynamic posture gate.
+    if !dynamic_posture && !mutating("drop_dynamic_posture") {
+        return false;
+    }
+    // (2) SSRF floor (shared predicate — same `is_global_ip` as the static path + `wasi:http` egress).
+    if !allow_private && !boatramp_core::access::is_global_ip(addr.ip()) {
+        return false;
+    }
+    // (3) Dynamic name-allowlist membership.
+    if mutating("admit_unallowlisted_dynamic") {
+        return true;
+    }
+    name_allowlisted
+}
+
 /// The full outbound-TCP connect authorization decision (`PLAN-handler-tcp-egress`): the single pure
 /// predicate the installed `socket_addr_check` closure ([`HandlerEngine::new_store`]) calls, so the
 /// TESTED code is the ENFORCED code. Returns `true` (permit) only when ALL hold:
@@ -1147,7 +1274,8 @@ fn installs_guest_socket_check(
 }
 
 /// The `tcpegress_mutation()` seam (test/`tcpegress-gate-mutation` only) neuters exactly one check at
-/// a time so the CI gate proves each is load-bearing; a shipped build evaluates all four.
+/// a time so the CI gate proves each is load-bearing; a shipped build evaluates all four. This is the
+/// STATIC IP-allowlist leg; the runtime-host leg is [`dynamic_connect_decision`] (BR-REQ-2).
 async fn tcp_connect_decision(
     use_: SocketAddrUse,
     addr: SocketAddr,
@@ -1229,6 +1357,8 @@ pub(crate) async fn resolve_and_gate_tcp_egress(
     allowlist: &[String],
     allow_private: bool,
     posture_tcp_egress: bool,
+    dynamic_hosts: &[String],
+    dynamic_posture: bool,
 ) -> Result<Vec<SocketAddr>, TcpEgressResolveError> {
     // ONE resolution. An IP-literal `host` "resolves" to itself synchronously (no network lookup);
     // everything else does a real DNS query. Either way, `addrs` is the FINAL, fixed candidate set —
@@ -1240,17 +1370,28 @@ pub(crate) async fn resolve_and_gate_tcp_egress(
     if addrs.is_empty() {
         return Err(TcpEgressResolveError::DnsFailure);
     }
+    // The runtime-host NAME authorization (BR-REQ-2) is decided ONCE on the guest-supplied hostname —
+    // the SSRF floor + the rebind choke below still apply per RESOLVED candidate, so this only ever
+    // widens WHICH names are eligible, never which IPs bypass the floor. An IP-literal host never
+    // name-matches (see `dynamic_egress_host_allowed`).
+    let name_allowlisted = dynamic_egress_host_allowed(dynamic_hosts, host, port);
     let mut checked = Vec::with_capacity(addrs.len());
     for addr in addrs {
-        if tcp_connect_decision(
+        // A candidate is admitted by EITHER the STATIC IP path (posture + IP-allowlist) OR the DYNAMIC
+        // runtime-host path (dynamic posture + the name match) — both independently connect-only (only
+        // `TcpConnect` candidates reach here) and SSRF-floored by the SAME `is_global_ip`. Fail-closed:
+        // with both postures off / both allowlists empty, neither admits ⇒ deny-all.
+        let static_ok = tcp_connect_decision(
             SocketAddrUse::TcpConnect,
             addr,
             allowlist,
             allow_private,
             posture_tcp_egress,
         )
-        .await
-        {
+        .await;
+        let dynamic_ok =
+            dynamic_connect_decision(addr, allow_private, dynamic_posture, name_allowlisted);
+        if static_ok || dynamic_ok {
             checked.push(addr);
         }
     }
@@ -1277,10 +1418,13 @@ fn lane_gate_mutation() -> Option<String> {
 
 /// The active TCP-egress gate mutation (`PLAN-handler-tcp-egress` TE-3 anti-hollow gate), or `None`.
 /// Present ONLY under `cfg(test)` (the in-crate gate) or the `tcpegress-gate-mutation` feature; a
-/// shipped build has neither, so [`tcp_connect_decision`]'s three security checks are unconditional
-/// and this is a dead `None`. Each recognized value neuters ONE check so the CI gate can prove it
-/// goes RED: `admit_unallowlisted` (bypass the allowlist), `admit_bind_listen` (drop connect-only),
-/// `drop_posture` (ignore the posture gate). NOT a backdoor — it only reads a test env var.
+/// shipped build has neither, so [`tcp_connect_decision`]'s AND [`dynamic_connect_decision`]'s
+/// security checks are unconditional and this is a dead `None`. Each recognized value neuters ONE
+/// check so the CI gate can prove it goes RED: STATIC IP path — `admit_unallowlisted` (bypass the
+/// allowlist), `admit_bind_listen` (drop connect-only), `drop_posture` (ignore the posture gate);
+/// DYNAMIC runtime-host path (BR-REQ-2) — `drop_dynamic_posture` (ignore the dynamic posture),
+/// `admit_unallowlisted_dynamic` (bypass the hostname allowlist). NOT a backdoor — it only reads a
+/// test env var.
 #[cfg(any(test, feature = "tcpegress-gate-mutation"))]
 fn tcpegress_mutation() -> Option<String> {
     std::env::var("BOATRAMP_TCPEGRESS_MUTATION").ok()
@@ -1741,6 +1885,15 @@ pub struct HandlerEngine {
     /// refused regardless of the per-handler allowlist. `true` installs the connect-only,
     /// allowlist-gated, SSRF-floored check. Never affects `wasi:http` egress (its own gate).
     allow_tcp_egress: bool,
+    /// Whether a guest's host-mediated `tcp-egress` dial may reach a **runtime-resolved host**
+    /// validated against its per-component `dynamic_egress_hosts` allowlist (BR-REQ-2, the operator
+    /// posture's `allow_guest_dynamic_egress`). `false` (the default) makes the runtime-host path
+    /// deny-all (a `connect-tls` whose host is NOT in the static `egress_allowlist` is refused). `true`
+    /// lets a `connect-tls` dial whose guest-supplied HOSTNAME matches a `dynamic_egress_hosts` glob
+    /// through — still HTTPS-only (the implicit-TLS dial only), SSRF-floored, and DNS-rebind-choked.
+    /// INDEPENDENT of [`allow_tcp_egress`](Self::allow_tcp_egress) (a fleet may enable the
+    /// hostname-allowlisted dynamic path while keeping the raw-IP static path off).
+    allow_dynamic_egress: bool,
     /// Whether the node posture allows host-owned inbound-TCP **listeners** to dispatch to a guest
     /// (`allow_guest_tcp_listener`, off under multi-tenant) — PLAN-handler-tcp-inbound. `false` (the
     /// default) makes [`dispatch_tcp_connection`](Self::dispatch_tcp_connection) refuse before it ever
@@ -2005,6 +2158,9 @@ impl HandlerEngine {
             // Deny-by-default: the socket host stays deny-all until an operator opts the posture in
             // via `with_tcp_egress`. A node that never calls it can never grant outbound TCP.
             allow_tcp_egress: false,
+            // Deny-by-default (BR-REQ-2): the runtime-resolved-host dial path stays deny-all until an
+            // operator opts the posture in via `with_dynamic_egress`.
+            allow_dynamic_egress: false,
             // Deny-by-default: inbound listeners dispatch only once an operator opts the posture in via
             // `with_tcp_listener`. A node that never calls it can never dispatch a listener connection.
             allow_tcp_listener: false,
@@ -2274,6 +2430,20 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_tcp_egress(mut self, allow: bool) -> Self {
         self.allow_tcp_egress = allow;
+        self
+    }
+
+    /// Permit (or refuse) a guest's host-mediated `tcp-egress` dial to a **runtime-resolved host**
+    /// validated against its per-component `dynamic_egress_hosts` allowlist (BR-REQ-2, the operator
+    /// posture's `allow_guest_dynamic_egress`). Default (`false`, off under multi-tenant) keeps the
+    /// runtime-host path deny-all. When on, a `connect-tls` dial whose guest-supplied HOSTNAME matches
+    /// a `dynamic_egress_hosts` glob is admitted — HTTPS-only (the implicit-TLS dial only), still held
+    /// to the `is_global_ip` SSRF floor (unless `with_private_egress` is also on) and the one-shot
+    /// DNS-rebind choke. INDEPENDENT of [`with_tcp_egress`](Self::with_tcp_egress): this gates ONLY the
+    /// hostname-allowlisted runtime path, never the static IP `egress_allowlist` / raw `wasi:sockets`.
+    #[must_use]
+    pub fn with_dynamic_egress(mut self, allow: bool) -> Self {
+        self.allow_dynamic_egress = allow;
         self
     }
 
@@ -3438,6 +3608,12 @@ impl HandlerEngine {
                 state.tcp_egress_connect_timeout,
                 state.tcp_egress_idle_timeout,
             )
+            // Layer the BR-REQ-2 runtime-resolved-host config: the `allow_guest_dynamic_egress`
+            // posture + the per-component `dynamic_egress_hosts` allowlist. Off/empty ⇒ deny-all.
+            .with_dynamic(
+                state.dynamic_egress_enabled,
+                state.bindings.dynamic_egress_hosts(),
+            )
         })?;
         // Host-owned-listener connection-context (mailroom cap-req #16): a listener guest reads the
         // CURRENT wire security of its connection. Always linked under `tcp-listener`; a non-listener
@@ -3612,6 +3788,8 @@ impl HandlerEngine {
             },
             #[cfg(feature = "tcp-egress")]
             tcp_egress_enabled: self.allow_tcp_egress,
+            #[cfg(feature = "tcp-egress")]
+            dynamic_egress_enabled: self.allow_dynamic_egress,
             #[cfg(feature = "tcp-egress")]
             tcp_egress_connect_timeout: self.tcp_egress_connect_timeout,
             #[cfg(feature = "tcp-egress")]
@@ -4359,6 +4537,176 @@ mod tests {
         );
 
         println!("TCP-EGRESS ALLOWLIST OK");
+    }
+
+    /// BR-REQ-2 — the dynamic (runtime-resolved-host) NAME allowlist matcher: `host-glob:port` with
+    /// the gateway globbing (exact / `*.suffix` / `**.suffix`), case- + trailing-dot-insensitive, port
+    /// must agree, empty ⇒ deny-all, malformed entry never matches, and an IP literal NEVER
+    /// name-matches (so the dynamic list can never widen reach to a raw IP — that stays the static
+    /// path's concern).
+    #[test]
+    fn dynamic_egress_host_allowed_matches_name_glob_port() {
+        let allow = vec![
+            "oauth2.googleapis.com:443".to_string(), // exact
+            "*.okta.com:443".to_string(),            // one label
+            "**.entra.example:443".to_string(),      // any depth
+        ];
+        // Exact host on the right port.
+        assert!(dynamic_egress_host_allowed(
+            &allow,
+            "oauth2.googleapis.com",
+            443
+        ));
+        // Case- + trailing-dot-insensitive (FQDN form the guest may pass).
+        assert!(dynamic_egress_host_allowed(
+            &allow,
+            "OAuth2.GoogleAPIs.com.",
+            443
+        ));
+        // `*.okta.com` matches ONE label (a tenant Okta org) but NOT the apex or a deeper label.
+        assert!(dynamic_egress_host_allowed(&allow, "acme.okta.com", 443));
+        assert!(!dynamic_egress_host_allowed(&allow, "okta.com", 443));
+        assert!(!dynamic_egress_host_allowed(&allow, "a.b.okta.com", 443));
+        // `**.entra.example` matches any depth incl. the apex.
+        assert!(dynamic_egress_host_allowed(&allow, "entra.example", 443));
+        assert!(dynamic_egress_host_allowed(
+            &allow,
+            "a.b.entra.example",
+            443
+        ));
+        // Wrong port ⇒ no match (even a name hit).
+        assert!(!dynamic_egress_host_allowed(
+            &allow,
+            "oauth2.googleapis.com",
+            8443
+        ));
+        // A host OUTSIDE the allowlist ⇒ refused.
+        assert!(!dynamic_egress_host_allowed(&allow, "evil.example", 443));
+        // Empty allowlist ⇒ deny-all (fail-closed).
+        assert!(!dynamic_egress_host_allowed(
+            &[],
+            "oauth2.googleapis.com",
+            443
+        ));
+        // A malformed entry (no `:port`, non-numeric port) never matches.
+        assert!(!dynamic_egress_host_allowed(
+            &["oauth2.googleapis.com".to_string()],
+            "oauth2.googleapis.com",
+            443
+        ));
+        assert!(!dynamic_egress_host_allowed(
+            &["oauth2.googleapis.com:https".to_string()],
+            "oauth2.googleapis.com",
+            443
+        ));
+        // An IP literal NEVER name-matches, even if an entry's glob would textually cover it.
+        assert!(!dynamic_egress_host_allowed(
+            &["**:443".to_string()],
+            "93.184.216.34",
+            443
+        ));
+        assert!(!dynamic_egress_host_allowed(
+            &["127.0.0.1:443".to_string()],
+            "127.0.0.1",
+            443
+        ));
+    }
+
+    /// BR-REQ-2 — the per-candidate DYNAMIC decision (`dynamic_connect_decision`): the runtime-host
+    /// leg admits ONLY when (1) the dynamic posture is on, (2) the candidate clears the `is_global_ip`
+    /// SSRF floor (unless `allow_private`), and (3) the hostname already name-matched. Each check is
+    /// load-bearing; the `tcpegress_mutation()` seam proves it in the CI gate (not set here).
+    #[test]
+    fn dynamic_connect_decision_gates_posture_ssrf_and_name() {
+        let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let global = sa("93.184.216.34:443");
+        let private = sa("10.0.0.5:443");
+        let metadata = sa("169.254.169.254:443");
+
+        // All three hold ⇒ admit.
+        assert!(dynamic_connect_decision(global, false, true, true));
+        // (1) Posture off ⇒ deny even a name-matched global (fail-closed).
+        assert!(!dynamic_connect_decision(global, false, false, true));
+        // (3) Name not allowlisted ⇒ deny even with posture on + a global peer.
+        assert!(!dynamic_connect_decision(global, false, true, false));
+        // (2) SSRF floor: a name-matched PRIVATE / METADATA peer is refused without allow_private…
+        assert!(!dynamic_connect_decision(private, false, true, true));
+        assert!(!dynamic_connect_decision(metadata, false, true, true));
+        // …and admitted only once allow_private is separately on (parity with the static path).
+        assert!(dynamic_connect_decision(private, true, true, true));
+        assert!(dynamic_connect_decision(metadata, true, true, true));
+
+        // Marker for the CI anti-hollow gate (grep catches a silent skip/rename). Under each dynamic
+        // mutation (`drop_dynamic_posture` / `admit_unallowlisted_dynamic`) one assertion above flips
+        // and this test FAILS — proving the posture + name checks are load-bearing.
+        println!("DYNAMIC EGRESS GATE OK");
+    }
+
+    /// BR-REQ-2 — the gate end to end (`resolve_and_gate_tcp_egress`) on the DYNAMIC path, using
+    /// `localhost` (resolves to loopback locally — no network) to exercise the resolve+gate pipeline:
+    /// the SSRF floor still fires on a name-allowlisted host, the posture is fail-closed, a
+    /// non-allowlisted name is refused, an empty allowlist is deny-all, and an admitted dial returns
+    /// the PINNED resolved address (the DNS-rebind choke — the caller connects to this, never
+    /// re-resolves). HTTPS-only is structural: `dial_plaintext_pipeline` passes `(&[], false)` for the
+    /// dynamic args, so the plaintext dial can never reach a dynamic host — modeled by the posture-off
+    /// / empty-list cases below.
+    #[cfg(feature = "tcp-egress")]
+    #[tokio::test]
+    async fn resolve_and_gate_dynamic_path_https_only_ssrf_floored() {
+        let dyn_allow = vec!["localhost:443".to_string()];
+        // Name-allowlisted, but loopback ⇒ the SSRF floor refuses it (allow_private off) — exactly as
+        // it would a private/metadata IdP host. (static list empty + static posture off throughout.)
+        assert_eq!(
+            resolve_and_gate_tcp_egress("localhost", 443, &[], false, false, &dyn_allow, true)
+                .await,
+            Err(TcpEgressResolveError::RefusedByGate),
+            "a name-allowlisted but non-global host must still be refused by the SSRF floor"
+        );
+        // With allow_private on, the SAME name-allowlisted host is admitted AND the returned checked
+        // set is the PINNED resolved loopback address (DNS-rebind choke: the caller dials THIS).
+        let checked =
+            resolve_and_gate_tcp_egress("localhost", 443, &[], true, false, &dyn_allow, true)
+                .await
+                .expect("name-allowlisted host clears the gate once allow_private is on");
+        assert!(
+            !checked.is_empty(),
+            "the gate returns the concrete pinned address(es)"
+        );
+        assert!(
+            checked
+                .iter()
+                .all(|a| a.ip().is_loopback() && a.port() == 443),
+            "every returned candidate is the pinned resolved loopback:443, never re-resolved"
+        );
+        // A host NOT on the dynamic allowlist (static off too) ⇒ refused.
+        assert_eq!(
+            resolve_and_gate_tcp_egress(
+                "localhost",
+                443,
+                &[],
+                true,
+                false,
+                &["*.okta.com:443".to_string()],
+                true
+            )
+            .await,
+            Err(TcpEgressResolveError::RefusedByGate),
+            "a non-allowlisted runtime host must be refused"
+        );
+        // Dynamic POSTURE off ⇒ fail-closed even for a name-matched host (this is also the shape the
+        // plaintext dial passes, so HTTPS-only holds structurally).
+        assert_eq!(
+            resolve_and_gate_tcp_egress("localhost", 443, &[], true, false, &dyn_allow, false)
+                .await,
+            Err(TcpEgressResolveError::RefusedByGate),
+            "dynamic posture off must deny-all (fail-closed)"
+        );
+        // Empty dynamic allowlist ⇒ deny-all (and the static path is off), i.e. the plaintext-dial args.
+        assert_eq!(
+            resolve_and_gate_tcp_egress("localhost", 443, &[], true, false, &[], true).await,
+            Err(TcpEgressResolveError::RefusedByGate),
+            "empty dynamic allowlist must be deny-all"
+        );
     }
 
     /// The `Bindings` a conn-lane dispatch would carry: an EMPTY outbound-TCP egress allowlist ⇒

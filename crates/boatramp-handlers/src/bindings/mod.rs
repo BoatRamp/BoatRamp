@@ -198,6 +198,14 @@ pub struct Bindings {
     /// only when the node posture `allow_guest_tcp_egress` is on; even then the gate is
     /// connect-only and SSRF-floored. Never guest-supplied — host config on the deploy record.
     egress_allowlist: Arc<[String]>,
+    /// This invocation's per-component **dynamic egress host allowlist** for the host-mediated
+    /// `tcp-egress` runtime-resolved-host dial (BR-REQ-2): `host-glob:port` entries whose NAME a
+    /// guest-supplied `connect-tls` host is matched against. Empty ⇒ deny-all (the runtime-host path
+    /// is simply unavailable; the static `egress_allowlist` is unaffected). Consulted by the
+    /// `tcp-egress` binding ONLY on the implicit-TLS dial (HTTPS-only) and ONLY when the node posture
+    /// `allow_guest_dynamic_egress` is on; even then the gate keeps the SSRF floor + the one-shot
+    /// DNS-rebind choke. Never guest-supplied — host config on the deploy record.
+    dynamic_egress_hosts: Arc<[String]>,
     /// The `dns-resolve` grant (mailroom cap-req #20): the server-provided host-side DNS resolver
     /// (MX + addr, with its own cache). `None` ⇒ not granted (every resolve ⇒ `access-denied`). The
     /// egress POSTURE (`allow_guest_tcp_egress`) + the SSRF floor are applied by the binding from the
@@ -392,6 +400,23 @@ impl Bindings {
     /// gated `wasi:sockets` allowlist was attached for a given import/grant shape.
     pub fn egress_allowlist(&self) -> Arc<[String]> {
         self.egress_allowlist.clone()
+    }
+
+    /// Set this invocation's per-component **dynamic egress host allowlist** (BR-REQ-2) for the
+    /// host-mediated `tcp-egress` runtime-resolved-host dial. Entries are `host-glob:port`. Attach
+    /// ONLY when the component is granted the host-mediated `tcp-egress` capability (the `wasi:sockets`
+    /// grant); an ungranted or empty allowlist leaves the runtime-host path deny-all (the static
+    /// `egress_allowlist` is independent). Host config on the deploy record — never guest-supplied.
+    #[must_use]
+    pub fn with_dynamic_egress_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.dynamic_egress_hosts = Arc::from(hosts);
+        self
+    }
+
+    /// This invocation's dynamic egress host allowlist (empty ⇒ the runtime-host path is deny-all).
+    /// Read by the engine's `build_linker` closure to build the per-invocation `TcpEgressHost`.
+    pub fn dynamic_egress_hosts(&self) -> Arc<[String]> {
+        self.dynamic_egress_hosts.clone()
     }
 
     /// Whether this invocation is HOST-MEDIATED-egress-only (mailroom cap-req #19): a non-empty

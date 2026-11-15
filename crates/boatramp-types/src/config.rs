@@ -195,6 +195,9 @@ impl DeployConfig {
             for import in &handler.imports {
                 check_import(import)?;
             }
+            // BR-REQ-2: lint each dynamic egress host entry's `host-glob:port` syntax so a typo fails
+            // loud here (the handler lane HONORS the field), not as a silent never-match at runtime.
+            validate_dynamic_egress_hosts(&handler.dynamic_egress_hosts)?;
             // `env` is for static, non-secret strings; a secret belongs in
             // `[handlers].secrets` as a *reference* to a host env var, so it
             // never lands in the (content-addressed, stored) manifest.
@@ -233,6 +236,9 @@ impl DeployConfig {
             for import in &consumer.imports {
                 check_import(import)?;
             }
+            // BR-REQ-2: lint the consumer lane's dynamic egress host syntax (the consumer lane HONORS
+            // the field, same as a handler).
+            validate_dynamic_egress_hosts(&consumer.dynamic_egress_hosts)?;
         }
         for cron in &self.crons {
             check_cron_schedule(&cron.schedule)?;
@@ -422,6 +428,11 @@ impl DeployConfig {
             for import in &session.imports {
                 check_import(import)?;
             }
+            // BR-REQ-2: a session component HONORS `dynamic_egress_hosts` with full handler parity
+            // (the session's synthesized `FunctionConfig` carries the field through the SAME gated
+            // `build_function_bindings` → `TcpEgressHost` path), so lint its `host-glob:port` syntax
+            // the same as a handler/consumer/function lane — a typo fails loud, not a silent never-match.
+            validate_dynamic_egress_hosts(&session.dynamic_egress_hosts)?;
         }
         Ok(())
     }
@@ -648,6 +659,55 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
             KNOWN_IMPORTS.join(", ")
         )))
     }
+}
+
+/// Validate ONE `dynamic_egress_hosts` entry's `host-glob:port` syntax (BR-REQ-2) at deploy/apply, so
+/// a typo fails LOUD at `apply`/`validate` instead of silently never-matching at runtime. This is the
+/// deploy-time lint half of the runtime matcher in `boatramp-handlers`
+/// (`engine::dynamic_egress_host_allowed` / `dynamic_egress_host_matches`): it reuses the SAME parse
+/// shape — a REQUIRED trailing `:<port>` split on the LAST colon, a numeric port, a non-empty
+/// host-glob, and a non-empty suffix after a `*.`/`**.` wildcard — and rejects EXACTLY the shapes that
+/// matcher would never usefully match, so the lint and the matcher agree. (Re-stated here rather than
+/// shared as one fn because `boatramp-handlers` does not depend on `boatramp-types`; a divergence would
+/// show up as a lint that accepts an entry the matcher silently drops.) `**` (match-anything on a port)
+/// is valid syntax (an operator footgun — see the operator docs — but not a typo, so not rejected).
+pub fn validate_dynamic_egress_entry(entry: &str) -> Result<(), ConfigError> {
+    let bad = |why: &str| {
+        ConfigError::parse(format!(
+            "dynamic_egress_hosts entry {entry:?} is malformed ({why}); each entry is \
+             `<host-glob>:<port>`, e.g. `oauth2.googleapis.com:443`, `*.okta.com:443`, or \
+             `**.entra.example:443`"
+        ))
+    };
+    // Split the REQUIRED trailing `:<port>` on the LAST colon (same as the matcher, so an IPv6-ish
+    // glob keeps its inner colons).
+    let Some((glob, port_s)) = entry.rsplit_once(':') else {
+        return Err(bad("missing the required `:<port>`"));
+    };
+    match port_s.trim().parse::<u16>() {
+        Ok(p) if p != 0 => {}
+        _ => return Err(bad("the port must be a number in 1..=65535")),
+    }
+    let glob = glob.trim();
+    if glob.is_empty() {
+        return Err(bad("the host-glob is empty"));
+    }
+    // A `*.`/`**.` wildcard must carry a non-empty suffix — `*.` / `**.` alone matches nothing.
+    if let Some(suffix) = glob.strip_prefix("**.").or_else(|| glob.strip_prefix("*."))
+        && suffix.is_empty()
+    {
+        return Err(bad("a `*.`/`**.` wildcard needs a non-empty suffix"));
+    }
+    Ok(())
+}
+
+/// Validate every entry of a component's `dynamic_egress_hosts` list (BR-REQ-2) — the deploy-time
+/// syntax lint applied on the lanes that HONOR the field (handler / consumer / standalone function).
+pub fn validate_dynamic_egress_hosts(entries: &[String]) -> Result<(), ConfigError> {
+    for entry in entries {
+        validate_dynamic_egress_entry(entry)?;
+    }
+    Ok(())
 }
 
 /// The canonical standard HTTP verbs. Each is also a valid RFC 7230 `token`; they are
@@ -956,6 +1016,29 @@ pub struct HandlerConfig {
     /// guest-supplied at runtime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-handler **dynamic egress host allowlist** for the host-mediated `tcp-egress` capability's
+    /// runtime-resolved-host dial (BR-REQ-2, the dynamic-allowlisted-egress capability). Each entry is
+    /// a `host-glob:port` target (`oauth2.googleapis.com:443`, `www.googleapis.com:443`,
+    /// `login.microsoftonline.com:443`, `*.okta.com:443`, `**.okta.com:443`): the HOSTNAME the guest
+    /// supplies at `connect-tls` time (resolved at RUNTIME from the guest's own per-tenant config, e.g.
+    /// a per-tenant OIDC issuer) is matched against these globs, case-insensitively, trailing dot
+    /// ignored (same globbing as [`crate::gateway::gateway_host_matches`]: exact, `*.suffix` one label,
+    /// `**.suffix` any depth). This is the RUNTIME-host counterpart to the static deploy-time
+    /// [`egress_allowlist`](Self::egress_allowlist) (which matches a resolved peer IP/CIDR/domain): it
+    /// matches the guest-NAMED host instead, so a per-tenant host not known at deploy (an Okta org)
+    /// can be reached without widening the IP list. **Host-authoritative** — the allowlist is this
+    /// deploy record's config, NEVER guest-supplied at runtime; the guest only names the host to reach.
+    /// **Empty ⇒ deny-all** (fail-closed). The dynamic dial keeps every egress guard: it is
+    /// **HTTPS-only** (consulted ONLY on the implicit-TLS `connect-tls` dial — a `connect-plaintext`
+    /// dial never uses it), SSRF-floored (every resolved address must be globally routable unless the
+    /// posture allows private egress), and DNS-rebind-choked (resolve once, gate each pinned
+    /// candidate, connect only to a pinned address). Only consulted when the component is granted the
+    /// host-mediated `tcp-egress` capability (the `wasi:sockets` grant) AND the node posture
+    /// [`allow_guest_dynamic_egress`](crate::security::SecurityPosture::allow_guest_dynamic_egress) is
+    /// on — with the posture off the runtime denies all (fail-closed). Host config on the deploy
+    /// record, never guest-supplied at runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_egress_hosts: Vec<String>,
     /// Per-handler **writable-zone allowlist** for the gated `dns-publish` capability (cap-req #24 WS3):
     /// the authorized zone suffixes (globs) this handler may WRITE DNS records under. The DNS analog of
     /// [`egress_allowlist`](Self::egress_allowlist) and least-privilege the same way: **empty ⇒
@@ -1182,6 +1265,13 @@ pub struct ConsumerConfig {
     /// (`allow_guest_tcp_egress`), SSRF-floored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-component **dynamic egress host allowlist** for this consumer's host-mediated `tcp-egress`
+    /// runtime-resolved-host dial (same contract as [`HandlerConfig::dynamic_egress_hosts`]): the
+    /// `host-glob:port` targets whose NAME the guest may dial via `connect-tls` at runtime,
+    /// host-authoritative, **empty ⇒ deny-all**, HTTPS-only + SSRF-floored + DNS-rebind-choked,
+    /// posture-gated by `allow_guest_dynamic_egress`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_egress_hosts: Vec<String>,
     /// Per-component **writable-zone allowlist** for the gated `dns-publish` capability (same contract
     /// as [`HandlerConfig::dns_publish_zones`]): the authorized zone-suffix globs this consumer may
     /// WRITE DNS records under (own name only, never the rdata target). **Empty ⇒ deny-all.**
@@ -1458,6 +1548,13 @@ pub struct SessionConfig {
     /// posture-gated (`allow_guest_tcp_egress`), SSRF-floored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<String>,
+    /// Per-component **dynamic egress host allowlist** for this session component's host-mediated
+    /// `tcp-egress` runtime-resolved-host dial (same contract as
+    /// [`HandlerConfig::dynamic_egress_hosts`]): the `host-glob:port` targets whose NAME the guest may
+    /// dial via `connect-tls` at runtime, host-authoritative, **empty ⇒ deny-all**, HTTPS-only +
+    /// SSRF-floored + DNS-rebind-choked, posture-gated by `allow_guest_dynamic_egress`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_egress_hosts: Vec<String>,
     /// Per-component **writable-zone allowlist** for the gated `dns-publish` capability (same contract
     /// as [`HandlerConfig::dns_publish_zones`]): the authorized zone-suffix globs this session's
     /// component may WRITE DNS records under (own name only). **Empty ⇒ deny-all.** Posture-gated
@@ -2593,6 +2690,7 @@ mod tests {
                 upload_containers: Vec::new(),
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
+                dynamic_egress_hosts: Vec::new(),
                 dns_publish_zones: Vec::new(),
                 dns_publish_ns_targets: Vec::new(),
             }],
@@ -2762,6 +2860,83 @@ mod tests {
         )
         .expect("parses without an allowlist");
         assert!(empty.handlers[0].egress_allowlist.is_empty());
+    }
+
+    #[test]
+    fn dynamic_egress_hosts_syntax_lint_and_session_parity() {
+        // BR-REQ-2 INFO-2 — the deploy-time `host-glob:port` syntax lint, both the standalone
+        // predicate and via `compile_check` on the honoring lanes.
+        // Well-formed shapes (exact / `*.` / `**.` / `**`) accept.
+        for ok in [
+            "oauth2.googleapis.com:443",
+            "*.okta.com:443",
+            "**.entra.example:443",
+            "**:443",
+            "login.microsoftonline.com:8443",
+        ] {
+            validate_dynamic_egress_entry(ok).unwrap_or_else(|e| panic!("{ok:?} must accept: {e}"));
+        }
+        // Malformed shapes reject (missing/non-numeric/zero port, empty glob, empty wildcard suffix).
+        for bad in [
+            "oauth2.googleapis.com",   // no :port
+            "oauth2.googleapis.com:0", // port 0
+            "oauth2.googleapis.com:https",
+            "oauth2.googleapis.com:99999", // > u16
+            ":443",                        // empty host-glob
+            "*.:443",                      // empty suffix
+            "**.:443",                     // empty suffix
+        ] {
+            assert!(
+                validate_dynamic_egress_entry(bad).is_err(),
+                "{bad:?} must be rejected by the lint"
+            );
+        }
+
+        // A HANDLER carrying a well-formed entry validates (from_ron runs compile_check); a malformed
+        // one fails loudly at load.
+        let good = DeployConfig::from_ron(
+            r#"( handlers: [ ( route: "/sso", methods: ["POST"], component: "sso.wasm",
+                 imports: ["wasi:sockets"], dynamic_egress_hosts: ["*.okta.com:443"] ) ] )"#,
+        )
+        .expect("a well-formed dynamic_egress_hosts handler validates");
+        good.compile_check().expect("idempotent re-validate");
+        assert_eq!(
+            good.handlers[0].dynamic_egress_hosts,
+            vec!["*.okta.com:443".to_string()]
+        );
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/sso", methods: ["POST"], component: "sso.wasm",
+                     imports: ["wasi:sockets"], dynamic_egress_hosts: ["*.okta.com"] ) ] )"#,
+            )
+            .is_err(),
+            "a malformed dynamic_egress_hosts entry must fail loudly at load (compile_check)"
+        );
+
+        // BR-REQ-2 session egress PARITY — a SESSION component HONORS `dynamic_egress_hosts` (same as
+        // a handler), so a well-formed value validates and round-trips…
+        let sess = DeployConfig::from_ron(
+            r#"( sessions: [ ( route: "/ws", component: "ws.wasm", imports: ["wasi:sockets"],
+                 egress_allowlist: ["db.internal:5432"], dynamic_egress_hosts: ["*.okta.com:443"] ) ] )"#,
+        )
+        .expect("a session with well-formed egress allowlists validates (handler parity)");
+        assert_eq!(
+            sess.sessions[0].egress_allowlist,
+            vec!["db.internal:5432".to_string()]
+        );
+        assert_eq!(
+            sess.sessions[0].dynamic_egress_hosts,
+            vec!["*.okta.com:443".to_string()]
+        );
+        // …and a MALFORMED session entry fails the SAME syntax lint (not a silent never-match).
+        assert!(
+            DeployConfig::from_ron(
+                r#"( sessions: [ ( route: "/ws", component: "ws.wasm", imports: ["wasi:sockets"],
+                     dynamic_egress_hosts: ["*.okta.com"] ) ] )"#,
+            )
+            .is_err(),
+            "a malformed session dynamic_egress_hosts entry must fail the lint"
+        );
     }
 
     #[test]

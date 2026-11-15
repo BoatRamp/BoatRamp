@@ -667,6 +667,14 @@ pub(super) async fn deploy_function(
     if let Some(resp) = reject_invalid_name("function", &name) {
         return resp;
     }
+    // BR-REQ-2 INFO-2: fail loud at deploy on a malformed `dynamic_egress_hosts` entry (the standalone
+    // function lane HONORS the field), so a typo'd `host-glob:port` is a clear 400 now, not a silent
+    // never-match at runtime. Same lint the handler/consumer lanes run in `DeployConfig::compile_check`.
+    if let Err(err) =
+        boatramp_core::config::validate_dynamic_egress_hosts(&body.config.dynamic_egress_hosts)
+    {
+        return (StatusCode::BAD_REQUEST, format!("function egress: {err}\n")).into_response();
+    }
     // Fail loud at deploy on a `secrets` map the posture forbids: under the
     // multi-tenant posture a bare / `env:` ref reads the operator's environment
     // (cross-tenant host-env exfiltration). Refuse here with the same message the
