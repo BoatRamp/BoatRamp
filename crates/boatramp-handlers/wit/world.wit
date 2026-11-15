@@ -1915,39 +1915,65 @@ interface dns-publish {
     backend(string),
   }
 
-  /// The DNS provider a RUNTIME-registered zone credential (cap-req #31) authenticates to. A SUBSET of
-  /// the operator serve-static provider set: only providers whose sole secret is ONE API token/key —
-  /// and whose zone is addressed either by the zone-root domain itself or by one opaque `zone-id` — fit
-  /// a single-token runtime registration. (route53 uses the ambient AWS credential chain, oci needs a
-  /// PEM private key, akamai needs three secrets; those remain operator-serve-static-only.)
+  /// The DNS provider a RUNTIME-registered zone credential (cap-req #31) authenticates to — the FULL
+  /// operator serve-static adapter set. The provider's secret bundle is supplied as a
+  /// `list<credential-field>` (see `register-zone-credential`); the host validates the bundle against
+  /// this provider's required/optional field set BEFORE sealing.
   enum provider-kind {
-    /// Cloudflare (API v4, token auth). Requires `zone-id` (the opaque Cloudflare zone id) + the token.
+    /// Cloudflare (API v4). Fields: `zone_id` (opaque, required), `token` (required).
     cloudflare,
-    /// DigitalOcean. The zone is the zone-root domain; `token` is the API token (`zone-id` ignored).
+    /// AWS Route 53. Fields: `access_key_id`, `secret_access_key`, `region`, `hosted_zone_id`
+    /// (required), `session_token` (optional).
+    route53,
+    /// Oracle Cloud (OCI) DNS. Fields: `region`, `key_id`, `private_key_pem` (required; the zone is the
+    /// zone-root). The PEM is multi-line and carried verbatim in the field value.
+    oci,
+    /// Akamai Edge DNS. Fields: `host`, `client_token`, `client_secret`, `access_token` (required; the
+    /// zone is the zone-root).
+    akamai,
+    /// DNSimple. Fields: `account_id`, `token` (required; the zone is the zone-root).
+    dnsimple,
+    /// Google Cloud DNS. Fields: `project`, `access_token` (required; the zone is the zone-root). NB the
+    /// adapter authenticates with a short-lived OAuth `access_token`, not a long-lived service-account
+    /// JSON key.
+    gcp,
+    /// Azure DNS. Fields: `subscription_id`, `resource_group`, `access_token` (required; the zone is the
+    /// zone-root). The `access_token` is a short-lived AAD bearer token.
+    azure,
+    /// DigitalOcean. Fields: `token` (required; the zone is the zone-root domain).
     digitalocean,
-    /// Hetzner DNS. The zone is the zone-root domain; `token` is the API token (`zone-id` ignored).
+    /// Hetzner DNS. Fields: `token` (required; the zone is the zone-root).
     hetzner,
-    /// NS1. The zone is the zone-root domain; `token` is the API key (`zone-id` ignored).
+    /// NS1. Fields: `api_key` (required; the zone is the zone-root).
     ns1,
+  }
+
+  /// One secret-bundle field for `register-zone-credential`: a `name` (the provider's field key, e.g.
+  /// `token`, `access_key_id`, `private_key_pem`) and its `value`. The host validates the SET of fields
+  /// against the provider's schema (required present, no unknowns, each value shape/length-bounded)
+  /// before sealing the whole bundle.
+  record credential-field {
+    name: string,
+    value: string,
   }
 
   /// Register a HOST-SEALED, zone-scoped DNS-write credential for `zone-root` (cap-req #31) — the
   /// runtime/dynamic analogue of the operator serve-static `[serve.dns_providers]` registry, for a
-  /// tenant connecting its OWN DNS zone with its OWN provider API token. The guest hands the `token`
-  /// ONCE; the host SEALS it (the node `[secrets]` key envelope) and holds it, keyed to THIS
-  /// invocation's host-resolved `(project, tenant)` + `zone-root` — the token is NEVER returned,
-  /// logged, or echoed, and the guest holds no persistent zone-write token. Subsequent `upsert` /
-  /// `upsert-set` whose record name falls under a registered `zone-root` route to the registered
-  /// credential (write-authorized BY the registration — the tenant proved it holds the token); a zone
-  /// with no registered credential falls through to the operator serve-static path unchanged.
+  /// tenant connecting its OWN DNS zone with its OWN provider credentials. The guest hands the
+  /// `credential` bundle ONCE; the host validates it for `provider`, SEALS the WHOLE bundle (the node
+  /// `[secrets]` key envelope) and holds it, keyed to THIS invocation's host-resolved `(project,
+  /// tenant)` + `zone-root` — no value is EVER returned, logged, or echoed, and the guest holds no
+  /// persistent zone-write secret. Subsequent `upsert`/`upsert-set` whose record name falls under a
+  /// registered `zone-root` route to the registered credential (write-authorized BY the registration);
+  /// a zone with no registered credential falls through to the operator serve-static path unchanged.
   ///
   /// Gated, fail-closed: `access-denied` unless the node posture `allow_guest_dynamic_dns_publish` is
   /// on AND `zone-root` matches this component's host-authoritative `dynamic_dns_zones` allowlist
   /// (empty ⇒ deny-all) AND the host resolved a single tenant for this invocation AND a `[secrets]`
-  /// envelope is configured. `zone-id` is the provider's opaque zone identifier — REQUIRED for
-  /// `cloudflare`, ignored for the name-keyed providers (the zone-root is the zone). A malformed
-  /// `zone-root` / a `cloudflare` registration missing `zone-id` is `invalid-record`.
-  register-zone-credential: func(zone-root: string, provider: provider-kind, zone-id: option<string>, token: string) -> result<_, publish-error>;
+  /// envelope is configured. The `credential` bundle is validated against `provider`'s field schema: a
+  /// missing required field, an unknown field name, an oversized value, or a value that fails its
+  /// shape check (e.g. a URL-interpolated id carrying `/`/`..`) is `invalid-record` — before sealing.
+  register-zone-credential: func(zone-root: string, provider: provider-kind, credential: list<credential-field>) -> result<_, publish-error>;
 
   /// Remove a previously-registered runtime credential for `zone-root` (cap-req #31). Idempotent — an
   /// already-absent credential is `ok`. After unregister, an `upsert`/`upsert-set` to that zone falls

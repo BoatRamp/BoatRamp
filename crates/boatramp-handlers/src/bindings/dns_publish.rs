@@ -146,19 +146,20 @@ struct OperatorWriter {
     ns_targets: Arc<[String]>,
 }
 
-/// The provider kind a RUNTIME-registered credential names (cap-req #31). Mirrors the WIT
-/// `provider-kind` subset, mapped into this crate-local enum so the server-side
-/// [`RuntimeDnsProviderFactory`] impl need not depend on the generated bindings. Only the single-token
-/// providers are runtime-registerable (the operator serve-static path adapts the full set).
+/// The provider kind a RUNTIME-registered credential names (cap-req #31) — the FULL operator
+/// serve-static adapter set. Mapped into this crate-local enum so the server-side
+/// [`RuntimeDnsProviderFactory`] impl need not depend on the generated bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeDnsProviderKind {
-    /// Cloudflare (API v4) — needs an opaque `zone-id` + the token.
     Cloudflare,
-    /// DigitalOcean — the zone is the zone-root domain; `token` is the API token.
+    Route53,
+    Oci,
+    Akamai,
+    Dnsimple,
+    Gcp,
+    Azure,
     DigitalOcean,
-    /// Hetzner DNS — the zone is the zone-root domain; `token` is the API token.
     Hetzner,
-    /// NS1 — the zone is the zone-root domain; `token` is the API key.
     Ns1,
 }
 
@@ -168,6 +169,12 @@ impl RuntimeDnsProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cloudflare => "cloudflare",
+            Self::Route53 => "route53",
+            Self::Oci => "oci",
+            Self::Akamai => "akamai",
+            Self::Dnsimple => "dnsimple",
+            Self::Gcp => "gcp",
+            Self::Azure => "azure",
             Self::DigitalOcean => "digitalocean",
             Self::Hetzner => "hetzner",
             Self::Ns1 => "ns1",
@@ -177,29 +184,286 @@ impl RuntimeDnsProviderKind {
     /// Parse back from the stored string token. `None` ⇒ an unknown/foreign kind (fail-closed).
     #[must_use]
     pub fn from_stored(s: &str) -> Option<Self> {
-        match s {
-            "cloudflare" => Some(Self::Cloudflare),
-            "digitalocean" => Some(Self::DigitalOcean),
-            "hetzner" => Some(Self::Hetzner),
-            "ns1" => Some(Self::Ns1),
-            _ => None,
+        Some(match s {
+            "cloudflare" => Self::Cloudflare,
+            "route53" => Self::Route53,
+            "oci" => Self::Oci,
+            "akamai" => Self::Akamai,
+            "dnsimple" => Self::Dnsimple,
+            "gcp" => Self::Gcp,
+            "azure" => Self::Azure,
+            "digitalocean" => Self::DigitalOcean,
+            "hetzner" => Self::Hetzner,
+            "ns1" => Self::Ns1,
+            _ => return None,
+        })
+    }
+
+    /// The per-provider credential-field schema (Security review #31-wide): the fields this provider's
+    /// adapter is constructed from, each with a shape (defense-in-depth beyond length) and whether it is
+    /// required. The ZONE is always the registered `zone-root` (never a field), except where the
+    /// provider addresses its zone by an opaque id (`zone_id` / `hosted_zone_id`), which IS a field. This
+    /// is the single source of truth the host validates a bundle against before sealing; the server
+    /// factory consumes the same field names to build the adapter.
+    #[must_use]
+    fn field_rules(self) -> &'static [CredentialFieldRule] {
+        match self {
+            Self::Cloudflare => CLOUDFLARE_FIELDS,
+            Self::Route53 => ROUTE53_FIELDS,
+            Self::Oci => OCI_FIELDS,
+            Self::Akamai => AKAMAI_FIELDS,
+            Self::Dnsimple => DNSIMPLE_FIELDS,
+            Self::Gcp => GCP_FIELDS,
+            Self::Azure => AZURE_FIELDS,
+            Self::DigitalOcean => TOKEN_ONLY_FIELDS,
+            Self::Hetzner => TOKEN_ONLY_FIELDS,
+            Self::Ns1 => API_KEY_FIELDS,
         }
     }
 }
 
-/// Builds a live [`DnsProvider`] adapter from an UNSEALED runtime credential, authoritative over
+const fn req(name: &'static str, shape: CredentialFieldShape) -> CredentialFieldRule {
+    CredentialFieldRule {
+        name,
+        shape,
+        required: true,
+    }
+}
+const fn opt(name: &'static str, shape: CredentialFieldShape) -> CredentialFieldRule {
+    CredentialFieldRule {
+        name,
+        shape,
+        required: false,
+    }
+}
+
+use CredentialFieldShape::{Hostname, Identifier, OciKeyId, OpaqueId, Pem, Region, Secret};
+
+const CLOUDFLARE_FIELDS: &[CredentialFieldRule] = &[req("zone_id", OpaqueId), req("token", Secret)];
+const ROUTE53_FIELDS: &[CredentialFieldRule] = &[
+    req("access_key_id", Identifier),
+    req("secret_access_key", Secret),
+    req("region", Region),
+    req("hosted_zone_id", OpaqueId),
+    opt("session_token", Secret),
+];
+const OCI_FIELDS: &[CredentialFieldRule] = &[
+    req("region", Region),
+    req("key_id", OciKeyId),
+    req("private_key_pem", Pem),
+];
+const AKAMAI_FIELDS: &[CredentialFieldRule] = &[
+    req("host", Hostname),
+    req("client_token", Secret),
+    req("client_secret", Secret),
+    req("access_token", Secret),
+];
+const DNSIMPLE_FIELDS: &[CredentialFieldRule] =
+    &[req("account_id", Identifier), req("token", Secret)];
+const GCP_FIELDS: &[CredentialFieldRule] =
+    &[req("project", Identifier), req("access_token", Secret)];
+const AZURE_FIELDS: &[CredentialFieldRule] = &[
+    req("subscription_id", Identifier),
+    req("resource_group", Identifier),
+    req("access_token", Secret),
+];
+const TOKEN_ONLY_FIELDS: &[CredentialFieldRule] = &[req("token", Secret)];
+const API_KEY_FIELDS: &[CredentialFieldRule] = &[req("api_key", Secret)];
+
+/// How one credential-field value is shape-validated before sealing (defense-in-depth beyond the length
+/// bound; the authoritative security property is that NO value can inject into a provider URL path or an
+/// auth header). Each shape maps to an interpolation context of the provider adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialFieldShape {
+    /// A bearer/API secret carried in an auth header. Reject CR/LF/control + `"` (header injection);
+    /// bounded.
+    Secret,
+    /// A PEM private key (OCI). Multi-line; must contain a PEM header; reject NUL/other control except
+    /// `\r`/`\n`/`\t`; larger bound.
+    Pem,
+    /// An opaque id interpolated into a URL path (Cloudflare zone id, Route53 hosted-zone id):
+    /// `[A-Za-z0-9]` only, bounded — so a `/`/`..` can never escape the path segment.
+    OpaqueId,
+    /// A dotted/hyphenated id interpolated into a URL path (account/project/subscription/resource-group,
+    /// AWS access-key-id): `[A-Za-z0-9._-]`, bounded (rejects `/ : % space`).
+    Identifier,
+    /// A cloud region interpolated into a URL host/path (`[a-z0-9-]`, short).
+    Region,
+    /// An API hostname (Akamai `host`) interpolated as the URL authority: `[A-Za-z0-9.-]`, no `/`.
+    Hostname,
+    /// An OCI `key_id` (`<tenancy_ocid>/<user_ocid>/<fingerprint>`) placed in the Authorization signing
+    /// string's `keyId="..."`: allow its real charset `[A-Za-z0-9._:/-]` but reject CR/LF/`"`/space so
+    /// it cannot break the header/signature.
+    OciKeyId,
+}
+
+/// One rule in a provider's credential-field schema: the field `name`, its [`CredentialFieldShape`], and
+/// whether it is required.
+#[derive(Debug, Clone, Copy)]
+struct CredentialFieldRule {
+    name: &'static str,
+    shape: CredentialFieldShape,
+    required: bool,
+}
+
+/// Max number of fields in a credential bundle (bounds a guest spamming a huge field list).
+const MAX_CREDENTIAL_FIELDS: usize = 16;
+/// Max length of a single secret/header field value.
+const MAX_SECRET_FIELD_LEN: usize = 8 * 1024;
+/// Max length of a PEM field value (multi-line private key).
+const MAX_PEM_FIELD_LEN: usize = 16 * 1024;
+
+/// Validate ONE field value against its shape (Security review #31-wide): every shape rejects the bytes
+/// that would let the value escape its interpolation context, and bounds its length. Returns a
+/// client-safe reason on failure (never the value).
+fn validate_field_value(
+    name: &str,
+    shape: CredentialFieldShape,
+    value: &str,
+) -> Result<(), String> {
+    use CredentialFieldShape::*;
+    let max = match shape {
+        Pem => MAX_PEM_FIELD_LEN,
+        Secret | OciKeyId => MAX_SECRET_FIELD_LEN,
+        OpaqueId | Identifier | Region => 128,
+        Hostname => 253,
+    };
+    if value.is_empty() {
+        return Err(format!("field `{name}` must not be empty"));
+    }
+    if value.len() > max {
+        return Err(format!("field `{name}` is too long"));
+    }
+    let ok = match shape {
+        // No CR/LF/control (header injection) and no `"` (breaks a quoted header param).
+        Secret => value.bytes().all(|b| !b.is_ascii_control() && b != b'"'),
+        Pem => {
+            value.contains("-----BEGIN")
+                && value
+                    .bytes()
+                    .all(|b| !b.is_ascii_control() || matches!(b, b'\r' | b'\n' | b'\t'))
+        }
+        OpaqueId => value.bytes().all(|b| b.is_ascii_alphanumeric()),
+        Identifier => value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+        Region => value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        Hostname => value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')),
+        OciKeyId => value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'-')),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("field `{name}` has an invalid value shape"))
+    }
+}
+
+/// Encode a validated field map as an opaque, self-delimiting blob (dependency-free; robust for
+/// arbitrary values incl. multi-line PEM, unlike a naive `k=v` format): each entry is
+/// `u32-le len(name) · name · u32-le len(value) · value`. The whole blob is then sealed.
+fn encode_fields(map: &std::collections::BTreeMap<String, String>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (k, v) in map {
+        out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        out.extend_from_slice(v.as_bytes());
+    }
+    out
+}
+
+/// Decode a blob produced by [`encode_fields`]. `None` on any truncation / bad length / non-UTF-8
+/// (fail-closed — a corrupt sealed credential never routes).
+fn decode_fields(bytes: &[u8]) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut map = std::collections::BTreeMap::new();
+    let mut i = 0usize;
+    let read_len = |b: &[u8], i: usize| -> Option<usize> {
+        let end = i.checked_add(4)?;
+        if end > b.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize)
+    };
+    while i < bytes.len() {
+        let klen = read_len(bytes, i)?;
+        i += 4;
+        let k_end = i.checked_add(klen)?;
+        if k_end > bytes.len() {
+            return None;
+        }
+        let k = std::str::from_utf8(&bytes[i..k_end]).ok()?.to_string();
+        i = k_end;
+        let vlen = read_len(bytes, i)?;
+        i += 4;
+        let v_end = i.checked_add(vlen)?;
+        if v_end > bytes.len() {
+            return None;
+        }
+        let v = std::str::from_utf8(&bytes[i..v_end]).ok()?.to_string();
+        i = v_end;
+        map.insert(k, v);
+    }
+    Some(map)
+}
+
+/// Validate a guest-supplied credential bundle against `kind`'s schema and return it as a field map
+/// (Security review #31-wide): reject a duplicate/unknown field name, a missing required field, too many
+/// fields, or a value that fails its shape/length check — ALL before sealing. The returned
+/// `BTreeMap` carries exactly the known fields (unknowns are rejected, so nothing extra is sealed).
+fn validate_credential_bundle(
+    kind: RuntimeDnsProviderKind,
+    fields: Vec<(String, String)>,
+) -> Result<std::collections::BTreeMap<String, String>, dns_publish::PublishError> {
+    use dns_publish::PublishError as P;
+    if fields.len() > MAX_CREDENTIAL_FIELDS {
+        return Err(P::InvalidRecord("too many credential fields".into()));
+    }
+    let rules = kind.field_rules();
+    let mut map = std::collections::BTreeMap::new();
+    for (name, value) in fields {
+        let Some(rule) = rules.iter().find(|r| r.name == name) else {
+            return Err(P::InvalidRecord(format!(
+                "unknown credential field `{name}` for this provider"
+            )));
+        };
+        if map.contains_key(&name) {
+            return Err(P::InvalidRecord(format!(
+                "duplicate credential field `{name}`"
+            )));
+        }
+        validate_field_value(&name, rule.shape, &value).map_err(P::InvalidRecord)?;
+        map.insert(name, value);
+    }
+    // Every required field must be present.
+    for rule in rules.iter().filter(|r| r.required) {
+        if !map.contains_key(rule.name) {
+            return Err(P::InvalidRecord(format!(
+                "missing required credential field `{}`",
+                rule.name
+            )));
+        }
+    }
+    Ok(map)
+}
+
+/// Builds a live [`DnsProvider`] adapter from an UNSEALED runtime credential bundle, authoritative over
 /// `zone_root` (cap-req #31). Injected (the real impl, over the `boatramp-acme` adapters, lives in
 /// `boatramp-server`) so a gate can supply a FAKE factory that never touches a real DNS provider. The
-/// token reaches the factory but NEVER crosses back to the guest or into a log/error.
+/// bundle reaches the factory but NEVER crosses back to the guest or into a log/error.
 pub trait RuntimeDnsProviderFactory: Send + Sync {
-    /// Build the provider for `kind` authoritative over `zone_root`. `zone_id` is the provider's opaque
-    /// zone identifier (required for Cloudflare). An `Err(reason)` is logged host-side and surfaced to
-    /// the guest only as a GENERIC `backend` error (the reason may name provider internals).
+    /// Build the provider for `kind` authoritative over `zone_root` from the validated `fields` bundle.
+    /// An `Err(reason)` is logged host-side and surfaced to the guest only as a GENERIC `backend` error
+    /// (the reason may name provider internals).
     fn build(
         &self,
         kind: RuntimeDnsProviderKind,
-        zone_id: Option<&str>,
-        token: &str,
+        fields: &std::collections::BTreeMap<String, String>,
         zone_root: &str,
     ) -> Result<Arc<dyn DnsProvider>, String>;
 }
@@ -605,9 +869,13 @@ impl<'a> DnsPublishHost<'a> {
         let kind = RuntimeDnsProviderKind::from_stored(&cred.provider_kind).ok_or_else(|| {
             dns_publish::PublishError::Backend("stored dns provider kind is unknown".into())
         })?;
+        // The sealed bundle is the validated field map; deserialize it back for the factory.
+        let fields = decode_fields(&cred.credential).ok_or_else(|| {
+            dns_publish::PublishError::Backend("corrupt sealed dns credential".into())
+        })?;
         let provider = reg
             .factory
-            .build(kind, cred.zone_id.as_deref(), &cred.token, &zone_root)
+            .build(kind, &fields, &zone_root)
             .map_err(|reason| {
                 tracing::warn!(
                     target: "boatramp::dns::publish",
@@ -776,14 +1044,6 @@ fn map_store_err(e: SecretError) -> dns_publish::PublishError {
 /// DNS zone-containment used by the operator `RoutingDnsProvider`: `name` equals the apex, or `name`
 /// ends with `.<root>`. `None` ⇒ no registered zone covers this name (the router falls through to the
 /// operator path). `roots` are the tenant's own canonical registered zone-roots.
-/// Whether a guest-supplied provider `zone-id` is a safe, bounded opaque identifier (Security review
-/// F2). The zone-id is interpolated into the provider's URL path, so it must be `[A-Za-z0-9]` only
-/// (no `/`, `.`, `:`, `%`, whitespace, or control bytes — so a `../..` can never escape the path) and
-/// `1..=64` bytes. Cloudflare zone ids are 32-char lowercase hex, well within this.
-fn is_valid_zone_id(zone_id: &str) -> bool {
-    !zone_id.is_empty() && zone_id.len() <= 64 && zone_id.bytes().all(|b| b.is_ascii_alphanumeric())
-}
-
 fn longest_covering_zone_root<'a>(roots: &'a [String], name: &str) -> Option<&'a str> {
     roots
         .iter()
@@ -840,6 +1100,12 @@ async fn write_one(
 fn map_provider_kind(p: dns_publish::ProviderKind) -> RuntimeDnsProviderKind {
     match p {
         dns_publish::ProviderKind::Cloudflare => RuntimeDnsProviderKind::Cloudflare,
+        dns_publish::ProviderKind::Route53 => RuntimeDnsProviderKind::Route53,
+        dns_publish::ProviderKind::Oci => RuntimeDnsProviderKind::Oci,
+        dns_publish::ProviderKind::Akamai => RuntimeDnsProviderKind::Akamai,
+        dns_publish::ProviderKind::Dnsimple => RuntimeDnsProviderKind::Dnsimple,
+        dns_publish::ProviderKind::Gcp => RuntimeDnsProviderKind::Gcp,
+        dns_publish::ProviderKind::Azure => RuntimeDnsProviderKind::Azure,
         dns_publish::ProviderKind::Digitalocean => RuntimeDnsProviderKind::DigitalOcean,
         dns_publish::ProviderKind::Hetzner => RuntimeDnsProviderKind::Hetzner,
         dns_publish::ProviderKind::Ns1 => RuntimeDnsProviderKind::Ns1,
@@ -851,8 +1117,7 @@ impl dns_publish::Host for DnsPublishHost<'_> {
         &mut self,
         zone_root: String,
         provider: dns_publish::ProviderKind,
-        zone_id: Option<String>,
-        token: String,
+        credential: Vec<dns_publish::CredentialField>,
     ) -> Result<(), dns_publish::PublishError> {
         // Layer 1: runtime registry present AND the dynamic posture on (fail-closed otherwise — no
         // registry wired, e.g. no `[secrets]` envelope, reads as not-granted).
@@ -867,49 +1132,25 @@ impl dns_publish::Host for DnsPublishHost<'_> {
             return Err(dns_publish::PublishError::AccessDenied);
         }
         let kind = map_provider_kind(provider);
-        let zone_id = zone_id
-            .map(|z| z.trim().to_string())
-            .filter(|z| !z.is_empty());
-        // F2: the zone-id is GUEST-CONTROLLED and is interpolated into the provider's URL path (e.g.
-        // Cloudflare `/zones/{zone_id}/dns_records`). Validate its SHAPE before sealing so a `../..` /
-        // separator / control byte can never reshape that path — accept a bounded opaque identifier
-        // `[A-Za-z0-9]` (Cloudflare zone ids are 32-char lowercase hex), reject everything else.
-        if let Some(zid) = zone_id.as_deref()
-            && !is_valid_zone_id(zid)
-        {
-            return Err(dns_publish::PublishError::InvalidRecord(
-                "provider zone-id must be a bounded alphanumeric identifier".into(),
-            ));
-        }
-        // Cloudflare addresses its zone by an opaque zone-id (not the zone-root) — require it up front.
-        if matches!(kind, RuntimeDnsProviderKind::Cloudflare) && zone_id.is_none() {
-            return Err(dns_publish::PublishError::InvalidRecord(
-                "cloudflare runtime credential requires a zone-id".into(),
-            ));
-        }
-        if token.is_empty() {
-            return Err(dns_publish::PublishError::InvalidRecord(
-                "provider token must not be empty".into(),
-            ));
-        }
-        // Seal + store, keyed to THIS invocation's resolved (project, tenant). The token is consumed
-        // here and NEVER returned, logged, or echoed.
+        // Validate the bundle against the provider's field schema BEFORE sealing: reject unknown /
+        // duplicate / missing-required fields and any value that fails its shape (a URL-path id carrying
+        // `/`/`..`, a header secret carrying CR/LF/`"`, an oversized value). The guest-controlled values
+        // never escape their interpolation context in the adapter.
+        let fields: Vec<(String, String)> =
+            credential.into_iter().map(|f| (f.name, f.value)).collect();
+        let map = validate_credential_bundle(kind, fields)?;
+        // Serialize the validated bundle to a compact blob and seal the WHOLE thing, keyed to THIS
+        // invocation's resolved (project, tenant). No value is ever returned, logged, or echoed.
+        let blob = encode_fields(&map);
         reg.store
-            .register(
-                reg.project(),
-                &reg.tenant,
-                &canonical,
-                kind.as_str(),
-                zone_id.as_deref(),
-                token.as_bytes(),
-            )
+            .register(reg.project(), &reg.tenant, &canonical, kind.as_str(), &blob)
             .await
             .map_err(map_store_err)?;
         tracing::info!(
             target: "boatramp::dns::publish",
             zone_root = %canonical,
             provider = kind.as_str(),
-            "dns-publish: runtime zone credential registered (sealed; token never surfaced)",
+            "dns-publish: runtime zone credential registered (bundle sealed; no value surfaced)",
         );
         Ok(())
     }
@@ -1856,11 +2097,15 @@ mod tests {
         }
     }
 
-    /// A fake provider factory: records every `(kind, zone_id, token, zone_root)` it is asked to build
-    /// (so a test can prove routing handed the registered credential to the adapter) and returns a
+    /// A fake provider factory: records every `(kind, fields, zone_root)` it is asked to build (so a
+    /// test can prove routing handed the registered credential bundle to the adapter) and returns a
     /// shared capturing [`StubProvider`] regardless — it NEVER touches a real DNS provider.
-    /// One recorded factory build: `(kind, zone_id, token, zone_root)`.
-    type FactoryBuild = (RuntimeDnsProviderKind, Option<String>, String, String);
+    /// One recorded factory build: `(kind, fields, zone_root)`.
+    type FactoryBuild = (
+        RuntimeDnsProviderKind,
+        std::collections::BTreeMap<String, String>,
+        String,
+    );
 
     struct FakeFactory {
         provider: Arc<StubProvider>,
@@ -1878,18 +2123,35 @@ mod tests {
         fn build(
             &self,
             kind: RuntimeDnsProviderKind,
-            zone_id: Option<&str>,
-            token: &str,
+            fields: &std::collections::BTreeMap<String, String>,
             zone_root: &str,
         ) -> Result<Arc<dyn DnsProvider>, String> {
-            self.builds.lock().unwrap().push((
-                kind,
-                zone_id.map(str::to_string),
-                token.to_string(),
-                zone_root.to_string(),
-            ));
+            self.builds
+                .lock()
+                .unwrap()
+                .push((kind, fields.clone(), zone_root.to_string()));
             Ok(Arc::clone(&self.provider) as Arc<dyn DnsProvider>)
         }
+    }
+
+    /// Build one WIT credential field.
+    fn cfield(name: &str, value: &str) -> dns_publish::CredentialField {
+        dns_publish::CredentialField {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+    /// A Cloudflare credential bundle (`zone_id` + `token`).
+    fn cloudflare_cred(zone_id: &str, token: &str) -> Vec<dns_publish::CredentialField> {
+        vec![cfield("zone_id", zone_id), cfield("token", token)]
+    }
+    /// A single-`token` bundle (hetzner / digitalocean).
+    fn token_cred(token: &str) -> Vec<dns_publish::CredentialField> {
+        vec![cfield("token", token)]
+    }
+    /// An NS1 bundle (`api_key`).
+    fn apikey_cred(key: &str) -> Vec<dns_publish::CredentialField> {
+        vec![cfield("api_key", key)]
     }
 
     fn cred_store() -> TenantDnsCredStore {
@@ -1934,8 +2196,7 @@ mod tests {
             host.register_zone_credential(
                 "acme.com".into(),
                 dns_publish::ProviderKind::Cloudflare,
-                Some("cfzoneid01".into()),
-                "cf-secret-token".into(),
+                cloudflare_cred("cfzoneid01", "cf-secret-token"),
             )
             .await
             .expect("register an allowlisted zone");
@@ -1958,9 +2219,15 @@ mod tests {
         let builds = factory.builds.lock().unwrap();
         assert_eq!(builds.len(), 1);
         assert_eq!(builds[0].0, RuntimeDnsProviderKind::Cloudflare);
-        assert_eq!(builds[0].1.as_deref(), Some("cfzoneid01"));
-        assert_eq!(builds[0].2, "cf-secret-token");
-        assert_eq!(builds[0].3, "acme.com");
+        assert_eq!(
+            builds[0].1.get("zone_id").map(String::as_str),
+            Some("cfzoneid01")
+        );
+        assert_eq!(
+            builds[0].1.get("token").map(String::as_str),
+            Some("cf-secret-token")
+        );
+        assert_eq!(builds[0].2, "acme.com");
     }
 
     /// Posture OFF: `register` is `access-denied` (nothing stored) AND a record that WOULD route to a
@@ -1978,8 +2245,7 @@ mod tests {
             host.register_zone_credential(
                 "acme.com".into(),
                 dns_publish::ProviderKind::Hetzner,
-                None,
-                "tok".into()
+                token_cred("tok"),
             )
             .await,
             Err(dns_publish::PublishError::AccessDenied)
@@ -2013,8 +2279,7 @@ mod tests {
             host.register_zone_credential(
                 "evil.example".into(), // not under **.acme.com
                 dns_publish::ProviderKind::Hetzner,
-                None,
-                "tok".into()
+                token_cred("tok"),
             )
             .await,
             Err(dns_publish::PublishError::AccessDenied)
@@ -2043,8 +2308,7 @@ mod tests {
             h.register_zone_credential(
                 "acme.com".into(),
                 dns_publish::ProviderKind::Ns1,
-                None,
-                "tok".into(),
+                apikey_cred("tok"),
             )
             .await
             .unwrap();
@@ -2096,8 +2360,7 @@ mod tests {
             h.register_zone_credential(
                 "acme.com".into(),
                 dns_publish::ProviderKind::Hetzner,
-                None,
-                "a-secret".into(),
+                token_cred("a-secret"),
             )
             .await
             .unwrap();
@@ -2153,8 +2416,7 @@ mod tests {
             h.register_zone_credential(
                 "acme.com".into(),
                 dns_publish::ProviderKind::Ns1,
-                None,
-                "k".into(),
+                apikey_cred("k"),
             )
             .await
             .unwrap();
@@ -2216,7 +2478,7 @@ mod tests {
             "a:b",
             "a%2e",
             "has space",
-            &"z".repeat(65),
+            &"z".repeat(200), // over the 128-byte OpaqueId bound
         ] {
             let mut h = dyn_host(&b, true, &bud);
             assert!(
@@ -2224,8 +2486,7 @@ mod tests {
                     h.register_zone_credential(
                         "acme.com".into(),
                         dns_publish::ProviderKind::Cloudflare,
-                        Some(bad.into()),
-                        "tok".into()
+                        cloudflare_cred(bad, "tok"),
                     )
                     .await,
                     Err(dns_publish::PublishError::InvalidRecord(_))
@@ -2247,26 +2508,107 @@ mod tests {
             h.register_zone_credential(
                 "acme.com".into(),
                 dns_publish::ProviderKind::Cloudflare,
-                Some("da8e3fe9a1b24c6f90ab12cd34ef5678".into()),
-                "tok".into(),
+                cloudflare_cred("da8e3fe9a1b24c6f90ab12cd34ef5678", "tok"),
             )
             .await
             .expect("a well-formed zone-id is accepted");
         }
     }
 
-    /// F4: `DnsZoneCred`'s `Debug` redacts the token (a stray `{:?}` can never leak the secret).
+    /// The PER-PROVIDER FIELD CONTRACT (#31-wide): for EVERY provider kind, a representative valid
+    /// bundle passes `validate_credential_bundle` and round-trips through the `encode_fields`/
+    /// `decode_fields` codec, AND dropping any one required field is refused. Locks the field-name set
+    /// the host validates + the server factory consumes (they must stay in sync).
+    #[test]
+    fn every_provider_field_contract_validates_and_round_trips() {
+        use RuntimeDnsProviderKind::*;
+        // (kind, a representative valid bundle of (name,value) — required fields only).
+        let cases: &[(RuntimeDnsProviderKind, &[(&str, &str)])] = &[
+            (Cloudflare, &[("zone_id", "abc123"), ("token", "t")]),
+            (
+                Route53,
+                &[
+                    ("access_key_id", "AKIAEXAMPLE"),
+                    ("secret_access_key", "s"),
+                    ("region", "us-east-1"),
+                    ("hosted_zone_id", "Z123"),
+                ],
+            ),
+            (
+                Oci,
+                &[
+                    ("region", "us-ashburn-1"),
+                    (
+                        "key_id",
+                        "ocid1.tenancy.oc1..aaaa/ocid1.user.oc1..bbbb/aa:bb:cc",
+                    ),
+                    (
+                        "private_key_pem",
+                        "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----",
+                    ),
+                ],
+            ),
+            (
+                Akamai,
+                &[
+                    ("host", "akab-xxx.luna.akamaiapis.net"),
+                    ("client_token", "ct"),
+                    ("client_secret", "cs"),
+                    ("access_token", "at"),
+                ],
+            ),
+            (Dnsimple, &[("account_id", "12345"), ("token", "t")]),
+            (Gcp, &[("project", "my-proj-1"), ("access_token", "at")]),
+            (
+                Azure,
+                &[
+                    ("subscription_id", "0000aaaa-bbbb-cccc"),
+                    ("resource_group", "rg_1"),
+                    ("access_token", "at"),
+                ],
+            ),
+            (DigitalOcean, &[("token", "t")]),
+            (Hetzner, &[("token", "t")]),
+            (Ns1, &[("api_key", "k")]),
+        ];
+        for (kind, fields) in cases {
+            let bundle: Vec<(String, String)> = fields
+                .iter()
+                .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+                .collect();
+            let map = validate_credential_bundle(*kind, bundle)
+                .unwrap_or_else(|e| panic!("{kind:?} valid bundle should pass: {e:?}"));
+            // Codec round-trips.
+            let decoded = decode_fields(&encode_fields(&map)).expect("decode");
+            assert_eq!(decoded, map, "{kind:?} codec round-trip");
+            // Dropping each required field is refused.
+            for drop in *fields {
+                let partial: Vec<(String, String)> = fields
+                    .iter()
+                    .filter(|(n, _)| *n != drop.0)
+                    .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+                    .collect();
+                assert!(
+                    validate_credential_bundle(*kind, partial).is_err(),
+                    "{kind:?} missing required `{}` must be refused",
+                    drop.0
+                );
+            }
+        }
+    }
+
+    /// F4: `DnsZoneCred`'s `Debug` redacts the WHOLE credential bundle (a stray `{:?}` can never leak
+    /// any sealed value).
     #[test]
     fn f4_dns_zone_cred_debug_redacts_token() {
         let cred = boatramp_core::secret_store::DnsZoneCred {
             provider_kind: "cloudflare".into(),
-            zone_id: Some("zid".into()),
-            token: "SUPER-SECRET".into(),
+            credential: b"token=SUPER-SECRET".to_vec(),
         };
         let shown = format!("{cred:?}");
         assert!(
             !shown.contains("SUPER-SECRET"),
-            "token must be redacted: {shown}"
+            "credential must be redacted: {shown}"
         );
         assert!(shown.contains("redacted"));
     }
@@ -2296,8 +2638,7 @@ mod tests {
             h.register_zone_credential(
                 "tenant.example".into(),
                 dns_publish::ProviderKind::Ns1,
-                None,
-                "rt-tok".into(),
+                apikey_cred("rt-tok"),
             )
             .await
             .unwrap();
@@ -2365,8 +2706,7 @@ mod tests {
                 h.register_zone_credential(
                     "t1.example".into(),
                     dns_publish::ProviderKind::Cloudflare,
-                    Some("zid".into()),
-                    "should-not-store".into()
+                    cloudflare_cred("zid", "should-not-store"),
                 )
                 .await,
                 Err(dns_publish::PublishError::AccessDenied)
@@ -2388,8 +2728,7 @@ mod tests {
                 h.register_zone_credential(
                     "evil.example".into(),
                     dns_publish::ProviderKind::Hetzner,
-                    None,
-                    "should-not-store".into()
+                    token_cred("should-not-store"),
                 )
                 .await,
                 Err(dns_publish::PublishError::AccessDenied)
@@ -2402,8 +2741,7 @@ mod tests {
             h.register_zone_credential(
                 "t1.example".into(),
                 dns_publish::ProviderKind::Cloudflare,
-                Some("cfzoneid01".into()),
-                "SECRET-cf-token".into(),
+                cloudflare_cred("cfzoneid01", "SECRET-cf-token"),
             )
             .await
             .expect("register an allowlisted zone");
@@ -2440,9 +2778,13 @@ mod tests {
             let builds = factory1.builds.lock().unwrap();
             assert_eq!(builds.len(), 1);
             assert_eq!(builds[0].0, RuntimeDnsProviderKind::Cloudflare);
-            assert_eq!(builds[0].1.as_deref(), Some("cfzoneid01"));
             assert_eq!(
-                builds[0].2, "SECRET-cf-token",
+                builds[0].1.get("zone_id").map(String::as_str),
+                Some("cfzoneid01")
+            );
+            assert_eq!(
+                builds[0].1.get("token").map(String::as_str),
+                Some("SECRET-cf-token"),
                 "the factory got the unsealed token"
             );
         }
@@ -2519,8 +2861,7 @@ mod tests {
             h.register_zone_credential(
                 "t1.example".into(),
                 dns_publish::ProviderKind::Hetzner,
-                None,
-                "re-registered".into(),
+                token_cred("re-registered"),
             )
             .await
             .expect("re-register ok");
@@ -2572,12 +2913,91 @@ mod tests {
                 h.register_zone_credential(
                     "t1.example".into(),
                     dns_publish::ProviderKind::Cloudflare,
-                    Some("../../evil".into()),
-                    "tok".into()
+                    cloudflare_cred("../../evil", "tok"),
                 )
                 .await,
                 Err(dns_publish::PublishError::InvalidRecord(_))
             ));
+        }
+
+        // (10) A REPRESENTATIVE MULTI-SECRET provider (Route 53): a full 4-field bundle registers →
+        // seals → routes, and the factory is handed every field. Proves the credential-field-map shape
+        // (not just a single token) end-to-end.
+        let r53_fields = vec![
+            cfield("access_key_id", "AKIAIOSFODNN7EXAMPLE"),
+            cfield(
+                "secret_access_key",
+                "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+            ),
+            cfield("region", "us-east-1"),
+            cfield("hosted_zone_id", "Z1234567890ABC"),
+        ];
+        {
+            let mut h = dyn_host(&b1, false, &bud);
+            h.register_zone_credential(
+                "rt.t1.example".into(),
+                dns_publish::ProviderKind::Route53,
+                r53_fields.clone(),
+            )
+            .await
+            .expect("a multi-secret route53 bundle registers");
+            h.upsert(a_record("mx.rt.t1.example", "203.0.113.5"))
+                .await
+                .expect("route53-routed upsert ok");
+        }
+        {
+            let builds = factory1.builds.lock().unwrap();
+            let last = builds.last().expect("a route53 build was recorded");
+            assert_eq!(last.0, RuntimeDnsProviderKind::Route53);
+            assert_eq!(
+                last.1.get("secret_access_key").map(String::as_str),
+                Some("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"),
+                "the factory got the unsealed multi-secret bundle"
+            );
+            assert_eq!(last.1.get("region").map(String::as_str), Some("us-east-1"));
+            assert_eq!(last.2, "rt.t1.example");
+        }
+        // The whole multi-secret bundle is sealed at rest (no value appears in any KV plaintext).
+        {
+            let all = kv.scan_prefix("project/").await.unwrap();
+            for (_k, v) in &all {
+                let s = String::from_utf8_lossy(v);
+                assert!(
+                    !s.contains("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY")
+                        && !s.contains("AKIAIOSFODNN7EXAMPLE"),
+                    "every route53 secret must be sealed at rest"
+                );
+            }
+        }
+
+        // (11) PER-PROVIDER VALIDATION — a route53 bundle MISSING a required field, carrying an UNKNOWN
+        // field, or an OVERSIZED field is `invalid-record` before sealing. (DROP the bundle validation ⇒
+        // these turn RED.)
+        {
+            let missing: Vec<_> = r53_fields
+                .iter()
+                .filter(|f| f.name != "region")
+                .cloned()
+                .collect();
+            let mut unknown = r53_fields.clone();
+            unknown.push(cfield("not_a_field", "x"));
+            let mut oversized = r53_fields.clone();
+            oversized[0].value = "A".repeat(200); // access_key_id over the 128-byte Identifier bound
+            for bad in [missing, unknown, oversized] {
+                let mut h = dyn_host(&b1, true, &bud);
+                assert!(
+                    matches!(
+                        h.register_zone_credential(
+                            "rt.t1.example".into(),
+                            dns_publish::ProviderKind::Route53,
+                            bad,
+                        )
+                        .await,
+                        Err(dns_publish::PublishError::InvalidRecord(_))
+                    ),
+                    "an invalid route53 bundle must be refused"
+                );
+            }
         }
 
         println!(
@@ -2586,7 +3006,9 @@ mod tests {
              rest and never returned; unregister fell the zone through; disallowed-zone + posture-off \
              both access-denied; a second tenant had zero cross-tenant access; removing the zone from \
              the allowlist revoked routing without an unregister (F1); a malformed zone-id was refused \
-             at register (F2); the operator path was unchanged"
+             at register (F2); a multi-secret route53 bundle registered/sealed/routed with every field \
+             delivered, and a missing/unknown/oversized field was refused; the operator path was \
+             unchanged"
         );
     }
 }

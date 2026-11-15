@@ -39,6 +39,36 @@ impl Route53Dns {
         }
     }
 
+    /// Build from EXPLICIT static credentials (cap-req #31 runtime per-tenant path): a tenant supplies
+    /// its OWN IAM access key (+ optional STS session token) and region, rather than the ambient
+    /// provider chain. The SDK handles request signing/serialization, so the credential values are not
+    /// string-interpolated into any URL/path here.
+    pub fn from_static_creds(
+        access_key_id: &str,
+        secret_access_key: &str,
+        region: &str,
+        session_token: Option<&str>,
+        hosted_zone_id: impl Into<String>,
+    ) -> Self {
+        use aws_sdk_route53::config::{BehaviorVersion, Credentials, Region};
+        let creds = Credentials::new(
+            access_key_id,
+            secret_access_key,
+            session_token.map(str::to_string),
+            None,
+            "boatramp-runtime-dns",
+        );
+        let config = aws_sdk_route53::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(region.to_string()))
+            .credentials_provider(creds)
+            .build();
+        Self {
+            client: Client::from_conf(config),
+            hosted_zone_id: hosted_zone_id.into(),
+        }
+    }
+
     async fn change(&self, action: ChangeAction, record: &DnsRecord) -> Result<(), DnsError> {
         let rr = ResourceRecord::builder()
             .value(rr_value(record))

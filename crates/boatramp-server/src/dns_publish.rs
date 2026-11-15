@@ -69,40 +69,88 @@ pub(crate) fn default_audit_sink() -> Arc<dyn DnsPublishAuditSink> {
 }
 
 /// The concrete [`RuntimeDnsProviderFactory`] (cap-req #31): builds a live `boatramp-acme` adapter from
-/// an UNSEALED runtime credential. The single-token provider set only (Cloudflare needs an opaque
-/// `zone-id`; the name-keyed providers use the zone-root as the zone). The token reaches the adapter but
-/// never crosses back to the guest or into a log.
+/// an UNSEALED, already-VALIDATED credential field bundle (the host binding validated required/shape
+/// before sealing). Covers the FULL serve-static adapter set. The zone is the `zone_root` except where
+/// the provider addresses it by an opaque id field (`zone_id` / `hosted_zone_id`). Field values reach
+/// the adapter but never cross back to the guest or into a log.
 struct AcmeRuntimeDnsProviderFactory;
+
+/// Read a required field from the validated bundle (present by construction; `Err` is defense-in-depth).
+fn field<'a>(
+    fields: &'a std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Result<&'a str, String> {
+    fields
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing field {name}"))
+}
 
 impl RuntimeDnsProviderFactory for AcmeRuntimeDnsProviderFactory {
     fn build(
         &self,
         kind: RuntimeDnsProviderKind,
-        zone_id: Option<&str>,
-        token: &str,
+        fields: &std::collections::BTreeMap<String, String>,
         zone_root: &str,
     ) -> Result<Arc<dyn DnsProvider>, String> {
+        use boatramp_acme as acme;
+        let zone = zone_root.to_string();
         Ok(match kind {
-            RuntimeDnsProviderKind::Cloudflare => {
-                let zone_id = zone_id.ok_or_else(|| "cloudflare requires a zone-id".to_string())?;
-                Arc::new(boatramp_acme::cloudflare::CloudflareDns::new(
-                    zone_id.to_string(),
-                    token.to_string(),
-                ))
-            }
-            RuntimeDnsProviderKind::DigitalOcean => {
-                Arc::new(boatramp_acme::digitalocean::DigitalOceanDns::new(
-                    zone_root.to_string(),
-                    token.to_string(),
-                ))
-            }
-            RuntimeDnsProviderKind::Hetzner => Arc::new(boatramp_acme::hetzner::HetznerDns::new(
-                zone_root.to_string(),
-                token.to_string(),
+            RuntimeDnsProviderKind::Cloudflare => Arc::new(acme::cloudflare::CloudflareDns::new(
+                field(fields, "zone_id")?.to_string(),
+                field(fields, "token")?.to_string(),
             )),
-            RuntimeDnsProviderKind::Ns1 => Arc::new(boatramp_acme::ns1::Ns1Dns::new(
-                zone_root.to_string(),
-                token.to_string(),
+            RuntimeDnsProviderKind::Route53 => {
+                Arc::new(acme::route53::Route53Dns::from_static_creds(
+                    field(fields, "access_key_id")?,
+                    field(fields, "secret_access_key")?,
+                    field(fields, "region")?,
+                    fields.get("session_token").map(String::as_str),
+                    field(fields, "hosted_zone_id")?.to_string(),
+                ))
+            }
+            RuntimeDnsProviderKind::Oci => Arc::new(
+                acme::oci::OciDns::new(
+                    field(fields, "region")?,
+                    zone,
+                    field(fields, "key_id")?.to_string(),
+                    field(fields, "private_key_pem")?,
+                )
+                .map_err(|e| e.to_string())?,
+            ),
+            RuntimeDnsProviderKind::Akamai => Arc::new(acme::akamai::AkamaiDns::new(
+                field(fields, "host")?.to_string(),
+                field(fields, "client_token")?.to_string(),
+                field(fields, "client_secret")?.to_string(),
+                field(fields, "access_token")?.to_string(),
+                zone,
+            )),
+            RuntimeDnsProviderKind::Dnsimple => Arc::new(acme::dnsimple::DnsimpleDns::new(
+                field(fields, "account_id")?.to_string(),
+                zone,
+                field(fields, "token")?.to_string(),
+            )),
+            RuntimeDnsProviderKind::Gcp => Arc::new(acme::gcp_dns::GcpDns::new(
+                field(fields, "project")?.to_string(),
+                zone,
+                field(fields, "access_token")?.to_string(),
+            )),
+            RuntimeDnsProviderKind::Azure => Arc::new(acme::azure_dns::AzureDns::new(
+                field(fields, "subscription_id")?.to_string(),
+                field(fields, "resource_group")?.to_string(),
+                zone,
+                field(fields, "access_token")?.to_string(),
+            )),
+            RuntimeDnsProviderKind::DigitalOcean => Arc::new(
+                acme::digitalocean::DigitalOceanDns::new(zone, field(fields, "token")?.to_string()),
+            ),
+            RuntimeDnsProviderKind::Hetzner => Arc::new(acme::hetzner::HetznerDns::new(
+                zone,
+                field(fields, "token")?.to_string(),
+            )),
+            RuntimeDnsProviderKind::Ns1 => Arc::new(acme::ns1::Ns1Dns::new(
+                zone,
+                field(fields, "api_key")?.to_string(),
             )),
         })
     }

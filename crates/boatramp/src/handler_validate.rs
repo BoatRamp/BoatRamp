@@ -263,13 +263,15 @@ mod imp {
     /// refuses a `requires = ["dns-publish"]` deploy loudly (rather than failing to link).
     ///
     /// `0.13.0` (cap-req #31): the `dns-publish` interface gained two verbs —
-    /// `register-zone-credential` / `unregister-zone-credential` — for the RUNTIME per-tenant
-    /// zone-credential path (a tenant connects its OWN zone with its OWN sealed provider token). They
-    /// ride the EXISTING `dns-publish` import/grant (no new grant kind), gated deny-by-default by a NEW
-    /// node posture `allow_guest_dynamic_dns_publish` (OFF under multi-tenant) + a per-component
-    /// `dynamic_dns_zones` allowlist (empty ⇒ deny-all) + the host-sealed per-tenant store. A pre-#31
-    /// host lacking the new verbs rejects a guest that imports them at link — the loud-fail this surface
-    /// bump makes visible.
+    /// `register-zone-credential(zone-root, provider, credential: list<credential-field>)` /
+    /// `unregister-zone-credential(zone-root)` — for the RUNTIME per-tenant zone-credential path (a
+    /// tenant connects its OWN zone with its OWN sealed provider credential bundle, covering the full
+    /// serve-static provider set). They ride the EXISTING `dns-publish` import/grant (no new grant kind),
+    /// gated deny-by-default by a NEW node posture `allow_guest_dynamic_dns_publish` (OFF under
+    /// multi-tenant) + a per-component `dynamic_dns_zones` allowlist (empty ⇒ deny-all) + the host-sealed
+    /// per-tenant store. A pre-#31 host lacking the new verbs rejects a guest that imports them at link —
+    /// the loud-fail this surface bump makes visible. (Still unreleased: the verb signatures widened from
+    /// a single `(zone-id, token)` to the `credential-field` map within this same 0.13.0 surface.)
     const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 13, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).

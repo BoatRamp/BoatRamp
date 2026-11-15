@@ -798,34 +798,34 @@ const MAX_DNS_ZONE_ROOT_LEN: usize = 253;
 pub const MAX_DNS_ZONE_CREDS: usize = 64;
 
 /// A runtime DNS-zone write credential as the guest registered it, UNSEALED at point-of-use (cap-req
-/// #31). The `token` is the provider API token/key — the SOLE secret, never returned to the guest,
-/// logged, or echoed; `provider_kind` + `zone_id` are non-secret provider-addressing metadata.
+/// #31). `credential` is the ENTIRE opaque credential bundle (the provider-field map, serialized by the
+/// caller) — the WHOLE thing is the secret (it carries tokens/keys/PEMs), never returned to the guest,
+/// logged, or echoed. `provider_kind` is the clear addressing metadata. The store is credential-shape
+/// agnostic: it seals + returns an opaque blob; the host binding owns the per-provider field schema.
 #[derive(Clone)]
 pub struct DnsZoneCred {
-    /// The provider kind token (`cloudflare` / `digitalocean` / `hetzner` / `ns1`), as registered.
+    /// The provider kind token (`cloudflare` / `route53` / … ), as registered. Clear, not secret.
     pub provider_kind: String,
-    /// The provider's opaque zone identifier, when the provider addresses its zone by an id rather than
-    /// the zone-root domain (e.g. the Cloudflare zone id). `None` for name-keyed providers.
-    pub zone_id: Option<String>,
-    /// The unsealed provider API token (the secret). Confidential — never surfaced to the guest.
-    pub token: String,
+    /// The unsealed, opaque credential bundle (the serialized provider-field map). Confidential — the
+    /// WHOLE blob is secret and must never be surfaced to the guest or logged.
+    pub credential: Vec<u8>,
 }
 
-// Manual `Debug` that REDACTS the token (Security review F4): the struct carries a plaintext secret, so
-// a stray `{:?}` must never leak it (the field is not logged today, but this closes the latent footgun).
+// Manual `Debug` that REDACTS the whole credential bundle (Security review F4, widened for #31's
+// multi-field bundle): the blob carries every provider secret (token / key / PEM / JSON), so a stray
+// `{:?}` must never leak ANY of it — not just a single `token` field.
 impl std::fmt::Debug for DnsZoneCred {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DnsZoneCred")
             .field("provider_kind", &self.provider_kind)
-            .field("zone_id", &self.zone_id)
-            .field("token", &"<redacted>")
+            .field("credential", &"<redacted>")
             .finish()
     }
 }
 
 /// The sealed record stored at `project/<proj>/dns-zone-cred/<tenant>/<zone-root>` (cap-req #31). Only
-/// `sealed_token` is confidential (the provider kind + zone-id are clear addressing metadata, like
-/// [`SecretRecord`]'s timestamps). Mirrors [`SecretRecord`]'s sealed-at-rest shape.
+/// `sealed_credential` is confidential (the provider kind + timestamps are clear metadata, like
+/// [`SecretRecord`]'s). Mirrors [`SecretRecord`]'s sealed-at-rest shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DnsCredRecord {
     /// Schema version, pinned at 1 (no migration until release).
@@ -838,11 +838,8 @@ struct DnsCredRecord {
     revision: u32,
     /// The provider kind token (clear — not secret).
     provider_kind: String,
-    /// The provider's opaque zone id, if any (clear — not secret).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    zone_id: Option<String>,
-    /// Envelope-sealed provider API token (the sole confidential field).
-    sealed_token: Vec<u8>,
+    /// Envelope-sealed credential bundle (the whole opaque blob — the sole confidential field).
+    sealed_credential: Vec<u8>,
 }
 
 /// Decode the RAW stored bytes at a DNS-cred key into a live [`DnsCredRecord`], treating ABSENT and a
@@ -884,12 +881,13 @@ impl TenantDnsCredStore {
         Self { kv, envelope }
     }
 
-    /// Seal `token` under `(project, tenant, zone_root)` and store it, overwriting an existing value
-    /// (rotation). Preserves the original `created_at`, bumps `revision`. `provider_kind` is the clear
-    /// provider token and `zone_id` the optional clear opaque zone id. Validates BOTH key segments
-    /// fail-closed, enforces the token-size + per-`(project, tenant)` zone-count caps, all BEFORE
-    /// touching the store. `zone_root` MUST already be canonical (lowercased, trailing dot stripped);
-    /// it is re-validated here. A concurrent register/unregister racing this one yields
+    /// Seal the opaque `credential` bundle under `(project, tenant, zone_root)` and store it, overwriting
+    /// an existing value (rotation). Preserves the original `created_at`, bumps `revision`.
+    /// `provider_kind` is the clear provider token. The store is credential-shape agnostic — it seals the
+    /// WHOLE `credential` blob (the host binding owns its field schema). Validates BOTH key segments
+    /// fail-closed, enforces the size + per-`(project, tenant)` zone-count caps, all BEFORE touching the
+    /// store. `zone_root` MUST already be canonical (lowercased, trailing dot stripped); it is
+    /// re-validated here. A concurrent register/unregister racing this one yields
     /// [`SecretError::Conflict`] (re-read + retry) — never a silent clobber.
     pub async fn register(
         &self,
@@ -897,19 +895,18 @@ impl TenantDnsCredStore {
         tenant: &str,
         zone_root: &str,
         provider_kind: &str,
-        zone_id: Option<&str>,
-        token: &[u8],
+        credential: &[u8],
     ) -> Result<(), SecretError> {
         validate_tenant(tenant)?;
         let zone_root = validate_zone_root(zone_root)?;
-        if token.is_empty() {
+        if credential.is_empty() {
             return Err(SecretError::InvalidName(
-                "dns zone-write token must not be empty".to_string(),
+                "dns zone-write credential must not be empty".to_string(),
             ));
         }
-        if token.len() > MAX_SECRET_VALUE_LEN {
+        if credential.len() > MAX_SECRET_VALUE_LEN {
             return Err(SecretError::ValueTooLarge {
-                len: token.len(),
+                len: credential.len(),
                 max: MAX_SECRET_VALUE_LEN,
             });
         }
@@ -936,10 +933,10 @@ impl TenantDnsCredStore {
         }
         let created_at = prev.as_ref().map_or(now, |r| r.created_at);
         let revision = prev.as_ref().map_or(0, |r| r.revision) + 1;
-        // Seal the token before writing; a wrap failure leaves any prior value untouched.
-        let sealed_token = self
+        // Seal the credential bundle before writing; a wrap failure leaves any prior value untouched.
+        let sealed_credential = self
             .envelope
-            .wrap(token)
+            .wrap(credential)
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
         let record = DnsCredRecord {
@@ -948,8 +945,7 @@ impl TenantDnsCredStore {
             updated_at: now,
             revision,
             provider_kind: provider_kind.to_string(),
-            zone_id: zone_id.map(str::to_string),
-            sealed_token,
+            sealed_credential,
         };
         let bytes = serde_json::to_vec(&record).map_err(|e| SecretError::Backend(e.to_string()))?;
         let swapped = self
@@ -986,18 +982,14 @@ impl TenantDnsCredStore {
         let Some(record) = decode_cred_record(raw.as_deref(), &key)? else {
             return Ok(None);
         };
-        let token = self
+        let credential = self
             .envelope
-            .unwrap(&record.sealed_token)
+            .unwrap(&record.sealed_credential)
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
-        let token = String::from_utf8(token).map_err(|_| {
-            SecretError::Backend("unsealed dns token is not valid UTF-8".to_string())
-        })?;
         Ok(Some(DnsZoneCred {
             provider_kind: record.provider_kind,
-            zone_id: record.zone_id,
-            token,
+            credential,
         }))
     }
 
@@ -1556,38 +1548,23 @@ mod tests {
     async fn dns_register_lookup_round_trips_and_token_is_sealed_at_rest() {
         let s = dns_store();
         let p = ProjectRef::new("acme");
-        s.register(
-            p,
-            "tenant-a",
-            "acme.com",
-            "cloudflare",
-            Some("zone-123"),
-            b"cf-token-secret",
-        )
-        .await
-        .unwrap();
+        s.register(p, "tenant-a", "acme.com", "cloudflare", b"cf-token-secret")
+            .await
+            .unwrap();
         let cred = s
             .lookup(p, "tenant-a", "acme.com")
             .await
             .unwrap()
             .expect("the registered credential is found");
         assert_eq!(cred.provider_kind, "cloudflare");
-        assert_eq!(cred.zone_id.as_deref(), Some("zone-123"));
-        assert_eq!(cred.token, "cf-token-secret");
+        assert_eq!(cred.credential, b"cf-token-secret");
 
         // At-rest: the raw KV value is sealed — the plaintext token never appears in the stored bytes.
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let s2 = TenantDnsCredStore::new(kv.clone(), Arc::new(XorEnvelope));
-        s2.register(
-            p,
-            "tenant-a",
-            "acme.com",
-            "cloudflare",
-            None,
-            b"cf-token-secret",
-        )
-        .await
-        .unwrap();
+        s2.register(p, "tenant-a", "acme.com", "cloudflare", b"cf-token-secret")
+            .await
+            .unwrap();
         let raw = kv
             .get(&crate::deploy::keys::dns_zone_cred(
                 p, "tenant-a", "acme.com",
@@ -1605,7 +1582,7 @@ mod tests {
     async fn dns_unregister_removes_the_credential() {
         let s = dns_store();
         let p = ProjectRef::new("acme");
-        s.register(p, "t", "acme.com", "hetzner", None, b"tok")
+        s.register(p, "t", "acme.com", "hetzner", b"tok")
             .await
             .unwrap();
         assert!(s.unregister(p, "t", "acme.com").await.unwrap(), "existed");
@@ -1624,16 +1601,9 @@ mod tests {
         // `(project, tenant, zone_root)` KV segments.
         let s = dns_store();
         let p = ProjectRef::new("acme");
-        s.register(
-            p,
-            "tenant-a",
-            "acme.com",
-            "cloudflare",
-            Some("z-a"),
-            b"a-token",
-        )
-        .await
-        .unwrap();
+        s.register(p, "tenant-a", "acme.com", "cloudflare", b"a-token")
+            .await
+            .unwrap();
         // tenant-b sees nothing for the same zone-root.
         assert!(
             s.lookup(p, "tenant-b", "acme.com").await.unwrap().is_none(),
@@ -1654,8 +1624,8 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("still present")
-                .token,
-            "a-token",
+                .credential,
+            b"a-token".to_vec(),
             "tenant-a's credential survives tenant-b's unregister attempt"
         );
         // A DIFFERENT project with the same tenant + zone-root is also isolated.
@@ -1673,13 +1643,11 @@ mod tests {
         let s = dns_store();
         let p = ProjectRef::new("acme");
         // Non-canonical inputs canonicalize (uppercase + trailing dot).
-        s.register(p, "t", "ACME.COM.", "ns1", None, b"k1")
+        s.register(p, "t", "ACME.COM.", "ns1", b"k1").await.unwrap();
+        s.register(p, "t", "sub.acme.com", "ns1", b"k2")
             .await
             .unwrap();
-        s.register(p, "t", "sub.acme.com", "ns1", None, b"k2")
-            .await
-            .unwrap();
-        s.register(p, "other", "evil.example", "ns1", None, b"k3")
+        s.register(p, "other", "evil.example", "ns1", b"k3")
             .await
             .unwrap();
         let roots = s.registered_zone_roots(p, "t").await.unwrap();
@@ -1702,7 +1670,7 @@ mod tests {
             "acme com",
         ] {
             let err = s
-                .register(p, "t", bad, "cloudflare", None, b"tok")
+                .register(p, "t", bad, "cloudflare", b"tok")
                 .await
                 .expect_err("bad zone-root refused");
             assert!(
@@ -1712,13 +1680,13 @@ mod tests {
         }
         // An empty token is refused.
         let err = s
-            .register(p, "t", "acme.com", "cloudflare", None, b"")
+            .register(p, "t", "acme.com", "cloudflare", b"")
             .await
             .expect_err("empty token refused");
         assert!(matches!(err, SecretError::InvalidName(_)));
         // A `/`-bearing tenant is refused (never reshapes the key).
         let err = s
-            .register(p, "a/b", "acme.com", "cloudflare", None, b"tok")
+            .register(p, "a/b", "acme.com", "cloudflare", b"tok")
             .await
             .expect_err("bad tenant refused");
         assert!(matches!(err, SecretError::InvalidTenant(_)));
@@ -1729,18 +1697,18 @@ mod tests {
         let s = dns_store();
         let p = ProjectRef::new("acme");
         for i in 0..MAX_DNS_ZONE_CREDS {
-            s.register(p, "t", &format!("z{i}.example"), "ns1", None, b"k")
+            s.register(p, "t", &format!("z{i}.example"), "ns1", b"k")
                 .await
                 .unwrap();
         }
         let err = s
-            .register(p, "t", "one-too-many.example", "ns1", None, b"k")
+            .register(p, "t", "one-too-many.example", "ns1", b"k")
             .await
             .expect_err("a new zone-root past the cap is refused");
         assert!(matches!(err, SecretError::TooManyNames { .. }));
         // Rotating an EXISTING zone-root is always allowed (introduces no new zone-root).
         assert!(
-            s.register(p, "t", "z0.example", "ns1", None, b"rot")
+            s.register(p, "t", "z0.example", "ns1", b"rot")
                 .await
                 .is_ok()
         );

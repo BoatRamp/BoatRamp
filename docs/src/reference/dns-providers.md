@@ -122,27 +122,56 @@ write. See [`serve.dns_providers`](boatramp-cfg.md#servedns_providers).
 
 The provider source above is **operator-configured** — the operator holds the provider credential and
 routes guest writes by owner name. A **multi-tenant** app, though, often needs each tenant to connect
-its **own** DNS zone with its **own** provider API token (e.g. a mailroom tenant publishing
+its **own** DNS zone with its **own** provider credentials (e.g. a mailroom tenant publishing
 MX/SPF/DKIM/DMARC/ownership records into *its* Cloudflare account). The **runtime per-tenant
-credential** path handles exactly that: a granted guest registers the tenant's token **once**, the host
-**seals** it (the `[secrets]` key envelope — a `[secrets]` section is **required**, otherwise the path
-is fail-closed) keyed to the resolved `(project, tenant)` + `zone-root`, and subsequent writes whose
-owner name falls under a registered zone-root route to the registered credential. **The token is never
-returned to the guest, logged, or echoed** — the guest holds no persistent zone-write token.
+credential** path handles exactly that: a granted guest registers the tenant's credential bundle
+**once**, the host validates it, **seals** the whole bundle (the `[secrets]` key envelope — a
+`[secrets]` section is **required**, otherwise the path is fail-closed) keyed to the resolved `(project,
+tenant)` + `zone-root`, and subsequent writes whose owner name falls under a registered zone-root route
+to the registered credential. **No credential value is ever returned to the guest, logged, or echoed** —
+the guest holds no persistent zone-write secret.
 
-Two WIT verbs on the `boatramp:handlers/dns-publish` interface drive it (they ride the existing
-`dns-publish` grant — no new grant kind):
+The credential is supplied as a **field map** (`list<credential-field>`), covering the **full** operator
+serve-static adapter set. Two WIT verbs on the `boatramp:handlers/dns-publish` interface drive it (they
+ride the existing `dns-publish` grant — no new grant kind):
 
 ```wit
-enum provider-kind { cloudflare, digitalocean, hetzner, ns1 }
-register-zone-credential:   func(zone-root: string, provider: provider-kind, zone-id: option<string>, token: string) -> result<_, publish-error>;
+record credential-field { name: string, value: string }
+enum provider-kind { cloudflare, route53, oci, akamai, dnsimple, gcp, azure, digitalocean, hetzner, ns1 }
+register-zone-credential:   func(zone-root: string, provider: provider-kind, credential: list<credential-field>) -> result<_, publish-error>;
 unregister-zone-credential: func(zone-root: string) -> result<_, publish-error>;
 ```
 
-Only the **single-token** provider set is runtime-registerable (`cloudflare` needs the opaque `zone-id`;
-the name-keyed providers use the zone-root as the zone). Providers whose credential is not a single
-token — `route53` (AWS credential chain), `oci` (PEM key), `akamai` (three secrets) and the ones that
-need extra non-secret identifiers — stay **operator-serve-static only**.
+### Per-provider field contract
+
+The host validates the bundle against the provider's schema **before sealing**: every **required** field
+must be present, **no unknown** field names are accepted, and each value is length- and
+**shape**-checked (defense-in-depth so no value can escape its URL-path segment or inject an auth
+header). The **zone** is always the registered `zone-root` — it is *not* a field — except where a
+provider addresses its zone by an opaque id (`zone_id` / `hosted_zone_id`), which **is** a field.
+Mailroom's connect-UI should collect exactly these `name` keys:
+
+| provider | required field names | optional | notes |
+|---|---|---|---|
+| `cloudflare` | `zone_id`, `token` | — | `zone_id` is the opaque Cloudflare zone id |
+| `route53` | `access_key_id`, `secret_access_key`, `region`, `hosted_zone_id` | `session_token` | IAM static creds (+ optional STS token) |
+| `oci` | `region`, `key_id`, `private_key_pem` | — | `private_key_pem` is the multi-line PEM **content** (not a path) |
+| `akamai` | `host`, `client_token`, `client_secret`, `access_token` | — | EdgeGrid; `host` is the API hostname |
+| `dnsimple` | `account_id`, `token` | — | |
+| `gcp` | `project`, `access_token` | — | **short-lived** OAuth access token (not a service-account JSON key) |
+| `azure` | `subscription_id`, `resource_group`, `access_token` | — | `access_token` is a **short-lived** AAD bearer token |
+| `digitalocean` | `token` | — | |
+| `hetzner` | `token` | — | |
+| `ns1` | `api_key` | — | |
+
+Value bounds: a secret/header field ≤ 8 KiB, a PEM ≤ 16 KiB, an id/region/hostname ≤ 128–253 bytes; at
+most 16 fields per bundle. A missing/unknown/oversized/malformed field is `invalid-record` before
+anything is sealed.
+
+> **GCP / Azure caveat.** The `gcp` and `azure` adapters authenticate with a **short-lived** bearer
+> `access_token` (matching the serve-static adapters), not a long-lived service-account JSON key or OAuth
+> client secret. A tenant must register a fresh token; a long-lived-key exchange would be a future
+> adapter enhancement.
 
 Fail-closed at every layer, all independent of the operator path:
 
@@ -167,8 +196,8 @@ Fail-closed at every layer, all independent of the operator path:
 - **Resolved tenant** — the registry is keyed to THIS invocation's host-resolved own tenant (never guest
   input). A guest in project A / tenant T can never register, read, route through, or unregister another
   tenant's credential; no resolved tenant ⇒ the path is inert.
-- **Sealing** — the token is sealed at rest with the same AEAD as the per-tenant secret store; with no
-  `[secrets]` envelope the path is fail-closed.
+- **Sealing** — the WHOLE credential bundle is sealed at rest with the same AEAD as the per-tenant
+  secret store; with no `[secrets]` envelope the path is fail-closed.
 
 A zone with **no** registered runtime credential falls through to the operator serve-static path above,
 unchanged. See [`HandlerConfig::dynamic_dns_zones`](boatramp-cfg.md) and

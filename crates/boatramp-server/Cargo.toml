@@ -248,10 +248,16 @@ tcp-egress = [
 dns-publish = [
   "handlers",
   "boatramp-handlers/dns-publish",
-  # The RUNTIME per-tenant credential factory (cap-req #31) builds these single-token `boatramp-acme`
-  # adapters; each adapter is behind its own `boatramp-acme` feature (its HTTP client deps are optional).
+  # The RUNTIME per-tenant credential factory (cap-req #31) builds the FULL serve-static `boatramp-acme`
+  # adapter set; each adapter is behind its own `boatramp-acme` feature (its client deps are optional).
   "dep:boatramp-acme",
   "boatramp-acme/cloudflare",
+  "boatramp-acme/route53",
+  "boatramp-acme/oci",
+  "boatramp-acme/akamai",
+  "boatramp-acme/dnsimple",
+  "boatramp-acme/gcp-dns",
+  "boatramp-acme/azure-dns",
   "boatramp-acme/digitalocean",
   "boatramp-acme/hetzner",
   "boatramp-acme/ns1",
