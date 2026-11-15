@@ -3615,6 +3615,32 @@ impl HandlerEngine {
                 state.bindings.dynamic_egress_hosts(),
             )
         })?;
+        // Host-mediated HTTP request to a runtime-resolved host (BR-REQ-3): the ergonomic sibling of
+        // `tcp-egress`'s `connect-tls` dynamic path — the host owns the HTTP framing and returns a
+        // buffered response. Reuses the EXACT SAME egress config: the `allow_tcp_egress`/
+        // `allow_private_egress` posture, the static `egress_allowlist`, the `allow_dynamic_egress`
+        // posture + the per-component `dynamic_egress_hosts` allowlist, and the guest-egress extra-CA
+        // roots — all threaded through the IDENTICAL `resolve_and_gate_tcp_egress` gate. No new grant
+        // kind, no new posture, no new allowlist (one operator config drives both verbs).
+        #[cfg(feature = "tcp-egress")]
+        bindings::http_egress::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::http_egress::HttpEgressHost::new(
+                state.tcp_egress_enabled,
+                state.http_hooks.allow_private_egress,
+                state.bindings.egress_allowlist(),
+                state.http_hooks.guest_egress_extra_roots.clone(),
+                // Connect/handshake bound by the per-dial connect timeout; the send + capped response
+                // read bound by the (longer) idle timeout — the same two engine knobs `tcp-egress`
+                // uses, no new config surface.
+                state.tcp_egress_connect_timeout,
+                state.tcp_egress_idle_timeout,
+                bindings::http_egress::DEFAULT_MAX_HTTP_RESPONSE_BYTES,
+            )
+            .with_dynamic(
+                state.dynamic_egress_enabled,
+                state.bindings.dynamic_egress_hosts(),
+            )
+        })?;
         // Host-owned-listener connection-context (mailroom cap-req #16): a listener guest reads the
         // CURRENT wire security of its connection. Always linked under `tcp-listener`; a non-listener
         // invocation has `conn_security == None`, which the binding fail-closes to `plaintext`.

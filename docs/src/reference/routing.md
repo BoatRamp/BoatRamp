@@ -235,7 +235,7 @@ rejected at validate.
 | `admin:domains` / `admin:email` / `admin:site` / `admin:secrets` | A guest project-self-config surface via `boatramp:handlers/admin`. Each is a **specific** surface grant (a bare `admin` and `admin:*` are deliberately not accepted — deny-by-default, least-privilege) and is additionally gated by the matching `allow_guest_admin_*` posture knob (all off under `multi-tenant`). |
 | `session` | A duplex/resumable [session](#sessions) route's per-frame session binding. Accepted in `imports` but advertised only when the host is built with the `session` feature (the `requires` ABI gate enforces host support at activation). |
 | `tenancy` | Host-verify a guest-presented token to seal an async-lane producer context (`boatramp:handlers/tenancy` `present-token`). Accepted in `imports` but advertised only when the host is built with the `messaging` feature. |
-| `wasi:sockets` | Host-mediated outbound TCP `connect` (`boatramp:handlers/tcp-egress`) — never a raw socket. Gated by the per-handler [`egress_allowlist`](#egress_allowlist) (empty ⇒ deny-all) **and** the node posture `allow_guest_tcp_egress` (off under `multi-tenant`); the dial is connect-only and still SSRF-floored even against an allowlisted target. The SAME grant also drives the **runtime-resolved-host** dial via [`dynamic_egress_hosts`](#dynamic_egress_hosts) (gated by the separate posture `allow_guest_dynamic_egress`, HTTPS-only). Advertised Experimental. |
+| `wasi:sockets` | Host-mediated outbound TCP `connect` (`boatramp:handlers/tcp-egress`) — never a raw socket. Gated by the per-handler [`egress_allowlist`](#egress_allowlist) (empty ⇒ deny-all) **and** the node posture `allow_guest_tcp_egress` (off under `multi-tenant`); the dial is connect-only and still SSRF-floored even against an allowlisted target. The SAME grant also drives the **runtime-resolved-host** dial via [`dynamic_egress_hosts`](#dynamic_egress_hosts) (gated by the separate posture `allow_guest_dynamic_egress`, HTTPS-only), **and** the host-mediated [**HTTP request** to a runtime host](#http-egress-host-mediated-http-to-a-runtime-host) (`boatramp:handlers/http-egress` `emit-http-dynamic`) — same grant, same `dynamic_egress_hosts` allowlist, same gate. Advertised Experimental. |
 | `dns-resolve` | Host-side MX/address resolution (`boatramp:handlers/dns-resolve`, `resolve-mx`/`resolve-addr`) without holding `wasi:sockets`. Gated by the same `allow_guest_tcp_egress` posture as `wasi:sockets`; results are SSRF-floored. Advertised Experimental. |
 | `dns-publish` | Host-side DNS **write** (`boatramp:handlers/dns-publish`) — the guest NAMES a zone/record and the host performs the mutation through a host-held provider credential (the guest never holds a zone-write token). Three-layer fail-closed gate: the node posture `allow_guest_dns_publish` (**off** in every built-in profile), the per-handler [`dns_publish_zones`](#dns_publish_zones) writable-zone allowlist (empty ⇒ deny-all), and a per-invocation rate budget + audit log. A sub-zone `NS` record's target is additionally checked against [`dns_publish_ns_targets`](#dns_publish_ns_targets) when the node posture `guest_dns_publish_ns` is `allowlist`. Advertised Experimental. |
 | `wasi:io`, `wasi:clocks`, `wasi:random`, `wasi:logging` | Standard host facilities (`wasi:logging` messages are captured into the site's logs alongside stdout/stderr). |
@@ -298,9 +298,11 @@ handlers: [ (route: "/api", component: "api.wasm", imports: ["wasi:sockets"], eg
 ### `dynamic_egress_hosts`
 
 The deny-by-default allowlist for a **runtime-resolved host** the guest dials by NAME
-through the host-mediated [`wasi:sockets`](#imports) `tcp-egress` capability (BR-REQ-2).
-Unlike [`egress_allowlist`](#egress_allowlist) — which matches a *resolved peer IP* against a
-fixed deploy-time list — this matches the HOSTNAME the guest supplies at `connect-tls` time
+through the host-mediated [`wasi:sockets`](#imports) capability. It authorizes **two** host-mediated
+runtime-host verbs under the one grant: the raw-TLS `tcp-egress` `connect-tls` dial (BR-REQ-2) and
+the host-framed [`http-egress` `emit-http-dynamic`](#http-egress-host-mediated-http-to-a-runtime-host)
+HTTP request (BR-REQ-3). Unlike [`egress_allowlist`](#egress_allowlist) — which matches a *resolved
+peer IP* against a fixed deploy-time list — this matches the HOSTNAME the guest supplies at call time
 against operator-authored `host-glob:port` globs, so a per-tenant host **not known at deploy**
 (e.g. a per-tenant OIDC issuer like a tenant's Okta org) is reachable without widening the IP
 list. The specific host is resolved at runtime (from the guest's own per-tenant config); only
@@ -329,6 +331,29 @@ a handler does, through the same `resolve_and_gate_tcp_egress` gate.
 handlers: [ (route: "/sso/callback", component: "sso.wasm", imports: ["wasi:sockets"],
              dynamic_egress_hosts: ["oauth2.googleapis.com:443", "www.googleapis.com:443", "*.okta.com:443"]) ],
 ```
+
+### `http-egress` (host-mediated HTTP to a runtime host)
+
+A guest that imports `wasi:sockets` and declares `dynamic_egress_hosts` can also call the
+host-mediated **HTTP request** verb `boatramp:handlers/http-egress` `emit-http-dynamic(host, port,
+request)` (BR-REQ-3) — the ergonomic sibling of the raw-TLS `tcp-egress` `connect-tls` dial. Where
+`connect-tls` hands the guest a raw TLS byte stream (so an HTTP call means hand-rolling HTTP/1.1),
+`emit-http-dynamic` lets the guest name a host + a request (method, path, headers, body) and the
+**host** owns the HTTP/1 framing and strict TLS, returning one buffered `response` (status, headers,
+body). So a per-tenant OIDC token POST + a JWKS GET become one-line calls in any guest language.
+
+It is gated by the **exact same** controls as `connect-tls`'s runtime-host path — one grant
+(`wasi:sockets`), one allowlist (`dynamic_egress_hosts`), one posture (`allow_guest_dynamic_egress`),
+one gate (`resolve_and_gate_tcp_egress`): the host is validated by NAME against `dynamic_egress_hosts`,
+every resolved address is held to the `is_global_ip` SSRF floor, the name is resolved **once** and the
+host connects only to that pinned address (DNS-rebind choke), and TLS is terminated **strict** (webpki
+⊕ the operator's extra roots). It is **HTTPS-only** (there is no cleartext verb), and the host supplies
+the framing headers (`host`, `connection: close`, `content-length`) — a guest copy of any of those is
+dropped. The response is bounded by a per-call timeout **and** a response-size cap (a larger response
+is refused with `response-too-large`, never truncated). **Redirects are not followed**: a 3xx is
+returned as-is, and the guest re-calls for the new host (which is itself re-gated against the
+allowlist) — so the host never auto-follows a redirect to an un-gated host. A guest declares
+`requires = ["http-egress"]` so a deploy against a host predating BR-REQ-3 is refused cleanly.
 
 ### `dns_publish_zones`
 

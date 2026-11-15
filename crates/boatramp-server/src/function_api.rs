@@ -462,6 +462,16 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
             name: "dns-resolve",
             lifecycle: Experimental,
         });
+        // The host-mediated HTTP-request-to-a-runtime-host capability (BR-REQ-3): the ergonomic sibling
+        // of `connect-tls` — the host owns the HTTP/1 framing + strict TLS and returns a buffered
+        // response. Rides the `tcp-egress` cargo feature + REUSES the `wasi:sockets` grant + the SAME
+        // `dynamic_egress_hosts` allowlist + `allow_guest_dynamic_egress` posture (no new grant kind).
+        // Its OWN `requires` name (`http-egress`) so a guest declaring `requires = ["http-egress"]` is
+        // refused cleanly on a pre-BR-REQ-3 host rather than failing to link the unknown import.
+        f.push(CapabilityFeature {
+            name: "http-egress",
+            lifecycle: Experimental,
+        });
     }
     // The host-side DNS **publish** (write) capability (cap-req #24, the WRITE counterpart to
     // `dns-resolve`): a granted guest NAMES a zone/record and the host performs the mutation through a
