@@ -237,7 +237,9 @@ const fn opt(name: &'static str, shape: CredentialFieldShape) -> CredentialField
     }
 }
 
-use CredentialFieldShape::{AkamaiHost, Identifier, OciKeyId, OpaqueId, Pem, Region, Secret};
+use CredentialFieldShape::{
+    AkamaiHost, Guid, Identifier, OciKeyId, OpaqueId, Pem, Region, Secret, ServiceAccountJson,
+};
 
 const CLOUDFLARE_FIELDS: &[CredentialFieldRule] = &[req("zone_id", OpaqueId), req("token", Secret)];
 const ROUTE53_FIELDS: &[CredentialFieldRule] = &[
@@ -260,12 +262,21 @@ const AKAMAI_FIELDS: &[CredentialFieldRule] = &[
 ];
 const DNSIMPLE_FIELDS: &[CredentialFieldRule] =
     &[req("account_id", Identifier), req("token", Secret)];
-const GCP_FIELDS: &[CredentialFieldRule] =
-    &[req("project", Identifier), req("access_token", Secret)];
+// cap-req #31: GCP takes a LONG-LIVED service-account JSON (project read from it) + the managed-zone
+// resource name (GCP addresses its zone by resource name, not the domain). The adapter exchanges the SA
+// key host-side for a cached short-lived token.
+const GCP_FIELDS: &[CredentialFieldRule] = &[
+    req("service_account_json", ServiceAccountJson),
+    req("managed_zone", Identifier),
+];
+// cap-req #31: Azure takes a LONG-LIVED service principal (GUID tenant/client ids + secret) + the
+// subscription/resource-group that scope the zone. The adapter runs client-credentials host-side.
 const AZURE_FIELDS: &[CredentialFieldRule] = &[
-    req("subscription_id", Identifier),
+    req("tenant_id", Guid),
+    req("client_id", Guid),
+    req("client_secret", Secret),
+    req("subscription_id", Guid),
     req("resource_group", Identifier),
-    req("access_token", Secret),
 ];
 const TOKEN_ONLY_FIELDS: &[CredentialFieldRule] = &[req("token", Secret)];
 const API_KEY_FIELDS: &[CredentialFieldRule] = &[req("api_key", Secret)];
@@ -300,6 +311,14 @@ enum CredentialFieldShape {
     /// string's `keyId="..."`: allow its real charset `[A-Za-z0-9._:/-]` but reject CR/LF/`"`/space so
     /// it cannot break the header/signature.
     OciKeyId,
+    /// A strict UUID/GUID (Azure `tenant_id`/`client_id`/`subscription_id`) — the `tenant_id` fills a
+    /// path segment of the FIXED Azure AD token endpoint, so it is held to the exact
+    /// `8-4-4-4-12` hex form (36 chars) and can never reshape the URL.
+    Guid,
+    /// A GCP service-account JSON key (cap-req #31): must parse as a JSON object carrying `client_email`,
+    /// `project_id`, and a `private_key` with a PEM `-----BEGIN` header. The whole bundle is sealed; the
+    /// adapter signs a JWT with the key host-side. Larger bound (the key file is a few KB).
+    ServiceAccountJson,
 }
 
 /// One rule in a provider's credential-field schema: the field `name`, its [`CredentialFieldShape`], and
@@ -332,10 +351,11 @@ fn validate_field_value(
 ) -> Result<(), String> {
     use CredentialFieldShape::*;
     let max = match shape {
-        Pem => MAX_PEM_FIELD_LEN,
+        Pem | ServiceAccountJson => MAX_PEM_FIELD_LEN,
         Secret | OciKeyId => MAX_SECRET_FIELD_LEN,
         OpaqueId | Identifier | Region => 128,
         AkamaiHost => 253,
+        Guid => 36,
     };
     if value.is_empty() {
         return Err(format!("field `{name}` must not be empty"));
@@ -380,12 +400,46 @@ fn validate_field_value(
         OciKeyId => value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'-')),
+        // A strict `8-4-4-4-12` hex GUID — nothing that could reshape the Azure token-endpoint path.
+        Guid => is_guid(value),
+        // Must parse as a JSON object with the service-account fields + a PEM private key.
+        ServiceAccountJson => is_service_account_json(value),
     };
     if ok {
         Ok(())
     } else {
         Err(format!("field `{name}` has an invalid value shape"))
     }
+}
+
+/// Whether `s` is a strict `8-4-4-4-12` lowercase/uppercase hex GUID (36 chars; dashes at 8/13/18/23).
+fn is_guid(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    s.bytes().enumerate().all(|(i, b)| {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            b == b'-'
+        } else {
+            b.is_ascii_hexdigit()
+        }
+    })
+}
+
+/// Whether `s` is a usable GCP service-account JSON key: a JSON object with non-empty string
+/// `client_email` + `project_id`, and a `private_key` string carrying a PEM `-----BEGIN` header.
+fn is_service_account_json(s: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return false;
+    };
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    let str_field = |k: &str| obj.get(k).and_then(serde_json::Value::as_str);
+    let nonempty = |k: &str| str_field(k).is_some_and(|x| !x.is_empty());
+    nonempty("client_email")
+        && nonempty("project_id")
+        && str_field("private_key").is_some_and(|k| k.contains("-----BEGIN"))
 }
 
 /// Encode a validated field map as an opaque, self-delimiting blob (dependency-free; robust for
@@ -482,13 +536,16 @@ fn validate_credential_bundle(
 /// bundle reaches the factory but NEVER crosses back to the guest or into a log/error.
 pub trait RuntimeDnsProviderFactory: Send + Sync {
     /// Build the provider for `kind` authoritative over `zone_root` from the validated `fields` bundle.
-    /// An `Err(reason)` is logged host-side and surfaced to the guest only as a GENERIC `backend` error
-    /// (the reason may name provider internals).
+    /// `cache_scope` is THIS invocation's tenancy identity (`project` + resolved `tenant`); the factory
+    /// may key a per-tenancy adapter/token cache on it so a minted OAuth token is reused across calls
+    /// but NEVER shared across tenants. An `Err(reason)` is logged host-side and surfaced to the guest
+    /// only as a GENERIC `backend` error (the reason may name provider internals).
     fn build(
         &self,
         kind: RuntimeDnsProviderKind,
         fields: &std::collections::BTreeMap<String, String>,
         zone_root: &str,
+        cache_scope: &str,
     ) -> Result<Arc<dyn DnsProvider>, String>;
 }
 
@@ -897,9 +954,12 @@ impl<'a> DnsPublishHost<'a> {
         let fields = decode_fields(&cred.credential).ok_or_else(|| {
             dns_publish::PublishError::Backend("corrupt sealed dns credential".into())
         })?;
+        // The per-tenancy cache scope — the project + resolved tenant — so a per-adapter token cache the
+        // factory keys on it is reused across this tenant's calls but NEVER shared across tenants.
+        let cache_scope = format!("{}\u{1f}{}", reg.project, reg.tenant);
         let provider = reg
             .factory
-            .build(kind, &fields, &zone_root)
+            .build(kind, &fields, &zone_root, &cache_scope)
             .map_err(|reason| {
                 tracing::warn!(
                     target: "boatramp::dns::publish",
@@ -2134,12 +2194,16 @@ mod tests {
     struct FakeFactory {
         provider: Arc<StubProvider>,
         builds: Mutex<Vec<FactoryBuild>>,
+        /// The `cache_scope` passed on each build — so a test can assert two tenants get DISTINCT scopes
+        /// (the token-cache-isolation invariant).
+        scopes: Mutex<Vec<String>>,
     }
     impl FakeFactory {
         fn new(provider: Arc<StubProvider>) -> Self {
             Self {
                 provider,
                 builds: Mutex::new(Vec::new()),
+                scopes: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2149,7 +2213,9 @@ mod tests {
             kind: RuntimeDnsProviderKind,
             fields: &std::collections::BTreeMap<String, String>,
             zone_root: &str,
+            cache_scope: &str,
         ) -> Result<Arc<dyn DnsProvider>, String> {
+            self.scopes.lock().unwrap().push(cache_scope.to_string());
             self.builds
                 .lock()
                 .unwrap()
@@ -2184,6 +2250,28 @@ mod tests {
             cfield("client_token", "ct"),
             cfield("client_secret", "cs"),
             cfield("access_token", "at"),
+        ]
+    }
+    /// A minimal, VALID GCP service-account JSON (parseable, with the required keys + a PEM key marker).
+    const VALID_SA_JSON: &str = concat!(
+        r#"{"client_email":"dns@acme.iam.gserviceaccount.com","project_id":"acme-proj","#,
+        r#""private_key":"-----BEGIN PRIVATE KEY-----\nMIIBVAIB\n-----END PRIVATE KEY-----\n"}"#,
+    );
+    /// A GCP bundle (`service_account_json` + `managed_zone`) with a given SA JSON.
+    fn gcp_cred(sa_json: &str) -> Vec<dns_publish::CredentialField> {
+        vec![
+            cfield("service_account_json", sa_json),
+            cfield("managed_zone", "acme-managed-zone"),
+        ]
+    }
+    /// An Azure bundle (service principal) with a given `tenant_id`.
+    fn azure_cred(tenant_id: &str) -> Vec<dns_publish::CredentialField> {
+        vec![
+            cfield("tenant_id", tenant_id),
+            cfield("client_id", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            cfield("client_secret", "sp-secret"),
+            cfield("subscription_id", "99999999-8888-7777-6666-555555555555"),
+            cfield("resource_group", "rg-1"),
         ]
     }
 
@@ -2660,13 +2748,24 @@ mod tests {
                 ],
             ),
             (Dnsimple, &[("account_id", "12345"), ("token", "t")]),
-            (Gcp, &[("project", "my-proj-1"), ("access_token", "at")]),
+            (
+                Gcp,
+                &[
+                    (
+                        "service_account_json",
+                        r#"{"client_email":"d@p.iam.gserviceaccount.com","project_id":"p","private_key":"-----BEGIN PRIVATE KEY-----\nMII\n-----END PRIVATE KEY-----\n"}"#,
+                    ),
+                    ("managed_zone", "my-zone-1"),
+                ],
+            ),
             (
                 Azure,
                 &[
-                    ("subscription_id", "0000aaaa-bbbb-cccc"),
+                    ("tenant_id", "11111111-2222-3333-4444-555555555555"),
+                    ("client_id", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+                    ("client_secret", "cs"),
+                    ("subscription_id", "99999999-8888-7777-6666-555555555555"),
                     ("resource_group", "rg_1"),
-                    ("access_token", "at"),
                 ],
             ),
             (DigitalOcean, &[("token", "t")]),
@@ -3137,6 +3236,59 @@ mod tests {
             .expect("a valid *.akamaiapis.net akamai host is accepted");
         }
 
+        // (13) GCP (service-account JSON) + Azure (service principal) LONG-LIVED credentials register
+        // and seal; a malformed SA JSON or a bad-GUID Azure tenant_id is refused at register. (DROP the
+        // service-account-json / GUID validation ⇒ these turn RED.)
+        {
+            let mut h = dyn_host(&b1, false, &bud);
+            h.register_zone_credential(
+                "t1.example".into(),
+                dns_publish::ProviderKind::Gcp,
+                gcp_cred(VALID_SA_JSON),
+            )
+            .await
+            .expect("a valid GCP service-account bundle registers");
+            h.register_zone_credential(
+                "t1.example".into(),
+                dns_publish::ProviderKind::Azure,
+                azure_cred("11111111-2222-3333-4444-555555555555"),
+            )
+            .await
+            .expect("a valid Azure service-principal bundle registers");
+        }
+        // The long-lived GCP private key is sealed at rest (its PEM marker never appears in cleartext).
+        {
+            let all = kv.scan_prefix("project/").await.unwrap();
+            for (_k, v) in &all {
+                assert!(
+                    !String::from_utf8_lossy(v).contains("BEGIN PRIVATE KEY"),
+                    "the GCP service-account key must be sealed at rest"
+                );
+            }
+        }
+        // A malformed SA JSON / a non-GUID Azure tenant_id is refused at register.
+        {
+            let mut h = dyn_host(&b1, true, &bud);
+            assert!(matches!(
+                h.register_zone_credential(
+                    "t1.example".into(),
+                    dns_publish::ProviderKind::Gcp,
+                    gcp_cred("{not valid json"),
+                )
+                .await,
+                Err(dns_publish::PublishError::InvalidRecord(_))
+            ));
+            assert!(matches!(
+                h.register_zone_credential(
+                    "t1.example".into(),
+                    dns_publish::ProviderKind::Azure,
+                    azure_cred("not-a-guid"),
+                )
+                .await,
+                Err(dns_publish::PublishError::InvalidRecord(_))
+            ));
+        }
+
         println!(
             "DNS-PUBLISH TENANT-CREDS LIVE OK: posture-gated register of an allowlisted zone sealed a \
              tenant token; a routed upsert reached the registered credential; the token was sealed at \
@@ -3146,7 +3298,9 @@ mod tests {
              at register (F2); a multi-secret route53 bundle registered/sealed/routed with every field \
              delivered, and a missing/unknown/oversized field was refused; an internal Akamai host was \
              refused by the EdgeGrid-domain pin while a real *.akamaiapis.net host was accepted (M1); \
-             the operator path was unchanged"
+             long-lived GCP service-account + Azure service-principal bundles registered + sealed (key \
+             never in cleartext) while a malformed SA JSON / bad-GUID tenant were refused; the operator \
+             path was unchanged"
         );
     }
 }

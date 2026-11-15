@@ -30,6 +30,10 @@ pub enum Error {
     /// Constructing the OCI DNS provider failed.
     #[error("{0}")]
     Oci(String),
+    /// Constructing a DNS provider from its credentials failed (cap-req #31: a malformed GCP
+    /// service-account JSON / bad private key).
+    #[error("{0}")]
+    DnsProvider(String),
     /// A PEM chain held no certificates.
     #[error("no certificates in PEM chain")]
     NoCertificates,
@@ -160,17 +164,26 @@ pub async fn build_provider_opts(
             env("DNSIMPLE_ZONE")?,
             env("DNSIMPLE_TOKEN")?,
         )),
-        DnsProviderKind::GcpDns => Box::new(boatramp_acme::gcp_dns::GcpDns::new(
-            env("GCP_DNS_PROJECT")?,
-            env("GCP_DNS_ZONE")?,
-            env("GCP_ACCESS_TOKEN")?,
-        )),
-        DnsProviderKind::AzureDns => Box::new(boatramp_acme::azure_dns::AzureDns::new(
-            env("AZURE_SUBSCRIPTION_ID")?,
-            env("AZURE_RESOURCE_GROUP")?,
-            env("AZURE_DNS_ZONE")?,
-            env("AZURE_ACCESS_TOKEN")?,
-        )),
+        // cap-req #31: GCP/Azure take a LONG-LIVED credential (no short-lived token anywhere) and
+        // exchange it host-side. GCP reads the whole service-account JSON (project from its
+        // `project_id`); Azure uses the service principal (tenant/client id + secret).
+        DnsProviderKind::GcpDns => Box::new(
+            boatramp_acme::gcp_dns::GcpDns::from_service_account(
+                env("GCP_DNS_ZONE")?,
+                &env("GCP_SERVICE_ACCOUNT_JSON")?,
+            )
+            .map_err(|e| Error::DnsProvider(format!("GCP DNS: {e}")))?,
+        ),
+        DnsProviderKind::AzureDns => {
+            Box::new(boatramp_acme::azure_dns::AzureDns::from_service_principal(
+                &env("AZURE_TENANT_ID")?,
+                env("AZURE_CLIENT_ID")?,
+                env("AZURE_CLIENT_SECRET")?,
+                env("AZURE_SUBSCRIPTION_ID")?,
+                env("AZURE_RESOURCE_GROUP")?,
+                env("AZURE_DNS_ZONE")?,
+            ))
+        }
         DnsProviderKind::Akamai => Box::new(boatramp_acme::akamai::AkamaiDns::new(
             env("AKAMAI_HOST")?,
             env("AKAMAI_CLIENT_TOKEN")?,

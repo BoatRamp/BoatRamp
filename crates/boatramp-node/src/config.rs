@@ -3472,10 +3472,21 @@ pub struct DnsProviderConfig {
     pub api_key: Option<String>,
     /// DNSimple numeric account id (non-secret).
     pub account_id: Option<String>,
-    /// OAuth2 access token — **secret** (GCP / Azure / Akamai `access_token`).
+    /// OAuth2 access token — **secret** (Akamai `access_token`). GCP/Azure no longer accept a
+    /// short-lived token (cap-req #31): GCP uses `service_account_json`, Azure the service-principal
+    /// `tenant_id`/`client_id`/`client_secret` — the adapter exchanges the LONG-LIVED credential
+    /// host-side.
     pub access_token: Option<String>,
-    /// GCP project (non-secret).
+    /// GCP project (non-secret). Optional — read from `service_account_json`'s `project_id` when unset.
     pub project: Option<String>,
+    /// GCP service-account JSON key — **secret** (cap-req #31): the whole key file (contains
+    /// `client_email`/`private_key`/`project_id`). The adapter signs a JWT + exchanges it for a cached
+    /// short-lived token.
+    pub service_account_json: Option<String>,
+    /// Azure AD tenant id — **secret-adjacent** GUID (service principal, cap-req #31).
+    pub tenant_id: Option<String>,
+    /// Azure AD application (client) id — GUID (service principal, cap-req #31).
+    pub client_id: Option<String>,
     /// Azure subscription id (non-secret).
     pub subscription_id: Option<String>,
     /// Azure resource group (non-secret).

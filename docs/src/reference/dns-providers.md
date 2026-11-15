@@ -22,16 +22,19 @@ and `boatramp domain add --provider <name>`.
 | `hetzner` | — | Hetzner Cloud DNS | `HETZNER_ZONE`, `HETZNER_DNS_TOKEN` |
 | `ns1` | — | NS1 (IBM) | `NS1_ZONE`, `NS1_API_KEY` |
 | `dnsimple` | — | DNSimple | `DNSIMPLE_ACCOUNT_ID`, `DNSIMPLE_ZONE`, `DNSIMPLE_TOKEN` |
-| `gcp-dns` | `gcp` | Google Cloud DNS | `GCP_DNS_PROJECT`, `GCP_DNS_ZONE`, `GCP_ACCESS_TOKEN` |
-| `azure-dns` | `azure` | Azure DNS | `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`, `AZURE_DNS_ZONE`, `AZURE_ACCESS_TOKEN` |
+| `gcp-dns` | `gcp` | Google Cloud DNS | `GCP_DNS_ZONE`, `GCP_SERVICE_ACCOUNT_JSON` |
+| `azure-dns` | `azure` | Azure DNS | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`, `AZURE_DNS_ZONE` |
 | `akamai` | — | Akamai Edge DNS | `AKAMAI_HOST`, `AKAMAI_CLIENT_TOKEN`, `AKAMAI_CLIENT_SECRET`, `AKAMAI_ACCESS_TOKEN`, `AKAMAI_ZONE` |
 
 ## Notes
 
 - `manual` prints the records to apply by hand and reads no credentials. It is
   the fallback for self-hosted authoritative servers (BIND, PowerDNS, Knot).
-- `gcp-dns` and `azure-dns` take a short-lived OAuth2 access token in
-  `GCP_ACCESS_TOKEN` / `AZURE_ACCESS_TOKEN`. Mint it with `gcloud` / `az`.
+- `gcp-dns` and `azure-dns` take a **long-lived** credential and exchange it for a short-lived token
+  **host-side** (cap-req #31 — no short-lived token is accepted anywhere): GCP a service-account JSON key
+  (`GCP_SERVICE_ACCOUNT_JSON`, the whole key file; the project is read from its `project_id`), Azure a
+  service principal (`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`). The minted token is
+  cached until near expiry and never persisted.
 - `route53` reads `ROUTE53_HOSTED_ZONE_ID` for the zone and resolves credentials
   through the standard AWS provider chain (environment, shared config, instance
   role).
@@ -102,8 +105,8 @@ Mirror each provider's env vars, lowercased/namespaced. **Bold** = secret (must 
 | `hetzner` | `zone`, **`token`** |
 | `ns1` | `zone`, **`api_key`** |
 | `dnsimple` | `account_id`, `zone`, **`token`** |
-| `gcp-dns` | `project`, `zone`, **`access_token`** |
-| `azure-dns` | `subscription_id`, `resource_group`, `zone`, **`access_token`** |
+| `gcp-dns` | `zone` (managed-zone name), **`service_account_json`** (project read from it) |
+| `azure-dns` | `tenant_id`, `client_id`, **`client_secret`**, `subscription_id`, `resource_group`, `zone` |
 | `akamai` | `host`, **`client_token`**, **`client_secret`**, **`access_token`**, `zone` |
 
 For **guest `dns-publish`** over the multi-zone registry, set
@@ -158,8 +161,8 @@ Mailroom's connect-UI should collect exactly these `name` keys:
 | `oci` | `region`, `key_id`, `private_key_pem` | — | `private_key_pem` is the multi-line PEM **content** (not a path) |
 | `akamai` | `host`, `client_token`, `client_secret`, `access_token` | — | EdgeGrid; `host` is **pinned** to a `*.akamaiapis.net` subdomain (IP literals + non-Akamai hosts refused — it is the only tenant-set request authority) |
 | `dnsimple` | `account_id`, `token` | — | |
-| `gcp` | `project`, `access_token` | — | **short-lived** OAuth access token (not a service-account JSON key) |
-| `azure` | `subscription_id`, `resource_group`, `access_token` | — | `access_token` is a **short-lived** AAD bearer token |
+| `gcp` | `service_account_json`, `managed_zone` | — | the whole **long-lived** service-account JSON (project read from its `project_id`) + the Cloud DNS managed-zone **resource name**; the host signs a JWT + exchanges it for a cached token |
+| `azure` | `tenant_id`, `client_id`, `client_secret`, `subscription_id`, `resource_group` | — | a **long-lived** service principal (GUID `tenant_id`/`client_id`); the host runs client-credentials + caches the token (the zone is the registered zone-root) |
 | `digitalocean` | `token` | — | |
 | `hetzner` | `token` | — | |
 | `ns1` | `api_key` | — | |
@@ -175,10 +178,13 @@ anything is sealed.
 > internal/metadata address. (A broader dial-time SSRF floor over every adapter's HTTP client is a
 > noted defense-in-depth follow-up; the pin closes the actual tenant-controlled-authority surface.)
 
-> **GCP / Azure caveat.** The `gcp` and `azure` adapters authenticate with a **short-lived** bearer
-> `access_token` (matching the serve-static adapters), not a long-lived service-account JSON key or OAuth
-> client secret. A tenant must register a fresh token; a long-lived-key exchange would be a future
-> adapter enhancement.
+> **GCP / Azure token exchange (cap-req #31).** The `gcp` and `azure` adapters take a **long-lived**
+> credential — a GCP service-account JSON key, an Azure service principal — and exchange it **host-side**
+> for a short-lived bearer token, which is cached (per tenancy) until near expiry and **never sealed,
+> returned, or logged**. The token endpoints are FIXED well-known hosts (`oauth2.googleapis.com` /
+> `login.microsoftonline.com`), pinned (not read from the credential), with the Azure `tenant_id` a
+> GUID-validated path segment — so the exchange has no SSRF surface. No short-lived token is accepted as
+> a stored credential on either the runtime or the operator path.
 
 Fail-closed at every layer, all independent of the operator path:
 

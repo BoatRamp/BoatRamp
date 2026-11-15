@@ -68,12 +68,33 @@ pub(crate) fn default_audit_sink() -> Arc<dyn DnsPublishAuditSink> {
     Arc::new(TracingDnsPublishSink)
 }
 
+/// Max distinct OAuth-adapter instances the factory caches (gcp/azure). A crude bound: when full the
+/// cache is cleared (a cleared entry just re-exchanges — never a correctness issue).
+const MAX_OAUTH_ADAPTER_CACHE: usize = 512;
+
 /// The concrete [`RuntimeDnsProviderFactory`] (cap-req #31): builds a live `boatramp-acme` adapter from
 /// an UNSEALED, already-VALIDATED credential field bundle (the host binding validated required/shape
 /// before sealing). Covers the FULL serve-static adapter set. The zone is the `zone_root` except where
-/// the provider addresses it by an opaque id field (`zone_id` / `hosted_zone_id`). Field values reach
-/// the adapter but never cross back to the guest or into a log.
-struct AcmeRuntimeDnsProviderFactory;
+/// the provider addresses it by an opaque id field (`zone_id` / `hosted_zone_id`) or, for GCP, a
+/// `managed_zone` resource name. Field values reach the adapter but never cross back to the guest or
+/// into a log.
+///
+/// For GCP/Azure — which exchange a LONG-LIVED credential for a cached SHORT-LIVED token — the factory
+/// caches the built ADAPTER INSTANCE (so its internal token cache persists across calls), keyed by a
+/// SHA-256 of `(cache_scope, zone_root, kind, credential bundle)`. `cache_scope` embeds `(project,
+/// tenant)`, so a cached adapter — and therefore its minted token — is NEVER shared across tenants; the
+/// cred is in the key, so a rotation yields a fresh adapter.
+struct AcmeRuntimeDnsProviderFactory {
+    oauth_adapters: std::sync::Mutex<std::collections::HashMap<[u8; 32], Arc<dyn DnsProvider>>>,
+}
+
+impl AcmeRuntimeDnsProviderFactory {
+    fn new() -> Self {
+        Self {
+            oauth_adapters: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
 
 /// Read a required field from the validated bundle (present by construction; `Err` is defense-in-depth).
 fn field<'a>(
@@ -86,73 +107,157 @@ fn field<'a>(
         .ok_or_else(|| format!("missing field {name}"))
 }
 
+/// The per-tenancy adapter-cache key: a SHA-256 over the tenancy scope + zone-root + kind + the whole
+/// credential bundle. The tenancy scope guarantees no cross-tenant reuse; the bundle guarantees a
+/// rotated credential gets a fresh adapter.
+fn oauth_cache_key(
+    cache_scope: &str,
+    zone_root: &str,
+    kind: RuntimeDnsProviderKind,
+    fields: &std::collections::BTreeMap<String, String>,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [
+        cache_scope.as_bytes(),
+        zone_root.as_bytes(),
+        kind.as_str().as_bytes(),
+    ] {
+        h.update((part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    for (k, v) in fields {
+        h.update((k.len() as u64).to_le_bytes());
+        h.update(k.as_bytes());
+        h.update((v.len() as u64).to_le_bytes());
+        h.update(v.as_bytes());
+    }
+    h.finalize().into()
+}
+
+/// Build a STATELESS adapter (every provider except gcp/azure) — a fresh instance per call is cheap and
+/// holds no minted-token state.
+fn build_stateless(
+    kind: RuntimeDnsProviderKind,
+    fields: &std::collections::BTreeMap<String, String>,
+    zone_root: &str,
+) -> Result<Arc<dyn DnsProvider>, String> {
+    use boatramp_acme as acme;
+    let zone = zone_root.to_string();
+    Ok(match kind {
+        RuntimeDnsProviderKind::Cloudflare => Arc::new(acme::cloudflare::CloudflareDns::new(
+            field(fields, "zone_id")?.to_string(),
+            field(fields, "token")?.to_string(),
+        )),
+        RuntimeDnsProviderKind::Route53 => Arc::new(acme::route53::Route53Dns::from_static_creds(
+            field(fields, "access_key_id")?,
+            field(fields, "secret_access_key")?,
+            field(fields, "region")?,
+            fields.get("session_token").map(String::as_str),
+            field(fields, "hosted_zone_id")?.to_string(),
+        )),
+        RuntimeDnsProviderKind::Oci => Arc::new(
+            acme::oci::OciDns::new(
+                field(fields, "region")?,
+                zone,
+                field(fields, "key_id")?.to_string(),
+                field(fields, "private_key_pem")?,
+            )
+            .map_err(|e| e.to_string())?,
+        ),
+        RuntimeDnsProviderKind::Akamai => Arc::new(acme::akamai::AkamaiDns::new(
+            field(fields, "host")?.to_string(),
+            field(fields, "client_token")?.to_string(),
+            field(fields, "client_secret")?.to_string(),
+            field(fields, "access_token")?.to_string(),
+            zone,
+        )),
+        RuntimeDnsProviderKind::Dnsimple => Arc::new(acme::dnsimple::DnsimpleDns::new(
+            field(fields, "account_id")?.to_string(),
+            zone,
+            field(fields, "token")?.to_string(),
+        )),
+        RuntimeDnsProviderKind::DigitalOcean => Arc::new(acme::digitalocean::DigitalOceanDns::new(
+            zone,
+            field(fields, "token")?.to_string(),
+        )),
+        RuntimeDnsProviderKind::Hetzner => Arc::new(acme::hetzner::HetznerDns::new(
+            zone,
+            field(fields, "token")?.to_string(),
+        )),
+        RuntimeDnsProviderKind::Ns1 => Arc::new(acme::ns1::Ns1Dns::new(
+            zone,
+            field(fields, "api_key")?.to_string(),
+        )),
+        // gcp/azure are built by `build_oauth` (cached), never here.
+        RuntimeDnsProviderKind::Gcp | RuntimeDnsProviderKind::Azure => {
+            return Err("oauth provider built on the wrong path".into());
+        }
+    })
+}
+
+/// Build a GCP/Azure adapter from the LONG-LIVED credential bundle (it exchanges host-side for a cached
+/// short-lived token). GCP: a service-account JSON + the `managed_zone` resource name. Azure: a service
+/// principal + subscription/resource-group scoping the DNS zone (= `zone_root`).
+fn build_oauth(
+    kind: RuntimeDnsProviderKind,
+    fields: &std::collections::BTreeMap<String, String>,
+    zone_root: &str,
+) -> Result<Arc<dyn DnsProvider>, String> {
+    use boatramp_acme as acme;
+    Ok(match kind {
+        RuntimeDnsProviderKind::Gcp => Arc::new(
+            acme::gcp_dns::GcpDns::from_service_account(
+                field(fields, "managed_zone")?.to_string(),
+                field(fields, "service_account_json")?,
+            )
+            .map_err(|e| e.to_string())?,
+        ),
+        RuntimeDnsProviderKind::Azure => {
+            Arc::new(acme::azure_dns::AzureDns::from_service_principal(
+                field(fields, "tenant_id")?,
+                field(fields, "client_id")?.to_string(),
+                field(fields, "client_secret")?.to_string(),
+                field(fields, "subscription_id")?.to_string(),
+                field(fields, "resource_group")?.to_string(),
+                zone_root.to_string(),
+            ))
+        }
+        _ => return Err("not an oauth provider".into()),
+    })
+}
+
 impl RuntimeDnsProviderFactory for AcmeRuntimeDnsProviderFactory {
     fn build(
         &self,
         kind: RuntimeDnsProviderKind,
         fields: &std::collections::BTreeMap<String, String>,
         zone_root: &str,
+        cache_scope: &str,
     ) -> Result<Arc<dyn DnsProvider>, String> {
-        use boatramp_acme as acme;
-        let zone = zone_root.to_string();
-        Ok(match kind {
-            RuntimeDnsProviderKind::Cloudflare => Arc::new(acme::cloudflare::CloudflareDns::new(
-                field(fields, "zone_id")?.to_string(),
-                field(fields, "token")?.to_string(),
-            )),
-            RuntimeDnsProviderKind::Route53 => {
-                Arc::new(acme::route53::Route53Dns::from_static_creds(
-                    field(fields, "access_key_id")?,
-                    field(fields, "secret_access_key")?,
-                    field(fields, "region")?,
-                    fields.get("session_token").map(String::as_str),
-                    field(fields, "hosted_zone_id")?.to_string(),
-                ))
-            }
-            RuntimeDnsProviderKind::Oci => Arc::new(
-                acme::oci::OciDns::new(
-                    field(fields, "region")?,
-                    zone,
-                    field(fields, "key_id")?.to_string(),
-                    field(fields, "private_key_pem")?,
-                )
-                .map_err(|e| e.to_string())?,
-            ),
-            RuntimeDnsProviderKind::Akamai => Arc::new(acme::akamai::AkamaiDns::new(
-                field(fields, "host")?.to_string(),
-                field(fields, "client_token")?.to_string(),
-                field(fields, "client_secret")?.to_string(),
-                field(fields, "access_token")?.to_string(),
-                zone,
-            )),
-            RuntimeDnsProviderKind::Dnsimple => Arc::new(acme::dnsimple::DnsimpleDns::new(
-                field(fields, "account_id")?.to_string(),
-                zone,
-                field(fields, "token")?.to_string(),
-            )),
-            RuntimeDnsProviderKind::Gcp => Arc::new(acme::gcp_dns::GcpDns::new(
-                field(fields, "project")?.to_string(),
-                zone,
-                field(fields, "access_token")?.to_string(),
-            )),
-            RuntimeDnsProviderKind::Azure => Arc::new(acme::azure_dns::AzureDns::new(
-                field(fields, "subscription_id")?.to_string(),
-                field(fields, "resource_group")?.to_string(),
-                zone,
-                field(fields, "access_token")?.to_string(),
-            )),
-            RuntimeDnsProviderKind::DigitalOcean => Arc::new(
-                acme::digitalocean::DigitalOceanDns::new(zone, field(fields, "token")?.to_string()),
-            ),
-            RuntimeDnsProviderKind::Hetzner => Arc::new(acme::hetzner::HetznerDns::new(
-                zone,
-                field(fields, "token")?.to_string(),
-            )),
-            RuntimeDnsProviderKind::Ns1 => Arc::new(acme::ns1::Ns1Dns::new(
-                zone,
-                field(fields, "api_key")?.to_string(),
-            )),
-        })
+        if !matches!(
+            kind,
+            RuntimeDnsProviderKind::Gcp | RuntimeDnsProviderKind::Azure
+        ) {
+            return build_stateless(kind, fields, zone_root);
+        }
+        // gcp/azure: reuse the cached adapter instance for this exact (tenancy, zone, cred) so its
+        // minted token is reused — but keyed on the tenancy scope, so NEVER shared across tenants.
+        let key = oauth_cache_key(cache_scope, zone_root, kind, fields);
+        let mut cache = self
+            .oauth_adapters
+            .lock()
+            .map_err(|_| "dns adapter cache poisoned".to_string())?;
+        if let Some(existing) = cache.get(&key) {
+            return Ok(existing.clone());
+        }
+        // Build while holding the lock (construction is synchronous — JSON parse + signer, no I/O).
+        let adapter = build_oauth(kind, fields, zone_root)?;
+        if cache.len() >= MAX_OAUTH_ADAPTER_CACHE {
+            cache.clear();
+        }
+        cache.insert(key, adapter.clone());
+        Ok(adapter)
     }
 }
 
@@ -173,7 +278,7 @@ static RUNTIME_SOURCE: OnceLock<DnsPublishRuntimeSource> = OnceLock::new();
 pub fn install_dns_cred_source(store: TenantDnsCredStore) {
     let _ = RUNTIME_SOURCE.set(DnsPublishRuntimeSource {
         store,
-        factory: Arc::new(AcmeRuntimeDnsProviderFactory),
+        factory: Arc::new(AcmeRuntimeDnsProviderFactory::new()),
     });
     tracing::info!(
         target: "boatramp::dns::publish",
@@ -253,4 +358,92 @@ pub(crate) fn maybe_attach(
         bindings = bindings.with_dns_publish_runtime(runtime, audit);
     }
     bindings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway RSA key (PKCS#8) + a valid service-account JSON, for the factory cache test.
+    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6AgEAAkEA5SrFVYD26w2NArwi\n\
+6uNqb0rEKalyCAaSLeURe7sWG6FSMY1SoZ0klwDoVzTw83Sg6UWOlP7ZULzP43F1\n\
+dfBy5QIDAQABAkEA4t+KBxEq4h9DN67r3qCP8WgSdbBjzOA8faUmvtjDlUsrcPrr\n\
+97v9jcBeflXcw/uG8pQ1p+tWJDOKA+UN3oECzQIhAPe0thijPyMLOQEX2K3LFLtK\n\
+Z0oHkKqFyXt7kZmDUlMvAiEA7Ncl7GYtqI5ZjalxU/SB5a7sL+6KqJcK1lXgvnKU\n\
+pisCIAF7SzuKfm4vOwAOrHUdqdoU79k5glwCwNnEO3K3nl5xAiBSLNgwrMc8y59Q\n\
+4rC6k4Saf9XdT6P2mOmeso9XJQRknwIgG689c5E5fvq9T4eam9dBCNJup4IgI6VT\n\
+sAmaXlKwnv8=\n\
+-----END PRIVATE KEY-----\n";
+
+    fn gcp_fields() -> std::collections::BTreeMap<String, String> {
+        let sa = serde_json::json!({
+            "client_email": "dns@proj.iam.gserviceaccount.com",
+            "private_key": TEST_KEY_PEM,
+            "project_id": "proj",
+        })
+        .to_string();
+        std::collections::BTreeMap::from([
+            ("service_account_json".to_string(), sa),
+            ("managed_zone".to_string(), "mz-1".to_string()),
+        ])
+    }
+
+    /// Security review: the OAuth adapter cache (whose instances hold the minted token) is keyed on the
+    /// tenancy scope, so it is reused WITHIN a tenant but NEVER shared across tenants.
+    #[test]
+    fn oauth_adapter_cache_is_per_tenancy_and_never_crosses_tenants() {
+        let factory = AcmeRuntimeDnsProviderFactory::new();
+        let fields = gcp_fields();
+        let a1 = factory
+            .build(
+                RuntimeDnsProviderKind::Gcp,
+                &fields,
+                "acme.com",
+                "proj\u{1f}tenant-a",
+            )
+            .unwrap();
+        let a2 = factory
+            .build(
+                RuntimeDnsProviderKind::Gcp,
+                &fields,
+                "acme.com",
+                "proj\u{1f}tenant-a",
+            )
+            .unwrap();
+        // Same tenancy + zone + cred ⇒ the SAME cached adapter (its minted token is reused).
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "same tenancy reuses the cached adapter"
+        );
+        // A DIFFERENT tenant ⇒ a DIFFERENT adapter instance (no shared minted token across tenants).
+        let b = factory
+            .build(
+                RuntimeDnsProviderKind::Gcp,
+                &fields,
+                "acme.com",
+                "proj\u{1f}tenant-b",
+            )
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "a different tenant must get a different adapter (token cache isolation)"
+        );
+    }
+
+    /// A malformed GCP service-account JSON reaching the factory (defense-in-depth beyond the host
+    /// binding's register-time validation) is a build error, not a panic.
+    #[test]
+    fn gcp_factory_rejects_malformed_service_account() {
+        let factory = AcmeRuntimeDnsProviderFactory::new();
+        let fields = std::collections::BTreeMap::from([
+            ("service_account_json".to_string(), "{bad".to_string()),
+            ("managed_zone".to_string(), "mz".to_string()),
+        ]);
+        assert!(
+            factory
+                .build(RuntimeDnsProviderKind::Gcp, &fields, "acme.com", "p\u{1f}t")
+                .is_err()
+        );
+    }
 }

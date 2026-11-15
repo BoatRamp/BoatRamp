@@ -17,32 +17,57 @@ use crate::dns::{
 const DEFAULT_API_BASE: &str = "https://management.azure.com";
 const API_VERSION: &str = "2018-05-01";
 
-/// An Azure DNS editor scoped to one zone in a subscription + resource group.
+/// The Resource Manager scope the minted token is requested for.
+const AZURE_SCOPE: &str = "https://management.azure.com/.default";
+
+/// Build the FIXED Azure AD token endpoint for `tenant_id` (the host `login.microsoftonline.com` is
+/// pinned; `tenant_id` is a GUID-validated path segment at register, so it can't reshape the URL).
+fn azure_token_endpoint(tenant_id: &str) -> String {
+    format!("https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token")
+}
+
+/// An Azure DNS editor scoped to one zone in a subscription + resource group, authenticating via a
+/// sealed service-principal (client-credentials) exchanged host-side for a cached short-lived token.
+///
+/// **Credential (cap-req #31): a LONG-LIVED service principal, exchanged host-side.** The adapter takes
+/// `tenant_id` + `client_id` + `client_secret` and runs the client-credentials grant at the FIXED Azure
+/// AD token endpoint for a short-lived AAD token, cached until near expiry. No short-lived token is
+/// accepted as the stored credential, and the minted token is never sealed, returned, or logged.
 pub struct AzureDns {
     client: reqwest::Client,
     api_base: String,
-    token: String,
+    /// The token-exchange endpoint (pinned to `login.microsoftonline.com`; overridable in tests only).
+    token_endpoint: String,
+    client_id: String,
+    client_secret: String,
     subscription: String,
     resource_group: String,
     zone: String,
+    token_cell: crate::oauth::TokenCell,
 }
 
 impl AzureDns {
-    /// Build a provider for `zone` under `subscription` + `resource_group`,
-    /// authenticating with an Azure AD access token for the Resource Manager.
-    pub fn new(
+    /// Build a provider for `zone` under `subscription` + `resource_group`, authenticating with a
+    /// service principal (`tenant_id` + `client_id` + `client_secret`) exchanged host-side (cap-req #31).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_service_principal(
+        tenant_id: &str,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
         subscription: impl Into<String>,
         resource_group: impl Into<String>,
         zone: impl Into<String>,
-        token: impl Into<String>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_base: DEFAULT_API_BASE.to_string(),
-            token: token.into(),
+            token_endpoint: azure_token_endpoint(tenant_id),
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
             subscription: subscription.into(),
             resource_group: resource_group.into(),
             zone: zone.into(),
+            token_cell: crate::oauth::TokenCell::new(),
         }
     }
 
@@ -50,6 +75,33 @@ impl AzureDns {
     pub fn with_api_base(mut self, base: impl Into<String>) -> Self {
         self.api_base = base.into();
         self
+    }
+
+    /// Override the token-exchange endpoint — TESTS ONLY (point it at a local mock). Production pins
+    /// `login.microsoftonline.com`.
+    #[doc(hidden)]
+    pub fn with_token_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.token_endpoint = endpoint.into();
+        self
+    }
+
+    /// A valid access token — cached, or minted by a fresh client-credentials exchange (cap-req #31).
+    async fn token(&self) -> Result<String, DnsError> {
+        self.token_cell.get_or_exchange(|| self.exchange()).await
+    }
+
+    async fn exchange(&self) -> Result<(String, u64), DnsError> {
+        crate::oauth::post_token(
+            &self.client,
+            &self.token_endpoint,
+            &[
+                ("grant_type", "client_credentials"),
+                ("client_id", &self.client_id),
+                ("client_secret", &self.client_secret),
+                ("scope", AZURE_SCOPE),
+            ],
+        )
+        .await
     }
 
     /// The record name relative to the zone: `_acme-challenge.deploy.example.com`
@@ -149,7 +201,7 @@ impl DnsProvider for AzureDns {
         // PUT is create-or-replace — idempotent, no read first.
         self.client
             .put(self.record_url(record))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.token().await?)
             .json(&Self::body(record)?)
             .send()
             .await
@@ -163,7 +215,7 @@ impl DnsProvider for AzureDns {
         let resp = self
             .client
             .delete(self.record_url(record))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.token().await?)
             .send()
             .await
             .map_err(|e| DnsError::Backend(e.to_string()))?;
@@ -202,7 +254,39 @@ mod tests {
     use super::*;
 
     fn provider() -> AzureDns {
-        AzureDns::new("sub1", "rg1", "example.com", "tok").with_api_base("https://az.test")
+        AzureDns::from_service_principal(
+            "11111111-2222-3333-4444-555555555555",
+            "client-id",
+            "client-secret",
+            "sub1",
+            "rg1",
+            "example.com",
+        )
+        .with_api_base("https://az.test")
+    }
+
+    #[test]
+    fn token_endpoint_pins_the_microsoft_login_host_with_the_tenant_guid() {
+        let p = provider();
+        assert_eq!(
+            p.token_endpoint,
+            "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/oauth2/v2.0/token"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_gate_azure_client_credentials_mint_and_cache() {
+        let (url, count) =
+            crate::oauth::test_mock::spawn(r#"{"access_token":"az-minted","expires_in":3600}"#)
+                .await;
+        let p = provider().with_token_endpoint(url);
+        assert_eq!(p.token().await.unwrap(), "az-minted");
+        assert_eq!(p.token().await.unwrap(), "az-minted");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the client-credentials exchange ran once; the second call was cached"
+        );
     }
 
     #[test]
