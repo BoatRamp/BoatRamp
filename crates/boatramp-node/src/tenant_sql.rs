@@ -1586,27 +1586,60 @@ async fn clear_db_dataloss_safe(
         ts = ts.saturating_add(1);
     };
     rename_db_aside(admin, kind, db, &tombstone).await?;
-    // Unify the tombstone lifecycle: register this self-heal-minted `__deleted_` with the EXISTING KV
-    // grace reaper (the ONLY other minter is `deprovision_tenant`). Same record shape + helper; the
-    // reaper reclaims it once `delete_after` passes and `recover_tenant` restores it uniformly.
-    //
-    // RETENTION FLOOR (Security re-review — E1 under OBS 1): this is a CRASH-RECOVERY artifact, NOT an
-    // intentional deprovision — it may hold the tenant's ONLY surviving copy if the subsequent restore
-    // fails. So its retention is `max(configured_grace, DEFAULT)`: an operator-configured grace LONGER
-    // than the default is honored (OBS 1's real intent — drop the artificial 7d CAP), but a configured
-    // grace SHORTER than the default — crucially `deprovision_grace_secs = 0` — is FLOORED to the
-    // 1033b4cc-proven-safe default window, so `delete_after` is never `ts` (immediately due) and the
-    // hourly reaper can never reclaim the sole copy within a tick of a failed restore. (The
-    // INTENTIONAL-deprovision path honors grace=0 as an immediate HARD-drop with NO tombstone — see
-    // `plan_deprovision`; this floor applies ONLY to the self-heal crash tombstone.) role +
-    // cred_workload are EMPTY (superuser-owned — no dedicated role/cred to drop; the derived roles +
-    // creds are the reprovisioned LIVE tenant's).
+    register_crash_tombstone(
+        kv,
+        project,
+        compute,
+        superuser,
+        derived_primary,
+        &tombstone,
+        ts,
+        grace_secs,
+    )
+    .await?;
+    Ok(DbClear::Preserved(tombstone))
+}
+
+/// Mint a superuser-OWNED grace-recovery KV [`Tombstone`](tenant_tombstone::Tombstone) record for a
+/// POPULATED database renamed aside to a `__deleted_<ts>` tombstone — the SINGLE place both the
+/// self-heal ([`clear_db_dataloss_safe`]) AND the atomic shadow swap ([`crate::project_export`]'s
+/// `pg_swap_shadow`, which moves the OLD live db aside at the one destructive moment) mint such a
+/// record, so the record shape + the retention FLOOR live in ONE place.
+///
+/// `tombstone_db` is the already-renamed `__deleted_<ts>` aside of `original_db` (the derived live
+/// name); `ts` its deletion time. It registers with the EXISTING KV grace reaper
+/// ([`spawn_tenant_tombstone_reaper`]) so the tombstone is auto-reclaimed once `delete_after` passes
+/// and is [`recover_tenant`]-restorable UNIFORMLY (never a `__deleted_` db the reaper ignores →
+/// unbounded disk growth). `role` + `cred_workload` are EMPTY (superuser-owned — there is no dedicated
+/// role/cred to drop; the derived roles + their creds belong to the still-/re-provisioned LIVE tenant,
+/// which the reaper/recover must NOT touch — [`hard_drop_tombstone`] / [`recover_tenant`] skip an empty
+/// role/cred).
+///
+/// RETENTION FLOOR (Security re-review — E1 under OBS 1): this is a CRASH-RECOVERY artifact, NOT an
+/// intentional deprovision — it may hold the tenant's ONLY surviving copy if a restore fails. So its
+/// retention is `max(configured_grace, DEFAULT)`: an operator-configured grace LONGER than the default
+/// is honored (drop the artificial 7d CAP), but a grace SHORTER than the default — crucially
+/// `deprovision_grace_secs = 0` — is FLOORED to the 1033b4cc-proven-safe default window, so
+/// `delete_after` is never `ts` (immediately due) and the hourly reaper can never reclaim the sole copy
+/// within a tick of a failed restore. (The INTENTIONAL-deprovision path honors grace=0 as an immediate
+/// HARD-drop with NO tombstone — see `plan_deprovision`; this floor applies ONLY to the crash tombstone.)
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn register_crash_tombstone(
+    kv: &Arc<dyn KvStore>,
+    project: &str,
+    compute: &str,
+    superuser: &str,
+    original_db: &str,
+    tombstone_db: &str,
+    ts: u64,
+    grace_secs: u64,
+) -> Result<(), String> {
     let retention = grace_secs.max(DEFAULT_DEPROVISION_GRACE_SECS);
     let record = tenant_tombstone::Tombstone {
         version: 1,
         project: project.to_string(),
-        renamed_db: tombstone.clone(),
-        original_db: derived_primary.to_string(),
+        renamed_db: tombstone_db.to_string(),
+        original_db: original_db.to_string(),
         role: String::new(),
         engine: "postgres".to_string(),
         compute: compute.to_string(),
@@ -1615,8 +1648,7 @@ async fn clear_db_dataloss_safe(
         deleted_at: ts,
         delete_after: ts.saturating_add(retention),
     };
-    tenant_tombstone::put(kv, &record).await?;
-    Ok(DbClear::Preserved(tombstone))
+    tenant_tombstone::put(kv, &record).await
 }
 
 /// Fully clear an EXCLUSIVELY-owned per-tenant derived `role` DATA-LOSS-SAFELY, returning `true` if it
@@ -1821,10 +1853,11 @@ async fn reconcile_derived_role_tangle(
     })
 }
 
-/// PRESERVE one of THIS orphan's own aside databases (a grace `__deleted_` tombstone) across the
-/// self-heal: fully DIVORCE the derived `roles` from it so a later `DROP ROLE` succeeds WITHOUT
-/// dropping the aside — its grace-recoverable data survives. Connected to the aside, `REASSIGN OWNED
-/// BY <roles> TO <maint_owner>` transfers every object the roles own there (and the aside DATABASE
+/// DIVORCE the derived `roles` from a database they own, IN PLACE (no rename, no drop), so a later
+/// `DROP ROLE` succeeds while the database's data survives untouched. Two callers: PRESERVE one of THIS
+/// orphan's own aside databases (a grace `__deleted_` tombstone), and (v0.59.8) divorce the still-live
+/// db before the atomic swap so the self-heal never empties live. Connected to the database, `REASSIGN
+/// OWNED BY <roles> TO <maint_owner>` transfers every object the roles own there (and the DATABASE
 /// itself — a shared object) to the stable superuser/maintenance owner, then `DROP OWNED BY <roles>`
 /// revokes any residual privileges GRANTED to the roles there (so no `pg_shdepend` ACL row keeps the
 /// role un-droppable). A belt-and-suspenders `ALTER DATABASE … OWNER` re-asserts the datdba. Every
@@ -1869,18 +1902,18 @@ async fn reassign_aside_to_owner(
     aside_admin
         .run_script(&format!("REASSIGN OWNED BY {roles_list} TO {owner_id};"))
         .await
-        .map_err(|e| format!("self-heal: REASSIGN OWNED on tombstone {aside}: {e}"))?;
+        .map_err(|e| format!("self-heal: REASSIGN OWNED divorcing roles from {aside}: {e}"))?;
     aside_admin
         .run_script(&format!("DROP OWNED BY {roles_list};"))
         .await
-        .map_err(|e| format!("self-heal: DROP OWNED on tombstone {aside}: {e}"))?;
+        .map_err(|e| format!("self-heal: DROP OWNED divorcing roles from {aside}: {e}"))?;
     // Belt-and-suspenders: re-assert the aside DATABASE's owner (REASSIGN OWNED above already moved
     // the shared db object, but an explicit ALTER is unambiguous and idempotent).
     let aside_id = boatramp_storage::tenant_provision::quote_ident(kind, aside);
     aside_admin
         .run_script(&format!("ALTER DATABASE {aside_id} OWNER TO {owner_id};"))
         .await
-        .map_err(|e| format!("self-heal: ALTER DATABASE OWNER on tombstone {aside}: {e}"))?;
+        .map_err(|e| format!("self-heal: ALTER DATABASE OWNER on {aside}: {e}"))?;
     Ok(())
 }
 
@@ -2086,33 +2119,41 @@ pub async fn untangle_colliding_orphan_roles(
         }
     }
 
-    // (C) Clear the live orphan db — DATA-LOSS-SAFELY, mirroring the fresh-dest occupant invariant
-    //     (`pg_reconcile_fresh_dest_occupant`). The restore has NOT landed yet; a mid-restore failure
-    //     tears the shadow down leaving live untouched, so HARD-dropping a POPULATED orphan here would
-    //     leave the tenant with NEITHER the source NOR the orphan — unrecoverable (Security review E1).
-    //     ALWAYS data-loss-safe (NEVER gated on `--drop-soft-deleted` — FINDING 3) and EXISTENCE-guarded
-    //     (an ABSENT primary — a crash left the derived name free + a populated `__old_` — is a clean
-    //     skip, NOT a fail-connect abort — FINDING 2): ABSENT → skip (reprovision recreates it); EMPTY →
-    //     hard-drop (the swap recreates); POPULATED → soft-deprovision to a recoverable `__deleted_`
-    //     tombstone (freeing the derived name for the restore), preserved so a failed restore is
-    //     recoverable.
-    match clear_db_dataloss_safe(
-        &admin,
-        deploy,
-        kv,
-        &creds,
-        kind,
-        compute,
-        superuser,
-        project,
-        grace_secs,
-        &names.database,
-        &names.database,
-    )
-    .await?
-    {
-        DbClear::Preserved(tomb) => preserved_tombstones.push(tomb),
-        DbClear::Dropped | DbClear::Absent => {}
+    // (C) DIVORCE the live db from the derived roles WITHOUT renaming or emptying it — the construens
+    //     ATOMICITY fix (v0.59.8; the data-loss core). The OLD self-heal soft-deprovisioned the live db
+    //     to a `__deleted_` tombstone AND fresh-provisioned an EMPTY live db HERE, i.e. it emptied LIVE
+    //     up front, BEFORE any dump was restored. A restore failure (for ANY reason) then stranded the
+    //     tenant on that empty mirror while the atomic shadow swap — the path that was ALREADY designed
+    //     to be the single destructive moment — never ran. Now the live db's data is left in place and
+    //     the ONLY destructive moment is the atomic swap (`pg_swap_shadow`): it moves the OLD live db →
+    //     a recoverable `__deleted_` grace tombstone (same KV grace record, same floor) and the VERIFIED
+    //     shadow → live in one step, so a restore failure (for any reason) leaves the ORIGINAL live db
+    //     serving, untouched (the invariant `pg_swap_shadow` already promises for the aside — now true
+    //     for the self-heal path too).
+    //
+    //     To let the DROP ROLE below succeed while the live db keeps serving, reassign the live db's
+    //     ownership (+ its objects) to the stable superuser — the SAME REASSIGN/DROP OWNED divorce step
+    //     D does for a tombstone, which is NON-destructive to the data. `provision_tenant` (G) re-GRANTs
+    //     the login role on those (now superuser-owned) tables (`grant_app_role_ddl` grants on ALL
+    //     TABLES, owner-independent), so the tenant keeps reading/writing throughout the restore. This
+    //     REASSIGN, connected to the live db, also greedily sweeps the roles' remaining shared db
+    //     ownerships to the superuser, so step D is then an idempotent re-assert.
+    //
+    //     EXISTENCE-guarded (FINDING 2): an ABSENT live name — a crash left it free — is a clean skip
+    //     (G recreates it; a failed restore then leaves an empty-but-new db, there being no prior data
+    //     to preserve). NEVER renames/empties live, so there is nothing to lose if the restore fails.
+    if db_exists(&admin, &names.database).await? {
+        reassign_aside_to_owner(
+            deploy,
+            &creds,
+            kind,
+            compute,
+            superuser,
+            superuser,
+            &names.database,
+            &roles,
+        )
+        .await?;
     }
 
     // (D) REASSIGN every PRESERVED tombstone (+ its inner objects) to the stable superuser, DIVORCING
@@ -2147,8 +2188,11 @@ pub async fn untangle_colliding_orphan_roles(
             tracing::info!(cred = %cred, error = %e, "self-heal: sealed credential delete skipped");
         }
     }
-    // (G) REPROVISION fresh — new roles + fresh credentials + a clean empty live db — so the
-    //     subsequent shadow-swap restore lands clean.
+    // (G) REPROVISION fresh — new roles + fresh credentials — and RE-GRANT the login role on the live
+    //     db's existing (now superuser-owned, from C) tables so the tenant keeps serving its ORIGINAL
+    //     data while the shadow restore runs. `CREATE DATABASE` is idempotent (the live db still exists
+    //     with its data — NOT emptied), so this provisions the roles + grants WITHOUT touching the live
+    //     data; the atomic swap replaces it only on a verified restore.
     provision_tenant(deploy, kv, envelope, binding, project, "").await?;
     Ok(SelfHealReport::Healed {
         cleared_asides,

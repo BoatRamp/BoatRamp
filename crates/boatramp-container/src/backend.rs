@@ -2476,9 +2476,19 @@ impl ContainerBackend {
                         if n == 0 {
                             break;
                         }
-                        sender.write_all(&buf[..n]).await.map_err(|e| {
-                            BackendError::Other(format!("ephemeral stdin write: {e}"))
-                        })?;
+                        if let Err(e) = sender.write_all(&buf[..n]).await {
+                            // DIAGNOSABILITY (v0.59.8): a BROKEN PIPE here means the guest closed its
+                            // stdin by EXITING early (e.g. `pg_restore` erroring out mid-dump). The
+                            // broken pipe is a SYMPTOM, not the cause — stop feeding and let the guest's
+                            // own non-zero EXIT CODE + captured stderr be the surfaced diagnostic,
+                            // instead of masking it with "ephemeral stdin write: Broken pipe". (Mirrors
+                            // `exec.rs`'s broken-pipe tolerance.) Any OTHER write error is a real
+                            // transport failure and still propagates.
+                            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                                break;
+                            }
+                            return Err(BackendError::Other(format!("ephemeral stdin write: {e}")));
+                        }
                     }
                 }
                 // Drop the write end → the guest's stdin sees EOF.

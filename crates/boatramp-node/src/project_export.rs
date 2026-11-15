@@ -2161,6 +2161,13 @@ struct PgShadowPlan {
     /// the swapped-in db is re-provisioned to the per-tenant isolation + serving grants
     /// (`pg_swap_shadow` re-runs the idempotent tenant provisioning). See [`SharedReprovision`].
     shared_reprovision: Option<SharedReprovision>,
+    /// RECOVERY-swap flag (v0.59.8): set `true` by `pg_sidecar_shadow_restore` ONLY when the pre-restore
+    /// self-heal reported `Healed` — i.e. this restore is RECOVERING a prior-FAILED Shared tenant whose
+    /// live db we DIVORCED-in-place (never emptied). On a recovery swap the old POPULATED live db is
+    /// PRESERVED as a recoverable `__deleted_` grace tombstone (a recovery affordance); on a ROUTINE /
+    /// NoOp re-sync (flag `false`) the old live db is DROPPED after the swap exactly as v0.59.7 did, so
+    /// healthy syncs never accumulate tombstones. Default `false` (routine / dedicated / Shared-DEFAULT).
+    preserve_prior_live_on_swap: bool,
 }
 
 /// Post-swap re-provisioning context for a SHARED multi-tenant managed binding (a NON-default
@@ -5946,6 +5953,10 @@ impl NodeProjectExport {
             image,
             trusted_extensions: self.trusted_extensions.clone(),
             shared_reprovision,
+            // Default routine: drop the prior live on swap. `pg_sidecar_shadow_restore` flips this to
+            // `true` only after the self-heal reports `Healed` (a recovery), so only a recovery swap
+            // preserves the prior live as a recoverable tombstone.
+            preserve_prior_live_on_swap: false,
         })
     }
 
@@ -5975,7 +5986,7 @@ impl NodeProjectExport {
         fresh_dest: bool,
         drop_soft_deleted: bool,
     ) -> Result<(), Perr> {
-        let plan = self.pg_shadow_plan(project, db, cfg).await?;
+        let mut plan = self.pg_shadow_plan(project, db, cfg).await?;
         // FAIL-SAFE fresh-dest reconciliation (construens undeclared-orphan, DATA-LOSS-SENSITIVE):
         // on the ABSENT-dest / fresh-sync path the sync treats the dest as absent, so a database
         // already occupying the derived target name is an UNEXPECTED orphan a prior `project rm` /
@@ -6000,13 +6011,21 @@ impl NodeProjectExport {
         // re-sync is a cheap NO-OP that REUSES the stable roles; a detected EXCLUSIVE tangle on the
         // existing-dest path (`fresh_dest = false` — construens's shape) is fully healed — each
         // `__deleted_` tombstone PRESERVED (reassigned to the superuser) by default or DROPPED under
-        // `--drop-soft-deleted`, the live orphan db cleared DATA-LOSS-SAFELY (a POPULATED orphan
-        // soft-deprovisioned to a recoverable `__deleted_` tombstone — never clobbered-and-empty if the
-        // restore then fails, E1; an EMPTY one hard-dropped), BOTH derived roles dropped + reprovisioned
-        // fresh. The `shared_with_live` HARD GUARD leaves a role shared with a live sibling fully
+        // `--drop-soft-deleted`, BOTH derived roles dropped + reprovisioned fresh.
+        //
+        // ATOMICITY (v0.59.8 — the construens empty-mirror fix): the self-heal NO LONGER empties the live
+        // db. The pre-v0.59.8 heal soft-deprovisioned the live db to a `__deleted_` tombstone AND
+        // fresh-provisioned an EMPTY live db HERE, so a restore that then failed (for ANY reason)
+        // stranded the tenant on that empty mirror. Now the live db's DATA is left in place (only its
+        // ownership is divorced to the superuser so the roles can be reprovisioned), and the ATOMIC SWAP
+        // (`pg_swap_shadow`) is the SINGLE destructive moment — it moves the old live db to a recoverable
+        // `__deleted_` grace tombstone (same KV record + retention floor) and the VERIFIED shadow to live
+        // in one step, so a restore failure leaves the ORIGINAL live db serving, untouched.
+        //
+        // The `shared_with_live` HARD GUARD leaves a role shared with a live sibling fully
         // intact. FATAL on error: a detected tangle MUST self-heal, so a failure aborts the restore
         // (the operator sees it rather than a silently half-healed state) — it runs BEFORE any shadow
-        // is created, so live is untouched on abort. No-op off the Shared cell.
+        // is created and never empties live, so live is untouched on abort. No-op off the Shared cell.
         if plan.shared_reprovision.is_some()
             && let Some(envelope) = self.envelope.as_ref()
         {
@@ -6036,6 +6055,11 @@ impl NodeProjectExport {
                     ref dropped_tombstones,
                     ref roles_reprovisioned,
                 } => {
+                    // RECOVERY swap: the self-heal healed a prior-failed tangle and DIVORCED the live db
+                    // in place (never emptied it). Mark the swap to PRESERVE the old populated live as a
+                    // recoverable `__deleted_` tombstone (a recovery affordance) — routine/NoOp re-syncs
+                    // leave this `false` and drop the prior live as v0.59.7 did.
+                    plan.preserve_prior_live_on_swap = true;
                     tracing::info!(
                         database = %db,
                         cleared_asides = ?cleared_asides,
@@ -6045,7 +6069,8 @@ impl NodeProjectExport {
                         "sync self-heal: a prior-failed sync left this tenant's derived roles tangled \
                          with stray objects — dropped + reprovisioned the roles fresh, cleared the \
                          stray asides, and reconciled the orphan (grace tombstones preserved unless \
-                         --drop-soft-deleted); the restore lands clean"
+                         --drop-soft-deleted). The live db's data is left in place and serving; the \
+                         atomic swap preserves it as a recoverable tombstone only on a verified restore"
                     );
                 }
                 SelfHealReport::LightUntangle { ref cleared_asides }
@@ -6133,8 +6158,36 @@ impl NodeProjectExport {
             self.pg_drop_shadow(&plan, stage_dir).await;
             return Err(e);
         }
+        // FAIL-LOUD non-empty guard (v0.59.8), SCOPED to the RECOVERY path (guardrail c): a restore that
+        // exited 0 but produced an EMPTY shadow must never be swapped in OVER a populated live db we are
+        // RECOVERING — the swap would tombstone the tenant's real data for an empty mirror. The guard is
+        // gated on `preserve_prior_live_on_swap` (the self-heal reported `Healed`, so live PROVABLY held
+        // data a prior-failed sync left and an empty restore is unambiguously a FAILURE) rather than the
+        // naive "shadow empty while live populated" — so a LEGITIMATE empty-source sync on a routine path
+        // (an intentional truncate-to-empty) is NOT false-refused (we cannot cheaply prove, from the
+        // opaque staged dump, whether a non-recovery source carried objects). On a refusal, tear the
+        // shadow down; live is left intact + recoverable.
+        if plan.preserve_prior_live_on_swap
+            && !self
+                .pg_db_has_user_tables(&plan, &plan.shadow_db, stage_dir)
+                .await?
+            && self.pg_db_exists(&plan, &plan.live_db, stage_dir).await?
+            && self
+                .pg_db_has_user_tables(&plan, &plan.live_db, stage_dir)
+                .await?
+        {
+            self.pg_drop_shadow(&plan, stage_dir).await;
+            return Err(Perr::Other(format!(
+                "pg restore of {db:?} REFUSED at swap: recovering a prior-failed tenant, but the restored \
+                 shadow has NO user objects while the live db still holds data — refusing to replace the \
+                 recoverable live data with an empty restore (fail-closed; live left intact, recoverable)"
+            )));
+        }
         // Restore clean (and the sidecar member was SHA-verified at staging) → atomic swap. A swap
-        // failure tears the shadow down (its own rollback keeps live intact); live is untouched.
+        // failure tears the shadow down (its own rollback keeps live intact); live is untouched. The
+        // swap is the SINGLE destructive moment: it moves the old live db → a recoverable `__deleted_`
+        // tombstone (Shared cell) and the verified shadow → live, so a restore failure never strands
+        // the tenant on an emptied live.
         if let Err(e) = self.pg_swap_shadow(&plan, stage_dir).await {
             self.pg_drop_shadow(&plan, stage_dir).await;
             return Err(e);
@@ -6659,21 +6712,69 @@ impl NodeProjectExport {
         }
     }
 
-    /// TRUSTED DDL: atomically swap the verified shadow in for live. Terminate live sessions,
-    /// `ALTER DATABASE <live> RENAME TO <live>__old_<suffix>` (skipped if there is no live db yet),
-    /// terminate shadow sessions, `ALTER DATABASE <shadow> RENAME TO <live>`, then drop the aside
-    /// copy. A sub-ms window exists between the two renames where no `<live>` db is present
-    /// (acceptable for an import/clone, not a live cutover). If the shadow→live rename fails after
-    /// the aside, the aside is renamed back so live is never lost.
+    /// TRUSTED DDL: atomically swap the verified shadow in for live — the SINGLE destructive moment of
+    /// the restore. Terminate live sessions, `ALTER DATABASE <live> RENAME TO <aside>` (skipped if there
+    /// is no live db yet), terminate shadow sessions, `ALTER DATABASE <shadow> RENAME TO <live>`, then
+    /// dispose of the aside: for the Shared recoverable cell the aside is a `<live>__deleted_<ts>` grace
+    /// tombstone that is KEPT + registered with the grace reaper (so the prior data is `recover_tenant`-
+    /// restorable); for Single/dedicated + Shared-DEFAULT it is a transient `<live>__old_<suffix>` aside
+    /// that is DROPPED. A sub-ms window exists between the two renames where no `<live>` db is present
+    /// (acceptable for an import/clone, not a live cutover). If the shadow→live rename fails after the
+    /// aside, the aside is renamed back so live is never lost (and no tombstone record is written).
     async fn pg_swap_shadow(&self, plan: &PgShadowPlan, stage_dir: &Path) -> Result<(), Perr> {
         let live_q = quote_ident(ExternalSqlKind::Postgres, &plan.live_db);
         let shadow_q = quote_ident(ExternalSqlKind::Postgres, &plan.shadow_db);
         let role_q = quote_ident(ExternalSqlKind::Postgres, &plan.eph_role);
         let owner_q = quote_ident(ExternalSqlKind::Postgres, &plan.owner_user);
-        // Derive the rename-aside name through the SAME bounded helper as the shadow (above), so a
-        // long live db name keeps both the shadow and the `__old_<suffix>` aside within the 63-byte
-        // NAMEDATALEN limit and the `ALTER DATABASE … RENAME TO <old>` cannot overflow + collapse.
-        let old_db = bounded_derived_db_name(&plan.live_db, "__old_", &plan.suffix);
+        // The rename-aside target for the OLD live db — the SINGLE destructive moment of the whole
+        // restore. For the Shared recoverable cell (a per-tenant db — `shared_reprovision` is `Some`),
+        // the old live db is PRESERVED as a recoverable `__deleted_<ts>` grace tombstone (same KV grace
+        // record + retention floor the self-heal mints), so a restore that FAILED (handled before we
+        // reach here) never emptied live, and a SUCCESSFUL swap keeps the prior data recoverable.
+        // v0.59.8: the self-heal no longer empties live up front, so this swap is now the ONLY place the
+        // live db becomes a tombstone. For Single/dedicated + Shared-DEFAULT (no recoverable per-tenant
+        // cell) it stays the transient `__old_<suffix>` aside that is DROPPED on success (a whole-
+        // container / whole-server replacement). Both use the SAME bounded helper so a long live name
+        // keeps the aside within the 63-byte NAMEDATALEN limit (the `… RENAME TO <aside>` can't overflow
+        // + collapse).
+        // PRESERVE the old live db as a recoverable `__deleted_` tombstone ONLY on a RECOVERY swap
+        // (guardrail a): `preserve_prior_live_on_swap` is set true ONLY when the pre-restore self-heal
+        // reported `Healed` (recovering a prior-failed Shared tenant). A ROUTINE / NoOp re-sync leaves it
+        // `false` and DROPS the prior live after the swap exactly as v0.59.7 did — so healthy syncs never
+        // accumulate recoverable tombstones. ONE swap path, parameterized by this flag (no fork). Also
+        // gated on the Shared recoverable cell + the old live ACTUALLY holding data (the data-loss-safe
+        // EMPTY → drop / POPULATED → preserve rule) so an empty old live never mints an empty tombstone.
+        let preserve = plan.preserve_prior_live_on_swap
+            && plan.shared_reprovision.is_some()
+            && self.pg_db_exists(plan, &plan.live_db, stage_dir).await?
+            && self
+                .pg_db_has_user_tables(plan, &plan.live_db, stage_dir)
+                .await?;
+        let (old_db, aside_ts) = if preserve {
+            // Pick a collision-free `__deleted_<ts>` (bump `ts` past any existing one) — the SAME
+            // bounded, reaper-/`recover_tenant`-/`is_orphan_aside`-recognized tombstone name shape the
+            // self-heal mints.
+            let mut ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            loop {
+                let cand = boatramp_storage::tenant_provision::bounded_aside_db_name(
+                    &plan.live_db,
+                    "__deleted_",
+                    &ts.to_string(),
+                );
+                if !self.pg_db_exists(plan, &cand, stage_dir).await? {
+                    break (cand, Some(ts));
+                }
+                ts = ts.saturating_add(1);
+            }
+        } else {
+            (
+                bounded_derived_db_name(&plan.live_db, "__old_", &plan.suffix),
+                None,
+            )
+        };
         let old_q = quote_ident(ExternalSqlKind::Postgres, &old_db);
         // SWAP-SAFETY INVARIANT (defense in depth; mirror of the mysql guard): never rename live
         // aside + drop the aside without the shadow REPLACEMENT present. pg renames the whole shadow
@@ -6808,21 +6909,58 @@ impl NodeProjectExport {
             return Err(e);
         }
         if aside_done {
-            // The swap succeeded; the aside copy is obsolete (best-effort drop).
-            let _ = self
-                .pg_run_ddl(
-                    plan,
-                    &format!(
-                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                         WHERE datname = {} AND pid <> pg_backend_pid()",
-                        pg_lit(&old_db)
-                    ),
-                    stage_dir,
+            if let Some(ts) = aside_ts {
+                // RECOVERABLE cell: the swap fully succeeded, so the old live db (renamed aside to
+                // `old_db`) is now a `__deleted_<ts>` grace tombstone — the SINGLE destructive moment is
+                // complete. Register its KV grace record (superuser-owned, retention FLOORED — the same
+                // helper + floor the self-heal uses) so the grace reaper auto-reclaims it after the
+                // window and `recover_tenant` can restore the prior data, then KEEP it (do NOT drop).
+                // Written ONLY after the swap succeeded, so a rolled-back swap (above) leaves no stale
+                // record. A record failure is loud (the data is preserved as a db but would not be
+                // reaper-tracked / recover-listed).
+                let rp = plan
+                    .shared_reprovision
+                    .as_ref()
+                    .expect("recoverable ⇒ shared_reprovision is Some");
+                let compute = rp.binding.compute.as_deref().unwrap_or_default();
+                let superuser = rp.binding.user.as_deref().unwrap_or_default();
+                crate::tenant_sql::register_crash_tombstone(
+                    &self.kv,
+                    &rp.project,
+                    compute,
+                    superuser,
+                    &plan.live_db,
+                    &old_db,
+                    ts,
+                    self.deprovision_grace_secs,
                 )
-                .await;
-            let _ = self
-                .pg_run_ddl(plan, &format!("DROP DATABASE IF EXISTS {old_q}"), stage_dir)
-                .await;
+                .await
+                .map_err(|e| {
+                    Perr::Other(format!(
+                        "pg swap: the old live db {:?} was preserved as recoverable tombstone \
+                         {old_db:?} but registering its grace record failed: {e}",
+                        plan.live_db
+                    ))
+                })?;
+            } else {
+                // Transient `__old_` aside (Single/dedicated + Shared-DEFAULT — a whole-container /
+                // whole-server replacement, no recoverable per-tenant cell): the swap succeeded, so the
+                // aside copy is obsolete (best-effort drop).
+                let _ = self
+                    .pg_run_ddl(
+                        plan,
+                        &format!(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                             WHERE datname = {} AND pid <> pg_backend_pid()",
+                            pg_lit(&old_db)
+                        ),
+                        stage_dir,
+                    )
+                    .await;
+                let _ = self
+                    .pg_run_ddl(plan, &format!("DROP DATABASE IF EXISTS {old_q}"), stage_dir)
+                    .await;
+            }
         }
         // The ephemeral apply role has no objects left (reassigned) — drop it.
         let _ = self
