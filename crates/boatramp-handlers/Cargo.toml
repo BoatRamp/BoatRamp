@@ -184,7 +184,12 @@ tcp-egress = ["engine", "dep:async-trait"]
 # itself pulls no provider-client deps (acme's `default = []`), so this stays lean. Off by default;
 # provided ONLY when the node posture `allow_guest_dns_publish` is on. The shipped binary turns it on
 # via batteries-included. `dep:async-trait` for the object-safe `DnsProvider`/audit-sink seams.
-dns-publish = ["engine", "dep:boatramp-acme", "dep:async-trait", "dep:serde_json"]
+dns-publish = [
+  "engine",
+  "dep:boatramp-acme",
+  "dep:async-trait",
+  "dep:serde_json",
+]
 
 [dependencies]
 boatramp-core.workspace = true
