@@ -22,16 +22,19 @@ and `boatramp domain add --provider <name>`.
 | `hetzner` | — | Hetzner Cloud DNS | `HETZNER_ZONE`, `HETZNER_DNS_TOKEN` |
 | `ns1` | — | NS1 (IBM) | `NS1_ZONE`, `NS1_API_KEY` |
 | `dnsimple` | — | DNSimple | `DNSIMPLE_ACCOUNT_ID`, `DNSIMPLE_ZONE`, `DNSIMPLE_TOKEN` |
-| `gcp-dns` | `gcp` | Google Cloud DNS | `GCP_DNS_PROJECT`, `GCP_DNS_ZONE`, `GCP_ACCESS_TOKEN` |
-| `azure-dns` | `azure` | Azure DNS | `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`, `AZURE_DNS_ZONE`, `AZURE_ACCESS_TOKEN` |
+| `gcp-dns` | `gcp` | Google Cloud DNS | `GCP_DNS_ZONE`, `GCP_SERVICE_ACCOUNT_JSON` |
+| `azure-dns` | `azure` | Azure DNS | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`, `AZURE_DNS_ZONE` |
 | `akamai` | — | Akamai Edge DNS | `AKAMAI_HOST`, `AKAMAI_CLIENT_TOKEN`, `AKAMAI_CLIENT_SECRET`, `AKAMAI_ACCESS_TOKEN`, `AKAMAI_ZONE` |
 
 ## Notes
 
 - `manual` prints the records to apply by hand and reads no credentials. It is
   the fallback for self-hosted authoritative servers (BIND, PowerDNS, Knot).
-- `gcp-dns` and `azure-dns` take a short-lived OAuth2 access token in
-  `GCP_ACCESS_TOKEN` / `AZURE_ACCESS_TOKEN`. Mint it with `gcloud` / `az`.
+- `gcp-dns` and `azure-dns` take a **long-lived** credential and exchange it for a short-lived token
+  **host-side** (cap-req #31 — no short-lived token is accepted anywhere): GCP a service-account JSON key
+  (`GCP_SERVICE_ACCOUNT_JSON`, the whole key file; the project is read from its `project_id`), Azure a
+  service principal (`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`). The minted token is
+  cached until near expiry and never persisted.
 - `route53` reads `ROUTE53_HOSTED_ZONE_ID` for the zone and resolves credentials
   through the standard AWS provider chain (environment, shared config, instance
   role).
@@ -102,8 +105,8 @@ Mirror each provider's env vars, lowercased/namespaced. **Bold** = secret (must 
 | `hetzner` | `zone`, **`token`** |
 | `ns1` | `zone`, **`api_key`** |
 | `dnsimple` | `account_id`, `zone`, **`token`** |
-| `gcp-dns` | `project`, `zone`, **`access_token`** |
-| `azure-dns` | `subscription_id`, `resource_group`, `zone`, **`access_token`** |
+| `gcp-dns` | `zone` (managed-zone name), **`service_account_json`** (project read from it) |
+| `azure-dns` | `tenant_id`, `client_id`, **`client_secret`**, `subscription_id`, `resource_group`, `zone` |
 | `akamai` | `host`, **`client_token`**, **`client_secret`**, **`access_token`**, `zone` |
 
 For **guest `dns-publish`** over the multi-zone registry, set
@@ -117,6 +120,101 @@ write. See [`serve.dns_providers`](boatramp-cfg.md#servedns_providers).
 > configured zones to that guest, not just one — a broader reach than the pre-registry single-zone
 > model. Keep each grant's `dns_publish_zones` scoped to the exact owner names it needs (the default
 > is deny-all); the allowlist, not the registry, is the per-guest least-privilege bound.
+
+## Runtime per-tenant zone credentials (cap-req #31)
+
+The provider source above is **operator-configured** — the operator holds the provider credential and
+routes guest writes by owner name. A **multi-tenant** app, though, often needs each tenant to connect
+its **own** DNS zone with its **own** provider credentials (e.g. a mailroom tenant publishing
+MX/SPF/DKIM/DMARC/ownership records into *its* Cloudflare account). The **runtime per-tenant
+credential** path handles exactly that: a granted guest registers the tenant's credential bundle
+**once**, the host validates it, **seals** the whole bundle (the `[secrets]` key envelope — a
+`[secrets]` section is **required**, otherwise the path is fail-closed) keyed to the resolved `(project,
+tenant)` + `zone-root`, and subsequent writes whose owner name falls under a registered zone-root route
+to the registered credential. **No credential value is ever returned to the guest, logged, or echoed** —
+the guest holds no persistent zone-write secret.
+
+The credential is supplied as a **field map** (`list<credential-field>`), covering the **full** operator
+serve-static adapter set. Two WIT verbs on the `boatramp:handlers/dns-publish` interface drive it (they
+ride the existing `dns-publish` grant — no new grant kind):
+
+```wit
+record credential-field { name: string, value: string }
+enum provider-kind { cloudflare, route53, oci, akamai, dnsimple, gcp, azure, digitalocean, hetzner, ns1 }
+register-zone-credential:   func(zone-root: string, provider: provider-kind, credential: list<credential-field>) -> result<_, publish-error>;
+unregister-zone-credential: func(zone-root: string) -> result<_, publish-error>;
+```
+
+### Per-provider field contract
+
+The host validates the bundle against the provider's schema **before sealing**: every **required** field
+must be present, **no unknown** field names are accepted, and each value is length- and
+**shape**-checked (defense-in-depth so no value can escape its URL-path segment or inject an auth
+header). The **zone** is always the registered `zone-root` — it is *not* a field — except where a
+provider addresses its zone by an opaque id (`zone_id` / `hosted_zone_id`), which **is** a field.
+Mailroom's connect-UI should collect exactly these `name` keys:
+
+| provider | required field names | optional | notes |
+|---|---|---|---|
+| `cloudflare` | `zone_id`, `token` | — | `zone_id` is the opaque Cloudflare zone id |
+| `route53` | `access_key_id`, `secret_access_key`, `region`, `hosted_zone_id` | `session_token` | IAM static creds (+ optional STS token) |
+| `oci` | `region`, `key_id`, `private_key_pem` | — | `private_key_pem` is the multi-line PEM **content** (not a path) |
+| `akamai` | `host`, `client_token`, `client_secret`, `access_token` | — | EdgeGrid; `host` is **pinned** to a `*.akamaiapis.net` subdomain (IP literals + non-Akamai hosts refused — it is the only tenant-set request authority) |
+| `dnsimple` | `account_id`, `token` | — | |
+| `gcp` | `service_account_json`, `managed_zone` | — | the whole **long-lived** service-account JSON (project read from its `project_id`) + the Cloud DNS managed-zone **resource name**; the host signs a JWT + exchanges it for a cached token |
+| `azure` | `tenant_id`, `client_id`, `client_secret`, `subscription_id`, `resource_group` | — | a **long-lived** service principal (GUID `tenant_id`/`client_id`); the host runs client-credentials + caches the token (the zone is the registered zone-root) |
+| `digitalocean` | `token` | — | |
+| `hetzner` | `token` | — | |
+| `ns1` | `api_key` | — | |
+
+Value bounds: a secret/header field ≤ 8 KiB, a PEM ≤ 16 KiB, an id/region/hostname ≤ 128–253 bytes; at
+most 16 fields per bundle. A missing/unknown/oversized/malformed field is `invalid-record` before
+anything is sealed.
+
+> **SSRF note.** Only one field in the whole set becomes a request **authority**: the Akamai `host`
+> (every other provider uses a fixed API host, with tenant ids going into the URL *path* and
+> shape-checked to reject `/`). That `host` is therefore **pinned** to a `*.akamaiapis.net` subdomain —
+> IP literals and any non-Akamai host are refused at register — so a tenant can never aim the dial at an
+> internal/metadata address. (A broader dial-time SSRF floor over every adapter's HTTP client is a
+> noted defense-in-depth follow-up; the pin closes the actual tenant-controlled-authority surface.)
+
+> **GCP / Azure token exchange (cap-req #31).** The `gcp` and `azure` adapters take a **long-lived**
+> credential — a GCP service-account JSON key, an Azure service principal — and exchange it **host-side**
+> for a short-lived bearer token, which is cached (per tenancy) until near expiry and **never sealed,
+> returned, or logged**. The token endpoints are FIXED well-known hosts (`oauth2.googleapis.com` /
+> `login.microsoftonline.com`), pinned (not read from the credential), with the Azure `tenant_id` a
+> GUID-validated path segment — so the exchange has no SSRF surface. No short-lived token is accepted as
+> a stored credential on either the runtime or the operator path.
+
+Fail-closed at every layer, all independent of the operator path:
+
+- **Posture** `allow_guest_dynamic_dns_publish` — **off under `multi-tenant`**, on under
+  `single-tenant`/`dev` (set via `[security.overrides]` /
+  `BOATRAMP_SECURITY_ALLOW_GUEST_DYNAMIC_DNS_PUBLISH`). Off ⇒ every `register`/`unregister` is
+  `access-denied` and no record routes to a runtime credential. Distinct from `allow_guest_dns_publish`.
+
+> **Posture asymmetry (read this).** `allow_guest_dynamic_dns_publish` is **on** under
+> `single-tenant`/`dev`, whereas `allow_guest_dns_publish` (the *operator*-credential path) is **off in
+> *every* built-in profile**. The difference is deliberate: the operator path lets a guest write through
+> the **operator's own** host-held provider credential — a credential whose blast radius is every zone
+> that credential can reach — so it stays opt-in everywhere. The runtime path writes only the **tenant's
+> own** zone with the **tenant's own** token, and the per-component **deny-all** `dynamic_dns_zones`
+> allowlist (not the posture) is the real gate — so under `single-tenant`/`dev` (where the one tenant is
+> effectively the operator) it is on by default, exactly like `allow_guest_dynamic_egress`. On a
+> `multi-tenant` node it is **off** until the operator opts in. An operator can set either knob
+> independently.
+- **Per-component `dynamic_dns_zones` allowlist** — the zone-root globs a guest may register a
+  credential for (same globbing as `dns_publish_zones`; `acme.com`, `**.acme.com`). **Empty ⇒ deny-all.**
+  Distinct from `dns_publish_zones` (which fences *operator*-credential writes by the record's own name).
+- **Resolved tenant** — the registry is keyed to THIS invocation's host-resolved own tenant (never guest
+  input). A guest in project A / tenant T can never register, read, route through, or unregister another
+  tenant's credential; no resolved tenant ⇒ the path is inert.
+- **Sealing** — the WHOLE credential bundle is sealed at rest with the same AEAD as the per-tenant
+  secret store; with no `[secrets]` envelope the path is fail-closed.
+
+A zone with **no** registered runtime credential falls through to the operator serve-static path above,
+unchanged. See [`HandlerConfig::dynamic_dns_zones`](boatramp-cfg.md) and
+[`allow_guest_dynamic_dns_publish`](boatramp-cfg.md#security).
 
 ## See also
 

@@ -1755,7 +1755,12 @@ pub(super) async fn build_function_bindings(
             granted("dns-publish"),
             project.as_str(),
             sql_site,
+            // THIS invocation's host-resolved OWN tenant (cap-req #31): the key for the runtime
+            // per-tenant credential store (`None` ⇒ the runtime path is inert — fail-closed).
+            resolved_tenant_string(&caller_tenant).as_deref(),
             &config.dns_publish_zones,
+            // The function's runtime-registerable zone-root allowlist (cap-req #31): empty ⇒ deny-all.
+            &config.dynamic_dns_zones,
             // The function's NS-target allowlist for a sub-zone NS delegation (MEDIUM-3): empty ⇒
             // deny-all under the `allowlist` NS posture.
             &config.dns_publish_ns_targets,
@@ -4324,6 +4329,7 @@ mod blobstore_dimension0_tests {
             blobstore_containers: &containers,
             egress_allowlist: &[],
             dns_publish_zones: &[],
+            dynamic_dns_zones: &[],
             dns_publish_ns_targets: &[],
             secret_allowlist: &[],
         };

@@ -190,22 +190,37 @@ async fn build_adapter(
             ))
         }
         DnsProviderKind::GcpDns => {
-            let project = r
-                .required(label, kname, "project", s(&cfg.project), false)
-                .await?;
+            // cap-req #31: a LONG-LIVED service-account JSON (project read from its `project_id`), NOT a
+            // short-lived access token. The adapter signs a JWT + exchanges it host-side (cached).
             let zone = r
                 .required(label, kname, "zone", s(&cfg.zone), false)
                 .await?;
-            let access_token = r
-                .required(label, kname, "access_token", s(&cfg.access_token), true)
+            let service_account_json = r
+                .required(
+                    label,
+                    kname,
+                    "service_account_json",
+                    s(&cfg.service_account_json),
+                    true,
+                )
                 .await?;
-            Arc::new(boatramp_acme::gcp_dns::GcpDns::new(
-                project,
-                zone,
-                access_token,
-            ))
+            Arc::new(
+                boatramp_acme::gcp_dns::GcpDns::from_service_account(zone, &service_account_json)
+                    .map_err(|e| Error::DnsProvidersConfig(format!("provider {label:?}: {e}")))?,
+            )
         }
         DnsProviderKind::AzureDns => {
+            // cap-req #31: a LONG-LIVED service principal (tenant/client id + secret), NOT a short-lived
+            // access token. The adapter runs client-credentials + caches the minted token host-side.
+            let tenant_id = r
+                .required(label, kname, "tenant_id", s(&cfg.tenant_id), false)
+                .await?;
+            let client_id = r
+                .required(label, kname, "client_id", s(&cfg.client_id), false)
+                .await?;
+            let client_secret = r
+                .required(label, kname, "client_secret", s(&cfg.client_secret), true)
+                .await?;
             let subscription_id = r
                 .required(
                     label,
@@ -227,14 +242,13 @@ async fn build_adapter(
             let zone = r
                 .required(label, kname, "zone", s(&cfg.zone), false)
                 .await?;
-            let access_token = r
-                .required(label, kname, "access_token", s(&cfg.access_token), true)
-                .await?;
-            Arc::new(boatramp_acme::azure_dns::AzureDns::new(
+            Arc::new(boatramp_acme::azure_dns::AzureDns::from_service_principal(
+                &tenant_id,
+                client_id,
+                client_secret,
                 subscription_id,
                 resource_group,
                 zone,
-                access_token,
             ))
         }
         DnsProviderKind::Akamai => {

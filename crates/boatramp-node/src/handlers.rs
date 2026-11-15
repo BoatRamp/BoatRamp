@@ -234,6 +234,11 @@ pub async fn build_handler_runtime(
     // the `DnsPublishHost` binding fail-closed to `access-denied` for every call. INDEPENDENT of the
     // egress knobs (DNS write is a distinct authority).
     allow_guest_dns_publish: bool,
+    // Posture: whether a guest may register a RUNTIME, host-sealed, per-tenant DNS-write credential and
+    // route writes through it (cap-req #31). OFF under multi-tenant; when off the engine makes every
+    // `register`/`unregister` `access-denied` and routes no record to a runtime credential. INDEPENDENT
+    // of `allow_guest_dns_publish`.
+    allow_guest_dynamic_dns_publish: bool,
     // Posture: the sub-zone `NS` delegation setting for a guest's `dns-publish` (Security review
     // MEDIUM-3). `none` refuses all sub-zone NS, `allowlist` holds the NS target to the per-grant
     // allowlist, `any` is today's behavior. Typed as the `boatramp-core` posture enum (always
@@ -524,6 +529,9 @@ pub async fn build_handler_runtime(
     // Posture gate for the guest `dns-publish` write capability (cap-req #24 WS3). OFF by default ⇒
     // fail-closed `access-denied`. INDEPENDENT of the egress knobs.
     .with_dns_publish(allow_guest_dns_publish)
+    // Posture gate for the RUNTIME per-tenant DNS-credential path (cap-req #31). OFF under multi-tenant
+    // ⇒ every register/route is fail-closed. INDEPENDENT of `with_dns_publish`.
+    .with_dynamic_dns_publish(allow_guest_dynamic_dns_publish)
     // Sub-zone `NS` delegation posture (Security review MEDIUM-3): map the `boatramp-core` posture
     // enum onto the handler-engine mirror (this layer owns both; the engine crate can't see types).
     .with_dns_publish_ns(match guest_dns_publish_ns {
@@ -1100,6 +1108,9 @@ pub async fn build_handler_runtime(
     // (the caller passes the posture value unconditionally); a lean node has no guest `dns-publish` to
     // gate, so it is ignored.
     _allow_guest_dns_publish: bool,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature (cap-req #31); a lean node has
+    // no guest `dns-publish` runtime path to gate, so it is ignored.
+    _allow_guest_dynamic_dns_publish: bool,
     // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single node.rs caller
     // (the caller passes the posture value unconditionally); a lean node has no guest `dns-publish` to
     // gate, so the sub-zone-NS posture is ignored (MEDIUM-3).

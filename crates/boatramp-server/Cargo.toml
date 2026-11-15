@@ -245,7 +245,23 @@ tcp-egress = [
 # per-grant binding attach) + the `boatramp-handlers/dns-publish` host binding. Fail-closed by default:
 # the provider source is installed by the top-level crate, so without it every guest call is
 # `access-denied`. Implies `handlers`. Experimental.
-dns-publish = ["handlers", "boatramp-handlers/dns-publish"]
+dns-publish = [
+  "handlers",
+  "boatramp-handlers/dns-publish",
+  # The RUNTIME per-tenant credential factory (cap-req #31) builds the FULL serve-static `boatramp-acme`
+  # adapter set; each adapter is behind its own `boatramp-acme` feature (its client deps are optional).
+  "dep:boatramp-acme",
+  "boatramp-acme/cloudflare",
+  "boatramp-acme/route53",
+  "boatramp-acme/oci",
+  "boatramp-acme/akamai",
+  "boatramp-acme/dnsimple",
+  "boatramp-acme/gcp-dns",
+  "boatramp-acme/azure-dns",
+  "boatramp-acme/digitalocean",
+  "boatramp-acme/hetzner",
+  "boatramp-acme/ns1",
+]
 
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via
@@ -467,6 +483,12 @@ time = { version = "0.3", default-features = false, features = [
 ], optional = true }
 
 boatramp-handlers = { workspace = true, optional = true }
+# The `boatramp-acme` DNS adapters (Cloudflare / DigitalOcean / Hetzner / NS1) the RUNTIME per-tenant
+# `dns-publish` credential factory builds (cap-req #31). OPTIONAL + tied to the `dns-publish` feature,
+# so a lean (no-dns-publish) build never pulls it (it is already in the graph transitively via
+# `boatramp-handlers` when `dns-publish` is on, so this adds no new crate). Also a dev-dependency below
+# (the serve-wiring gate uses it unconditionally in tests).
+boatramp-acme = { workspace = true, optional = true }
 # Byte buffers for the serving path (multipart/byteranges part headers) + the
 # handler/gateway body plumbing.
 bytes.workspace = true

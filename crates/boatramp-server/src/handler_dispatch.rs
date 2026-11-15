@@ -634,6 +634,8 @@ pub(super) async fn dispatch_handler(
         &handler.dynamic_egress_hosts,
         // Per-handler `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
         &handler.dns_publish_zones,
+        // Per-handler runtime-registerable zone-root allowlist (cap-req #31): empty ⇒ deny-all.
+        &handler.dynamic_dns_zones,
         // Per-handler `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.
         &handler.dns_publish_ns_targets,
         // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool, else only these keys.
@@ -2446,6 +2448,11 @@ pub(super) async fn build_bindings(
     // `handlers`-on/`dns-publish`-off build.
     #[cfg_attr(not(feature = "dns-publish"), allow(unused_variables))]
     dns_publish_zones: &[String],
+    // Per-component runtime-registerable zone-root allowlist for the RUNTIME per-tenant `dns-publish`
+    // credential path (cap-req #31): the zone-root globs a guest may register its OWN sealed credential
+    // for. Empty ⇒ deny-all. Consumed only under the `dns-publish` feature (the attach below).
+    #[cfg_attr(not(feature = "dns-publish"), allow(unused_variables))]
+    dynamic_dns_zones: &[String],
     // Per-component approved NS-target allowlist for a sub-zone `NS` delegation (Security review
     // MEDIUM-3, cap-req #24): the authorized nameserver targets this component's sub-zone NS may
     // delegate to, consulted by the host ONLY under the `allowlist` NS posture (`guest_dns_publish_ns`).
@@ -3363,7 +3370,12 @@ pub(super) async fn build_bindings(
             granted("dns-publish"),
             project.as_str(),
             site,
+            // THIS invocation's host-resolved OWN tenant (cap-req #31): the runtime credential store key
+            // (`None` ⇒ the runtime path is inert — fail-closed), the SAME value the SQL scope injector /
+            // blob confinement / `tenant-secrets` use.
+            super::function_runtime::resolved_tenant_string(&handler_caller_tenant).as_deref(),
             dns_publish_zones,
+            dynamic_dns_zones,
             dns_publish_ns_targets,
         );
     }
@@ -3812,6 +3824,10 @@ pub(super) struct ConsumerRebuild<'a> {
     /// The consumer's per-component `dns-publish` writable-zone allowlist (cap-req #24 WS3). Empty ⇒
     /// deny-all. Threaded so a per-message rebuild gates DNS writes identically to the once-per-tick build.
     pub dns_publish_zones: &'a [String],
+    /// The consumer's per-component runtime-registerable zone-root allowlist (cap-req #31). Empty ⇒
+    /// deny-all. Threaded so a per-message rebuild gates runtime DNS-credential registration identically
+    /// to the once-per-tick build.
+    pub dynamic_dns_zones: &'a [String],
     /// The consumer's per-component `dns-publish` NS-target allowlist (Security review MEDIUM-3). Empty
     /// ⇒ deny-all under the `allowlist` NS posture. Threaded so a per-message rebuild gates a sub-zone
     /// NS delegation identically to the once-per-tick build.
@@ -3850,6 +3866,7 @@ impl ConsumerRebuild<'_> {
             // DYNAMIC egress host allowlist (BR-REQ-2): empty for this test harness.
             &[],
             self.dns_publish_zones,
+            self.dynamic_dns_zones,
             self.dns_publish_ns_targets,
             self.secret_allowlist,
             // Consumers resolve their secrets as before (no `no_secrets` opt-out on the async lane).
@@ -5151,6 +5168,8 @@ mod consumer_dns_resolve_tests {
             // dynamic_egress_hosts (BR-REQ-2): empty ⇒ the runtime-host path is deny-all here.
             &[],
             // dns_publish_zones (cap-req #24 WS3): empty ⇒ deny-all (this test exercises egress only).
+            &[],
+            // dynamic_dns_zones (cap-req #31): empty ⇒ the runtime per-tenant credential path is deny-all here.
             &[],
             // dns_publish_ns_targets (MEDIUM-3): empty ⇒ deny-all under the `allowlist` NS posture.
             &[],

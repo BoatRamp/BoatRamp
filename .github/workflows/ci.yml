@@ -31,6 +31,13 @@ name: CI
 #                       REAL router() pipeline — access-denied with no provider source installed, then
 #                       applied + captured once serve's boot wiring installs it — so the serve seam
 #                       can't regress to inert again),
+#                       live-gate-dns-publish-tenant-creds (cap-req #31: the RUNTIME per-tenant
+#                       credential path — register seals a tenant token, a routed upsert reaches it,
+#                       unregister falls through, disallowed-zone/posture-off are access-denied, a
+#                       second tenant has zero cross-tenant access — mutation-proven on the posture,
+#                       allowlist, and tenancy-key checks),
+#                       live-gate-dns-oauth-exchange (cap-req #31: the gcp/azure long-lived-credential
+#                       token exchange + caching against a local mock endpoint — no real egress),
 #                       live-gate-kv-stratum-sync (PLAN-project-sync: the node-side selective-sync KV
 #                       endpoint carrying settings/graphql/history between two in-process router()
 #                       nodes — round-trip + coherence, the history→siteconfig dependency skip, an
@@ -1776,6 +1783,61 @@ jobs:
             || { echo "::error::dns-publish live gate did not run (silent skip or a failure)" >&2; exit 1; }
           grep -q 'DNS-PUBLISH LIVE OK' dns-publish-live.log \
             || { echo "::error::dns-publish live gate never reached its marker (a guest DNS-write serve-path / fail-closed-gate regression — #24 WS3)" >&2; exit 1; }
+
+  # cap-req #31 RUNTIME per-tenant DNS-credential gate (marker `DNS-PUBLISH TENANT-CREDS LIVE OK`). One
+  # end-to-end run over the REAL `TenantDnsCredStore` (sealing envelope) + a FAKE provider factory (no
+  # real DNS provider): a posture-gated guest registers a sealed credential for an allowlisted zone-root,
+  # a subsequent upsert ROUTES to it, the token is sealed at rest + never returned, unregister falls the
+  # zone through, a disallowed-zone + posture-off are both access-denied, and a second tenant has ZERO
+  # cross-tenant access. Structured so dropping the posture check, the allowlist check, or the tenancy
+  # key turns it RED (mutation-proven).
+  live-gate-dns-publish-tenant-creds:
+    name: live gate (dns-publish tenant-creds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-dns-publish-tenant-creds-musl
+
+      - name: "dns-publish runtime per-tenant credential gate (register / seal / route / unregister / disallowed / posture-off / cross-tenant)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features dns-publish --lib bindings::dns_publish::tests::tenant_creds_live_gate \
+            -- --nocapture 2>&1 | tee dns-publish-tenant-creds.log
+          grep -qE 'test result: ok\. 1 passed' dns-publish-tenant-creds.log \
+            || { echo "::error::dns-publish tenant-creds gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'DNS-PUBLISH TENANT-CREDS LIVE OK' dns-publish-tenant-creds.log \
+            || { echo "::error::dns-publish tenant-creds gate never reached its marker (a runtime per-tenant credential seal/route/tenancy/posture regression — cap-req #31)" >&2; exit 1; }
+
+  # cap-req #31 GCP/Azure OAuth token-exchange gate: the gcp (service-account JWT-bearer) + azure
+  # (service-principal client-credentials) adapters mint a short-lived token at a LOCAL MOCK token
+  # endpoint (never real Google/Azure), parse it, and CACHE it (the second call does not re-exchange).
+  # Proves the long-lived-credential exchange + cache without any network egress.
+  live-gate-dns-oauth-exchange:
+    name: live gate (dns oauth exchange)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-gate-dns-oauth-exchange-musl
+
+      - name: "gcp/azure long-lived-credential token exchange + caching (mock endpoint, no real egress)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-acme \
+            --features gcp-dns,azure-dns --lib oauth_gate \
+            -- --nocapture 2>&1 | tee dns-oauth-exchange.log
+          grep -qE 'test result: ok\. 4 passed' dns-oauth-exchange.log \
+            || { echo "::error::dns oauth-exchange gate did not run all 4 exchange/cache tests (a GCP JWT-bearer / Azure client-credentials / token-cache regression — cap-req #31)" >&2; exit 1; }
 
   # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
   # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the

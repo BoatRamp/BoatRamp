@@ -29,7 +29,9 @@ digitalocean = ["dep:reqwest", "dep:serde_json"]
 hetzner = ["dep:reqwest", "dep:serde_json"]
 ns1 = ["dep:reqwest", "dep:serde_json"]
 dnsimple = ["dep:reqwest", "dep:serde_json"]
-gcp-dns = ["dep:reqwest", "dep:serde_json"]
+# GCP service-account JWT-bearer exchange signs an RS256 JWT host-side (reusing the `rsa` crate the OCI
+# signer already pulls; `base64`/`sha2` are always-on workspace deps).
+gcp-dns = ["dep:reqwest", "dep:serde_json", "dep:rsa"]
 azure-dns = ["dep:reqwest", "dep:serde_json"]
 akamai = ["dep:reqwest", "dep:serde_json", "dep:hmac"]
 

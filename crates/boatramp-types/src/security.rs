@@ -113,6 +113,9 @@ impl SecurityProfile {
                 allow_guest_dynamic_egress: false,
                 allow_guest_tcp_listener: false,
                 allow_guest_dns_publish: false,
+                // A new, security-sensitive runtime zone-credential surface (cap-req #31): OFF under
+                // multi-tenant until the operator opts in. Its own Security review gates the default.
+                allow_guest_dynamic_dns_publish: false,
                 // A multi-tenant guest may NOT delegate a sub-zone NS to any nameserver (MEDIUM-3).
                 guest_dns_publish_ns: GuestDnsPublishNs::None,
                 max_handler_blob_bytes: MT_MAX_BLOB,
@@ -153,6 +156,11 @@ impl SecurityProfile {
                 // A new, security-sensitive zone-write surface: OFF even on single-tenant until the
                 // operator opts in explicitly (its Security review gates the broader default).
                 allow_guest_dns_publish: false,
+                // The RUNTIME per-tenant zone-credential path (cap-req #31): ON under single-tenant —
+                // the one tenant supplies its OWN provider token for its OWN zone (still fenced by the
+                // per-component `dynamic_dns_zones` allowlist + the host-sealed store). An operator can
+                // still override it off. (Distinct from the operator serve-static path above.)
+                allow_guest_dynamic_dns_publish: true,
                 // A single operator who owns every site may delegate a sub-zone NS, but only to a
                 // nameserver on the per-grant allowlist (never an arbitrary target) — MEDIUM-3.
                 guest_dns_publish_ns: GuestDnsPublishNs::Allowlist,
@@ -194,6 +202,9 @@ impl SecurityProfile {
                 // Off even under dev — a guest `dns-publish` would mutate REAL external DNS (the
                 // provider credential is real); an operator opts in explicitly.
                 allow_guest_dns_publish: false,
+                // The RUNTIME per-tenant zone-credential path (cap-req #31): ON under dev (the dev
+                // operator supplies its own token for its own zone; still allowlist- + seal-fenced).
+                allow_guest_dynamic_dns_publish: true,
                 // Dev is loopback-loose: once an operator opts `dns-publish` on, a sub-zone NS may
                 // delegate to any target (MEDIUM-3). The apex-NS guardrail still applies.
                 guest_dns_publish_ns: GuestDnsPublishNs::Any,
@@ -311,6 +322,12 @@ pub struct PostureOverrides {
     /// zone-write surface; an operator opts in explicitly. Independent of the egress knobs (DNS write
     /// is a distinct authority). See [`SecurityPosture::allow_guest_dns_publish`].
     pub allow_guest_dns_publish: Option<bool>,
+    /// Permit a **guest** to register a RUNTIME, host-sealed, per-tenant DNS-write credential and route
+    /// `dns-publish` writes through it (cap-req #31) — the dynamic analogue of the operator serve-static
+    /// `dns_providers` registry. **Off** under `multi-tenant`, **on** under `single-tenant`/`dev`.
+    /// INDEPENDENT of [`allow_guest_dns_publish`](Self::allow_guest_dns_publish) (which gates the
+    /// operator serve-static path). See [`SecurityPosture::allow_guest_dynamic_dns_publish`].
+    pub allow_guest_dynamic_dns_publish: Option<bool>,
     /// Posture for a guest's **sub-zone `NS` delegation** via `dns-publish` (Security review MEDIUM-3):
     /// `none` (refuse all sub-zone NS), `allowlist` (only an NS target on the per-grant
     /// `dns_publish_ns_targets` allowlist), or `any` (today's behavior). See
@@ -551,6 +568,11 @@ impl SecurityConfig {
             o.allow_guest_dns_publish.is_some(),
         );
         row(
+            "allow_guest_dynamic_dns_publish",
+            p.allow_guest_dynamic_dns_publish.to_string(),
+            o.allow_guest_dynamic_dns_publish.is_some(),
+        );
+        row(
             "guest_dns_publish_ns",
             p.guest_dns_publish_ns.as_str().to_string(),
             o.guest_dns_publish_ns.is_some(),
@@ -759,6 +781,19 @@ pub struct SecurityPosture {
     /// default even on `single-tenant`/`dev` — an operator opts in explicitly. INDEPENDENT of every
     /// egress knob (DNS write is a distinct authority). Any single wiring omission fails CLOSED.
     pub allow_guest_dns_publish: bool,
+    /// Permit a **guest** to register a RUNTIME, host-sealed, per-tenant DNS-write credential and route
+    /// `dns-publish` writes through it (cap-req #31): the tenant connects its OWN zone with its OWN
+    /// provider API token; the host SEALS the token (the `[secrets]` key envelope), holds it keyed to
+    /// the resolved `(project, tenant)`, and routes a write whose name falls under a registered
+    /// `zone-root` to it — the token is NEVER returned to the guest. This is the dynamic analogue of the
+    /// operator serve-static `dns_providers` registry. `false` makes every `register`/`unregister`
+    /// `access-denied` and keeps every record on the operator serve-static path. **Off** under
+    /// `multi-tenant` (a new, security-sensitive surface — the operator opts in), **on** under
+    /// `single-tenant`/`dev`. Still fenced by the per-component `dynamic_dns_zones` allowlist (empty ⇒
+    /// deny-all) + the sealed per-tenant store. INDEPENDENT of
+    /// [`allow_guest_dns_publish`](Self::allow_guest_dns_publish). Any single wiring omission fails
+    /// CLOSED.
+    pub allow_guest_dynamic_dns_publish: bool,
     /// The posture governing a guest's **sub-zone `NS` delegation** via `dns-publish` (Security review
     /// MEDIUM-3, cap-req #24). A sub-zone NS hands a subtree to an arbitrary nameserver — a persistent,
     /// post-revocation, unaudited authority handoff — so it is gated SEPARATELY from the own-name
@@ -943,6 +978,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_dns_publish {
         base.allow_guest_dns_publish = v;
+    }
+    if let Some(v) = o.allow_guest_dynamic_dns_publish {
+        base.allow_guest_dynamic_dns_publish = v;
     }
     if let Some(v) = o.guest_dns_publish_ns {
         base.guest_dns_publish_ns = v;

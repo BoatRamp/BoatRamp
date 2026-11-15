@@ -815,6 +815,7 @@ mod tests {
             egress_allowlist: Vec::new(),
             dynamic_egress_hosts: Vec::new(),
             dns_publish_zones: Vec::new(),
+            dynamic_dns_zones: Vec::new(),
             dns_publish_ns_targets: Vec::new(),
         };
         let handlers = vec![
@@ -861,6 +862,7 @@ mod tests {
             egress_allowlist: Vec::new(),
             dynamic_egress_hosts: Vec::new(),
             dns_publish_zones: Vec::new(),
+            dynamic_dns_zones: Vec::new(),
             dns_publish_ns_targets: Vec::new(),
         }
     }

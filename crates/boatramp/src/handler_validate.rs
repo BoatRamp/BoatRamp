@@ -268,7 +268,18 @@ mod imp {
     /// grant kind) and the same egress posture + budget gate, so a pre-#30 host that lacks the
     /// function simply rejects the unknown func at link — the loud-fail the surface bump makes
     /// visible. No SSRF floor (a TXT value is opaque text, not a dialable address).
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 13, 0);
+    ///
+    /// `0.14.0` (cap-req #31): the `dns-publish` interface gained two verbs —
+    /// `register-zone-credential(zone-root, provider, credential: list<credential-field>)` /
+    /// `unregister-zone-credential(zone-root)` — for the RUNTIME per-tenant zone-credential path (a
+    /// tenant connects its OWN zone with its OWN sealed provider credential bundle, covering the full
+    /// serve-static provider set). They ride the EXISTING `dns-publish` import/grant (no new grant kind),
+    /// gated deny-by-default by a NEW node posture `allow_guest_dynamic_dns_publish` (OFF under
+    /// multi-tenant) + a per-component `dynamic_dns_zones` allowlist (empty ⇒ deny-all) + the host-sealed
+    /// per-tenant store. A pre-#31 host lacking the new verbs rejects a guest that imports them at link —
+    /// the loud-fail this surface bump makes visible. The verb signatures carry the full
+    /// `credential-field` provider map (10 serve-static providers incl. gcp/azure OAuth).
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 14, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]
@@ -893,6 +904,7 @@ mod imp {
                     egress_allowlist: Vec::new(),
                     dynamic_egress_hosts: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dynamic_dns_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],
                 ..Default::default()

@@ -1,13 +1,20 @@
-//! Google Cloud DNS provider (v1 REST, OAuth2 bearer token).
+//! Google Cloud DNS provider (v1 REST), authenticating via a LONG-LIVED **service-account key**
+//! exchanged host-side for a short-lived token.
 //!
 //! Cloud DNS edits are atomic **changes** (a batch of `additions` + `deletions`
 //! posted to `…/changes`) with no in-place update: to replace a record set you
 //! delete the current one — by its *exact* current object — and add the new one
 //! in the same change, so `upsert` first reads the current rrset. Two format
 //! rules the helpers encode: names are FQDNs with a trailing dot, and TXT rrdata
-//! is double-quoted. The access token comes from the environment
-//! (`GCP_ACCESS_TOKEN`), matching the KMS signer — no embedded SDK credential
-//! flow. Request construction is pure + unit-tested; the round-trip is a live seam.
+//! is double-quoted. Request construction is pure + unit-tested; the round-trip is a live seam.
+//!
+//! **Credential (cap-req #31): a LONG-LIVED service-account key, exchanged host-side.** The adapter
+//! takes the whole service-account JSON (`client_email` + `private_key` + `project_id`), builds and
+//! RS256-signs a JWT host-side, and exchanges it (`urn:ietf:params:oauth:grant-type:jwt-bearer`) at the
+//! FIXED Google token endpoint for a short-lived access token, which it CACHES (per adapter instance)
+//! until near expiry. No short-lived token is ever accepted as the stored credential, and the minted
+//! token is never sealed, returned, or logged. The token endpoint is pinned (not read from the JSON's
+//! `token_uri`), so a crafted SA JSON cannot redirect the exchange.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -15,37 +22,117 @@ use serde::Deserialize;
 use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
 const DEFAULT_API_BASE: &str = "https://dns.googleapis.com/dns/v1";
+/// The FIXED Google OAuth2 token endpoint (pinned — never taken from the service-account JSON).
+const GCP_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+/// The Cloud DNS read-write scope the minted token is requested for.
+const GCP_SCOPE: &str = "https://www.googleapis.com/auth/ndev.clouddns.readwrite";
 
-/// A Google Cloud DNS editor scoped to one managed zone.
+/// The service-account JSON fields the adapter needs (the rest of the key file is ignored). The
+/// `token_uri` in the file is deliberately NOT used for the exchange (pinned) — only the signing
+/// identity + key + project matter.
+#[derive(Deserialize)]
+struct ServiceAccountKey {
+    client_email: String,
+    private_key: String,
+    project_id: String,
+}
+
+/// A Google Cloud DNS editor scoped to one managed zone, authenticating via a sealed service-account
+/// key exchanged host-side for a cached short-lived token.
 pub struct GcpDns {
     client: reqwest::Client,
     api_base: String,
-    token: String,
+    /// The token-exchange endpoint (pinned to [`GCP_TOKEN_ENDPOINT`]; overridable in tests only).
+    token_endpoint: String,
     project: String,
     zone: String,
+    client_email: String,
+    signing_key: rsa::pkcs1v15::SigningKey<rsa::sha2::Sha256>,
+    token_cell: crate::oauth::TokenCell,
 }
 
 impl GcpDns {
-    /// Build a provider for `project` + managed `zone`, authenticating with an
-    /// OAuth2 access token scoped for Cloud DNS.
-    pub fn new(
-        project: impl Into<String>,
+    /// Build a provider for managed `zone` from a service-account JSON key (cap-req #31). The project is
+    /// read from the key's `project_id`. A malformed JSON / missing field / bad private key is a
+    /// [`DnsError::Config`].
+    pub fn from_service_account(
         zone: impl Into<String>,
-        token: impl Into<String>,
-    ) -> Self {
-        Self {
+        service_account_json: &str,
+    ) -> Result<Self, DnsError> {
+        use rsa::pkcs8::DecodePrivateKey;
+        let sa: ServiceAccountKey = serde_json::from_str(service_account_json)
+            .map_err(|e| DnsError::Config(format!("GCP service-account JSON: {e}")))?;
+        let key = rsa::RsaPrivateKey::from_pkcs8_pem(&sa.private_key)
+            .map_err(|e| DnsError::Config(format!("GCP service-account private key: {e}")))?;
+        Ok(Self {
             client: reqwest::Client::new(),
             api_base: DEFAULT_API_BASE.to_string(),
-            token: token.into(),
-            project: project.into(),
+            token_endpoint: GCP_TOKEN_ENDPOINT.to_string(),
+            project: sa.project_id,
             zone: zone.into(),
-        }
+            client_email: sa.client_email,
+            signing_key: rsa::pkcs1v15::SigningKey::<rsa::sha2::Sha256>::new(key),
+            token_cell: crate::oauth::TokenCell::new(),
+        })
     }
 
     /// Override the API base URL (for pointing tests at a stub).
     pub fn with_api_base(mut self, base: impl Into<String>) -> Self {
         self.api_base = base.into();
         self
+    }
+
+    /// Override the token-exchange endpoint — TESTS ONLY (point it at a local mock); `#[cfg(test)]` +
+    /// private, so it is unreachable from any non-test caller. Production pins [`GCP_TOKEN_ENDPOINT`].
+    #[cfg(test)]
+    fn with_token_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.token_endpoint = endpoint.into();
+        self
+    }
+
+    /// A valid access token — cached, or minted by a fresh JWT-bearer exchange (cap-req #31).
+    async fn token(&self) -> Result<String, DnsError> {
+        self.token_cell.get_or_exchange(|| self.exchange()).await
+    }
+
+    /// Mint a token: sign a JWT with the service-account key and POST the jwt-bearer assertion to the
+    /// FIXED token endpoint.
+    async fn exchange(&self) -> Result<(String, u64), DnsError> {
+        let assertion = self.signed_jwt()?;
+        crate::oauth::post_token(
+            &self.client,
+            &self.token_endpoint,
+            &[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", &assertion),
+            ],
+        )
+        .await
+    }
+
+    /// Build + RS256-sign the JWT-bearer assertion (`iss`=client_email, `scope`=Cloud DNS,
+    /// `aud`=the pinned token endpoint, short `iat`/`exp`).
+    fn signed_jwt(&self) -> Result<String, DnsError> {
+        use base64::Engine;
+        use rsa::signature::{SignatureEncoding, Signer};
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let now = crate::now_secs();
+        let header = b64.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let claims = serde_json::json!({
+            "iss": self.client_email,
+            "scope": GCP_SCOPE,
+            "aud": self.token_endpoint,
+            "iat": now,
+            "exp": now + 3600,
+        });
+        let claims_json =
+            serde_json::to_vec(&claims).map_err(|e| DnsError::Backend(e.to_string()))?;
+        let signing_input = format!("{header}.{}", b64.encode(claims_json));
+        let signature = self.signing_key.sign(signing_input.as_bytes());
+        Ok(format!(
+            "{signing_input}.{}",
+            b64.encode(signature.to_bytes())
+        ))
     }
 
     /// A name as an FQDN with the trailing dot Cloud DNS requires.
@@ -168,7 +255,7 @@ impl GcpDns {
         let resp = self
             .client
             .get(self.rrsets_url())
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.token().await?)
             .query(&[
                 ("name", Self::fqdn(&record.name)),
                 ("type", record.kind.as_str().to_string()),
@@ -188,7 +275,7 @@ impl GcpDns {
     async fn post_change(&self, change: serde_json::Value) -> Result<(), DnsError> {
         self.client
             .post(self.changes_url())
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.token().await?)
             .json(&change)
             .send()
             .await
@@ -262,8 +349,77 @@ impl DnsProvider for GcpDns {
 mod tests {
     use super::*;
 
+    /// A throwaway RSA key (PKCS#8 PEM) + a service-account JSON wrapping it, for construction tests.
+    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIBVAIBADANBgkqhkiG9w0BAQEFAASCAT4wggE6AgEAAkEA5SrFVYD26w2NArwi\n\
+6uNqb0rEKalyCAaSLeURe7sWG6FSMY1SoZ0klwDoVzTw83Sg6UWOlP7ZULzP43F1\n\
+dfBy5QIDAQABAkEA4t+KBxEq4h9DN67r3qCP8WgSdbBjzOA8faUmvtjDlUsrcPrr\n\
+97v9jcBeflXcw/uG8pQ1p+tWJDOKA+UN3oECzQIhAPe0thijPyMLOQEX2K3LFLtK\n\
+Z0oHkKqFyXt7kZmDUlMvAiEA7Ncl7GYtqI5ZjalxU/SB5a7sL+6KqJcK1lXgvnKU\n\
+pisCIAF7SzuKfm4vOwAOrHUdqdoU79k5glwCwNnEO3K3nl5xAiBSLNgwrMc8y59Q\n\
+4rC6k4Saf9XdT6P2mOmeso9XJQRknwIgG689c5E5fvq9T4eam9dBCNJup4IgI6VT\n\
+sAmaXlKwnv8=\n\
+-----END PRIVATE KEY-----\n";
+
+    /// A minimal service-account JSON with `project_id = proj`, for the construction tests.
+    fn test_sa_json() -> String {
+        serde_json::json!({
+            "client_email": "dns@proj.iam.gserviceaccount.com",
+            "private_key": TEST_KEY_PEM,
+            "project_id": "proj",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+        .to_string()
+    }
+
     fn provider() -> GcpDns {
-        GcpDns::new("proj", "zone1", "tok").with_api_base("https://gcp.test/dns/v1")
+        GcpDns::from_service_account("zone1", &test_sa_json())
+            .expect("valid SA JSON")
+            .with_api_base("https://gcp.test/dns/v1")
+    }
+
+    #[test]
+    fn service_account_json_reads_project_and_builds_signer() {
+        let p = provider();
+        assert_eq!(p.project, "proj");
+        assert_eq!(p.client_email, "dns@proj.iam.gserviceaccount.com");
+        // A valid JWT-bearer assertion is three base64url segments.
+        let jwt = p.signed_jwt().expect("sign");
+        assert_eq!(jwt.split('.').count(), 3);
+    }
+
+    #[tokio::test]
+    async fn oauth_gate_gcp_jwt_bearer_mint_and_cache() {
+        let (url, count) =
+            crate::oauth::test_mock::spawn(r#"{"access_token":"gcp-minted","expires_in":3600}"#)
+                .await;
+        let p = GcpDns::from_service_account("zone1", &test_sa_json())
+            .unwrap()
+            .with_token_endpoint(url);
+        assert_eq!(p.token().await.unwrap(), "gcp-minted");
+        assert_eq!(p.token().await.unwrap(), "gcp-minted");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the JWT-bearer exchange ran once; the second call was cached"
+        );
+    }
+
+    #[test]
+    fn malformed_service_account_json_is_config_error() {
+        assert!(GcpDns::from_service_account("z", "{not json").is_err());
+        assert!(
+            GcpDns::from_service_account("z", r#"{"client_email":"x","project_id":"p"}"#).is_err(),
+            "missing private_key"
+        );
+        assert!(
+            GcpDns::from_service_account(
+                "z",
+                r#"{"client_email":"x","project_id":"p","private_key":"not a pem"}"#
+            )
+            .is_err(),
+            "bad private key"
+        );
     }
 
     #[test]

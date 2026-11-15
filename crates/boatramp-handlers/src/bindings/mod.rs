@@ -488,6 +488,26 @@ impl Bindings {
         self
     }
 
+    /// Attach (or augment) the RUNTIME per-tenant DNS-credential registry (cap-req #31): the host-sealed
+    /// store, the provider factory, and THIS invocation's host-resolved `(project, tenant)` + the
+    /// per-component `dynamic_dns_zones` allowlist. If an operator [`with_dns_publish`](Self::with_dns_publish)
+    /// binding is already present on this `Bindings`, the runtime registry is ADDED to it (both paths
+    /// coexist and route per-zone); otherwise a runtime-only binding is created. The posture gate
+    /// (`allow_guest_dynamic_dns_publish`) + the budget are enforced by the host binding; the guest
+    /// never sees a stored token.
+    #[cfg(feature = "dns-publish")]
+    pub fn with_dns_publish_runtime(
+        mut self,
+        runtime: dns_publish::RuntimeDnsRegistry,
+        audit: std::sync::Arc<dyn dns_publish::DnsPublishAuditSink>,
+    ) -> Self {
+        self.dns_publish = Some(match self.dns_publish.take() {
+            Some(binding) => binding.with_runtime(runtime),
+            None => dns_publish::DnsPublishBinding::runtime_only(runtime, audit),
+        });
+        self
+    }
+
     /// The granted SQL databases (`name -> backend`).
     #[cfg(feature = "sql")]
     pub(crate) fn sql(&self) -> HashMap<String, Arc<dyn SqlBackend>> {

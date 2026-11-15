@@ -184,7 +184,7 @@ tcp-egress = ["engine", "dep:async-trait"]
 # itself pulls no provider-client deps (acme's `default = []`), so this stays lean. Off by default;
 # provided ONLY when the node posture `allow_guest_dns_publish` is on. The shipped binary turns it on
 # via batteries-included. `dep:async-trait` for the object-safe `DnsProvider`/audit-sink seams.
-dns-publish = ["engine", "dep:boatramp-acme", "dep:async-trait"]
+dns-publish = ["engine", "dep:boatramp-acme", "dep:async-trait", "dep:serde_json"]
 
 [dependencies]
 boatramp-core.workspace = true
@@ -228,6 +228,9 @@ async-trait = { workspace = true, optional = true }
 lettre = { workspace = true, optional = true }
 # (De)serialize an outbound email onto the durable spool, behind `email`.
 serde = { workspace = true, optional = true }
+# Validate a guest-supplied GCP service-account JSON credential at register (cap-req #31). Optional,
+# pulled by the `dns-publish` feature only.
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

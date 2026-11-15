@@ -553,6 +553,13 @@ struct HostState {
     /// under its egress posture (cap-req #24 WS3).
     #[cfg(feature = "dns-publish")]
     dns_publish_enabled: bool,
+    /// Whether this invocation's guest may register/route a RUNTIME, host-sealed, per-tenant DNS-write
+    /// credential (copied from the engine's `allow_dynamic_dns_publish` posture — the
+    /// `allow_guest_dynamic_dns_publish` flag, cap-req #31). `false` is the deny-by-default; the binding
+    /// fail-closes every `register`/`unregister` to `access-denied` and routes no record to a runtime
+    /// credential when off. INDEPENDENT of `dns_publish_enabled`.
+    #[cfg(feature = "dns-publish")]
+    dynamic_dns_publish_enabled: bool,
     /// The sub-zone `NS` delegation posture for this invocation (Security review MEDIUM-3), copied from
     /// the engine's `dns_publish_ns` — the `guest_dns_publish_ns` knob. Gates a (non-apex) `NS` write
     /// only: `None` refuses it, `Allowlist` holds the NS target to the per-grant `dns_publish_ns_targets`
@@ -1934,6 +1941,16 @@ pub struct HandlerEngine {
     /// knobs — DNS write is a distinct authority gated separately.
     #[cfg_attr(not(feature = "dns-publish"), allow(dead_code))]
     allow_dns_publish: bool,
+    /// Whether the node posture allows a guest to register a RUNTIME, host-sealed, per-tenant DNS-write
+    /// credential and route writes through it (`allow_guest_dynamic_dns_publish`, cap-req #31) — the
+    /// dynamic analogue of the operator serve-static `dns_providers` registry. OFF under multi-tenant
+    /// (operator opts in), ON under single-tenant/dev. INDEPENDENT of
+    /// [`allow_dns_publish`](Self::allow_dns_publish) (which gates the operator serve-static path): with
+    /// this off, every `register`/`unregister` is `access-denied` and no record routes to a runtime
+    /// credential (records fall through to the operator path). Seeded into each new store and read by the
+    /// `DnsPublishHost` gate.
+    #[cfg_attr(not(feature = "dns-publish"), allow(dead_code))]
+    allow_dynamic_dns_publish: bool,
     /// The node posture governing a guest's **sub-zone `NS` delegation** via `dns-publish` (Security
     /// review MEDIUM-3, cap-req #24): `None` (refuse all sub-zone NS — the fail-closed default),
     /// `Allowlist` (only an NS target on the per-grant `dns_publish_ns_targets` allowlist, empty ⇒
@@ -2172,6 +2189,9 @@ impl HandlerEngine {
             // Deny-by-default: DNS write is off until an operator opts the posture in via
             // `with_dns_publish`. A node that never calls it can never let a guest mutate DNS.
             allow_dns_publish: false,
+            // Deny-by-default: the runtime per-tenant DNS-credential path (cap-req #31) is off until an
+            // operator opts the posture in via `with_dynamic_dns_publish`.
+            allow_dynamic_dns_publish: false,
             // Fail-closed default: no sub-zone NS delegation until an operator sets the posture via
             // `with_dns_publish_ns` (MEDIUM-3).
             dns_publish_ns: GuestDnsPublishNs::None,
@@ -2518,6 +2538,17 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_dns_publish(mut self, allow: bool) -> Self {
         self.allow_dns_publish = allow;
+        self
+    }
+
+    /// Permit (or refuse) a guest to register a RUNTIME, host-sealed, per-tenant DNS-write credential
+    /// and route writes through it — the operator posture's `allow_guest_dynamic_dns_publish` (cap-req
+    /// #31). Default (`false`) makes every `register`/`unregister` `access-denied` and keeps every
+    /// record on the operator serve-static path. INDEPENDENT of
+    /// [`with_dns_publish`](Self::with_dns_publish). Any single wiring omission fails CLOSED.
+    #[must_use]
+    pub fn with_dynamic_dns_publish(mut self, allow: bool) -> Self {
+        self.allow_dynamic_dns_publish = allow;
         self
     }
 
@@ -3653,6 +3684,9 @@ impl HandlerEngine {
                 state.dns_publish_ns,
                 state.dns_publish_budget.as_ref(),
             )
+            // cap-req #31: the RUNTIME per-tenant posture (`allow_guest_dynamic_dns_publish`), carried
+            // from the store-resident `HostState` exactly like `dns_publish_enabled`.
+            .with_dynamic_posture(state.dynamic_dns_publish_enabled)
         })?;
         Ok(linker)
     }
@@ -3800,6 +3834,8 @@ impl HandlerEngine {
             )),
             #[cfg(feature = "dns-publish")]
             dns_publish_enabled: self.allow_dns_publish,
+            #[cfg(feature = "dns-publish")]
+            dynamic_dns_publish_enabled: self.allow_dynamic_dns_publish,
             #[cfg(feature = "dns-publish")]
             dns_publish_ns: self.dns_publish_ns,
             #[cfg(feature = "dns-publish")]

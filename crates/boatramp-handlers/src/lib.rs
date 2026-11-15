@@ -80,7 +80,7 @@ pub use bindings::capability::{CapabilityBinding, CapabilityMinter};
 #[cfg(feature = "dns-publish")]
 pub use bindings::dns_publish::{
     DnsPublishAuditEntry, DnsPublishAuditSink, DnsPublishBinding, DnsPublishOp, DnsPublishOutcome,
-    TracingDnsPublishSink,
+    RuntimeDnsProviderFactory, RuntimeDnsProviderKind, RuntimeDnsRegistry, TracingDnsPublishSink,
 };
 /// The host-side DNS resolver capability (mailroom cap-req #20): the injected [`DnsResolver`] backend
 /// (implemented in boatramp-server with hickory) + its host-facing value types.
