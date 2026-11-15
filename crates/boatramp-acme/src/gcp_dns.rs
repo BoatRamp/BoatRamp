@@ -1,4 +1,5 @@
-//! Google Cloud DNS provider (v1 REST, OAuth2 bearer token).
+//! Google Cloud DNS provider (v1 REST), authenticating via a LONG-LIVED **service-account key**
+//! exchanged host-side for a short-lived token.
 //!
 //! Cloud DNS edits are atomic **changes** (a batch of `additions` + `deletions`
 //! posted to `…/changes`) with no in-place update: to replace a record set you
@@ -81,10 +82,10 @@ impl GcpDns {
         self
     }
 
-    /// Override the token-exchange endpoint — TESTS ONLY (point it at a local mock). Production pins
-    /// [`GCP_TOKEN_ENDPOINT`].
-    #[doc(hidden)]
-    pub fn with_token_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+    /// Override the token-exchange endpoint — TESTS ONLY (point it at a local mock); `#[cfg(test)]` +
+    /// private, so it is unreachable from any non-test caller. Production pins [`GCP_TOKEN_ENDPOINT`].
+    #[cfg(test)]
+    fn with_token_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.token_endpoint = endpoint.into();
         self
     }

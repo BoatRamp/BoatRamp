@@ -1,12 +1,19 @@
-//! Azure DNS provider (Resource Manager REST, OAuth2 bearer token).
+//! Azure DNS provider (Resource Manager REST), authenticating via a LONG-LIVED **service principal**
+//! exchanged host-side for a short-lived token.
 //!
 //! Azure record sets are addressed by `(zone, type, relative-name)` and edited
 //! with a single idempotent `PUT` (create-or-replace) — no read-modify-write, so
 //! `upsert` is one request and `delete` one more (404 = already gone). The record
 //! body is per-type (`TXTRecords` / `ARecords` / `AAAARecords` / `CNAMERecord`).
-//! Names are relative to the zone (`@` = apex). The access token comes from the
-//! environment (`AZURE_ACCESS_TOKEN`), matching the Key Vault signer. Request
-//! construction is pure + unit-tested; the round-trip is a live seam.
+//! Names are relative to the zone (`@` = apex). Request construction is pure + unit-tested; the
+//! round-trip is a live seam.
+//!
+//! **Credential (cap-req #31): a service principal, not a short-lived token.** The adapter takes
+//! `tenant_id` + `client_id` + `client_secret` and runs the OAuth2 **client-credentials** grant at the
+//! FIXED Azure AD token endpoint (`login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token`, the host
+//! pinned, `tenant_id` a GUID-validated path segment) for a short-lived AAD bearer token, cached until
+//! near expiry. No short-lived token is accepted as the stored credential, and the minted token is
+//! never sealed, returned, or logged.
 
 use async_trait::async_trait;
 
@@ -77,10 +84,11 @@ impl AzureDns {
         self
     }
 
-    /// Override the token-exchange endpoint — TESTS ONLY (point it at a local mock). Production pins
+    /// Override the token-exchange endpoint — TESTS ONLY (point it at a local mock); `#[cfg(test)]` +
+    /// private, so it is unreachable from any non-test caller. Production pins
     /// `login.microsoftonline.com`.
-    #[doc(hidden)]
-    pub fn with_token_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+    #[cfg(test)]
+    fn with_token_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.token_endpoint = endpoint.into();
         self
     }
