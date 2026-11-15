@@ -117,9 +117,13 @@ interface orm {
   use sql-types.{value, row, query-result, error};
 
   // `count-distinct` is APPEND-ONLY and MUST stay last: WIT enum variants encode by ordinal, so
-  // appending preserves the wire positions of the existing variants (backward-compatible — an old
-  // host never receives it; a guest that emits it declares the requirement in its function-manifest
-  // `requires`, checked at deploy). Same rationale as the expr-node append-only note below.
+  // appending preserves the wire positions of the existing variants (backward-compatible). An old
+  // host predating the variant cannot decode its ordinal, so a guest that emits it declares
+  // `requires = ["count-distinct"]` in its function-manifest; the host advertises `count-distinct`
+  // as a capability feature (`host_capability_features`) and `unmet_requires` checks it at deploy,
+  // so such a host refuses the deploy cleanly instead of misreading the unknown ordinal at
+  // runtime. Same rationale, and same `requires` ABI gate, as `orm-subquery` for the subquery nodes
+  // below and the expr-node append-only note.
   enum agg { count, sum, avg, min, max, count-distinct }
   enum bin-op { add, sub, mul, div, modulo }
   // (`lower`/`upper` are spelled `*-case` to avoid colliding with wasmtime's ComponentType
