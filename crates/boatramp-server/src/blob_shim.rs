@@ -4,8 +4,9 @@
 //! An opaque compute workload (container / micro-VM) cannot import the WASI
 //! `wasi:blobstore` host interface a handler uses. This shim gives it the *same*
 //! per-site-scoped [`Storage`] namespace over a plain HTTP wire: a single per-node
-//! endpoint exposing `PUT`/`GET`/`HEAD`/`DELETE` on `{BLOB_URL}/{container}/{key}`,
-//! so an off-the-shelf HTTP client in the guest reads/writes exactly the objects a
+//! endpoint exposing `PUT`/`GET`/`HEAD`/`DELETE` on `{BLOB_URL}/{container}/{key}` plus a
+//! `LIST` (`GET {BLOB_URL}/{container}` with an optional `?prefix=`/`?after=`/`?limit=`), so an
+//! off-the-shelf HTTP client in the guest reads/writes/enumerates exactly the objects a
 //! `wasi:blobstore` handler for the same `(project, site)` sees — objects under
 //! `hblob/{project-qualified-site}/{container}/{key}`, the SAME `Storage` backend
 //! (`BlobBackends::backend(project)`) the host binding resolves. A handler and a
@@ -52,21 +53,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Json, Router};
 use base64::Engine as _;
 use boatramp_core::blob_backends::BlobBackends;
 use boatramp_core::compute::{
     BindingKind, ComputeBinding, ComputeBindingResolver, SurfaceContribution,
 };
 use boatramp_core::project::{ProjectRef, validate_key_segment, validate_object_key};
-use boatramp_core::{ByteStream, PutMeta, Storage, StorageError};
+use boatramp_core::{ByteStream, ObjectMeta, PutMeta, Storage, StorageError};
 use futures::StreamExt as _;
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
@@ -74,6 +76,18 @@ use tokio::sync::RwLock;
 /// `compute.blob_shim_max_object_bytes`. Bounds a single write so a compromised/buggy guest cannot
 /// exhaust node/bucket storage with one unbounded PUT. `0` (operator-configured) = unlimited.
 pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// The LIST page ceiling: a `GET /{container}` returns at most this many keys per request (the
+/// guest resumes with the opaque `?after=` cursor), clamping a guest-supplied `?limit=` to
+/// `[1, MAX_LIST_PAGE]`. Matches the `wasi:blobstore` `blob-list` host binding's own page ceiling,
+/// so the shim and a handler bound the keyspace identically.
+const MAX_LIST_PAGE: u32 = 1000;
+
+/// The reserved key namespace a LIST must never surface — the container marker
+/// (`.boatramp-container`) and host-internal multipart staging (`.boatramp-uploads/…`). A guest can
+/// never WRITE one ([`validate_object_key`] rejects it), but the host writes the marker, so the
+/// listing hides ANY key whose path touches it. Mirrors the host `blob-list` binding's reserve.
+const RESERVED_PREFIX: &str = ".boatramp";
 
 /// A token-resolved blob capability: the site's [`Storage`] backend, the key prefix the
 /// token is confined to (`hblob/{project-qualified-site}/` — host-stamped, never
@@ -171,10 +185,14 @@ impl BlobShim {
         None
     }
 
-    /// The axum router: `{PUT,GET,HEAD,DELETE} /{container}/{*key}`. Mount it on a
+    /// The axum router: `{PUT,GET,HEAD,DELETE} /{container}/{*key}` on individual objects, plus
+    /// `GET /{container}` (no key segment) to LIST the keys under the token's container. The two
+    /// routes never collide: the object routes require a container AND a key segment, while the
+    /// single-segment LIST route has no key (and an object key is never empty). Mount it on a
     /// node-internal listener (see [`spawn_blob_shim`]).
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/{container}", get(list_objects))
             .route(
                 "/{container}/{*key}",
                 get(get_object)
@@ -624,6 +642,8 @@ enum Denied {
     /// The object key escapes its container prefix (`..`/absolute/reserved/…, gate case
     /// ii) → 400.
     BadKey(String),
+    /// A guest-supplied LIST prefix is not container-relative (`..`/absolute/reserved/…) → 400.
+    BadPrefix(String),
 }
 
 impl IntoResponse for Denied {
@@ -645,6 +665,11 @@ impl IntoResponse for Denied {
             Self::BadKey(e) => (
                 StatusCode::BAD_REQUEST,
                 format!("invalid object key: {e}\n"),
+            )
+                .into_response(),
+            Self::BadPrefix(e) => (
+                StatusCode::BAD_REQUEST,
+                format!("invalid list prefix: {e}\n"),
             )
                 .into_response(),
         }
@@ -698,6 +723,114 @@ fn authorize(
         scope.storage.clone(),
         format!("{}{container}/{key}", scope.site_prefix),
     ))
+}
+
+/// The LIST analogue of [`authorize`] — the single enforced decision behind `GET /{container}`.
+/// Given the token-resolved `scope` and the client-supplied `container` + optional container-relative
+/// `prefix`, return the backend, the JOINED storage prefix to list under
+/// (`hblob/{project-qualified-site}/{container}/{prefix}`), and the bare
+/// `hblob/{project-qualified-site}/{container}/` prefix results are relativized against, or a
+/// fail-closed [`Denied`].
+///
+/// Same fail-closed model as [`authorize`]: the SITE comes ONLY from `scope.site_prefix`
+/// (token-bound, never a client field), so a listing can only ever narrow WITHIN the token's own
+/// site, and a container-bound token admits ONLY its container — **cross-site and cross-container are
+/// structurally impossible**. It shares [`authorize`]'s `allow_cross_container` mutation seam (i) and
+/// `allow_traversal` seam (ii, here neutering the defense-in-depth prefix screen so the gate proves
+/// the structural join-under-prefix confinement still contains an escaping prefix).
+fn authorize_list(
+    scope: Option<&BlobScope>,
+    container: &str,
+    prefix: &str,
+) -> Result<(Arc<dyn Storage>, String, String), Denied> {
+    // (iii) authentication: no resolved scope ⇒ fail closed.
+    let scope = scope.ok_or(Denied::Unauthenticated)?;
+    // (i) cross-container: a container-bound token lists ONLY its own container.
+    if let Some(bound) = scope.container.as_deref() {
+        let permitted =
+            bound == container || blob_mutation().as_deref() == Some("allow_cross_container");
+        if !permitted {
+            return Err(Denied::CrossContainer);
+        }
+    }
+    // The container must be a single safe segment (defense-in-depth, as in `authorize`).
+    validate_key_segment("container", container)
+        .map_err(|e| Denied::BadContainer(e.to_string()))?;
+    // (ii) screen the guest LIST prefix. The LOAD-BEARING confinement is structural — the join UNDER
+    // the container prefix below + the strip back in `confine_list_names` — so this screen is
+    // defense-in-depth and a clean guest error; `allow_traversal` neuters it so the gate proves the
+    // structural confinement alone still contains an escaping prefix.
+    if blob_mutation().as_deref() != Some("allow_traversal") {
+        screen_list_prefix(prefix).map_err(Denied::BadPrefix)?;
+    }
+    // Compose under the TOKEN's site+container prefix: list under
+    // `hblob/{qualified-site}/{container}/{prefix}`, relativize against
+    // `hblob/{qualified-site}/{container}/`.
+    let container_prefix = format!("{}{container}/", scope.site_prefix);
+    Ok((
+        scope.storage.clone(),
+        format!("{container_prefix}{prefix}"),
+        container_prefix,
+    ))
+}
+
+/// Screen a guest-supplied LIST `prefix` (mirrors the host `blob-list` binding's `screen_list_prefix`):
+/// empty is fine (the whole container); otherwise reject a leading `/` (absolute-looking), a `..` path
+/// segment, the reserved `.boatramp*` namespace, backslashes, globs, and control bytes. Defense-in-depth
+/// only — [`authorize_list`]'s join-under-prefix + [`confine_list_names`]'s strip are the structural
+/// confinement, so an escaping prefix that slipped the screen would simply match nothing.
+fn screen_list_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    if prefix.starts_with('/') {
+        return Err("must be container-relative (no leading '/')".to_string());
+    }
+    if prefix.contains('\0')
+        || prefix.contains('\\')
+        || prefix.contains('*')
+        || prefix.chars().any(char::is_control)
+    {
+        return Err("contains a control, backslash, or glob character".to_string());
+    }
+    if prefix.split('/').any(|seg| seg == "..") {
+        return Err("'..' path segment".to_string());
+    }
+    if prefix.starts_with(RESERVED_PREFIX) {
+        return Err("reserved namespace".to_string());
+    }
+    Ok(())
+}
+
+/// Whether a container-relative `name` touches the reserved [`RESERVED_PREFIX`] namespace in ANY path
+/// segment — the container marker / host staging, never a guest object — so a LIST must drop it.
+/// Mirrors the host `blob-list` binding's `is_reserved_name`.
+fn is_reserved_name(name: &str) -> bool {
+    name.split('/').any(|seg| {
+        seg.get(..RESERVED_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_PREFIX))
+    })
+}
+
+/// Relativize + confine a raw backend listing page to the guest's container view: STRIP
+/// `container_prefix` off each key (→ container-relative, e.g. `sub/c.txt`) and DROP the reserved
+/// `.boatramp*` namespace; a key not under `container_prefix` is dropped entirely (the structural
+/// guarantee a raw internal / foreign key can never reach the guest). The direct analogue of the host
+/// `blob-list` binding's `confine_list_names`. The `list_no_strip` mutation seam (test / gate only,
+/// compiled out of ships) returns the raw internal key, so the CI gate proves the strip load-bearing.
+fn confine_list_names(container_prefix: &str, metas: Vec<ObjectMeta>) -> Vec<String> {
+    let strip = blob_mutation().as_deref() != Some("list_no_strip");
+    metas
+        .into_iter()
+        .filter_map(|meta| {
+            let name = if strip {
+                meta.key.strip_prefix(container_prefix)?.to_string()
+            } else {
+                meta.key
+            };
+            (!is_reserved_name(&name)).then_some(name)
+        })
+        .collect()
 }
 
 /// Extract the `Authorization: Bearer <token>` value.
@@ -949,13 +1082,68 @@ async fn delete_object(
     }
 }
 
+/// Query parameters for the LIST endpoint (`GET /{container}`): an optional container-relative
+/// `prefix` filter, an opaque `after` cursor (a prior response's `cursor`, to resume), and a
+/// `limit` (clamped to `[1, MAX_LIST_PAGE]`; absent ⇒ a full [`MAX_LIST_PAGE`] page).
+#[derive(Deserialize, Default)]
+struct ListQuery {
+    prefix: Option<String>,
+    after: Option<String>,
+    limit: Option<u32>,
+}
+
+/// The LIST response body: the container-relative object `keys` for this page, plus an OPAQUE
+/// `cursor` — `null` once the listing is exhausted, otherwise passed back as `?after=` for the next
+/// page. The keys are exactly the names a `wasi:blobstore` `blob-list` handler for the same container
+/// returns (container-relative, reserved namespace hidden).
+#[derive(Serialize)]
+struct ListResponse {
+    keys: Vec<String>,
+    cursor: Option<String>,
+}
+
+/// `GET /{container}[?prefix=&after=&limit=]`: list the object keys under the token's container,
+/// optionally narrowed by a container-relative `prefix`, returned container-relative and bounded to
+/// one [`MAX_LIST_PAGE`] page (resume with the response `cursor` as `?after=`). The blob analogue of
+/// the `wasi:blobstore` `blob-list` host binding — authed by the SAME bearer and confined to the
+/// token's site+container, so a token can only ever enumerate WITHIN its own namespace.
+async fn list_objects(
+    State(shim): State<BlobShim>,
+    headers: HeaderMap,
+    Path(container): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> Response {
+    let prefix = q.prefix.unwrap_or_default();
+    let token = bearer(&headers);
+    let scope = shim.authenticate(token.as_deref()).await;
+    let (storage, joined, container_prefix) =
+        match authorize_list(scope.as_ref(), &container, &prefix) {
+            Ok(v) => v,
+            Err(denied) => return denied.into_response(),
+        };
+    let limit = q.limit.unwrap_or(MAX_LIST_PAGE).clamp(1, MAX_LIST_PAGE);
+    match storage.list_page(&joined, q.after.as_deref(), limit).await {
+        Ok(page) => {
+            let keys = confine_list_names(&container_prefix, page.metas);
+            Json(ListResponse {
+                keys,
+                cursor: page.cursor,
+            })
+            .into_response()
+        }
+        Err(err) => storage_fault("list", &joined, err),
+    }
+}
+
 /// The active compute-blob-shim gate mutation (PLAN-compute-bindings anti-hollow gate), or
 /// `None`. Present ONLY under `cfg(test)` (the in-crate gate) or the
 /// `compute-blob-shim-gate-mutation` feature; a shipped build has neither, so
 /// [`authorize`] / [`BlobShim::authenticate`] evaluate every check unconditionally and
 /// this is a dead `None`. Each recognized value neuters ONE check so the CI gate can prove
-/// it goes RED: `allow_cross_container` (bypass the container bind), `allow_traversal`
-/// (skip the object-key screen), `admit_unmatched` (admit a missing/unknown token). NOT a
+/// it goes RED: `allow_cross_container` (bypass the container bind — GET/PUT/… and LIST),
+/// `allow_traversal` (skip the object-key screen, and the LIST prefix screen),
+/// `admit_unmatched` (admit a missing/unknown token), `list_no_strip` (LIST returns the raw
+/// internal `hblob/{site}/{container}/…` key instead of the container-relative name). NOT a
 /// backdoor — it only reads a test env var.
 #[cfg(any(test, feature = "compute-blob-shim-gate-mutation"))]
 fn blob_mutation() -> Option<String> {
@@ -1102,6 +1290,30 @@ mod tests {
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec();
         (status, bytes)
+    }
+
+    /// Drive a LIST (`GET /{container}[?…]`) through the real router and parse the JSON body into
+    /// `(status, keys, cursor)`. A non-200 yields empty keys (the caller asserts the status).
+    async fn list_keys(
+        shim: &BlobShim,
+        path: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, Vec<String>, Option<String>) {
+        let (status, body) = request(shim, "GET", path, token, b"").await;
+        if status != StatusCode::OK {
+            return (status, Vec::new(), None);
+        }
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let keys = v["keys"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|k| k.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cursor = v["cursor"].as_str().map(str::to_string);
+        (status, keys, cursor)
     }
 
     fn resolver(shim: &BlobShim, storage: Arc<dyn Storage>) -> BlobShimResolver {
@@ -1415,6 +1627,121 @@ mod tests {
         );
 
         println!("COMPUTE BLOB-SHIM SCOPED OK");
+    }
+
+    /// **CI mutation gate** (PLAN-compute-bindings anti-hollow, marker `COMPUTE BLOB-SHIM LIST
+    /// SCOPED OK`). Drives the ENFORCED LIST decision (`authorize_list` + `confine_list_names` +
+    /// `BlobShim::authenticate`) through the REAL `GET /{container}` route, and proves the positive
+    /// behavior (keys returned container-relative; the reserved namespace + a foreign site + another
+    /// container never surface; a `prefix` filter narrows). MUTATION-VERIFIED: the SAME test re-run
+    /// under each `BOATRAMP_COMPUTEBLOB_MUTATION` neuters ONE check and MUST FAIL —
+    /// `allow_cross_container` (an `assets`-bound token LISTs a DIFFERENT container),
+    /// `allow_traversal` (a `../` list prefix escapes the container), `admit_unmatched` (an
+    /// unauthenticated LIST is admitted), `list_no_strip` (the raw internal key leaks instead of the
+    /// container-relative name). A pass-under-mutation (a hollow gate) fails the merge.
+    #[cfg(feature = "handlers")]
+    #[tokio::test]
+    async fn compute_blob_shim_list_scoped_gate() {
+        let shim = BlobShim::new();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let resolver = resolver(&shim, storage.clone());
+
+        // Token bound to container `assets`, site `api`, project default ⇒ prefix hblob/default/api/.
+        let env = resolver
+            .resolve("default", "api", 0, &[blob_binding("assets")])
+            .await;
+        let token = env
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+
+        // Seed three objects (one nested) under the token's container via the shim PUT.
+        for (p, b) in [
+            ("/assets/a.txt", &b"1"[..]),
+            ("/assets/b.txt", b"2"),
+            ("/assets/sub/c.txt", b"3"),
+        ] {
+            let (s, _) = request(&shim, "PUT", p, Some(&token), b).await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        // And, straight into the backend: the host-written reserved marker, a DIFFERENT container in
+        // the SAME site, and a DIFFERENT site's object — none may ever surface to the assets token.
+        for k in [
+            "hblob/default/api/assets/.boatramp-container",
+            "hblob/default/api/secrets/s.txt",
+            "hblob/default/other/assets/foreign.txt",
+        ] {
+            storage
+                .put(k, once_stream(Bytes::from_static(b"x")), PutMeta::default())
+                .await
+                .unwrap();
+        }
+
+        // ---- positive: LIST returns the container-relative keys ---------------------------------
+        let (status, keys, _) = list_keys(&shim, "/assets", Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        for want in ["a.txt", "b.txt", "sub/c.txt"] {
+            assert!(
+                keys.iter().any(|k| k == want),
+                "LIST must return {want:?}; got {keys:?}"
+            );
+        }
+        // Relativized — the raw internal `hblob/…` key is never leaked (bites `list_no_strip`).
+        assert!(
+            keys.iter().all(|k| !k.starts_with("hblob/")),
+            "keys must be container-relative, not raw internal keys: {keys:?}"
+        );
+        // The reserved marker, another container, and a foreign site are all absent (structural
+        // site/container confinement + reserved-namespace hiding).
+        assert!(
+            keys.iter().all(|k| !k.starts_with(".boatramp")),
+            "the reserved namespace must be hidden: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k.contains("foreign")),
+            "another site's keys must never surface: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k.contains("secrets") || k == "s.txt"),
+            "another container's keys must never surface: {keys:?}"
+        );
+
+        // ---- prefix filter narrows --------------------------------------------------------------
+        let (status, keys, _) = list_keys(&shim, "/assets?prefix=sub/", Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            keys,
+            vec!["sub/c.txt".to_string()],
+            "a prefix filter must narrow to the sub/ subtree"
+        );
+
+        // ---- (i) cross-container: the assets-bound token must NOT list another container --------
+        let (status, _) = request(&shim, "GET", "/secrets", Some(&token), b"").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a container-bound token must refuse to LIST a different container"
+        );
+
+        // ---- (ii) a traversal list prefix is refused (the structural confinement's belt) --------
+        let (status, _) =
+            request(&shim, "GET", "/assets?prefix=../escape", Some(&token), b"").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a '..' list prefix must be refused"
+        );
+
+        // ---- (iii) an unauthenticated LIST is refused -------------------------------------------
+        let (status, _) = request(&shim, "GET", "/assets", None, b"").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated LIST must be refused"
+        );
+
+        println!("COMPUTE BLOB-SHIM LIST SCOPED OK");
     }
 
     /// A fake [`BlobUploadMinter`] returning fixed `TempCredentials` (bucket = the requested
