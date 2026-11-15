@@ -800,7 +800,7 @@ pub const MAX_DNS_ZONE_CREDS: usize = 64;
 /// A runtime DNS-zone write credential as the guest registered it, UNSEALED at point-of-use (cap-req
 /// #31). The `token` is the provider API token/key — the SOLE secret, never returned to the guest,
 /// logged, or echoed; `provider_kind` + `zone_id` are non-secret provider-addressing metadata.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DnsZoneCred {
     /// The provider kind token (`cloudflare` / `digitalocean` / `hetzner` / `ns1`), as registered.
     pub provider_kind: String,
@@ -809,6 +809,18 @@ pub struct DnsZoneCred {
     pub zone_id: Option<String>,
     /// The unsealed provider API token (the secret). Confidential — never surfaced to the guest.
     pub token: String,
+}
+
+// Manual `Debug` that REDACTS the token (Security review F4): the struct carries a plaintext secret, so
+// a stray `{:?}` must never leak it (the field is not logged today, but this closes the latent footgun).
+impl std::fmt::Debug for DnsZoneCred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsZoneCred")
+            .field("provider_kind", &self.provider_kind)
+            .field("zone_id", &self.zone_id)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The sealed record stored at `project/<proj>/dns-zone-cred/<tenant>/<zone-root>` (cap-req #31). Only

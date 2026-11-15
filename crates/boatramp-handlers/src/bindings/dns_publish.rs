@@ -568,6 +568,13 @@ impl<'a> DnsPublishHost<'a> {
     /// build the provider + return it with its authoritative registered `zone_root`. `Ok(None)` ⇒ no
     /// runtime credential covers this name (fall through to the operator path). An error is a hard
     /// store/seal/factory failure, surfaced generically.
+    ///
+    /// **Allowlist-removal is an effective revocation (Security review F1).** Routing re-checks the
+    /// covering `zone_root` against the UPSERTING component's CURRENT `dynamic_dns_zones` allowlist
+    /// before building the provider: if the operator has SHRUNK the allowlist to revoke a zone, an
+    /// already-registered credential stops routing immediately (fall through — the sealed registration
+    /// stays, but writes nothing until the zone is re-allowlisted). Without this re-check a de-allowlist
+    /// would only take effect once the tenant itself unregistered.
     async fn runtime_route(
         &self,
         reg: &RuntimeDnsRegistry,
@@ -581,6 +588,11 @@ impl<'a> DnsPublishHost<'a> {
         let Some(zone_root) = longest_covering_zone_root(&roots, name).map(str::to_string) else {
             return Ok(None);
         };
+        // F1: the registered zone-root must STILL be covered by this component's current allowlist — so
+        // removing it from `dynamic_dns_zones` revokes routing without waiting on an unregister.
+        if !zone_authorized(&reg.dynamic_zones, &zone_root) {
+            return Ok(None);
+        }
         let Some(cred) = reg
             .store
             .lookup(reg.project(), &reg.tenant, &zone_root)
@@ -764,6 +776,14 @@ fn map_store_err(e: SecretError) -> dns_publish::PublishError {
 /// DNS zone-containment used by the operator `RoutingDnsProvider`: `name` equals the apex, or `name`
 /// ends with `.<root>`. `None` ⇒ no registered zone covers this name (the router falls through to the
 /// operator path). `roots` are the tenant's own canonical registered zone-roots.
+/// Whether a guest-supplied provider `zone-id` is a safe, bounded opaque identifier (Security review
+/// F2). The zone-id is interpolated into the provider's URL path, so it must be `[A-Za-z0-9]` only
+/// (no `/`, `.`, `:`, `%`, whitespace, or control bytes — so a `../..` can never escape the path) and
+/// `1..=64` bytes. Cloudflare zone ids are 32-char lowercase hex, well within this.
+fn is_valid_zone_id(zone_id: &str) -> bool {
+    !zone_id.is_empty() && zone_id.len() <= 64 && zone_id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 fn longest_covering_zone_root<'a>(roots: &'a [String], name: &str) -> Option<&'a str> {
     roots
         .iter()
@@ -850,6 +870,17 @@ impl dns_publish::Host for DnsPublishHost<'_> {
         let zone_id = zone_id
             .map(|z| z.trim().to_string())
             .filter(|z| !z.is_empty());
+        // F2: the zone-id is GUEST-CONTROLLED and is interpolated into the provider's URL path (e.g.
+        // Cloudflare `/zones/{zone_id}/dns_records`). Validate its SHAPE before sealing so a `../..` /
+        // separator / control byte can never reshape that path — accept a bounded opaque identifier
+        // `[A-Za-z0-9]` (Cloudflare zone ids are 32-char lowercase hex), reject everything else.
+        if let Some(zid) = zone_id.as_deref()
+            && !is_valid_zone_id(zid)
+        {
+            return Err(dns_publish::PublishError::InvalidRecord(
+                "provider zone-id must be a bounded alphanumeric identifier".into(),
+            ));
+        }
         // Cloudflare addresses its zone by an opaque zone-id (not the zone-root) — require it up front.
         if matches!(kind, RuntimeDnsProviderKind::Cloudflare) && zone_id.is_none() {
             return Err(dns_publish::PublishError::InvalidRecord(
@@ -1903,7 +1934,7 @@ mod tests {
             host.register_zone_credential(
                 "acme.com".into(),
                 dns_publish::ProviderKind::Cloudflare,
-                Some("cf-zone-id".into()),
+                Some("cfzoneid01".into()),
                 "cf-secret-token".into(),
             )
             .await
@@ -1927,7 +1958,7 @@ mod tests {
         let builds = factory.builds.lock().unwrap();
         assert_eq!(builds.len(), 1);
         assert_eq!(builds[0].0, RuntimeDnsProviderKind::Cloudflare);
-        assert_eq!(builds[0].1.as_deref(), Some("cf-zone-id"));
+        assert_eq!(builds[0].1.as_deref(), Some("cfzoneid01"));
         assert_eq!(builds[0].2, "cf-secret-token");
         assert_eq!(builds[0].3, "acme.com");
     }
@@ -2107,6 +2138,140 @@ mod tests {
     }
 
     /// Operator serve-static + runtime per-tenant coexist on ONE binding and route PER ZONE: a record in
+    /// F1: removing a zone from `dynamic_dns_zones` revokes routing immediately, even while the sealed
+    /// credential is still registered — and re-allowlisting restores it (the registration survived).
+    #[tokio::test]
+    async fn f1_allowlist_removal_revokes_routing() {
+        let store = cred_store();
+        let provider = Arc::new(StubProvider::new(BASIC));
+        // Register through an allowlisting registry.
+        let (reg_ok, _f) = registry(store.clone(), "t", "acme.com", provider.clone());
+        let b_ok = DnsPublishBinding::runtime_only(reg_ok, audit_sink());
+        let bud = budget(16);
+        {
+            let mut h = dyn_host(&b_ok, false, &bud);
+            h.register_zone_credential(
+                "acme.com".into(),
+                dns_publish::ProviderKind::Ns1,
+                None,
+                "k".into(),
+            )
+            .await
+            .unwrap();
+            h.upsert(a_record("www.acme.com", "203.0.113.1"))
+                .await
+                .expect("routes");
+        }
+        assert_eq!(provider.count(), 1);
+        // A registry whose allowlist no longer covers acme.com ⇒ the SAME upsert no longer routes.
+        let revoked_provider = Arc::new(StubProvider::new(BASIC));
+        let factory = Arc::new(FakeFactory::new(revoked_provider.clone()));
+        let reg_revoked = RuntimeDnsRegistry::new(
+            store.clone(),
+            factory as Arc<dyn RuntimeDnsProviderFactory>,
+            "proj",
+            "t",
+            vec!["**.other.example".to_string()],
+        );
+        let b_revoked = DnsPublishBinding::runtime_only(reg_revoked, audit_sink());
+        {
+            let mut h = dyn_host(&b_revoked, false, &bud);
+            assert!(matches!(
+                h.upsert(a_record("www.acme.com", "203.0.113.1")).await,
+                Err(dns_publish::PublishError::NotAuthorized(_))
+            ));
+        }
+        assert_eq!(
+            revoked_provider.count(),
+            0,
+            "de-allowlisted zone wrote nothing"
+        );
+        // Re-allowlisting restores routing (the credential was never unregistered).
+        {
+            let mut h = dyn_host(&b_ok, false, &bud);
+            h.upsert(a_record("mx.acme.com", "203.0.113.2"))
+                .await
+                .expect("routes again");
+        }
+        assert_eq!(provider.count(), 2);
+    }
+
+    /// F2: a malformed (path-traversal / separator-bearing) zone-id is refused at register, before
+    /// sealing; a well-formed alphanumeric one (Cloudflare's 32-hex shape) is accepted.
+    #[tokio::test]
+    async fn f2_zone_id_shape_is_validated() {
+        let store = cred_store();
+        let (reg, _f) = registry(
+            store.clone(),
+            "t",
+            "acme.com",
+            Arc::new(StubProvider::new(BASIC)),
+        );
+        let b = DnsPublishBinding::runtime_only(reg, audit_sink());
+        let bud = budget(16);
+        for bad in [
+            "../../evil",
+            "a/b",
+            "a.b",
+            "a:b",
+            "a%2e",
+            "has space",
+            &"z".repeat(65),
+        ] {
+            let mut h = dyn_host(&b, true, &bud);
+            assert!(
+                matches!(
+                    h.register_zone_credential(
+                        "acme.com".into(),
+                        dns_publish::ProviderKind::Cloudflare,
+                        Some(bad.into()),
+                        "tok".into()
+                    )
+                    .await,
+                    Err(dns_publish::PublishError::InvalidRecord(_))
+                ),
+                "zone-id {bad:?} must be refused"
+            );
+        }
+        // Nothing was stored by any refused register.
+        assert!(
+            store
+                .registered_zone_roots(ProjectRef::new("proj"), "t")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A canonical 32-hex zone-id is accepted.
+        {
+            let mut h = dyn_host(&b, true, &bud);
+            h.register_zone_credential(
+                "acme.com".into(),
+                dns_publish::ProviderKind::Cloudflare,
+                Some("da8e3fe9a1b24c6f90ab12cd34ef5678".into()),
+                "tok".into(),
+            )
+            .await
+            .expect("a well-formed zone-id is accepted");
+        }
+    }
+
+    /// F4: `DnsZoneCred`'s `Debug` redacts the token (a stray `{:?}` can never leak the secret).
+    #[test]
+    fn f4_dns_zone_cred_debug_redacts_token() {
+        let cred = boatramp_core::secret_store::DnsZoneCred {
+            provider_kind: "cloudflare".into(),
+            zone_id: Some("zid".into()),
+            token: "SUPER-SECRET".into(),
+        };
+        let shown = format!("{cred:?}");
+        assert!(
+            !shown.contains("SUPER-SECRET"),
+            "token must be redacted: {shown}"
+        );
+        assert!(shown.contains("redacted"));
+    }
+
+    /// Operator serve-static + runtime per-tenant coexist on ONE binding and route PER ZONE: a record in
     /// the operator's zone uses the operator writer; a record in a registered runtime zone uses the
     /// runtime credential. Neither path leaks into the other.
     #[tokio::test]
@@ -2237,7 +2402,7 @@ mod tests {
             h.register_zone_credential(
                 "t1.example".into(),
                 dns_publish::ProviderKind::Cloudflare,
-                Some("cf-zone-id".into()),
+                Some("cfzoneid01".into()),
                 "SECRET-cf-token".into(),
             )
             .await
@@ -2275,7 +2440,7 @@ mod tests {
             let builds = factory1.builds.lock().unwrap();
             assert_eq!(builds.len(), 1);
             assert_eq!(builds[0].0, RuntimeDnsProviderKind::Cloudflare);
-            assert_eq!(builds[0].1.as_deref(), Some("cf-zone-id"));
+            assert_eq!(builds[0].1.as_deref(), Some("cfzoneid01"));
             assert_eq!(
                 builds[0].2, "SECRET-cf-token",
                 "the factory got the unsealed token"
@@ -2345,12 +2510,83 @@ mod tests {
             "nothing more published after unregister"
         );
 
+        // (8) F1 — allowlist removal is an effective revocation. Re-register the credential, confirm it
+        // routes, then over a registry whose `dynamic_dns_zones` NO LONGER covers the zone (operator
+        // shrank the allowlist) the SAME upsert stops routing — WITHOUT any unregister. (DROP the
+        // route-time re-check ⇒ this assertion RED.)
+        {
+            let mut h = dyn_host(&b1, false, &bud);
+            h.register_zone_credential(
+                "t1.example".into(),
+                dns_publish::ProviderKind::Hetzner,
+                None,
+                "re-registered".into(),
+            )
+            .await
+            .expect("re-register ok");
+        }
+        {
+            let mut h = dyn_host(&b1, false, &bud);
+            h.upsert(a_record("mx.t1.example", "203.0.113.7"))
+                .await
+                .expect("routes while allowlisted");
+        }
+        assert_eq!(t1_provider.count(), 2, "routed after re-register");
+        // A registry (same store + tenant) whose allowlist no longer covers t1.example.
+        let t1_revoked_provider = Arc::new(StubProvider::new(BASIC));
+        let (reg_revoked, _fr) = {
+            let factory = Arc::new(FakeFactory::new(t1_revoked_provider.clone()));
+            (
+                RuntimeDnsRegistry::new(
+                    store.clone(),
+                    factory.clone() as Arc<dyn RuntimeDnsProviderFactory>,
+                    "proj",
+                    "tenant-1",
+                    vec!["**.other.example".to_string()], // t1.example REMOVED
+                ),
+                factory,
+            )
+        };
+        let b1_revoked = DnsPublishBinding::runtime_only(reg_revoked, audit_sink());
+        {
+            let mut h = dyn_host(&b1_revoked, false, &bud);
+            assert!(
+                matches!(
+                    h.upsert(a_record("mx.t1.example", "203.0.113.7")).await,
+                    Err(dns_publish::PublishError::NotAuthorized(_))
+                ),
+                "a de-allowlisted zone must stop routing even though the credential is still registered"
+            );
+        }
+        assert_eq!(
+            t1_revoked_provider.count(),
+            0,
+            "revoked-allowlist wrote nothing"
+        );
+
+        // (9) F2 — a malformed (path-traversal) zone-id is refused at register, before sealing. (DROP
+        // the zone-id shape check ⇒ this assertion RED.)
+        {
+            let mut h = dyn_host(&b1, true, &bud);
+            assert!(matches!(
+                h.register_zone_credential(
+                    "t1.example".into(),
+                    dns_publish::ProviderKind::Cloudflare,
+                    Some("../../evil".into()),
+                    "tok".into()
+                )
+                .await,
+                Err(dns_publish::PublishError::InvalidRecord(_))
+            ));
+        }
+
         println!(
             "DNS-PUBLISH TENANT-CREDS LIVE OK: posture-gated register of an allowlisted zone sealed a \
              tenant token; a routed upsert reached the registered credential; the token was sealed at \
              rest and never returned; unregister fell the zone through; disallowed-zone + posture-off \
-             both access-denied; a second tenant had zero cross-tenant access; the operator path was \
-             unchanged"
+             both access-denied; a second tenant had zero cross-tenant access; removing the zone from \
+             the allowlist revoked routing without an unregister (F1); a malformed zone-id was refused \
+             at register (F2); the operator path was unchanged"
         );
     }
 }

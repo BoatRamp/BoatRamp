@@ -150,6 +150,17 @@ Fail-closed at every layer, all independent of the operator path:
   `single-tenant`/`dev` (set via `[security.overrides]` /
   `BOATRAMP_SECURITY_ALLOW_GUEST_DYNAMIC_DNS_PUBLISH`). Off ⇒ every `register`/`unregister` is
   `access-denied` and no record routes to a runtime credential. Distinct from `allow_guest_dns_publish`.
+
+> **Posture asymmetry (read this).** `allow_guest_dynamic_dns_publish` is **on** under
+> `single-tenant`/`dev`, whereas `allow_guest_dns_publish` (the *operator*-credential path) is **off in
+> *every* built-in profile**. The difference is deliberate: the operator path lets a guest write through
+> the **operator's own** host-held provider credential — a credential whose blast radius is every zone
+> that credential can reach — so it stays opt-in everywhere. The runtime path writes only the **tenant's
+> own** zone with the **tenant's own** token, and the per-component **deny-all** `dynamic_dns_zones`
+> allowlist (not the posture) is the real gate — so under `single-tenant`/`dev` (where the one tenant is
+> effectively the operator) it is on by default, exactly like `allow_guest_dynamic_egress`. On a
+> `multi-tenant` node it is **off** until the operator opts in. An operator can set either knob
+> independently.
 - **Per-component `dynamic_dns_zones` allowlist** — the zone-root globs a guest may register a
   credential for (same globbing as `dns_publish_zones`; `acme.com`, `**.acme.com`). **Empty ⇒ deny-all.**
   Distinct from `dns_publish_zones` (which fences *operator*-credential writes by the record's own name).
