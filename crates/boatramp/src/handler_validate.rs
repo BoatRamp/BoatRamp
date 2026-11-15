@@ -234,6 +234,15 @@ mod imp {
             // per-function. A component `use`s `tcp-egress-types` and imports `tcp-egress`; both label
             // as this token.
             ("boatramp:handlers", "tcp-egress-types" | "tcp-egress") => Some("wasi:sockets"),
+            // The host-mediated HTTP-request-to-a-runtime-host capability (BR-REQ-3): the ergonomic
+            // sibling of `tcp-egress`'s `connect-tls` runtime-host path — the host owns the HTTP
+            // framing and returns a buffered response. It REUSES the `wasi:sockets` token (not a new
+            // grant kind), exactly as `tcp-egress` does: the SAME deploy declaration (`wasi:sockets`)
+            // + the SAME per-component `dynamic_egress_hosts` allowlist + `allow_guest_dynamic_egress`
+            // posture + SSRF floor gate (`resolve_and_gate_tcp_egress`, one source of truth) authorize
+            // BOTH the raw `connect-tls` dial and this HTTP verb. A component `use`s `http-egress-types`
+            // and imports `http-egress`; both label as this token.
+            ("boatramp:handlers", "http-egress-types" | "http-egress") => Some("wasi:sockets"),
             _ => None,
         }
     }
@@ -269,6 +278,9 @@ mod imp {
     /// function simply rejects the unknown func at link — the loud-fail the surface bump makes
     /// visible. No SSRF floor (a TXT value is opaque text, not a dialable address).
     ///
+    /// `0.14.0` ships TWO capability-surface additions in the v0.61.0 release (on top of the
+    /// v0.60.0 0.13.0 `resolve-txt` surface):
+    ///
     /// `0.14.0` (cap-req #31): the `dns-publish` interface gained two verbs —
     /// `register-zone-credential(zone-root, provider, credential: list<credential-field>)` /
     /// `unregister-zone-credential(zone-root)` — for the RUNTIME per-tenant zone-credential path (a
@@ -279,6 +291,17 @@ mod imp {
     /// per-tenant store. A pre-#31 host lacking the new verbs rejects a guest that imports them at link —
     /// the loud-fail this surface bump makes visible. The verb signatures carry the full
     /// `credential-field` provider map (10 serve-static providers incl. gcp/azure OAuth).
+    ///
+    /// `0.14.0` (BR-REQ-3): a NEW `http-egress` interface — the host-mediated
+    /// HTTP-request-to-a-runtime-host verb (`emit-http-dynamic: func(host, port, request) ->
+    /// result<response, http-error>`), the ergonomic sibling of `tcp-egress`'s `connect-tls`
+    /// runtime-host path: the host owns the HTTP/1 framing + strict TLS and returns a buffered
+    /// response. It RIDES the EXISTING `wasi:sockets` grant (no new grant kind) + the SAME
+    /// `dynamic_egress_hosts` allowlist + `allow_guest_dynamic_egress` posture + SSRF floor +
+    /// DNS-rebind choke as `connect-tls` (one gate, `resolve_and_gate_tcp_egress`). It is a NEW
+    /// interface, so the host advertises the `http-egress` feature only under the `tcp-egress` cargo
+    /// feature and a pre-BR-REQ-3 host rejects the unknown import at link (the loud-fail the surface
+    /// bump makes visible). HTTPS-only; response-size- and time-bounded; redirects not followed.
     const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 14, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).

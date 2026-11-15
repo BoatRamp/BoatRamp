@@ -736,6 +736,44 @@ jobs:
             fi
           done
 
+      # BR-REQ-3 HOST-MEDIATED HTTP-TO-RUNTIME-HOST GATE (marker `HTTP-EGRESS DYNAMIC GATE OK`). The
+      # `http-egress` capability lets a guest name a host + a request (method/path/headers/body) and the
+      # HOST owns the HTTP/1 framing + strict TLS, returning a buffered response — the ergonomic sibling
+      # of BR-REQ-2's `connect-tls` runtime-host dial. It REUSES the SAME `resolve_and_gate_tcp_egress`
+      # gate (the `allow_guest_dynamic_egress` posture + the `dynamic_egress_hosts` NAME allowlist +
+      # the `is_global_ip` SSRF floor + the one-shot DNS-rebind choke), is HTTPS-only, and adds a
+      # response-size cap + a per-call timeout so a hostile host can neither hang nor OOM the host. This
+      # step drives the REAL `emit-http-dynamic` host path end-to-end (a loopback-TLS mock server), NOT a
+      # unit shim of the gate. MUTATION-VERIFIED across BOTH seams: the SHARED gate
+      # (`BOATRAMP_TCPEGRESS_MUTATION`: `admit_unallowlisted_dynamic` bypasses the hostname allowlist,
+      # `drop_dynamic_posture` ignores the posture) AND the HTTP-specific seam
+      # (`BOATRAMP_HTTPEGRESS_MUTATION`: `skip_tls_wrap` hands the raw TCP stream to the HTTP framer so a
+      # real HTTPS round trip breaks, `skip_response_cap` lifts the body byte cap so the oversized-BODY
+      # refusal is lost, `skip_head_bound` raises the explicit `max_headers`/`max_buf_size` response-HEAD
+      # bounds (N1) so the oversized-HEAD refusal is lost) — EACH must FAIL the gate; a PASS-under-mutation
+      # (a hollow gate) fails the merge.
+      - name: "http-egress dynamic gate (host-mediated HTTP to a runtime host, same gate as BR-REQ-2)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features tcp-egress http_egress_dynamic_gate -- --nocapture 2>&1 | tee http-egress.log
+          grep -qE 'test result: ok\. 1 passed' http-egress.log \
+            || { echo "::error::http-egress gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'HTTP-EGRESS DYNAMIC GATE OK' http-egress.log \
+            || { echo "::error::http-egress gate never reached its marker (a host-mediated HTTP egress regression)" >&2; exit 1; }
+          # Mutation guard: each mutation (shared gate + http-specific seam) MUST fail the gate.
+          for mut in TCPEGRESS:admit_unallowlisted_dynamic TCPEGRESS:drop_dynamic_posture HTTPEGRESS:skip_tls_wrap HTTPEGRESS:skip_response_cap HTTPEGRESS:skip_head_bound; do
+            var="BOATRAMP_${mut%%:*}_MUTATION"; val="${mut##*:}"
+            if env "$var=$val" cargo-zigbuild test --target x86_64-unknown-linux-musl \
+              -p boatramp-handlers --features tcp-egress http_egress_dynamic_gate \
+              -- --nocapture > "http-egress-mutation-$val.log" 2>&1; then
+              echo "::error::http-egress gate is HOLLOW — it passed under mutation '$var=$val' (a host-mediated HTTP egress security property is not actually enforced)" >&2
+              exit 1
+            else
+              echo "http-egress mutation verified: '$var=$val' fails the gate as expected."
+            fi
+          done
+
       # BR-REQ-2 SESSION egress PARITY GATE (marker `SESSION EGRESS PARITY OK`). A SESSION component now
       # gets the SAME gated outbound egress a handler does: the session's synthesized `FunctionConfig`
       # carries BOTH the static `egress_allowlist` and the runtime-host `dynamic_egress_hosts` through the

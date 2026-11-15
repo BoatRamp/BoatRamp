@@ -48,6 +48,13 @@ pub mod dns_resolve;
 pub mod email;
 #[cfg(feature = "graphql")]
 pub mod graphql;
+/// The host-mediated HTTP-request-to-a-runtime-host binding (`boatramp:handlers/http-egress`,
+/// BR-REQ-3): the host frames + sends ONE HTTPS request to a `dynamic_egress_hosts`-allowlisted
+/// runtime host and returns a buffered response — the ergonomic sibling of `tcp-egress`'s
+/// `connect-tls` runtime-host path. Rides the SAME `tcp-egress` feature + `wasi:sockets` grant + the
+/// SAME dynamic-egress gate (no new grant kind, no new posture, no new allowlist).
+#[cfg(feature = "tcp-egress")]
+pub mod http_egress;
 #[cfg(feature = "invoke")]
 pub mod invoke;
 pub mod keyvalue;
