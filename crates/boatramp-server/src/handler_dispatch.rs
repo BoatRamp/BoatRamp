@@ -7,6 +7,18 @@
 
 use super::*;
 
+/// The host-set request header carrying a plain handler's VERIFIED caller identity for the opt-in
+/// [`HandlerConfig::verify_caller`](boatramp_core::config::HandlerConfig::verify_caller) path: the
+/// verified JWT claims (every claim from the verified token, incl. `sub`) as compact JSON. The host
+/// is the SOLE writer platform-wide — any client/guest-supplied value is stripped at the
+/// dispatch entry (for EVERY handler, opting in or not) AND at the invoke-request builders
+/// ([`crate::function_runtime`] `prepare_invoke_request` / `build_internal_request`), so a guest can
+/// trust it iff its route declared `verify_caller`. Lowercase + valid, so
+/// [`HeaderName::from_static`] never panics on it. Mirrors the stream lane's
+/// `x-boatramp-stream-principal` precedent.
+#[cfg(feature = "handlers")]
+pub(crate) const VERIFIED_CLAIMS_HEADER: &str = "x-boatramp-verified-claims";
+
 /// Dispatch a matched handler: load its component blob, build the site's
 /// granted bindings, run it on the engine, and adapt the response back to axum.
 #[cfg(feature = "handlers")]
@@ -50,6 +62,12 @@ pub(super) async fn dispatch_handler(
     // *before* the URI rewrite drops the public host context. This is the only
     // request mutation the host makes beyond the URI; no application semantics.
     set_forwarded_headers(&mut request, client_ip);
+    // Strip any client-supplied spoof of the host-verified-claims header BEFORE anything downstream
+    // can observe it. The host is the sole writer of `x-boatramp-verified-claims` (the opt-in
+    // `verify_caller` path below sets it only after FULL verification); removing it unconditionally
+    // here — for every handler, opting in or not — guarantees a plain handler that does NOT opt in
+    // can never be handed a forged caller identity, and that the opt-in set below always wins.
+    request.headers_mut().remove(VERIFIED_CLAIMS_HEADER);
     // The guest sees the *site-relative* path via a well-formed absolute URI
     // (wasi:http needs scheme + authority); the public `/_sites/<site>/…` prefix
     // and host routing are the server's concern, not the handler's.
@@ -488,6 +506,19 @@ pub(super) async fn dispatch_handler(
         .query()
         .and_then(|q| query_value(q, "handle"))
         .map(str::to_string);
+    // Opt-in host-verified caller (`verify_caller`): when this route declares a verifier, the host
+    // verifies the inbound bearer (the SAME app-bearer verifier the data connector + scoped streams
+    // use) and FORWARDS the verified claims (`sub` + scalars) to the guest as the host-set
+    // `x-boatramp-verified-claims` header — rejecting a missing/invalid/expired/wrong-issuer/forged
+    // token with 401 BEFORE the guest runs (fail-closed, matching the stream lane), and before the
+    // expensive bindings build below. A route that does NOT opt in is unchanged: the guest still
+    // receives the raw bearer (the unconditional spoof-strip above is then the only mutation).
+    if let Some(verify_cfg) = handler.verify_caller.as_ref()
+        && let Err(resp) =
+            verify_and_forward_caller(inner.env_source(), verify_cfg, &mut request).await
+    {
+        return resp;
+    }
     // Ask B: per-COMPONENT serve-admission. Acquire a permit (keyed by component hash) BEFORE the
     // expensive `build_bindings` + instantiate + serve-to-head region and hold it until this function
     // returns the head (the body then streams on its own task, not holding the permit). So at most
@@ -1580,6 +1611,95 @@ pub(super) fn set_forwarded_headers(request: &mut Request, client_ip: IpAddr) {
             HeaderValue::from_static("http"),
         );
     }
+}
+
+/// Opt-in host-verified caller: verify the request's `Authorization` bearer against `cfg` (the SAME
+/// app-bearer verifier the GraphQL data connector + scoped streams use —
+/// [`crate::graphql_data::token::verified_claims`]) and, on success, FORWARD the verified claims
+/// (every claim from the verified token, incl. `sub`) to the guest as the host-set
+/// `x-boatramp-verified-claims` request header (compact JSON). Fail-closed, matching the stream lane
+/// ([`verify_stream_bearer`]): a MISSING /
+/// INVALID / EXPIRED / WRONG-ISSUER / FORGED bearer → `Err(401)` so the dispatcher rejects the
+/// request BEFORE the guest runs. The host is the sole writer of the header — this re-strips any
+/// client-supplied value first (defense-in-depth over the unconditional strip at dispatch entry), so
+/// it can never be spoofed. Needs the `oidc` feature (for `jsonwebtoken`, like the data connector
+/// and the stream path); without it a declared verifier fails CLOSED (`503`) rather than forwarding
+/// an unverified identity.
+#[cfg(all(feature = "handlers", feature = "oidc"))]
+async fn verify_and_forward_caller(
+    env_source: &dyn boatramp_core::env::EnvSource,
+    cfg: &boatramp_core::config::HandlerGraphqlTokenClaims,
+    request: &mut Request,
+) -> Result<(), Response> {
+    // Never trust a client-supplied value, even though dispatch entry already stripped it.
+    request.headers_mut().remove(VERIFIED_CLAIMS_HEADER);
+    let bearer = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
+        .map(str::to_string);
+    // A declared verifier with no bearer fails closed (the route opted into REQUIRING a verified
+    // caller) — the stream lane's `stream requires a bearer token` 401 analog.
+    let Some(bearer) = bearer else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "this route requires a verified caller bearer token\n",
+        )
+            .into_response());
+    };
+    let Some(claims) = crate::graphql_data::token::verified_claims(cfg, &bearer, env_source).await
+    else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "caller bearer token did not verify\n",
+        )
+            .into_response());
+    };
+    // Compact JSON of the verified claims (`sub` + scalars). Built via `from_bytes` so a UTF-8 claim
+    // value (bytes 0x80–0xFF) survives; serde escapes every control char, so the only reject path is
+    // a pathological raw DEL (0x7F) in a claim — which fails CLOSED here (500, guest never runs)
+    // rather than forwarding a malformed header.
+    let json = match serde_json::to_vec(&claims) {
+        Ok(j) => j,
+        Err(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not encode verified caller claims\n",
+            )
+                .into_response());
+        }
+    };
+    let Ok(value) = HeaderValue::from_bytes(&json) else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "verified caller claims are not a valid header value\n",
+        )
+            .into_response());
+    };
+    request
+        .headers_mut()
+        .insert(HeaderName::from_static(VERIFIED_CLAIMS_HEADER), value);
+    Ok(())
+}
+
+/// Without the `oidc` feature there is no bearer verifier, so a declared `verify_caller` fails CLOSED
+/// (`503`) rather than forwarding an unverified identity — mirroring the stream lane's
+/// `verify_stream_bearer` non-`oidc` arm.
+#[cfg(all(feature = "handlers", not(feature = "oidc")))]
+async fn verify_and_forward_caller(
+    _env_source: &dyn boatramp_core::env::EnvSource,
+    _cfg: &boatramp_core::config::HandlerGraphqlTokenClaims,
+    _request: &mut Request,
+) -> Result<(), Response> {
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "verify_caller requires the `oidc` feature for bearer verification\n",
+    )
+        .into_response())
 }
 
 /// Rewrite a request's URI to an absolute `http://{authority}{site-relative
@@ -5065,5 +5185,163 @@ mod consumer_dns_resolve_tests {
             !bindings.egress_allowlist().is_empty(),
             "but it still carries the outbound-TCP allowlist it WAS granted"
         );
+    }
+}
+
+/// Host-seam gate for the opt-in `verify_caller` path: the seam that verifies the inbound app
+/// bearer and FORWARDS the verified claims to the guest as `x-boatramp-verified-claims`. Proves the
+/// SYNC/HTTP-lane host logic directly (there is no guest in this seam — the wasm bridge forwards
+/// every request header to the guest exactly as it already does for `X-Forwarded-*`), with the REAL
+/// [`crate::graphql_data::token`] verifier over an Ed25519 JWKS. (1) A valid token forwards the
+/// verified identity (every claim from the verified token, incl. `sub`) as compact JSON, and a client-supplied SPOOF of the
+/// header is overwritten by the verified value (never trusted). (2) A tampered-sig / expired /
+/// wrong-issuer / missing bearer is REJECTED 401 and NO verified header is left on the request
+/// (fail-closed — the guest, downstream, never runs).
+///
+/// Marker `VERIFY-CALLER HOST-SEAM OK`. The companion end-to-end gate
+/// (`conformance::verify_caller_forwards_verified_sub_and_fails_closed_before_guest`) proves the
+/// same fail-closed-BEFORE-the-guest property through the real `router()` with an observable guest.
+#[cfg(all(test, feature = "handlers", feature = "oidc"))]
+mod verify_caller_tests {
+    use super::*;
+    use base64::Engine;
+    use boatramp_core::config::HandlerGraphqlTokenClaims;
+    use boatramp_core::env::{EnvSource, MapEnv};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const ISS: &str = "https://idp.test";
+
+    fn b64url(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Sign an Ed25519 JWT by hand (the real `TokenVerifier` checks it via the JWKS).
+    fn sign(key: &SigningKey, kid: &str, claims: serde_json::Value) -> String {
+        let header = b64url(
+            serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": kid })
+                .to_string()
+                .as_bytes(),
+        );
+        let payload = b64url(claims.to_string().as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        format!(
+            "{signing_input}.{}",
+            b64url(&key.sign(signing_input.as_bytes()).to_bytes())
+        )
+    }
+
+    /// The app IdP: a deterministic Ed25519 key, its JWKS in a `MapEnv` (as an operator maps it),
+    /// and the opt-in verifier config naming that env var.
+    fn fixture() -> (SigningKey, MapEnv, HandlerGraphqlTokenClaims) {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let jwks = serde_json::json!({ "keys": [ {
+            "kty": "OKP", "crv": "Ed25519", "kid": "app",
+            "x": b64url(key.verifying_key().as_bytes()),
+        } ] })
+        .to_string();
+        let env = MapEnv::new().with("VC_JWKS", jwks);
+        let cfg = HandlerGraphqlTokenClaims {
+            issuer: ISS.to_string(),
+            jwks_env: Some("VC_JWKS".to_string()),
+            ..Default::default()
+        };
+        (key, env, cfg)
+    }
+
+    fn req_with(bearer: Option<&str>, spoof: Option<&str>) -> Request {
+        let mut b = Request::builder().method("GET").uri("http://site.test/me");
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if let Some(s) = spoof {
+            b = b.header(VERIFIED_CLAIMS_HEADER, s);
+        }
+        b.body(axum::body::Body::empty()).unwrap()
+    }
+
+    fn far_future() -> i64 {
+        4_102_444_800 // 2100-01-01
+    }
+
+    #[tokio::test]
+    async fn valid_token_forwards_verified_sub_and_overwrites_a_client_spoof() {
+        let (key, env, cfg) = fixture();
+        let token = sign(
+            &key,
+            "app",
+            serde_json::json!({ "iss": ISS, "exp": far_future(), "sub": "u42", "tid": "acme" }),
+        );
+        // The client tries to spoof the trusted header; the host must overwrite it with the VERIFIED
+        // claims, never pass the attacker's value through.
+        let mut request = req_with(Some(&token), Some(r#"{"sub":"attacker","tid":"evil"}"#));
+        verify_and_forward_caller(&env as &dyn EnvSource, &cfg, &mut request)
+            .await
+            .expect("a valid token verifies and forwards");
+
+        let fwd = request
+            .headers()
+            .get(VERIFIED_CLAIMS_HEADER)
+            .expect("the host set the verified-claims header");
+        let claims: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(fwd.as_bytes()).expect("header is compact JSON");
+        assert_eq!(
+            claims.get("sub").and_then(|v| v.as_str()),
+            Some("u42"),
+            "the VERIFIED sub is forwarded (the client spoof `attacker` is overwritten)"
+        );
+        assert_eq!(
+            claims.get("tid").and_then(|v| v.as_str()),
+            Some("acme"),
+            "scalar claims ride along with sub"
+        );
+        // The raw bearer is left intact (apps that still read it keep working).
+        assert!(
+            request.headers().get(header::AUTHORIZATION).is_some(),
+            "the Authorization header is preserved"
+        );
+        println!("VERIFY-CALLER HOST-SEAM OK");
+    }
+
+    #[tokio::test]
+    async fn bad_tokens_are_rejected_401_before_any_forward() {
+        let (key, env, cfg) = fixture();
+        let good = sign(
+            &key,
+            "app",
+            serde_json::json!({ "iss": ISS, "exp": far_future(), "sub": "u42" }),
+        );
+        let expired = sign(
+            &key,
+            "app",
+            serde_json::json!({ "iss": ISS, "exp": 1_000_000_000, "sub": "u42" }),
+        );
+        let wrong_iss = sign(
+            &key,
+            "app",
+            serde_json::json!({ "iss": "https://evil.test", "exp": far_future(), "sub": "u42" }),
+        );
+        let tampered = format!("{good}x"); // mangled signature
+
+        for (label, bearer) in [
+            ("missing bearer", None),
+            ("tampered signature", Some(tampered.as_str())),
+            ("expired", Some(expired.as_str())),
+            ("wrong issuer", Some(wrong_iss.as_str())),
+        ] {
+            // Even a REJECTED request carries a client spoof on entry — it must never survive.
+            let mut request = req_with(bearer, Some(r#"{"sub":"attacker"}"#));
+            let err = verify_and_forward_caller(&env as &dyn EnvSource, &cfg, &mut request)
+                .await
+                .expect_err(&format!("{label} must be rejected"));
+            assert_eq!(
+                err.status(),
+                StatusCode::UNAUTHORIZED,
+                "{label} fails closed with 401"
+            );
+            assert!(
+                request.headers().get(VERIFIED_CLAIMS_HEADER).is_none(),
+                "{label}: no verified-claims header is forwarded (client spoof stripped, none set)"
+            );
+        }
     }
 }

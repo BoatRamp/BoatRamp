@@ -89,6 +89,7 @@ async fn live_app() -> axum::Router {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            verify_caller: None,
             route: RPC_PATH.to_string(),
             methods: vec!["POST".to_string()],
             component: "connect/ticker.wasm".to_string(),

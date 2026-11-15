@@ -97,6 +97,7 @@ async fn live_app() -> axum::Router {
         // HandlerConfig has no `Default`, so spell every field (least-privilege: no imports, no
         // secrets, no egress, no tenancy — the greeter is a pure transport echo).
         handlers: vec![HandlerConfig {
+            verify_caller: None,
             route: RPC_PATH.to_string(),
             methods: vec!["POST".to_string()],
             component: "connect/greeter.wasm".to_string(),

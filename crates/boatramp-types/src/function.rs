@@ -1150,6 +1150,7 @@ mod tests {
 
     fn handler(route: &str, component: &str, methods: &[&str], imports: &[&str]) -> HandlerConfig {
         HandlerConfig {
+            verify_caller: None,
             tenancy: None,
             token_claims: None,
             no_secrets: false,

@@ -1798,6 +1798,16 @@ fn prepare_invoke_request(mut request: Request) -> Request {
     request
         .headers_mut()
         .insert(header::HOST, HeaderValue::from_static(INVOKE_AUTHORITY));
+    // The host is the SOLE writer of the verified-caller header
+    // ([`crate::handler_dispatch::VERIFIED_CLAIMS_HEADER`], PLAN-handler-verified-caller): a
+    // caller/guest-supplied value on an invoke request must NEVER reach the function guest, so strip
+    // it here — the invoke-path analog of the dispatch-entry strip, keeping the sole-writer invariant
+    // true platform-wide (external `/api/functions/<name>/invoke` AND every internal invoke, since
+    // the internal path funnels through here too). The invoke lane never SETS the trusted value, so
+    // this is strip-only (unlike the dispatch lane, which verifies and sets it).
+    request
+        .headers_mut()
+        .remove(crate::handler_dispatch::VERIFIED_CLAIMS_HEADER);
     request
 }
 
@@ -2137,8 +2147,12 @@ fn build_internal_request(request: boatramp_handlers::InvokeRequest) -> Result<R
         .uri(format!("http://{INVOKE_AUTHORITY}{path}"));
     for (name, value) in &request.headers {
         // The host is set by `prepare_invoke_request`; a guest-supplied one is
-        // dropped so it can't spoof the authority.
-        if name.eq_ignore_ascii_case("host") {
+        // dropped so it can't spoof the authority. The verified-caller header is the host's to
+        // set, never the guest's — drop any guest-supplied one so it can't spoof the caller identity
+        // (defense-in-depth with `prepare_invoke_request`'s strip; the sole-writer invariant).
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case(crate::handler_dispatch::VERIFIED_CLAIMS_HEADER)
+        {
             continue;
         }
         builder = builder.header(name.as_str(), value.as_slice());
@@ -4504,5 +4518,58 @@ mod blobstore_dimension0_tests {
              (undeclared refused under strict posture; Disabled binds permissive; scoped+allowlist \
              binds)"
         );
+    }
+}
+
+/// F2 gate: the host is the SOLE writer of `x-boatramp-verified-claims` platform-wide — the
+/// invoke-request builders must STRIP any caller/guest-supplied value so it can never reach a
+/// function guest (external `/api/functions/<name>/invoke` via [`prepare_invoke_request`], and every
+/// internal / federation / graphql::run invoke via [`build_internal_request`]). Deleting either
+/// strip turns this RED. Marker `VERIFY-CALLER INVOKE-STRIP OK`.
+#[cfg(all(test, feature = "handlers"))]
+mod verify_caller_invoke_strip_tests {
+    use super::*;
+
+    const VC: &str = crate::handler_dispatch::VERIFIED_CLAIMS_HEADER;
+
+    #[test]
+    fn prepare_invoke_request_strips_a_client_supplied_verified_claims_header() {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/functions/f/invoke")
+            .header(VC, r#"{"sub":"attacker"}"#)
+            .header(header::AUTHORIZATION, "Bearer app-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let prepared = prepare_invoke_request(request);
+        assert!(
+            prepared.headers().get(VC).is_none(),
+            "a client-supplied verified-claims header must be stripped on the invoke path"
+        );
+        // The raw bearer is untouched (the function still verifies it itself if it wants to).
+        assert!(prepared.headers().get(header::AUTHORIZATION).is_some());
+    }
+
+    #[test]
+    fn build_internal_request_drops_a_guest_supplied_verified_claims_header() {
+        let invoke = boatramp_handlers::InvokeRequest {
+            method: "GET".to_string(),
+            path: "/x".to_string(),
+            headers: vec![
+                (VC.to_string(), br#"{"sub":"attacker"}"#.to_vec()),
+                ("authorization".to_string(), b"Bearer app-token".to_vec()),
+            ],
+            body: Vec::new(),
+        };
+        let request = build_internal_request(invoke).expect("builds");
+        assert!(
+            request.headers().get(VC).is_none(),
+            "a guest-supplied verified-claims header must be dropped building the internal request"
+        );
+        assert!(
+            request.headers().get(header::AUTHORIZATION).is_some(),
+            "the forwarded bearer is preserved"
+        );
+        println!("VERIFY-CALLER INVOKE-STRIP OK");
     }
 }

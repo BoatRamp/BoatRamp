@@ -36,6 +36,28 @@ impl Guest for Component {
                     format!("greeting={greeting} path_leaked={path_leaked}").as_bytes(),
                 );
             }
+            "/echo-header" => {
+                // Reflect exactly what the GUEST receives for the host-verified-caller header (and
+                // the raw Authorization), so a host test can assert the host STRIPPED a client spoof
+                // for a NON-opting route and FORWARDED the verified value for an opting one. This is
+                // the only way to observe the dispatch-entry strip end-to-end (the sole-writer
+                // invariant for the majority, non-opting path).
+                let headers = request.headers();
+                let get = |name: &str| {
+                    headers
+                        .get(&name.to_string())
+                        .into_iter()
+                        .next()
+                        .and_then(|v| String::from_utf8(v).ok())
+                        .unwrap_or_else(|| "ABSENT".to_string())
+                };
+                let vc = get("x-boatramp-verified-claims");
+                let auth = get("authorization");
+                respond(
+                    outparam,
+                    format!("verified-claims={vc}\nauthorization={auth}\n").as_bytes(),
+                );
+            }
             _ => respond(outparam, b"hello from boatramp handler\n"),
         }
     }
