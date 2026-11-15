@@ -906,6 +906,21 @@ pub struct HandlerConfig {
     /// record, never guest-supplied at runtime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_publish_zones: Vec<String>,
+    /// Per-handler **runtime-registerable zone-root allowlist** for the RUNTIME per-tenant
+    /// `dns-publish` credential path (cap-req #31). Each entry is a zone-root glob (`acme.com`,
+    /// `**.acme.com`): a guest may `register-zone-credential(zone-root)` ONLY if `zone-root` matches an
+    /// entry (same globbing as [`dns_publish_zones`](Self::dns_publish_zones): exact, `*.suffix` one
+    /// label, `**.suffix` any depth). DISTINCT from `dns_publish_zones`, which fences OPERATOR-credential
+    /// writes by the record's OWN name; this fences which zones a TENANT may register its OWN sealed
+    /// credential for (the registration then authorizes writes under that zone-root). **Empty ⇒
+    /// deny-all** (fail-closed — a handler that names no zones can register nothing). Only consulted when
+    /// `imports` contains `dns-publish` AND the node posture
+    /// [`allow_guest_dynamic_dns_publish`](crate::security::SecurityPosture::allow_guest_dynamic_dns_publish)
+    /// is on AND the host resolved a single tenant AND a `[secrets]` envelope is configured — otherwise
+    /// the runtime path is fail-closed. Host config on the deploy record, never guest-supplied at
+    /// runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_dns_zones: Vec<String>,
     /// Per-handler **approved NS-target allowlist** for the gated `dns-publish` capability (Security
     /// review MEDIUM-3, cap-req #24): the authorized nameserver targets (globs) a **sub-zone `NS`**
     /// record this handler writes may delegate to. This is the DNS analog of
@@ -1104,6 +1119,12 @@ pub struct ConsumerConfig {
     /// Posture-gated (`allow_guest_dns_publish`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_publish_zones: Vec<String>,
+    /// Per-component **runtime-registerable zone-root allowlist** for the RUNTIME per-tenant
+    /// `dns-publish` credential path (same contract as [`HandlerConfig::dynamic_dns_zones`], cap-req
+    /// #31): the zone-root globs a guest may register its OWN sealed provider credential for. **Empty ⇒
+    /// deny-all.** Posture-gated (`allow_guest_dynamic_dns_publish`); DISTINCT from `dns_publish_zones`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_dns_zones: Vec<String>,
     /// Per-consumer approved **NS-target allowlist** for a sub-zone `NS` delegation (same contract as
     /// [`HandlerConfig::dns_publish_ns_targets`]): the authorized nameserver targets a sub-zone NS may
     /// point to, consulted only under the `allowlist` NS posture. **Empty ⇒ deny-all.** Does not affect
@@ -1363,6 +1384,11 @@ pub struct SessionConfig {
     /// (`allow_guest_dns_publish`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_publish_zones: Vec<String>,
+    /// Per-component **runtime-registerable zone-root allowlist** for the RUNTIME per-tenant
+    /// `dns-publish` credential path (same contract as [`HandlerConfig::dynamic_dns_zones`], cap-req
+    /// #31). **Empty ⇒ deny-all.** Posture-gated (`allow_guest_dynamic_dns_publish`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_dns_zones: Vec<String>,
     /// Per-session approved **NS-target allowlist** for a sub-zone `NS` delegation (same contract as
     /// [`HandlerConfig::dns_publish_ns_targets`]): the authorized nameserver targets a sub-zone NS this
     /// session writes may point to, consulted only under the `allowlist` NS posture. **Empty ⇒
@@ -2479,6 +2505,7 @@ mod tests {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dynamic_dns_zones: Vec::new(),
                 dns_publish_ns_targets: Vec::new(),
             }],
             ..Default::default()

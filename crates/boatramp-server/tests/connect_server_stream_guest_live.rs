@@ -106,6 +106,7 @@ async fn live_app() -> axum::Router {
             blobstore_containers: vec![],
             egress_allowlist: vec![],
             dns_publish_zones: vec![],
+            dynamic_dns_zones: Vec::new(),
             dns_publish_ns_targets: vec![],
             tenancy: None,
             token_claims: None,

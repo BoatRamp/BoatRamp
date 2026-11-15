@@ -118,6 +118,51 @@ write. See [`serve.dns_providers`](boatramp-cfg.md#servedns_providers).
 > model. Keep each grant's `dns_publish_zones` scoped to the exact owner names it needs (the default
 > is deny-all); the allowlist, not the registry, is the per-guest least-privilege bound.
 
+## Runtime per-tenant zone credentials (cap-req #31)
+
+The provider source above is **operator-configured** — the operator holds the provider credential and
+routes guest writes by owner name. A **multi-tenant** app, though, often needs each tenant to connect
+its **own** DNS zone with its **own** provider API token (e.g. a mailroom tenant publishing
+MX/SPF/DKIM/DMARC/ownership records into *its* Cloudflare account). The **runtime per-tenant
+credential** path handles exactly that: a granted guest registers the tenant's token **once**, the host
+**seals** it (the `[secrets]` key envelope — a `[secrets]` section is **required**, otherwise the path
+is fail-closed) keyed to the resolved `(project, tenant)` + `zone-root`, and subsequent writes whose
+owner name falls under a registered zone-root route to the registered credential. **The token is never
+returned to the guest, logged, or echoed** — the guest holds no persistent zone-write token.
+
+Two WIT verbs on the `boatramp:handlers/dns-publish` interface drive it (they ride the existing
+`dns-publish` grant — no new grant kind):
+
+```wit
+enum provider-kind { cloudflare, digitalocean, hetzner, ns1 }
+register-zone-credential:   func(zone-root: string, provider: provider-kind, zone-id: option<string>, token: string) -> result<_, publish-error>;
+unregister-zone-credential: func(zone-root: string) -> result<_, publish-error>;
+```
+
+Only the **single-token** provider set is runtime-registerable (`cloudflare` needs the opaque `zone-id`;
+the name-keyed providers use the zone-root as the zone). Providers whose credential is not a single
+token — `route53` (AWS credential chain), `oci` (PEM key), `akamai` (three secrets) and the ones that
+need extra non-secret identifiers — stay **operator-serve-static only**.
+
+Fail-closed at every layer, all independent of the operator path:
+
+- **Posture** `allow_guest_dynamic_dns_publish` — **off under `multi-tenant`**, on under
+  `single-tenant`/`dev` (set via `[security.overrides]` /
+  `BOATRAMP_SECURITY_ALLOW_GUEST_DYNAMIC_DNS_PUBLISH`). Off ⇒ every `register`/`unregister` is
+  `access-denied` and no record routes to a runtime credential. Distinct from `allow_guest_dns_publish`.
+- **Per-component `dynamic_dns_zones` allowlist** — the zone-root globs a guest may register a
+  credential for (same globbing as `dns_publish_zones`; `acme.com`, `**.acme.com`). **Empty ⇒ deny-all.**
+  Distinct from `dns_publish_zones` (which fences *operator*-credential writes by the record's own name).
+- **Resolved tenant** — the registry is keyed to THIS invocation's host-resolved own tenant (never guest
+  input). A guest in project A / tenant T can never register, read, route through, or unregister another
+  tenant's credential; no resolved tenant ⇒ the path is inert.
+- **Sealing** — the token is sealed at rest with the same AEAD as the per-tenant secret store; with no
+  `[secrets]` envelope the path is fail-closed.
+
+A zone with **no** registered runtime credential falls through to the operator serve-static path above,
+unchanged. See [`HandlerConfig::dynamic_dns_zones`](boatramp-cfg.md) and
+[`allow_guest_dynamic_dns_publish`](boatramp-cfg.md#security).
+
 ## See also
 
 - [Automate DNS with a provider](../how-to/auto-dns.md)

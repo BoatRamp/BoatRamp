@@ -2033,6 +2033,19 @@ impl HandlerRuntime {
         }
     }
 
+    /// Wire the per-**tenant** sealed DNS-zone CREDENTIAL store (cap-req #31) that backs the RUNTIME
+    /// guest `dns-publish` register/route/unregister path — installing the process-wide runtime source
+    /// (store + an acme-backed provider factory) into the serve binding seam. Set once at startup, gated
+    /// on the `[secrets]` envelope; if never set the runtime path stays fail-closed (`access-denied`). A
+    /// no-op unless the `dns-publish` feature is compiled (the node has one unconditional call site).
+    #[cfg(feature = "handlers")]
+    pub fn set_dns_cred_store(&self, store: Arc<boatramp_core::secret_store::TenantDnsCredStore>) {
+        #[cfg(feature = "dns-publish")]
+        crate::dns_publish::install_dns_cred_source((*store).clone());
+        #[cfg(not(feature = "dns-publish"))]
+        let _ = store;
+    }
+
     /// Wire an injectable environment source for config-named host-env secret
     /// lookups. Production leaves this unset (⇒ the real process env,
     /// [`boatramp_core::env::SystemEnv`]); a test wires a `MapEnv` so host-env
@@ -5868,6 +5881,7 @@ mod tests {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dynamic_dns_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
@@ -6044,6 +6058,7 @@ mod tests {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dynamic_dns_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],
                 ..Default::default()
@@ -6489,6 +6504,7 @@ mod tests {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dynamic_dns_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],
                 ..Default::default()
@@ -8755,6 +8771,7 @@ mod tests {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dynamic_dns_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],
                 crons: vec![CronConfig {
@@ -8944,6 +8961,7 @@ mod tests {
                     blobstore_containers: Vec::new(),
                     egress_allowlist: Vec::new(),
                     dns_publish_zones: Vec::new(),
+                    dynamic_dns_zones: Vec::new(),
                     dns_publish_ns_targets: Vec::new(),
                 }],
                 crons: vec![CronConfig {
@@ -9111,6 +9129,8 @@ mod tests {
                     &[],
                     // `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
                     &[],
+                    // runtime-registerable zone-root allowlist (cap-req #31): empty ⇒ deny-all.
+                    &[],
                     // `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.
                     &[],
                     // Per-guest secret allowlist (task #492): empty ⇒ the whole site pool.
@@ -9263,6 +9283,8 @@ mod tests {
                 // Outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
                 &[],
                 // `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
+                &[],
+                // runtime-registerable zone-root allowlist (cap-req #31): empty ⇒ deny-all.
                 &[],
                 // `dns-publish` NS-target allowlist (MEDIUM-3): empty ⇒ deny-all under `allowlist`.
                 &[],
@@ -9444,6 +9466,7 @@ mod tests {
             blobstore_containers: &[],
             egress_allowlist: &[],
             dns_publish_zones: &[],
+            dynamic_dns_zones: &[],
             dns_publish_ns_targets: &[],
             secret_allowlist: &[],
         };

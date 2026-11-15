@@ -164,6 +164,14 @@ pub struct FunctionConfig {
     /// `allow_guest_dns_publish` is on (fail-closed otherwise).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_publish_zones: Vec<String>,
+    /// Per-component **runtime-registerable zone-root allowlist** for the RUNTIME per-tenant
+    /// `dns-publish` credential path (same contract as
+    /// [`crate::config::HandlerConfig::dynamic_dns_zones`], cap-req #31): the zone-root globs a guest may
+    /// register its OWN sealed provider credential for. **Empty ⇒ deny-all.** Only consulted when
+    /// `imports` contains `dns-publish` AND the node posture `allow_guest_dynamic_dns_publish` is on AND
+    /// the host resolved a single tenant (fail-closed otherwise). DISTINCT from `dns_publish_zones`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_dns_zones: Vec<String>,
     /// Per-component approved **NS-target allowlist** for a sub-zone `NS` delegation (same contract as
     /// [`crate::config::HandlerConfig::dns_publish_ns_targets`], Security review MEDIUM-3): the
     /// authorized nameserver targets a sub-zone NS this function writes may delegate to, consulted only
@@ -297,6 +305,8 @@ impl FunctionConfig {
             egress_allowlist: h.egress_allowlist.clone(),
             // Carry the handler's `dns-publish` writable-zone allowlist likewise (grant surface parity).
             dns_publish_zones: h.dns_publish_zones.clone(),
+            // Carry the handler's runtime-registerable zone allowlist likewise (cap-req #31 parity).
+            dynamic_dns_zones: h.dynamic_dns_zones.clone(),
             // Carry the handler's `dns-publish` NS-target allowlist likewise (MEDIUM-3 grant parity).
             dns_publish_ns_targets: h.dns_publish_ns_targets.clone(),
             // A desugared handler-function runs on the site-handler dispatch path, where the site is
@@ -332,6 +342,8 @@ impl FunctionConfig {
             egress_allowlist: c.egress_allowlist.clone(),
             // Carry the consumer's `dns-publish` writable-zone allowlist likewise.
             dns_publish_zones: c.dns_publish_zones.clone(),
+            // Carry the consumer's runtime-registerable zone allowlist likewise (cap-req #31 parity).
+            dynamic_dns_zones: c.dynamic_dns_zones.clone(),
             // Carry the consumer's `dns-publish` NS-target allowlist likewise (MEDIUM-3 grant parity).
             dns_publish_ns_targets: c.dns_publish_ns_targets.clone(),
             ..Default::default()
@@ -1174,6 +1186,7 @@ mod tests {
             blobstore_containers: Vec::new(),
             egress_allowlist: Vec::new(),
             dns_publish_zones: Vec::new(),
+            dynamic_dns_zones: Vec::new(),
             dns_publish_ns_targets: Vec::new(),
         }
     }
@@ -1218,6 +1231,7 @@ mod tests {
                 blobstore_containers: Vec::new(),
                 egress_allowlist: Vec::new(),
                 dns_publish_zones: Vec::new(),
+                dynamic_dns_zones: Vec::new(),
                 dns_publish_ns_targets: Vec::new(),
             }],
             crons: vec![CronConfig {

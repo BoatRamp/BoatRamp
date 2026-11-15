@@ -853,6 +853,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_ALLOW_GUEST_TCP_EGRESS",
     "BOATRAMP_SECURITY_ALLOW_GUEST_TCP_LISTENER",
     "BOATRAMP_SECURITY_ALLOW_GUEST_DNS_PUBLISH",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_DYNAMIC_DNS_PUBLISH",
     "BOATRAMP_SECURITY_GUEST_DNS_PUBLISH_NS",
     "BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES",
     "BOATRAMP_SECURITY_MAX_COMPONENT_BYTES",
@@ -4816,6 +4817,9 @@ mod tests {
             }),
             ("BOATRAMP_SECURITY_ALLOW_GUEST_TCP_LISTENER", |p| {
                 p.allow_guest_tcp_listener
+            }),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_DYNAMIC_DNS_PUBLISH", |p| {
+                p.allow_guest_dynamic_dns_publish
             }),
             ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_DOMAINS", |p| {
                 p.allow_guest_admin_domains

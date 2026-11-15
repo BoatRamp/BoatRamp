@@ -22,7 +22,11 @@
 
 use std::sync::{Arc, OnceLock};
 
-use boatramp_handlers::{DnsProvider, DnsPublishAuditSink, TracingDnsPublishSink};
+use boatramp_core::secret_store::TenantDnsCredStore;
+use boatramp_handlers::{
+    DnsProvider, DnsPublishAuditSink, RuntimeDnsProviderFactory, RuntimeDnsProviderKind,
+    RuntimeDnsRegistry, TracingDnsPublishSink,
+};
 
 /// The host-held DNS writer for a granted `dns-publish` guest, plus the zone it is authoritative over
 /// (passed to the central guardrail so an apex `NS` is refused). The provider's adapter credential is
@@ -64,6 +68,95 @@ pub(crate) fn default_audit_sink() -> Arc<dyn DnsPublishAuditSink> {
     Arc::new(TracingDnsPublishSink)
 }
 
+/// The concrete [`RuntimeDnsProviderFactory`] (cap-req #31): builds a live `boatramp-acme` adapter from
+/// an UNSEALED runtime credential. The single-token provider set only (Cloudflare needs an opaque
+/// `zone-id`; the name-keyed providers use the zone-root as the zone). The token reaches the adapter but
+/// never crosses back to the guest or into a log.
+struct AcmeRuntimeDnsProviderFactory;
+
+impl RuntimeDnsProviderFactory for AcmeRuntimeDnsProviderFactory {
+    fn build(
+        &self,
+        kind: RuntimeDnsProviderKind,
+        zone_id: Option<&str>,
+        token: &str,
+        zone_root: &str,
+    ) -> Result<Arc<dyn DnsProvider>, String> {
+        Ok(match kind {
+            RuntimeDnsProviderKind::Cloudflare => {
+                let zone_id = zone_id.ok_or_else(|| "cloudflare requires a zone-id".to_string())?;
+                Arc::new(boatramp_acme::cloudflare::CloudflareDns::new(
+                    zone_id.to_string(),
+                    token.to_string(),
+                ))
+            }
+            RuntimeDnsProviderKind::DigitalOcean => {
+                Arc::new(boatramp_acme::digitalocean::DigitalOceanDns::new(
+                    zone_root.to_string(),
+                    token.to_string(),
+                ))
+            }
+            RuntimeDnsProviderKind::Hetzner => Arc::new(boatramp_acme::hetzner::HetznerDns::new(
+                zone_root.to_string(),
+                token.to_string(),
+            )),
+            RuntimeDnsProviderKind::Ns1 => Arc::new(boatramp_acme::ns1::Ns1Dns::new(
+                zone_root.to_string(),
+                token.to_string(),
+            )),
+        })
+    }
+}
+
+/// The installed RUNTIME per-tenant DNS-credential source (cap-req #31): the host-sealed store + the
+/// provider factory. Installed once at boot from the node (`HandlerRuntime::set_dns_cred_store`) when a
+/// `[secrets]` envelope is configured. `None` (unset) ⇒ fail-closed: no runtime registry is attached, so
+/// every `register`/`unregister` is `access-denied`.
+struct DnsPublishRuntimeSource {
+    store: TenantDnsCredStore,
+    factory: Arc<dyn RuntimeDnsProviderFactory>,
+}
+
+static RUNTIME_SOURCE: OnceLock<DnsPublishRuntimeSource> = OnceLock::new();
+
+/// Install the runtime per-tenant DNS-credential source ONCE at boot (cap-req #31), from the node's
+/// sealed [`TenantDnsCredStore`] + the acme-backed provider factory. A later call is ignored
+/// (`OnceLock`). Not calling it (no `[secrets]` envelope) keeps the runtime path fail-closed.
+pub fn install_dns_cred_source(store: TenantDnsCredStore) {
+    let _ = RUNTIME_SOURCE.set(DnsPublishRuntimeSource {
+        store,
+        factory: Arc::new(AcmeRuntimeDnsProviderFactory),
+    });
+    tracing::info!(
+        target: "boatramp::dns::publish",
+        "dns-publish: runtime per-tenant credential source INSTALLED (cap-req #31) — the node posture \
+         `allow_guest_dynamic_dns_publish` + a per-component `dynamic_dns_zones` allowlist + the \
+         resolved tenant still gate every register/route",
+    );
+}
+
+/// Build the per-invocation [`RuntimeDnsRegistry`] for `(project, resolved_tenant)` when the runtime
+/// source is installed, a tenant resolved, and `dynamic_dns_zones` is non-empty. `None` ⇒ no runtime
+/// path for this invocation (fail-closed — no envelope, no tenant, or no registerable zones).
+fn runtime_registry(
+    project: &str,
+    resolved_tenant: Option<&str>,
+    dynamic_dns_zones: &[String],
+) -> Option<RuntimeDnsRegistry> {
+    if dynamic_dns_zones.is_empty() {
+        return None;
+    }
+    let tenant = resolved_tenant?;
+    let source = RUNTIME_SOURCE.get()?;
+    Some(RuntimeDnsRegistry::new(
+        source.store.clone(),
+        source.factory.clone(),
+        project,
+        tenant,
+        dynamic_dns_zones.to_vec(),
+    ))
+}
+
 /// Attach the `dns-publish` binding to `bindings` when (and only when) the component is granted the
 /// capability AND an operator provider source resolves a writer for this `(project, site)`. The
 /// per-grant `writable_zones` (own-name allowlist, empty ⇒ deny-all) is the deploy-record config. Every
@@ -71,30 +164,45 @@ pub(crate) fn default_audit_sink() -> Arc<dyn DnsPublishAuditSink> {
 /// this attach is purely "make the writer reachable"; an un-granted or un-sourced component simply has
 /// no binding and the host fail-closes to `access-denied`. Returns `bindings` unchanged when not
 /// granted / not sourced.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn maybe_attach(
     bindings: boatramp_handlers::Bindings,
     granted: bool,
     project: &str,
     site: &str,
+    resolved_tenant: Option<&str>,
     writable_zones: &[String],
+    dynamic_dns_zones: &[String],
     ns_targets: &[String],
 ) -> boatramp_handlers::Bindings {
     if !granted {
         return bindings;
     }
-    let Some(source) = provider_source() else {
+    // OPERATOR serve-static path (cap-req #24, UNCHANGED): attach the host-held writer when a provider
+    // source resolves one for this `(project, site)`.
+    let operator_grant = provider_source().and_then(|source| source.provider_for(project, site));
+    // RUNTIME per-tenant path (cap-req #31): attach the sealed-credential registry when the runtime
+    // source is installed, a single tenant resolved, and this component names registerable zones.
+    let runtime = runtime_registry(project, resolved_tenant, dynamic_dns_zones);
+    // Nothing to attach ⇒ the host fail-closes to `access-denied` (unchanged).
+    if operator_grant.is_none() && runtime.is_none() {
         return bindings;
-    };
-    let Some(grant) = source.provider_for(project, site) else {
-        return bindings;
-    };
-    bindings.with_dns_publish(
-        grant.provider,
-        grant.zone_root,
-        writable_zones.to_vec(),
-        // The per-grant NS-target allowlist for a sub-zone NS delegation (MEDIUM-3). Deploy-record
-        // config, mirrored from the handler/function/consumer config exactly like `writable_zones`.
-        ns_targets.to_vec(),
-        default_audit_sink(),
-    )
+    }
+    let audit = default_audit_sink();
+    let mut bindings = bindings;
+    if let Some(grant) = operator_grant {
+        bindings = bindings.with_dns_publish(
+            grant.provider,
+            grant.zone_root,
+            writable_zones.to_vec(),
+            // The per-grant NS-target allowlist for a sub-zone NS delegation (MEDIUM-3). Deploy-record
+            // config, mirrored from the handler/function/consumer config exactly like `writable_zones`.
+            ns_targets.to_vec(),
+            audit.clone(),
+        );
+    }
+    if let Some(runtime) = runtime {
+        bindings = bindings.with_dns_publish_runtime(runtime, audit);
+    }
+    bindings
 }

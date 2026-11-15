@@ -534,6 +534,30 @@ pub(crate) mod keys {
         format!("project/{project}/tenant-secret-index/{tenant}")
     }
 
+    /// A per-tenant sealed **DNS-zone write credential** (cap-req #31, the runtime/dynamic analogue of
+    /// the operator serve-static `[serve.dns_providers]` registry):
+    /// `project/<proj>/dns-zone-cred/<tenant>/<zone-root>` → an envelope-sealed provider API token plus
+    /// small clear metadata (the provider kind + an optional opaque provider zone-id). The
+    /// `dns-zone-cred/` infix is a DISTINCT keyspace from BOTH the project `secret/` and the per-tenant
+    /// `tenant-secret/` stores — the guest-facing `tenant-secrets` binding can never address it (so the
+    /// sealed zone-write token is never readable back by the guest). The `<tenant>` segment is
+    /// [`validate_key_segment`](crate::project::validate_key_segment)-screened and the `<zone-root>`
+    /// segment screened to a canonical DNS name (both fail-closed) by
+    /// [`TenantDnsCredStore`](crate::secret_store::TenantDnsCredStore) BEFORE they reach here, so neither
+    /// can carry a `/` and reshape the key to a sibling tenant's — the register, route, and unregister
+    /// paths compose the SAME byte-identical segments.
+    pub fn dns_zone_cred(project: ProjectRef<'_>, tenant: &str, zone_root: &str) -> String {
+        format!("project/{project}/dns-zone-cred/{tenant}/{zone_root}")
+    }
+
+    /// The prefix listing ONE tenant's registered DNS-zone credentials within a project
+    /// (`project/<proj>/dns-zone-cred/<tenant>/`) — keyed on the TENANT, never project-wide, so a
+    /// `list` can only ever enumerate the resolved tenant's own registered zone-roots (no cross-tenant
+    /// oracle). The `strip_prefix` tail is a single `<zone-root>` segment.
+    pub fn dns_zone_cred_prefix(project: ProjectRef<'_>, tenant: &str) -> String {
+        format!("project/{project}/dns-zone-cred/{tenant}/")
+    }
+
     /// A project-scoped SMTP email profile: `project/<proj>/email/<name>` → the
     /// clear connection config plus an envelope-sealed password. Project-scoped so
     /// the `email` guest capability resolves only within its own project's

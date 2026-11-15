@@ -1915,6 +1915,47 @@ interface dns-publish {
     backend(string),
   }
 
+  /// The DNS provider a RUNTIME-registered zone credential (cap-req #31) authenticates to. A SUBSET of
+  /// the operator serve-static provider set: only providers whose sole secret is ONE API token/key —
+  /// and whose zone is addressed either by the zone-root domain itself or by one opaque `zone-id` — fit
+  /// a single-token runtime registration. (route53 uses the ambient AWS credential chain, oci needs a
+  /// PEM private key, akamai needs three secrets; those remain operator-serve-static-only.)
+  enum provider-kind {
+    /// Cloudflare (API v4, token auth). Requires `zone-id` (the opaque Cloudflare zone id) + the token.
+    cloudflare,
+    /// DigitalOcean. The zone is the zone-root domain; `token` is the API token (`zone-id` ignored).
+    digitalocean,
+    /// Hetzner DNS. The zone is the zone-root domain; `token` is the API token (`zone-id` ignored).
+    hetzner,
+    /// NS1. The zone is the zone-root domain; `token` is the API key (`zone-id` ignored).
+    ns1,
+  }
+
+  /// Register a HOST-SEALED, zone-scoped DNS-write credential for `zone-root` (cap-req #31) — the
+  /// runtime/dynamic analogue of the operator serve-static `[serve.dns_providers]` registry, for a
+  /// tenant connecting its OWN DNS zone with its OWN provider API token. The guest hands the `token`
+  /// ONCE; the host SEALS it (the node `[secrets]` key envelope) and holds it, keyed to THIS
+  /// invocation's host-resolved `(project, tenant)` + `zone-root` — the token is NEVER returned,
+  /// logged, or echoed, and the guest holds no persistent zone-write token. Subsequent `upsert` /
+  /// `upsert-set` whose record name falls under a registered `zone-root` route to the registered
+  /// credential (write-authorized BY the registration — the tenant proved it holds the token); a zone
+  /// with no registered credential falls through to the operator serve-static path unchanged.
+  ///
+  /// Gated, fail-closed: `access-denied` unless the node posture `allow_guest_dynamic_dns_publish` is
+  /// on AND `zone-root` matches this component's host-authoritative `dynamic_dns_zones` allowlist
+  /// (empty ⇒ deny-all) AND the host resolved a single tenant for this invocation AND a `[secrets]`
+  /// envelope is configured. `zone-id` is the provider's opaque zone identifier — REQUIRED for
+  /// `cloudflare`, ignored for the name-keyed providers (the zone-root is the zone). A malformed
+  /// `zone-root` / a `cloudflare` registration missing `zone-id` is `invalid-record`.
+  register-zone-credential: func(zone-root: string, provider: provider-kind, zone-id: option<string>, token: string) -> result<_, publish-error>;
+
+  /// Remove a previously-registered runtime credential for `zone-root` (cap-req #31). Idempotent — an
+  /// already-absent credential is `ok`. After unregister, an `upsert`/`upsert-set` to that zone falls
+  /// through to the operator serve-static path (then fail-closes if that zone is not operator-served
+  /// either). Same fail-closed gate as `register-zone-credential`; scoped to THIS invocation's resolved
+  /// `(project, tenant)` — a guest can never unregister another tenant's credential.
+  unregister-zone-credential: func(zone-root: string) -> result<_, publish-error>;
+
   /// Create-or-replace one record (idempotent: a retried upsert converges rather than duplicating).
   /// (`record` is a WIT keyword, so the parameter is named `rec`.)
   upsert: func(rec: dns-record) -> result<_, publish-error>;

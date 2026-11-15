@@ -189,6 +189,8 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let allow_guest_tcp_egress = options.posture.allow_guest_tcp_egress;
     let allow_guest_tcp_listener = options.posture.allow_guest_tcp_listener;
     let allow_guest_dns_publish = options.posture.allow_guest_dns_publish;
+    // The RUNTIME per-tenant DNS-credential posture (cap-req #31).
+    let allow_guest_dynamic_dns_publish = options.posture.allow_guest_dynamic_dns_publish;
     // Sub-zone `NS` delegation posture (Security review MEDIUM-3); mapped onto the handler-engine enum
     // inside `build_handler_runtime` (which owns both crates).
     let guest_dns_publish_ns = options.posture.guest_dns_publish_ns;
@@ -241,6 +243,17 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // closed with a clear 501 and the guest binding is not built.
     let tenant_secret_store = secrets_envelope.clone().map(|envelope| {
         Arc::new(boatramp_core::secret_store::TenantSecretStore::new(
+            secrets_kv.clone(),
+            envelope,
+        ))
+    });
+    // The per-TENANT sealed DNS-zone CREDENTIAL store (cap-req #31), sealed with the SAME `[secrets]`
+    // envelope and routed through the SAME `CheckpointKv` (an irreplaceable sealed token). Backs the
+    // runtime guest `dns-publish` register/route/unregister path (installed into the server's runtime
+    // source below, when the `dns-publish` feature is compiled). `None` when no envelope is configured,
+    // so the runtime path is fail-closed (every register is `access-denied`).
+    let dns_cred_store = secrets_envelope.clone().map(|envelope| {
+        Arc::new(boatramp_core::secret_store::TenantDnsCredStore::new(
             secrets_kv.clone(),
             envelope,
         ))
@@ -317,6 +330,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         allow_guest_tcp_egress,
         allow_guest_tcp_listener,
         allow_guest_dns_publish,
+        allow_guest_dynamic_dns_publish,
         guest_dns_publish_ns,
         self_egress_addrs,
         guest_egress_extra_roots,
@@ -353,6 +367,15 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(feature = "handlers")]
     if let Some(store) = tenant_secret_store.clone() {
         handlers.set_tenant_secret_store(store);
+    }
+    // Hand the runtime the per-tenant DNS-zone CREDENTIAL store `Arc` (cap-req #31), so it installs the
+    // runtime `dns-publish` credential source (store + an acme-backed provider factory) into the serve
+    // binding seam. Unset when no `[secrets]` envelope, so the runtime register/route path stays
+    // fail-closed (`access-denied`). Handlers-gated like `set_tenant_secret_store`; a no-op when the
+    // `dns-publish` feature is not compiled.
+    #[cfg(feature = "handlers")]
+    if let Some(store) = dns_cred_store.clone() {
+        handlers.set_dns_cred_store(store);
     }
     // Record the node data directory so the node-health endpoint can report `/data` filesystem
     // headroom (a node-health-alerting request — the disk-full incident signal).

@@ -39,6 +39,8 @@ use boatramp_acme::dns::{
     DnsError, DnsProvider, DnsRecord as AcmeRecord, RecordKind, RecordKindTag, SvcParam,
     ZoneResolution, canonicalize_owner_name, validate_writable,
 };
+use boatramp_core::project::ProjectRef;
+use boatramp_core::secret_store::{SecretError, TenantDnsCredStore};
 
 use crate::engine::GuestDnsPublishNs;
 
@@ -124,11 +126,12 @@ impl DnsPublishAuditSink for TracingDnsPublishSink {
     }
 }
 
-/// The per-invocation `dns-publish` grant: the host-held DNS writer, the zone it is authoritative over
-/// (for the apex-NS guardrail), the writable-zone allowlist (layer 2), and the audit sink. `None` ⇒
-/// not granted. The guest never sees any of this — it only names records.
+/// The operator **serve-static** DNS writer for a grant (cap-req #24, UNCHANGED): the host-held
+/// provider, the zone it is authoritative over (for the apex-NS guardrail), the own-name writable-zone
+/// allowlist (layer 2), and the NS-target allowlist. The guest never sees any of this — it only names
+/// records.
 #[derive(Clone)]
-pub struct DnsPublishBinding {
+struct OperatorWriter {
     /// The host-held writer whose adapter credential performs the mutation.
     provider: Arc<dyn DnsProvider>,
     /// The apex of the zone the provider is authoritative over (e.g. `example.com`), passed to
@@ -140,18 +143,132 @@ pub struct DnsPublishBinding {
     /// The authorized **NS-target** suffixes (globs) for a sub-zone `NS` delegation (Security review
     /// MEDIUM-3). Consulted ONLY under the `Allowlist` NS posture, and matched against the NS record's
     /// rdata TARGET nameserver (NOT its own name). **Empty ⇒ deny-all** under `Allowlist` (fail-closed).
-    /// This is the DNS analog of `writable_zones` but for the one rdata target that is constrained; the
-    /// own-name allowlist above is unchanged (still own-name-only) and governs every record type.
     ns_targets: Arc<[String]>,
+}
+
+/// The provider kind a RUNTIME-registered credential names (cap-req #31). Mirrors the WIT
+/// `provider-kind` subset, mapped into this crate-local enum so the server-side
+/// [`RuntimeDnsProviderFactory`] impl need not depend on the generated bindings. Only the single-token
+/// providers are runtime-registerable (the operator serve-static path adapts the full set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeDnsProviderKind {
+    /// Cloudflare (API v4) — needs an opaque `zone-id` + the token.
+    Cloudflare,
+    /// DigitalOcean — the zone is the zone-root domain; `token` is the API token.
+    DigitalOcean,
+    /// Hetzner DNS — the zone is the zone-root domain; `token` is the API token.
+    Hetzner,
+    /// NS1 — the zone is the zone-root domain; `token` is the API key.
+    Ns1,
+}
+
+impl RuntimeDnsProviderKind {
+    /// The stable string token stored (clear) in the sealed record + echoed in the audit log.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::DigitalOcean => "digitalocean",
+            Self::Hetzner => "hetzner",
+            Self::Ns1 => "ns1",
+        }
+    }
+
+    /// Parse back from the stored string token. `None` ⇒ an unknown/foreign kind (fail-closed).
+    #[must_use]
+    pub fn from_stored(s: &str) -> Option<Self> {
+        match s {
+            "cloudflare" => Some(Self::Cloudflare),
+            "digitalocean" => Some(Self::DigitalOcean),
+            "hetzner" => Some(Self::Hetzner),
+            "ns1" => Some(Self::Ns1),
+            _ => None,
+        }
+    }
+}
+
+/// Builds a live [`DnsProvider`] adapter from an UNSEALED runtime credential, authoritative over
+/// `zone_root` (cap-req #31). Injected (the real impl, over the `boatramp-acme` adapters, lives in
+/// `boatramp-server`) so a gate can supply a FAKE factory that never touches a real DNS provider. The
+/// token reaches the factory but NEVER crosses back to the guest or into a log/error.
+pub trait RuntimeDnsProviderFactory: Send + Sync {
+    /// Build the provider for `kind` authoritative over `zone_root`. `zone_id` is the provider's opaque
+    /// zone identifier (required for Cloudflare). An `Err(reason)` is logged host-side and surfaced to
+    /// the guest only as a GENERIC `backend` error (the reason may name provider internals).
+    fn build(
+        &self,
+        kind: RuntimeDnsProviderKind,
+        zone_id: Option<&str>,
+        token: &str,
+        zone_root: &str,
+    ) -> Result<Arc<dyn DnsProvider>, String>;
+}
+
+/// The per-invocation RUNTIME per-tenant DNS-credential registry (cap-req #31): the host-sealed store,
+/// the provider factory, and THIS invocation's host-resolved `(project, tenant)` + the per-component
+/// `dynamic_dns_zones` allowlist of registerable zone-roots. All host-owned — the guest supplies only a
+/// `zone-root` + provider + token to register, and names records to route; it never names a tenant and
+/// never sees a stored token. `None` on the binding ⇒ the dynamic path is not wired for this invocation.
+#[derive(Clone)]
+pub struct RuntimeDnsRegistry {
+    store: TenantDnsCredStore,
+    factory: Arc<dyn RuntimeDnsProviderFactory>,
+    project: String,
+    /// THIS invocation's host-resolved own tenant (never guest-supplied). The registry is only built
+    /// when a single tenant resolved, so this is always present here.
+    tenant: String,
+    /// The per-component host-authoritative allowlist of registerable zone-root globs. **Empty ⇒
+    /// deny-all** (fail-closed). `register-zone-credential(zone-root)` is admitted only if `zone-root`
+    /// matches an entry (same glob semantics as the own-name `writable_zones` allowlist).
+    dynamic_zones: Arc<[String]>,
+}
+
+impl RuntimeDnsRegistry {
+    /// Build the registry handle. `tenant` is THIS invocation's host-resolved own tenant;
+    /// `dynamic_zones` is the per-component registerable-zone allowlist (empty ⇒ deny-all).
+    pub fn new(
+        store: TenantDnsCredStore,
+        factory: Arc<dyn RuntimeDnsProviderFactory>,
+        project: impl Into<String>,
+        tenant: impl Into<String>,
+        dynamic_zones: Vec<String>,
+    ) -> Self {
+        Self {
+            store,
+            factory,
+            project: project.into(),
+            tenant: tenant.into(),
+            dynamic_zones: Arc::from(dynamic_zones),
+        }
+    }
+
+    fn project(&self) -> ProjectRef<'_> {
+        ProjectRef::new(&self.project)
+    }
+}
+
+/// The per-invocation `dns-publish` grant: an OPTIONAL operator serve-static writer (cap-req #24,
+/// unchanged) AND an OPTIONAL runtime per-tenant credential registry (cap-req #31), plus the redacted
+/// audit sink. `None` on the binding ⇒ not granted. At least one of operator/runtime is present when
+/// attached. The guest never sees any of this — it only names records (and, for the runtime path,
+/// registers a token the host seals and never returns).
+#[derive(Clone)]
+pub struct DnsPublishBinding {
+    /// The operator serve-static writer (cap-req #24). `None` for a runtime-only (tenant-credential)
+    /// grant whose scope has no operator provider.
+    operator: Option<OperatorWriter>,
+    /// The runtime per-tenant credential registry (cap-req #31). `None` when the dynamic path is not
+    /// wired for this invocation.
+    runtime: Option<RuntimeDnsRegistry>,
     /// Where each mutation is audited (redacted).
     audit: Arc<dyn DnsPublishAuditSink>,
 }
 
 impl DnsPublishBinding {
-    /// Build the grant. `zone_root` is the provider's authoritative zone apex; `writable_zones` is the
-    /// per-grant own-name allowlist (empty ⇒ deny-all); `ns_targets` is the per-grant NS-target
-    /// allowlist for a sub-zone NS delegation (empty ⇒ deny-all under the `Allowlist` posture);
-    /// `audit` is the redacted sink (use [`TracingDnsPublishSink`] for the default).
+    /// Build an OPERATOR serve-static grant (cap-req #24, UNCHANGED). `zone_root` is the provider's
+    /// authoritative zone apex; `writable_zones` is the per-grant own-name allowlist (empty ⇒
+    /// deny-all); `ns_targets` is the per-grant NS-target allowlist for a sub-zone NS delegation (empty
+    /// ⇒ deny-all under the `Allowlist` posture); `audit` is the redacted sink.
     pub fn new(
         provider: Arc<dyn DnsProvider>,
         zone_root: impl Into<String>,
@@ -160,12 +277,34 @@ impl DnsPublishBinding {
         audit: Arc<dyn DnsPublishAuditSink>,
     ) -> Self {
         Self {
-            provider,
-            zone_root: zone_root.into(),
-            writable_zones: Arc::from(writable_zones),
-            ns_targets: Arc::from(ns_targets),
+            operator: Some(OperatorWriter {
+                provider,
+                zone_root: zone_root.into(),
+                writable_zones: Arc::from(writable_zones),
+                ns_targets: Arc::from(ns_targets),
+            }),
+            runtime: None,
             audit,
         }
+    }
+
+    /// Build a RUNTIME-only grant (cap-req #31): no operator provider for this scope, only the
+    /// per-tenant credential registry. Used when a tenant's own zone is reachable through runtime
+    /// credentials but the operator wired no serve-static provider for this `(project, site)`.
+    pub fn runtime_only(runtime: RuntimeDnsRegistry, audit: Arc<dyn DnsPublishAuditSink>) -> Self {
+        Self {
+            operator: None,
+            runtime: Some(runtime),
+            audit,
+        }
+    }
+
+    /// Add (or replace) the runtime per-tenant credential registry on an existing (operator) grant, so
+    /// both paths coexist on one binding and route per-zone (cap-req #31).
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: RuntimeDnsRegistry) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 }
 
@@ -356,9 +495,17 @@ fn map_write_err(e: &DnsError) -> dns_publish::PublishError {
 /// view is rebuilt on every host call, so it owns no mutable state of its own.
 pub struct DnsPublishHost<'a> {
     binding: Option<&'a DnsPublishBinding>,
+    /// The operator serve-static posture (`allow_guest_dns_publish`), carried from the store-resident
+    /// `HostState`. Gates the operator path only (cap-req #24).
     posture_enabled: bool,
+    /// The RUNTIME per-tenant posture (`allow_guest_dynamic_dns_publish`, cap-req #31), carried from the
+    /// store-resident `HostState` exactly like `posture_enabled`. Gates `register`/`unregister` and the
+    /// runtime routing path. INDEPENDENT of `posture_enabled`. `false` (the default) ⇒ the dynamic path
+    /// is entirely inert (every register/unregister is `access-denied`; no record routes to a runtime
+    /// credential — records fall through to the operator path).
+    dynamic_posture_enabled: bool,
     /// The sub-zone `NS` delegation posture (Security review MEDIUM-3), carried from the store-resident
-    /// `HostState` exactly like `posture_enabled`. Applied by [`Self::prepare`] ONLY to a non-apex NS.
+    /// `HostState` exactly like `posture_enabled`. Applied by [`prepare`] ONLY to a non-apex NS.
     ns_posture: GuestDnsPublishNs,
     budget: &'a AtomicU32,
 }
@@ -373,19 +520,140 @@ impl<'a> DnsPublishHost<'a> {
         Self {
             binding,
             posture_enabled,
+            dynamic_posture_enabled: false,
             ns_posture,
             budget,
         }
     }
 
-    /// Layer 1: the grant must be present AND the node posture on. Deny-by-default, fail-closed
-    /// (posture off ⇒ denied even when granted). Checked BEFORE the budget, so a denied call can never
-    /// burn a victim invocation's budget.
-    fn admit(&self) -> Result<&'a DnsPublishBinding, dns_publish::PublishError> {
-        match self.binding {
-            Some(b) if self.posture_enabled => Ok(b),
+    /// Set the RUNTIME per-tenant posture (`allow_guest_dynamic_dns_publish`, cap-req #31) for this view.
+    /// Default (`false`) ⇒ the dynamic path is inert. The engine threads the resolved node posture here.
+    #[must_use]
+    pub fn with_dynamic_posture(mut self, enabled: bool) -> Self {
+        self.dynamic_posture_enabled = enabled;
+        self
+    }
+
+    /// Layer 1 (combined): the grant must be present AND at least one path is admissible — the operator
+    /// path (operator writer present AND `allow_guest_dns_publish` on) OR the runtime path (registry
+    /// present AND `allow_guest_dynamic_dns_publish` on). Deny-by-default, fail-closed. Checked BEFORE
+    /// the budget, so a denied call can never burn a victim invocation's budget.
+    fn admit_any(&self) -> Result<&'a DnsPublishBinding, dns_publish::PublishError> {
+        let b = self
+            .binding
+            .ok_or(dns_publish::PublishError::AccessDenied)?;
+        let operator_ok = b.operator.is_some() && self.posture_enabled;
+        let runtime_ok = b.runtime.is_some() && self.dynamic_posture_enabled;
+        if operator_ok || runtime_ok {
+            Ok(b)
+        } else {
+            Err(dns_publish::PublishError::AccessDenied)
+        }
+    }
+
+    /// Admit the RUNTIME path for `register`/`unregister` (cap-req #31): the registry must be present
+    /// AND `allow_guest_dynamic_dns_publish` on. Fail-closed `access-denied` otherwise (no registry
+    /// wired — e.g. no `[secrets]` envelope — reads as not-granted, exactly like the operator path).
+    fn admit_runtime(&self) -> Result<&'a RuntimeDnsRegistry, dns_publish::PublishError> {
+        let b = self
+            .binding
+            .ok_or(dns_publish::PublishError::AccessDenied)?;
+        match b.runtime.as_ref() {
+            Some(reg) if self.dynamic_posture_enabled => Ok(reg),
             _ => Err(dns_publish::PublishError::AccessDenied),
         }
+    }
+
+    /// If the runtime path is admitted and a registered credential covers `name` (already canonical),
+    /// build the provider + return it with its authoritative registered `zone_root`. `Ok(None)` ⇒ no
+    /// runtime credential covers this name (fall through to the operator path). An error is a hard
+    /// store/seal/factory failure, surfaced generically.
+    async fn runtime_route(
+        &self,
+        reg: &RuntimeDnsRegistry,
+        name: &str,
+    ) -> Result<Option<(Arc<dyn DnsProvider>, String)>, dns_publish::PublishError> {
+        let roots = reg
+            .store
+            .registered_zone_roots(reg.project(), &reg.tenant)
+            .await
+            .map_err(map_store_err)?;
+        let Some(zone_root) = longest_covering_zone_root(&roots, name).map(str::to_string) else {
+            return Ok(None);
+        };
+        let Some(cred) = reg
+            .store
+            .lookup(reg.project(), &reg.tenant, &zone_root)
+            .await
+            .map_err(map_store_err)?
+        else {
+            // Raced an unregister between the list and the lookup — treat as no runtime route.
+            return Ok(None);
+        };
+        let kind = RuntimeDnsProviderKind::from_stored(&cred.provider_kind).ok_or_else(|| {
+            dns_publish::PublishError::Backend("stored dns provider kind is unknown".into())
+        })?;
+        let provider = reg
+            .factory
+            .build(kind, cred.zone_id.as_deref(), &cred.token, &zone_root)
+            .map_err(|reason| {
+                tracing::warn!(
+                    target: "boatramp::dns::publish",
+                    zone_root = %zone_root,
+                    error = %reason,
+                    "dns-publish runtime provider build failed",
+                );
+                dns_publish::PublishError::Backend("dns provider unavailable".into())
+            })?;
+        Ok(Some((provider, zone_root)))
+    }
+
+    /// Resolve ONE guest record to the provider that will write it + the validated [`AcmeRecord`],
+    /// trying the RUNTIME path first (a registered credential covering the record's own name), then the
+    /// OPERATOR serve-static path. Performs NO write and NO budget spend. The runtime path's own-name
+    /// allowlist is the registered `zone_root` itself (`**.<zone_root>`, so the record must land at or
+    /// under the zone the tenant proved it holds); its NS-target allowlist is empty (a runtime grant may
+    /// not delegate a sub-zone NS under the `Allowlist` posture — deny-by-default for the tenant path).
+    async fn resolve_one(
+        &self,
+        b: &'a DnsPublishBinding,
+        wit: dns_publish::DnsRecord,
+    ) -> Result<(Arc<dyn DnsProvider>, AcmeRecord), dns_publish::PublishError> {
+        // Canonicalize once for routing (invalid ⇒ invalid-record before any path decision).
+        let name = canonicalize_owner_name(&wit.name).map_err(map_guardrail_err)?;
+        // RUNTIME path first (cap-req #31): a registered credential covering the name routes to it.
+        if self.dynamic_posture_enabled
+            && let Some(reg) = b.runtime.as_ref()
+            && let Some((provider, zone_root)) = self.runtime_route(reg, &name).await?
+        {
+            let writable = [format!("**.{zone_root}")];
+            let record = prepare(
+                provider.as_ref(),
+                &zone_root,
+                &writable,
+                &[],
+                self.ns_posture,
+                wit,
+            )?;
+            return Ok((provider, record));
+        }
+        // OPERATOR serve-static path (cap-req #24, UNCHANGED).
+        if self.posture_enabled
+            && let Some(op) = b.operator.as_ref()
+        {
+            let record = prepare(
+                op.provider.as_ref(),
+                &op.zone_root,
+                &op.writable_zones,
+                &op.ns_targets,
+                self.ns_posture,
+                wit,
+            )?;
+            return Ok((Arc::clone(&op.provider), record));
+        }
+        // Neither path is admissible for this record (posture off, or no operator provider and no
+        // runtime credential covers it) ⇒ fail-closed.
+        Err(dns_publish::PublishError::NotAuthorized(name))
     }
 
     /// Reserve `n` units of this invocation's (store-resident) publish budget, all-or-nothing.
@@ -412,83 +680,110 @@ impl<'a> DnsPublishHost<'a> {
             }
         }
     }
+}
 
-    /// Layer 2 + the central guardrail, with NO write and NO budget spend. A failure here means
-    /// NOTHING is written.
-    ///
-    /// **CRITICAL-1 / MEDIUM-2 — one canonical string for authorize AND dispatch.** The guest-supplied
-    /// owner `name` is [`canonicalize_owner_name`]'d FIRST: a syntactically-illegal name (path
-    /// traversal, whitespace, `/`, `..`, an overlong/empty label, …) is refused as `invalid-record`
-    /// BEFORE the allowlist is even consulted. The resulting canonical string is then used for BOTH
-    /// (a) the writable-zone allowlist check and (b) the [`AcmeRecord::name`] dispatched to the adapter
-    /// — they are byte-identical, so a name can never be authorized as a normalized copy of a different
-    /// raw string that then escapes to another zone in the provider URL path. The rdata TARGET
-    /// (CNAME/MX/SRV/NS exchange/target) is deliberately NOT canonicalized or constrained — it
-    /// legitimately points elsewhere.
-    ///
-    /// Then build the typed record and run [`validate_writable`] (apex-NS / supported-kind /
-    /// malformed-rdata) on that same canonical name.
-    ///
-    /// **Sub-zone NS delegation posture (Security review MEDIUM-3).** After the guardrail (which has
-    /// already refused an apex NS), a surviving non-apex `NS` is additionally held to `ns_posture`
-    /// ([`ns_delegation_authorized`]): `None` refuses it, `Allowlist` holds the NS record's rdata
-    /// TARGET to the per-grant `ns_targets` allowlist, `Any` allows it (today's behavior). This is the
-    /// ONLY place the rdata target is constrained and it is NS-SPECIFIC — the own-name allowlist above
-    /// is unchanged (still own-name-only) and every non-NS record is unaffected by this posture.
-    fn prepare(
-        b: &DnsPublishBinding,
-        ns_posture: GuestDnsPublishNs,
-        wit: dns_publish::DnsRecord,
-    ) -> Result<AcmeRecord, dns_publish::PublishError> {
-        // Canonicalize the guest name up front — invalid ⇒ invalid-record, before the allowlist.
-        let name = canonicalize_owner_name(&wit.name).map_err(map_guardrail_err)?;
-        // Layer 2: own-name allowlist (deny-empty), on the canonical name. The rdata TARGET is never
-        // passed here.
-        if !zone_authorized(&b.writable_zones, &name) {
-            return Err(dns_publish::PublishError::NotAuthorized(name));
-        }
-        let kind = build_kind(wit.data)?;
-        let record = AcmeRecord {
-            kind,
-            name,
-            ttl: wit.ttl,
-        };
-        // cap-req #27: the apex-NS guardrail needs the apex of the zone THIS record lands in. A single
-        // provider has one configured `zone_root` (`UseConfigured`); a multi-zone routing provider
-        // selects the per-record apex (`Zone`), or reports no authoritative zone (`NoZone` ⇒ fail
-        // closed — the record is in no zone this grant can write). The write dispatched below routes to
-        // the SAME selected zone, so the apex checked here matches the adapter actually used.
-        let zone_root: std::borrow::Cow<'_, str> = match b.provider.resolve_zone_root(&record.name)
-        {
-            ZoneResolution::UseConfigured => std::borrow::Cow::Borrowed(b.zone_root.as_str()),
-            ZoneResolution::Zone(z) => std::borrow::Cow::Owned(z),
-            ZoneResolution::NoZone => {
-                return Err(dns_publish::PublishError::NotAuthorized(
-                    record.name.clone(),
-                ));
-            }
-        };
-        validate_writable(b.provider.as_ref(), &record, &zone_root).map_err(map_guardrail_err)?;
-        // MEDIUM-3: a surviving (non-apex) NS is gated by the operator's sub-zone-delegation posture.
-        // The apex NS was already refused by `validate_writable`, so this only ever sees a sub-zone NS.
-        if let RecordKind::Ns(ref target) = record.kind {
-            ns_delegation_authorized(ns_posture, &b.ns_targets, target)?;
-        }
-        Ok(record)
+/// Layer 2 + the central guardrail for ONE record against a SELECTED provider + zone, with NO write and
+/// NO budget spend (a failure here means NOTHING is written). Shared by BOTH the operator serve-static
+/// path (cap-req #24) and the runtime per-tenant path (cap-req #31): the caller supplies the selected
+/// `provider`, its authoritative `zone_root` (for the apex-NS guardrail), the own-name `writable_zones`
+/// allowlist (empty ⇒ deny-all), and the `ns_targets` NS-target allowlist — so the two paths run the
+/// IDENTICAL canonicalize → own-name-allowlist → build → `validate_writable` → NS-delegation gate.
+///
+/// **CRITICAL-1 / MEDIUM-2 — one canonical string for authorize AND dispatch.** The guest-supplied
+/// owner `name` is [`canonicalize_owner_name`]'d FIRST (a syntactically-illegal name is `invalid-record`
+/// BEFORE the allowlist); that canonical string is then used for BOTH the allowlist check and the
+/// [`AcmeRecord::name`] dispatched to the adapter — byte-identical, so a name can never be authorized as
+/// a normalized copy of a different raw string that escapes to another zone. The rdata TARGET is never
+/// canonicalized or constrained here (it legitimately points elsewhere).
+fn prepare(
+    provider: &dyn DnsProvider,
+    zone_root: &str,
+    writable_zones: &[String],
+    ns_targets: &[String],
+    ns_posture: GuestDnsPublishNs,
+    wit: dns_publish::DnsRecord,
+) -> Result<AcmeRecord, dns_publish::PublishError> {
+    // Canonicalize the guest name up front — invalid ⇒ invalid-record, before the allowlist.
+    let name = canonicalize_owner_name(&wit.name).map_err(map_guardrail_err)?;
+    // Layer 2: own-name allowlist (deny-empty), on the canonical name. The rdata TARGET is never
+    // passed here.
+    if !zone_authorized(writable_zones, &name) {
+        return Err(dns_publish::PublishError::NotAuthorized(name));
     }
+    let kind = build_kind(wit.data)?;
+    let record = AcmeRecord {
+        kind,
+        name,
+        ttl: wit.ttl,
+    };
+    // cap-req #27: the apex-NS guardrail needs the apex of the zone THIS record lands in. A single
+    // provider has one configured `zone_root` (`UseConfigured`); a multi-zone routing provider selects
+    // the per-record apex (`Zone`), or reports no authoritative zone (`NoZone` ⇒ fail closed). The write
+    // dispatched below routes to the SAME selected zone, so the apex checked here matches the adapter.
+    let selected_zone: std::borrow::Cow<'_, str> = match provider.resolve_zone_root(&record.name) {
+        ZoneResolution::UseConfigured => std::borrow::Cow::Borrowed(zone_root),
+        ZoneResolution::Zone(z) => std::borrow::Cow::Owned(z),
+        ZoneResolution::NoZone => {
+            return Err(dns_publish::PublishError::NotAuthorized(
+                record.name.clone(),
+            ));
+        }
+    };
+    validate_writable(provider, &record, &selected_zone).map_err(map_guardrail_err)?;
+    // MEDIUM-3: a surviving (non-apex) NS is gated by the sub-zone-delegation posture. The apex NS was
+    // already refused by `validate_writable`, so this only ever sees a sub-zone NS.
+    if let RecordKind::Ns(ref target) = record.kind {
+        ns_delegation_authorized(ns_posture, ns_targets, target)?;
+    }
+    Ok(record)
+}
+
+/// Map a [`TenantDnsCredStore`] error to the guest-visible wire error (cap-req #31). A client error
+/// (bad zone-root/tenant, oversized/absent token, too-many-zones) is surfaced as `invalid-record` with
+/// its client-safe message; a conflict or backend failure is a GENERIC `backend` (its detail — KV key
+/// shapes, a KMS status — is never surfaced).
+fn map_store_err(e: SecretError) -> dns_publish::PublishError {
+    use dns_publish::PublishError as P;
+    match e {
+        SecretError::InvalidName(m) | SecretError::InvalidTenant(m) => P::InvalidRecord(m),
+        SecretError::ValueTooLarge { .. } => {
+            P::InvalidRecord("dns credential token is too large".into())
+        }
+        SecretError::TooManyNames { max } => P::Backend(format!(
+            "too many registered dns zone credentials for this tenant (max {max})"
+        )),
+        SecretError::Conflict(_) => {
+            P::Backend("the dns credential store is contended; retry".into())
+        }
+        SecretError::Backend(_) => P::Backend("dns credential store error".into()),
+    }
+}
+
+/// The registered zone-root (from `roots`) whose apex is the LONGEST label-boundary suffix of the
+/// already-canonical owner `name` — i.e. the most specific registered zone the record falls under. The
+/// DNS zone-containment used by the operator `RoutingDnsProvider`: `name` equals the apex, or `name`
+/// ends with `.<root>`. `None` ⇒ no registered zone covers this name (the router falls through to the
+/// operator path). `roots` are the tenant's own canonical registered zone-roots.
+fn longest_covering_zone_root<'a>(roots: &'a [String], name: &str) -> Option<&'a str> {
+    roots
+        .iter()
+        .map(String::as_str)
+        .filter(|root| name == *root || name.ends_with(&format!(".{root}")))
+        .max_by_key(|root| root.len())
 }
 
 /// Dispatch one prepared mutation to the provider and audit the outcome (redacted). A `delete` of an
 /// already-absent record converges (idempotent teardown → `ok`). A backend failure is logged
 /// host-side (detail) and surfaced generically.
 async fn write_one(
-    b: &DnsPublishBinding,
+    provider: &dyn DnsProvider,
+    audit: &dyn DnsPublishAuditSink,
     record: &AcmeRecord,
     op: DnsPublishOp,
 ) -> Result<(), dns_publish::PublishError> {
     let res = match op {
-        DnsPublishOp::Upsert => b.provider.upsert(record).await,
-        DnsPublishOp::Delete => b.provider.delete(record).await,
+        DnsPublishOp::Upsert => provider.upsert(record).await,
+        DnsPublishOp::Delete => provider.delete(record).await,
     };
     let mapped = match res {
         Ok(()) => Ok(()),
@@ -499,7 +794,7 @@ async fn write_one(
                 target: "boatramp::dns::publish",
                 op = op.as_str(),
                 name = %record.name,
-                provider = b.provider.name(),
+                provider = provider.name(),
                 error = %e,
                 "dns-publish backend write failed",
             );
@@ -511,62 +806,166 @@ async fn write_one(
     } else {
         DnsPublishOutcome::Failed
     };
-    b.audit.record(&DnsPublishAuditEntry {
+    audit.record(&DnsPublishAuditEntry {
         op,
         name: &record.name,
         kind: record.kind.tag(),
-        provider: b.provider.name(),
+        provider: provider.name(),
         outcome,
     });
     mapped
 }
 
+/// Map the generated WIT `provider-kind` to the crate-local [`RuntimeDnsProviderKind`].
+fn map_provider_kind(p: dns_publish::ProviderKind) -> RuntimeDnsProviderKind {
+    match p {
+        dns_publish::ProviderKind::Cloudflare => RuntimeDnsProviderKind::Cloudflare,
+        dns_publish::ProviderKind::Digitalocean => RuntimeDnsProviderKind::DigitalOcean,
+        dns_publish::ProviderKind::Hetzner => RuntimeDnsProviderKind::Hetzner,
+        dns_publish::ProviderKind::Ns1 => RuntimeDnsProviderKind::Ns1,
+    }
+}
+
 impl dns_publish::Host for DnsPublishHost<'_> {
+    async fn register_zone_credential(
+        &mut self,
+        zone_root: String,
+        provider: dns_publish::ProviderKind,
+        zone_id: Option<String>,
+        token: String,
+    ) -> Result<(), dns_publish::PublishError> {
+        // Layer 1: runtime registry present AND the dynamic posture on (fail-closed otherwise — no
+        // registry wired, e.g. no `[secrets]` envelope, reads as not-granted).
+        let reg = self.admit_runtime()?;
+        // Canonicalize the zone-root with the SAME validator used for record owner names — one canonical
+        // string for BOTH the allowlist check and the store key (the CRITICAL-1 invariant). A
+        // syntactically-illegal zone-root is `invalid-record` before the allowlist.
+        let canonical = canonicalize_owner_name(&zone_root).map_err(map_guardrail_err)?;
+        // Layer 2: the zone-root must be in this component's `dynamic_dns_zones` allowlist (empty ⇒
+        // deny-all), matched with the SAME glob semantics as the own-name `writable_zones` allowlist.
+        if !zone_authorized(&reg.dynamic_zones, &canonical) {
+            return Err(dns_publish::PublishError::AccessDenied);
+        }
+        let kind = map_provider_kind(provider);
+        let zone_id = zone_id
+            .map(|z| z.trim().to_string())
+            .filter(|z| !z.is_empty());
+        // Cloudflare addresses its zone by an opaque zone-id (not the zone-root) — require it up front.
+        if matches!(kind, RuntimeDnsProviderKind::Cloudflare) && zone_id.is_none() {
+            return Err(dns_publish::PublishError::InvalidRecord(
+                "cloudflare runtime credential requires a zone-id".into(),
+            ));
+        }
+        if token.is_empty() {
+            return Err(dns_publish::PublishError::InvalidRecord(
+                "provider token must not be empty".into(),
+            ));
+        }
+        // Seal + store, keyed to THIS invocation's resolved (project, tenant). The token is consumed
+        // here and NEVER returned, logged, or echoed.
+        reg.store
+            .register(
+                reg.project(),
+                &reg.tenant,
+                &canonical,
+                kind.as_str(),
+                zone_id.as_deref(),
+                token.as_bytes(),
+            )
+            .await
+            .map_err(map_store_err)?;
+        tracing::info!(
+            target: "boatramp::dns::publish",
+            zone_root = %canonical,
+            provider = kind.as_str(),
+            "dns-publish: runtime zone credential registered (sealed; token never surfaced)",
+        );
+        Ok(())
+    }
+
+    async fn unregister_zone_credential(
+        &mut self,
+        zone_root: String,
+    ) -> Result<(), dns_publish::PublishError> {
+        let reg = self.admit_runtime()?;
+        let canonical = canonicalize_owner_name(&zone_root).map_err(map_guardrail_err)?;
+        // The allowlist gates unregister too — a guest can only ever touch a zone it could have
+        // registered (and only within its OWN resolved tenant's keyspace).
+        if !zone_authorized(&reg.dynamic_zones, &canonical) {
+            return Err(dns_publish::PublishError::AccessDenied);
+        }
+        // Idempotent: an already-absent credential is `ok` (existed/not is not surfaced).
+        reg.store
+            .unregister(reg.project(), &reg.tenant, &canonical)
+            .await
+            .map_err(map_store_err)?;
+        Ok(())
+    }
+
     async fn upsert(
         &mut self,
         record: dns_publish::DnsRecord,
     ) -> Result<(), dns_publish::PublishError> {
-        let b = self.admit()?;
-        let prepared = Self::prepare(b, self.ns_posture, record)?;
+        let b = self.admit_any()?;
+        let (provider, prepared) = self.resolve_one(b, record).await?;
         self.spend(1)?;
-        write_one(b, &prepared, DnsPublishOp::Upsert).await
+        write_one(
+            provider.as_ref(),
+            b.audit.as_ref(),
+            &prepared,
+            DnsPublishOp::Upsert,
+        )
+        .await
     }
 
     async fn delete(
         &mut self,
         record: dns_publish::DnsRecord,
     ) -> Result<(), dns_publish::PublishError> {
-        let b = self.admit()?;
-        let prepared = Self::prepare(b, self.ns_posture, record)?;
+        let b = self.admit_any()?;
+        let (provider, prepared) = self.resolve_one(b, record).await?;
         self.spend(1)?;
-        write_one(b, &prepared, DnsPublishOp::Delete).await
+        write_one(
+            provider.as_ref(),
+            b.audit.as_ref(),
+            &prepared,
+            DnsPublishOp::Delete,
+        )
+        .await
     }
 
     async fn upsert_set(
         &mut self,
         records: Vec<dns_publish::DnsRecord>,
     ) -> Result<(), dns_publish::PublishError> {
-        let b = self.admit()?;
-        // LOW-4: fast-fail an over-budget set BEFORE the O(N) canonicalize/validate/alloc loop, so a
-        // guest cannot force the host to do per-record work for a set it could never afford to write
-        // (a cheap pre-write amplifier). This is only an early-out; `spend` below is still the
-        // authoritative all-or-nothing reservation (its CAS handles any concurrent drain). Compared as
-        // u64 so a huge `records.len()` (usize) can never wrap when measured against the u32 budget.
+        let b = self.admit_any()?;
+        // LOW-4: fast-fail an over-budget set BEFORE the O(N) resolve/validate loop, so a guest cannot
+        // force the host to do per-record work (incl. per-record store round-trips) for a set it could
+        // never afford to write. Only an early-out; `spend` below is still the authoritative
+        // all-or-nothing reservation.
         let remaining = self.budget.load(std::sync::atomic::Ordering::Relaxed);
         if records.len() as u64 > u64::from(remaining) {
             return Err(dns_publish::PublishError::RateLimited);
         }
-        // Validate + gate EVERY record BEFORE writing any (fail-closed, all-or-nothing on validation):
-        // one bad record refuses the whole set and nothing is written.
-        let mut prepared = Vec::with_capacity(records.len());
+        // Resolve + validate + gate EVERY record (routing each to its runtime or operator provider)
+        // BEFORE writing any (fail-closed, all-or-nothing on validation): one bad record refuses the
+        // whole set and nothing is written.
+        let mut prepared: Vec<(Arc<dyn DnsProvider>, AcmeRecord)> =
+            Vec::with_capacity(records.len());
         for r in records {
-            prepared.push(Self::prepare(b, self.ns_posture, r)?);
+            prepared.push(self.resolve_one(b, r).await?);
         }
         // Reserve the whole set's budget up front — a set that cannot fit the budget writes NOTHING.
         self.spend(prepared.len() as u32)?;
         // Apply in order; upserts are idempotent, so a backend failure mid-set converges on retry.
-        for record in &prepared {
-            write_one(b, record, DnsPublishOp::Upsert).await?;
+        for (provider, record) in &prepared {
+            write_one(
+                provider.as_ref(),
+                b.audit.as_ref(),
+                record,
+                DnsPublishOp::Upsert,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -730,6 +1129,22 @@ mod tests {
 
     fn budget(n: u32) -> AtomicU32 {
         AtomicU32::new(n)
+    }
+
+    /// The default redacted audit sink, as the host installs it.
+    fn audit_sink() -> Arc<dyn DnsPublishAuditSink> {
+        Arc::new(TracingDnsPublishSink)
+    }
+
+    /// A host view over `b` + `bud` with the runtime posture ON and operator posture `op_posture`
+    /// (a free fn rather than a closure so the shared `'a` lifetime is expressible).
+    fn dyn_host<'a>(
+        b: &'a DnsPublishBinding,
+        op_posture: bool,
+        bud: &'a AtomicU32,
+    ) -> DnsPublishHost<'a> {
+        DnsPublishHost::new(Some(b), op_posture, GuestDnsPublishNs::Any, bud)
+            .with_dynamic_posture(true)
     }
 
     #[tokio::test]
@@ -1389,5 +1804,553 @@ mod tests {
             );
         }
         assert_eq!(p.count(), 3);
+    }
+
+    // ---- cap-req #31: RUNTIME per-tenant credential path -------------------
+
+    use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::project::ProjectRef;
+    use boatramp_core::secret_store::TenantDnsCredStore;
+
+    /// A reversible test envelope (XOR) — so a sealed token is visibly different at rest yet round-trips.
+    struct XorEnvelope;
+    #[async_trait::async_trait]
+    impl KeyEnvelope for XorEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(p.iter().map(|b| b ^ 0x5a).collect())
+        }
+        async fn unwrap(&self, w: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(w.iter().map(|b| b ^ 0x5a).collect())
+        }
+    }
+
+    /// A fake provider factory: records every `(kind, zone_id, token, zone_root)` it is asked to build
+    /// (so a test can prove routing handed the registered credential to the adapter) and returns a
+    /// shared capturing [`StubProvider`] regardless — it NEVER touches a real DNS provider.
+    /// One recorded factory build: `(kind, zone_id, token, zone_root)`.
+    type FactoryBuild = (RuntimeDnsProviderKind, Option<String>, String, String);
+
+    struct FakeFactory {
+        provider: Arc<StubProvider>,
+        builds: Mutex<Vec<FactoryBuild>>,
+    }
+    impl FakeFactory {
+        fn new(provider: Arc<StubProvider>) -> Self {
+            Self {
+                provider,
+                builds: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl RuntimeDnsProviderFactory for FakeFactory {
+        fn build(
+            &self,
+            kind: RuntimeDnsProviderKind,
+            zone_id: Option<&str>,
+            token: &str,
+            zone_root: &str,
+        ) -> Result<Arc<dyn DnsProvider>, String> {
+            self.builds.lock().unwrap().push((
+                kind,
+                zone_id.map(str::to_string),
+                token.to_string(),
+                zone_root.to_string(),
+            ));
+            Ok(Arc::clone(&self.provider) as Arc<dyn DnsProvider>)
+        }
+    }
+
+    fn cred_store() -> TenantDnsCredStore {
+        TenantDnsCredStore::new(Arc::new(MemoryKv::new()), Arc::new(XorEnvelope))
+    }
+
+    /// A runtime registry for `tenant` over `store`, registerable zones = `["**.{zone}"]`, with a fake
+    /// factory wrapping `provider`. Returns the registry + a handle to the factory (to read its builds).
+    fn registry(
+        store: TenantDnsCredStore,
+        tenant: &str,
+        zone: &str,
+        provider: Arc<StubProvider>,
+    ) -> (RuntimeDnsRegistry, Arc<FakeFactory>) {
+        let factory = Arc::new(FakeFactory::new(provider));
+        let reg = RuntimeDnsRegistry::new(
+            store,
+            factory.clone() as Arc<dyn RuntimeDnsProviderFactory>,
+            "proj",
+            tenant,
+            vec![format!("**.{zone}")],
+        );
+        (reg, factory)
+    }
+
+    /// Posture ON: a guest registers a Cloudflare runtime credential for an ALLOWLISTED zone-root, then
+    /// an `upsert` to a name under it ROUTES to the registered credential (the fake factory is handed
+    /// the sealed token + zone-id) and the record reaches the (fake) provider. The WIT returns carry no
+    /// token.
+    #[tokio::test]
+    async fn dynamic_register_then_upsert_routes_to_runtime_cred() {
+        let store = cred_store();
+        let provider = Arc::new(StubProvider::new(BASIC));
+        let (reg, factory) = registry(store, "tenant-a", "acme.com", provider.clone());
+        let b = DnsPublishBinding::runtime_only(reg, audit_sink());
+        let bud = budget(16);
+
+        // Register (posture on).
+        {
+            let mut host = DnsPublishHost::new(Some(&b), false, GuestDnsPublishNs::Any, &bud)
+                .with_dynamic_posture(true);
+            host.register_zone_credential(
+                "acme.com".into(),
+                dns_publish::ProviderKind::Cloudflare,
+                Some("cf-zone-id".into()),
+                "cf-secret-token".into(),
+            )
+            .await
+            .expect("register an allowlisted zone");
+        }
+        // Upsert under the registered zone → routes to the runtime credential.
+        {
+            let mut host = DnsPublishHost::new(Some(&b), false, GuestDnsPublishNs::Any, &bud)
+                .with_dynamic_posture(true);
+            host.upsert(a_record("www.acme.com", "203.0.113.7"))
+                .await
+                .expect("in-zone runtime-routed upsert ok");
+        }
+        assert_eq!(
+            provider.count(),
+            1,
+            "the record reached the runtime provider"
+        );
+        assert_eq!(provider.ops.lock().unwrap()[0].1.name, "www.acme.com");
+        // The factory was handed the SEALED-then-unsealed registered credential.
+        let builds = factory.builds.lock().unwrap();
+        assert_eq!(builds.len(), 1);
+        assert_eq!(builds[0].0, RuntimeDnsProviderKind::Cloudflare);
+        assert_eq!(builds[0].1.as_deref(), Some("cf-zone-id"));
+        assert_eq!(builds[0].2, "cf-secret-token");
+        assert_eq!(builds[0].3, "acme.com");
+    }
+
+    /// Posture OFF: `register` is `access-denied` (nothing stored) AND a record that WOULD route to a
+    /// runtime credential does not — it falls through (here to no operator ⇒ `not-authorized`).
+    #[tokio::test]
+    async fn dynamic_posture_off_denies_register_and_route() {
+        let store = cred_store();
+        let provider = Arc::new(StubProvider::new(BASIC));
+        let (reg, _f) = registry(store.clone(), "tenant-a", "acme.com", provider.clone());
+        let b = DnsPublishBinding::runtime_only(reg, audit_sink());
+        let bud = budget(16);
+        // register with dynamic posture OFF ⇒ access-denied.
+        let mut host = DnsPublishHost::new(Some(&b), false, GuestDnsPublishNs::Any, &bud); // dynamic=false
+        assert!(matches!(
+            host.register_zone_credential(
+                "acme.com".into(),
+                dns_publish::ProviderKind::Hetzner,
+                None,
+                "tok".into()
+            )
+            .await,
+            Err(dns_publish::PublishError::AccessDenied)
+        ));
+        // Nothing was stored.
+        assert!(
+            store
+                .registered_zone_roots(ProjectRef::new("proj"), "tenant-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A zone-root OUTSIDE the per-component `dynamic_dns_zones` allowlist ⇒ `access-denied` (even with
+    /// the posture on), and nothing is stored.
+    #[tokio::test]
+    async fn register_disallowed_zone_is_access_denied() {
+        let store = cred_store();
+        let (reg, _f) = registry(
+            store.clone(),
+            "tenant-a",
+            "acme.com",
+            Arc::new(StubProvider::new(BASIC)),
+        );
+        let b = DnsPublishBinding::runtime_only(reg, audit_sink());
+        let bud = budget(16);
+        let mut host = DnsPublishHost::new(Some(&b), false, GuestDnsPublishNs::Any, &bud)
+            .with_dynamic_posture(true);
+        assert!(matches!(
+            host.register_zone_credential(
+                "evil.example".into(), // not under **.acme.com
+                dns_publish::ProviderKind::Hetzner,
+                None,
+                "tok".into()
+            )
+            .await,
+            Err(dns_publish::PublishError::AccessDenied)
+        ));
+        assert!(
+            store
+                .registered_zone_roots(ProjectRef::new("proj"), "tenant-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `unregister` removes the credential; a subsequent `upsert` falls through (here, with no operator
+    /// writer, to `not-authorized`).
+    #[tokio::test]
+    async fn unregister_removes_and_upsert_falls_through() {
+        let store = cred_store();
+        let provider = Arc::new(StubProvider::new(BASIC));
+        let (reg, _f) = registry(store, "tenant-a", "acme.com", provider.clone());
+        let b = DnsPublishBinding::runtime_only(reg, audit_sink());
+        let bud = budget(16);
+        // Distinct host views, one shared binding + budget (store-resident).
+        {
+            let mut h = dyn_host(&b, false, &bud);
+            h.register_zone_credential(
+                "acme.com".into(),
+                dns_publish::ProviderKind::Ns1,
+                None,
+                "tok".into(),
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let mut h = dyn_host(&b, false, &bud);
+            h.upsert(a_record("www.acme.com", "203.0.113.7"))
+                .await
+                .expect("routes while registered");
+        }
+        assert_eq!(provider.count(), 1);
+        {
+            let mut h = dyn_host(&b, false, &bud);
+            h.unregister_zone_credential("acme.com".into())
+                .await
+                .expect("unregister ok");
+        }
+        {
+            let mut h = dyn_host(&b, false, &bud);
+            let err = h
+                .upsert(a_record("www.acme.com", "203.0.113.7"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, dns_publish::PublishError::NotAuthorized(_)),
+                "after unregister, no runtime cred and no operator ⇒ fall-through fail-closed: {err:?}"
+            );
+        }
+        assert_eq!(provider.count(), 1, "nothing published after unregister");
+    }
+
+    /// THE tenancy isolation property at the host seam: tenant-b (a SECOND host view over the SAME store,
+    /// resolved to a different tenant) can neither ROUTE through nor UNREGISTER tenant-a's credential.
+    #[tokio::test]
+    async fn cross_tenant_cannot_route_or_unregister() {
+        let store = cred_store();
+        let provider_a = Arc::new(StubProvider::new(BASIC));
+        let provider_b = Arc::new(StubProvider::new(BASIC));
+        let (reg_a, _fa) = registry(store.clone(), "tenant-a", "acme.com", provider_a.clone());
+        let (reg_b, _fb) = registry(store.clone(), "tenant-b", "acme.com", provider_b.clone());
+        let b_a = DnsPublishBinding::runtime_only(reg_a, audit_sink());
+        let b_b = DnsPublishBinding::runtime_only(reg_b, audit_sink());
+        let bud = budget(16);
+
+        // tenant-a registers its own credential.
+        {
+            let mut h = DnsPublishHost::new(Some(&b_a), false, GuestDnsPublishNs::Any, &bud)
+                .with_dynamic_posture(true);
+            h.register_zone_credential(
+                "acme.com".into(),
+                dns_publish::ProviderKind::Hetzner,
+                None,
+                "a-secret".into(),
+            )
+            .await
+            .unwrap();
+        }
+        // tenant-b cannot ROUTE an upsert to acme.com (it has no credential of its own) → falls through
+        // to no-operator ⇒ not-authorized. Nothing reaches tenant-b's provider.
+        {
+            let mut h = DnsPublishHost::new(Some(&b_b), false, GuestDnsPublishNs::Any, &bud)
+                .with_dynamic_posture(true);
+            let err = h
+                .upsert(a_record("www.acme.com", "203.0.113.7"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, dns_publish::PublishError::NotAuthorized(_)));
+        }
+        assert_eq!(provider_b.count(), 0, "tenant-b published nothing");
+        // tenant-b "unregistering" acme.com touches only its OWN (empty) keyspace — tenant-a's cred
+        // survives, and tenant-a can still route.
+        {
+            let mut h = DnsPublishHost::new(Some(&b_b), false, GuestDnsPublishNs::Any, &bud)
+                .with_dynamic_posture(true);
+            h.unregister_zone_credential("acme.com".into())
+                .await
+                .expect("idempotent no-op on tenant-b's own keyspace");
+        }
+        {
+            let mut h = DnsPublishHost::new(Some(&b_a), false, GuestDnsPublishNs::Any, &bud)
+                .with_dynamic_posture(true);
+            h.upsert(a_record("mx.acme.com", "203.0.113.9"))
+                .await
+                .expect("tenant-a's credential survives tenant-b's unregister");
+        }
+        assert_eq!(
+            provider_a.count(),
+            1,
+            "tenant-a still routes after tenant-b's attempt"
+        );
+    }
+
+    /// Operator serve-static + runtime per-tenant coexist on ONE binding and route PER ZONE: a record in
+    /// the operator's zone uses the operator writer; a record in a registered runtime zone uses the
+    /// runtime credential. Neither path leaks into the other.
+    #[tokio::test]
+    async fn operator_and_runtime_coexist_route_per_zone() {
+        let op_provider = Arc::new(StubProvider::new(BASIC));
+        let rt_provider = Arc::new(StubProvider::new(BASIC));
+        let store = cred_store();
+        let (reg, _f) = registry(store, "tenant-a", "tenant.example", rt_provider.clone());
+        // Operator writer over op.example + the runtime registry over **.tenant.example.
+        let b = DnsPublishBinding::new(
+            op_provider.clone() as Arc<dyn DnsProvider>,
+            "op.example",
+            vec!["**.op.example".to_string()],
+            Vec::new(),
+            audit_sink(),
+        )
+        .with_runtime(reg);
+        let bud = budget(16);
+        // Register the runtime credential.
+        {
+            let mut h = dyn_host(&b, true, &bud);
+            h.register_zone_credential(
+                "tenant.example".into(),
+                dns_publish::ProviderKind::Ns1,
+                None,
+                "rt-tok".into(),
+            )
+            .await
+            .unwrap();
+        }
+        // A record in the operator zone → operator provider.
+        {
+            let mut h = dyn_host(&b, true, &bud);
+            h.upsert(a_record("www.op.example", "203.0.113.1"))
+                .await
+                .expect("operator-zone upsert ok");
+        }
+        // A record in the registered runtime zone → runtime provider.
+        {
+            let mut h = dyn_host(&b, true, &bud);
+            h.upsert(a_record("mx.tenant.example", "203.0.113.2"))
+                .await
+                .expect("runtime-zone upsert ok");
+        }
+        assert_eq!(op_provider.count(), 1, "exactly the operator-zone record");
+        assert_eq!(op_provider.ops.lock().unwrap()[0].1.name, "www.op.example");
+        assert_eq!(rt_provider.count(), 1, "exactly the runtime-zone record");
+        assert_eq!(
+            rt_provider.ops.lock().unwrap()[0].1.name,
+            "mx.tenant.example"
+        );
+    }
+
+    /// The cap-req #31 LIVE CAPABILITY GATE (marker: `DNS-PUBLISH TENANT-CREDS LIVE OK`). One end-to-end
+    /// run over the REAL `TenantDnsCredStore` (a contract-faithful sealing envelope — production uses the
+    /// `[secrets]` LocalKek/Vault AEAD) + a FAKE provider factory (NO real DNS provider is contacted),
+    /// proving every promised property AND structured so each required MUTATION turns it RED:
+    ///  - posture-gated register of an ALLOWLISTED zone-root → a subsequent `upsert` ROUTES to the
+    ///    registered credential (the fake factory is handed the unsealed token);
+    ///  - the sealed token is NEVER cleartext at rest and never returned;
+    ///  - `unregister` removes it → the next `upsert` falls through / fail-closes;
+    ///  - a DISALLOWED zone-root register → `access-denied` (DROP the allowlist check ⇒ RED);
+    ///  - posture OFF → `access-denied` (DROP the posture check ⇒ RED);
+    ///  - a SECOND tenant cannot see/use/unregister tenant-1's credential (DROP the tenancy key ⇒ RED);
+    ///  - the operator serve-static path is unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tenant_creds_live_gate() {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let store = TenantDnsCredStore::new(kv.clone(), Arc::new(XorEnvelope));
+        let project = ProjectRef::new("proj");
+        let bud = budget(64);
+
+        // Operator serve-static writer (op.example) + a runtime registry for tenant-1 (**.t1.example).
+        let op_provider = Arc::new(StubProvider::new(BASIC));
+        let t1_provider = Arc::new(StubProvider::new(BASIC));
+        let (reg1, factory1) =
+            registry(store.clone(), "tenant-1", "t1.example", t1_provider.clone());
+        let b1 = DnsPublishBinding::new(
+            op_provider.clone() as Arc<dyn DnsProvider>,
+            "op.example",
+            vec!["**.op.example".to_string()],
+            Vec::new(),
+            audit_sink(),
+        )
+        .with_runtime(reg1);
+
+        // (1) Posture OFF ⇒ register is access-denied (DROP the posture check ⇒ this assertion RED).
+        {
+            let mut h = DnsPublishHost::new(Some(&b1), true, GuestDnsPublishNs::Any, &bud); // dynamic OFF
+            assert!(matches!(
+                h.register_zone_credential(
+                    "t1.example".into(),
+                    dns_publish::ProviderKind::Cloudflare,
+                    Some("zid".into()),
+                    "should-not-store".into()
+                )
+                .await,
+                Err(dns_publish::PublishError::AccessDenied)
+            ));
+        }
+        assert!(
+            store
+                .registered_zone_roots(project, "tenant-1")
+                .await
+                .unwrap()
+                .is_empty(),
+            "posture-off register stored nothing"
+        );
+
+        // (2) A DISALLOWED zone-root register ⇒ access-denied (DROP the allowlist check ⇒ RED).
+        {
+            let mut h = dyn_host(&b1, true, &bud);
+            assert!(matches!(
+                h.register_zone_credential(
+                    "evil.example".into(),
+                    dns_publish::ProviderKind::Hetzner,
+                    None,
+                    "should-not-store".into()
+                )
+                .await,
+                Err(dns_publish::PublishError::AccessDenied)
+            ));
+        }
+
+        // (3) Posture ON + allowlisted zone ⇒ register seals the token.
+        {
+            let mut h = dyn_host(&b1, true, &bud);
+            h.register_zone_credential(
+                "t1.example".into(),
+                dns_publish::ProviderKind::Cloudflare,
+                Some("cf-zone-id".into()),
+                "SECRET-cf-token".into(),
+            )
+            .await
+            .expect("register an allowlisted zone");
+        }
+        // Sealed at rest: NO raw KV value anywhere contains the cleartext token.
+        {
+            let all = kv.scan_prefix("project/").await.unwrap();
+            assert!(!all.is_empty(), "the credential was stored");
+            for (_k, v) in &all {
+                assert!(
+                    !String::from_utf8_lossy(v).contains("SECRET-cf-token"),
+                    "the provider token must be sealed at rest (never cleartext in any KV value)"
+                );
+            }
+        }
+
+        // (4) An upsert under the registered zone ROUTES to the runtime credential (fake provider), and
+        // the factory was handed the unsealed token.
+        {
+            let mut h = dyn_host(&b1, true, &bud);
+            h.upsert(rec(
+                "_dmarc.t1.example",
+                dns_publish::Rdata::Txt(vec!["v=DMARC1; p=reject".into()]),
+            ))
+            .await
+            .expect("runtime-routed upsert ok");
+        }
+        assert_eq!(
+            t1_provider.count(),
+            1,
+            "the record reached the runtime provider"
+        );
+        {
+            let builds = factory1.builds.lock().unwrap();
+            assert_eq!(builds.len(), 1);
+            assert_eq!(builds[0].0, RuntimeDnsProviderKind::Cloudflare);
+            assert_eq!(builds[0].1.as_deref(), Some("cf-zone-id"));
+            assert_eq!(
+                builds[0].2, "SECRET-cf-token",
+                "the factory got the unsealed token"
+            );
+        }
+
+        // (5) The operator serve-static path is UNCHANGED (a record in op.example uses op_provider).
+        {
+            let mut h = dyn_host(&b1, true, &bud);
+            h.upsert(a_record("www.op.example", "203.0.113.1"))
+                .await
+                .expect("operator-zone upsert ok");
+        }
+        assert_eq!(op_provider.count(), 1, "operator path unchanged");
+
+        // (6) A SECOND tenant cannot ROUTE or UNREGISTER tenant-1's credential (DROP the tenancy key ⇒
+        // RED). tenant-2's registry shares the SAME store but a different resolved tenant.
+        let t2_provider = Arc::new(StubProvider::new(BASIC));
+        let (reg2, _f2) = registry(store.clone(), "tenant-2", "t1.example", t2_provider.clone());
+        let b2 = DnsPublishBinding::runtime_only(reg2, audit_sink());
+        {
+            let mut h = dyn_host(&b2, false, &bud);
+            // tenant-2 has no credential for t1.example ⇒ falls through to no-operator ⇒ not-authorized.
+            assert!(matches!(
+                h.upsert(a_record("www.t1.example", "203.0.113.9")).await,
+                Err(dns_publish::PublishError::NotAuthorized(_))
+            ));
+        }
+        assert_eq!(
+            t2_provider.count(),
+            0,
+            "tenant-2 published nothing of tenant-1's"
+        );
+        {
+            let mut h = dyn_host(&b2, false, &bud);
+            h.unregister_zone_credential("t1.example".into())
+                .await
+                .expect("idempotent no-op on tenant-2's own keyspace");
+        }
+        // tenant-1's credential survived.
+        assert!(
+            store
+                .lookup(project, "tenant-1", "t1.example")
+                .await
+                .unwrap()
+                .is_some(),
+            "tenant-1's credential survives tenant-2's unregister attempt"
+        );
+
+        // (7) tenant-1 unregisters → a subsequent upsert falls through / fail-closes.
+        {
+            let mut h = dyn_host(&b1, false, &bud); // operator posture off to isolate the runtime path
+            h.unregister_zone_credential("t1.example".into())
+                .await
+                .expect("unregister ok");
+        }
+        {
+            let mut h = dyn_host(&b1, false, &bud);
+            assert!(matches!(
+                h.upsert(a_record("mx.t1.example", "203.0.113.7")).await,
+                Err(dns_publish::PublishError::NotAuthorized(_))
+            ));
+        }
+        assert_eq!(
+            t1_provider.count(),
+            1,
+            "nothing more published after unregister"
+        );
+
+        println!(
+            "DNS-PUBLISH TENANT-CREDS LIVE OK: posture-gated register of an allowlisted zone sealed a \
+             tenant token; a routed upsert reached the registered credential; the token was sealed at \
+             rest and never returned; unregister fell the zone through; disallowed-zone + posture-off \
+             both access-denied; a second tenant had zero cross-tenant access; the operator path was \
+             unchanged"
+        );
     }
 }
