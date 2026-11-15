@@ -237,7 +237,7 @@ const fn opt(name: &'static str, shape: CredentialFieldShape) -> CredentialField
     }
 }
 
-use CredentialFieldShape::{Hostname, Identifier, OciKeyId, OpaqueId, Pem, Region, Secret};
+use CredentialFieldShape::{AkamaiHost, Identifier, OciKeyId, OpaqueId, Pem, Region, Secret};
 
 const CLOUDFLARE_FIELDS: &[CredentialFieldRule] = &[req("zone_id", OpaqueId), req("token", Secret)];
 const ROUTE53_FIELDS: &[CredentialFieldRule] = &[
@@ -253,7 +253,7 @@ const OCI_FIELDS: &[CredentialFieldRule] = &[
     req("private_key_pem", Pem),
 ];
 const AKAMAI_FIELDS: &[CredentialFieldRule] = &[
-    req("host", Hostname),
+    req("host", AkamaiHost),
     req("client_token", Secret),
     req("client_secret", Secret),
     req("access_token", Secret),
@@ -289,8 +289,13 @@ enum CredentialFieldShape {
     Identifier,
     /// A cloud region interpolated into a URL host/path (`[a-z0-9-]`, short).
     Region,
-    /// An API hostname (Akamai `host`) interpolated as the URL authority: `[A-Za-z0-9.-]`, no `/`.
-    Hostname,
+    /// The Akamai API `host` — the ONLY credential field that becomes a request's AUTHORITY
+    /// (`AkamaiDns`: `https://{host}{path}`), so it is a blind-SSRF vector if unconstrained (Security
+    /// review M1). PINNED to the Akamai EdgeGrid API domain: lowercase `[a-z0-9.-]` with no empty label,
+    /// NOT an IP literal (v4/v6), and REQUIRED to be a non-empty subdomain of `.akamaiapis.net` — so a
+    /// tenant can never aim the dial at `localhost` / `10.0.0.5` / `169.254.169.254` / any non-Akamai
+    /// host. A `host` outside the Akamai API domain is `invalid-record` at register.
+    AkamaiHost,
     /// An OCI `key_id` (`<tenancy_ocid>/<user_ocid>/<fingerprint>`) placed in the Authorization signing
     /// string's `keyId="..."`: allow its real charset `[A-Za-z0-9._:/-]` but reject CR/LF/`"`/space so
     /// it cannot break the header/signature.
@@ -312,6 +317,10 @@ const MAX_CREDENTIAL_FIELDS: usize = 16;
 const MAX_SECRET_FIELD_LEN: usize = 8 * 1024;
 /// Max length of a PEM field value (multi-line private key).
 const MAX_PEM_FIELD_LEN: usize = 16 * 1024;
+/// The Akamai EdgeGrid API domain the tenant `host` field is PINNED under (Security review M1). EdgeGrid
+/// API hosts are `<account>-<id>.luna.akamaiapis.net` (and siblings) — all under `.akamaiapis.net` (the
+/// `boatramp-acme` Akamai adapter's own example host is `akab-h.luna.akamaiapis.net`).
+const AKAMAI_API_DOMAIN_SUFFIX: &str = ".akamaiapis.net";
 
 /// Validate ONE field value against its shape (Security review #31-wide): every shape rejects the bytes
 /// that would let the value escape its interpolation context, and bounds its length. Returns a
@@ -326,7 +335,7 @@ fn validate_field_value(
         Pem => MAX_PEM_FIELD_LEN,
         Secret | OciKeyId => MAX_SECRET_FIELD_LEN,
         OpaqueId | Identifier | Region => 128,
-        Hostname => 253,
+        AkamaiHost => 253,
     };
     if value.is_empty() {
         return Err(format!("field `{name}` must not be empty"));
@@ -344,15 +353,30 @@ fn validate_field_value(
                     .all(|b| !b.is_ascii_control() || matches!(b, b'\r' | b'\n' | b'\t'))
         }
         OpaqueId => value.bytes().all(|b| b.is_ascii_alphanumeric()),
-        Identifier => value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+        // i1: `[A-Za-z0-9._-]` AND no empty dot-segment (rejects `..`, a leading/trailing dot, and the
+        // value being `.`/`..`) — mirrors `validate_name`'s dot rule.
+        Identifier => {
+            value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                && !value.split('.').any(str::is_empty)
+        }
         Region => value
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
-        Hostname => value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')),
+        // M1: the Akamai host is PINNED to the EdgeGrid API domain — lowercase hostname charset, no
+        // empty label, NOT an IP literal, and a non-empty subdomain of `.akamaiapis.net`. This closes
+        // the only tenant-controlled request-authority (blind SSRF) in the adapter set.
+        AkamaiHost => {
+            value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+                && !value.split('.').any(str::is_empty)
+                && value.parse::<std::net::IpAddr>().is_err()
+                && value
+                    .strip_suffix(AKAMAI_API_DOMAIN_SUFFIX)
+                    .is_some_and(|prefix| !prefix.is_empty())
+        }
         OciKeyId => value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'-')),
@@ -2153,6 +2177,15 @@ mod tests {
     fn apikey_cred(key: &str) -> Vec<dns_publish::CredentialField> {
         vec![cfield("api_key", key)]
     }
+    /// An Akamai bundle with a given `host` (the fields the EdgeGrid adapter needs).
+    fn akamai_cred(host: &str) -> Vec<dns_publish::CredentialField> {
+        vec![
+            cfield("host", host),
+            cfield("client_token", "ct"),
+            cfield("client_secret", "cs"),
+            cfield("access_token", "at"),
+        ]
+    }
 
     fn cred_store() -> TenantDnsCredStore {
         TenantDnsCredStore::new(Arc::new(MemoryKv::new()), Arc::new(XorEnvelope))
@@ -2513,6 +2546,75 @@ mod tests {
             .await
             .expect("a well-formed zone-id is accepted");
         }
+    }
+
+    /// M1: the Akamai `host` (the only tenant-controlled request AUTHORITY) is PINNED to the EdgeGrid
+    /// API domain — internal hosts / IP literals / non-akamaiapis.net hosts are refused at register
+    /// (blind-SSRF closed), while a real `*.akamaiapis.net` host is accepted.
+    #[tokio::test]
+    async fn m1_akamai_host_pinned_to_edgegrid_domain() {
+        let store = cred_store();
+        let (reg, _f) = registry(
+            store.clone(),
+            "t",
+            "acme.com",
+            Arc::new(StubProvider::new(BASIC)),
+        );
+        let b = DnsPublishBinding::runtime_only(reg, audit_sink());
+        let bud = budget(16);
+        for bad in [
+            "localhost",
+            "10.0.0.5",
+            "169.254.169.254",
+            "metadata.google.internal",
+            "evil.attacker.com",
+            "akamaiapis.net",                // bare apex, no subdomain
+            "x.akamaiapis.net.attacker.com", // suffix not at the end
+            "akab-h.luna.akamaiapis.net.",   // trailing dot ⇒ empty last label
+            "::1",
+            "[::1]",
+        ] {
+            let mut h = dyn_host(&b, true, &bud);
+            assert!(
+                matches!(
+                    h.register_zone_credential(
+                        "acme.com".into(),
+                        dns_publish::ProviderKind::Akamai,
+                        akamai_cred(bad),
+                    )
+                    .await,
+                    Err(dns_publish::PublishError::InvalidRecord(_))
+                ),
+                "akamai host {bad:?} must be refused (SSRF pin)"
+            );
+        }
+        // A real EdgeGrid API host is accepted.
+        {
+            let mut h = dyn_host(&b, true, &bud);
+            h.register_zone_credential(
+                "acme.com".into(),
+                dns_publish::ProviderKind::Akamai,
+                akamai_cred("akab-h.luna.akamaiapis.net"),
+            )
+            .await
+            .expect("a valid *.akamaiapis.net host is accepted");
+        }
+    }
+
+    /// i1: the `Identifier` shape rejects an empty dot-segment (`..`, a leading/trailing dot) for
+    /// `account_id`/`project`/`subscription_id`/`resource_group`.
+    #[test]
+    fn i1_identifier_rejects_empty_dot_segment() {
+        for bad in ["..", ".", "a..b", ".a", "a."] {
+            assert!(
+                validate_field_value("account_id", CredentialFieldShape::Identifier, bad).is_err(),
+                "identifier {bad:?} must be refused"
+            );
+        }
+        // A legitimate dotted/hyphenated id is still fine.
+        assert!(
+            validate_field_value("project", CredentialFieldShape::Identifier, "my-proj.1").is_ok()
+        );
     }
 
     /// The PER-PROVIDER FIELD CONTRACT (#31-wide): for EVERY provider kind, a representative valid
@@ -3000,6 +3102,41 @@ mod tests {
             }
         }
 
+        // (12) M1 — the Akamai `host` (the only tenant-controlled request AUTHORITY) is PINNED to the
+        // EdgeGrid API domain: an internal host / IP / metadata address is refused at register (blind
+        // SSRF closed), a real `*.akamaiapis.net` host is accepted. (DROP the Akamai host-pin ⇒ the
+        // internal-host case turns RED.)
+        for bad in [
+            "10.0.0.5",
+            "localhost",
+            "169.254.169.254",
+            "evil.example.com",
+        ] {
+            let mut h = dyn_host(&b1, true, &bud);
+            assert!(
+                matches!(
+                    h.register_zone_credential(
+                        "t1.example".into(),
+                        dns_publish::ProviderKind::Akamai,
+                        akamai_cred(bad),
+                    )
+                    .await,
+                    Err(dns_publish::PublishError::InvalidRecord(_))
+                ),
+                "akamai host {bad:?} must be refused at register (SSRF pin)"
+            );
+        }
+        {
+            let mut h = dyn_host(&b1, true, &bud);
+            h.register_zone_credential(
+                "t1.example".into(),
+                dns_publish::ProviderKind::Akamai,
+                akamai_cred("akab-h.luna.akamaiapis.net"),
+            )
+            .await
+            .expect("a valid *.akamaiapis.net akamai host is accepted");
+        }
+
         println!(
             "DNS-PUBLISH TENANT-CREDS LIVE OK: posture-gated register of an allowlisted zone sealed a \
              tenant token; a routed upsert reached the registered credential; the token was sealed at \
@@ -3007,8 +3144,9 @@ mod tests {
              both access-denied; a second tenant had zero cross-tenant access; removing the zone from \
              the allowlist revoked routing without an unregister (F1); a malformed zone-id was refused \
              at register (F2); a multi-secret route53 bundle registered/sealed/routed with every field \
-             delivered, and a missing/unknown/oversized field was refused; the operator path was \
-             unchanged"
+             delivered, and a missing/unknown/oversized field was refused; an internal Akamai host was \
+             refused by the EdgeGrid-domain pin while a real *.akamaiapis.net host was accepted (M1); \
+             the operator path was unchanged"
         );
     }
 }

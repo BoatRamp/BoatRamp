@@ -156,7 +156,7 @@ Mailroom's connect-UI should collect exactly these `name` keys:
 | `cloudflare` | `zone_id`, `token` | — | `zone_id` is the opaque Cloudflare zone id |
 | `route53` | `access_key_id`, `secret_access_key`, `region`, `hosted_zone_id` | `session_token` | IAM static creds (+ optional STS token) |
 | `oci` | `region`, `key_id`, `private_key_pem` | — | `private_key_pem` is the multi-line PEM **content** (not a path) |
-| `akamai` | `host`, `client_token`, `client_secret`, `access_token` | — | EdgeGrid; `host` is the API hostname |
+| `akamai` | `host`, `client_token`, `client_secret`, `access_token` | — | EdgeGrid; `host` is **pinned** to a `*.akamaiapis.net` subdomain (IP literals + non-Akamai hosts refused — it is the only tenant-set request authority) |
 | `dnsimple` | `account_id`, `token` | — | |
 | `gcp` | `project`, `access_token` | — | **short-lived** OAuth access token (not a service-account JSON key) |
 | `azure` | `subscription_id`, `resource_group`, `access_token` | — | `access_token` is a **short-lived** AAD bearer token |
@@ -167,6 +167,13 @@ Mailroom's connect-UI should collect exactly these `name` keys:
 Value bounds: a secret/header field ≤ 8 KiB, a PEM ≤ 16 KiB, an id/region/hostname ≤ 128–253 bytes; at
 most 16 fields per bundle. A missing/unknown/oversized/malformed field is `invalid-record` before
 anything is sealed.
+
+> **SSRF note.** Only one field in the whole set becomes a request **authority**: the Akamai `host`
+> (every other provider uses a fixed API host, with tenant ids going into the URL *path* and
+> shape-checked to reject `/`). That `host` is therefore **pinned** to a `*.akamaiapis.net` subdomain —
+> IP literals and any non-Akamai host are refused at register — so a tenant can never aim the dial at an
+> internal/metadata address. (A broader dial-time SSRF floor over every adapter's HTTP client is a
+> noted defense-in-depth follow-up; the pin closes the actual tenant-controlled-authority surface.)
 
 > **GCP / Azure caveat.** The `gcp` and `azure` adapters authenticate with a **short-lived** bearer
 > `access_token` (matching the serve-static adapters), not a long-lived service-account JSON key or OAuth
