@@ -787,11 +787,23 @@ fn authorize_list(
     // `hblob/{qualified-site}/{container}/{prefix}`, relativize against
     // `hblob/{qualified-site}/{container}/`.
     let container_prefix = format!("{}{container}/", scope.site_prefix);
-    Ok((
-        scope.storage.clone(),
-        format!("{container_prefix}{prefix}"),
-        container_prefix,
-    ))
+    let joined = join_list_prefix(&container_prefix, prefix);
+    Ok((scope.storage.clone(), joined, container_prefix))
+}
+
+/// Join a screened guest list `prefix` UNDER the host-computed `container_prefix`
+/// (`hblob/{site}/{container}/`), so the storage prefix ALWAYS starts with the container prefix and
+/// the listing can only ever narrow WITHIN the guest's own container — one half of the structural
+/// confinement (the other is [`confine_list_names`]). The direct analogue of the host `blob-list`
+/// binding's `join_list_prefix`, kept a pure split so the anti-hollow gate can mutate it directly.
+fn join_list_prefix(container_prefix: &str, guest_prefix: &str) -> String {
+    // MUTATION SEAM (gate `escape_prefix`): use the guest prefix RAW, so the listing escapes the
+    // container (another site's keyspace). Compiled out of shipped builds; the confinement gate then
+    // goes RED. Parity with the host `blob-list` binding's same-named seam.
+    if blob_mutation().as_deref() == Some("escape_prefix") {
+        return guest_prefix.to_string();
+    }
+    format!("{container_prefix}{guest_prefix}")
 }
 
 /// Screen a guest-supplied LIST `prefix` (mirrors the host `blob-list` binding's `screen_list_prefix`):
@@ -836,10 +848,13 @@ fn is_reserved_name(name: &str) -> bool {
 /// `container_prefix` off each key (→ container-relative, e.g. `sub/c.txt`) and DROP the reserved
 /// `.boatramp*` namespace; a key not under `container_prefix` is dropped entirely (the structural
 /// guarantee a raw internal / foreign key can never reach the guest). The direct analogue of the host
-/// `blob-list` binding's `confine_list_names`. The `list_no_strip` mutation seam (test / gate only,
-/// compiled out of ships) returns the raw internal key, so the CI gate proves the strip load-bearing.
+/// `blob-list` binding's `confine_list_names`. MUTATION SEAMS (test / gate only, compiled out of
+/// ships, parity with that host binding): `list_no_strip` returns the raw internal key (leaks the
+/// `hblob/…` prefix AND fails to drop a foreign key), and `show_marker` leaks the reserved `.boatramp*`
+/// namespace (the container marker + host staging) — each turns the relevant gate assertion RED.
 fn confine_list_names(container_prefix: &str, metas: Vec<ObjectMeta>) -> Vec<String> {
     let strip = blob_mutation().as_deref() != Some("list_no_strip");
+    let hide_reserved = blob_mutation().as_deref() != Some("show_marker");
     metas
         .into_iter()
         .filter_map(|meta| {
@@ -848,7 +863,7 @@ fn confine_list_names(container_prefix: &str, metas: Vec<ObjectMeta>) -> Vec<Str
             } else {
                 meta.key
             };
-            (!is_reserved_name(&name)).then_some(name)
+            (!(hide_reserved && is_reserved_name(&name))).then_some(name)
         })
         .collect()
 }
@@ -1215,9 +1230,11 @@ async fn list_objects(
 /// it goes RED: `allow_cross_container` (bypass the container bind — GET/PUT/… and LIST),
 /// `allow_traversal` (skip the object-key screen, and the LIST prefix screen),
 /// `admit_unmatched` (admit a missing/unknown token), `list_no_strip` (LIST returns the raw
-/// internal `hblob/{site}/{container}/…` key instead of the container-relative name),
-/// `skip_marker` (skip a PUT's container-marker ensure, so a worker-written container is not
-/// openable by a guest `get-container`). NOT a backdoor — it only reads a test env var.
+/// internal `hblob/{site}/{container}/…` key instead of the container-relative name), `escape_prefix`
+/// (LIST joins the guest prefix RAW so it escapes the container), `show_marker` (LIST leaks the
+/// reserved `.boatramp*` namespace), `skip_marker` (skip a PUT's container-marker ensure, so a
+/// worker-written container is not openable by a guest `get-container`). NOT a backdoor — it only
+/// reads a test env var.
 #[cfg(any(test, feature = "compute-blob-shim-gate-mutation"))]
 fn blob_mutation() -> Option<String> {
     std::env::var("BOATRAMP_COMPUTEBLOB_MUTATION").ok()
@@ -1244,6 +1261,9 @@ mod tests {
     #[derive(Default, Clone)]
     struct MemStorage {
         map: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+        /// The `limit` the most recent `list_page` received — lets a test assert the LIST handler's
+        /// MAX_LIST_PAGE clamp (`[1, MAX_LIST_PAGE]`) without depending on backend key ordering.
+        last_limit: Arc<std::sync::atomic::AtomicU32>,
     }
 
     fn meta(key: &str, len: usize) -> ObjectMeta {
@@ -1337,8 +1357,10 @@ mod tests {
             &self,
             prefix: &str,
             _after: Option<&str>,
-            _limit: u32,
+            limit: u32,
         ) -> Result<ListPage, StorageError> {
+            self.last_limit
+                .store(limit, std::sync::atomic::Ordering::SeqCst);
             Ok(ListPage {
                 metas: self.list(prefix).await?,
                 cursor: None,
@@ -1837,7 +1859,9 @@ mod tests {
     /// `allow_cross_container` (an `assets`-bound token LISTs a DIFFERENT container),
     /// `allow_traversal` (a `../` list prefix escapes the container), `admit_unmatched` (an
     /// unauthenticated LIST is admitted), `list_no_strip` (the raw internal key leaks instead of the
-    /// container-relative name). A pass-under-mutation (a hollow gate) fails the merge.
+    /// container-relative name), `escape_prefix` (the guest list prefix joins RAW so the `prefix=sub/`
+    /// narrowing matches nothing — the join confinement is load-bearing), `show_marker` (the reserved
+    /// `.boatramp*` marker surfaces). A pass-under-mutation (a hollow gate) fails the merge.
     #[cfg(feature = "handlers")]
     #[tokio::test]
     async fn compute_blob_shim_list_scoped_gate() {
@@ -1941,6 +1965,56 @@ mod tests {
         );
 
         println!("COMPUTE BLOB-SHIM LIST SCOPED OK");
+    }
+
+    /// The native blob-shim LIST clamps a guest-supplied `?limit=` to `[1, MAX_LIST_PAGE]` before it
+    /// reaches the backend (parity with the `wasi:blobstore` `blob-list` host binding's page ceiling):
+    /// an over-large limit is capped at `MAX_LIST_PAGE`, a zero one floored at `1`, and an absent one
+    /// defaults to the ceiling — so a guest can neither demand an unbounded page nor a zero-size one.
+    #[cfg(feature = "handlers")]
+    #[tokio::test]
+    async fn compute_blob_shim_list_clamps_the_page_limit() {
+        let shim = BlobShim::new();
+        let mem = MemStorage::default();
+        // Keep a typed handle (shared via the inner `Arc`s) so the test can read back the `limit` the
+        // handler actually passed the backend, while the router still sees it as a `dyn Storage`.
+        let storage: Arc<dyn Storage> = Arc::new(mem.clone());
+        let resolver = resolver(&shim, storage.clone());
+        let env = resolver
+            .resolve("default", "api", 0, &[blob_binding("assets")])
+            .await;
+        let token = env
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let (s, _) = request(&shim, "PUT", "/assets/a.txt", Some(&token), b"1").await;
+        assert_eq!(s, StatusCode::OK);
+
+        let seen = || mem.last_limit.load(std::sync::atomic::Ordering::SeqCst);
+
+        // An over-large guest limit is capped at MAX_LIST_PAGE.
+        let (status, _, _) = list_keys(&shim, "/assets?limit=99999", Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen(),
+            MAX_LIST_PAGE,
+            "an over-large ?limit must clamp to MAX_LIST_PAGE"
+        );
+
+        // A zero limit is floored at 1 (never a zero-size page).
+        let (status, _, _) = list_keys(&shim, "/assets?limit=0", Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen(), 1, "a ?limit=0 must floor to 1");
+
+        // An absent limit defaults to the MAX_LIST_PAGE ceiling.
+        let (status, _, _) = list_keys(&shim, "/assets", Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen(),
+            MAX_LIST_PAGE,
+            "an absent ?limit must default to MAX_LIST_PAGE"
+        );
     }
 
     /// A fake [`BlobUploadMinter`] returning fixed `TempCredentials` (bucket = the requested

@@ -28,6 +28,13 @@ token from its environment (see [the next section](#what-a-deployed-workload-see
 A worker produces to and consumes from the project bus `{project}/bus/<topic>` — the same bus
 a `wasi:messaging` producer publishes to and a consumer claims from.
 
+> **Reaching this worker from a handler.** A `wasi:messaging` handler meets this worker only on the
+> shared project bus, which it addresses with the **`bus:` selector**: a handler's `bus:deliver`
+> publish maps to `{project}/bus/deliver` — the same queue a worker bound with `--bind
+> messaging:deliver` claims from. A **plain** topic (no `bus:` prefix) is **component-private**
+> (host-namespaced `{site}/{alias}/<topic>`, site-scoped), so it never reaches the project bus and
+> cannot reach this worker. See [the messaging binding](./handler-binding-messaging.md#topic-namespaces-component-private-vs-the-project-bus).
+
 | Method & path | Purpose |
 |---|---|
 | `POST /publish/{topic}` | Publish; the request body is the raw message payload. Optional `?delay_ms=`, `?ttl_ms=`, `?priority=`. |

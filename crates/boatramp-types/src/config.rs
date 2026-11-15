@@ -3286,6 +3286,31 @@ mod tests {
     }
 
     #[test]
+    fn single_issuer_jwks_source_requires_a_non_empty_issuer_f3() {
+        // verify_caller Security review F3: a single-issuer JWKS source (jwks_env/jwks_url) with an
+        // EMPTY `issuer` pins `set_issuer(&[""])`, so EVERY token fails the `iss` check at runtime —
+        // a config that deploys clean then silently 401s all traffic. `validate()` must reject it at
+        // apply, and accept the same source once `issuer` is set.
+        let empty_issuer = HandlerGraphqlTokenClaims {
+            issuer: String::new(),
+            jwks_env: Some("APP_JWKS".into()),
+            ..Default::default()
+        };
+        assert!(
+            empty_issuer.validate().is_err(),
+            "a single-issuer JWKS source with an empty `issuer` must be rejected at validate (F3)"
+        );
+        let with_issuer = HandlerGraphqlTokenClaims {
+            issuer: "https://app.acme.example".into(),
+            jwks_env: Some("APP_JWKS".into()),
+            ..Default::default()
+        };
+        with_issuer
+            .validate()
+            .expect("the same JWKS source is accepted once `issuer` is set");
+    }
+
+    #[test]
     fn system_when_round_trips_and_defaults_the_claim_to_role() {
         // The `claim` defaults to `role`; absent system_when round-trips to None (byte-identical).
         let bare: HandlerGraphqlTokenClaims =

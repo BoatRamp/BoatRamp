@@ -1095,7 +1095,9 @@ jobs:
       # `allow_cross_container` (an `assets`-bound token LISTs a DIFFERENT container), `allow_traversal`
       # (a `../` list prefix escapes the container), `admit_unmatched` (an unauthenticated LIST is
       # admitted), `list_no_strip` (the raw internal `hblob/{site}/{container}/…` key leaks instead of the
-      # container-relative name). A pass-under-mutation (a hollow gate) fails the merge.
+      # container-relative name), `escape_prefix` (the guest list prefix joins RAW so the listing escapes
+      # the container), `show_marker` (the reserved `.boatramp*` namespace leaks). A pass-under-mutation
+      # (a hollow gate) fails the merge.
       - name: "compute blob-shim LIST gate (container-bound enumeration, traversal-safe, authed, relativized)"
         run: |
           set -eo pipefail
@@ -1106,7 +1108,7 @@ jobs:
           grep -q 'COMPUTE BLOB-SHIM LIST SCOPED OK' compute-blob-shim-list.log \
             || { echo "::error::compute blob-shim LIST gate never reached its marker (a token-scope / traversal / auth / relativization regression)" >&2; exit 1; }
           # Mutation guard: each mutation MUST fail the gate (proving each check is load-bearing).
-          for mut in allow_cross_container allow_traversal admit_unmatched list_no_strip; do
+          for mut in allow_cross_container allow_traversal admit_unmatched list_no_strip escape_prefix show_marker; do
             if BOATRAMP_COMPUTEBLOB_MUTATION="$mut" cargo-zigbuild test --target x86_64-unknown-linux-musl \
               -p boatramp-server --features handlers compute_blob_shim_list_scoped_gate \
               -- --nocapture > "compute-blob-shim-list-mutation-$mut.log" 2>&1; then

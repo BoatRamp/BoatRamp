@@ -32,6 +32,23 @@ routing: (
 The messaging binding takes **no per-binding backend block** — it follows the
 server's backends set under `serve`.
 
+## Topic namespaces: component-private vs the project bus
+
+A topic name resolves into one of two **host-namespaced** namespaces (the guest never writes the
+`{site}`/`{project}` prefix itself, so it can neither read another component's private topic nor
+forge the project prefix):
+
+- A **plain** topic (e.g. `orders.created`) is **component-private**, host-namespaced under
+  `{site}/{alias}/<topic>` (site-scoped). A handler's publish and its OWN consumer's subscribe to the
+  same plain name meet here; nothing outside the component reaches it.
+- A **`bus:` topic** (e.g. `bus:orders.created`) addresses the **shared project bus**,
+  `{project}/bus/<topic>`. This is the only namespace that crosses components: a handler's
+  `bus:deliver` publish and a native [compute worker](./native-compute-worker.md) bound with
+  `--bind messaging:deliver` (which claims from `{project}/bus/deliver`) are the SAME queue. Use it to
+  hand work from a request-path handler to an off-path worker or consumer in the same project.
+
+So a handler that must reach a `bind-messaging` worker publishes `bus:<topic>`, not a plain topic.
+
 ## Read bus stats (`messaging-stats`)
 
 A component that needs to *show* how a flow is doing — "is this customer's sync backed up or

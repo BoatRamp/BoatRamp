@@ -1935,12 +1935,17 @@ pub enum SelfHealReport {
     /// FAIL-SAFE: the derived roles are SHARED with a still-live sibling binding — LEFT fully intact
     /// (roles + asides + tombstone), the live sibling's data never touched (the HARD GUARD).
     SharedWithLive { roles: Vec<String> },
-    /// FULL SELF-HEAL of an EXCLUSIVE tangle: the orphan's stray asides were cleared; each `__deleted_`
-    /// grace tombstone PRESERVED (reassigned to the superuser) unless `drop_soft_deleted`; the live
-    /// orphan db cleared DATA-LOSS-SAFELY (a POPULATED orphan SOFT-DEPROVISIONED to a recoverable
-    /// `__deleted_` tombstone — `preserved_tombstones` — so a mid-restore failure never clobbers it; an
-    /// EMPTY orphan hard-dropped); BOTH derived roles DROPPED + their sealed credentials deleted; and
-    /// the tenant REPROVISIONED fresh — so the subsequent shadow-swap restore lands clean.
+    /// FULL SELF-HEAL of an EXCLUSIVE tangle: the orphan's stray TRANSIENT asides were cleared (a
+    /// populated `__old_` soft-deprovisioned to a recoverable tombstone, an empty one hard-dropped);
+    /// each `__deleted_` grace tombstone PRESERVED (reassigned to the superuser) unless
+    /// `drop_soft_deleted`; the live orphan db is DIVORCED from the derived roles IN PLACE — its
+    /// ownership reassigned to the stable superuser WITHOUT renaming or emptying it, so it keeps serving
+    /// its ORIGINAL data (the construens ATOMICITY fix: live is NEVER emptied up front, so a restore
+    /// failure for any reason strands nothing); BOTH derived roles DROPPED + their sealed credentials
+    /// deleted; and the tenant REPROVISIONED fresh OVER the still-populated live db — so the subsequent
+    /// atomic shadow-swap (the SINGLE destructive moment) replaces live only on a VERIFIED restore.
+    /// `preserved_tombstones` carries the `__old_` / grace tombstones reassigned-not-dropped; the live
+    /// db is NOT among them (it is left in place, never soft-deprovisioned here).
     Healed {
         cleared_asides: Vec<String>,
         preserved_tombstones: Vec<String>,
@@ -1969,18 +1974,29 @@ pub enum SelfHealReport {
 ///      ([`clear_db_dataloss_safe`] — FINDING 1).
 ///   B. The EXISTING `__deleted_` grace tombstones: DROP under `--drop-soft-deleted` (pre-existing
 ///      soft-deleted data ONLY — never the live orphan / a populated `__old_`), else PRESERVE.
-///   C. CLEARS the live orphan db DATA-LOSS-SAFELY ([`clear_db_dataloss_safe`], Security review E1) —
-///      the restore has NOT landed yet and a mid-restore failure leaves live untouched, so a POPULATED
-///      orphan is SOFT-DEPROVISIONED (renamed to a recoverable `__deleted_` tombstone, mirroring the
-///      fresh-dest invariant `pg_reconcile_fresh_dest_occupant`), an EMPTY one hard-dropped, and an
-///      ABSENT one (a crash freed the name — FINDING 2) a clean skip, NOT a fail-connect abort. NEVER
-///      gated on `--drop-soft-deleted` (FINDING 3 — the flag must not cause live-data loss).
+///   C. DIVORCES the live orphan db from the derived roles IN PLACE — WITHOUT renaming or emptying it
+///      (the construens ATOMICITY fix, v0.59.8; Security review E1). The OLD heal EMPTIED live here —
+///      it soft-deprovisioned the live db to a `__deleted_` tombstone AND fresh-provisioned an empty
+///      live db — BEFORE any dump was restored, so a restore failure (for any reason) stranded the
+///      tenant on that empty mirror while the atomic swap, already designed to be the single
+///      destructive moment, never ran. Now the live data STAYS in place and its ownership (+ objects)
+///      is REASSIGNED to the stable superuser ([`reassign_aside_to_owner`] — the same non-destructive
+///      divorce step (D) applies to a tombstone) so the DROP ROLE in (E) succeeds while the tenant
+///      keeps serving; the login role is re-GRANTed on those (now superuser-owned) tables in (E)'s
+///      reprovision. The ONLY destructive moment stays the later atomic shadow swap (`pg_swap_shadow`),
+///      which moves the OLD live db → a recoverable grace tombstone and the VERIFIED shadow → live in
+///      one step. EXISTENCE-guarded (FINDING 2): an ABSENT live name (a crash freed it) is a clean
+///      skip, NOT a fail-connect abort. The `--drop-soft-deleted` flag NEVER governs the live db
+///      (FINDING 3 — the flag must not cause live-data loss on a restore failure).
 ///   D. REASSIGNS every PRESERVED tombstone (+ its inner objects) to the stable superuser
 ///      ([`reassign_aside_to_owner`] — its data SURVIVES while the roles are divorced from it). Done
-///      AFTER (A) so the sweep touches only the tombstones.
-///   E. DROPS BOTH derived roles ([`clear_exclusive_role`], self-guarding), then deletes their sealed
-///      credentials and REPROVISIONS the tenant fresh — new roles, fresh credentials, a clean empty
-///      live db — so the subsequent shadow-swap restore lands clean.
+///      AFTER (A) so the sweep touches only the tombstones; after (C) it is an idempotent re-assert of
+///      the shared-db ownership sweep the live-db reassign already performed.
+///   E. DROPS BOTH derived roles ([`clear_exclusive_role`], self-guarding — they now own NOTHING),
+///      deletes their sealed credentials, and REPROVISIONS the tenant fresh — new roles, fresh
+///      credentials, RE-GRANTED on the still-populated live db's (now superuser-owned) tables — so the
+///      tenant keeps serving its ORIGINAL data while the shadow restore runs and the atomic swap lands
+///      live only on a VERIFIED restore.
 ///
 /// FAIL-SAFE (HARD, unchanged): a role SHARED with a still-live sibling binding is LEFT fully intact
 /// ([`SharedWithLive`](SelfHealReport::SharedWithLive)) — the restore still proceeds, the live sibling

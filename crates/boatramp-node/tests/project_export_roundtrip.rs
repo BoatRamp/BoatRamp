@@ -6428,7 +6428,28 @@ async fn project_sync_self_heal_tangle_live() {
             "after the heal the fresh owner must own ONLY the restored live db"
         );
 
+        // The atomic shadow swap renamed the ORIGINAL live db to a FRESH `__deleted_<ts>` grace
+        // tombstone (a NEW name minted at swap time, distinct from the seeded `tombstone` above).
+        // Drop that swap-minted leftover too so the heal test leaves no orphan database behind. The
+        // bounded aside name keeps the first 43 chars of the 63-char live db name, so an exact
+        // `left(datname, 40)` prefix match (within the preserved region) + the `__deleted_` marker
+        // pins it without a LIKE-wildcard ambiguity.
+        let swap_prefix: String = dest_db.chars().take(40).collect();
+        let swap_minted = scalar(format!(
+            "SELECT coalesce(string_agg(datname, ',' ORDER BY datname), '') FROM pg_database \
+             WHERE left(datname, 40) = '{swap_prefix}' AND position('__deleted_' in datname) > 0"
+        ))
+        .await;
         for db in [&src_db, &dest_db, &tombstone] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            )
+            .await;
+        }
+        for db in swap_minted.split(',').filter(|d| !d.is_empty()) {
             let _ = psql(
                 backend.as_ref(),
                 &image,
@@ -6512,7 +6533,28 @@ async fn project_sync_self_heal_tangle_live() {
             "flag path: owner role still reprovisioned fresh"
         );
 
+        // The atomic shadow swap renamed the ORIGINAL live db to a FRESH `__deleted_<ts>` grace
+        // tombstone (a NEW name minted at swap time, distinct from the seeded `tombstone` above).
+        // Drop that swap-minted leftover too so the heal test leaves no orphan database behind. The
+        // bounded aside name keeps the first 43 chars of the 63-char live db name, so an exact
+        // `left(datname, 40)` prefix match (within the preserved region) + the `__deleted_` marker
+        // pins it without a LIKE-wildcard ambiguity.
+        let swap_prefix: String = dest_db.chars().take(40).collect();
+        let swap_minted = scalar(format!(
+            "SELECT coalesce(string_agg(datname, ',' ORDER BY datname), '') FROM pg_database \
+             WHERE left(datname, 40) = '{swap_prefix}' AND position('__deleted_' in datname) > 0"
+        ))
+        .await;
         for db in [&src_db, &dest_db, &tombstone] {
+            let _ = psql(
+                backend.as_ref(),
+                &image,
+                &maint,
+                &format!("DROP DATABASE IF EXISTS \"{db}\""),
+            )
+            .await;
+        }
+        for db in swap_minted.split(',').filter(|d| !d.is_empty()) {
             let _ = psql(
                 backend.as_ref(),
                 &image,
