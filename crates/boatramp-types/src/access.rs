@@ -4,13 +4,16 @@
 //! content.
 //!
 //! This module holds the configuration types and the *pure* decision logic
-//! (CIDR matching, credential verification, client-IP resolution). The stateful
-//! rate-limit token buckets live in the server, since they need a clock and
-//! shared mutable state; this module only defines the [`RateLimit`] budget.
+//! (CIDR matching, credential verification, client-IP resolution). The
+//! process-local rate-limit token buckets live here too ([`RateLimiter`]): they
+//! need only a clock and the [`RateLimit`] budget, so they travel with the policy
+//! they enforce. (The server wraps this behind its own `RateLimitStore` trait and
+//! additionally offers a cluster-wide, KV-backed limiter.)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use argon2::password_hash::{PasswordHash, SaltString};
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
@@ -174,6 +177,72 @@ impl RateLimit {
             self.rps.max(1)
         } else {
             self.burst
+        }
+    }
+}
+
+/// Cap on distinct buckets, so a flood of unique client IPs cannot grow the map
+/// without bound. When exceeded, idle (full) buckets are dropped first.
+const MAX_BUCKETS: usize = 100_000;
+
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
+/// An in-memory token-bucket rate limiter, keyed by `(site, client IP)`.
+///
+/// The budget (`rps`/`burst`) is the site-config [`RateLimit`]; the buckets
+/// themselves are process-local state held here. A bucket refills continuously at
+/// `rps` tokens/second up to `burst`. Checking a request is a single mutex-guarded
+/// arithmetic step — it happens *before* the streaming body, so it never stalls a
+/// response in flight.
+///
+/// This is the *pure*, dependency-free limiter — it needs only a clock and the
+/// [`RateLimit`] budget — so it lives alongside the policy it enforces.
+/// `boatramp-server` wraps it behind its own `RateLimitStore` trait (and offers a
+/// cluster-wide, KV-backed alternative that shares limits across nodes).
+#[derive(Default)]
+pub struct RateLimiter {
+    buckets: Mutex<HashMap<(String, IpAddr), Bucket>>,
+}
+
+impl RateLimiter {
+    /// Create an empty limiter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Charge one request to `(site, ip)` under `limit`. Returns `true` if a
+    /// token was available (request allowed), `false` if the bucket is empty
+    /// (request should be rejected with `429`).
+    pub fn check(&self, site: &str, ip: IpAddr, limit: &RateLimit) -> bool {
+        let capacity = limit.burst_capacity() as f64;
+        let rate = limit.rps.max(1) as f64;
+        let now = Instant::now();
+
+        let mut buckets = self.buckets.lock().unwrap();
+        if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(&(site.to_string(), ip)) {
+            // Evict idle (refilled-to-capacity) buckets to make room.
+            buckets.retain(|_, b| {
+                let refilled = b.tokens + now.duration_since(b.last).as_secs_f64() * rate;
+                refilled < capacity
+            });
+        }
+
+        let bucket = buckets.entry((site.to_string(), ip)).or_insert(Bucket {
+            tokens: capacity,
+            last: now,
+        });
+        let elapsed = now.duration_since(bucket.last).as_secs_f64();
+        bucket.last = now;
+        bucket.tokens = (bucket.tokens + elapsed * rate).min(capacity);
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 }
@@ -392,5 +461,37 @@ mod tests {
         assert!(auth.verify("alice", "hunter2"));
         assert!(!auth.verify("alice", "wrong"));
         assert!(!auth.verify("bob", "hunter2")); // unknown user
+    }
+}
+
+#[cfg(test)]
+mod ratelimiter_tests {
+    use super::*;
+
+    fn ip() -> IpAddr {
+        "203.0.113.1".parse().unwrap()
+    }
+
+    #[test]
+    fn allows_burst_then_blocks() {
+        let limiter = RateLimiter::new();
+        let limit = RateLimit { rps: 1, burst: 3 };
+        // Three immediate requests fit the burst; the fourth is blocked.
+        assert!(limiter.check("s", ip(), &limit));
+        assert!(limiter.check("s", ip(), &limit));
+        assert!(limiter.check("s", ip(), &limit));
+        assert!(!limiter.check("s", ip(), &limit));
+    }
+
+    #[test]
+    fn separate_keys_have_separate_buckets() {
+        let limiter = RateLimiter::new();
+        let limit = RateLimit { rps: 1, burst: 1 };
+        assert!(limiter.check("s", ip(), &limit));
+        assert!(!limiter.check("s", ip(), &limit));
+        // Different site, same IP: fresh bucket.
+        assert!(limiter.check("other", ip(), &limit));
+        // Different IP, same site: fresh bucket.
+        assert!(limiter.check("s", "203.0.113.2".parse().unwrap(), &limit));
     }
 }
