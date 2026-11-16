@@ -95,6 +95,8 @@ pub enum DnsProviderKind {
     /// Akamai Edge DNS (`AKAMAI_HOST`, `AKAMAI_CLIENT_TOKEN`,
     /// `AKAMAI_CLIENT_SECRET`, `AKAMAI_ACCESS_TOKEN`, `AKAMAI_ZONE`).
     Akamai,
+    /// Gandi LiveDNS (`GANDI_ZONE`, `GANDI_PAT` — a Gandi Personal Access Token).
+    Gandi,
 }
 
 fn env(var: &str) -> Result<String> {
@@ -190,6 +192,10 @@ pub async fn build_provider_opts(
             env("AKAMAI_CLIENT_SECRET")?,
             env("AKAMAI_ACCESS_TOKEN")?,
             env("AKAMAI_ZONE")?,
+        )),
+        DnsProviderKind::Gandi => Box::new(boatramp_acme::gandi::GandiDns::new(
+            env("GANDI_ZONE")?,
+            env("GANDI_PAT")?,
         )),
     })
 }

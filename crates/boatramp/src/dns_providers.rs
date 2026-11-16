@@ -275,6 +275,17 @@ async fn build_adapter(
                 zone,
             ))
         }
+        DnsProviderKind::Gandi => {
+            // Gandi LiveDNS: the zone is addressed by domain name, authenticated with a
+            // Personal Access Token (secret). The API host is fixed to api.gandi.net.
+            let zone = r
+                .required(label, kname, "zone", s(&cfg.zone), false)
+                .await?;
+            let token = r
+                .required(label, kname, "token", s(&cfg.token), true)
+                .await?;
+            Arc::new(boatramp_acme::gandi::GandiDns::new(zone, token))
+        }
     })
 }
 
@@ -303,7 +314,7 @@ pub async fn build_routing_registry(
         let kind = cfg.kind.ok_or_else(|| {
             Error::DnsProvidersConfig(format!(
                 "provider {:?}: `kind` is required (one of manual | cloudflare | route53 | oci | \
-                 digitalocean | hetzner | ns1 | dnsimple | gcp-dns | azure-dns | akamai)",
+                 digitalocean | hetzner | ns1 | dnsimple | gcp-dns | azure-dns | akamai | gandi)",
                 cfg.name
             ))
         })?;

@@ -508,7 +508,8 @@ pub fn canonicalize_owner_name(raw: &str) -> Result<String, DnsError> {
     feature = "azure-dns",
     feature = "akamai",
     feature = "oci",
-    feature = "hetzner"
+    feature = "hetzner",
+    feature = "gandi"
 ))]
 pub(crate) fn encode_name_segment(name: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -1341,7 +1342,8 @@ mod tests {
         feature = "azure-dns",
         feature = "akamai",
         feature = "oci",
-        feature = "hetzner"
+        feature = "hetzner",
+        feature = "gandi"
     ))]
     #[test]
     fn encode_name_segment_preserves_valid_encodes_dangerous() {
