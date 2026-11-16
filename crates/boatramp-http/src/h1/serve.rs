@@ -17,34 +17,67 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
-use super::parse::{BodyFraming, ParseResult, chunked, parse_request_head};
+use super::parse::{BodyFraming, ParseResult, chunked, parse_request_head_with};
+use crate::shutdown::GracefulShutdown;
 use crate::{Body, BodyError, Handler, ReqBody};
 
 /// Default slowloris bound: how long we wait for a client to deliver a complete request
 /// head or the next byte of its body before closing the connection.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Serve one HTTP/1.1 connection with the default read timeout — see
-/// [`serve_connection_with`].
+/// Per-connection tuning for the HTTP/1.1 serve loop. Every field defaults to the value the
+/// loop historically hardcoded, so [`H1Config::default`] reproduces the old behavior
+/// exactly and existing callers are unaffected; the unified dispatcher ([`crate::Config`])
+/// threads its own values through here.
+#[derive(Clone)]
+pub struct H1Config {
+    /// Slowloris bound on a stalled request head/body before the connection is dropped
+    /// (default [`DEFAULT_READ_TIMEOUT`]).
+    pub read_timeout: Duration,
+    /// Largest request head (request line + headers, through the CRLFCRLF) buffered before
+    /// a `400` (default [`super::parse::MAX_HEAD`] = 64 KiB).
+    pub max_head: usize,
+    /// Optional cap on a single request's body; a body that exceeds it drops the
+    /// connection. `None` (default) is unbounded — the historical behavior.
+    pub body_limit: Option<u64>,
+    /// Optional graceful-shutdown signal: once triggered, the loop closes after the request
+    /// it is currently serving (its response carries `Connection: close`). `None` (default)
+    /// never closes on its own.
+    pub shutdown: Option<GracefulShutdown>,
+}
+
+impl Default for H1Config {
+    fn default() -> Self {
+        Self {
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            max_head: super::parse::MAX_HEAD,
+            body_limit: None,
+            shutdown: None,
+        }
+    }
+}
+
+impl H1Config {
+    /// A config that overrides only the read timeout (every other field default).
+    pub fn with_read_timeout(read_timeout: Duration) -> Self {
+        Self {
+            read_timeout,
+            ..Self::default()
+        }
+    }
+}
+
+/// Serve one HTTP/1.1 connection with all defaults — see [`serve_connection_with_config`].
 pub async fn serve_connection<IO, H>(io: IO, handler: H) -> std::io::Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
-    serve_connection_with(io, handler, DEFAULT_READ_TIMEOUT).await
+    serve_connection_with_config(io, handler, H1Config::default()).await
 }
 
-/// Serve one HTTP/1.1 connection: drive `handler` over each request until the connection
-/// closes. Returns `Ok(())` on a clean close (client EOF, `Connection: close`, or a
-/// write failure) and `Err` only on an unexpected local IO error. `read_timeout` bounds
-/// how long a stalled client (partial head/body) is held before the connection is dropped.
-///
-/// The request body **streams** to the handler: for each request the handler runs
-/// concurrently with a body pump that feeds the request's [`ReqBody`] channel from the
-/// connection as bytes arrive — so a large upload flows client → boatramp → upstream
-/// without being buffered whole. Because HTTP/1.1 is one-request-at-a-time, the pump and
-/// the handler share this task via [`tokio::join!`]; the pump owns the reader while the
-/// handler owns only the channel, so the response write reclaims the connection after.
+/// Serve one HTTP/1.1 connection with a custom read timeout (every other setting default).
+/// Thin wrapper over [`serve_connection_with_config`], kept for backwards compatibility.
 pub async fn serve_connection_with<IO, H>(
     io: IO,
     handler: H,
@@ -54,6 +87,41 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
+    serve_connection_with_config(io, handler, H1Config::with_read_timeout(read_timeout)).await
+}
+
+/// Serve one HTTP/1.1 connection: drive `handler` over each request until the connection
+/// closes. Returns `Ok(())` on a clean close (client EOF, `Connection: close`, or a
+/// write failure) and `Err` only on an unexpected local IO error. The [`H1Config`] bounds
+/// a stalled client (read timeout + head/body size limits) and may carry a graceful-
+/// shutdown signal.
+///
+/// On every exit except an accepted protocol upgrade (where the raw connection is handed
+/// off), the loop **shuts the stream's write half down** before returning, so a TLS
+/// transport emits its `close_notify` alert and the peer sees a clean close rather than a
+/// truncated stream.
+///
+/// The request body **streams** to the handler: for each request the handler runs
+/// concurrently with a body pump that feeds the request's [`ReqBody`] channel from the
+/// connection as bytes arrive — so a large upload flows client → boatramp → upstream
+/// without being buffered whole. Because HTTP/1.1 is one-request-at-a-time, the pump and
+/// the handler share this task via [`tokio::join!`]; the pump owns the reader while the
+/// handler owns only the channel, so the response write reclaims the connection after.
+pub async fn serve_connection_with_config<IO, H>(
+    io: IO,
+    handler: H,
+    config: H1Config,
+) -> std::io::Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    H: Handler,
+{
+    let H1Config {
+        read_timeout,
+        max_head,
+        body_limit,
+        shutdown,
+    } = config;
     // Keep the connection **un-split** by default. A request with no body (the common
     // GET/HEAD — every static hit) is served sequentially (read head → handler → write
     // response), which keeps the concrete socket reachable so a `Body::File` response can
@@ -65,21 +133,23 @@ where
     // body, leaving any pipelined bytes for the next iteration.
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
 
-    loop {
+    // On exit (any `break 'conn`), the write half is shut down so a TLS transport sends its
+    // `close_notify`; only an accepted upgrade bypasses this by moving `io` to the consumer.
+    'conn: loop {
         // --- read + parse a request head (slowloris-bounded) ---------------------
         let (head, head_len) = loop {
-            match parse_request_head(&buf) {
+            match parse_request_head_with(&buf, max_head) {
                 ParseResult::Complete { head, consumed } => break (head, consumed),
                 ParseResult::Reject(_) => {
                     // Malformed / ambiguous head → 400 and close (never resync).
                     let _ = write_status(&mut io, 400, true).await;
-                    return Ok(());
+                    break 'conn;
                 }
                 ParseResult::Incomplete => {
                     match tokio::time::timeout(read_timeout, io.read_buf(&mut buf)).await {
-                        Ok(Ok(0)) => return Ok(()), // EOF on a request boundary → clean close
+                        Ok(Ok(0)) => break 'conn, // EOF on a request boundary → clean close
                         Ok(Ok(_)) => continue,
-                        _ => return Ok(()), // read error / slowloris timeout → drop
+                        _ => break 'conn, // read error / slowloris timeout → drop
                     }
                 }
             }
@@ -88,7 +158,12 @@ where
         let method = head.method.clone();
         let version = head.version;
         let framing = head.framing.clone();
-        let client_close = wants_close(&head.headers, version);
+        // Close after this request if the client asked, or a graceful shutdown was triggered
+        // (the response then carries `Connection: close` and the loop exits below).
+        let client_close = wants_close(&head.headers, version)
+            || shutdown
+                .as_ref()
+                .is_some_and(GracefulShutdown::is_triggered);
         let is_upgrade = crate::upgrade::is_upgrade_request(&head.headers);
         let expect_continue = head
             .headers
@@ -121,16 +196,18 @@ where
                 let head = build_upgrade_head(&resp);
                 drop(resp);
                 if write_all(&mut io, &head).await.is_err() {
-                    return Ok(());
+                    break 'conn;
                 }
                 let prefix = Bytes::from(std::mem::take(&mut buf));
                 let _ = up_tx.send(crate::upgrade::Upgraded::new(io, prefix));
-                return Ok(()); // the connection now belongs to the upgrade consumer
+                // The connection now belongs to the upgrade consumer; `io` is moved, so
+                // this path must NOT fall through to the write-half shutdown below.
+                return Ok(());
             }
             // The handler declined the upgrade: send its response and close (a rejected
             // upgrade never keeps the connection alive).
             let _ = write_response(&mut io, resp, &method, version, true).await;
-            return Ok(());
+            break 'conn;
         }
 
         // --- no request body: serve sequentially on the un-split connection ------
@@ -147,10 +224,10 @@ where
             let (result, resp_close) =
                 write_response(&mut io, resp, &method, version, client_close).await;
             if result.is_err() {
-                return Ok(()); // client went away mid-response
+                break 'conn; // client went away mid-response
             }
             if resp_close {
-                return Ok(());
+                break 'conn;
             }
             continue;
         }
@@ -163,7 +240,7 @@ where
                 .await
                 .is_err()
         {
-            return Ok(());
+            break 'conn;
         }
         let (mut rd, mut wr) = tokio::io::split(io);
         // A bounded channel backs the request's ReqBody stream; the pump feeds it from the
@@ -184,20 +261,26 @@ where
         };
         let ((result, resp_close), pump) = tokio::join!(
             respond,
-            pump_body(&mut rd, &mut buf, framing, tx, read_timeout)
+            pump_body(&mut rd, &mut buf, framing, tx, read_timeout, body_limit)
         );
         // Reunite the halves so the next keep-alive request is served un-split again.
         io = rd.unsplit(wr);
 
         if result.is_err() {
-            return Ok(()); // client went away mid-response
+            break 'conn; // client went away mid-response
         }
         // Close after this request if either side asked, or the request body framing was
         // bad/truncated (the connection boundary can no longer be trusted).
         if resp_close || pump.is_err() {
-            return Ok(());
+            break 'conn;
         }
     }
+
+    // Clean close: shut the write half down so a TLS transport flushes `close_notify` and
+    // the peer observes a clean end (not a truncated stream). Best-effort — the peer may
+    // already be gone. An accepted upgrade returned earlier and never reaches here.
+    let _ = io.shutdown().await;
+    Ok(())
 }
 
 /// Stream the request body from the connection into `tx` (backpressured by the channel),
@@ -211,6 +294,7 @@ async fn pump_body<IO>(
     framing: BodyFraming,
     tx: mpsc::Sender<Result<Bytes, BodyError>>,
     read_timeout: Duration,
+    body_limit: Option<u64>,
 ) -> Result<(), ()>
 where
     IO: AsyncRead + Unpin,
@@ -218,6 +302,9 @@ where
     // Once the receiver is gone we stop sending but keep consuming, to preserve the
     // connection boundary for the next pipelined request.
     let mut sending = true;
+    // Running total of body bytes consumed, checked against `body_limit` (if any). A body
+    // that exceeds the limit fails the pump (the connection then closes).
+    let mut received: u64 = 0;
     // Report a truncated / malformed body to the handler (if still listening) and fail.
     macro_rules! fail {
         () => {{
@@ -227,10 +314,23 @@ where
             return Err(());
         }};
     }
+    // Account `n` just-consumed body bytes and fail if they push the total past the limit.
+    macro_rules! account {
+        ($n:expr) => {{
+            received += $n as u64;
+            if body_limit.is_some_and(|lim| received > lim) {
+                fail!();
+            }
+        }};
+    }
 
     match framing {
         BodyFraming::Empty => Ok(()),
         BodyFraming::Length(n) => {
+            // Reject an over-limit declared length up front — no need to read the body.
+            if body_limit.is_some_and(|lim| n > lim) {
+                fail!();
+            }
             let mut remaining = n as usize;
             while remaining > 0 {
                 if buf.is_empty() {
@@ -244,6 +344,7 @@ where
                 let chunk = Bytes::copy_from_slice(&buf[..take]);
                 buf.drain(..take);
                 remaining -= take;
+                account!(take);
                 if sending && tx.send(Ok(chunk)).await.is_err() {
                     sending = false;
                 }
@@ -259,6 +360,7 @@ where
                 } => {
                     let chunk = Bytes::copy_from_slice(&buf[data_start..data_end]);
                     buf.drain(..next);
+                    account!(data_end - data_start);
                     if sending && tx.send(Ok(chunk)).await.is_err() {
                         sending = false;
                     }
