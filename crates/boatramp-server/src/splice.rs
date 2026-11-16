@@ -455,7 +455,10 @@ async fn splice_conn(
         // Only a Content-Length body with no chunked framing is splice-able. HEAD
         // has no body regardless. Anything else → close after this response.
         let head_only = method == "HEAD" || matches!(status_ok, Some(204) | Some(304));
-        let out_head = rewrite_response_head(&resp_head, &plan.upstream);
+        // Preserve `Transfer-Encoding: chunked` for the chunked passthrough below (we
+        // forward the chunk framing verbatim, so the client must keep the header to
+        // delimit the body).
+        let out_head = rewrite_response_head(&resp_head, &plan.upstream, chunked && !head_only);
         client.write_all(&out_head).await?;
         if !body_prefix.is_empty() && !head_only {
             client.write_all(&body_prefix).await?;
@@ -466,18 +469,27 @@ async fn splice_conn(
             }
             continue;
         }
-        match content_length {
-            Some(total) if !chunked => {
-                let remaining = total.saturating_sub(body_prefix.len());
-                if remaining > 0 {
-                    splice_body(&upstream, &client, remaining).await?;
+        if chunked {
+            // A chunked upstream: forward the chunk framing verbatim and stop at the
+            // terminating 0-chunk, so a keep-alive upstream (which never closes) does not
+            // leave the client waiting forever for a connection close. `body_prefix` was
+            // already written above; it is re-scanned (not re-sent) to locate the end.
+            relay_chunked(&mut upstream, &mut client, body_prefix).await?;
+        } else {
+            match content_length {
+                Some(total) => {
+                    let remaining = total.saturating_sub(body_prefix.len());
+                    if remaining > 0 {
+                        splice_body(&upstream, &client, remaining).await?;
+                    }
                 }
-            }
-            // No Content-Length or chunked: we can't cheaply splice a known count;
-            // relay the rest verbatim then close (correct, just not keep-alive).
-            _ => {
-                relay_to_close(&mut upstream, &mut client).await?;
-                return Ok(());
+                // No Content-Length and not chunked: the response is close-delimited, so
+                // relay the rest verbatim then close (the upstream frames the body by
+                // closing its side, so this terminates — unlike a keep-alive upstream).
+                None => {
+                    relay_to_close(&mut upstream, &mut client).await?;
+                    return Ok(());
+                }
             }
         }
         if close || client_close {
@@ -639,8 +651,13 @@ fn build_upstream_head(
 }
 
 /// Rewrite the upstream response head for the client: drop hop-by-hop, apply the
-/// upstream's `header_down` ops. Content-Length is preserved (we splice exactly).
-fn rewrite_response_head(resp_head: &[u8], upstream: &Upstream) -> Vec<u8> {
+/// upstream's `header_down` ops. `Content-Length` is preserved (we splice exactly).
+/// `keep_chunked_te` preserves the `Transfer-Encoding: chunked` header for a chunked
+/// passthrough: the fast-path forwards the chunk framing verbatim (see [`relay_chunked`]),
+/// so the client needs the header to delimit the body — dropping it (as a bare hop-by-hop
+/// strip did) left an HTTP/1.1 keep-alive client with no framing at all, so it treated the
+/// body as close-delimited and hung waiting for a connection close that never came.
+fn rewrite_response_head(resp_head: &[u8], upstream: &Upstream, keep_chunked_te: bool) -> Vec<u8> {
     let text = match std::str::from_utf8(resp_head) {
         Ok(t) => t,
         Err(_) => return resp_head.to_vec(),
@@ -656,12 +673,17 @@ fn rewrite_response_head(resp_head: &[u8], upstream: &Upstream) -> Vec<u8> {
         }
         if let Some((k, _)) = line.split_once(':') {
             let lk = k.trim().to_ascii_lowercase();
-            if HOP_BY_HOP.contains(&lk.as_str())
-                || upstream
-                    .header_down
-                    .remove
-                    .iter()
-                    .any(|h| lk.eq_ignore_ascii_case(h))
+            // Preserve the chunked Transfer-Encoding when we pass the chunk framing
+            // through verbatim (so the client can delimit the body); otherwise strip it
+            // (and every other hop-by-hop header) as before.
+            let keep_te = keep_chunked_te && lk == "transfer-encoding";
+            if !keep_te
+                && (HOP_BY_HOP.contains(&lk.as_str())
+                    || upstream
+                        .header_down
+                        .remove
+                        .iter()
+                        .any(|h| lk.eq_ignore_ascii_case(h)))
             {
                 continue;
             }
@@ -709,10 +731,65 @@ fn find_head_end(b: &[u8]) -> Option<usize> {
     b.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
-/// Relay `src`→`dst` until `src` closes (for close-delimited / chunked bodies we
-/// don't splice by count). Uses splice on Linux, a userspace copy elsewhere.
+/// Relay `src`→`dst` until `src` closes (for a close-delimited body — one with no
+/// Content-Length and no chunked framing — whose end *is* the connection close).
 async fn relay_to_close(src: &mut TcpStream, dst: &mut TcpStream) -> io::Result<()> {
     tokio::io::copy(src, dst).await.map(|_| ())
+}
+
+/// Relay a **chunked** response body `src`→`dst`, forwarding the chunk framing verbatim
+/// and returning once the terminating 0-chunk has been seen — so a keep-alive upstream
+/// (which never closes the connection) does not leave the client blocked waiting for a
+/// connection close. The client keeps the `Transfer-Encoding: chunked` header (see
+/// [`rewrite_response_head`]) and de-chunks the verbatim framing itself.
+///
+/// `already_forwarded` is the response-body prefix the caller already wrote to `dst` (read
+/// off the socket together with the response head); it is re-scanned to find the body's
+/// end, never re-sent. Newly read bytes are forwarded as they arrive. Because the fast-path
+/// owns the upstream connection and pipelines nothing, the upstream sends only this
+/// response, so nothing past the terminating chunk is ever forwarded. A `0`-length read
+/// before the terminating chunk is a truncated body → `Err` (the caller then closes the
+/// client, signalling the truncation rather than framing a clean end); malformed chunk
+/// framing is likewise an error (fail closed).
+async fn relay_chunked(
+    src: &mut TcpStream,
+    dst: &mut TcpStream,
+    already_forwarded: Vec<u8>,
+) -> io::Result<()> {
+    use boatramp_http::h1::chunked::{ChunkStep, next_chunk};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Bytes seen but not yet fully parsed into chunks. Consumed chunks are drained so this
+    // holds at most one partial chunk — the whole body is never buffered.
+    let mut pending = already_forwarded;
+    let mut tmp = [0u8; 16 * 1024];
+    loop {
+        // Advance through every complete chunk currently buffered.
+        loop {
+            match next_chunk(&pending) {
+                ChunkStep::Data { next, .. } => {
+                    pending.drain(..next);
+                }
+                ChunkStep::Last { .. } => return Ok(()), // terminating 0-chunk → done
+                ChunkStep::Incomplete => break,          // need more bytes
+                ChunkStep::Reject(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed chunked upstream body",
+                    ));
+                }
+            }
+        }
+        let n = src.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream closed before the terminating chunk",
+            ));
+        }
+        dst.write_all(&tmp[..n]).await?;
+        pending.extend_from_slice(&tmp[..n]);
+    }
 }
 
 /// Move exactly `n` bytes `src`→`dst` via `splice()` — no userspace copy of the
@@ -912,10 +989,8 @@ mod tests {
     #[test]
     fn response_head_rewrite_drops_hop_by_hop_keeps_length() {
         let up = Upstream::default();
-        let out = rewrite_response_head(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n",
-            &up,
-        );
+        let raw: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n";
+        let out = rewrite_response_head(raw, &up, false);
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("content-length: 3\r\n") || text.contains("Content-Length: 3\r\n"));
@@ -923,15 +998,259 @@ mod tests {
             text.to_ascii_lowercase()
                 .contains("content-type: text/plain")
         );
-        // Hop-by-hop headers are stripped.
+        // Hop-by-hop headers are stripped (keep_chunked_te = false).
         assert!(!text.to_ascii_lowercase().contains("connection:"));
         assert!(!text.to_ascii_lowercase().contains("transfer-encoding:"));
+
+        // With keep_chunked_te = true (a chunked passthrough) the chunked
+        // Transfer-Encoding is preserved so the client can delimit the body; the other
+        // hop-by-hop headers are still stripped.
+        let kept = String::from_utf8(rewrite_response_head(raw, &up, true)).unwrap();
+        assert!(
+            kept.to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "chunked passthrough must keep Transfer-Encoding: {kept}"
+        );
+        assert!(!kept.to_ascii_lowercase().contains("connection:"));
     }
 
     #[test]
     fn head_end_index() {
         assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n\r\nBODY"), Some(18));
         assert_eq!(find_head_end(b"partial\r\nno end"), None);
+    }
+
+    /// Regression (reproduce-first): a `Transfer-Encoding: chunked` upstream that keeps
+    /// its connection alive must not hang an HTTP/1.1 keep-alive client. Pre-fix the
+    /// fast-path (1) stripped `Transfer-Encoding` from the response head (hop-by-hop) —
+    /// so the client saw no framing header and treated the body as close-delimited — and
+    /// (2) relayed the body with `relay_to_close` (`tokio::io::copy`), which waits for the
+    /// *upstream* to close; a keep-alive upstream never does, so the client was left
+    /// waiting forever for a connection close that never came. `Content-Length` responses
+    /// (spliced by count) and HTTP/1.0 clients (rejected → userspace fallback) both
+    /// worked, which is why only chunked-over-keep-alive hung.
+    ///
+    /// This drives `splice_conn` directly: the chunked relay is userspace (not kernel
+    /// splice), so the exact production seam reproduces on every target, not only where
+    /// `splice()` engages. The client reads the response with boatramp's own HTTP/1.1
+    /// client codec, so framing is taken from the response head exactly as a real client
+    /// (curl `--http1.1`) would — pre-fix the body read blocks until the timeout fires.
+    #[tokio::test]
+    async fn chunked_keepalive_upstream_does_not_hang_the_client() {
+        use boatramp_core::config::SiteConfig;
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::gateway::{GatewayConfig, GatewayRoute, Upstream};
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::security::SecurityProfile;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        // A chunked KEEP-ALIVE upstream: it sends a complete chunked response (including
+        // the terminating 0-chunk) and then holds the connection open forever (never
+        // closes), exactly like a real keep-alive origin.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => break,
+                        }
+                    }
+                    let resp: &[u8] = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n\
+                                        5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+                    if s.write_all(resp).await.is_err() {
+                        return;
+                    }
+                    // Keep-alive: never close; block reading a next request that never comes.
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        // A gateway site whose single plaintext-HTTP backend is the chunked upstream.
+        let deploy = DeployStore::new(
+            Arc::new(boatramp_storage::FsStorage::new(std::env::temp_dir())),
+            Arc::new(MemoryKv::new()),
+        );
+        let cfg = SiteConfig {
+            gateway: Some(GatewayConfig {
+                upstreams: std::iter::once((
+                    "backend".to_string(),
+                    Upstream {
+                        target: format!("http://{up_addr}"),
+                        ..Default::default()
+                    },
+                ))
+                .collect(),
+                routes: vec![GatewayRoute {
+                    matches: "/**".into(),
+                    upstream: "backend".into(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        deploy
+            .set_site_config(ProjectRef::DEFAULT, "www", &cfg)
+            .await
+            .unwrap();
+
+        let posture = SecurityProfile::Dev.preset();
+        let resolved = proxy::resolve_target(
+            &format!("http://{up_addr}"),
+            proxy::GatewayTargetPolicy::Operator,
+            &posture,
+        )
+        .await
+        .unwrap();
+        let plan = SplicePlan {
+            resolved,
+            upstream: Upstream {
+                target: format!("http://{up_addr}"),
+                ..Default::default()
+            },
+            site: "www".to_string(),
+            project: ProjectRef::DEFAULT.as_str().to_string(),
+        };
+        let ctx = SpliceCtx {
+            deploy,
+            posture,
+            daemon: None,
+        };
+
+        // A client <-> `splice_conn` socket pair over loopback.
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
+        let (server_side, peer) = front.accept().await.unwrap();
+        let serve: crate::ServeInput = axum::Router::new().into();
+        tokio::spawn(async move {
+            let _ = splice_conn(server_side, peer, plan, ctx, serve).await;
+        });
+
+        // An HTTP/1.1 keep-alive client (no `Connection: close` — the exact repro).
+        client
+            .write_all(b"GET /page HTTP/1.1\r\nHost: test.local\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Read the response as a real HTTP/1.1 client would: framing comes from the
+        // response head. Pre-fix the head carries neither `Transfer-Encoding` nor
+        // `Content-Length` → close-delimited → the body read blocks until the connection
+        // closes, which never happens → the timeout fires. Post-fix the head carries
+        // `Transfer-Encoding: chunked` → the body de-chunks to a clean end.
+        let read = timeout(Duration::from_secs(5), async move {
+            let mut conn = boatramp_http::h1::Conn::new(client);
+            let head = conn.read_response_head().await.unwrap();
+            let mut reader = boatramp_http::h1::BodyReader::r#for(&axum::http::Method::GET, &head);
+            let mut body = Vec::new();
+            while let Some(chunk) = conn.read_body_chunk(&mut reader).await.unwrap() {
+                body.extend_from_slice(&chunk);
+            }
+            (head, body)
+        })
+        .await;
+
+        let (head, body) = read.expect(
+            "chunked keep-alive upstream left the HTTP/1.1 client hanging \
+             (no end-of-response was signalled)",
+        );
+        assert_eq!(head.status, axum::http::StatusCode::OK);
+        // The response must be self-delimiting so a keep-alive client knows where the
+        // body ends: the chunked framing must be preserved end to end.
+        assert!(
+            head.headers
+                .contains_key(axum::http::header::TRANSFER_ENCODING),
+            "Transfer-Encoding must be preserved so the client can delimit the chunked \
+             body: {:?}",
+            head.headers
+        );
+        assert_eq!(body, b"hello world", "de-chunked body mismatch");
+    }
+
+    /// Regression (real serve path, Linux): the whole plaintext fast-path — `serve` →
+    /// `peek_classify`/`classify` → `splice_conn` — must stream a chunked keep-alive
+    /// upstream to an HTTP/1.1 keep-alive client without hanging. Gated to Linux because
+    /// the classifier only intercepts where kernel `splice()` is available; on every other
+    /// target each connection takes the (already-correct) userspace serve fallback, so this
+    /// exact production path is Linux-only. (The cross-platform seam coverage is
+    /// [`chunked_keepalive_upstream_does_not_hang_the_client`], which drives `splice_conn`
+    /// directly.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn serve_loop_streams_a_chunked_keepalive_upstream_without_hanging() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        // A chunked keep-alive upstream that never closes (holds the connection open after
+        // the response, as a real keep-alive origin does).
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => break,
+                        }
+                    }
+                    let resp: &[u8] = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n\
+                                        5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+                    if s.write_all(resp).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let addr = spawn_gateway_serve(up_addr).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // HTTP/1.1 keep-alive (no `Connection: close` — the exact reported repro).
+        client
+            .write_all(b"GET /anything HTTP/1.1\r\nHost: test.local\r\n\r\n")
+            .await
+            .unwrap();
+        let read = timeout(Duration::from_secs(5), async move {
+            let mut conn = boatramp_http::h1::Conn::new(client);
+            let head = conn.read_response_head().await.unwrap();
+            let mut reader = boatramp_http::h1::BodyReader::r#for(&axum::http::Method::GET, &head);
+            let mut body = Vec::new();
+            while let Some(chunk) = conn.read_body_chunk(&mut reader).await.unwrap() {
+                body.extend_from_slice(&chunk);
+            }
+            (head, body)
+        })
+        .await;
+        let (head, body) =
+            read.expect("serve loop hung streaming a chunked keep-alive upstream over keep-alive");
+        assert_eq!(head.status, axum::http::StatusCode::OK);
+        assert!(
+            head.headers
+                .contains_key(axum::http::header::TRANSFER_ENCODING),
+            "Transfer-Encoding must be preserved end to end: {:?}",
+            head.headers
+        );
+        assert_eq!(body, b"hello world", "de-chunked body mismatch");
     }
 
     /// End-to-end over real sockets: the serve loop reverse-proxies a gateway route
@@ -1244,7 +1563,8 @@ mod tests {
             let _ = parse_request_head(&data);
             let _ = parse_response_head(&data);
             let up = Upstream::default();
-            let _ = rewrite_response_head(&data, &up);
+            let _ = rewrite_response_head(&data, &up, false);
+            let _ = rewrite_response_head(&data, &up, true);
             let _ = find_head_end(&data);
         }
 
