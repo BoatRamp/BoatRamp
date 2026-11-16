@@ -49,16 +49,16 @@ root-holds-no-secret is trivially preserved** — statically, by the lint, befor
 
 ## What stays DEFERRED (owner/Security gates — flagged, not guessed)
 
-- **S1 — the relay placement (the gate for operator-facing wiring).** The host client-byte relay needs
+- **S1 — the relay placement. RESOLVED (owner, 2026-11-14): a SEPARATE least-authority relay process
+  (`__vm-relay`), NOT a widening of the root.** The host client-byte relay needs
   `accept4`/`connect`/`read`/`write`; the secret-blind root's TCB-floor self-profile is **networkless**
-  (`derive_root_profile` → `ROOT_NET_STRIP`) and hard-kills `fork`. So the relay CANNOT run inside the
-  confined root as-is. Two shapes, an owner/Security call: (a) **widen the root's self-profile** for the
-  relay syscalls when VM frontends exist (bounded — no new key access, no new bind, execve still
-  pinned — but it is new TCB in the secret-blind root, exactly what design §1b/§8 S1 flags); or (b) a
-  **separate least-authority relay process** (`__vm-relay`, its own narrow profile). Until this is
-  ratified, `resolve_spawn_backend` refuses a `substrate: vm` frontend fail-closed with a message naming
-  this gate (no silent downgrade). The MECHANISM is built + live-gated; only the operator-facing
-  supervise dispatch waits on S1.
+  (`derive_root_profile` → `ROOT_NET_STRIP`) and hard-kills `fork`. The two shapes were (a) widen the
+  root's self-profile for the relay syscalls (bounded, but new TCB in the secret-blind root) or (b) a
+  separate least-authority relay process. The owner chose **(b)** — keep the TCB floor minimal; a relay
+  bug, parsing untrusted client bytes, stays OUT of the root. See the **S1 section** below for what is
+  now landed (the root→relay boundary contract) and what the next increment wires. Until that wiring
+  lands, `resolve_spawn_backend` still refuses a `substrate: vm` frontend fail-closed (no silent
+  downgrade); the MECHANISM is built + live-gated.
 - **S3/S4 — the guest-kernel floor.** The in-guest fail-closed `Enforced` profile requires Landlock
   `MIN_LANDLOCK_ABI = V5` (kernel ≥ 6.10). The firecracker CI kernels (≤ 6.1, Landlock ABI ≤ V2) and
   boatramp's own `linux_6_1` compute-plane guest kernel do NOT meet it — a privsep VM needs a
@@ -71,3 +71,68 @@ root-holds-no-secret is trivially preserved** — statically, by the lint, befor
 - **The vsock KEY-material relay — EXCLUDED (owner-gated).** Any transport that routes key bytes through
   the secret-blind root (design §3 / S2) is out of scope and refused by the lint + the spawn gate.
 - **vz / macOS; multi-VM CID/port topology; restart-path supervision** — follow-ons (design §6, §1b, §5).
+
+## S1 — the separate `__vm-relay` process: what's landed, what's next
+
+The owner RESOLVED S1 (2026-11-14) as a **separate least-authority relay process** (`__vm-relay`),
+not a widening of the secret-blind root. The relay accepts each client on the root-bound public TCP
+listener and splices its bytes to the frontend-in-guest over firecracker's vsock UDS bridge — it
+carries ONLY untrusted client bytes, never key material (a scoped static-parser frontend holds no
+key, enforced by `check_vm_secret_blindness_closure` before spawn), so the relay is itself
+secret-blind.
+
+### Landed in this increment (the root→relay BOUNDARY CONTRACT — pure, host-tested, inert)
+
+The S1 analog of WS-B's `InstanceSpawnSpec` (the fully-formed, tested command + environment the root
+hands the OS), in `crates/boatramp/src/privsep.rs`:
+
+- **`VM_RELAY_SUBCOMMAND = "__vm-relay"`** — the internal `argv[1]` token (mirrors
+  `__root`/`__instance`/`__vm-guest`; kept out of the clap enum).
+- **`VmRelayDescriptor { label, uds_path, guest_port }`** + **`PRIVSEP_VM_RELAY_ENV`** — the
+  NON-SECRET launch descriptor (names/paths/a port only) the root hands the relay, serialized into
+  its env var (like `PRIVSEP_FDS_ENV` / `PRIVSEP_AUTHORITY_LINKS_ENV`); `to_env_value` /
+  `from_env_value` / `from_env` round-trip it.
+- **`VmRelaySpawnSpec { label, argv, env }` + `to_command`** and **`plan_vm_relay_spec(...)`** — the
+  pure builder: argv `["__vm-relay", "<label>"]`; the env is the SAME minimal secret-scrub every
+  capability-less instance gets (`build_instance_env(parent, &[], declared_secret_env)` — so a
+  `_TOKEN`/`_SECRET`/… or a config-declared BYO-credential var is scrubbed, Finding-1 parity) plus
+  ONLY the two non-secret wiring vars; the pre-bound public TCP listener rides the ONE existing
+  fd-pass mechanism (`PrivsepChildFds { links: {}, listener: Some(fd) }`), not a parallel one.
+- Unit tests (`vm_relay_descriptor_round_trips_through_its_env_value`,
+  `plan_vm_relay_spec_is_secret_blind_and_wires_the_boundary`) prove the round-trip + that NOT ONE of
+  three secret-bearing parent vars (a secret `BOATRAMP_*`, a config-declared BYO credential, a cloud
+  credential) crosses to the relay, while the listener fd + descriptor wire correctly.
+
+Nothing is wired into the runtime: `resolve_spawn_backend` still refuses `substrate: vm` fail-closed,
+the secret-blind root / the two prod VM-refusal gates / the lint are untouched, and the contract is
+inert dead-code (`#[allow(dead_code)]` on `to_command`) until the next increment calls it.
+
+### Next increment (Security-reviewed + Linux-live-gated — NOT in this cut)
+
+1. **The relay's own least-authority seccomp/Landlock profile** (a NEW `DerivedProfile`, the one
+   genuinely Security-critical design piece — recommended shape, to ratify): seccomp = the Phase-0
+   `ALLOWED` baseline KEEPING only the socket verbs the relay needs (`socket` for AF_UNIX,
+   `connect`, `accept4`, the read/write/`shutdown` family) — i.e. a SUBSET of `ROOT_NET_STRIP`,
+   NOT `bind`/`listen`/`socketpair` (the listener is passed pre-bound) — MINUS `KEY_LOCK`, MINUS
+   `EXEC_SPAWN` (the relay never execs — TIGHTER than the root); kill = the full `KILL_SURFACE`
+   INCLUDING `execve`/`execveat` + `fork`/`vfork` (the relay spawns nothing; threads use
+   `clone`/`CLONE_THREAD`, which stays allowed). Landlock view = READ+EXECUTE on its own static
+   binary only, plus the ONE firecracker vsock UDS path it dials — NO config, NO `data_dir`, NO key,
+   NO instance state. Derive it pure + unit-tested (like `root_supervisor_allowlist`), install it
+   through the SAME `install_derived` machinery, fail-closed `Enforced`.
+2. **The supervise dispatch**: for a scoped-frontend `substrate: vm` instance, the root binds the
+   public listener, assembles+boots the microVM (`launch_frontend_vm`, minus its in-root relay
+   thread), then `fork`+`exec`s the `__vm-relay` child via `VmRelaySpawnSpec::to_command` — `dup2`ing
+   the listener onto the fixed fd + passing the vsock UDS path in the descriptor — and supervises BOTH
+   the firecracker child and the relay child (either's death ⇒ `FailNodeClosed`). Flip
+   `resolve_spawn_backend` to accept the scoped shape.
+3. **`run_vm_relay()` entry** (the `__vm-relay` dispatch in `lib.rs`, beside `__vm-guest`): read the
+   descriptor + the listener fd, install the profile (1), run `privsep_vm::run_relay` behind it.
+4. **Linux live gate**: invert a fail-closed `#[ignore]`d relay gate to assert the separate relay
+   process serves end-to-end over the vsock bridge on lighthouse+KVM (the mechanism's serve path
+   already proven; this validates the process split + its profile).
+
+Toward **O4 full capability parity** (backends in VMs, owner 2026-11-14), S1's separated relay is the
+transport prerequisite; the inward backend relay (§1d), guest net/egress, and secret-blind cred
+delivery (key material stays in-guest / relayed by the key-holder sealer, never the root) are the
+subsequent O4 increments on this same separated-relay foundation.

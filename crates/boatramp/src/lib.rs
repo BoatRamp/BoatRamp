@@ -417,6 +417,17 @@ fn run() -> Result<(), CliError> {
     if std::env::args().nth(1).as_deref() == Some("__vm-guest") {
         return privsep::run_vm_guest();
     }
+    // A re-exec'd `boatramp __vm-relay <label>` is the scoped VM substrate's SEPARATE least-authority
+    // client-byte RELAY process (owner S1 decision 2026-11-14 — a dedicated process, NOT a widening
+    // of the secret-blind root). It validates its non-secret launch contract (the VmRelayDescriptor +
+    // the inherited pre-bound listener fd) then, in this scaffold increment, REFUSES fail-closed (its
+    // own least-authority profile + the byte pipe over the vsock UDS are the next increment). Handled
+    // HERE in the pre-runtime single-threaded window, matching `argv[1]` EXACTLY (out of the clap
+    // enum). Cross-platform: the refusal is platform-independent; the real relay is Linux-only once
+    // wired. Never reached in production today (`resolve_spawn_backend` refuses `substrate: vm`).
+    if std::env::args().nth(1).as_deref() == Some(privsep::VM_RELAY_SUBCOMMAND) {
+        return privsep::run_vm_relay(&std::env::args().nth(2).unwrap_or_default());
+    }
     // A re-exec'd `boatramp __root` / `boatramp __instance <label>` is the privsep Phase-1 root
     // supervisor / feature-instance (design F10). Handled HERE, in the same pre-runtime
     // single-threaded window as the workers above (so a per-instance profile can install on the main

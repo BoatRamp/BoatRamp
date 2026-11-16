@@ -893,6 +893,55 @@ pub fn run_vm_guest() -> Result<(), CliError> {
     crate::privsep_vm::guest_accept_serve_loop(listener, &label)
 }
 
+/// The separate least-authority VM client-byte **relay process** entry
+/// (`boatramp __vm-relay <label>`) — the owner's S1 placement (2026-11-14): a dedicated process,
+/// NOT a widening of the secret-blind root, that accepts each client on the root-bound public TCP
+/// listener and splices its bytes to the frontend-in-guest over the firecracker vsock UDS bridge
+/// ([`crate::privsep_vm`]). It carries ONLY untrusted client bytes — never key material — so it is
+/// itself secret-blind (it scrubs its own environ first). The root→relay contract is
+/// [`VmRelayDescriptor`] (over [`PRIVSEP_VM_RELAY_ENV`]) + the inherited pre-bound listener fd (over
+/// [`PRIVSEP_FDS_ENV`] / [`PrivsepChildFds`]).
+///
+/// **SCAFFOLD STATE (S1, this increment):** it reads + validates that NON-SECRET contract, then
+/// REFUSES fail-closed — the relay's OWN least-authority seccomp/Landlock profile (and running the
+/// byte pipe behind it) is the next Security-reviewed, Linux-live-gated increment. It is never
+/// reached in production today: [`resolve_spawn_backend`] refuses `substrate: vm` before any relay
+/// is spawned, so this entry exists for dispatch completeness + to pin the root→relay contract as
+/// reachable, exercised code (not an unused seam).
+pub fn run_vm_relay(label: &str) -> Result<(), CliError> {
+    crate::init_tracing();
+    // The relay handles untrusted client bytes; scrub any inherited live credential first (inv10).
+    scrub_own_environ();
+    let fail = |reason: String| PrivsepError::InstanceServe {
+        label: label.to_string(),
+        reason,
+    };
+    // Validate the non-secret launch contract the root wired (fail loudly on a broken spawn).
+    let descriptor = VmRelayDescriptor::from_env().map_err(fail)?;
+    let fds = PrivsepChildFds::from_env().map_err(fail)?;
+    let listener_fd = fds.listener.ok_or_else(|| {
+        fail(format!(
+            "the __vm-relay process needs an inherited pre-bound public listener fd via \
+             {PRIVSEP_FDS_ENV}; none was wired"
+        ))
+    })?;
+    tracing::info!(
+        instance = %label,
+        guest_port = descriptor.guest_port,
+        listener_fd,
+        "[privsep] __vm-relay: launch contract validated (secret-blind client-byte relay); the \
+         least-authority profile + byte-pipe wiring are the next increment — refusing fail-closed"
+    );
+    Err(fail(format!(
+        "the separate-process VM client-byte relay (S1, owner-resolved) is scaffolded — its \
+         least-authority seccomp/Landlock profile + the byte pipe over the vsock UDS {uds} are the \
+         next Security-reviewed increment; refusing to serve unprofiled (no VM frontend is \
+         operator-launched yet — resolve_spawn_backend refuses substrate: vm)",
+        uds = descriptor.uds_path.display(),
+    ))
+    .into())
+}
+
 // =============================================================================
 // The root→instance fd-pass contract (WS-C): which inherited fd is which link / listener
 // =============================================================================
@@ -983,6 +1032,156 @@ fn instance_listener_addr(
     config.serve.as_ref().and_then(|s| s.addr)
 }
 
+// =============================================================================
+// S1: the separate least-authority VM client-byte relay process (`__vm-relay`)
+// =============================================================================
+//
+// The scoped VM substrate (`crate::privsep_vm`) needs a HOST-side client-byte relay: the root binds
+// the privileged public TCP listener, and some host process accepts each client and splices its
+// bytes to the frontend-in-guest over firecracker's vsock UDS bridge (design §1c, Model A). That
+// relay needs `accept4`/`connect`/`read`/`write` — which the secret-blind root's networkless
+// TCB-floor self-profile (`sandbox::derive_root_profile` → `ROOT_NET_STRIP`) forbids. The owner
+// RESOLVED the placement (S1, 2026-11-14): a SEPARATE least-authority relay process — do NOT widen
+// the secret-blind root (a relay bug, parsing untrusted client bytes, stays OUT of the root's TCB
+// floor). The relay carries ONLY untrusted client bytes — NEVER key material (a scoped
+// static-parser frontend holds no key; `check_vm_secret_blindness_closure` refuses any other VM
+// shape before spawn), so the relay is itself secret-blind.
+//
+// This is the ROOT→relay BOUNDARY CONTRACT (the S1 analog of `InstanceSpawnSpec` for WS-B): the
+// fully-formed, host-tested command + environment the root hands the OS for the relay. The actual
+// `.spawn()`, the pre-bound-listener-fd pass, the relay's OWN least-authority seccomp/Landlock
+// profile install, and the supervise wiring are the NEXT (Security-reviewed, Linux-live-gated)
+// increment — this is the reviewable primitive they build on. Until then `substrate: Vm` stays
+// refused fail-closed at `resolve_spawn_backend` (no runtime path change; the secret-blind root,
+// the prod VM-refusal gates, and the lint are all untouched).
+
+/// The internal `argv[1]` token that engages the separate VM client-byte relay process. Mirrors the
+/// `__root`/`__instance`/`__vm-guest` precedent: an EXACT `argv[1]` match, kept OUT of the clap
+/// `Command` enum entirely (internal, never user-facing / completion / `--help`).
+pub const VM_RELAY_SUBCOMMAND: &str = "__vm-relay";
+
+/// The env var the root sets on a spawned `__vm-relay` process carrying its NON-SECRET launch
+/// descriptor ([`VmRelayDescriptor`] — the frontend label, the firecracker host-side vsock UDS path
+/// to dial, and the guest vsock port). Names/paths/a port only — NEVER a secret (the relay is
+/// secret-blind: it only splices untrusted client bytes), so it passes the `BOATRAMP_*` spawn-env
+/// allowlist exactly like [`PRIVSEP_FDS_ENV`] / [`PRIVSEP_AUTHORITY_LINKS_ENV`]. The pre-bound
+/// public TCP listener fd rides the SAME [`PRIVSEP_FDS_ENV`] / [`PrivsepChildFds`] mechanism every
+/// instance's listener uses (the root `dup2`s it onto the fixed `listener` fd number) — ONE
+/// fd-passing path, not a parallel one.
+pub const PRIVSEP_VM_RELAY_ENV: &str = "BOATRAMP_PRIVSEP_VM_RELAY";
+
+/// The non-secret launch descriptor the root hands a `__vm-relay` process (serialized into
+/// [`PRIVSEP_VM_RELAY_ENV`]). It carries ONLY names/paths/a port: the relay holds NO
+/// [`HostAuthority`] and NO key — its entire authority is the inherited pre-bound listener fd plus
+/// the ability to dial the one firecracker vsock UDS named here. The relay accepts each client on
+/// the listener and splices its bytes to the guest over a fresh vsock connection to
+/// `uds_path` : `guest_port` ([`crate::privsep_vm`]'s `run_relay` is the byte-pipe it runs, once
+/// wired behind its own profile).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmRelayDescriptor {
+    /// The frontend instance label this relay serves (for logging + the `FailNodeClosed` signal).
+    pub label: String,
+    /// The firecracker host-side vsock UDS the relay dials — the ONLY path into the guest (S1).
+    pub uds_path: PathBuf,
+    /// The guest vsock port the relay dials over that UDS.
+    pub guest_port: u32,
+}
+
+impl VmRelayDescriptor {
+    /// Serialize for the [`PRIVSEP_VM_RELAY_ENV`] value.
+    pub fn to_env_value(&self) -> String {
+        serde_json::to_string(self).expect("the VM relay descriptor is always serializable")
+    }
+
+    /// Parse from a raw [`PRIVSEP_VM_RELAY_ENV`] value (split out so the contract is unit-testable
+    /// without mutating the process environment).
+    pub fn from_env_value(value: &str) -> Result<Self, String> {
+        serde_json::from_str(value).map_err(|e| format!("parsing {PRIVSEP_VM_RELAY_ENV}: {e}"))
+    }
+
+    /// Read + parse the descriptor from the process environment (the relay process's entry reads
+    /// this). An ABSENT var is an error — a `__vm-relay` process with no descriptor is a broken
+    /// spawn, refused loudly rather than defaulting.
+    pub fn from_env() -> Result<Self, String> {
+        let value = std::env::var(PRIVSEP_VM_RELAY_ENV)
+            .map_err(|e| format!("reading {PRIVSEP_VM_RELAY_ENV}: {e}"))?;
+        Self::from_env_value(&value)
+    }
+}
+
+/// The root→`__vm-relay` re-exec spawn spec — the S1 boundary primitive (the analog of
+/// [`InstanceSpawnSpec`] for the separate relay process). It is the fully-formed, tested command +
+/// environment the root hands the OS; the `.spawn()` + listener-fd pass + the relay's own
+/// least-authority profile install + supervision are the next increment.
+///
+/// `#[allow(dead_code)]` carries it (+ [`plan_vm_relay_spec`]) as the root-side S1 seam, exercised by
+/// the tests, until the supervise loop builds + spawns it — exactly as [`InstanceSpawnSpec`] carried
+/// its own `to_command` seam before WS-C wired the spawn.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmRelaySpawnSpec {
+    /// The frontend instance label this relay serves.
+    pub label: String,
+    /// The re-exec argv TAIL (after `argv[0]`): `["__vm-relay", "<label>"]` (mirrors `__instance`).
+    pub argv: Vec<String>,
+    /// The EXPLICITLY MINIMAL, secret-scrubbed environment (the relay is secret-blind — it splices
+    /// untrusted client bytes and MUST carry no credential), PLUS the non-secret
+    /// [`PRIVSEP_VM_RELAY_ENV`] descriptor and the [`PRIVSEP_FDS_ENV`] listener-fd map. The root
+    /// spawns with `env_clear().envs(this)`, so nothing else is inherited.
+    pub env: BTreeMap<String, String>,
+}
+
+impl VmRelaySpawnSpec {
+    /// Build the ready-to-spawn re-exec [`std::process::Command`]: `env_clear` + the minimal
+    /// scrubbed env + the `__vm-relay` argv tail. `#[allow(dead_code)]` carries it as the S1 seam
+    /// (exercised by the tests) until the supervise loop calls it.
+    #[allow(dead_code)]
+    pub fn to_command(&self, current_exe: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new(current_exe);
+        cmd.args(&self.argv).env_clear().envs(&self.env);
+        cmd
+    }
+}
+
+/// Build the root→`__vm-relay` spawn spec for ONE scoped static-parser-frontend VM (S1). PURE +
+/// host-testable, so the whole boundary — what crosses to the relay, what is scrubbed, which fd
+/// carries the listener — is unit-tested before any live wiring.
+///
+/// The relay holds NO [`HostAuthority`] (it is a dumb byte pipe), so its environment is
+/// `build_instance_env(parent, &[], declared_secret_env)` — the SAME minimal, secret-scrubbed env
+/// every capability-less instance gets (so a `_TOKEN`/`_SECRET`/… or config-declared BYO
+/// credential var is scrubbed, Finding-1 parity) — plus ONLY the two non-secret wiring vars: the
+/// [`PRIVSEP_VM_RELAY_ENV`] descriptor and the [`PRIVSEP_FDS_ENV`] map carrying the pre-bound
+/// public TCP listener on `listener_fd` (`links` empty — the relay has no feature-links). Pure
+/// (host-testable). `parent_env` is the root's environment; `declared_secret_env` the config-driven
+/// secret-env set from [`privsep_resolve::declared_secret_env_var_names`].
+#[allow(dead_code)]
+pub fn plan_vm_relay_spec<I>(
+    label: &str,
+    descriptor: &VmRelayDescriptor,
+    listener_fd: i32,
+    parent_env: I,
+    declared_secret_env: &BTreeSet<String>,
+) -> VmRelaySpawnSpec
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    // The relay bears no capability — the minimal capability-less scrub, no secret couriered.
+    let mut env = privsep_resolve::build_instance_env(parent_env, &[], declared_secret_env);
+    env.insert(PRIVSEP_VM_RELAY_ENV.to_string(), descriptor.to_env_value());
+    // The pre-bound public TCP listener rides the one fd-pass mechanism (links empty).
+    let fds = PrivsepChildFds {
+        links: BTreeMap::new(),
+        listener: Some(listener_fd),
+    };
+    env.insert(PRIVSEP_FDS_ENV.to_string(), fds.to_env_value());
+    VmRelaySpawnSpec {
+        label: label.to_string(),
+        argv: vec![VM_RELAY_SUBCOMMAND.to_string(), label.to_string()],
+        env,
+    }
+}
+
 /// The per-instance SPAWN-BACKEND dispatch for the operator-selectable isolation SUBSTRATE (design §7
 /// generalizing seam — "substrate is a spawn backend"). The root calls this for EACH instance BEFORE
 /// wiring any links / binding any listener, so a composition that selects an unwired substrate is
@@ -1002,12 +1201,16 @@ fn instance_listener_addr(
 /// - A key-free **static-parser frontend** (a group-C `listen.*`-only slice — the lint's P3;
 ///   [`crate::privsep_vm::is_scoped_static_parser_frontend`]) is exactly the owner-greenlit scoped
 ///   first cut. Its substrate MECHANISM is BUILT + live-gated ([`crate::privsep_vm`], the shim, the
-///   `__vm-guest` serve, the lighthouse serve gate), but the operator-facing SUPERVISE wiring is gated
-///   on the **S1 relay-placement** decision: the host client-byte relay (design §1c Model A) needs
-///   `accept4`/`connect`/`read`/`write`, which the secret-blind root's networkless TCB-floor
-///   self-profile (`derive_root_profile` — `ROOT_NET_STRIP`) forbids, so running the relay in the root
-///   widens that floor (new TCB — a Security call), and running it in a separate least-authority
-///   process is the alternative. Until the owner/Security ratify the placement, the frontend is not
+///   `__vm-guest` serve, the lighthouse serve gate), but the operator-facing SUPERVISE wiring is still
+///   being built on the **S1 relay-placement** decision, now RESOLVED (owner, 2026-11-14): the host
+///   client-byte relay (design §1c Model A) needs `accept4`/`connect`/`read`/`write`, which the
+///   secret-blind root's networkless TCB-floor self-profile (`derive_root_profile` — `ROOT_NET_STRIP`)
+///   forbids, so it runs in a SEPARATE least-authority relay process (`__vm-relay`) — NOT a widening of
+///   the root (a relay bug, parsing untrusted client bytes, stays OUT of the root's TCB floor). The
+///   root→relay BOUNDARY CONTRACT is built ([`VmRelaySpawnSpec`] / [`plan_vm_relay_spec`] /
+///   [`VmRelayDescriptor`], the S1 analog of [`InstanceSpawnSpec`]); the relay's OWN least-authority
+///   seccomp/Landlock profile, the `.spawn()` + listener-fd pass, and the supervise dispatch are the
+///   next (Security-reviewed, Linux-live-gated) increment. Until that lands the frontend is not
 ///   operator-launched (never silently downgraded to an OS process, which would discard the wall).
 /// - Any OTHER VM shape — a co-located sealer bundle (P1, which needs the owner-GATED vsock key-relay,
 ///   design §3 / S2), a backend, an exec/control instance — is outside the approved scope entirely.
@@ -1024,9 +1227,10 @@ fn resolve_spawn_backend(
     if matches!(substrate, InstanceSubstrate::Vm) {
         let reason = if crate::privsep_vm::is_scoped_static_parser_frontend(capabilities) {
             "it IS the owner-greenlit scoped shape (a key-free static-parser frontend), and the VM \
-             substrate MECHANISM is built + live-gated — but the operator-facing supervise wiring is \
-             gated on the S1 relay-placement decision (the host client-byte relay needs socket \
-             syscalls the secret-blind root's networkless self-profile forbids)"
+             substrate MECHANISM is built + live-gated — the operator-facing supervise wiring is \
+             being built on the RESOLVED S1 decision (a separate least-authority `__vm-relay` \
+             process; the root→relay boundary spec is landed), pending the relay's own \
+             least-authority profile + the supervise dispatch (the next Security-reviewed increment)"
         } else {
             "it is NOT a key-free static-parser frontend (a group-C `listen.*`-only slice), so it is \
              outside the approved scope entirely — a co-located sealer bundle / backend / exec/control \
@@ -4747,6 +4951,96 @@ mod tests {
         assert!(
             o.contains("key-relay") && o.contains("fail-closed"),
             "the out-of-scope VM refusal must name the owner-gated key-relay + stay fail-closed: {o:?}"
+        );
+    }
+
+    // ---- S1: the separate least-authority `__vm-relay` process boundary contract ----
+
+    #[test]
+    fn vm_relay_descriptor_round_trips_through_its_env_value() {
+        let d = VmRelayDescriptor {
+            label: "edge-parser".to_string(),
+            uds_path: PathBuf::from("/run/brvsk-3-4242.sock"),
+            guest_port: crate::privsep_vm::DEFAULT_GUEST_VSOCK_PORT,
+        };
+        let back = VmRelayDescriptor::from_env_value(&d.to_env_value())
+            .expect("the non-secret descriptor round-trips through its env value");
+        assert_eq!(d, back);
+    }
+
+    #[test]
+    fn plan_vm_relay_spec_is_secret_blind_and_wires_the_boundary() {
+        // A root environment mixing: a kept non-secret (PATH), a kept non-secret BOATRAMP_* overlay,
+        // a name-allowlisted-but-secret BOATRAMP_* (scrubbed by the secret screen), a config-DECLARED
+        // BYO credential var (scrubbed by the Finding-1 declared set even though `_URL` is no secret
+        // suffix), and a plain cloud credential (dropped by the allowlist). NONE of the three secrets
+        // may cross to the relay — it splices untrusted client bytes and must carry no credential.
+        let parent = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("BOATRAMP_LOG_FORMAT".to_string(), "json".to_string()),
+            ("BOATRAMP_SQL_TOKEN".to_string(), "live-token".to_string()),
+            (
+                "BOATRAMP_MAIN_DB_URL".to_string(),
+                "postgres://u:p@h/db".to_string(),
+            ),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "AKIA...".to_string()),
+        ];
+        let declared: BTreeSet<String> = ["BOATRAMP_MAIN_DB_URL".to_string()].into_iter().collect();
+        let descriptor = VmRelayDescriptor {
+            label: "edge".to_string(),
+            uds_path: PathBuf::from("/run/brvsk-3-7.sock"),
+            guest_port: 5201,
+        };
+
+        let spec = plan_vm_relay_spec("edge", &descriptor, 7, parent, &declared);
+
+        // argv mirrors `__instance`: the internal token + the label, nothing else.
+        assert_eq!(
+            spec.argv,
+            vec![VM_RELAY_SUBCOMMAND.to_string(), "edge".to_string()]
+        );
+        assert_eq!(spec.label, "edge");
+
+        // Secret-blind: NOT ONE of the three secret-bearing vars crossed to the relay.
+        assert!(
+            !spec.env.contains_key("BOATRAMP_SQL_TOKEN"),
+            "secret token scrubbed"
+        );
+        assert!(
+            !spec.env.contains_key("BOATRAMP_MAIN_DB_URL"),
+            "config-declared BYO credential scrubbed (Finding-1 parity)"
+        );
+        assert!(
+            !spec.env.contains_key("AWS_SECRET_ACCESS_KEY"),
+            "cloud credential never crosses"
+        );
+        // The kept non-secrets are present (the relay resolves the same non-secret config the root saw).
+        assert_eq!(spec.env.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(
+            spec.env.get("BOATRAMP_LOG_FORMAT").map(String::as_str),
+            Some("json")
+        );
+
+        // The non-secret descriptor rode PRIVSEP_VM_RELAY_ENV, intact.
+        let back = VmRelayDescriptor::from_env_value(
+            spec.env
+                .get(PRIVSEP_VM_RELAY_ENV)
+                .expect("the descriptor env var is set"),
+        )
+        .expect("the descriptor parses back");
+        assert_eq!(back, descriptor);
+
+        // The pre-bound public TCP listener rode the ONE fd-pass mechanism: links empty, listener=7.
+        let fds: PrivsepChildFds = serde_json::from_str(
+            spec.env
+                .get(PRIVSEP_FDS_ENV)
+                .expect("the fd map env var is set"),
+        )
+        .expect("the fd map parses back");
+        assert_eq!(fds.listener, Some(7));
+        assert!(
+            fds.links.is_empty(),
+            "the relay holds no feature-links — only the listener fd"
         );
     }
 
