@@ -2987,7 +2987,7 @@ Create the `*.deploy.<host>` record so by-id preview subdomains resolve to this 
 
 | Argument | Env | Default | Values | Description |
 | --- | --- | --- | --- | --- |
-| `--provider <PROVIDER>` | — | — | manual \| cloudflare \| route53 \| oci \| digitalocean \| hetzner \| ns1 \| dnsimple \| gcp-dns \| azure-dns \| akamai | DNS provider (`manual` prints the record to create by hand) |
+| `--provider <PROVIDER>` | — | — | manual \| cloudflare \| route53 \| oci \| digitalocean \| hetzner \| ns1 \| dnsimple \| gcp-dns \| azure-dns \| akamai \| gandi | DNS provider (`manual` prints the record to create by hand) |
 | `--host <HOST>` | — | — | — | The site host, e.g. `example.com` (the record is `*.deploy.<host>`) |
 | `--target <TARGET>` | — | — | — | Where the wildcard points: an IPv4/IPv6 address (→ A/AAAA) or another hostname (→ CNAME) |
 | `--ttl <TTL>` | — | `120` | — | Record TTL (seconds) |
@@ -3001,7 +3001,7 @@ Point a **verified** custom domain (apex or sub-domain) at this server by upsert
 | Argument | Env | Default | Values | Description |
 | --- | --- | --- | --- | --- |
 | `<HOST>` | — | — | — | The custom hostname, e.g. `www.example.com` or the apex `example.com` |
-| `--provider <PROVIDER>` | — | — | manual \| cloudflare \| route53 \| oci \| digitalocean \| hetzner \| ns1 \| dnsimple \| gcp-dns \| azure-dns \| akamai | DNS provider (`manual` prints the record to create by hand) |
+| `--provider <PROVIDER>` | — | — | manual \| cloudflare \| route53 \| oci \| digitalocean \| hetzner \| ns1 \| dnsimple \| gcp-dns \| azure-dns \| akamai \| gandi | DNS provider (`manual` prints the record to create by hand) |
 | `--target <TARGET>` | — | — | — | Where it points: an IPv4/IPv6 address (→ A/AAAA) or another hostname (→ CNAME; invalid at a true apex — use an address there) |
 | `--ttl <TTL>` | — | `300` | — | Record TTL (seconds) |
 | `--proxied` | — | — | — | Proxy the record through Cloudflare (orange-cloud: cache/WAF/edge TLS). Cloudflare-only; ignored by other providers, and forces automatic TTL |
@@ -3015,7 +3015,7 @@ Issue (or renew) the `*.deploy.<host>` wildcard certificate via ACME DNS-01, int
 
 | Argument | Env | Default | Values | Description |
 | --- | --- | --- | --- | --- |
-| `--provider <PROVIDER>` | — | — | manual \| cloudflare \| route53 \| oci \| digitalocean \| hetzner \| ns1 \| dnsimple \| gcp-dns \| azure-dns \| akamai | — |
+| `--provider <PROVIDER>` | — | — | manual \| cloudflare \| route53 \| oci \| digitalocean \| hetzner \| ns1 \| dnsimple \| gcp-dns \| azure-dns \| akamai \| gandi | — |
 | `--host <HOST>` | — | — | — | The site host; the cert covers `*.deploy.<host>` |
 | `--acme-directory <ACME_DIRECTORY>` | — | `https://acme-v02.api.letsencrypt.org/directory` | — | ACME directory URL (defaults to Let's Encrypt production) |
 | `--acme-contact <ACME_CONTACT>` | — | — | — | Contact email for the ACME account |
