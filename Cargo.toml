@@ -254,8 +254,6 @@ figment = { version = "0.10", default-features = false }
 # `boatramp-firecracker/build` feature.
 tar = "0.4"
 
-# TLS (compiled only with the `tls` feature).
-axum-server = { version = "0.8", features = ["tls-rustls"] }
 # The `axum` feature (which pulls axum-server) is deliberately omitted: ACME is
 # served through boatramp's own TLS accept loop off the state's cert resolver, not
 # rustls-acme's axum acceptor.
