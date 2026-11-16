@@ -95,17 +95,28 @@ pub enum ParseResult {
 /// - Every smuggling vector in `tests/smuggling.rs` returns `Reject` (fail closed).
 /// - Panic-free and desync-free on arbitrary bytes (`tests/fuzz_smoke.rs`).
 pub fn parse_request_head(buf: &[u8]) -> ParseResult {
-    match parse_head_inner(buf) {
+    parse_request_head_with(buf, MAX_HEAD)
+}
+
+/// Parse a request head like [`parse_request_head`], but with a caller-chosen maximum head
+/// size (request line + all headers, through the terminating CRLFCRLF) before a
+/// [`Reject::TooLarge`]. The serve loop threads its configured bound here; the bare
+/// [`parse_request_head`] uses the default [`MAX_HEAD`]. The byte-level framing contract is
+/// otherwise identical.
+pub fn parse_request_head_with(buf: &[u8], max_head: usize) -> ParseResult {
+    match parse_head_inner(buf, max_head) {
         Ok(Some((head, consumed))) => ParseResult::Complete { head, consumed },
         Ok(None) => ParseResult::Incomplete,
         Err(r) => ParseResult::Reject(r),
     }
 }
 
-/// The largest request head (request line + all headers, through the terminating
-/// CRLFCRLF) we will buffer before rejecting — a slowloris / oversized-header bound.
-/// Shared with the client codec's response-head parser ([`super::client`]).
-pub(super) const MAX_HEAD: usize = 64 * 1024;
+/// The default largest request head (request line + all headers, through the terminating
+/// CRLFCRLF) buffered before rejecting — a slowloris / oversized-header bound. The serve
+/// loop can override it per connection (see [`parse_request_head_with`] and
+/// `crate::h1::H1Config`); also shared with the client codec's response-head parser
+/// ([`super::client`]).
+pub const MAX_HEAD: usize = 64 * 1024;
 
 /// One CRLF-terminated line pulled from a buffer, or a signal to stop.
 pub(super) enum Line<'a> {
@@ -135,7 +146,7 @@ pub(super) fn next_line(buf: &[u8], pos: usize) -> Result<Line<'_>, Reject> {
     Ok(Line::Got(content, nl + 1))
 }
 
-fn parse_head_inner(buf: &[u8]) -> Result<Option<(RequestHead, usize)>, Reject> {
+fn parse_head_inner(buf: &[u8], max_head: usize) -> Result<Option<(RequestHead, usize)>, Reject> {
     // Tolerate at most one empty line before the request line (RFC 9112 §2.2).
     let mut pos = match next_line(buf, 0)? {
         Line::Got(&[], next) => next,
@@ -144,7 +155,7 @@ fn parse_head_inner(buf: &[u8]) -> Result<Option<(RequestHead, usize)>, Reject> 
 
     let (method, uri, version) = match next_line(buf, pos)? {
         Line::Incomplete => {
-            return if buf.len() > MAX_HEAD {
+            return if buf.len() > max_head {
                 Err(Reject::TooLarge)
             } else {
                 Ok(None)
@@ -165,12 +176,12 @@ fn parse_head_inner(buf: &[u8]) -> Result<Option<(RequestHead, usize)>, Reject> 
     let mut host_empty = false;
 
     loop {
-        if buf.len() > MAX_HEAD && pos >= MAX_HEAD {
+        if buf.len() > max_head && pos >= max_head {
             return Err(Reject::TooLarge);
         }
         match next_line(buf, pos)? {
             Line::Incomplete => {
-                return if buf.len() > MAX_HEAD {
+                return if buf.len() > max_head {
                     Err(Reject::TooLarge)
                 } else {
                     Ok(None)

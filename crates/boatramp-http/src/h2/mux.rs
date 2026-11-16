@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -32,14 +33,16 @@ use crate::h2::hpack::Hpack;
 use crate::h2::http::{self, Handler, Response};
 use crate::h2::settings::{self, Settings};
 use crate::h2::stream::StreamState;
+use crate::shutdown::GracefulShutdown;
 
 const OUR_MAX_FRAME_SIZE: u32 = settings::DEFAULT_MAX_FRAME_SIZE;
 /// Cap on a single emitted DATA frame (keeps batches bounded; well above the usual
 /// 16 KiB negotiated max-frame).
 const MAX_OUT_FRAME: usize = 128 * 1024;
-/// Bound on a single request's accumulated header block (HEADERS + CONTINUATION), to
-/// cap memory against a CONTINUATION flood (CVE-2024-27316).
-const MAX_HEADER_BLOCK: usize = 64 * 1024;
+/// Default bound on a single request's accumulated header block (HEADERS + CONTINUATION),
+/// to cap memory against a CONTINUATION flood (CVE-2024-27316). Overridable per connection
+/// via [`MuxConfig::max_header_block`].
+pub const MAX_HEADER_BLOCK: usize = 64 * 1024;
 /// Bound on CONTINUATION frames per header block, to cap CPU against a flood of
 /// *empty* CONTINUATION frames (which add no bytes but force frame parsing).
 const MAX_CONTINUATION_FRAMES: u32 = 64;
@@ -53,8 +56,9 @@ const RAPID_RESET_MIN: u64 = 100;
 /// memory and a further mitigation for stream-concurrency floods (CVE-2023-44487).
 /// 256 is well above any legitimate multiplexing need; the (limit + 1)th concurrent
 /// stream is refused with `RST_STREAM(REFUSED_STREAM)`, which a client may retry on a
-/// new connection. Matches the cap the previous hyper serving path advertised.
-const MAX_CONCURRENT_STREAMS: u32 = 256;
+/// new connection. Matches the cap the previous hyper serving path advertised. Overridable
+/// per connection via [`MuxConfig::max_concurrent_streams`].
+pub const MAX_CONCURRENT_STREAMS: u32 = 256;
 /// Soft target for one batched socket write: keep draining ready streams into the
 /// buffer until it reaches this, then write and start a fresh batch.
 const WRITE_BATCH_TARGET: usize = 64 * 1024;
@@ -87,7 +91,40 @@ fn env_kb(name: &str, default_kb: usize) -> usize {
 /// before giving up and letting the socket drop. Bounds a graceful close against a
 /// peer that never closes its side; a well-behaved peer closes as soon as it sees
 /// our GOAWAY/FIN, so this rarely elapses.
-const GRACEFUL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-connection tuning for the concurrent HTTP/2 mux driver. Every field defaults to the
+/// value the driver historically hardcoded, so [`MuxConfig::default`] reproduces the old
+/// behavior exactly and existing callers are unaffected; the unified dispatcher
+/// ([`crate::Config`]) threads its own values through here.
+#[derive(Clone, Copy, Debug)]
+pub struct MuxConfig {
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` advertised and enforced — the (limit + 1)th
+    /// concurrent stream is `RST_STREAM(REFUSED_STREAM)`'d (default
+    /// [`MAX_CONCURRENT_STREAMS`] = 256).
+    pub max_concurrent_streams: u32,
+    /// Cap on a single request's accumulated header block (HEADERS + CONTINUATION), a
+    /// CONTINUATION-flood guard (default [`MAX_HEADER_BLOCK`] = 64 KiB).
+    pub max_header_block: usize,
+    /// Optional idle timeout: when the connection has no open streams and no running
+    /// handlers, how long to wait for the next frame before a graceful `GOAWAY` + close.
+    /// `None` (default) waits indefinitely — the historical behavior.
+    pub idle_timeout: Option<Duration>,
+    /// Optional cap on a single request's buffered body; a body that exceeds it resets the
+    /// stream with `ENHANCE_YOUR_CALM`. `None` (default) is unbounded.
+    pub body_limit: Option<u64>,
+}
+
+impl Default for MuxConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: MAX_CONCURRENT_STREAMS,
+            max_header_block: MAX_HEADER_BLOCK,
+            idle_timeout: None,
+            body_limit: None,
+        }
+    }
+}
 
 /// A response frame a handler has produced, awaiting the writer + flow control.
 enum OutFrame {
@@ -151,6 +188,14 @@ struct Shared {
     /// Streams opened + streams reset by the peer, for Rapid Reset detection.
     opened: u64,
     resets: u64,
+    /// A graceful shutdown has been triggered: a `GOAWAY` was queued and new streams above
+    /// `goaway_last` are refused so in-flight work can drain.
+    shutting_down: bool,
+    /// The highest client stream id opened so far — the `GOAWAY` last-stream-id captured at
+    /// shutdown, so streams ≤ it still complete and streams above it are refused.
+    last_opened: u32,
+    /// Snapshot of `last_opened` taken when the graceful shutdown was triggered.
+    goaway_last: u32,
 }
 
 impl Shared {
@@ -170,8 +215,28 @@ impl Shared {
 
 type Conn = Arc<Mutex<Shared>>;
 
-/// Serve one HTTP/2 connection with the concurrent multiplexed driver.
+/// Serve one HTTP/2 connection with the concurrent multiplexed driver and default
+/// [`MuxConfig`] (no idle timeout, no body limit — the historical behavior).
 pub async fn serve_connection_mux<IO, H>(io: IO, handler: H) -> std::io::Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    H: Handler,
+{
+    serve_connection_mux_with(io, handler, MuxConfig::default(), None).await
+}
+
+/// Serve one HTTP/2 connection with explicit [`MuxConfig`] limits and an optional
+/// [`GracefulShutdown`] signal. When the signal is triggered, the driver emits a `GOAWAY`
+/// (last-stream-id = the highest stream it has accepted) and lets its in-flight handlers
+/// finish; streams opened after the `GOAWAY` are refused with `REFUSED_STREAM`. The
+/// connection then closes once the peer closes its side (the caller imposes any hard
+/// deadline by dropping this future — see [`GracefulShutdown`]).
+pub async fn serve_connection_mux_with<IO, H>(
+    io: IO,
+    handler: H,
+    config: MuxConfig,
+    shutdown: Option<GracefulShutdown>,
+) -> std::io::Result<()>
 where
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     H: Handler,
@@ -187,24 +252,64 @@ where
         reader_done: false,
         opened: 0,
         resets: 0,
+        shutting_down: false,
+        last_opened: 0,
+        goaway_last: 0,
     }));
     let notify = Arc::new(Notify::new());
     let handler = Arc::new(handler);
 
-    let reader = reader_loop(rd, shared.clone(), notify.clone(), handler);
+    let reader = reader_loop(rd, shared.clone(), notify.clone(), handler, config);
     let writer = writer_loop(wr, shared.clone(), notify.clone());
-    let (_r, w) = tokio::join!(reader, writer);
-    w
+
+    match shutdown {
+        // No graceful-shutdown handle: run the reader + writer exactly as before.
+        None => {
+            let (_r, w) = tokio::join!(reader, writer);
+            w
+        }
+        // A handle is present: race a watcher that, on trigger, queues the GOAWAY and marks
+        // the connection shutting-down. The watcher parks forever after acting, so the
+        // `select!` is resolved by the serve join (the connection draining), and the watcher
+        // is then dropped — no leaked task, and no graceful path when the handle never fires.
+        Some(sd) => {
+            let watch_shared = shared.clone();
+            let watch_notify = notify.clone();
+            let watcher = async move {
+                sd.watch().await;
+                let last = {
+                    let mut s = watch_shared.lock().unwrap();
+                    s.shutting_down = true;
+                    s.goaway_last = s.last_opened;
+                    s.last_opened
+                };
+                push_ctrl(&watch_shared, &watch_notify, |out| {
+                    out.extend_from_slice(&frame::goaway(last, ErrorCode::NoError, &[]));
+                });
+                std::future::pending::<()>().await;
+            };
+            let serve = async { tokio::join!(reader, writer).1 };
+            tokio::select! {
+                w = serve => w,
+                _ = watcher => unreachable!("watcher parks forever after queuing GOAWAY"),
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ reader ----
 
-async fn reader_loop<R, H>(mut rd: R, shared: Conn, notify: Arc<Notify>, handler: Arc<H>)
-where
+async fn reader_loop<R, H>(
+    mut rd: R,
+    shared: Conn,
+    notify: Arc<Notify>,
+    handler: Arc<H>,
+    config: MuxConfig,
+) where
     R: AsyncRead + Unpin,
     H: Handler,
 {
-    let _ = read_and_dispatch(&mut rd, &shared, &notify, &handler).await;
+    let _ = read_and_dispatch(&mut rd, &shared, &notify, &handler, config).await;
     {
         let mut s = shared.lock().unwrap();
         s.reader_done = true;
@@ -262,6 +367,56 @@ struct ReaderState {
     requests: HashMap<u32, http::Request>,
     bodies: HashMap<u32, Vec<u8>>,
     content_len: HashMap<u32, Option<u64>>,
+    /// The connection's configured limits, threaded through dispatch (header-block size,
+    /// concurrent-stream cap, request-body cap).
+    max_header_block: usize,
+    max_concurrent_streams: u32,
+    body_limit: Option<u64>,
+}
+
+/// Outcome of reading the next frame header (see [`next_frame_header`]).
+enum FrameRead {
+    /// A full frame header was read into the buffer.
+    Ok,
+    /// The peer closed or the read errored.
+    Closed,
+    /// The connection sat idle (no streams, no handlers) past the idle timeout.
+    Idle,
+}
+
+/// Read the next 9-byte frame header, bounding the wait by `idle_timeout` **only** while the
+/// connection is idle (no open streams and no running handlers — a keep-alive connection
+/// between requests). During active work the read is unbounded, so a long server-streamed
+/// response is never cut off; `None` leaves it unbounded always (the historical behavior).
+async fn next_frame_header<R>(
+    rd: &mut R,
+    shared: &Conn,
+    idle_timeout: Option<Duration>,
+    hdr: &mut [u8; frame::FRAME_HEADER_LEN],
+) -> FrameRead
+where
+    R: AsyncRead + Unpin,
+{
+    let idle_bound = match idle_timeout {
+        Some(t) => {
+            let s = shared.lock().unwrap();
+            (s.active_handlers == 0 && s.streams.is_empty()).then_some(t)
+        }
+        None => None,
+    };
+    match idle_bound {
+        // Not cancel-safe, but on a timeout we close the connection, so a partially-read
+        // header is discarded with it.
+        Some(t) => match tokio::time::timeout(t, rd.read_exact(&mut hdr[..])).await {
+            Ok(Ok(_)) => FrameRead::Ok,
+            Ok(Err(_)) => FrameRead::Closed,
+            Err(_) => FrameRead::Idle,
+        },
+        None => match rd.read_exact(&mut hdr[..]).await {
+            Ok(_) => FrameRead::Ok,
+            Err(_) => FrameRead::Closed,
+        },
+    }
 }
 
 async fn read_and_dispatch<R, H>(
@@ -269,6 +424,7 @@ async fn read_and_dispatch<R, H>(
     shared: &Conn,
     notify: &Arc<Notify>,
     handler: &Arc<H>,
+    config: MuxConfig,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -279,22 +435,37 @@ where
     if preface != CLIENT_PREFACE {
         return Ok(());
     }
-    // Our initial SETTINGS: advertise the concurrent-stream cap (§5.1.2); the rest
-    // stay at their spec defaults.
+    // Our initial SETTINGS: advertise the configured concurrent-stream cap (§5.1.2); the
+    // rest stay at their spec defaults.
     push_ctrl(shared, notify, |out| {
         let mut payload = Vec::with_capacity(6);
         payload.extend_from_slice(&0x3u16.to_be_bytes()); // SETTINGS_MAX_CONCURRENT_STREAMS
-        payload.extend_from_slice(&MAX_CONCURRENT_STREAMS.to_be_bytes());
+        payload.extend_from_slice(&config.max_concurrent_streams.to_be_bytes());
         frame::write_frame(out, FrameType::Settings, 0, 0, &payload);
     });
 
     let mut hpack = Hpack::new();
-    let mut rs = ReaderState::default();
+    let mut rs = ReaderState {
+        max_header_block: config.max_header_block,
+        max_concurrent_streams: config.max_concurrent_streams,
+        body_limit: config.body_limit,
+        ..ReaderState::default()
+    };
 
     loop {
         let mut hdr = [0u8; frame::FRAME_HEADER_LEN];
-        if rd.read_exact(&mut hdr).await.is_err() {
-            return Ok(()); // client closed
+        // Bound an idle keep-alive wait (no open streams, no running handlers) by the
+        // configured idle timeout, if any. During active work the read is never bounded, so
+        // a long-running streamed response is unaffected. `None` leaves the read unbounded —
+        // the historical behavior.
+        match next_frame_header(rd, shared, config.idle_timeout, &mut hdr).await {
+            FrameRead::Ok => {}
+            FrameRead::Closed => return Ok(()), // client closed
+            FrameRead::Idle => {
+                // Idle past the timeout: tell the peer with a GOAWAY and close cleanly.
+                goaway(shared, notify, rs.last_client_id, ErrorCode::NoError);
+                return Ok(());
+            }
         }
         let header = FrameHeader::parse(&hdr);
         if header.length > OUR_MAX_FRAME_SIZE {
@@ -509,6 +680,7 @@ where
                 }
                 if new_stream {
                     rs.last_client_id = sid;
+                    s.last_opened = sid;
                     s.opened += 1;
                     let iw = i64::from(s.peer.initial_window_size);
                     s.streams.insert(sid, MuxStream::new(iw));
@@ -519,7 +691,7 @@ where
             }
             rs.header_buf.clear();
             rs.continuation_count = 0;
-            if block.len() > MAX_HEADER_BLOCK {
+            if block.len() > rs.max_header_block {
                 return Err(H2Error::conn(ErrorCode::EnhanceYourCalm));
             }
             rs.header_buf.extend_from_slice(block);
@@ -539,7 +711,7 @@ where
             }
             rs.continuation_count += 1;
             if rs.continuation_count > MAX_CONTINUATION_FRAMES
-                || rs.header_buf.len() + payload.len() > MAX_HEADER_BLOCK
+                || rs.header_buf.len() + payload.len() > rs.max_header_block
             {
                 return Err(H2Error::conn(ErrorCode::EnhanceYourCalm));
             }
@@ -568,7 +740,16 @@ where
                 s.streams.get_mut(&sid).unwrap().state = next;
             }
             let data = frame::strip_padding(&payload, header.has_flag(flag::PADDED))?;
-            rs.bodies.entry(sid).or_default().extend_from_slice(data);
+            let body = rs.bodies.entry(sid).or_default();
+            body.extend_from_slice(data);
+            // Enforce the optional request-body cap: an over-limit body resets the stream
+            // (the connection survives). `None` is unbounded — the historical behavior.
+            if rs.body_limit.is_some_and(|lim| body.len() as u64 > lim) {
+                rs.bodies.remove(&sid);
+                rs.requests.remove(&sid);
+                rs.content_len.remove(&sid);
+                return Err(H2Error::stream(sid, ErrorCode::EnhanceYourCalm));
+            }
             let n = payload.len() as u32;
             if n > 0 {
                 push_ctrl(shared, notify, |out| {
@@ -635,14 +816,29 @@ where
     // map stays small and this stays O(1) under the lock. Only when the map exceeds
     // the cap do we pay the active-only count (open/half-closed; closed & reset don't
     // count, per §5.1.2, and may linger until reaped).
+    // After a graceful shutdown, refuse a brand-new stream opened past the GOAWAY's
+    // last-stream-id (§6.8) so the drain can finish; streams ≤ that id (accepted before the
+    // GOAWAY) still complete. The header block was decoded above, keeping the shared HPACK
+    // context consistent.
+    let refuse_shutdown = {
+        let s = shared.lock().unwrap();
+        s.shutting_down && sid > s.goaway_last
+    };
+    if refuse_shutdown {
+        rs.content_len.remove(&sid);
+        rs.bodies.remove(&sid);
+        reset_local(shared, notify, sid, ErrorCode::RefusedStream);
+        return Ok(());
+    }
+    let max_concurrent = rs.max_concurrent_streams as usize;
     let over_cap = {
         let s = shared.lock().unwrap();
-        s.streams.len() > MAX_CONCURRENT_STREAMS as usize
+        s.streams.len() > max_concurrent
             && s.streams
                 .values()
                 .filter(|st| st.state != StreamState::Closed && !st.reset)
                 .count()
-                > MAX_CONCURRENT_STREAMS as usize
+                > max_concurrent
     };
     if over_cap {
         rs.content_len.remove(&sid);

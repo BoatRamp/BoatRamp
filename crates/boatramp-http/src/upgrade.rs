@@ -137,3 +137,160 @@ pub fn on_upgrade<B>(req: &mut http::Request<B>) -> Option<OnUpgrade> {
         .and_then(|p| p.0.lock().unwrap().take())
         .map(OnUpgrade)
 }
+
+/// The WebSocket GUID appended to the client key before hashing (RFC 6455 §1.3).
+const WS_MAGIC_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// Compute the `Sec-WebSocket-Accept` response-header value for a client's
+/// `Sec-WebSocket-Key` during a WebSocket opening handshake (RFC 6455 §4.2.2 step 5.4):
+/// `base64(SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`.
+///
+/// `key` is the trimmed value of the request's `Sec-WebSocket-Key` header (its syntactic
+/// validity is the handler's concern — this only derives the accept token). A handler that
+/// returns a `101` for a WebSocket upgrade sets this on the response so the client can
+/// confirm the handshake instead of hand-rolling the SHA-1 + base64 itself.
+///
+/// ```
+/// // The canonical example from RFC 6455 §1.3.
+/// let accept = boatramp_http::upgrade::sec_websocket_accept("dGhlIHNhbXBsZSBub25jZQ==");
+/// assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+/// ```
+pub fn sec_websocket_accept(key: &str) -> String {
+    let mut input = key.as_bytes().to_vec();
+    input.extend_from_slice(WS_MAGIC_GUID);
+    base64_encode(&sha1(&input))
+}
+
+/// SHA-1 (FIPS 180-4) of `data`. First-party so this crate stays dependency-free (it
+/// hand-rolls HPACK's Huffman table for the same reason); the WS handshake hashes ~60
+/// bytes once, so performance is immaterial.
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [
+        0x6745_2301,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
+
+    // Pad: append 0x80, then zeros, then the 64-bit big-endian bit length, to a multiple
+    // of 64 bytes.
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in block.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
+            };
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = tmp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Standard base64 (RFC 4648) with `+/` and `=` padding — the alphabet
+/// `Sec-WebSocket-Accept` requires.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha1_known_vectors() {
+        // FIPS 180-4 / RFC 3174 sample vectors.
+        assert_eq!(
+            sha1(b"abc"),
+            [
+                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
+                0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
+            ]
+        );
+        assert_eq!(
+            sha1(b""),
+            [
+                0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60,
+                0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09,
+            ]
+        );
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn sec_websocket_accept_rfc6455_example() {
+        // RFC 6455 §1.3: key "dGhlIHNhbXBsZSBub25jZQ==" → "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".
+        assert_eq!(
+            sec_websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+}

@@ -18,15 +18,33 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use std::time::Duration;
 
 use crate::Handler;
+use crate::shutdown::GracefulShutdown;
 
-/// Serving timeouts (a slowloris defense at each blocking phase). Defaults suit a
-/// public listener; an operator can tune them per deployment.
+/// Serving limits (slowloris defenses + resource caps). Every field defaults to the value
+/// the codecs historically hardcoded, so `Config::default()` is byte-for-byte the old
+/// behavior; an operator can tune them per deployment. Purely additive — existing callers
+/// that construct it via [`Default`] are unaffected.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// How long to wait for enough opening bytes to classify a connection (h2 vs h1).
     pub sniff_timeout: Duration,
     /// How long the h1 loop waits on a stalled request head/body before dropping.
     pub read_timeout: Duration,
+    /// Largest h1 request head (request line + headers) buffered before a `400` (default
+    /// [`crate::h1::MAX_HEAD`] = 64 KiB).
+    pub h1_max_head: usize,
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` the h2 mux advertises + enforces (default 256).
+    pub h2_max_concurrent_streams: u32,
+    /// Cap on an h2 request's accumulated header block (HEADERS + CONTINUATION), a
+    /// CONTINUATION-flood guard (default [`crate::h2::MAX_HEADER_BLOCK`] = 64 KiB).
+    pub h2_max_header_block: usize,
+    /// Optional h2 idle timeout: how long an idle keep-alive connection (no open streams,
+    /// no running handlers) waits for the next frame before a graceful `GOAWAY` + close.
+    /// `None` (default) waits indefinitely — the historical behavior.
+    pub h2_idle_timeout: Option<Duration>,
+    /// Optional cap on a single request's body, applied to both codecs. `None` (default)
+    /// is unbounded — the historical behavior.
+    pub request_body_limit: Option<u64>,
 }
 
 impl Default for Config {
@@ -34,6 +52,33 @@ impl Default for Config {
         Self {
             sniff_timeout: Duration::from_secs(10),
             read_timeout: crate::h1::DEFAULT_READ_TIMEOUT,
+            h1_max_head: crate::h1::MAX_HEAD,
+            h2_max_concurrent_streams: crate::h2::MAX_CONCURRENT_STREAMS,
+            h2_max_header_block: crate::h2::MAX_HEADER_BLOCK,
+            h2_idle_timeout: None,
+            request_body_limit: None,
+        }
+    }
+}
+
+impl Config {
+    /// The h2 mux driver's config derived from these limits.
+    fn mux_config(&self) -> crate::h2::MuxConfig {
+        crate::h2::MuxConfig {
+            max_concurrent_streams: self.h2_max_concurrent_streams,
+            max_header_block: self.h2_max_header_block,
+            idle_timeout: self.h2_idle_timeout,
+            body_limit: self.request_body_limit,
+        }
+    }
+
+    /// The h1 serve loop's config derived from these limits, carrying `shutdown`.
+    fn h1_config(&self, shutdown: Option<GracefulShutdown>) -> crate::h1::H1Config {
+        crate::h1::H1Config {
+            read_timeout: self.read_timeout,
+            max_head: self.h1_max_head,
+            body_limit: self.request_body_limit,
+            shutdown,
         }
     }
 }
@@ -58,9 +103,35 @@ where
     let (prefix, io, is_h2) = classify(io, config.sniff_timeout).await?;
     let rewound = Rewind::new(prefix, io);
     if is_h2 {
-        crate::h2::serve_connection_mux(rewound, handler).await
+        crate::h2::serve_connection_mux_with(rewound, handler, config.mux_config(), None).await
     } else {
-        crate::h1::serve_connection_with(rewound, handler, config.read_timeout).await
+        crate::h1::serve_connection_with_config(rewound, handler, config.h1_config(None)).await
+    }
+}
+
+/// Serve one accepted connection like [`serve_connection_with`], but watching a
+/// [`GracefulShutdown`] signal the caller can trigger to drain the connection: the h2 side
+/// then emits a `GOAWAY` and lets its in-flight requests finish, and the h1 side closes
+/// after the request it is currently serving. See [`GracefulShutdown`] for the draining
+/// model (and how a caller imposes a hard deadline).
+pub async fn serve_connection_graceful<IO, H>(
+    io: IO,
+    handler: H,
+    config: Config,
+    shutdown: GracefulShutdown,
+) -> std::io::Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    H: Handler,
+{
+    let (prefix, io, is_h2) = classify(io, config.sniff_timeout).await?;
+    let rewound = Rewind::new(prefix, io);
+    if is_h2 {
+        crate::h2::serve_connection_mux_with(rewound, handler, config.mux_config(), Some(shutdown))
+            .await
+    } else {
+        crate::h1::serve_connection_with_config(rewound, handler, config.h1_config(Some(shutdown)))
+            .await
     }
 }
 

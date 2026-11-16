@@ -8,18 +8,24 @@
 //!   the `tests/` harness).
 //! - [`h2`] — the concurrent multiplexed HTTP/2 driver (formerly the `boatramp-h2`
 //!   crate, folded in — Stage 1 of `DESIGN-serving.md`).
-//! - `serve` — the unified accept-loop dispatcher (TLS ALPN / plaintext h2c-preface
+//! - [`serve`] — the unified accept-loop dispatcher (TLS ALPN / plaintext h2c-preface
 //!   sniff → h1 vs h2), replacing the `boatramp-server` mux-serve bridge + `splice.rs`
-//!   (Stage 3, not yet built).
+//!   (Stage 3 of `DESIGN-serving.md`, built: [`serve_connection`] /
+//!   [`serve_connection_with`] classify an accepted connection and drive it through the
+//!   right codec).
 //!
 //! The shared serving types ([`Body`], [`Handler`], [`Request`], [`Response`]) are
 //! re-exported at the crate root — the surface both codecs produce/consume and the
-//! serve dispatcher will hand to a `tower::Service` (the axum Router).
+//! serve dispatcher hands to a `tower::Service` (the axum Router).
 
 pub mod h1;
 pub mod h2;
 pub mod serve;
-pub use serve::{Config, serve_connection, serve_connection_with};
+pub use serve::{Config, serve_connection, serve_connection_graceful, serve_connection_with};
+
+// The caller-held graceful-shutdown signal shared by the h1 + h2 serve loops.
+mod shutdown;
+pub use shutdown::GracefulShutdown;
 
 // The shared serving abstraction (`Request`/`Response`/`Body`/`Handler`) — homed at the
 // crate root, the surface both codecs produce/consume.
@@ -29,7 +35,7 @@ pub use serving::{Body, BodyChunk, BodyError, Handler, ReqBody, Request, Respons
 // HTTP/1.1 connection upgrade (WebSocket + generic `Connection: upgrade`) — replaces
 // `hyper::upgrade` so the serving path owns upgrades.
 pub mod upgrade;
-pub use upgrade::{OnUpgrade, Upgraded, is_upgrade_request, on_upgrade};
+pub use upgrade::{OnUpgrade, Upgraded, is_upgrade_request, on_upgrade, sec_websocket_accept};
 
 // The verification kit (corpus + normalized-verdict model + combinatorial generators)
 // shared by the h1 gate, the differential-vs-hyper driver, and the fuzz targets — one

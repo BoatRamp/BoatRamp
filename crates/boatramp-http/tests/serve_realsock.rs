@@ -145,6 +145,7 @@ async fn slowloris_head_is_dropped_by_the_read_timeout() {
     let cfg = Config {
         sniff_timeout: Duration::from_millis(300),
         read_timeout: Duration::from_millis(300),
+        ..Config::default()
     };
     let addr = spawn_server(cfg).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
