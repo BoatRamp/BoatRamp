@@ -24,6 +24,17 @@
 //! The verifier's whole decision is "is this exact public key trusted" — never a
 //! name or chain check, so there is no `notBefore`/`notAfter` clock hazard in the
 //! auth path by construction.
+//!
+//! **TLS 1.3 session resumption is disabled on every config in this crate.** A
+//! resumed TLS 1.3 handshake re-establishes a session from a prior ticket *without*
+//! re-running the certificate verifier — so a peer whose key was revoked from the
+//! [`TrustSet`] after a session was established could reconnect via resumption and
+//! skip the live re-check, defeating the "pinning follows rotation/revocation"
+//! invariant. To keep that invariant exact, the server configs issue **no** TLS 1.3
+//! tickets (`send_tls13_tickets = 0`) and the client configs disable resumption
+//! entirely ([`rustls::client::Resumption::disabled`]), so the trust-set verifier
+//! runs on **every** handshake. This is hard-off, not a knob: there is no safe
+//! setting at which a resumed handshake may skip the live trust check.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -508,10 +519,15 @@ pub fn server_config(presented: &PresentedKey, trust: TrustSet) -> Result<Server
     let provider = rpk_provider();
     let algs = provider.signature_verification_algorithms;
     let verifier = Arc::new(RpkClientVerifier { trust, algs });
-    Ok(ServerConfig::builder_with_provider(provider)
+    let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(verifier)
-        .with_cert_resolver(Arc::new(RpkServerKeyResolver(presented.clone()))))
+        .with_cert_resolver(Arc::new(RpkServerKeyResolver(presented.clone())));
+    // Issue no TLS 1.3 session tickets: a resumed handshake skips the client-cert
+    // verifier, so a ticket would let a peer revoked from the trust set reconnect
+    // without the live re-check. Default is 2; 0 means never resumable. (crate docs)
+    config.send_tls13_tickets = 0;
+    Ok(config)
 }
 
 /// The rustls **client** config for dialing `peer`: presents `presented`'s live
@@ -526,11 +542,16 @@ pub fn client_config(
     let provider = rpk_provider();
     let algs = provider.signature_verification_algorithms;
     let verifier = Arc::new(RpkServerVerifier { trust, peer, algs });
-    Ok(ClientConfig::builder_with_provider(provider)
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_client_cert_resolver(Arc::new(RpkClientKeyResolver(presented.clone()))))
+        .with_client_cert_resolver(Arc::new(RpkClientKeyResolver(presented.clone())));
+    // Disable resumption so `verify_server_cert` runs on every handshake: a resumed
+    // TLS 1.3 session skips the verifier, which would bypass the live trust-set
+    // re-check this config's pinning relies on (crate docs).
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
 }
 
 /// A **server-authenticated** server config: presents `presented`'s raw public
@@ -539,10 +560,14 @@ pub fn client_config(
 /// control-plane bootstrap TLS listener. TLS 1.3 + PQ-hybrid only.
 pub fn server_config_server_auth(presented: &PresentedKey) -> Result<ServerConfig, RpkError> {
     let provider = rpk_provider();
-    Ok(ServerConfig::builder_with_provider(provider)
+    let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(RpkServerKeyResolver(presented.clone()))))
+        .with_cert_resolver(Arc::new(RpkServerKeyResolver(presented.clone())));
+    // No TLS 1.3 tickets — a resumed handshake must never skip the dialer's live
+    // trust-set re-check of this server's key (crate docs).
+    config.send_tls13_tickets = 0;
+    Ok(config)
 }
 
 /// A **server-authenticated** client config for dialing `peer`: pins the server
@@ -553,11 +578,15 @@ pub fn client_config_server_auth(trust: TrustSet, peer: PeerId) -> Result<Client
     let provider = rpk_provider();
     let algs = provider.signature_verification_algorithms;
     let verifier = Arc::new(RpkServerVerifier { trust, peer, algs });
-    Ok(ClientConfig::builder_with_provider(provider)
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth())
+        .with_no_client_auth();
+    // Disable resumption so the server's key is re-pinned against the live trust set
+    // on every handshake, never skipped by a resumed session (crate docs).
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
 }
 
 /// A dialer verifier that **accepts any** presented raw public key and records
@@ -630,11 +659,15 @@ pub fn client_config_capturing(
     let provider = rpk_provider();
     let algs = provider.signature_verification_algorithms;
     let verifier = Arc::new(CapturingServerVerifier { captured, algs });
-    Ok(ClientConfig::builder_with_provider(provider)
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth())
+        .with_no_client_auth();
+    // Disable resumption so the capturing verifier records the server's key on every
+    // handshake rather than silently resuming a prior session (crate docs).
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
 }
 
 /// A node's RPK TLS context: its own identity (swappable on rotation), the live
@@ -1099,6 +1132,150 @@ mod tests {
         assert!(
             handshake(&new, &client, server_trust, client_trust, 1).await,
             "the new key remains trusted after rotation completes"
+        );
+    }
+
+    /// Run ONE real localhost connection using the given **shared** configs and
+    /// return whether the *client* completed the handshake + a `ping`/`pong`
+    /// round-trip. Reusing the same `Arc<ClientConfig>`/`Arc<ServerConfig>` across
+    /// two calls shares the client's resumption store and the server's session
+    /// storage — so a second call *would* resume the first's session if resumption
+    /// were enabled. The client reads `pong` (which trails any `NewSessionTicket`
+    /// the server emits), so by the time this returns the ticket, if any, has been
+    /// processed by the client's store.
+    async fn connect_once(server_cfg: Arc<ServerConfig>, client_cfg: Arc<ClientConfig>) -> bool {
+        let acceptor = TlsAcceptor::from(server_cfg);
+        let connector = TlsConnector::from(client_cfg);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await
+                && let Ok(mut tls) = acceptor.accept(tcp).await
+            {
+                let mut buf = [0u8; 4];
+                let _ = tls.read_exact(&mut buf).await;
+                let _ = tls.write_all(b"pong").await;
+                let _ = tls.flush().await;
+                // Keep the connection open until the client drains the ticket + pong
+                // and closes, so nothing is lost to a premature drop.
+                let _ = tls.read(&mut buf).await;
+            }
+        });
+        let name = ServerName::try_from("rpk").unwrap();
+        let client_ok = async {
+            let tcp = TcpStream::connect(addr).await.map_err(|_| ())?;
+            let mut tls = connector.connect(name, tcp).await.map_err(|_| ())?;
+            tls.write_all(b"ping").await.map_err(|_| ())?;
+            tls.flush().await.map_err(|_| ())?;
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).await.map_err(|_| ())?;
+            Ok::<_, ()>(&buf == b"pong")
+        }
+        .await
+        .unwrap_or(false);
+        let _ = server_task.await;
+        client_ok
+    }
+
+    /// The core invariant: a dialer that established a session with a peer must NOT
+    /// silently resume it after that peer's key is revoked from the live trust set —
+    /// the revocation has to be re-checked on the reconnect. A resumed TLS 1.3
+    /// handshake skips `verify_server_cert`, so if resumption were enabled the second
+    /// connection would reuse the first session's ticket and accept the now-revoked
+    /// key without ever consulting the trust set. This genuinely exercises the
+    /// resumption path: the shared `Arc` configs carry the client store + server
+    /// session storage across both connections, so re-enabling resumption (reverting
+    /// BOTH `send_tls13_tickets = 0` and `Resumption::disabled()`) makes the final
+    /// assertion FAIL (the reconnect would be silently resumed and accepted).
+    #[tokio::test]
+    async fn revoked_server_key_is_not_silently_resumed() {
+        let server = RpkIdentity::generate().unwrap();
+        let client = RpkIdentity::generate().unwrap();
+        let server_pk = PresentedKey::from_identity(&server).unwrap();
+        let client_pk = PresentedKey::from_identity(&client).unwrap();
+
+        // Server trusts the dialer (peer 2); the dialer trusts the server (peer 1).
+        let server_trust = TrustSet::from_map(BTreeMap::from([(2, client.public_key().to_vec())]));
+        let client_trust = TrustSet::from_map(BTreeMap::from([(1, server.public_key().to_vec())]));
+
+        // Build the configs ONCE and reuse them, so the resumption store / session
+        // storage persist across the two connections (the thing that makes a resumed
+        // handshake possible in the first place).
+        let server_cfg = Arc::new(server_config(&server_pk, server_trust).unwrap());
+        let client_cfg = Arc::new(client_config(&client_pk, client_trust.clone(), 1).unwrap());
+
+        // Conn #1: the server's key is trusted → a full handshake succeeds and (were
+        // tickets enabled) the client would cache a resumption ticket here.
+        assert!(
+            connect_once(server_cfg.clone(), client_cfg.clone()).await,
+            "the first handshake to a trusted peer must succeed"
+        );
+
+        // Revoke the server's key from the dialer's LIVE trust set.
+        client_trust.remove(1);
+
+        // Conn #2 reuses the same client config. With resumption hard-off this is a
+        // full handshake, `verify_server_cert` runs, and the revoked key is rejected.
+        // If resumption were enabled, conn #2 would resume conn #1's session and skip
+        // the verifier — silently accepting the revoked peer (this assertion RED).
+        assert!(
+            !connect_once(server_cfg.clone(), client_cfg.clone()).await,
+            "a reconnect after revocation must be rejected, never silently resumed"
+        );
+    }
+
+    /// Isolates the **client-side** guard: even against a server that *does* issue
+    /// TLS 1.3 tickets (we force `send_tls13_tickets` back on for this test only),
+    /// our client config must refuse to resume, so a revoked server key is still
+    /// re-checked on reconnect. Reverting the client's `Resumption::disabled()`
+    /// alone makes the final assertion FAIL — the client would cache the forced
+    /// ticket and resume past the revocation.
+    #[tokio::test]
+    async fn client_refuses_resumption_against_a_ticket_issuing_server() {
+        let server = RpkIdentity::generate().unwrap();
+        let server_pk = PresentedKey::from_identity(&server).unwrap();
+        let trust = TrustSet::from_map(BTreeMap::from([(1, server.public_key().to_vec())]));
+
+        // A server that offers resumption tickets (overriding this crate's hard-off),
+        // to prove the CLIENT alone blocks resumption. Shared Arc → its stateful
+        // session storage persists across both connections.
+        let mut server_cfg = server_config_server_auth(&server_pk).unwrap();
+        server_cfg.send_tls13_tickets = 2;
+        let server_cfg = Arc::new(server_cfg);
+        let client_cfg = Arc::new(client_config_server_auth(trust.clone(), 1).unwrap());
+
+        assert!(
+            connect_once(server_cfg.clone(), client_cfg.clone()).await,
+            "the first handshake to the trusted server must succeed"
+        );
+
+        trust.remove(1);
+
+        assert!(
+            !connect_once(server_cfg.clone(), client_cfg.clone()).await,
+            "the dialer must re-check the revoked server key, not resume the session"
+        );
+    }
+
+    /// Isolates the **server-side** guard as a config-value invariant: every server
+    /// config this crate builds must emit zero TLS 1.3 session tickets, so a peer can
+    /// never obtain a ticket to resume with. Reverting `send_tls13_tickets = 0` on
+    /// either builder makes this assertion FAIL.
+    #[test]
+    fn server_configs_issue_no_tls13_tickets() {
+        let id = RpkIdentity::generate().unwrap();
+        let pk = PresentedKey::from_identity(&id).unwrap();
+        assert_eq!(
+            server_config(&pk, TrustSet::default())
+                .unwrap()
+                .send_tls13_tickets,
+            0,
+            "mutual server config must issue no TLS 1.3 tickets"
+        );
+        assert_eq!(
+            server_config_server_auth(&pk).unwrap().send_tls13_tickets,
+            0,
+            "server-auth config must issue no TLS 1.3 tickets"
         );
     }
 }
