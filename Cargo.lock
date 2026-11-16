@@ -2091,7 +2091,6 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-lc-rs",
- "aws-sdk-kms",
  "aws-sdk-s3",
  "aws-sdk-sts",
  "axum",
@@ -2108,11 +2107,11 @@ dependencies = [
  "boatramp-handlers",
  "boatramp-http",
  "boatramp-mcp",
+ "boatramp-signer",
  "boatramp-storage",
  "bytes",
  "chrono",
  "connect-clients",
- "cryptoki",
  "ed25519-dalek",
  "futures",
  "getrandom 0.2.17",
@@ -2131,7 +2130,6 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "lru 0.18.5",
- "p256",
  "proptest",
  "quinn",
  "rcgen 0.13.2",
@@ -2156,6 +2154,25 @@ dependencies = [
  "tracing",
  "wasmparser 0.252.0",
  "webpki-roots 1.0.10",
+]
+
+[[package]]
+name = "boatramp-signer"
+version = "0.61.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-lc-rs",
+ "aws-sdk-kms",
+ "base64 0.22.1",
+ "boatramp-core",
+ "cryptoki",
+ "hex",
+ "p256",
+ "reqwest 0.12.28",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

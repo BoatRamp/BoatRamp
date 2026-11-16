@@ -19,7 +19,7 @@ use super::SignerError;
 const BACKEND: &str = "aws-kms";
 
 /// An AWS KMS asymmetric (P-256) signing key.
-pub(crate) struct AwsKmsSigner {
+pub struct AwsKmsSigner {
     client: aws_sdk_kms::Client,
     key_id: String,
     public: TokenPublicKey,

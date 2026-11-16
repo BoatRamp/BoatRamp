@@ -17,7 +17,7 @@ const BACKEND: &str = "azure-kv";
 const API_VERSION: &str = "7.4";
 
 /// An Azure Key Vault EC (P-256) signing key.
-pub(crate) struct AzureKvSigner {
+pub struct AzureKvSigner {
     http: reqwest::Client,
     sign_url: String,
     access_token_env: String,

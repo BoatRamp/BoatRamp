@@ -40,6 +40,23 @@ mod rest;
 #[cfg(feature = "signer-vault")]
 mod vault;
 
+// The backend types, re-exported so they are nameable at the crate root — and,
+// through `boatramp-server`'s `pub use boatramp_signer::*`, at
+// `boatramp_server::signer::*` exactly as before the extraction. Each re-export is
+// gated on the same `signer-*` feature that compiles its module; their only
+// constructor (`connect`) stays crate-internal, so the sole public way to build one
+// remains [`build_signer`].
+#[cfg(feature = "signer-aws")]
+pub use aws_kms::AwsKmsSigner;
+#[cfg(feature = "signer-azure")]
+pub use azure::AzureKvSigner;
+#[cfg(feature = "signer-gcp")]
+pub use gcp::GcpKmsSigner;
+#[cfg(feature = "signer-pkcs11")]
+pub use pkcs11::Pkcs11Signer;
+#[cfg(feature = "signer-vault")]
+pub use vault::VaultSigner;
+
 /// A failure constructing or driving an external signer.
 #[derive(Debug, thiserror::Error)]
 pub enum SignerError {
@@ -233,7 +250,7 @@ pub(crate) fn sha256(data: &[u8]) -> Vec<u8> {
 /// public key the signer resolved at connect — the full end-to-end round-trip
 /// that proves an external backend actually signs valid boatramp tokens. Shared by
 /// the `#[ignore]` live tests (each constructs its backend from env, then calls
-/// this). Run e.g. `cargo test -p boatramp-server --features signer-vault -- --ignored`.
+/// this). Run e.g. `cargo test -p boatramp-signer --features signer-vault -- --ignored`.
 #[cfg(all(
     test,
     any(

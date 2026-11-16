@@ -11,6 +11,9 @@ members = [
   # a std plaintext transport + the generic unary / server-stream call primitives.
   "crates/boatramp-connect-client",
   "crates/boatramp-core",
+  # External KMS/HSM/Vault token-signer backends, extracted from `boatramp-server`
+  # (v0.62.0); the server re-exports it at `boatramp_server::signer::*` unchanged.
+  "crates/boatramp-signer",
   "crates/boatramp-storage",
   "crates/boatramp-server",
   "crates/boatramp-handlers",
@@ -126,6 +129,9 @@ double_must_use = "allow"
 [workspace.dependencies]
 boatramp-types = { path = "crates/boatramp-types", version = "0.61.0" }
 boatramp-core = { path = "crates/boatramp-core", version = "0.61.0" }
+# External KMS/HSM/Vault token-signer backends, extracted from `boatramp-server`
+# (v0.62.0). Depends only on `boatramp-core`; the server re-exports it unchanged.
+boatramp-signer = { path = "crates/boatramp-signer", version = "0.61.0" }
 boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.61.0" }
 boatramp-overlay-proto = { path = "crates/boatramp-overlay-proto", version = "0.61.0" }
 boatramp-overlay = { path = "crates/boatramp-overlay", version = "0.61.0" }

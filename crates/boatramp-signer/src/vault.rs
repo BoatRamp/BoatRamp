@@ -15,7 +15,7 @@ use super::{SignerError, rest};
 const BACKEND: &str = "vault";
 
 /// A Vault Transit signing key.
-pub(crate) struct VaultSigner {
+pub struct VaultSigner {
     http: reqwest::Client,
     /// `POST` target for signing, `.../v1/transit/sign/<key>`.
     sign_url: String,

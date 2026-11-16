@@ -757,7 +757,7 @@ jobs:
           BOATRAMP_TEST_PKCS11_KEY: boatramp-signing-key
         run: |
           set -o pipefail
-          cargo test -p boatramp-server --features signer-pkcs11 pkcs11_live \
+          cargo test -p boatramp-signer --features signer-pkcs11 pkcs11_live \
             -- --ignored --nocapture 2>&1 | tee softhsm.log
           grep -qE 'test result: ok' softhsm.log \
             || { echo "::error::PKCS#11 signer round-trip failed" >&2; exit 1; }
