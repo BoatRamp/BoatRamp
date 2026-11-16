@@ -3634,6 +3634,9 @@ pub async fn serve_with(
         deploy: deploy.clone(),
         posture: options.posture,
         daemon: options.daemon_runtime.clone(),
+        // Bound the fast-path's own keep-alive client/upstream reads like the normal
+        // `boatramp_http::serve_connection` path it bypasses (slow-loris / stalled-peer DoS).
+        read_timeout: boatramp_http::h1::DEFAULT_READ_TIMEOUT,
     };
     // Background scheduler: drives consumers/crons for active deployments
     // (no-op without the handlers feature/runtime). Aborted after the drain.

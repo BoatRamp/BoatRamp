@@ -66,6 +66,13 @@ pub struct SpliceCtx {
     pub deploy: DeployStore,
     pub posture: SecurityPosture,
     pub daemon: Option<Arc<crate::DaemonRuntime>>,
+    /// Idle read timeout for the splice fast-path's own socket reads once a connection is
+    /// served: the per-request client head read on a kept-alive connection (N-1) and every
+    /// upstream read (N-5). Set to [`boatramp_http::h1::DEFAULT_READ_TIMEOUT`] so a
+    /// slow-loris / stalled peer on the fast-path is bounded exactly like the normal
+    /// [`boatramp_http::serve_connection`] path the fast-path bypasses. (Request #1's
+    /// non-consuming peek is separately bounded by [`PEEK_TIMEOUT`].)
+    pub read_timeout: std::time::Duration,
 }
 
 /// A resolved plan to splice one connection's requests: the pinned upstream and
@@ -515,13 +522,16 @@ async fn splice_conn(
     ctx: SpliceCtx,
     serve: crate::ServeInput,
 ) -> io::Result<()> {
-    let mut upstream = UpstreamConn::connect(plan.resolved.addr).await?;
+    let mut upstream = UpstreamConn::connect(plan.resolved.addr, ctx.read_timeout).await?;
     let client_ip: IpAddr = peer.ip();
     loop {
-        // Read (consuming) the client request head.
-        let (head, leftover) = match read_head(&mut client).await? {
+        // Read (consuming) the client request head, bounded by the idle read timeout so a
+        // slow-loris that dribbles request #2 (or stalls between keep-alive requests) is
+        // dropped rather than pinning the client socket + the pinned upstream + this task
+        // indefinitely (N-1) — the same bound the normal server applies to its head read.
+        let (head, leftover) = match read_head(&mut client, ctx.read_timeout).await? {
             Some(v) => v,
-            None => return Ok(()), // client closed between keep-alive requests
+            None => return Ok(()), // client closed / idled out between keep-alive requests
         };
         // Re-check eligibility per request with the **hardened** parser (a keep-alive
         // client could change path/method, or smuggle a framing header on request #2).
@@ -889,12 +899,35 @@ fn trim_ows_bytes(mut v: &[u8]) -> &[u8] {
 // ---- low-level IO helpers --------------------------------------------------
 
 /// Read until CRLFCRLF from `s`; returns `(head_incl_terminator, bytes_read_past_head)`.
-async fn read_head(s: &mut TcpStream) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+///
+/// `read_timeout` is a per-read **idle** timeout — reset on every successful read, exactly
+/// like `boatramp_http`'s own [`serve_connection`](boatramp_http::serve_connection) head
+/// read — so a legitimately slow-but-progressing client is treated the same as it would be
+/// on the normal server path, while a stalled one is bounded. On expiry with no bytes
+/// buffered the connection is idle between keep-alive requests → a clean `None` (drop, like
+/// the normal server). On expiry mid-head (a partial head then silence — slow-loris) it is a
+/// `TimedOut` error so the caller closes the connection (N-1).
+async fn read_head(
+    s: &mut TcpStream,
+    read_timeout: std::time::Duration,
+) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
     use tokio::io::AsyncReadExt;
     let mut acc: Vec<u8> = Vec::with_capacity(1024);
     let mut tmp = [0u8; 8192];
     loop {
-        let n = s.read(&mut tmp).await?;
+        let n = match tokio::time::timeout(read_timeout, s.read(&mut tmp)).await {
+            Ok(r) => r?,
+            Err(_elapsed) => {
+                return if acc.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "client head read timed out",
+                    ))
+                };
+            }
+        };
         if n == 0 {
             return if acc.is_empty() {
                 Ok(None)
@@ -941,15 +974,21 @@ struct FinalResp {
 struct UpstreamConn {
     sock: TcpStream,
     buf: Vec<u8>,
+    /// Idle read timeout applied to every upstream read (via [`UpstreamConn::fill`]): a
+    /// non-conformant (trusted) upstream that stalls — a dripped response head, an endless
+    /// close-delimited body, a stalled chunk — fails closed instead of pinning the task
+    /// forever (N-5). Mirrors the client-side `read_head` bound (same value).
+    read_timeout: std::time::Duration,
 }
 
 impl UpstreamConn {
-    async fn connect(addr: SocketAddr) -> io::Result<Self> {
+    async fn connect(addr: SocketAddr, read_timeout: std::time::Duration) -> io::Result<Self> {
         let sock = TcpStream::connect(addr).await?;
         sock.set_nodelay(true).ok();
         Ok(Self {
             sock,
             buf: Vec::with_capacity(16 * 1024),
+            read_timeout,
         })
     }
 
@@ -958,10 +997,22 @@ impl UpstreamConn {
     }
 
     /// Read one more chunk of bytes from the socket into `buf`; returns the count (0 = the
-    /// upstream closed its side).
+    /// upstream closed its side). Bounded by a per-read idle timeout (reset each call) so a
+    /// stalled upstream — holding the connection open without delivering the rest of a
+    /// response — fails closed rather than hanging the forwarder task (N-5). Every upstream
+    /// read in the forwarder (`read_response_head`, the chunked fill loop, `forward_to_close`)
+    /// routes through here, so one bound covers them all.
     async fn fill(&mut self) -> io::Result<usize> {
         let mut tmp = [0u8; 16 * 1024];
-        let n = self.sock.read(&mut tmp).await?;
+        let n = match tokio::time::timeout(self.read_timeout, self.sock.read(&mut tmp)).await {
+            Ok(r) => r?,
+            Err(_elapsed) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "upstream read timed out",
+                ));
+            }
+        };
         self.buf.extend_from_slice(&tmp[..n]);
         Ok(n)
     }
@@ -1211,13 +1262,20 @@ impl UpstreamConn {
 
     /// Forward a close-delimited body: the buffered prefix, then everything until the
     /// upstream closes its side (the close *is* the frame, so this terminates and the
-    /// connection is spent).
+    /// connection is spent). Each read goes through [`UpstreamConn::fill`], so it inherits
+    /// the idle read timeout — a non-conformant upstream that holds a no-Content-Length
+    /// connection open without ever closing fails closed instead of pinning this task
+    /// forever (N-5), rather than the previous unbounded `tokio::io::copy`.
     async fn forward_to_close(&mut self, client: &mut TcpStream) -> io::Result<()> {
-        if !self.buf.is_empty() {
-            client.write_all(&self.buf).await?;
-            self.buf.clear();
+        loop {
+            if !self.buf.is_empty() {
+                client.write_all(&self.buf).await?;
+                self.buf.clear();
+            }
+            if self.fill().await? == 0 {
+                return Ok(()); // upstream closed → the close delimits the body
+            }
         }
-        tokio::io::copy(&mut self.sock, client).await.map(|_| ())
     }
 
     /// Whether the upstream has bytes ready to read **right now** — between responses, before
@@ -1854,6 +1912,7 @@ mod tests {
             deploy,
             posture,
             daemon: None,
+            read_timeout: boatramp_http::h1::DEFAULT_READ_TIMEOUT,
         };
 
         // A client <-> `splice_conn` socket pair over loopback.
@@ -1975,6 +2034,7 @@ mod tests {
             deploy,
             posture,
             daemon: None,
+            read_timeout: boatramp_http::h1::DEFAULT_READ_TIMEOUT,
         };
         (plan, ctx)
     }
@@ -2470,6 +2530,7 @@ mod tests {
             deploy,
             posture,
             daemon: None,
+            read_timeout: boatramp_http::h1::DEFAULT_READ_TIMEOUT,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2634,6 +2695,149 @@ mod tests {
         assert!(
             text.starts_with("HTTP/1.1 "),
             "POST after a spliced GET got no HTTP response: {text}"
+        );
+    }
+
+    /// Reproduce-first (N-1, slow-loris keep-alive DoS): once a connection is served, the
+    /// per-request client head read on keep-alive request #2+ must be bounded by the read
+    /// timeout. A client that completes one valid eligible GET then dribbles request #2 (a
+    /// partial head, then silence) must be CLOSED after ~the timeout — not left pinning the
+    /// client socket, the pinned upstream connection, and this task indefinitely. Pre-fix
+    /// `read_head(&mut client)` awaited with no timeout (only request #1's non-consuming peek
+    /// was bounded, by `PEEK_TIMEOUT`), so request #2's read hung forever.
+    ///
+    /// Drives `splice_conn` directly (the client head read is userspace on every target, not
+    /// only where kernel `splice()` engages), with a short injected `read_timeout` so the
+    /// assertion is a tight wall-clock bound: pre-fix the read never returns and the outer
+    /// timeout fires; post-fix the connection closes ~`read_timeout` after the stall.
+    #[tokio::test]
+    async fn slowloris_keepalive_request_two_is_closed_by_the_read_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        // A keep-alive upstream: head+body in one write (no kernel splice needed → the
+        // forwarder runs on every target) and holds the connection open between requests.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => {}
+                        }
+                        if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (plan, mut ctx) = direct_plan_ctx(up_addr).await;
+        // A short idle read timeout so the test is a tight wall-clock bound (production uses
+        // DEFAULT_READ_TIMEOUT; the value is just threaded through).
+        ctx.read_timeout = Duration::from_millis(500);
+        let mut client = spawn_splice_conn(plan, ctx).await;
+
+        // Request 1: a clean keep-alive GET (no `Connection: close`) — served, loop returns
+        // to the (now-bounded) client head read for request #2.
+        client
+            .write_all(b"GET /a HTTP/1.1\r\nHost: test.local\r\n\r\n")
+            .await
+            .unwrap();
+        let r1 = read_one_response(&mut client).await;
+        assert!(r1.contains("ok"), "request 1 was not served: {r1}");
+
+        // Request 2: dribble a PARTIAL head (no terminating CRLFCRLF), then stall forever.
+        client
+            .write_all(b"GET /b HTTP/1.1\r\nHost: test.local\r\n")
+            .await
+            .unwrap();
+        // The property under test: the connection is closed by the read timeout (read_to_end
+        // completes) rather than hanging. Pre-fix this read_to_end never returns → the outer
+        // timeout fires → `read.is_err()` → the assert fails (the reproduce-first witness).
+        let mut rest = Vec::new();
+        let read = timeout(Duration::from_secs(5), client.read_to_end(&mut rest)).await;
+        assert!(
+            read.is_ok(),
+            "a slow-loris keep-alive request #2 was NOT closed by the read timeout — the \
+             client/upstream/task are pinned indefinitely (N-1)"
+        );
+    }
+
+    /// Reproduce-first (N-5, stalled-upstream hang, same class): a non-conformant (trusted)
+    /// upstream that sends a no-Content-Length (close-delimited) response head + a partial
+    /// body then holds the connection open forever — never sending EOF — must be bounded by
+    /// the idle read timeout, failing closed (closing the client) rather than pinning the
+    /// forwarder task. Pre-fix `forward_to_close` used an unbounded `tokio::io::copy` that
+    /// waits for an upstream EOF that never comes.
+    ///
+    /// Drives `splice_conn` directly (the close-delimited relay is userspace on every target).
+    #[tokio::test]
+    async fn stalled_close_delimited_upstream_is_closed_by_the_read_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        // Upstream: a close-delimited response (no CL, no TE, no `Connection: close`) with a
+        // partial body, then HOLD the connection open forever (never close, never send more).
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => break,
+                        }
+                    }
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npartial-body",
+                        )
+                        .await;
+                    // Never close, never send the rest — a stalled close-delimited origin.
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let (plan, mut ctx) = direct_plan_ctx(up_addr).await;
+        ctx.read_timeout = Duration::from_millis(500);
+        let mut client = spawn_splice_conn(plan, ctx).await;
+        client
+            .write_all(b"GET /p HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        // Pre-fix `forward_to_close` waits for an upstream EOF that never arrives → the client
+        // read_to_end hangs → the outer timeout fires. Post-fix the idle read timeout closes
+        // the connection ~`read_timeout` after the stall.
+        let read = timeout(Duration::from_secs(5), client.read_to_end(&mut out)).await;
+        assert!(
+            read.is_ok(),
+            "a stalled close-delimited upstream left the forwarder (and the client) hanging — \
+             no idle read timeout on the upstream leg (N-5)"
+        );
+        // The partial body it DID send is forwarded before the fail-closed close.
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("partial-body"),
+            "the partial close-delimited body was not forwarded before closing: {text}"
         );
     }
 
