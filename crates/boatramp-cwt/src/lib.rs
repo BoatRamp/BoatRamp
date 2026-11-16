@@ -502,9 +502,15 @@ fn split_tagged(spec: &str) -> Result<(TokenAlg, Vec<u8>), TokenError> {
 /// block's caveat into a running accumulator with [`meet`](Self::meet) and
 /// **verifying every step only narrows** with
 /// [`is_narrower_or_equal`](Self::is_narrower_or_equal). The engine owns the walk
-/// and the monotonicity check, so the *narrowing* guarantee does not depend on the
-/// consumer impl being correct: a `meet` that widens is caught and the credential
-/// rejected (fail-closed). What the consumer owns is the *meaning* of its caveats
+/// and the monotonicity check. Two guarantees hold **independently of the consumer
+/// impl**: authority is read only from the verified root block (a delegation block
+/// can never *add* a right), and the credential's expiry is the engine's min-fold
+/// over every block's expiry (a block can never *extend* lifetime past the root).
+/// The caveat-monotonicity check additionally relies on the consumer's
+/// [`is_narrower_or_equal`](Self::is_narrower_or_equal) being honest; but even a
+/// dishonest [`meet`](Self::meet) or ordering can at worst *deny* or *wrongly
+/// scope* within its own caveat vocabulary — it can never add authority or extend
+/// lifetime past the root. What the consumer owns is the *meaning* of its caveats
 /// (their wire form and, outside this engine, their `allows` semantics).
 ///
 /// The narrowing lattice is a *meet-semilattice*: [`default`](Default::default) is
