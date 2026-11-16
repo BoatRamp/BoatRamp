@@ -91,6 +91,12 @@ pub mod session;
 /// identity / liveness roster (UX-C1) a multi-writer backend uses for N stateless nodes without Raft.
 pub mod shared_mode;
 pub mod sql;
+/// TEST-SUPPORT (never shipped): the shared [`Storage`] conformance suite, so every blob backend's
+/// test runs the IDENTICAL assertions — the object-storage analogue of [`kv::conformance`]. Compiled
+/// only for this crate's tests or behind the `storage-conformance` feature a downstream test build enables.
+#[cfg(any(test, feature = "storage-conformance"))]
+#[doc(hidden)]
+pub mod storage_conformance;
 /// Host-side parse-and-rewrite confinement of a guest's **raw-SQL target read** (R4/D8): the
 /// AST-level analog of the `orm` path's `PerTableTarget` per-table confinement, injecting
 /// `tenant = B AND <public subset>` onto EVERY table reference so a target read of another tenant

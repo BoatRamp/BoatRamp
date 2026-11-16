@@ -229,7 +229,13 @@ memmap2 = { version = "0.9", optional = true }
 # for the test build only (the storage crate itself needs no COSE).
 # `kv-conformance` exposes `boatramp_core::kv::conformance` so the `SqlKv` test suite runs the
 # IDENTICAL shared `KvStore` conformance assertions (test build only; never shipped).
-boatramp-core = { workspace = true, features = ["authz", "kv-conformance"] }
+# `storage-conformance` likewise exposes `boatramp_core::storage_conformance` so the `FsStorage`
+# suite runs the shared `Storage` conformance assertions (test build only; never shipped).
+boatramp-core = { workspace = true, features = [
+  "authz",
+  "kv-conformance",
+  "storage-conformance",
+] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 # The claim-transform gate builds `serde_json::Value` claims for `derive_tenant` (serde_json is only
 # an OPTIONAL dep of the crate itself; the tests always need it).

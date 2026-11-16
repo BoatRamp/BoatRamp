@@ -45,6 +45,9 @@ pub mod ns1;
 #[cfg(feature = "dnsimple")]
 pub mod dnsimple;
 
+#[cfg(feature = "gandi")]
+pub mod gandi;
+
 #[cfg(feature = "gcp-dns")]
 pub mod gcp_dns;
 

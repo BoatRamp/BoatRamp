@@ -51,6 +51,11 @@ overlay-policy = ["dep:cedar-policy"]
 # crate's TEST build can run the IDENTICAL suite against its own backend (e.g. `boatramp-storage`'s
 # `SqlKv`). Off in every normal/shipped build; a downstream crate enables it only in `dev-dependencies`.
 kv-conformance = []
+# TEST-SUPPORT, NEVER SHIPPED: expose `storage_conformance` (the shared `Storage` conformance suite)
+# as a `#[doc(hidden)] pub` module so another crate's TEST build can run the IDENTICAL suite against
+# its own blob backend (e.g. `boatramp-storage`'s `FsStorage`). The object-storage analogue of
+# `kv-conformance`. Off in every normal/shipped build; a downstream crate enables it in `dev-dependencies`.
+storage-conformance = []
 # TEST-ONLY, NEVER SHIPPED: pass-through of the D4 authz mutation seam to `boatramp-types` for the
 # `BLOB DRAIN DAEMON-MEDIATED OK` gate (v0.6.3). `boatramp-server`'s `blob-drain-gate-mutation`
 # enables this, which enables `boatramp-types/blob-drain-gate-mutation` — where the `Right::required`

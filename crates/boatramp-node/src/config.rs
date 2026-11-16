@@ -3359,6 +3359,8 @@ pub enum DnsProviderKind {
     AzureDns,
     /// Akamai Edge DNS.
     Akamai,
+    /// Gandi LiveDNS.
+    Gandi,
 }
 
 impl DnsProviderKind {
@@ -3376,6 +3378,7 @@ impl DnsProviderKind {
             Self::GcpDns => "gcp-dns",
             Self::AzureDns => "azure-dns",
             Self::Akamai => "akamai",
+            Self::Gandi => "gandi",
         }
     }
 
@@ -3394,6 +3397,7 @@ impl DnsProviderKind {
             "gcp-dns" | "gcp" | "gcpdns" => Some(Self::GcpDns),
             "azure-dns" | "azure" | "azuredns" => Some(Self::AzureDns),
             "akamai" => Some(Self::Akamai),
+            "gandi" => Some(Self::Gandi),
             _ => None,
         }
     }
@@ -3411,7 +3415,7 @@ impl<'de> Deserialize<'de> for DnsProviderKind {
         Self::from_token(&s).ok_or_else(|| {
             serde::de::Error::custom(format!(
                 "unknown DNS provider kind {s:?} (expected manual | cloudflare | route53 | oci | \
-                 digitalocean | hetzner | ns1 | dnsimple | gcp-dns | azure-dns | akamai)"
+                 digitalocean | hetzner | ns1 | dnsimple | gcp-dns | azure-dns | akamai | gandi)"
             ))
         })
     }
