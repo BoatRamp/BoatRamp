@@ -387,6 +387,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `FsStorage` satisfies the shared `Storage` conformance suite (the object-storage analogue of
+    /// `SqlKv`'s `kv_conformance` run) — streaming round-trips, ranged reads, `NotFound`, idempotent
+    /// delete, prefix listing, and resumable `list_page` pagination, all identical to every other
+    /// backend's expected contract. Runs in a pid-unique temp root, cleaned up after.
+    #[tokio::test]
+    async fn fs_storage_satisfies_the_conformance_suite() {
+        let root = std::env::temp_dir().join(format!("boatramp-fsconf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = FsStorage::new(&root);
+        boatramp_core::storage_conformance::storage_conformance(&store).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn watch_reports_a_write_under_the_prefix() {
         // A pid-unique temp root so parallel tests don't collide.
