@@ -285,16 +285,16 @@ compression = ["dep:async-compression"]
 http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:tower"]
 
 # External token signer backends: the control-plane root key
-# lives outside the process (KMS/HSM/Vault). The REST backends (Vault/GCP/Azure)
-# reuse the in-tree `reqwest`; AWS pulls the KMS SDK; PKCS#11 pulls `cryptoki`.
-# All off by default (the `local` in-process signer needs no feature). The
-# request/response + signature-format logic is unit-tested; the live round-trip
-# is exercised only in integration testing.
-signer-vault = []
-signer-gcp = []
-signer-azure = []
-signer-aws = ["dep:aws-config", "dep:aws-sdk-kms"]
-signer-pkcs11 = ["dep:cryptoki"]
+# lives outside the process (KMS/HSM/Vault). The backends themselves live in the
+# standalone `boatramp-signer` crate (extracted v0.62.0); these features forward
+# one-to-one to it, so a caller's `--features signer-<x>` set is unchanged and the
+# `boatramp_server::signer::*` re-export carries the same types. All off by default
+# (the `local` in-process signer needs no feature).
+signer-vault = ["boatramp-signer/signer-vault"]
+signer-gcp = ["boatramp-signer/signer-gcp"]
+signer-azure = ["boatramp-signer/signer-azure"]
+signer-aws = ["boatramp-signer/signer-aws"]
+signer-pkcs11 = ["boatramp-signer/signer-pkcs11"]
 
 # The embedded web management console: bake the `boatramp-console` Wasm SPA
 # (its built `dist/`) into the binary via `include_dir` and serve it, when the
@@ -322,6 +322,11 @@ rmcp = { version = "1.2", features = [
 # for the server (it is the native binary's auth; `boatramp-core` keeps it opt-in
 # for library/wasm cleanliness).
 boatramp-core = { workspace = true, features = ["authz"] }
+# External KMS/HSM/Vault token-signer backends (extracted v0.62.0). Non-optional: the
+# server always re-exports `SignerConfig`/`build_signer`/`SignerError` at
+# `boatramp_server::signer::*`; the per-backend `signer-*` features forward into it, so a
+# lean build pulls only the crate's `boatramp-core` + `thiserror`, no heavy SDK.
+boatramp-signer = { workspace = true }
 # The hand-rolled HTTP serving stack (h1 loop + h2 mux driver + connection upgrade):
 # *the* serving path, replacing hyper/axum_server. Non-optional. A first-party,
 # published workspace member (its HPACK codec is our own — no external HPACK crate).
@@ -443,14 +448,10 @@ thiserror.workspace = true
 async-graphql-parser = { version = "7", optional = true }
 async-graphql-value = { version = "7", optional = true }
 
-# External signer backends (optional). AWS KMS reuses the workspace `aws-config`
-# (already in the tree for s3) + the KMS SDK; PKCS#11 uses `cryptoki` (a thin,
-# audited binding). Vault/GCP/Azure are REST over the in-tree `reqwest`.
+# External signer backends live in the `boatramp-signer` crate; the heavy KMS/HSM
+# SDKs (`aws-sdk-kms`, `cryptoki`) moved there with them. `aws-config` stays here —
+# it is shared with the M4 AWS blob-upload minter below (enabled by `blob-upload-aws`).
 aws-config = { workspace = true, optional = true }
-aws-sdk-kms = { version = "1", features = [
-  "behavior-version-latest",
-], optional = true }
-cryptoki = { version = "0.12", optional = true }
 
 # The M4 cloud blob-upload minters (feature-gated). AWS reuses the workspace aws-config +
 # the STS SDK for session-policy brokering + aws-sdk-s3 for the presigned-PUT shape. GCS uses
@@ -539,12 +540,6 @@ proptest = "1"
 # Emits federation SDL exactly as a live subgraph's `_service { sdl }` does, so the
 # composer is tested against real federation-v2 SDL — not only synthetic fixtures.
 async-graphql = { version = "7" }
-# P-256 for the signer backends' unit tests (building SPKI/DER fixtures). Already
-# in the tree via `boatramp-core[authz]`; exposing it directly is cheap. The
-# `getrandom` feature enables the `Generate` trait's `SigningKey::generate()`, used
-# for the fixture keys (the RustCrypto-0.14 replacement for `random(&mut OsRng)`), so
-# no direct rand_core dep is needed.
-p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem", "getrandom"] }
 # Ed25519 for signing a test app-token the GraphQL data connector verifies via a JWKS
 # (already in the tree via `boatramp-core[authz]`). Deterministic key, no keygen rng.
 ed25519-dalek = { version = "2" }

@@ -1,0 +1,86 @@
+[package]
+name = "boatramp-signer"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "External KMS/HSM/Vault signer backends for the boatramp control-plane token issuer"
+
+[features]
+# External token signer backends: the control-plane root key lives outside the
+# process (KMS/HSM/Vault). The REST backends (Vault/GCP/Azure) reuse the in-tree
+# `reqwest`; AWS pulls the KMS SDK; PKCS#11 pulls `cryptoki`. All off by default
+# (the `local` in-process signer — resolved by the caller — needs no feature). The
+# request/response + signature-format logic is unit-tested; the live round-trip is
+# exercised only in integration testing (`#[ignore]`).
+#
+# These are the SAME `signer-*` names `boatramp-server` exposes; the server's
+# features forward one-to-one to these so a caller's `--features signer-<x>` set is
+# unchanged.
+signer-vault = [
+  "dep:reqwest",
+  "dep:serde_json",
+  "dep:base64",
+  "dep:hex",
+  "dep:async-trait",
+]
+signer-gcp = [
+  "dep:reqwest",
+  "dep:serde_json",
+  "dep:base64",
+  "dep:async-trait",
+  "dep:aws-lc-rs",
+]
+signer-azure = [
+  "dep:reqwest",
+  "dep:serde_json",
+  "dep:base64",
+  "dep:hex",
+  "dep:async-trait",
+  "dep:aws-lc-rs",
+]
+signer-aws = ["dep:aws-config", "dep:aws-sdk-kms", "dep:async-trait"]
+signer-pkcs11 = ["dep:cryptoki", "dep:hex", "dep:async-trait", "dep:aws-lc-rs"]
+
+[dependencies]
+# The token format (`cose`) + the `Signer` trait the backends implement, and the
+# `GrantedRole`/`Claims` vocabulary the live-round-trip helper mints over.
+boatramp-core = { workspace = true, features = ["authz"] }
+thiserror.workspace = true
+
+# Backend plumbing — all optional, pulled only by the feature that needs them so a
+# no-feature build stays lean (just `boatramp-core` + `thiserror`).
+async-trait = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+# Vault/GCP/Azure REST (rustls, bounded timeout).
+reqwest = { workspace = true, optional = true }
+# SHA-256 digest for the GCP/Azure/PKCS#11 backends (the aws-lc-rs provider already
+# in the tree for rustls + the mesh).
+aws-lc-rs = { version = "1.17", optional = true }
+# AWS KMS asymmetric signing.
+aws-config = { workspace = true, optional = true }
+aws-sdk-kms = { version = "1", features = [
+  "behavior-version-latest",
+], optional = true }
+# PKCS#11 HSM (a thin, audited binding).
+cryptoki = { version = "0.12", optional = true }
+
+[dev-dependencies]
+# The `#[tokio::test]` live round-trips (`#[ignore]`) and the deterministic unit
+# tests.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+# P-256 for the backends' unit tests (building SPKI/DER/JWK fixtures). The
+# `getrandom` feature enables `SigningKey::generate()` for the fixture keys.
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem", "getrandom"] }
+
+[lints]
+workspace = true

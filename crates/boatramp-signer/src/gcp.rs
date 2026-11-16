@@ -18,7 +18,7 @@ const BACKEND: &str = "gcp-kms";
 const API: &str = "https://cloudkms.googleapis.com/v1";
 
 /// A GCP Cloud KMS asymmetric signing key version.
-pub(crate) struct GcpKmsSigner {
+pub struct GcpKmsSigner {
     http: reqwest::Client,
     key_version: String,
     access_token_env: String,

@@ -27,7 +27,7 @@ use super::{SignerError, sha256};
 const BACKEND: &str = "pkcs11";
 
 /// A PKCS#11 HSM signing key.
-pub(crate) struct Pkcs11Signer {
+pub struct Pkcs11Signer {
     ctx: Pkcs11,
     slot: Slot,
     key_label: Vec<u8>,
