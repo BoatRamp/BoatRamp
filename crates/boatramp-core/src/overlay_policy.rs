@@ -57,7 +57,7 @@
 //! complex temporal logic are rejected at store time ([`screen_temporal`]): the gate has no
 //! scheduler, and such a rule could not be enforced on a cap already minted inside its window.
 
-#![cfg(feature = "authz")]
+#![cfg(feature = "overlay-policy")]
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;

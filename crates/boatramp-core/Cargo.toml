@@ -21,14 +21,31 @@ description = "Core domain types, streaming storage trait, pluggable KV, and con
 # default so the lean build and the wasm32 edge target stay free of it. The decision
 # logic is unit-tested (incl. a Cedar-vs-oracle differential gate); the live
 # multi-node revocation round-trip is exercised against a running cluster.
-authz = [
+# `authz` is the UNION of the four finer authz sub-features below — kept so every
+# existing consumer (`features = ["authz"]`) and the batteries-included build are
+# byte-for-byte unaffected by the split.
+authz = ["cose", "cedar", "kernel-trust", "overlay-policy"]
+# COSE/CWT control-plane tokens (`cose` module): mint / verify / attenuable
+# capability credentials over the `boatramp_types::authz` vocabulary. The generic
+# COSE_Sign1/CWT engine (Signer + chain-walk) lives in `boatramp-cwt`; this module
+# is the thin boatramp-specific layer over it. Pulls the token-format + signing
+# crates (`coset`/`ciborium`, `p256`/`ed25519-dalek` for ES256 default + Ed25519).
+cose = [
+  "dep:boatramp-cwt",
   "dep:coset",
   "dep:ciborium",
   "dep:p256",
   "dep:ed25519-dalek",
   "dep:rand_core",
-  "dep:cedar-policy",
 ]
+# Cedar RBAC authorization decision (`cedar` module).
+cedar = ["dep:cedar-policy"]
+# Posture-scaled kernel-trust verification (`kernel_trust` module). Needs the
+# `cose` signing primitives (`TokenPublicKey`), so it enables `cose`.
+kernel-trust = ["cose"]
+# Overlay enroll/dial Cedar policy point (`overlay_policy` module). Uses the Cedar
+# engine crate directly (its own policy/entity vocabulary).
+overlay-policy = ["dep:cedar-policy"]
 # TEST-SUPPORT, NEVER SHIPPED: expose `kv::conformance` (the shared `KvStore` conformance suite +
 # the `cas_race_has_exactly_one_winner` property) as a `#[doc(hidden)] pub` module so another
 # crate's TEST build can run the IDENTICAL suite against its own backend (e.g. `boatramp-storage`'s
@@ -127,7 +144,11 @@ tracing.workspace = true
 # `boatramp.*` / `@boatramp_*` write past a naive string filter.
 sqlparser.workspace = true
 
-# COSE/CWT tokens + Cedar authorization (`authz` feature). Optional, native only.
+# COSE/CWT tokens + Cedar authorization (`cose`/`cedar` features). Optional, native only.
+# The generic attenuable COSE_Sign1/CWT engine (Signer + chain-walk with
+# engine-enforced monotonic narrowing); `cose` re-exports its primitives and layers
+# boatramp's claim/caveat vocabulary on top.
+boatramp-cwt = { workspace = true, optional = true }
 coset = { version = "0.3", optional = true }
 ciborium = { version = "0.2", optional = true }
 # ES256 (P-256). The `getrandom` feature enables the `Generate` trait's getrandom-backed

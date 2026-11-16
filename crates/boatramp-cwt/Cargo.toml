@@ -1,0 +1,44 @@
+[package]
+name = "boatramp-cwt"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Generic attenuable COSE_Sign1/CWT capability-credential engine (RFC 8392/9052/8747): pluggable Signer (ES256 default + Ed25519), offline chain-walk verification, and engine-enforced monotonic narrowing over a caveat lattice"
+
+[dependencies]
+# COSE_Sign1 (RFC 9052) + CWT (RFC 8392) envelope + claim-set building.
+coset = "0.3"
+# CBOR value model for the private-use claims (roles/caveats/holder key).
+ciborium = "0.2"
+# ES256 (P-256). `getrandom` enables the `Generate` trait's getrandom-backed
+# `SigningKey::generate()` (RustCrypto 0.14), matching the host crate's fail-stop
+# key generation; `pkcs8`/`pem` parse the SPKI forms cloud KMS returns.
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem", "getrandom"] }
+# Ed25519 (local/Vault/AWS) sign + verify_strict.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# `rand_core 0.6` — `OsRng` for Ed25519 key generation only (dalek 2 is pinned to
+# the 0.6 trait family). The P-256 path generates via p256 0.14's getrandom path.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Random `cti`/`jti` revocation + single-use ids.
+getrandom = { workspace = true }
+# base64url token/credential encoding.
+base64 = { workspace = true }
+# `"<alg>:<hex>"` key encodings + `cti` hex.
+hex = { workspace = true }
+# Async `Signer` (so a remote KMS round-trip fits the same seam as a local key).
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
