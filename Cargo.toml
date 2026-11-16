@@ -10,6 +10,11 @@ members = [
   # the `boatramp-connect` serving shim. Built on the shared frame crate; a thin transport trait +
   # a std plaintext transport + the generic unary / server-stream call primitives.
   "crates/boatramp-connect-client",
+  # Generic attenuable COSE_Sign1/CWT capability-credential engine (ES256/Ed25519
+  # Signer + offline chain-walk with engine-enforced monotonic narrowing). The
+  # vocabulary-free core under boatramp-core's `cose` module. Publishes BEFORE
+  # boatramp-core (see the justfile `crate_order`).
+  "crates/boatramp-cwt",
   "crates/boatramp-core",
   "crates/boatramp-storage",
   "crates/boatramp-server",
@@ -125,6 +130,7 @@ double_must_use = "allow"
 
 [workspace.dependencies]
 boatramp-types = { path = "crates/boatramp-types", version = "0.61.0" }
+boatramp-cwt = { path = "crates/boatramp-cwt", version = "0.61.0" }
 boatramp-core = { path = "crates/boatramp-core", version = "0.61.0" }
 boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.61.0" }
 boatramp-overlay-proto = { path = "crates/boatramp-overlay-proto", version = "0.61.0" }

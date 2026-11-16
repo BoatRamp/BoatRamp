@@ -17,11 +17,11 @@ pub mod blob_backends;
 pub mod blob_class;
 pub mod blob_provision;
 pub mod cache_coherence;
-#[cfg(feature = "authz")]
+#[cfg(feature = "cedar")]
 pub mod cedar;
 pub mod cert;
 pub mod compat;
-#[cfg(feature = "authz")]
+#[cfg(feature = "cose")]
 pub mod cose;
 /// Crown-jewel CAS conversion (MF-1): the test-only mutation seam + mutation-verified gate helpers.
 pub mod crownjewel;
@@ -30,7 +30,7 @@ pub mod crownjewel;
 /// never require mutating the global process environment.
 pub mod env;
 pub mod envelope;
-#[cfg(feature = "authz")]
+#[cfg(feature = "overlay-policy")]
 pub mod overlay_policy;
 // `compute` extends the wasm-clean `boatramp_types::compute` (re-exported within)
 // with the native control-plane layer: the `ComputeBackend` trait, the scheduler,
@@ -48,8 +48,8 @@ pub mod error;
 pub mod health_alert;
 /// Per-node guest-IP pool shared by the VMM (tap) + container (veth) backends.
 pub mod ipam;
-/// Posture-scaled kernel-trust verification (needs the `authz` signing primitives).
-#[cfg(feature = "authz")]
+/// Posture-scaled kernel-trust verification (needs the `cose` signing primitives).
+#[cfg(feature = "kernel-trust")]
 pub mod kernel_trust;
 pub mod kv;
 /// Portable, versioned, backend-agnostic KV dump format + a generic `KvStore`↔`KvStore` copier

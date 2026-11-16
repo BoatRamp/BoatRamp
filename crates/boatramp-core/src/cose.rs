@@ -15,16 +15,22 @@
 //! possession), caveats intersected, `not_after` folded into the effective `exp`,
 //! and roles taken from the **root only** (the anti-escalation invariant).
 
-use async_trait::async_trait;
-use base64::Engine as _;
 use ciborium::value::Value as CborValue;
 use coset::cwt::{ClaimsSet, ClaimsSetBuilder, Timestamp};
-use coset::{
-    Algorithm as CoseAlg, CborSerializable, CoseSign1, CoseSign1Builder, HeaderBuilder,
-    TaggedCborSerializable, iana,
-};
 
 use boatramp_types::authz::GrantedRole;
+
+// The generic COSE_Sign1/CWT engine lives in `boatramp-cwt`. These re-exports keep
+// boatramp-core's public API byte-for-byte: `boatramp_core::cose::{TokenError,
+// Signer, LocalSigner, TokenPublicKey, TokenAlg, MAX_CHAIN_*, p256_der_sig_to_raw}`
+// resolve exactly as before, now pointing at the shared engine.
+pub use boatramp_cwt::{
+    LocalSigner, MAX_CHAIN_BYTES, MAX_CHAIN_DEPTH, NarrowingCaveats, Signer, TokenAlg, TokenError,
+    TokenPublicKey, p256_der_sig_to_raw,
+};
+// Low-level engine helpers this module's boatramp-specific mint/verify functions
+// call (private, as they were before the extraction).
+use boatramp_cwt::{check_exp, claim_cti, random_cti, sign_claims, text_claim, verify_envelope};
 
 /// Text claim key for the boatramp role set (an array of `[name]` / `[name,target]`).
 const CLAIM_ROLES: &str = "br_roles";
@@ -220,12 +226,6 @@ const CLAIM_CNF: &str = "br_cnf";
 /// Text claim key for a delegation block's narrowing caveats (a CBOR map).
 const CLAIM_CAVEATS: &str = "br_caveats";
 
-/// Max blocks in a presented delegation chain — a resource bound checked *before*
-/// any signature verification.
-pub const MAX_CHAIN_DEPTH: usize = 8;
-/// Max serialized bytes of a presented delegation chain — bounded before parsing.
-pub const MAX_CHAIN_BYTES: usize = 8 * 1024;
-
 /// Restrict-only caveats a delegation block adds. Every field can only *narrow*
 /// the credential's authority; the chain walk intersects them (the tightest wins).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -293,6 +293,58 @@ impl Caveats {
         }
         true
     }
+}
+
+/// boatramp's [`Caveats`] is the first [`NarrowingCaveats`] impl: the engine drives
+/// the delegation chain-walk over it, and — crucially — the engine VERIFIES that
+/// [`meet`](NarrowingCaveats::meet) only narrows (see
+/// [`is_narrower_or_equal`](NarrowingCaveats::is_narrower_or_equal)). boatramp's
+/// `meet` is the existing [`tighten`](Caveats::tighten) intersection (a true
+/// greatest-lower-bound), so the engine's monotonicity check is always satisfied
+/// here and the mint/verify behavior is byte-for-byte unchanged.
+impl NarrowingCaveats for Caveats {
+    const KIND_CLAIM: &'static str = CLAIM_KIND;
+    const CNF_CLAIM: &'static str = CLAIM_CNF;
+    const CAVEATS_CLAIM: &'static str = CLAIM_CAVEATS;
+    const DELEGATION_KIND: &'static str = KIND_DELEGATION;
+
+    /// Greatest-lower-bound = the existing restrict-only [`tighten`](Self::tighten)
+    /// intersection (the tightest field wins; disjoint `only_site`s → impossible).
+    fn meet(&self, deeper: &Self) -> Self {
+        let mut out = self.clone();
+        out.tighten(deeper);
+        out
+    }
+
+    /// `self ⊑ other`: `self`'s permitted set ⊆ `other`'s (self restricts at least
+    /// as much). `impossible` is the lattice bottom (narrowest). Consistent with
+    /// [`meet`](Self::meet): `self.meet(b)` is always `⊑` both `self` and `b`, so
+    /// the engine's narrowing check never trips for a faithful boatramp chain.
+    fn is_narrower_or_equal(&self, other: &Self) -> bool {
+        if self.impossible {
+            return true; // bottom ⊑ everything
+        }
+        if other.impossible {
+            return false; // only bottom ⊑ bottom
+        }
+        // read_only: if `other` forbids writes, `self` must too.
+        if other.read_only && !self.read_only {
+            return false;
+        }
+        // only_site: `self`'s allowed-site set ⊆ `other`'s.
+        match (self.only_site.as_deref(), other.only_site.as_deref()) {
+            (_, None) => {}                    // other allows any site
+            (Some(s), Some(o)) if s == o => {} // same single site
+            (_, Some(_)) => return false,      // other pins a site self doesn't match
+        }
+        // not_after: `self` must bound the lifetime at least as tightly (sooner).
+        match (self.not_after, other.not_after) {
+            (_, None) => {}                    // other has no bound
+            (Some(s), Some(o)) if s <= o => {} // self sooner-or-equal
+            (_, Some(_)) => return false,      // self later / unbounded vs other's bound
+        }
+        true
+    }
 
     /// Encode as a CBOR map with only the present fields.
     fn to_cbor(&self) -> CborValue {
@@ -315,8 +367,8 @@ impl Caveats {
         CborValue::Map(map)
     }
 
-    /// Decode from the CBOR produced by [`to_cbor`](Self::to_cbor); unknown/ill-typed
-    /// entries are ignored (never a panic on a hostile token).
+    /// Decode from the CBOR produced by [`to_cbor`](NarrowingCaveats::to_cbor);
+    /// unknown/ill-typed entries are ignored (never a panic on a hostile token).
     fn from_cbor(value: &CborValue) -> Self {
         let mut caveats = Self::default();
         let CborValue::Map(entries) = value else {
@@ -335,257 +387,11 @@ impl Caveats {
         }
         caveats
     }
-}
 
-/// The token signing algorithm. **ES256 is the portable default** (every HSM/KMS
-/// can sign it); Ed25519 is offered for AWS/Vault/local deployments.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TokenAlg {
-    /// ECDSA P-256 with SHA-256 (COSE `ES256`).
-    Es256,
-    /// Ed25519 (COSE `EdDSA`).
-    Ed25519,
-}
-
-impl TokenAlg {
-    fn iana(self) -> iana::Algorithm {
-        match self {
-            Self::Es256 => iana::Algorithm::ES256,
-            Self::Ed25519 => iana::Algorithm::EdDSA,
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            Self::Es256 => "es256",
-            Self::Ed25519 => "ed25519",
-        }
-    }
-}
-
-/// A failure minting or verifying a control-plane token.
-#[derive(Debug, thiserror::Error)]
-pub enum TokenError {
-    /// Key material failed to parse/load.
-    #[error("token key: {0}")]
-    Key(String),
-    /// Building/serializing the token failed.
-    #[error("token build: {0}")]
-    Build(String),
-    /// The signer (local/HSM/KMS) failed to produce a signature.
-    #[error("token signer: {0}")]
-    Signer(String),
-    /// The token is not authentic / malformed / wrong algorithm (a signature or
-    /// framing failure — the presenter is unauthenticated).
-    #[error("token invalid: {0}")]
-    Invalid(String),
-    /// The token is authentic but its claims are wrong for the use (e.g. a role
-    /// token presented as a join token, or a missing claim) — authenticated but
-    /// not authorized for this operation.
-    #[error("token claims: {0}")]
-    Claims(String),
-    /// The token is past its `exp`.
-    #[error("token expired")]
-    Expired,
-}
-
-/// Mints tokens by signing the COSE `ToBeSigned` bytes. Async so a remote KMS
-/// (an HTTP round-trip) fits the same seam as a local key. Verification does not
-/// use this — it needs only the [`TokenPublicKey`].
-#[async_trait]
-pub trait Signer: Send + Sync {
-    /// The algorithm this signer produces.
-    fn alg(&self) -> TokenAlg;
-    /// The public key that verifies this signer's tokens (the config trust anchor).
-    fn public_key(&self) -> TokenPublicKey;
-    /// Sign the COSE `ToBeSigned` bytes, returning the raw fixed-size signature
-    /// (ES256 = 64-byte `r‖s`; Ed25519 = 64 bytes).
-    async fn sign(&self, tbs: &[u8]) -> Result<Vec<u8>, TokenError>;
-}
-
-/// An in-process signing key (the default / test backend). External backends
-/// (Vault, PKCS#11, KMS) live in `boatramp-server`.
-pub enum LocalSigner {
-    /// ES256 (P-256) key.
-    Es256(p256::ecdsa::SigningKey),
-    /// Ed25519 key.
-    Ed25519(ed25519_dalek::SigningKey),
-}
-
-impl LocalSigner {
-    /// Generate a fresh key for `alg`.
-    pub fn generate(alg: TokenAlg) -> Self {
-        match alg {
-            // P-256 (RustCrypto 0.14): the `Generate` trait's `generate()` draws from the system CSPRNG
-            // (`getrandom::SysRng`) and panics only if the OS RNG fails — the same fail-stop behavior as
-            // the old `SigningKey::random(&mut OsRng)` (now deprecated), with no direct rand_core dep.
-            TokenAlg::Es256 => {
-                use p256::elliptic_curve::Generate as _;
-                Self::Es256(p256::ecdsa::SigningKey::generate())
-            }
-            // Ed25519 (rand_core 0.6): `ed25519-dalek 2` is pinned to the rand_core 0.6 trait family,
-            // so its `generate` takes a 0.6 `OsRng` — unchanged by the P-256 migration.
-            TokenAlg::Ed25519 => {
-                Self::Ed25519(ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng))
-            }
-        }
-    }
-
-    /// Load from an `"<alg>:<hex>"` private key (32-byte scalar/seed), as written
-    /// by [`private_hex`](Self::private_hex).
-    pub fn from_private_hex(spec: &str) -> Result<Self, TokenError> {
-        let (alg, raw) = split_tagged(spec)?;
-        match alg {
-            TokenAlg::Es256 => Ok(Self::Es256(
-                p256::ecdsa::SigningKey::from_slice(&raw)
-                    .map_err(|e| TokenError::Key(format!("es256 private key: {e}")))?,
-            )),
-            TokenAlg::Ed25519 => {
-                let bytes: [u8; 32] = raw
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| TokenError::Key("ed25519 private key must be 32 bytes".into()))?;
-                Ok(Self::Ed25519(ed25519_dalek::SigningKey::from_bytes(&bytes)))
-            }
-        }
-    }
-
-    /// The private key as `"<alg>:<hex>"` (store securely; shown once).
-    pub fn private_hex(&self) -> String {
-        match self {
-            Self::Es256(sk) => format!("es256:{}", hex::encode(sk.to_bytes())),
-            Self::Ed25519(sk) => format!("ed25519:{}", hex::encode(sk.to_bytes())),
-        }
-    }
-}
-
-#[async_trait]
-impl Signer for LocalSigner {
-    fn alg(&self) -> TokenAlg {
-        match self {
-            Self::Es256(_) => TokenAlg::Es256,
-            Self::Ed25519(_) => TokenAlg::Ed25519,
-        }
-    }
-
-    fn public_key(&self) -> TokenPublicKey {
-        match self {
-            Self::Es256(sk) => TokenPublicKey::Es256(*sk.verifying_key()),
-            Self::Ed25519(sk) => TokenPublicKey::Ed25519(sk.verifying_key()),
-        }
-    }
-
-    async fn sign(&self, tbs: &[u8]) -> Result<Vec<u8>, TokenError> {
-        match self {
-            Self::Es256(sk) => {
-                use p256::ecdsa::signature::Signer as _;
-                let sig: p256::ecdsa::Signature = sk
-                    .try_sign(tbs)
-                    .map_err(|e| TokenError::Signer(e.to_string()))?;
-                Ok(sig.to_bytes().to_vec())
-            }
-            Self::Ed25519(sk) => {
-                use ed25519_dalek::Signer as _;
-                let sig = sk
-                    .try_sign(tbs)
-                    .map_err(|e| TokenError::Signer(e.to_string()))?;
-                Ok(sig.to_bytes().to_vec())
-            }
-        }
-    }
-}
-
-/// The public key that verifies a token — the config trust anchor on every node.
-#[derive(Clone, Debug)]
-pub enum TokenPublicKey {
-    /// ES256 (P-256) verifying key.
-    Es256(p256::ecdsa::VerifyingKey),
-    /// Ed25519 verifying key.
-    Ed25519(ed25519_dalek::VerifyingKey),
-}
-
-impl TokenPublicKey {
-    /// This key's algorithm.
-    pub fn alg(&self) -> TokenAlg {
-        match self {
-            Self::Es256(_) => TokenAlg::Es256,
-            Self::Ed25519(_) => TokenAlg::Ed25519,
-        }
-    }
-
-    /// `"<alg>:<hex>"` — ES256 is the 33-byte compressed SEC1 point, Ed25519 the
-    /// 32-byte key. This is the config trust anchor (`auth_root_public_key`).
-    pub fn to_hex(&self) -> String {
-        match self {
-            Self::Es256(vk) => {
-                // ecdsa 0.17 renamed `to_encoded_point` → `to_sec1_point`. `true` = point
-                // compression, so this is the identical 33-byte compressed SEC1 point (0x02/0x03 ‖ x)
-                // the old code emitted — the on-wire trust anchor is byte-unchanged.
-                format!("es256:{}", hex::encode(vk.to_sec1_point(true).as_bytes()))
-            }
-            Self::Ed25519(vk) => format!("ed25519:{}", hex::encode(vk.as_bytes())),
-        }
-    }
-
-    /// Parse an ES256 (P-256) public key from X.509 `SubjectPublicKeyInfo` DER —
-    /// the form cloud KMS `GetPublicKey` returns. Ed25519 is not offered here
-    /// (GCP/Azure KMS can't sign it, and AWS KMS only signs ECDSA).
-    pub fn es256_from_spki_der(der: &[u8]) -> Result<Self, TokenError> {
-        use p256::pkcs8::DecodePublicKey as _;
-        p256::ecdsa::VerifyingKey::from_public_key_der(der)
-            .map(TokenPublicKey::Es256)
-            .map_err(|e| TokenError::Key(format!("es256 SPKI DER: {e}")))
-    }
-
-    /// Parse an ES256 public key from a PEM `SubjectPublicKeyInfo` block — the form
-    /// Vault Transit + GCP Cloud KMS return.
-    pub fn es256_from_spki_pem(pem: &str) -> Result<Self, TokenError> {
-        use p256::pkcs8::DecodePublicKey as _;
-        p256::ecdsa::VerifyingKey::from_public_key_pem(pem)
-            .map(TokenPublicKey::Es256)
-            .map_err(|e| TokenError::Key(format!("es256 SPKI PEM: {e}")))
-    }
-
-    /// Parse an `"<alg>:<hex>"` public key.
-    pub fn from_hex(spec: &str) -> Result<Self, TokenError> {
-        let (alg, raw) = split_tagged(spec)?;
-        match alg {
-            TokenAlg::Es256 => Ok(Self::Es256(
-                p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw)
-                    .map_err(|e| TokenError::Key(format!("es256 public key: {e}")))?,
-            )),
-            TokenAlg::Ed25519 => {
-                let bytes: [u8; 32] = raw
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| TokenError::Key("ed25519 public key must be 32 bytes".into()))?;
-                Ok(Self::Ed25519(
-                    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
-                        .map_err(|e| TokenError::Key(format!("ed25519 public key: {e}")))?,
-                ))
-            }
-        }
-    }
-
-    /// Verify a raw signature over `tbs`. Anti-malleability: ES256 uses the fixed
-    /// `r‖s` form, Ed25519 uses `verify_strict`. Public so other subsystems (e.g.
-    /// the kernel-trust check) can verify a detached signature with the same
-    /// pinned-algorithm primitives.
-    pub fn verify(&self, tbs: &[u8], sig: &[u8]) -> Result<(), TokenError> {
-        match self {
-            Self::Es256(vk) => {
-                use p256::ecdsa::signature::Verifier as _;
-                let sig = p256::ecdsa::Signature::from_slice(sig)
-                    .map_err(|e| TokenError::Invalid(format!("es256 signature: {e}")))?;
-                vk.verify(tbs, &sig)
-                    .map_err(|_| TokenError::Invalid("signature verification failed".into()))
-            }
-            Self::Ed25519(vk) => {
-                let sig = ed25519_dalek::Signature::from_slice(sig)
-                    .map_err(|e| TokenError::Invalid(format!("ed25519 signature: {e}")))?;
-                vk.verify_strict(tbs, &sig)
-                    .map_err(|_| TokenError::Invalid("signature verification failed".into()))
-            }
-        }
+    /// Fold `not_after` into the block's `exp` so the standard expiry check (min
+    /// across the chain) enforces it.
+    fn not_after(&self) -> Option<u64> {
+        self.not_after
     }
 }
 
@@ -835,39 +641,6 @@ pub fn verify_member_assertion(
         pubkey_hex: pubkey_hex
             .ok_or_else(|| TokenError::Claims("member assertion has no pubkey".into()))?,
     })
-}
-
-/// A random 16-byte revocation/single-use id (`cti`).
-fn random_cti() -> Result<Vec<u8>, TokenError> {
-    let mut cti = [0u8; 16];
-    getrandom::getrandom(&mut cti).map_err(|e| TokenError::Build(format!("rng: {e}")))?;
-    Ok(cti.to_vec())
-}
-
-/// Wrap a CWT claim set in a signed `COSE_Sign1` and base64url-encode it. The
-/// protected header carries the signer's algorithm; the canonical `ToBeSigned`
-/// bytes are what gets signed (never hand-rolled).
-async fn sign_claims(claims: ClaimsSet, signer: &dyn Signer) -> Result<String, TokenError> {
-    let bytes = sign_claims_bytes(claims, signer).await?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-}
-
-/// Sign a claim set into the tagged `COSE_Sign1` bytes (the raw block form used
-/// inside a delegation chain, and the pre-base64 form of a plain token).
-async fn sign_claims_bytes(claims: ClaimsSet, signer: &dyn Signer) -> Result<Vec<u8>, TokenError> {
-    let payload = claims
-        .to_vec()
-        .map_err(|e| TokenError::Build(e.to_string()))?;
-    let header = HeaderBuilder::new().algorithm(signer.alg().iana()).build();
-    let mut sign1 = CoseSign1Builder::new()
-        .protected(header)
-        .payload(payload)
-        .build();
-    let tbs = sign1.tbs_data(&[]);
-    sign1.signature = signer.sign(&tbs).await?;
-    sign1
-        .to_tagged_vec()
-        .map_err(|e| TokenError::Build(e.to_string()))
 }
 
 /// Verify a base64url `COSE_Sign1` CWT against `public` at `now_unix`: checks the
@@ -2264,26 +2037,10 @@ pub async fn attenuate(
     next_holder: Option<&TokenPublicKey>,
     now_unix: u64,
 ) -> Result<String, TokenError> {
-    let mut blocks = decode_credential(credential)?;
-    let mut builder = ClaimsSetBuilder::new()
-        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
-        .cwt_id(random_cti()?)
-        .text_claim(
-            CLAIM_KIND.to_string(),
-            CborValue::Text(KIND_DELEGATION.to_string()),
-        )
-        .text_claim(CLAIM_CAVEATS.to_string(), caveats.to_cbor());
-    if let Some(holder) = next_holder {
-        builder = builder.text_claim(CLAIM_CNF.to_string(), CborValue::Text(holder.to_hex()));
-    }
-    // Fold `not_after` into `exp` so the standard expiry check enforces it.
-    if let Some(na) = caveats.not_after {
-        builder = builder.expiration_time(Timestamp::WholeSeconds(na as i64));
-    }
-    // A block carries NO roles: children can only narrow (the anti-escalation
-    // invariant — verify never reads a block's roles).
-    blocks.push(sign_claims_bytes(builder.build(), holder_signer).await?);
-    encode_chain(blocks)
+    // Thin layer over the generic engine: boatramp's `Caveats` is the first
+    // `NarrowingCaveats` impl, so block framing (kind/caveats/cnf claims, the
+    // `not_after`→`exp` fold) is identical to the pre-extraction code.
+    boatramp_cwt::attenuate(credential, holder_signer, caveats, next_holder, now_unix).await
 }
 
 /// Verify a presented credential — a plain token *or* a delegation chain — against
@@ -2297,54 +2054,20 @@ pub fn verify_credential(
     root_public: &TokenPublicKey,
     now_unix: u64,
 ) -> Result<VerifiedChain, TokenError> {
-    let blocks = decode_credential(credential)?;
-    let (root_bytes, children) = blocks
-        .split_first()
-        .ok_or_else(|| TokenError::Invalid("empty credential".into()))?;
-
-    let root_claims = verify_envelope_bytes(root_bytes, root_public)?;
-    let root = role_token(&root_claims, check_exp(&root_claims, now_unix)?)?;
-
-    let mut effective_exp = root.exp;
-    let mut caveats = Caveats::default();
-    let mut parent_cnf = root.cnf.clone();
-
-    for block in children {
-        // Each block must be signed by the key the parent declared (`cnf`) — proof
-        // of possession. A parent that declared no holder key can't be extended.
-        let holder_hex = parent_cnf
-            .take()
-            .ok_or_else(|| TokenError::Claims("delegation past a non-delegatable block".into()))?;
-        let holder = TokenPublicKey::from_hex(&holder_hex)
-            .map_err(|e| TokenError::Claims(format!("holder key: {e}")))?;
-        let claims = verify_envelope_bytes(block, &holder)?;
-
-        // Domain separation: a role token can't masquerade as a delegation block.
-        let kind = text_claim(&claims, CLAIM_KIND).and_then(|v| match v {
-            CborValue::Text(t) => Some(t.as_str()),
-            _ => None,
-        });
-        if kind != Some(KIND_DELEGATION) {
-            return Err(TokenError::Claims("not a delegation block".into()));
-        }
-        // Anti-escalation: a block's roles are never read — only its caveats narrow.
-        let block_caveats = text_claim(&claims, CLAIM_CAVEATS)
-            .map(Caveats::from_cbor)
-            .unwrap_or_default();
-        caveats.tighten(&block_caveats);
-        effective_exp = min_opt(effective_exp, check_exp(&claims, now_unix)?);
-        parent_cnf = claim_cnf(&claims);
-    }
-
+    // The generic engine walks the chain (signatures, PoP `cnf` binding, the
+    // engine-VERIFIED monotonic narrowing of `Caveats`, min-folded expiry) and
+    // returns the verified ROOT claim set — authority is read from the root alone.
+    // This layer projects boatramp's roles/kind from that root, so the result is
+    // byte-for-byte the pre-extraction `VerifiedChain`.
+    let chain = boatramp_cwt::verify_credential::<Caveats>(credential, root_public, now_unix)?;
+    let root = role_token(&chain.root_claims, chain.exp)?;
     Ok(VerifiedChain {
         roles: root.roles,
         kind: root.kind,
-        cti: root.cti,
-        exp: effective_exp,
-        caveats,
-        // After the walk, `parent_cnf` holds the terminal block's declared holder
-        // key (or the root's, for a plain token) — the leaf a PoP proof binds to.
-        leaf_cnf: parent_cnf,
+        cti: chain.cti,
+        exp: chain.exp,
+        caveats: chain.caveats,
+        leaf_cnf: chain.leaf_cnf,
     })
 }
 
@@ -2464,133 +2187,12 @@ pub fn verify_pop(
     claim_cti(&claims)
 }
 
-/// Decode a presented credential into its ordered blocks (raw tagged
-/// `COSE_Sign1` bytes). A plain token is a bare `COSE_Sign1` (one block); a chain
-/// is a CBOR array of byte strings. Enforces the size/depth bounds *before* any
-/// verification, so a hostile credential can't force unbounded work.
-fn decode_credential(credential: &str) -> Result<Vec<Vec<u8>>, TokenError> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(credential.trim())
-        .map_err(|e| TokenError::Invalid(format!("base64: {e}")))?;
-    if bytes.len() > MAX_CHAIN_BYTES {
-        return Err(TokenError::Invalid("credential exceeds size bound".into()));
-    }
-    // CBOR major type 4 (0b100_xxxxx) is an array (a chain); a tagged COSE_Sign1
-    // is major type 6 (tag). Peek before parsing.
-    let is_array = matches!(bytes.first(), Some(b) if (b >> 5) == 4);
-    if !is_array {
-        return Ok(vec![bytes]);
-    }
-    let value: CborValue =
-        ciborium::from_reader(&bytes[..]).map_err(|e| TokenError::Invalid(e.to_string()))?;
-    let CborValue::Array(items) = value else {
-        return Err(TokenError::Invalid("malformed credential".into()));
-    };
-    if items.is_empty() || items.len() > MAX_CHAIN_DEPTH {
-        return Err(TokenError::Invalid(
-            "credential chain length out of bounds".into(),
-        ));
-    }
-    items
-        .into_iter()
-        .map(|item| match item {
-            CborValue::Bytes(b) => Ok(b),
-            _ => Err(TokenError::Invalid("malformed chain block".into())),
-        })
-        .collect()
-}
-
-/// Encode ordered blocks as `base64url(CBOR array of byte strings)`.
-fn encode_chain(blocks: Vec<Vec<u8>>) -> Result<String, TokenError> {
-    let array = CborValue::Array(blocks.into_iter().map(CborValue::Bytes).collect());
-    let mut buf = Vec::new();
-    ciborium::into_writer(&array, &mut buf).map_err(|e| TokenError::Build(e.to_string()))?;
-    if buf.len() > MAX_CHAIN_BYTES {
-        return Err(TokenError::Build(
-            "delegation chain exceeds size bound".into(),
-        ));
-    }
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
-}
-
-/// The tighter of two optional expiries (treating `None` as "no bound").
-fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.min(y)),
-        (Some(x), None) => Some(x),
-        (None, b) => b,
-    }
-}
-
-/// Decode + signature-verify a base64url `COSE_Sign1` CWT against `public`,
-/// returning its claim set. Pins the algorithm to the *key's* algorithm (never
-/// trusting the attacker-controlled protected header) to defeat algorithm
-/// confusion. All failures here are authenticity/framing failures
-/// ([`TokenError::Invalid`]).
-fn verify_envelope(token: &str, public: &TokenPublicKey) -> Result<ClaimsSet, TokenError> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token.trim())
-        .map_err(|e| TokenError::Invalid(format!("base64: {e}")))?;
-    verify_envelope_bytes(&bytes, public)
-}
-
-/// Verify the tagged `COSE_Sign1` bytes of one block against `public`, returning
-/// its claim set. The shared core of [`verify`] and the delegation chain walk.
-fn verify_envelope_bytes(bytes: &[u8], public: &TokenPublicKey) -> Result<ClaimsSet, TokenError> {
-    let sign1 =
-        CoseSign1::from_tagged_slice(bytes).map_err(|e| TokenError::Invalid(e.to_string()))?;
-
-    let want = CoseAlg::Assigned(public.alg().iana());
-    if sign1.protected.header.alg.as_ref() != Some(&want) {
-        return Err(TokenError::Invalid("algorithm mismatch".into()));
-    }
-    sign1.verify_signature(&[], |sig, tbs| public.verify(tbs, sig))?;
-
-    let payload = sign1
-        .payload
-        .as_ref()
-        .ok_or_else(|| TokenError::Invalid("no payload".into()))?;
-    ClaimsSet::from_slice(payload).map_err(|e| TokenError::Invalid(e.to_string()))
-}
-
 /// Read the holder-key (`cnf`) claim, if present.
 fn claim_cnf(claims: &ClaimsSet) -> Option<String> {
     text_claim(claims, CLAIM_CNF).and_then(|v| match v {
         CborValue::Text(t) => Some(t.clone()),
         _ => None,
     })
-}
-
-/// Look up a text-keyed private-use claim by name.
-fn text_claim<'a>(claims: &'a ClaimsSet, name: &str) -> Option<&'a CborValue> {
-    claims.rest.iter().find_map(|(k, v)| match k {
-        coset::cwt::ClaimName::Text(t) if t == name => Some(v),
-        _ => None,
-    })
-}
-
-/// The token's revocation id (`cti`, hex). A token with no `cti` is malformed.
-fn claim_cti(claims: &ClaimsSet) -> Result<String, TokenError> {
-    claims
-        .cwt_id
-        .as_ref()
-        .map(hex::encode)
-        .ok_or_else(|| TokenError::Invalid("no cti".into()))
-}
-
-/// Read the `exp` claim and enforce it against `now_unix`. Returns the expiry (if
-/// any); [`TokenError::Expired`] when past it.
-fn check_exp(claims: &ClaimsSet, now_unix: u64) -> Result<Option<u64>, TokenError> {
-    let exp = match claims.expiration_time {
-        Some(Timestamp::WholeSeconds(s)) => Some(s.max(0) as u64),
-        _ => None,
-    };
-    if let Some(exp) = exp
-        && now_unix > exp
-    {
-        return Err(TokenError::Expired);
-    }
-    Ok(exp)
 }
 
 /// Encode roles as a CBOR array of `[name]` (global) / `[name, target]` (scoped).
@@ -2631,38 +2233,14 @@ fn cbor_to_roles(value: &CborValue) -> Vec<GrantedRole> {
     out
 }
 
-/// Convert a DER-encoded ECDSA/P-256 signature to the raw fixed 64-byte `r‖s`
-/// COSE form. AWS KMS and GCP Cloud KMS return ECDSA signatures DER-encoded;
-/// Vault (with `marshaling_algorithm=jws`), Azure Key Vault, and PKCS#11
-/// (`CKM_ECDSA`) already return the raw form. Ed25519 signatures are always raw.
-pub fn p256_der_sig_to_raw(der: &[u8]) -> Result<Vec<u8>, TokenError> {
-    p256::ecdsa::Signature::from_der(der)
-        .map(|sig| sig.to_bytes().to_vec())
-        .map_err(|e| TokenError::Invalid(format!("es256 DER signature: {e}")))
-}
-
-/// Split an `"<alg>:<hex>"` spec into `(alg, bytes)`.
-fn split_tagged(spec: &str) -> Result<(TokenAlg, Vec<u8>), TokenError> {
-    let (tag, hex_str) = spec
-        .trim()
-        .split_once(':')
-        .ok_or_else(|| TokenError::Key("expected \"<alg>:<hex>\"".into()))?;
-    let alg = match tag {
-        t if t == TokenAlg::Es256.label() => TokenAlg::Es256,
-        t if t == TokenAlg::Ed25519.label() => TokenAlg::Ed25519,
-        other => {
-            return Err(TokenError::Key(format!(
-                "unknown token algorithm {other:?}"
-            )));
-        }
-    };
-    let bytes = hex::decode(hex_str).map_err(|e| TokenError::Key(format!("hex: {e}")))?;
-    Ok((alg, bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Low-level engine helpers used only by these tests (crafting raw chains /
+    // malformed blocks). They were private helpers in this module before the
+    // `boatramp-cwt` extraction; the production code above no longer calls them.
+    use base64::Engine as _;
+    use boatramp_cwt::{decode_credential, encode_chain, sign_claims_bytes};
 
     const NOW: u64 = 1_700_000_000;
 

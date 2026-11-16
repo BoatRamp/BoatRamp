@@ -1800,6 +1800,7 @@ version = "0.61.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "boatramp-cwt",
  "boatramp-types",
  "bytes",
  "cedar-policy",
@@ -1823,6 +1824,23 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boatramp-cwt"
+version = "0.61.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "ciborium",
+ "coset",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hex",
+ "p256",
+ "rand_core 0.6.4",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
