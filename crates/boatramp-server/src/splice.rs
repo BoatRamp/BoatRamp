@@ -29,8 +29,10 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::task::Poll;
 
-use tokio::io::AsyncWriteExt;
+use axum::http::{self, HeaderMap, Method};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use boatramp_core::deploy::DeployStore;
@@ -75,6 +77,11 @@ struct SplicePlan {
     /// request (a keep-alive client may send different paths under the same route).
     site: String,
     project: String,
+    /// The single plaintext-HTTP backend string this connection is pinned to. A
+    /// subsequent keep-alive request is re-classified ([`SplicePlan::reverify`]) and is
+    /// only served on this pinned upstream connection when it still resolves to *this*
+    /// exact backend — otherwise the connection falls back to the userspace router.
+    target: String,
 }
 
 /// How long to wait for a connection's first request head before giving up on the
@@ -243,33 +250,98 @@ async fn peek_classify(io: &TcpStream, ctx: &SpliceCtx) -> Option<SplicePlan> {
     }
 }
 
-/// Decide whether the pipeline would reverse-proxy this request to a single
-/// plaintext-HTTP gateway upstream — and, if so, resolve+pin it. Conservative by
-/// construction: any uncertainty or advanced feature returns `None` (fall back).
-async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
-    // No kernel splice off Linux → never intercept; everything serves as before.
-    if !splice_supported() {
+/// A fast-path-eligible request head, parsed by the **hardened** [`boatramp_http::h1`]
+/// request parser (not an ad-hoc `str::split`). The parser rejects bare CR/LF
+/// terminators, validates header-field names (tchar) and values (no CTL/DEL), resolves
+/// the body framing per RFC 9112 §6, and refuses a `Content-Length`×`Transfer-Encoding`
+/// conflict — so a smuggled header (`X: y\nTransfer-Encoding: chunked`) can never reach
+/// [`build_upstream_head`] and be re-emitted to a lenient upstream (F-4).
+struct FastReq {
+    method: Method,
+    /// Origin-form request target (path + query) to forward.
+    target: String,
+    /// The validated request headers (a [`HeaderMap`] — every value already proven free
+    /// of embedded CR/LF, so re-emitting it verbatim cannot inject a header line).
+    headers: HeaderMap,
+}
+
+/// Parse **and** gate a request head for the splice fast path with the hardened h1
+/// parser. `Some` only for an idempotent, body-less `GET`/`HEAD` over HTTP/1.1 with no
+/// `Upgrade`/`Expect` and no declared body framing. This is the full header-framing guard
+/// and it is applied to **every** request — the first (via [`classify`]) *and* every
+/// subsequent keep-alive request (via [`splice_conn`]) — closing the F-6 gap where a
+/// split request #2 could carry a `Content-Length`/`Transfer-Encoding` the first-request
+/// guard never re-checked.
+fn parse_fastpath_request(head: &[u8]) -> Option<FastReq> {
+    use boatramp_http::h1::{BodyFraming, ParseResult, parse_request_head};
+    // Incomplete (truncated) or Reject (bare CR/LF, bad name/value, conflicting framing,
+    // obs-fold, missing/duplicate Host, …) → never intercept; hand to the router.
+    let ParseResult::Complete { head, .. } = parse_request_head(head) else {
+        return None;
+    };
+    // HTTP/1.0 keep-alive semantics differ (default-close) — the old ad-hoc path fell
+    // back on 1.0 and so do we.
+    if head.version != http::Version::HTTP_11 {
         return None;
     }
-    let (method, target_path, headers) = parse_request_head(head)?;
-    // Only idempotent, body-less requests: a request body would need forwarding
-    // (and splicing) upstream too, and non-GET/HEAD may not be safe to retry.
-    if !matches!(method.as_str(), "GET" | "HEAD") {
+    // Only idempotent, body-less requests: a request body would need forwarding (and
+    // splicing) upstream too, and non-GET/HEAD may not be safe to retry.
+    if !matches!(head.method, Method::GET | Method::HEAD) {
         return None;
     }
-    // A declared request body or an upgrade is out of scope for the fast-path.
-    if header(&headers, "content-length").is_some()
-        || header(&headers, "transfer-encoding").is_some()
-        || header(&headers, "upgrade").is_some()
-        || header(&headers, "expect").is_some()
+    // A declared request body (Content-Length or Transfer-Encoding) is out of scope and a
+    // desync surface — fall back. The hardened parser already rejected CL×TE outright.
+    if head.framing != BodyFraming::Empty {
+        return None;
+    }
+    // An upgrade or an Expect negotiation is not a plain proxyable GET/HEAD.
+    if head.headers.contains_key(http::header::UPGRADE)
+        || head.headers.contains_key(http::header::EXPECT)
     {
         return None;
     }
-    let host = header(&headers, "host").map(strip_port).unwrap_or("");
-    let path = path_only(&target_path);
-    // Reserved control-plane / system routes are matched by the app router *before*
-    // the `serve_by_host` fallback where the gateway lives — so a site's catch-all
-    // (`/**`) never actually handles them. Never intercept these; the router must.
+    // Reconstruct the origin-form target (path + query) to forward.
+    let target = head
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| head.uri.path().to_string());
+    Some(FastReq {
+        method: head.method,
+        target,
+        headers: head.headers,
+    })
+}
+
+/// A site classified as a pure single-backend plaintext-HTTP gateway proxy for one
+/// request — everything [`classify`] resolves except the SSRF address pin (which is done
+/// once, on the first request, and the connection is then reused). Returned by
+/// [`classify_site`] so the first-request path and the per-request re-verification path
+/// ([`SplicePlan::reverify`]) run the **identical** decision and cannot drift.
+struct Classified {
+    project: String,
+    site: String,
+    upstream: Upstream,
+    /// The single `http://` backend string the route resolves to.
+    target: String,
+}
+
+/// Run the full routing decision for one request against the live config: reserved-path
+/// defer, console mount, host→site, site access-rule/transport/handler/stream
+/// preconditions, manifest route precedence, and the gateway single-plaintext-backend
+/// check. Returns `Some` only for an unambiguous pure-proxy outcome. Shared by the
+/// first-request [`classify`] and the per-request [`SplicePlan::reverify`] so both apply
+/// the same guard (anti-desync on keep-alive).
+async fn classify_site(
+    ctx: &SpliceCtx,
+    host: &str,
+    target_path: &str,
+    path: &str,
+    method: &Method,
+) -> Option<Classified> {
+    // Reserved control-plane / system routes are matched by the app router *before* the
+    // `serve_by_host` fallback where the gateway lives — so a site's catch-all (`/**`)
+    // never actually handles them. Never intercept these; the router must.
     if is_reserved_path(path) {
         return None;
     }
@@ -326,7 +398,7 @@ async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
         &cfg.domains,
         "http",
         host,
-        &target_path,
+        target_path,
     )
     .is_some()
     {
@@ -355,7 +427,7 @@ async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
         // File (static) / NotFound are fine: the gateway wins over static files.
         Outcome::File { .. } | Outcome::NotFound { .. } => {}
     }
-    if route::match_handler(&manifest.config.handlers, &method, path).is_some() {
+    if route::match_handler(&manifest.config.handlers, method.as_str(), path).is_some() {
         return None;
     }
     // A site declaring SSE stream routes is not a pure proxy (a stream can preempt
@@ -383,20 +455,50 @@ async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
     if !target.starts_with("http://") {
         return None;
     }
-    // Resolve + SSRF-pin exactly like the userspace proxy path. The splice fast-path serves only a
-    // SITE gateway upstream (operator tier), so the operator address policy applies.
-    let resolved_target =
-        proxy::resolve_target(target, proxy::GatewayTargetPolicy::Operator, &ctx.posture)
-            .await
-            .ok()?;
+    Some(Classified {
+        project,
+        site,
+        upstream: upstream.clone(),
+        target: target.to_string(),
+    })
+}
+
+/// Decide whether the pipeline would reverse-proxy this request to a single
+/// plaintext-HTTP gateway upstream — and, if so, resolve+pin it. Conservative by
+/// construction: any uncertainty or advanced feature returns `None` (fall back).
+async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
+    // No kernel splice off Linux → never intercept; everything serves as before.
+    if !splice_supported() {
+        return None;
+    }
+    let req = parse_fastpath_request(head)?;
+    let host = req
+        .headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(strip_port)
+        .unwrap_or("");
+    let path = path_only(&req.target);
+    let c = classify_site(ctx, host, &req.target, path, &req.method).await?;
+    // Resolve + SSRF-pin exactly like the userspace proxy path. The splice fast-path
+    // serves only a SITE gateway upstream (operator tier), so the operator address
+    // policy applies.
+    let resolved_target = proxy::resolve_target(
+        &c.target,
+        proxy::GatewayTargetPolicy::Operator,
+        &ctx.posture,
+    )
+    .await
+    .ok()?;
     if !proxy::gateway_addr_allowed(resolved_target.addr.ip(), &ctx.posture) {
         return None;
     }
     Some(SplicePlan {
         resolved: resolved_target,
-        upstream: upstream.clone(),
-        site,
-        project,
+        upstream: c.upstream,
+        site: c.site,
+        project: c.project,
+        target: c.target,
     })
 }
 
@@ -413,8 +515,7 @@ async fn splice_conn(
     ctx: SpliceCtx,
     serve: crate::ServeInput,
 ) -> io::Result<()> {
-    let mut upstream = TcpStream::connect(plan.resolved.addr).await?;
-    upstream.set_nodelay(true).ok();
+    let mut upstream = UpstreamConn::connect(plan.resolved.addr).await?;
     let client_ip: IpAddr = peer.ip();
     loop {
         // Read (consuming) the client request head.
@@ -422,211 +523,171 @@ async fn splice_conn(
             Some(v) => v,
             None => return Ok(()), // client closed between keep-alive requests
         };
-        // Re-check eligibility per request (a keep-alive client could change path or
-        // method). On anything not a clean splice, hand the connection — with the
-        // head we already read replayed — to the normal server so nothing is lost.
-        let eligible = parse_request_head(&head)
-            .filter(|(m, _, _)| matches!(m.as_str(), "GET" | "HEAD") && leftover.is_empty());
-        let (method, target_path, headers) = match eligible {
+        // Re-check eligibility per request with the **hardened** parser (a keep-alive
+        // client could change path/method, or smuggle a framing header on request #2).
+        // This re-runs the FULL header-framing guard every request (F-4, F-6). A pipelined
+        // request (non-empty leftover) also falls back. On anything not a clean splice,
+        // hand the connection — with the head we already read replayed — to the normal
+        // server so nothing is lost.
+        let req = match (leftover.is_empty())
+            .then(|| parse_fastpath_request(&head))
+            .flatten()
+        {
             Some(v) => v,
             None => return fall_back(head, leftover, client, peer, serve).await,
         };
-        // Honor a client `Connection: close`: serve this one request, then close
-        // (HTTP/1.1 defaults to keep-alive otherwise).
-        let client_close = header(&headers, "connection")
-            .is_some_and(|v| v.to_ascii_lowercase().contains("close"));
-        let path = path_only(&target_path);
+        let host = req
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(strip_port)
+            .unwrap_or("");
+        let path = path_only(&req.target);
+        // Re-run the full routing decision (reserved-path defer, host→site, access/
+        // transport/handler/stream preconditions, gateway single-backend) against the
+        // live config, and require it still pins to THIS exact upstream connection
+        // (F-6: a redeploy, a changed Host, or a reserved path on request #2 must not
+        // ride the pinned splice). Otherwise fall back.
         if plan
-            .upstream_route(&ctx, &plan.project, &plan.site, path)
+            .reverify(&ctx, host, &req.target, path, &req.method)
             .await
             .is_none()
         {
             return fall_back(head, leftover, client, peer, serve).await;
         }
-        // Build + send the upstream request head.
-        let up_head = build_upstream_head(&plan, &method, &target_path, &headers, client_ip);
+        // Honor a client `Connection: close`: serve this one request, then close
+        // (HTTP/1.1 defaults to keep-alive otherwise).
+        let client_close = header_has_token(&req.headers, http::header::CONNECTION, "close");
+        // Build + send the upstream request head (from the validated HeaderMap).
+        let up_head = build_upstream_head(&plan, &req, client_ip);
         upstream.write_all(&up_head).await?;
-        // Read the upstream response head.
-        let (resp_head, body_prefix) = match read_head(&mut upstream).await? {
-            Some(v) => v,
-            None => return Ok(()),
+        // Read the final upstream response head, forwarding + skipping any 1xx interim
+        // responses (F-5: a 100/103 is not the final response — never body-frame it).
+        let resp = match upstream
+            .read_final_response_head(&mut client, &req.method)
+            .await
+        {
+            Ok(Some(r)) => r,
+            Ok(None) => return Ok(()), // upstream closed before a final response
+            Err(e) => {
+                // A malformed upstream response head is a desync risk: refuse (fail closed).
+                let _ = client.write_all(BAD_GATEWAY).await;
+                return Err(e);
+            }
         };
-        let (status_ok, content_length, chunked, close) = parse_response_head(&resp_head);
-        // Only a Content-Length body with no chunked framing is splice-able. HEAD
-        // has no body regardless. Anything else → close after this response.
-        let head_only = method == "HEAD" || matches!(status_ok, Some(204) | Some(304));
-        // Preserve `Transfer-Encoding: chunked` for the chunked passthrough below (we
-        // forward the chunk framing verbatim, so the client must keep the header to
-        // delimit the body).
-        let out_head = rewrite_response_head(&resp_head, &plan.upstream, chunked && !head_only);
-        client.write_all(&out_head).await?;
-        if !body_prefix.is_empty() && !head_only {
-            client.write_all(&body_prefix).await?;
-        }
-        if head_only {
-            if close || client_close {
+        // Resolve the response body framing with strict RFC 9112 §6 logic — reject a
+        // Content-Length×Transfer-Encoding conflict, multiple Transfer-Encoding fields, or
+        // a non-last `chunked` (F-2: these are the response CL.TE desync / cache-poisoning
+        // vectors). An ambiguous response is answered 502 + close, never forwarded.
+        let framing = match resolve_response_framing(resp.status, &req.method, &resp.headers) {
+            Ok(f) => f,
+            Err(_) => {
+                let _ = client.write_all(BAD_GATEWAY).await;
                 return Ok(());
             }
-            continue;
+        };
+        // Build + send the downstream response head: strip hop-by-hop, keep chunked TE for
+        // the verbatim passthrough, and DROP Content-Length when forwarding chunked
+        // (F-2: never emit CL+TE to the client). Apply the upstream's header_down ops.
+        let out_head = build_downstream_head(&resp, &plan.upstream, &framing);
+        client.write_all(&out_head).await?;
+        // Forward EXACTLY the framed body — streaming (F-1: never buffer a whole chunk)
+        // and never past this response's end (F-3: a trailing injected response is not
+        // forwarded as the client's next response). `clean` is false if the upstream
+        // already buffered bytes past this response.
+        let clean = upstream.forward_body(&mut client, &framing).await?;
+        if matches!(framing, RespFraming::CloseDelimited) {
+            return Ok(()); // the close IS the frame; the connection is spent
         }
-        if chunked {
-            // A chunked upstream: forward the chunk framing verbatim and stop at the
-            // terminating 0-chunk, so a keep-alive upstream (which never closes) does not
-            // leave the client waiting forever for a connection close. `body_prefix` was
-            // already written above; it is re-scanned (not re-sent) to locate the end.
-            relay_chunked(&mut upstream, &mut client, body_prefix).await?;
-        } else {
-            match content_length {
-                Some(total) => {
-                    let remaining = total.saturating_sub(body_prefix.len());
-                    if remaining > 0 {
-                        splice_body(&upstream, &client, remaining).await?;
-                    }
-                }
-                // No Content-Length and not chunked: the response is close-delimited, so
-                // relay the rest verbatim then close (the upstream frames the body by
-                // closing its side, so this terminates — unlike a keep-alive upstream).
-                None => {
-                    relay_to_close(&mut upstream, &mut client).await?;
-                    return Ok(());
-                }
-            }
+        if !clean {
+            return Ok(()); // buffered trailing bytes (desync) → close, don't reuse
         }
-        if close || client_close {
+        if resp.close || client_close {
+            return Ok(());
+        }
+        // Keep-alive reuse: a compliant upstream is silent until it receives the next
+        // request. Any bytes readable NOW (before we send request N+1) are unsolicited —
+        // a queued/injected response — so close rather than forward them later (F-3).
+        if upstream.has_unsolicited_bytes().await? {
             return Ok(());
         }
     }
 }
 
 impl SplicePlan {
-    /// Recompute the route for `path` under this plan's site (a keep-alive client
-    /// may vary the path). `Some` when the same single-backend gateway route still
-    /// covers it. Cheap: the config is content-hash cached.
-    async fn upstream_route(
+    /// Re-verify that a subsequent keep-alive request still classifies as a pure proxy to
+    /// **this exact pinned backend** under the live config. Runs the same decision as the
+    /// first-request [`classify`] (via [`classify_site`]) — so a redeploy that adds access
+    /// rules / handlers / streams, a changed `Host`, a reserved path, or a route change all
+    /// force a fall back rather than riding the pinned splice connection. Cheap: the config
+    /// + manifest are content-hash cached.
+    async fn reverify(
         &self,
         ctx: &SpliceCtx,
-        project: &str,
-        site: &str,
+        host: &str,
+        target_path: &str,
         path: &str,
+        method: &Method,
     ) -> Option<()> {
-        let project_ref = boatramp_core::project::ProjectRef::new(project);
-        let cfg = ctx
-            .deploy
-            .get_site_config_cached(project_ref, site)
-            .await
-            .ok()??;
-        let gw = cfg.gateway.as_ref().filter(|g| g.is_enabled())?;
-        let route_match = gw.match_route(path)?;
-        // Same upstream + still a single plaintext-http backend.
-        let upstream = gw.upstreams.get(&route_match.upstream)?;
-        let backends = upstream.static_backends();
-        if backends.len() == 1 && backends[0].starts_with("http://") {
-            Some(())
-        } else {
-            None
-        }
+        let c = classify_site(ctx, host, target_path, path, method).await?;
+        // Must still pin to the same (project, site) AND the same single backend string —
+        // else the pinned upstream connection is pointed at the wrong origin.
+        (c.project == self.project && c.site == self.site && c.target == self.target).then_some(())
     }
 }
 
-// ---- request/response head parsing + rewriting -----------------------------
+/// A `502 Bad Gateway` sent to the client when an upstream response is malformed or
+/// framing-ambiguous (fail closed; the connection is then dropped).
+const BAD_GATEWAY: &[u8] =
+    b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
-/// A parsed request head: `(method, request-target, headers)`.
-type RequestHead = (String, String, Vec<(String, String)>);
-
-/// Parse the request line + headers from a head buffer; `None` if malformed or
-/// not HTTP/1.1.
-fn parse_request_head(head: &[u8]) -> Option<RequestHead> {
-    let text = std::str::from_utf8(head).ok()?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next()?;
-    let mut parts = request_line.split(' ');
-    let method = parts.next()?.to_string();
-    let target = parts.next()?.to_string();
-    let version = parts.next()?;
-    if version != "HTTP/1.1" {
-        return None; // HTTP/1.0 keep-alive semantics differ; fall back
-    }
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
-        }
-    }
-    Some((method, target, headers))
+/// Whether a header's value carries `token` as a comma-separated element (case-
+/// insensitive) — e.g. `Connection: keep-alive, close`.
+fn header_has_token(headers: &HeaderMap, name: http::header::HeaderName, token: &str) -> bool {
+    headers.get_all(name).iter().any(|v| {
+        v.to_str()
+            .is_ok_and(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+    })
 }
 
-/// Parse `(status-allows-body, content_length, is_chunked, must_close)` from a
-/// response head.
-fn parse_response_head(head: &[u8]) -> (Option<u16>, Option<usize>, bool, bool) {
-    let text = match std::str::from_utf8(head) {
-        Ok(t) => t,
-        Err(_) => return (None, None, false, true),
-    };
-    let mut lines = text.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    let status: Option<u16> = status_line.split(' ').nth(1).and_then(|s| s.parse().ok());
-    let mut content_length = None;
-    let mut chunked = false;
-    let mut close = false;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            let k = k.trim();
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().ok();
-            } else if k.eq_ignore_ascii_case("transfer-encoding")
-                && v.to_ascii_lowercase().contains("chunked")
-            {
-                chunked = true;
-            } else if k.eq_ignore_ascii_case("connection")
-                && v.to_ascii_lowercase().contains("close")
-            {
-                close = true;
-            }
-        }
-    }
-    (status, content_length, chunked, close)
-}
+// ---- request/response head building + framing ------------------------------
 
-/// Build the upstream request head bytes: rewritten path, forwarded headers minus
-/// hop-by-hop + Host, plus the X-Forwarded chain, matching the userspace proxy.
-fn build_upstream_head(
-    plan: &SplicePlan,
-    method: &str,
-    target_path: &str,
-    headers: &[(String, String)],
-    client_ip: IpAddr,
-) -> Vec<u8> {
+/// Build the upstream request head bytes from the **validated** [`FastReq`] headers:
+/// rewritten path, forwarded headers minus hop-by-hop + Host, plus the X-Forwarded chain,
+/// matching the userspace proxy. Because every header value came through the hardened h1
+/// parser (no embedded CR/LF, no CTL), re-emitting it verbatim cannot inject a header line
+/// — closing the request-smuggling vector (F-4). Built as raw bytes so an opaque (obs-text,
+/// non-UTF-8) header value round-trips unchanged.
+fn build_upstream_head(plan: &SplicePlan, req: &FastReq, client_ip: IpAddr) -> Vec<u8> {
     // Upstream path: the target's base path + the (strip-prefixed) request path +
     // original query.
     let base = plan.resolved.parsed.path().trim_end_matches('/');
-    let (req_path, query) = match target_path.split_once('?') {
+    let (req_path, query) = match req.target.split_once('?') {
         Some((p, q)) => (p, Some(q)),
-        None => (target_path, None),
+        None => (req.target.as_str(), None),
     };
     let forwarded = plan.upstream.forward_path(req_path);
-    let mut out = format!("{method} {base}{forwarded}");
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    out.extend_from_slice(req.method.as_str().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(base.as_bytes());
+    out.extend_from_slice(forwarded.as_bytes());
     if let Some(q) = query {
-        out.push('?');
-        out.push_str(q);
+        out.push(b'?');
+        out.extend_from_slice(q.as_bytes());
     }
-    out.push_str(" HTTP/1.1\r\n");
+    out.extend_from_slice(b" HTTP/1.1\r\n");
     // Host: the upstream's own authority (explicit override, else the target host).
     let host = plan
         .upstream
         .host_header
         .as_deref()
         .unwrap_or(plan.resolved.host.as_str());
-    out.push_str(&format!("host: {host}\r\n"));
-    for (name, value) in headers {
-        let lname = name.to_ascii_lowercase();
+    push_header(&mut out, "host", host.as_bytes());
+    for (name, value) in req.headers.iter() {
+        let lname = name.as_str(); // HeaderName is always lowercase
         if lname == "host"
-            || HOP_BY_HOP.contains(&lname.as_str())
+            || HOP_BY_HOP.contains(&lname)
             || plan
                 .upstream
                 .header_up
@@ -636,66 +697,193 @@ fn build_upstream_head(
         {
             continue;
         }
-        out.push_str(&format!("{name}: {value}\r\n"));
+        push_header(&mut out, lname, value.as_bytes());
     }
-    out.push_str(&format!("x-forwarded-for: {client_ip}\r\n"));
-    out.push_str("x-forwarded-proto: http\r\n");
-    if let Some(h) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")) {
-        out.push_str(&format!("x-forwarded-host: {}\r\n", h.1));
+    push_header(
+        &mut out,
+        "x-forwarded-for",
+        client_ip.to_string().as_bytes(),
+    );
+    push_header(&mut out, "x-forwarded-proto", b"http");
+    // Preserve the inbound X-Forwarded-Host (the original client Host), matching the
+    // userspace proxy. (The client's own X-Forwarded-For, if any, was forwarded in the
+    // header loop above and our hop is appended after it — the same append-not-strip
+    // behavior as `proxy.rs`; see the F-7 parity note in the module tests.)
+    if let Some(h) = req.headers.get(http::header::HOST) {
+        push_header(&mut out, "x-forwarded-host", h.as_bytes());
     }
     for (name, value) in &plan.upstream.header_up.set {
-        out.push_str(&format!("{name}: {value}\r\n"));
+        push_header(&mut out, name, value.as_bytes());
     }
-    out.push_str("\r\n");
-    out.into_bytes()
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
-/// Rewrite the upstream response head for the client: drop hop-by-hop, apply the
-/// upstream's `header_down` ops. `Content-Length` is preserved (we splice exactly).
-/// `keep_chunked_te` preserves the `Transfer-Encoding: chunked` header for a chunked
-/// passthrough: the fast-path forwards the chunk framing verbatim (see [`relay_chunked`]),
-/// so the client needs the header to delimit the body — dropping it (as a bare hop-by-hop
-/// strip did) left an HTTP/1.1 keep-alive client with no framing at all, so it treated the
-/// body as close-delimited and hung waiting for a connection close that never came.
-fn rewrite_response_head(resp_head: &[u8], upstream: &Upstream, keep_chunked_te: bool) -> Vec<u8> {
-    let text = match std::str::from_utf8(resp_head) {
-        Ok(t) => t,
-        Err(_) => return resp_head.to_vec(),
-    };
-    let mut lines = text.split("\r\n");
-    let status_line = lines.next().unwrap_or("HTTP/1.1 502 Bad Gateway");
-    let mut out = String::with_capacity(resp_head.len());
-    out.push_str(status_line);
-    out.push_str("\r\n");
-    for line in lines {
-        if line.is_empty() {
-            break;
+/// Append `name: value\r\n` to a head buffer (raw bytes).
+fn push_header(out: &mut Vec<u8>, name: &str, value: &[u8]) {
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b": ");
+    out.extend_from_slice(value);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Build the downstream response head for the client from the parsed upstream response:
+/// drop hop-by-hop + the upstream's `header_down.remove`, apply `header_down.set`. When
+/// forwarding a chunked body the `Transfer-Encoding: chunked` header is **kept** (so a
+/// keep-alive client can delimit the verbatim chunk framing) and `Content-Length` is
+/// **stripped** (RFC 9112 §6.1 — never emit CL+TE to the client; F-2). For a non-chunked
+/// body `Transfer-Encoding` is stripped as a normal hop-by-hop header and `Content-Length`
+/// is preserved (we forward exactly that many octets).
+fn build_downstream_head(resp: &FinalResp, upstream: &Upstream, framing: &RespFraming) -> Vec<u8> {
+    let status = resp.status;
+    let reason = http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("");
+    let mut out: Vec<u8> = format!("HTTP/1.1 {status} {reason}\r\n").into_bytes();
+    let is_chunked = matches!(framing, RespFraming::Chunked);
+    for (name, value) in resp.headers.iter() {
+        let lk = name.as_str(); // always lowercase
+        // Drop Content-Length when forwarding chunked (defense in depth — a CL+TE response
+        // was already rejected by `resolve_response_framing`).
+        if is_chunked && lk == "content-length" {
+            continue;
         }
-        if let Some((k, _)) = line.split_once(':') {
-            let lk = k.trim().to_ascii_lowercase();
-            // Preserve the chunked Transfer-Encoding when we pass the chunk framing
-            // through verbatim (so the client can delimit the body); otherwise strip it
-            // (and every other hop-by-hop header) as before.
-            let keep_te = keep_chunked_te && lk == "transfer-encoding";
-            if !keep_te
-                && (HOP_BY_HOP.contains(&lk.as_str())
-                    || upstream
-                        .header_down
-                        .remove
-                        .iter()
-                        .any(|h| lk.eq_ignore_ascii_case(h)))
-            {
+        let is_hop = HOP_BY_HOP.contains(&lk)
+            || upstream
+                .header_down
+                .remove
+                .iter()
+                .any(|h| lk.eq_ignore_ascii_case(h));
+        if is_hop {
+            // Keep the chunked Transfer-Encoding for the verbatim passthrough; strip every
+            // other hop-by-hop header (and any header_down.remove target).
+            if !(is_chunked && lk == "transfer-encoding") {
                 continue;
             }
         }
-        out.push_str(line);
-        out.push_str("\r\n");
+        push_header(&mut out, lk, value.as_bytes());
     }
     for (name, value) in &upstream.header_down.set {
-        out.push_str(&format!("{name}: {value}\r\n"));
+        push_header(&mut out, name, value.as_bytes());
     }
-    out.push_str("\r\n");
-    out.into_bytes()
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// How an upstream response body is framed, for forwarding (RFC 9112 §6, receiver side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RespFraming {
+    /// No body is forwarded (HEAD / 204 / 304 / CONNECT-2xx).
+    None,
+    /// A fixed-length body of this many octets.
+    Length(u64),
+    /// A chunked body — forwarded framing-verbatim until the terminating 0-chunk.
+    Chunked,
+    /// Framed by connection close.
+    CloseDelimited,
+}
+
+/// Resolve how to forward an upstream response body, with the **same strict** CL×TE logic
+/// the request parser's `resolve_framing` enforces (RFC 9112 §6.3). `Err(())` on any
+/// desync-risk framing — both `Content-Length` and `Transfer-Encoding` present, multiple
+/// `Transfer-Encoding` fields, or `Transfer-Encoding` whose final coding is not `chunked`
+/// — so the proxy answers 502 + close instead of forwarding an ambiguously-framed response
+/// a downstream could re-interpret (cache poisoning / response CL.TE desync; F-2).
+///
+/// 1xx is handled by the caller (never reaches here).
+fn resolve_response_framing(
+    status: u16,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Result<RespFraming, ()> {
+    // No-body statuses (RFC 9110 §6.4.1) override the framing headers.
+    if *method == Method::HEAD
+        || status == 204
+        || status == 304
+        || (*method == Method::CONNECT && (200..300).contains(&status))
+    {
+        return Ok(RespFraming::None);
+    }
+    // Gather Content-Length tokens (split each field on commas) and Transfer-Encoding
+    // field values — mirroring the request-side resolver.
+    let mut cl_tokens: Vec<&[u8]> = Vec::new();
+    for v in headers.get_all(http::header::CONTENT_LENGTH) {
+        for tok in v.as_bytes().split(|&b| b == b',') {
+            cl_tokens.push(trim_ows_bytes(tok));
+        }
+    }
+    let te_values: Vec<&[u8]> = headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .map(http::HeaderValue::as_bytes)
+        .collect();
+    let cl_present = !cl_tokens.is_empty();
+    let te_present = !te_values.is_empty();
+    // Both framing headers present is THE response CL/TE desync surface — never reconcile.
+    if cl_present && te_present {
+        return Err(());
+    }
+    if te_present {
+        // Multiple Transfer-Encoding *fields* is a TE.TE desync vector (first-vs-last
+        // disagreement) — reject rather than combine.
+        if te_values.len() != 1 {
+            return Err(());
+        }
+        let codings: Vec<Vec<u8>> = te_values[0]
+            .split(|&b| b == b',')
+            .map(|t| trim_ows_bytes(t).to_ascii_lowercase())
+            .collect();
+        if codings.iter().any(std::vec::Vec::is_empty) {
+            return Err(());
+        }
+        let chunked_count = codings
+            .iter()
+            .filter(|c| c.as_slice() == b"chunked")
+            .count();
+        let last_is_chunked = codings.last().map(|c| c.as_slice() == b"chunked") == Some(true);
+        // `chunked` must appear exactly once and be the final coding (else no determinable
+        // length — a desync setup).
+        if chunked_count != 1 || !last_is_chunked {
+            return Err(());
+        }
+        return Ok(RespFraming::Chunked);
+    }
+    if cl_present {
+        // Exactly one Content-Length token (any duplication, even identical, is ambiguous).
+        if cl_tokens.len() != 1 {
+            return Err(());
+        }
+        let tok = cl_tokens[0];
+        if tok.is_empty() || !tok.iter().all(u8::is_ascii_digit) {
+            return Err(());
+        }
+        let n = std::str::from_utf8(tok)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(())?;
+        return Ok(RespFraming::Length(n));
+    }
+    Ok(RespFraming::CloseDelimited)
+}
+
+/// Trim leading + trailing OWS (SP / HTAB) from a byte slice.
+fn trim_ows_bytes(mut v: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = v {
+        if *first == b' ' || *first == b'\t' {
+            v = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = v {
+        if *last == b' ' || *last == b'\t' {
+            v = rest;
+        } else {
+            break;
+        }
+    }
+    v
 }
 
 // ---- low-level IO helpers --------------------------------------------------
@@ -731,64 +919,397 @@ fn find_head_end(b: &[u8]) -> Option<usize> {
     b.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
-/// Relay `src`→`dst` until `src` closes (for a close-delimited body — one with no
-/// Content-Length and no chunked framing — whose end *is* the connection close).
-async fn relay_to_close(src: &mut TcpStream, dst: &mut TcpStream) -> io::Result<()> {
-    tokio::io::copy(src, dst).await.map(|_| ())
+// ---- the pinned upstream connection + framed body forwarder ----------------
+
+/// The response-head overread / un-forwarded upstream byte buffer is capped: anything
+/// that cannot complete a chunk-size line or the terminal-chunk trailer section within
+/// this bound (a dripped size line, an endless trailer section) is a fail-closed error.
+const MAX_CHUNK_META: usize = 16 * 1024;
+
+/// A final (non-1xx) upstream response head, reduced to what the forwarder needs.
+struct FinalResp {
+    status: u16,
+    headers: HeaderMap,
+    /// The upstream asked to close after this response (`Connection: close`).
+    close: bool,
 }
 
-/// Relay a **chunked** response body `src`→`dst`, forwarding the chunk framing verbatim
-/// and returning once the terminating 0-chunk has been seen — so a keep-alive upstream
-/// (which never closes the connection) does not leave the client blocked waiting for a
-/// connection close. The client keeps the `Transfer-Encoding: chunked` header (see
-/// [`rewrite_response_head`]) and de-chunks the verbatim framing itself.
-///
-/// `already_forwarded` is the response-body prefix the caller already wrote to `dst` (read
-/// off the socket together with the response head); it is re-scanned to find the body's
-/// end, never re-sent. Newly read bytes are forwarded as they arrive. Because the fast-path
-/// owns the upstream connection and pipelines nothing, the upstream sends only this
-/// response, so nothing past the terminating chunk is ever forwarded. A `0`-length read
-/// before the terminating chunk is a truncated body → `Err` (the caller then closes the
-/// client, signalling the truncation rather than framing a clean end); malformed chunk
-/// framing is likewise an error (fail closed).
-async fn relay_chunked(
-    src: &mut TcpStream,
-    dst: &mut TcpStream,
-    already_forwarded: Vec<u8>,
-) -> io::Result<()> {
-    use boatramp_http::h1::chunked::{ChunkStep, next_chunk};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// One pinned upstream HTTP/1.1 connection: the socket plus a buffer of bytes read past
+/// the current message boundary (a response-head overread, or the start of the body). The
+/// buffer is the key to the anti-desync invariant — the forwarder consumes from it exactly
+/// up to each response's framed end and never forwards a byte it has not accounted for.
+struct UpstreamConn {
+    sock: TcpStream,
+    buf: Vec<u8>,
+}
 
-    // Bytes seen but not yet fully parsed into chunks. Consumed chunks are drained so this
-    // holds at most one partial chunk — the whole body is never buffered.
-    let mut pending = already_forwarded;
-    let mut tmp = [0u8; 16 * 1024];
-    loop {
-        // Advance through every complete chunk currently buffered.
+impl UpstreamConn {
+    async fn connect(addr: SocketAddr) -> io::Result<Self> {
+        let sock = TcpStream::connect(addr).await?;
+        sock.set_nodelay(true).ok();
+        Ok(Self {
+            sock,
+            buf: Vec::with_capacity(16 * 1024),
+        })
+    }
+
+    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.sock.write_all(bytes).await
+    }
+
+    /// Read one more chunk of bytes from the socket into `buf`; returns the count (0 = the
+    /// upstream closed its side).
+    async fn fill(&mut self) -> io::Result<usize> {
+        let mut tmp = [0u8; 16 * 1024];
+        let n = self.sock.read(&mut tmp).await?;
+        self.buf.extend_from_slice(&tmp[..n]);
+        Ok(n)
+    }
+
+    /// Parse one response head off the front of `buf` with the **hardened** h1 response
+    /// parser, consuming it from `buf` and leaving the body prefix behind. `None` = the
+    /// upstream closed before a head; a malformed head is a hard `Err` (fail closed).
+    async fn read_response_head(&mut self) -> io::Result<Option<boatramp_http::h1::ResponseHead>> {
+        use boatramp_http::h1::{RespParse, parse_response_head};
         loop {
-            match next_chunk(&pending) {
-                ChunkStep::Data { next, .. } => {
-                    pending.drain(..next);
+            match parse_response_head(&self.buf) {
+                RespParse::Complete { head, consumed } => {
+                    self.buf.drain(..consumed);
+                    return Ok(Some(head));
                 }
-                ChunkStep::Last { .. } => return Ok(()), // terminating 0-chunk → done
-                ChunkStep::Incomplete => break,          // need more bytes
-                ChunkStep::Reject(_) => {
+                RespParse::Reject => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "malformed chunked upstream body",
+                        "malformed upstream response head",
                     ));
+                }
+                RespParse::Incomplete => {
+                    if self.fill().await? == 0 {
+                        return if self.buf.is_empty() {
+                            Ok(None)
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "upstream closed mid response head",
+                            ))
+                        };
+                    }
                 }
             }
         }
-        let n = src.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "upstream closed before the terminating chunk",
-            ));
+    }
+
+    /// Read the **final** response head, forwarding each interim `1xx` head (no body) to
+    /// the client and continuing — a `100 Continue` / `103 Early Hints` is not the final
+    /// response, so it must never be body-framed or treated as close-delimited (F-5).
+    async fn read_final_response_head(
+        &mut self,
+        client: &mut TcpStream,
+        _method: &Method,
+    ) -> io::Result<Option<FinalResp>> {
+        loop {
+            let head = match self.read_response_head().await? {
+                Some(h) => h,
+                None => return Ok(None),
+            };
+            let status = head.status.as_u16();
+            if (100..200).contains(&status) {
+                // Interim response: forward the head verbatim-ish (hop-by-hop stripped),
+                // never a body, then read the next head from the same connection.
+                let out = build_interim_head(&head);
+                client.write_all(&out).await?;
+                continue;
+            }
+            let close = header_has_token(&head.headers, http::header::CONNECTION, "close");
+            return Ok(Some(FinalResp {
+                status,
+                headers: head.headers,
+                close,
+            }));
         }
-        dst.write_all(&tmp[..n]).await?;
-        pending.extend_from_slice(&tmp[..n]);
+    }
+
+    /// Forward exactly the framed response body to `client`. Returns `Ok(true)` when the
+    /// upstream is clean for keep-alive reuse (no bytes buffered past this response),
+    /// `Ok(false)` when trailing bytes were seen (a desync — the caller then closes).
+    async fn forward_body(
+        &mut self,
+        client: &mut TcpStream,
+        framing: &RespFraming,
+    ) -> io::Result<bool> {
+        match framing {
+            // No body: any buffered bytes are unsolicited (not a body — HEAD/204/304).
+            RespFraming::None => Ok(self.buf.is_empty()),
+            RespFraming::Length(total) => self.forward_length(client, *total).await,
+            RespFraming::Chunked => self.forward_chunked(client).await,
+            RespFraming::CloseDelimited => {
+                self.forward_to_close(client).await?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Forward a fixed-length body of `total` octets: drain up to `total` from `buf`, then
+    /// `splice()` the remainder socket→client (zero-copy on Linux). Forwards EXACTLY
+    /// `total` bytes — a `buf` that already holds more than `total` means the upstream
+    /// appended bytes past this response (desync) → those are NOT forwarded (F-3).
+    async fn forward_length(&mut self, client: &mut TcpStream, total: u64) -> io::Result<bool> {
+        let from_buf = usize::try_from(total)
+            .unwrap_or(usize::MAX)
+            .min(self.buf.len());
+        if from_buf > 0 {
+            client.write_all(&self.buf[..from_buf]).await?;
+        }
+        let trailing = self.buf.len() > from_buf; // bytes past the CL body already buffered
+        self.buf.drain(..from_buf);
+        let remaining = total - from_buf as u64;
+        if remaining > 0 {
+            // `from_buf == buf.len()` here (we took all of buf), so nothing is stranded.
+            splice_body(&self.sock, &*client, remaining as usize).await?;
+        }
+        Ok(!trailing)
+    }
+
+    /// Forward a **chunked** body framing-verbatim, STREAMING each chunk's payload rather
+    /// than buffering it (F-1: a 2 GB or hostile `7fff…` chunk is moved in read-sized
+    /// slices, never retained), and stopping EXACTLY at the terminating 0-chunk's end
+    /// (F-3: a second response appended after it is never forwarded). Returns `Ok(false)`
+    /// if bytes remain buffered past the terminal chunk (desync → close).
+    async fn forward_chunked(&mut self, client: &mut TcpStream) -> io::Result<bool> {
+        loop {
+            // 1) Pull a complete chunk-size line to the front of `buf` (bounded).
+            let (size, line_len) = loop {
+                match parse_chunk_size_line(&self.buf) {
+                    SizeLine::Got { size, line_len } => break (size, line_len),
+                    SizeLine::Reject => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "malformed chunk-size line",
+                        ));
+                    }
+                    SizeLine::Incomplete => {
+                        if self.buf.len() > MAX_CHUNK_META {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "chunk-size line exceeds bound",
+                            ));
+                        }
+                        if self.fill().await? == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "upstream closed before a chunk-size line",
+                            ));
+                        }
+                    }
+                }
+            };
+            if size == 0 {
+                // Terminal chunk: forward `0CRLF` + trailers + final CRLF, then stop.
+                return self.forward_terminal_chunk(client).await;
+            }
+            // 2) Forward the size-line + `size` payload octets + the trailing CRLF
+            //    verbatim, streaming (never buffering the whole payload).
+            self.forward_chunk_body(client, line_len, size).await?;
+        }
+    }
+
+    /// Stream one data chunk verbatim: `line_len` size-line bytes already at the front of
+    /// `buf`, then `size` payload octets, then a CRLF — forwarding in read-sized slices and
+    /// validating the terminating CRLF. The whole payload is never held in memory at once.
+    async fn forward_chunk_body(
+        &mut self,
+        client: &mut TcpStream,
+        line_len: usize,
+        size: usize,
+    ) -> io::Result<()> {
+        // Total verbatim bytes for this chunk: size-line + payload + CRLF. Checked so a
+        // near-`usize::MAX` declared size is a fail-closed error, not an overflow panic.
+        let payload_end = line_len
+            .checked_add(size)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk size overflow"))?; // index where the trailing CRLF begins
+        let chunk_total = payload_end
+            .checked_add(2)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk size overflow"))?;
+        let mut pos = 0usize; // bytes of THIS chunk already forwarded
+        while pos < chunk_total {
+            if self.buf.is_empty() && self.fill().await? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "upstream closed mid chunk",
+                ));
+            }
+            let avail = self.buf.len().min(chunk_total - pos);
+            // Validate the chunk's terminating CRLF as it passes (positions payload_end,
+            // payload_end+1) — a malformed terminator is a fail-closed error.
+            for i in 0..avail {
+                match pos + i {
+                    p if p == payload_end && self.buf[i] != b'\r' => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "bad chunk terminator",
+                        ));
+                    }
+                    p if p == payload_end + 1 && self.buf[i] != b'\n' => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "bad chunk terminator",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            client.write_all(&self.buf[..avail]).await?;
+            self.buf.drain(..avail);
+            pos += avail;
+        }
+        Ok(())
+    }
+
+    /// Forward the terminating 0-chunk (+ trailer section + final CRLF) verbatim, validated
+    /// by the hardened `next_chunk` (which rejects a framing-sensitive trailer / obs-fold),
+    /// and STOP there. Returns `Ok(false)` if bytes remain buffered past it (a second,
+    /// injected response — never forwarded as the client's next response; F-3).
+    async fn forward_terminal_chunk(&mut self, client: &mut TcpStream) -> io::Result<bool> {
+        use boatramp_http::h1::chunked::{ChunkStep, next_chunk};
+        loop {
+            match next_chunk(&self.buf) {
+                ChunkStep::Last { end } => {
+                    client.write_all(&self.buf[..end]).await?;
+                    self.buf.drain(..end);
+                    return Ok(self.buf.is_empty());
+                }
+                ChunkStep::Data { .. } => {
+                    // Unreachable (the size was 0), but fail closed rather than trust it.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected data chunk at terminator",
+                    ));
+                }
+                ChunkStep::Reject(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed terminal chunk",
+                    ));
+                }
+                ChunkStep::Incomplete => {
+                    if self.buf.len() > MAX_CHUNK_META {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "terminal chunk / trailers exceed bound",
+                        ));
+                    }
+                    if self.fill().await? == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "upstream closed before the terminating chunk",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Forward a close-delimited body: the buffered prefix, then everything until the
+    /// upstream closes its side (the close *is* the frame, so this terminates and the
+    /// connection is spent).
+    async fn forward_to_close(&mut self, client: &mut TcpStream) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            client.write_all(&self.buf).await?;
+            self.buf.clear();
+        }
+        tokio::io::copy(&mut self.sock, client).await.map(|_| ())
+    }
+
+    /// Whether the upstream has bytes ready to read **right now** — between responses, before
+    /// the next request is sent, so any such bytes are unsolicited (a queued/injected
+    /// response; F-3). Non-blocking: a non-ready socket reports no pending bytes.
+    async fn has_unsolicited_bytes(&self) -> io::Result<bool> {
+        if !self.buf.is_empty() {
+            return Ok(true);
+        }
+        std::future::poll_fn(|cx| {
+            let mut probe = [0u8; 1];
+            let mut rb = tokio::io::ReadBuf::new(&mut probe);
+            match self.sock.poll_peek(cx, &mut rb) {
+                Poll::Ready(Ok(_)) => Poll::Ready(Ok(!rb.filled().is_empty())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                // Not readable now ⇒ nothing buffered between responses.
+                Poll::Pending => Poll::Ready(Ok(false)),
+            }
+        })
+        .await
+    }
+}
+
+/// Build an interim (`1xx`) response head to forward to the client: the status line + all
+/// headers minus hop-by-hop, no body.
+fn build_interim_head(head: &boatramp_http::h1::ResponseHead) -> Vec<u8> {
+    let status = head.status.as_u16();
+    let reason = head.status.canonical_reason().unwrap_or("");
+    let mut out: Vec<u8> = format!("HTTP/1.1 {status} {reason}\r\n").into_bytes();
+    for (name, value) in head.headers.iter() {
+        if HOP_BY_HOP.contains(&name.as_str()) {
+            continue;
+        }
+        push_header(&mut out, name.as_str(), value.as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// The outcome of parsing a chunk-size line off the front of a buffer.
+enum SizeLine {
+    /// A complete `<hex>[;ext]CRLF` line: the decoded `size` and the line's total byte
+    /// length (through the CRLF).
+    Got { size: usize, line_len: usize },
+    /// No complete CRLF-terminated line yet — read more (bounded by the caller).
+    Incomplete,
+    /// Malformed (bare CR/LF, non-hex / overflowing size, oversized line) — fail closed.
+    Reject,
+}
+
+/// Largest chunk-size line (`<hex>;<ext>`) accepted — matches the h1 codec's bound.
+const MAX_CHUNK_SIZE_LINE: usize = 1024;
+
+/// Parse just the chunk-size line (not the payload) from the front of `buf`, so the
+/// payload can be **streamed** rather than buffered. Enforces strict CRLF framing and the
+/// hardened size rules (1..=16 hex digits, no `0x`/sign, `usize`-bounded).
+fn parse_chunk_size_line(buf: &[u8]) -> SizeLine {
+    let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
+        return SizeLine::Incomplete;
+    };
+    // Strict CRLF: the byte before LF must be CR, and no bare CR inside the line.
+    if nl == 0 || buf[nl - 1] != b'\r' {
+        return SizeLine::Reject;
+    }
+    let line = &buf[..nl - 1];
+    if line.contains(&b'\r') || line.len() > MAX_CHUNK_SIZE_LINE {
+        return SizeLine::Reject;
+    }
+    // Strip an optional chunk-extension (`;...`); the size is the hex prefix.
+    let size_bytes = match line.iter().position(|&b| b == b';') {
+        Some(i) => &line[..i],
+        None => line,
+    };
+    let size_bytes = trim_ows_bytes(size_bytes);
+    if size_bytes.is_empty()
+        || size_bytes.len() > 16
+        || !size_bytes.iter().all(u8::is_ascii_hexdigit)
+    {
+        return SizeLine::Reject;
+    }
+    let Ok(s) = std::str::from_utf8(size_bytes) else {
+        return SizeLine::Reject;
+    };
+    let Ok(size64) = u64::from_str_radix(s, 16) else {
+        return SizeLine::Reject;
+    };
+    let Ok(size) = usize::try_from(size64) else {
+        return SizeLine::Reject;
+    };
+    SizeLine::Got {
+        size,
+        line_len: nl + 1,
     }
 }
 
@@ -879,13 +1400,6 @@ pub fn splice_supported() -> bool {
 
 // ---- small string helpers --------------------------------------------------
 
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
-
 fn strip_port(host: &str) -> &str {
     host.rsplit_once(':')
         .filter(|(h, _)| !h.contains(':') || h.starts_with('['))
@@ -950,32 +1464,175 @@ mod tests {
         }
     }
 
-    #[test]
-    fn request_head_parse_only_http11_bodyless() {
-        let (m, t, h) = parse_request_head(
-            b"GET /b/100k?x=1 HTTP/1.1\r\nHost: a.example\r\nAccept: */*\r\n\r\n",
-        )
-        .expect("valid GET");
-        assert_eq!(m, "GET");
-        assert_eq!(t, "/b/100k?x=1");
-        assert_eq!(header(&h, "host"), Some("a.example"));
-        // HTTP/1.0 is rejected (different keep-alive semantics → fall back).
-        assert!(parse_request_head(b"GET / HTTP/1.0\r\nHost: a\r\n\r\n").is_none());
+    /// Parse a response head into the forwarder's [`FinalResp`] for the head-building /
+    /// framing unit tests (the hardened h1 response parser is the production path).
+    fn final_resp(bytes: &[u8]) -> FinalResp {
+        use boatramp_http::h1::{RespParse, parse_response_head};
+        let RespParse::Complete { head, .. } = parse_response_head(bytes) else {
+            panic!(
+                "response head did not parse: {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        };
+        FinalResp {
+            status: head.status.as_u16(),
+            close: header_has_token(&head.headers, http::header::CONNECTION, "close"),
+            headers: head.headers,
+        }
     }
 
     #[test]
-    fn response_head_parse_detects_length_chunked_close() {
-        let (st, content_length, chunked, close) = parse_response_head(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 102400\r\nContent-Type: x\r\n\r\n",
+    fn fastpath_request_gate_only_http11_bodyless_get_head() {
+        let req = parse_fastpath_request(
+            b"GET /b/100k?x=1 HTTP/1.1\r\nHost: a.example\r\nAccept: */*\r\n\r\n",
+        )
+        .expect("valid GET");
+        assert_eq!(req.method, Method::GET);
+        assert_eq!(req.target, "/b/100k?x=1");
+        assert_eq!(
+            req.headers.get(http::header::HOST).unwrap().as_bytes(),
+            b"a.example"
         );
-        assert_eq!(st, Some(200));
-        assert_eq!(content_length, Some(102400));
-        assert!(!chunked && !close);
-        let (_, content_length2, chunked2, close2) = parse_response_head(
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        // HTTP/1.0 is rejected (different keep-alive semantics → fall back).
+        assert!(parse_fastpath_request(b"GET / HTTP/1.0\r\nHost: a\r\n\r\n").is_none());
+        // A declared body (Content-Length or Transfer-Encoding) is rejected (not body-less).
+        assert!(
+            parse_fastpath_request(b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n")
+                .is_none()
         );
-        assert_eq!(content_length2, None);
-        assert!(chunked2 && close2);
+        assert!(
+            parse_fastpath_request(
+                b"GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )
+            .is_none()
+        );
+        // Upgrade / Expect are rejected.
+        assert!(
+            parse_fastpath_request(b"GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\n\r\n")
+                .is_none()
+        );
+        assert!(
+            parse_fastpath_request(b"GET / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\r\n")
+                .is_none()
+        );
+        // POST is not idempotent/body-less-eligible.
+        assert!(
+            parse_fastpath_request(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n")
+                .is_none()
+        );
+    }
+
+    /// Reproduce-first (F-4, request smuggling): a header carrying a bare `\n` (or bare `\r`)
+    /// would, re-emitted verbatim to the upstream, smuggle a second header line past the
+    /// framing guard (`X: y\nTransfer-Encoding: chunked`). The hardened h1 parser rejects a
+    /// bare CR/LF, so such a request is never classified eligible. Pre-fix the ad-hoc
+    /// `str::split("\r\n")` parser missed the embedded `\n` and `build_upstream_head`
+    /// re-emitted it.
+    #[test]
+    fn fastpath_request_rejects_bare_crlf_header_smuggling() {
+        // A bare LF embedded in a header value → reject (would smuggle a TE header).
+        assert!(
+            parse_fastpath_request(
+                b"GET / HTTP/1.1\r\nHost: a\r\nX: y\nTransfer-Encoding: chunked\r\n\r\n"
+            )
+            .is_none()
+        );
+        // A bare CR embedded in a header value → reject.
+        assert!(
+            parse_fastpath_request(
+                b"GET / HTTP/1.1\r\nHost: a\r\nX: y\rTransfer-Encoding: chunked\r\n\r\n"
+            )
+            .is_none()
+        );
+        // A bare-LF-terminated request line → reject.
+        assert!(parse_fastpath_request(b"GET / HTTP/1.1\nHost: a\r\n\r\n").is_none());
+        // Sanity: the same request without the bare LF (the two headers properly CRLF-framed)
+        // is rejected too, because it then carries a Transfer-Encoding (a declared body).
+        assert!(
+            parse_fastpath_request(
+                b"GET / HTTP/1.1\r\nHost: a\r\nX: y\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn response_framing_is_resolved_strictly() {
+        // A plain Content-Length response frames by length.
+        assert_eq!(
+            resolve_response_framing(
+                200,
+                &Method::GET,
+                &final_resp(b"HTTP/1.1 200 OK\r\nContent-Length: 102400\r\n\r\n").headers,
+            ),
+            Ok(RespFraming::Length(102400))
+        );
+        // Transfer-Encoding: chunked frames chunked.
+        assert_eq!(
+            resolve_response_framing(
+                200,
+                &Method::GET,
+                &final_resp(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").headers,
+            ),
+            Ok(RespFraming::Chunked)
+        );
+        // HEAD / 204 / 304 never carry a body regardless of headers.
+        assert_eq!(
+            resolve_response_framing(
+                200,
+                &Method::HEAD,
+                &final_resp(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n").headers,
+            ),
+            Ok(RespFraming::None)
+        );
+        assert_eq!(
+            resolve_response_framing(
+                204,
+                &Method::GET,
+                &final_resp(b"HTTP/1.1 204 No Content\r\n\r\n").headers,
+            ),
+            Ok(RespFraming::None)
+        );
+        // No framing headers → close-delimited.
+        assert_eq!(
+            resolve_response_framing(
+                200,
+                &Method::GET,
+                &final_resp(b"HTTP/1.1 200 OK\r\nContent-Type: x\r\n\r\n").headers,
+            ),
+            Ok(RespFraming::CloseDelimited)
+        );
+        // F-2: CL+TE, multiple TE, and non-last chunked are all rejected (502/close).
+        assert!(
+            resolve_response_framing(
+                200,
+                &Method::GET,
+                &final_resp(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .headers,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_response_framing(
+                200,
+                &Method::GET,
+                &final_resp(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .headers,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_response_framing(
+                200,
+                &Method::GET,
+                &final_resp(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n").headers,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -987,37 +1644,95 @@ mod tests {
     }
 
     #[test]
-    fn response_head_rewrite_drops_hop_by_hop_keeps_length() {
+    fn downstream_head_drops_hop_by_hop_keeps_length() {
         let up = Upstream::default();
-        let raw: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n";
-        let out = rewrite_response_head(raw, &up, false);
-        let text = String::from_utf8(out).unwrap();
+        // A Content-Length response: hop-by-hop (Connection) stripped, CL kept.
+        let resp = final_resp(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\nContent-Type: text/plain\r\n\r\n",
+        );
+        let text =
+            String::from_utf8(build_downstream_head(&resp, &up, &RespFraming::Length(3))).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(text.contains("content-length: 3\r\n") || text.contains("Content-Length: 3\r\n"));
+        assert!(text.to_ascii_lowercase().contains("content-length: 3\r\n"));
         assert!(
             text.to_ascii_lowercase()
                 .contains("content-type: text/plain")
         );
-        // Hop-by-hop headers are stripped (keep_chunked_te = false).
         assert!(!text.to_ascii_lowercase().contains("connection:"));
-        assert!(!text.to_ascii_lowercase().contains("transfer-encoding:"));
+    }
 
-        // With keep_chunked_te = true (a chunked passthrough) the chunked
-        // Transfer-Encoding is preserved so the client can delimit the body; the other
-        // hop-by-hop headers are still stripped.
-        let kept = String::from_utf8(rewrite_response_head(raw, &up, true)).unwrap();
-        assert!(
-            kept.to_ascii_lowercase()
-                .contains("transfer-encoding: chunked"),
-            "chunked passthrough must keep Transfer-Encoding: {kept}"
+    /// F-2: a chunked response that ALSO carries Content-Length must be forwarded with the
+    /// Content-Length STRIPPED (RFC 9112 §6.1) so a downstream preferring CL cannot desync.
+    /// (The both-headers response is rejected by `resolve_response_framing`; this guards the
+    /// defense-in-depth strip in `build_downstream_head` for the chunked-forward path.)
+    #[test]
+    fn downstream_head_strips_content_length_when_chunked() {
+        let up = Upstream::default();
+        // Parse a chunked response (without the conflicting CL, which the hardened response
+        // parser would otherwise accept as two separate fields) then force the chunked
+        // framing to exercise the CL strip with a CL present in the map.
+        let resp = final_resp(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n",
         );
-        assert!(!kept.to_ascii_lowercase().contains("connection:"));
+        let text =
+            String::from_utf8(build_downstream_head(&resp, &up, &RespFraming::Chunked)).unwrap();
+        // The chunked Transfer-Encoding is kept (so the client can delimit the body)…
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "chunked passthrough must keep Transfer-Encoding: {text}"
+        );
+        // …but Content-Length is stripped (no CL+TE to the client).
+        assert!(
+            !text.to_ascii_lowercase().contains("content-length:"),
+            "Content-Length must be stripped when forwarding chunked (F-2): {text}"
+        );
     }
 
     #[test]
     fn head_end_index() {
         assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n\r\nBODY"), Some(18));
         assert_eq!(find_head_end(b"partial\r\nno end"), None);
+    }
+
+    #[test]
+    fn chunk_size_line_parses_and_rejects() {
+        // A normal size line + an extension.
+        assert!(matches!(
+            parse_chunk_size_line(b"5\r\nhello"),
+            SizeLine::Got {
+                size: 5,
+                line_len: 3
+            }
+        ));
+        assert!(matches!(
+            parse_chunk_size_line(b"a;ext=1\r\n...."),
+            SizeLine::Got {
+                size: 10,
+                line_len: 9
+            }
+        ));
+        // The terminal 0-chunk.
+        assert!(matches!(
+            parse_chunk_size_line(b"0\r\n\r\n"),
+            SizeLine::Got {
+                size: 0,
+                line_len: 3
+            }
+        ));
+        // No CRLF yet → Incomplete.
+        assert!(matches!(parse_chunk_size_line(b"5"), SizeLine::Incomplete));
+        // Bare LF (no CR) is a hard reject (anti-smuggling).
+        assert!(matches!(parse_chunk_size_line(b"5\n"), SizeLine::Reject));
+        // Non-hex / too-long size → reject.
+        assert!(matches!(
+            parse_chunk_size_line(b"xyz\r\n"),
+            SizeLine::Reject
+        ));
+        assert!(matches!(
+            parse_chunk_size_line(b"11111111111111111\r\n"),
+            SizeLine::Reject
+        ));
     }
 
     /// Regression (reproduce-first): a `Transfer-Encoding: chunked` upstream that keeps
@@ -1037,8 +1752,8 @@ mod tests {
     /// (curl `--http1.1`) would — pre-fix the body read blocks until the timeout fires.
     #[tokio::test]
     async fn chunked_keepalive_upstream_does_not_hang_the_client() {
-        use boatramp_core::config::SiteConfig;
-        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::config::{DomainConfig, SiteConfig};
+        use boatramp_core::deploy::{DeployStore, Manifest};
         use boatramp_core::gateway::{GatewayConfig, GatewayRoute, Upstream};
         use boatramp_core::kv::MemoryKv;
         use boatramp_core::project::ProjectRef;
@@ -1084,6 +1799,10 @@ mod tests {
             Arc::new(MemoryKv::new()),
         );
         let cfg = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("test.local".into()),
+                ..Default::default()
+            },
             gateway: Some(GatewayConfig {
                 upstreams: std::iter::once((
                     "backend".to_string(),
@@ -1105,6 +1824,13 @@ mod tests {
             .set_site_config(ProjectRef::DEFAULT, "www", &cfg)
             .await
             .unwrap();
+        // The per-request re-verification ([`SplicePlan::reverify`]) re-runs the full
+        // routing decision (host→site + manifest), so a manifest must be activated.
+        let id = deploy.put_manifest(&Manifest::default()).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "www", &id)
+            .await
+            .unwrap();
 
         let posture = SecurityProfile::Dev.preset();
         let resolved = proxy::resolve_target(
@@ -1122,6 +1848,7 @@ mod tests {
             },
             site: "www".to_string(),
             project: ProjectRef::DEFAULT.as_str().to_string(),
+            target: format!("http://{up_addr}"),
         };
         let ctx = SpliceCtx {
             deploy,
@@ -1177,6 +1904,364 @@ mod tests {
             head.headers
         );
         assert_eq!(body, b"hello world", "de-chunked body mismatch");
+    }
+
+    /// Deploy a gateway site (host `test.local`, route `/**` → `up_addr`) + build a pinned
+    /// [`SplicePlan`]/[`SpliceCtx`] for the cross-platform tests that drive `splice_conn`
+    /// directly. (The per-request re-verification re-runs the full routing decision, so a
+    /// resolvable host→site + an activated manifest are required.)
+    async fn direct_plan_ctx(up_addr: SocketAddr) -> (SplicePlan, SpliceCtx) {
+        use boatramp_core::config::{DomainConfig, SiteConfig};
+        use boatramp_core::deploy::{DeployStore, Manifest};
+        use boatramp_core::gateway::{GatewayConfig, GatewayRoute, Upstream};
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::security::SecurityProfile;
+
+        let deploy = DeployStore::new(
+            Arc::new(boatramp_storage::FsStorage::new(std::env::temp_dir())),
+            Arc::new(MemoryKv::new()),
+        );
+        let cfg = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("test.local".into()),
+                ..Default::default()
+            },
+            gateway: Some(GatewayConfig {
+                upstreams: std::iter::once((
+                    "backend".to_string(),
+                    Upstream {
+                        target: format!("http://{up_addr}"),
+                        ..Default::default()
+                    },
+                ))
+                .collect(),
+                routes: vec![GatewayRoute {
+                    matches: "/**".into(),
+                    upstream: "backend".into(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        deploy
+            .set_site_config(ProjectRef::DEFAULT, "www", &cfg)
+            .await
+            .unwrap();
+        let id = deploy.put_manifest(&Manifest::default()).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "www", &id)
+            .await
+            .unwrap();
+        let posture = SecurityProfile::Dev.preset();
+        let resolved = proxy::resolve_target(
+            &format!("http://{up_addr}"),
+            proxy::GatewayTargetPolicy::Operator,
+            &posture,
+        )
+        .await
+        .unwrap();
+        let plan = SplicePlan {
+            resolved,
+            upstream: Upstream {
+                target: format!("http://{up_addr}"),
+                ..Default::default()
+            },
+            site: "www".to_string(),
+            project: ProjectRef::DEFAULT.as_str().to_string(),
+            target: format!("http://{up_addr}"),
+        };
+        let ctx = SpliceCtx {
+            deploy,
+            posture,
+            daemon: None,
+        };
+        (plan, ctx)
+    }
+
+    /// Spawn `splice_conn` with `plan`/`ctx` behind a loopback socket pair; the fallback
+    /// `serve` is an EMPTY router (so a request that falls back is answered 404, not proxied
+    /// — letting a test tell "spliced to the upstream" apart from "fell back"). Returns the
+    /// client end of the connection.
+    async fn spawn_splice_conn(plan: SplicePlan, ctx: SpliceCtx) -> TcpStream {
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let client = TcpStream::connect(front_addr).await.unwrap();
+        let (server_side, peer) = front.accept().await.unwrap();
+        let serve: crate::ServeInput = axum::Router::new().into();
+        tokio::spawn(async move {
+            let _ = splice_conn(server_side, peer, plan, ctx, serve).await;
+        });
+        client
+    }
+
+    /// Reproduce-first (F-3, response-queue desync): a second response the upstream appends
+    /// right after a chunked response's terminating 0-chunk must NOT be forwarded to the
+    /// client as its next response (cross-user cache/response poisoning on a pooled conn).
+    /// Pre-fix `relay_chunked` wrote the body prefix — which held the injected response — to
+    /// the client *before* parsing, so the injection leaked through. The fix forwards EXACTLY
+    /// up to the terminal chunk and closes on trailing bytes.
+    #[tokio::test]
+    async fn chunked_trailing_injected_response_is_not_forwarded_to_the_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => break,
+                        }
+                    }
+                    // A complete chunked response, then — in the SAME burst — an injected
+                    // second response. A compliant proxy forwards only the first.
+                    let resp: &[u8] = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n\
+                        5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n\
+                        HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nPWNEDPWNED";
+                    let _ = s.write_all(resp).await;
+                    // Hold the connection open (keep-alive), as a pooled origin would.
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let (plan, ctx) = direct_plan_ctx(up_addr).await;
+        let mut client = spawn_splice_conn(plan, ctx).await;
+        client
+            .write_all(b"GET /p HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let read = timeout(Duration::from_secs(5), client.read_to_end(&mut out)).await;
+        assert!(read.is_ok(), "client hung after the chunked response");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("PWNED"),
+            "an injected response appended after the 0-chunk leaked to the client (F-3): {text}"
+        );
+        // The legitimate chunked body is still delivered (framing forwarded verbatim).
+        assert!(
+            text.contains("hello") && text.contains("world"),
+            "the legitimate chunked body was not delivered: {text}"
+        );
+    }
+
+    /// Reproduce-first (F-1, OOM/unbounded buffer): a hostile upstream that opens an endless
+    /// chunk-size line (hex digits, never a CRLF) must be failed closed at a bounded buffer,
+    /// not buffered without limit. Pre-fix `relay_chunked` appended every byte to `pending`
+    /// until a chunk completed — an unterminated size line grew it without bound. The fix
+    /// caps the size-line/meta buffer and errors past it.
+    #[tokio::test]
+    async fn hostile_unbounded_chunk_size_line_is_bounded_not_buffered() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let written = Arc::new(AtomicU64::new(0));
+        let written_up = written.clone();
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                let written_up = written_up.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => break,
+                        }
+                    }
+                    if s.write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // An endless chunk-size line: valid hex digits, never a CRLF. Bounded by
+                    // a hard 8 MiB cap so the test terminates even if the proxy (buggily)
+                    // keeps buffering.
+                    let block = [b'a'; 8192];
+                    let mut sent = 0u64;
+                    while sent < 8 * 1024 * 1024 {
+                        if s.write_all(&block).await.is_err() {
+                            break; // the proxy closed the connection (bounded — the fix)
+                        }
+                        sent += block.len() as u64;
+                        written_up.store(sent, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        let (plan, ctx) = direct_plan_ctx(up_addr).await;
+        let mut client = spawn_splice_conn(plan, ctx).await;
+        client
+            .write_all(b"GET /p HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let read = timeout(Duration::from_secs(10), client.read_to_end(&mut out)).await;
+        assert!(
+            read.is_ok(),
+            "client hung on a hostile unbounded chunk-size line"
+        );
+        // The forwarder must have failed closed after a BOUNDED read, closing the upstream —
+        // not consumed/buffered the whole hostile stream. (The margin is generous to absorb
+        // in-flight TCP send/receive buffering; the buggy path buffers the full 8 MiB.)
+        let total = written.load(Ordering::Relaxed);
+        assert!(
+            total < 2 * 1024 * 1024,
+            "the forwarder buffered an unbounded chunk-size line ({total} bytes) instead of \
+             failing closed at the bound (F-1)"
+        );
+    }
+
+    /// Reproduce-first (F-5, 1xx hang): a `1xx` interim upstream response (100/103) must be
+    /// forwarded and the NEXT response read as the final one — never treated as the final
+    /// (no CL/TE → close-delimited → hang on a keep-alive upstream). Pre-fix `head_only`
+    /// only covered HEAD/204/304, so a 1xx fell into `relay_to_close` and hung.
+    #[tokio::test]
+    async fn interim_1xx_response_is_forwarded_then_the_final_is_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => break,
+                        }
+                    }
+                    // A 103 interim, then the final 200 — then HOLD the connection open
+                    // (keep-alive). Pre-fix the 103 is framed as close-delimited and the
+                    // relay waits forever for a close that never comes.
+                    let resp: &[u8] =
+                        b"HTTP/1.1 103 Early Hints\r\nlink: </s.css>; rel=preload\r\n\r\n\
+                        HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello";
+                    let _ = s.write_all(resp).await;
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let (plan, ctx) = direct_plan_ctx(up_addr).await;
+        let mut client = spawn_splice_conn(plan, ctx).await;
+        client
+            .write_all(b"GET /p HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let read = timeout(Duration::from_secs(5), client.read_to_end(&mut out)).await;
+        assert!(
+            read.is_ok(),
+            "client hung — a 1xx interim response was mis-framed as the final (F-5)"
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("103 Early Hints"),
+            "the interim 1xx was not forwarded: {text}"
+        );
+        assert!(
+            text.contains("200 OK") && text.contains("hello"),
+            "the final response was not delivered after the 1xx: {text}"
+        );
+    }
+
+    /// Reproduce-first (F-6, subsequent-request guard): the full header-framing guard must
+    /// run on EVERY keep-alive request, so a `GET` carrying `Content-Length` on request #2
+    /// is NOT spliced (it would forward the CL to the upstream with no body — a desync). It
+    /// must fall back to the userspace router instead. Pre-fix request #2 re-checked only
+    /// method + route and the CL was deemed eligible.
+    #[tokio::test]
+    async fn get_with_content_length_on_request_two_falls_back_not_spliced() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => {}
+                        }
+                        // A distinctive body so a test can tell an upstream (spliced) reply
+                        // apart from a userspace-fallback (404) reply. Head + body in one
+                        // write so the body is in-buffer (no kernel splice needed → the
+                        // forwarder's framing logic runs on every target).
+                        let _ = s
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nUPSTREAM-BODY",
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let (plan, ctx) = direct_plan_ctx(up_addr).await;
+        let mut client = spawn_splice_conn(plan, ctx).await;
+        // Request 1: a clean GET — spliced to the upstream.
+        client
+            .write_all(b"GET /a HTTP/1.1\r\nHost: test.local\r\n\r\n")
+            .await
+            .unwrap();
+        let r1 = read_one_response(&mut client).await;
+        assert!(
+            r1.contains("UPSTREAM-BODY"),
+            "request 1 was not spliced to the upstream: {r1}"
+        );
+        // Request 2: a GET carrying a Content-Length — must fall back (not be spliced). CL:0
+        // (no body) keeps `leftover` empty, so the header-framing guard in
+        // `parse_fastpath_request` is the SOLE gate that must reject it (any declared length
+        // is rejected the same way). The empty fallback router answers 404, so the reply is
+        // NOT the upstream body.
+        client
+            .write_all(
+                b"GET /b HTTP/1.1\r\nHost: test.local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        let read = timeout(Duration::from_secs(5), client.read_to_end(&mut rest)).await;
+        assert!(read.is_ok(), "request 2 hung (desync)");
+        let text = String::from_utf8_lossy(&rest);
+        assert!(
+            text.starts_with("HTTP/1.1 "),
+            "request 2 got no HTTP response: {text}"
+        );
+        assert!(
+            !text.contains("UPSTREAM-BODY"),
+            "a GET with Content-Length was spliced to the upstream on request #2 (F-6): {text}"
+        );
     }
 
     /// Regression (real serve path, Linux): the whole plaintext fast-path — `serve` →
@@ -1552,7 +2637,7 @@ mod tests {
         );
     }
 
-    // ---- property-based fuzzing of the hand-written parsers -----------------
+    // ---- property-based fuzzing of the fast-path parsers --------------------
     // The fast-path is default-on, so its byte parsers must be panic-free on
     // adversarial input, and must never let a request/response through in a way
     // that could desync the upstream (HTTP request smuggling).
@@ -1560,43 +2645,43 @@ mod tests {
         #[test]
         fn parsers_never_panic_on_arbitrary_bytes(data: Vec<u8>) {
             // The only requirement: no panic / no hang on any input.
-            let _ = parse_request_head(&data);
-            let _ = parse_response_head(&data);
-            let up = Upstream::default();
-            let _ = rewrite_response_head(&data, &up, false);
-            let _ = rewrite_response_head(&data, &up, true);
+            let _ = parse_fastpath_request(&data);
+            let _ = parse_chunk_size_line(&data);
             let _ = find_head_end(&data);
         }
 
         #[test]
         fn parsers_never_panic_on_arbitrary_ascii(s in ".{0,4096}") {
-            let _ = parse_request_head(s.as_bytes());
-            let _ = parse_response_head(s.as_bytes());
+            let _ = parse_fastpath_request(s.as_bytes());
+            let _ = parse_chunk_size_line(s.as_bytes());
         }
 
-        // Desync guard: any response advertising *both* Content-Length and chunked
-        // Transfer-Encoding must be reported as chunked, so `splice_conn` takes the
-        // relay-and-close path instead of splicing a bounded count it can't trust.
+        // Desync guard (F-2): any response advertising BOTH Content-Length and chunked
+        // Transfer-Encoding is REJECTED outright (fail closed) — never resolved to a
+        // forwardable framing a downstream could re-interpret.
         #[test]
-        fn cl_plus_te_response_is_never_treated_as_pure_length(len in 0usize..1_000_000) {
+        fn cl_plus_te_response_is_rejected(len in 0u64..1_000_000) {
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nTransfer-Encoding: chunked\r\n\r\n"
             );
-            let (_, _content_length, chunked, _close) = parse_response_head(head.as_bytes());
-            proptest::prop_assert!(chunked, "CL+TE must be flagged chunked (desync guard)");
+            let resp = final_resp(head.as_bytes());
+            proptest::prop_assert!(
+                resolve_response_framing(resp.status, &Method::GET, &resp.headers).is_err(),
+                "CL+TE must be rejected (desync guard)"
+            );
         }
 
         // A well-formed GET head always round-trips its method + target through the
-        // parser (parser and re-serializer agree on the request line).
+        // hardened fast-path parser.
         #[test]
         fn wellformed_get_head_roundtrips(path in "/[a-zA-Z0-9_/.-]{0,64}", host in "[a-z][a-z0-9.-]{0,32}") {
             let head = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: */*\r\n\r\n");
-            let parsed = parse_request_head(head.as_bytes());
+            let parsed = parse_fastpath_request(head.as_bytes());
             proptest::prop_assert!(parsed.is_some());
-            let (m, t, h) = parsed.unwrap();
-            proptest::prop_assert_eq!(m, "GET");
-            proptest::prop_assert_eq!(t, path);
-            proptest::prop_assert_eq!(header(&h, "host"), Some(host.as_str()));
+            let req = parsed.unwrap();
+            proptest::prop_assert_eq!(req.method, Method::GET);
+            proptest::prop_assert_eq!(&req.target, &path);
+            proptest::prop_assert_eq!(req.headers.get(http::header::HOST).unwrap().as_bytes(), host.as_bytes());
         }
     }
 }
