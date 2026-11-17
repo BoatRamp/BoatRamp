@@ -1918,6 +1918,7 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wasmtime-wasi-io",
+ "wat",
  "webpki-roots 1.0.10",
 ]
 

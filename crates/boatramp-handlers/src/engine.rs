@@ -1,6 +1,7 @@
 //! The wasmtime component engine: compile (cached by blob hash), instantiate
 //! per request, drive `wasi:http/incoming-handler`, and enforce limits.
 
+use std::any::Any;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
@@ -16,7 +17,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper::body::{Body as HttpBody, Frame};
 use lru::LruCache;
 use tokio::sync::Semaphore;
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Component, InstancePre, Linker, ResourceTable, Val};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::sockets::SocketAddrUse;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -442,9 +443,38 @@ impl From<wasmtime::Error> for HandlerError {
     }
 }
 
+/// Embedder-supplied host interfaces for the **host-world lane** (U7). An embedder that runs a
+/// component of a world boatramp does not itself define — e.g. uchron's cells, which import
+/// `uchron:engine/engine` and export `run` — registers its own host interfaces on the lane's linker
+/// through this trait, set once on the engine via
+/// [`HandlerEngine::with_host_interfaces`](HandlerEngine::with_host_interfaces).
+///
+/// [`add_to_linker`](Self::add_to_linker) runs **host-side**, on the lane's own linker — a fresh
+/// linker that offers `wasi:io` and boatramp's grantable capability bindings and **nothing else of
+/// WASI** (no clocks / random / sockets / cli / filesystem / http; see
+/// [`build_world_linker`](HandlerEngine::build_world_linker)). The embedder reaches its own
+/// per-invocation state through [`HostState::embedder_state`]: `call_export` moves a
+/// `Box<dyn Any + Send>` into a fresh store per call, and the host functions the embedder registers
+/// downcast it. The slot is per-store, so no embedder state is shared or reused across invocations.
+///
+/// Generic plumbing: the trait carries no uchron (or any embedder) semantics; it is purely "the
+/// embedder names the extra host imports its world needs".
+pub trait HostInterfaces: Send + Sync {
+    /// Register the embedder's host interfaces on the world lane's `linker`. Called once per
+    /// compiled world component (at `instantiate_pre` time), exactly as boatramp's own
+    /// `bindings::*::add_to_linker` are. Inside a registered host function, reach per-invocation
+    /// embedder state with [`HostState::embedder_state`].
+    fn add_to_linker(&self, linker: &mut Linker<HostState>) -> wasmtime::Result<()>;
+}
+
 /// Per-store host state: the WASI + WASI-HTTP contexts, the resource table, the
 /// memory limiter, and the per-site capability bindings (kv/blob/sql) this
 /// invocation was granted.
+///
+/// `pub` for the **host-world lane** (U7): an embedder's [`HostInterfaces::add_to_linker`] names
+/// `Linker<HostState>` to register its host interfaces, and its host functions call
+/// [`embedder_state`](Self::embedder_state) to reach the per-invocation slot. All fields stay
+/// private — the embedder touches only the slot, never boatramp's internal state.
 /// Wraps [`StoreLimits`] to *observe* a denied linear-memory growth, so a guest that traps after
 /// exhausting its (lane ∧ component) memory budget is classified as [`HandlerError::OutOfMemory`]
 /// rather than an opaque `trap`. It changes NO policy: every decision is forwarded to the inner
@@ -504,12 +534,20 @@ impl wasmtime::ResourceLimiter for MemLimiter {
     }
 }
 
-struct HostState {
+pub struct HostState {
     table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
     limits: MemLimiter,
     bindings: Bindings,
+    /// The **host-world lane**'s per-invocation embedder slot (U7): the `Box<dyn Any + Send>` that
+    /// [`HandlerEngine::call_export`] moves into this store for one call. The embedder's host
+    /// functions (registered via [`HostInterfaces::add_to_linker`]) downcast it through
+    /// [`embedder_state`](Self::embedder_state). `None` on every non-world store (request / consumer /
+    /// session / tcp-connection), which never reaches it — only the world linker links the embedder's
+    /// interfaces. Lives and dies with the store, so it is isolated per invocation: a fresh store per
+    /// `call_export` means no cross-invocation leak or reuse of embedder state.
+    embedder: Option<Box<dyn Any + Send>>,
     /// This invocation's guest-egress policy, carried as the `wasi:http` [`WasiHttpHooks`] so the
     /// SSRF guard + self-egress-depth cap + dev-posture extra-CA send run on every guest outbound
     /// request. (wasmtime 49 moved the outbound-send override off `WasiHttpView::send_request` onto
@@ -598,6 +636,32 @@ impl HostState {
     /// drive task and so cannot be read back directly after the trap.
     fn oom_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.limits.oom)
+    }
+
+    /// The **host-world lane**'s per-invocation embedder slot (U7), for an embedder's host function
+    /// to downcast to its own per-call state. [`HandlerEngine::call_export`] always sets it on a
+    /// world store before the guest runs, so it is `Some` wherever the embedder's interfaces are
+    /// reachable; the `expect` is an engine invariant (the embedder's interfaces are linked **only**
+    /// on the world lane, whose store this method is reached through), never guest-triggerable.
+    ///
+    /// The infallible `&mut (dyn Any + Send)` is deliberate (Security review F5): returning a
+    /// `Result`/`Option` here would push an impossible-case branch into every embedder host function
+    /// for a condition that cannot occur, so the invariant is enforced by construction, not the type.
+    pub fn embedder_state(&mut self) -> &mut (dyn Any + Send) {
+        self.embedder
+            .as_deref_mut()
+            .expect("embedder slot is set by call_export on every host-world-lane store")
+    }
+}
+
+impl wasmtime_wasi_io::IoView for HostState {
+    /// The resource table backing `wasi:io` on the host-world lane. This is the **same** table
+    /// `wasmtime_wasi`'s `WasiView` exposes (`ctx().table`), so the `input-stream` / `output-stream`
+    /// resources the boatramp bindings (blob/invoke) push are the exact type the lane's `wasi:io`
+    /// host expects. Lets [`wasmtime_wasi_io::add_to_linker_async`] add `wasi:io` **alone**, without
+    /// `wasmtime_wasi`'s clocks / random / sockets / cli / filesystem.
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
     }
 }
 
@@ -1964,6 +2028,21 @@ pub struct HandlerEngine {
     /// [`DEFAULT_DNS_PUBLISH_BUDGET`].
     #[cfg_attr(not(feature = "dns-publish"), allow(dead_code))]
     dns_publish_budget_default: u32,
+    /// Compile cache for the **host-world lane** (U7) — components of an embedder-named world
+    /// (`run` export + embedder imports), a different world than the request `ProxyPre` / consumer /
+    /// session caches. Keyed by component blob hash, holds the generic
+    /// [`InstancePre`](wasmtime::component::InstancePre) (no typed `bindgen!` wrapper, since the world
+    /// is the embedder's). [`call_export`](Self::call_export) looks an entry up here, so a component
+    /// must first be made resident via
+    /// [`precompile_and_serialize_world`](Self::precompile_and_serialize_world) or
+    /// [`hydrate_world_artifact`](Self::hydrate_world_artifact).
+    world_cache: Mutex<LruCache<String, InstancePre<HostState>>>,
+    /// The embedder's host interfaces for the world lane (U7), or `None`. Set once via
+    /// [`with_host_interfaces`](Self::with_host_interfaces); linked onto the world linker **only**
+    /// (never the request/consumer/session linkers), so the request lane is byte-for-byte unchanged.
+    /// `None` ⇒ the world linker offers only `wasi:io` + boatramp's bindings, so a component importing
+    /// an embedder interface fails to link (a clear missing-import compile error).
+    host_interfaces: Option<Arc<dyn HostInterfaces>>,
     epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -2196,6 +2275,12 @@ impl HandlerEngine {
             // `with_dns_publish_ns` (MEDIUM-3).
             dns_publish_ns: GuestDnsPublishNs::None,
             dns_publish_budget_default: DEFAULT_DNS_PUBLISH_BUDGET,
+            // The host-world lane (U7) shares the same cache sizing as the request/consumer/session
+            // caches; empty + inert until an embedder precompiles/hydrates a world component.
+            world_cache: Mutex::new(LruCache::new(capacity)),
+            // No embedder by default — the world lane offers only wasi:io + boatramp bindings until a
+            // caller opts in via `with_host_interfaces`. An engine built without it behaves as before.
+            host_interfaces: None,
             limits,
             epoch_ticker,
         })
@@ -2364,6 +2449,213 @@ impl HandlerEngine {
         let mut fp = [0u8; 32];
         fp.copy_from_slice(&out);
         fp
+    }
+
+    // ---- Host-world lane (U7) ---------------------------------------------------------------
+    //
+    // A generic lane for running a component of a world boatramp does not itself define: the
+    // embedder names the extra host imports its world needs (via `with_host_interfaces`), the lane
+    // links `wasi:io` + boatramp's grantable capabilities and nothing else of WASI
+    // (`build_world_linker`), and the embedder calls an export by name (`call_export`) under the
+    // engine's Limits/epoch/fuel with the per-invocation SQL session finalized commit-on-Ok /
+    // rollback-on-trap, exactly as the request lane. The compiled artifact serializes/hydrates and is
+    // partitioned by the SAME `artifact_fingerprint` as the request lane (one durable cache serves
+    // both), because `Component::serialize` is world-independent — it is the compiled component, and
+    // the engine fingerprint (codegen config) is what governs cross-node deserialize compatibility.
+
+    /// Set the embedder's host interfaces for the **host-world lane** (U7). Linked onto the world
+    /// linker ONLY (never the request/consumer/session linkers), so this cannot change the request
+    /// lane's behavior. Called once at engine build. Without it, the world lane still works for a
+    /// component that imports no embedder interface (it offers `wasi:io` + boatramp's capabilities),
+    /// but a component importing one fails to link with a clear missing-import error.
+    ///
+    /// # Security — the component's declared world is NOT the security boundary
+    /// The world lane offers boatramp's FULL grantable capability set (the same set as the request
+    /// lane), each gated by the per-invocation grant it was given and the node posture. boatramp does
+    /// **no** validation that a component only imports the capabilities its honest WIT world declares,
+    /// so a crafted component can import ANY offered capability regardless of its advertised world. The
+    /// only thing that bounds the authority a world component can actually exercise is therefore (a)
+    /// the per-invocation [`Bindings`] the embedder passes to [`call_export`](Self::call_export), and
+    /// (b) the engine's node posture. **The embedder MUST pass a MINIMAL `Bindings` per invocation** —
+    /// grant only the capabilities that invocation legitimately needs — because an ungranted capability
+    /// fails `access-denied` but a granted one is reachable whether or not the component's world
+    /// mentions it.
+    #[must_use]
+    pub fn with_host_interfaces(mut self, host_interfaces: Arc<dyn HostInterfaces>) -> Self {
+        self.host_interfaces = Some(host_interfaces);
+        self
+    }
+
+    /// Compile a **world-lane** component (`hash`) into a reusable generic
+    /// [`InstancePre`](wasmtime::component::InstancePre) through [`build_world_linker`], caching it in
+    /// the world cache. The world-lane analog of [`compile`](Self::compile)/[`proxy_pre`](Self::proxy_pre),
+    /// but there is no typed `bindgen!` wrapper (the world is the embedder's) — the pre is instantiated
+    /// and the export looked up by name in [`call_export`](Self::call_export).
+    fn compile_world(&self, wasm: &[u8]) -> Result<InstancePre<HostState>, HandlerError> {
+        let component = Component::from_binary(&self.engine, wasm)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        self.build_world_linker()?
+            .instantiate_pre(&component)
+            .map_err(|err| HandlerError::Compile(err.to_string()))
+    }
+
+    /// Compile a world-lane component (`hash`) and warm the world cache, WITHOUT producing a
+    /// serialized artifact — the world-lane analog of [`precompile`](Self::precompile), for an
+    /// embedder that compiles from source locally and does not need the portable AOT bytes. A
+    /// subsequent [`call_export`](Self::call_export) then hits the warm cache. The deterministic world
+    /// posture is applied here, so a nondeterministic-import component is refused at this step.
+    pub fn precompile_world(&self, hash: &str, wasm: &[u8]) -> Result<(), HandlerError> {
+        let pre = self.compile_world(wasm)?;
+        cache_insert_evicted(&self.world_cache, hash, pre);
+        Ok(())
+    }
+
+    /// Compile a world-lane component once, warm the world cache, AND return the portable
+    /// **serialized artifact** for cross-node upload — the world-lane analog of
+    /// [`precompile_and_serialize_request`](Self::precompile_and_serialize_request). The returned
+    /// bytes are the wasmtime-serialized `Component` (the caller frames + MACs them before storing;
+    /// they are NOT self-authenticating), and they are partitioned by the SAME
+    /// [`artifact_fingerprint`](Self::artifact_fingerprint) as a request artifact (serialize is
+    /// world-independent). The link step applies the deterministic world posture, so a component that
+    /// imports a nondeterministic WASI interface (clocks/random/sockets/filesystem/http) fails HERE
+    /// with a clear missing-import compile error, never at call time.
+    pub fn precompile_and_serialize_world(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<Vec<u8>, HandlerError> {
+        let component = Component::from_binary(&self.engine, wasm)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        let artifact = component
+            .serialize()
+            .map_err(|err| HandlerError::Compile(format!("serialize component: {err}")))?;
+        let pre = self
+            .build_world_linker()?
+            .instantiate_pre(&component)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        cache_insert_evicted(&self.world_cache, hash, pre);
+        Ok(artifact)
+    }
+
+    /// Hydrate a **MAC-verified** serialized world-lane artifact into the world cache, skipping
+    /// cranelift — the world-lane analog of [`hydrate_request_artifact`](Self::hydrate_request_artifact).
+    ///
+    /// # Security
+    /// `artifact` MUST already have been integrity-verified by the caller (the same cluster-keyed AOT
+    /// MAC the request lane uses). `Component::deserialize` loads EXECUTABLE native code and is only
+    /// lightly validated — passing unverified bytes here is arbitrary code execution. A deserialize
+    /// error returns `Err` so the caller falls back to compile-from-source. The posture is applied at
+    /// the link step below exactly as for a from-source compile.
+    pub fn hydrate_world_artifact(&self, hash: &str, artifact: &[u8]) -> Result<(), HandlerError> {
+        // SAFETY: the caller has verified the cluster AOT MAC over exactly these bytes (the same
+        // contract as `hydrate_request_artifact`); a tampered/foreign blob never reaches here.
+        let component = unsafe { Component::deserialize(&self.engine, artifact) }
+            .map_err(|err| HandlerError::Compile(format!("deserialize AOT artifact: {err}")))?;
+        let pre = self
+            .build_world_linker()?
+            .instantiate_pre(&component)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        cache_insert_evicted(&self.world_cache, hash, pre);
+        Ok(())
+    }
+
+    /// Whether a world-lane component (`hash`) is compiled + resident in the world cache (a
+    /// non-promoting peek). The caller can use this to decide whether a
+    /// [`call_export`](Self::call_export) will hit the cache.
+    pub fn world_component_warm(&self, hash: &str) -> bool {
+        self.world_cache.lock().unwrap().contains(hash)
+    }
+
+    /// Call a named export of a resident **world-lane** component (U7), under the engine's
+    /// `Limits` (linear-memory ceiling, epoch wall-clock timeout, CPU fuel) with the per-invocation
+    /// SQL session finalized the same way as the request lane: **commit on `Ok`, roll back on `Err`
+    /// or trap**. The component must already be resident (via
+    /// [`precompile_and_serialize_world`](Self::precompile_and_serialize_world) or
+    /// [`hydrate_world_artifact`](Self::hydrate_world_artifact)); an absent one is a clear error.
+    ///
+    /// `host_state` is moved into a FRESH store for this one call and exposed to the embedder's host
+    /// functions through [`HostState::embedder_state`]; it lives and dies with the store, so it is
+    /// isolated per invocation (no cross-call leak or reuse). `params` must match the export's
+    /// signature; the returned [`Val`](wasmtime::component::Val)s are the export's results.
+    ///
+    /// No lane concurrency permit is taken — the embedder decides when a world component fires (it
+    /// may already be inside an enclosing transaction), so acquiring a request/async permit here could
+    /// deadlock or wrongly bound it. The memory/epoch/fuel bounds (the engine's sync `Limits`) still
+    /// apply through `new_store`.
+    ///
+    /// # Security — `bindings` is the authority boundary
+    /// `bindings` is the ONLY per-invocation bound on the host authority this component can exercise
+    /// (together with the node posture): the lane offers boatramp's full capability set and does NOT
+    /// check that the component only imports what its declared world advertises, so pass a MINIMAL
+    /// `Bindings` granting only what this invocation legitimately needs. See
+    /// [`with_host_interfaces`](Self::with_host_interfaces) for the full rationale.
+    pub async fn call_export(
+        &self,
+        hash: &str,
+        bindings: Bindings,
+        host_state: Box<dyn Any + Send>,
+        export: &str,
+        params: &[Val],
+    ) -> Result<Vec<Val>, HandlerError> {
+        let pre = self
+            .world_cache
+            .lock()
+            .unwrap()
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| {
+                HandlerError::Compile(format!(
+                    "world component `{hash}` not resident (precompile_and_serialize_world or \
+                     hydrate_world_artifact it first)"
+                ))
+            })?;
+        // The world lane runs under the request (`Sync`) ceiling for memory/epoch/fuel — "the same
+        // Limits as the request lane". `new_store` applies the linear-memory limiter, the epoch
+        // deadline, and the fuel budget; the SQL session is built from `bindings` exactly as a
+        // request's.
+        let effective = self.effective_limits(Lane::Sync, self.limits);
+        let mut store = self.new_store(bindings, effective);
+        // Move the embedder slot into THIS store so the embedder's host functions can downcast it.
+        // Per-store ⇒ per-invocation isolation (dropped with the store when the call returns).
+        store.data_mut().embedder = Some(host_state);
+        let instance = match pre.instantiate_async(&mut store).await {
+            Ok(instance) => instance,
+            Err(e) => {
+                // A component may call a host import (e.g. a `sql-query`) from a core `start` during
+                // instantiation and then trap. Finalize (roll back) the SQL session on this early
+                // return too, so such a transaction is EXPLICITLY rolled back — symmetric with the
+                // missing-export and post-call paths, never left to backend drop semantics.
+                let err = classify(&e, store.data().oom());
+                #[cfg(feature = "sql")]
+                store.data_mut().sql.finalize(false).await;
+                return Err(err);
+            }
+        };
+        let func = match instance.get_func(&mut store, export) {
+            Some(f) => f,
+            None => {
+                // Finalize (roll back) the SQL session even on a pre-call shape error, so a lazily
+                // begun transaction never dangles.
+                #[cfg(feature = "sql")]
+                store.data_mut().sql.finalize(false).await;
+                return Err(HandlerError::Compile(format!(
+                    "world component does not export `{export}`"
+                )));
+            }
+        };
+        // Size the results slice to the export's result arity (`call_async` requires an exact match);
+        // the placeholder values are overwritten by the call.
+        let result_arity = func.ty(&store).results().len();
+        let mut results = vec![Val::Bool(false); result_arity];
+        let call = func.call_async(&mut store, params, &mut results).await;
+        // Close the per-invocation SQL transaction: commit only on a clean return, roll back on a
+        // trap/timeout/fuel/oom — identical to the request and consumer lanes.
+        #[cfg(feature = "sql")]
+        store.data_mut().sql.finalize(call.is_ok()).await;
+        match call {
+            Ok(()) => Ok(results),
+            Err(trap) => Err(classify(&trap, store.data().oom())),
+        }
     }
 
     /// Resolve the **per-consumer** concurrency gate (P2 resource isolation): the `Arc<Semaphore>`
@@ -3541,86 +3833,134 @@ impl HandlerEngine {
         let mut linker = Linker::<HostState>::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+        self.add_capability_bindings(&mut linker)?;
+        Ok(linker)
+    }
+
+    /// Build the **host-world lane** linker (U7): a FRESH linker whose WASI posture is exactly
+    /// `wasi:io` — nothing of `wasi:clocks`, `wasi:random`, `wasi:sockets`, `wasi:cli`,
+    /// `wasi:filesystem` or `wasi:http` is offered, so a component of an embedder-named world runs
+    /// deterministically (it cannot reach a clock, an RNG, the filesystem, or a raw socket). It then
+    /// links boatramp's grantable capability bindings — the EXACT same set as the request lane, via
+    /// the shared [`add_capability_bindings`](Self::add_capability_bindings) — each gated per-invocation
+    /// by the grant it was given (ungranted ⇒ `access-denied`) and by the engine posture (every egress
+    /// posture is off by default), so the world lane grants no authority the request lane doesn't. The
+    /// embedder's own host interfaces (e.g. `uchron:engine/engine`) are registered LAST, through
+    /// [`HostInterfaces::add_to_linker`]; without an embedder, a component importing one fails to link.
+    ///
+    /// This is a SEPARATE linker from [`build_linker`](Self::build_linker) on purpose: reusing the
+    /// request linker would smuggle `wasmtime_wasi`'s full WASI (clocks/random/fs/sockets) onto the
+    /// world lane. `wasmtime_wasi_io::add_to_linker_async` adds `wasi:io` ALONE.
+    fn build_world_linker(&self) -> Result<Linker<HostState>, HandlerError> {
+        let mut linker = Linker::<HostState>::new(&self.engine);
+        // `wasi:io` ONLY — streams/poll/error, which move bytes and are deterministic. Deliberately
+        // NOT `wasmtime_wasi::p2::add_to_linker_async` (which would also add clocks/random/sockets/
+        // cli/filesystem) and NOT `add_only_http_to_linker_async` (wasi:http). This is the determinism
+        // boundary: the lane physically cannot serve a nondeterministic WASI import.
+        wasmtime_wasi_io::add_to_linker_async(&mut linker)?;
+        // boatramp's grantable capabilities — the same gated set as the request lane. A cell world
+        // (`uchron:engine/cell`) imports a subset of these (sql-query/orm/invoke/messaging-producer/
+        // tenant-secrets/email-sender/keyvalue/blobstore); offering the full set keeps the lane generic
+        // (no embedder-specific policy) while authority stays per-grant + posture-gated exactly as on
+        // the request lane.
+        self.add_capability_bindings(&mut linker)?;
+        // The embedder's extra host imports (U7), registered host-side on THIS linker only. Mapped to
+        // a compile error so a bad registration fails like any other link failure.
+        if let Some(host_interfaces) = &self.host_interfaces {
+            host_interfaces
+                .add_to_linker(&mut linker)
+                .map_err(|e| HandlerError::Compile(format!("embedder host interfaces: {e}")))?;
+        }
+        Ok(linker)
+    }
+
+    /// Register boatramp's grantable capability bindings (kv/blob/sql/orm/messaging/invoke/secrets/…)
+    /// on `linker`. Shared verbatim by [`build_linker`](Self::build_linker) (request/consumer/session
+    /// lanes) and [`build_world_linker`](Self::build_world_linker) (U7), so the capability surface — and
+    /// its per-grant / per-posture gating — is identical on every lane and the request lane's behavior
+    /// is unchanged. The WASI posture itself is NOT added here (each lane adds its own: full WASI + http
+    /// for the request lane, `wasi:io` alone for the world lane).
+    fn add_capability_bindings(&self, linker: &mut Linker<HostState>) -> Result<(), HandlerError> {
         // `wasi:logging` is host-side observability (captured like stdout/stderr), always linked
         // — not a grantable capability. A guest that imports it emits into the same log sink.
-        bindings::wasi_logging::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::wasi_logging::add_to_linker(linker, |state: &mut HostState| {
             bindings::wasi_logging::WasiLoggingHost::new(state.bindings.logging())
         })?;
-        bindings::keyvalue::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::keyvalue::add_to_linker(linker, |state: &mut HostState| {
             bindings::keyvalue::KvHost::new(&mut state.table, state.bindings.keyvalue())
         })?;
-        bindings::blobstore::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::blobstore::add_to_linker(linker, |state: &mut HostState| {
             bindings::blobstore::BlobHost::new(&mut state.table, state.bindings.blobstore())
         })?;
         #[cfg(feature = "sql")]
-        bindings::sql::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::sql::add_to_linker(linker, |state: &mut HostState| {
             bindings::sql::SqlHost::new(&mut state.table, &mut state.sql)
         })?;
         // The typed `orm` binding shares the same per-invocation SQL session (backends +
         // transactions) as the raw `sql` binding above.
         #[cfg(feature = "sql")]
-        bindings::orm::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::orm::add_to_linker(linker, |state: &mut HostState| {
             bindings::orm::OrmHost::new(&mut state.table, &mut state.sql)
         })?;
         #[cfg(feature = "messaging")]
-        bindings::messaging::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::messaging::add_to_linker(linker, |state: &mut HostState| {
             bindings::messaging::MessagingHost::new(state.bindings.messaging())
         })?;
         #[cfg(feature = "messaging")]
-        bindings::tenancy::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::tenancy::add_to_linker(linker, |state: &mut HostState| {
             bindings::tenancy::TenancyHost::new(
                 state.bindings.tenancy_present(),
                 state.bindings.sealed_principal(),
             )
         })?;
         #[cfg(feature = "messaging")]
-        bindings::messaging_stats::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::messaging_stats::add_to_linker(linker, |state: &mut HostState| {
             bindings::messaging_stats::StatsHost::new(state.bindings.messaging_stats())
         })?;
         #[cfg(feature = "tenant-secrets")]
-        bindings::tenant_secrets::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::tenant_secrets::add_to_linker(linker, |state: &mut HostState| {
             bindings::tenant_secrets::TenantSecretsHost::new(state.bindings.tenant_secrets())
         })?;
         #[cfg(feature = "sealed-state")]
-        bindings::sealed_state::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::sealed_state::add_to_linker(linker, |state: &mut HostState| {
             bindings::sealed_state::SealedStateMintHost::new(state.bindings.sealed_state_mint())
         })?;
         #[cfg(feature = "invoke")]
-        bindings::invoke::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::invoke::add_to_linker(linker, |state: &mut HostState| {
             bindings::invoke::InvokeHost::new(&mut state.table, state.bindings.invoke())
         })?;
         #[cfg(feature = "graphql")]
-        bindings::graphql::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::graphql::add_to_linker(linker, |state: &mut HostState| {
             bindings::graphql::GraphqlHost::new(state.bindings.graphql())
         })?;
         #[cfg(feature = "email")]
-        bindings::email::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::email::add_to_linker(linker, |state: &mut HostState| {
             bindings::email::EmailHost::new(state.bindings.email())
         })?;
         #[cfg(feature = "admin")]
-        bindings::admin::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::admin::add_to_linker(linker, |state: &mut HostState| {
             bindings::admin::AdminHost::new(state.bindings.admin())
         })?;
         #[cfg(feature = "migrate")]
-        bindings::migrate::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::migrate::add_to_linker(linker, |state: &mut HostState| {
             bindings::migrate::MigrateHost::new(state.bindings.migrate())
         })?;
         #[cfg(feature = "capability")]
-        bindings::capability::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::capability::add_to_linker(linker, |state: &mut HostState| {
             bindings::capability::CapabilityHost::new(state.bindings.capability())
         })?;
         #[cfg(feature = "blob-upload")]
-        bindings::blob_upload::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::blob_upload::add_to_linker(linker, |state: &mut HostState| {
             bindings::blob_upload::BlobUploadHost::new(state.bindings.blob_upload())
         })?;
         #[cfg(feature = "sql")]
-        bindings::target_context::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::target_context::add_to_linker(linker, |state: &mut HostState| {
             bindings::target_context::TargetContextHost::new(
                 state.bindings.tenancy_target_context(),
             )
         })?;
         #[cfg(feature = "session")]
-        bindings::session::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::session::add_to_linker(linker, |state: &mut HostState| {
             bindings::session::SessionHost::new(state.bindings.session())
         })?;
         // Host-terminated outbound-TLS egress (`PLAN-handler-tcp-egress` Build A, mailroom #15):
@@ -3629,7 +3969,7 @@ impl HandlerEngine {
         // posture + its guest-egress extra-CA roots, so the dial is gated identically to a guest's
         // own `wasi:sockets` connect.
         #[cfg(feature = "tcp-egress")]
-        bindings::tcp_egress::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::tcp_egress::add_to_linker(linker, |state: &mut HostState| {
             bindings::tcp_egress::TcpEgressHost::new(
                 &mut state.table,
                 state.tcp_egress_enabled,
@@ -3654,7 +3994,7 @@ impl HandlerEngine {
         // roots — all threaded through the IDENTICAL `resolve_and_gate_tcp_egress` gate. No new grant
         // kind, no new posture, no new allowlist (one operator config drives both verbs).
         #[cfg(feature = "tcp-egress")]
-        bindings::http_egress::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::http_egress::add_to_linker(linker, |state: &mut HostState| {
             bindings::http_egress::HttpEgressHost::new(
                 state.tcp_egress_enabled,
                 state.http_hooks.allow_private_egress,
@@ -3676,7 +4016,7 @@ impl HandlerEngine {
         // CURRENT wire security of its connection. Always linked under `tcp-listener`; a non-listener
         // invocation has `conn_security == None`, which the binding fail-closes to `plaintext`.
         #[cfg(feature = "tcp-listener")]
-        bindings::tcp_connection_context::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::tcp_connection_context::add_to_linker(linker, |state: &mut HostState| {
             bindings::tcp_connection_context::ConnContextHost::new(state.conn_security.clone())
         })?;
         // Host-side DNS resolver (mailroom cap-req #20): the resolver half of the egress story. Gated
@@ -3684,7 +4024,7 @@ impl HandlerEngine {
         // `tcp-egress` (`tcp_egress_enabled`); the SSRF floor on resolved addresses uses the same
         // `allow_private_egress` flag as a `tcp-egress` dial.
         #[cfg(feature = "tcp-egress")]
-        bindings::dns_resolve::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::dns_resolve::add_to_linker(linker, |state: &mut HostState| {
             bindings::dns_resolve::DnsResolveHost::new(
                 state.bindings.dns_resolve(),
                 state.tcp_egress_enabled,
@@ -3703,7 +4043,7 @@ impl HandlerEngine {
         // `validate_writable` guardrail. The budget is BORROWED from the store-resident `HostState`
         // field (the per-call view-rebuild footgun — see `DnsPublishHost`'s STORE-RESIDENT note).
         #[cfg(feature = "dns-publish")]
-        bindings::dns_publish::add_to_linker(&mut linker, |state: &mut HostState| {
+        bindings::dns_publish::add_to_linker(linker, |state: &mut HostState| {
             bindings::dns_publish::DnsPublishHost::new(
                 state.bindings.dns_publish(),
                 state.dns_publish_enabled,
@@ -3714,7 +4054,7 @@ impl HandlerEngine {
             // from the store-resident `HostState` exactly like `dns_publish_enabled`.
             .with_dynamic_posture(state.dynamic_dns_publish_enabled)
         })?;
-        Ok(linker)
+        Ok(())
     }
 
     /// The configured ceiling for `lane`.
@@ -3874,6 +4214,9 @@ impl HandlerEngine {
             // `None` (the `tcp-connection-context` import fail-closes to `plaintext`).
             #[cfg(feature = "tcp-listener")]
             conn_security: None,
+            // The host-world lane (U7) sets this per call in `call_export`; every other lane leaves
+            // it `None` and never links the embedder interfaces that would read it.
+            embedder: None,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -5608,5 +5951,603 @@ mod egress_pin_tests {
              re-resolved the request host — the DNS-rebinding window between the SSRF check and the \
              connect is closed (a non-resolvable `.invalid` URI host still reached the pinned origin)."
         );
+    }
+}
+
+/// Host-world lane (U7) tests. These mirror uchron's
+/// `boatramp-compat/tests/handlers_surface.rs` refusal demonstrations — the two cases that FAIL on
+/// the request (`wasi:http/proxy`) lane — and assert they now SUCCEED on the world lane, plus the
+/// four security foci: the deterministic `wasi:io`-only posture (clocks/random/filesystem are
+/// unreachable), the `Limits`/epoch/fuel enforcement, the per-invocation embedder-slot isolation,
+/// and the commit-on-`Ok` / rollback-on-trap SQL-session finalize.
+#[cfg(test)]
+mod u7_host_world_lane_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use wasmtime::StoreContextMut;
+
+    /// A cell-shaped component (uchron's exact `CELL_COMPONENT`): imports the `uchron:engine/engine`
+    /// interface and exports `run`. The request lane cannot link the import; the world lane can.
+    const CELL_COMPONENT: &str = r#"(component
+        (import "uchron:engine/engine" (instance
+            (export "log" (func (param "level" u8) (param "msg" string)))
+        ))
+        (core module $m
+            (memory (export "memory") 1)
+            (func (export "run") (result i32) i32.const 0)
+        )
+        (core instance $i (instantiate $m))
+        (func $run (result (result (error string)))
+            (canon lift (core func $i "run") (memory (core memory $i "memory"))))
+        (export "run" (func $run))
+    )"#;
+
+    /// uchron's exact `RUN_ONLY_COMPONENT`: only the `run` export, no imports. The request lane
+    /// refuses it ("not a wasi:http/proxy handler"); the world lane runs it.
+    const RUN_ONLY_COMPONENT: &str = r#"(component
+        (core module $m
+            (memory (export "memory") 1)
+            (func (export "run") (result i32) i32.const 0)
+        )
+        (core instance $i (instantiate $m))
+        (func $run (result (result (error string)))
+            (canon lift (core func $i "run") (memory (core memory $i "memory"))))
+        (export "run" (func $run))
+    )"#;
+
+    /// A `run` component whose body loops forever — for the epoch/fuel enforcement tests.
+    const SPIN_COMPONENT: &str = r#"(component
+        (core module $m
+            (memory (export "memory") 1)
+            (func (export "run") (result i32)
+                (loop $l br $l)
+                i32.const 0)
+        )
+        (core instance $i (instantiate $m))
+        (func $run (result (result (error string)))
+            (canon lift (core func $i "run") (memory (core memory $i "memory"))))
+        (export "run" (func $run))
+    )"#;
+
+    fn wasm(src: &str) -> Vec<u8> {
+        wat::parse_str(src).expect("WAT fixture assembles")
+    }
+
+    /// A component that imports interface `iface` with a no-arg func `func`, and whose `run` CALLS it,
+    /// then either returns `Ok` or `unreachable`-traps (`trap_after`). Used for the embedder-slot
+    /// (ping) and SQL-finalize (touch) tests.
+    fn call_host_component(iface: &str, func: &str, trap_after: bool) -> Vec<u8> {
+        let tail = if trap_after {
+            "unreachable"
+        } else {
+            "i32.const 0"
+        };
+        wasm(&format!(
+            r#"(component
+                (import "{iface}" (instance $p (export "{func}" (func))))
+                (alias export $p "{func}" (func $f))
+                (core func $f_core (canon lower (func $f)))
+                (core module $m
+                    (import "host" "{func}" (func $f))
+                    (memory (export "memory") 1)
+                    (func (export "run") (result i32)
+                        call $f
+                        {tail}))
+                (core instance $i (instantiate $m
+                    (with "host" (instance (export "{func}" (func $f_core))))))
+                (func $run (result (result (error string)))
+                    (canon lift (core func $i "run") (memory (core memory $i "memory"))))
+                (export "run" (func $run)))"#
+        ))
+    }
+
+    /// A `run` component that imports interface `iface` exposing exactly `export_decl` (the inner of a
+    /// `(export …)` in an instance type), and never calls it. `export_decl` is a TYPE-CORRECT subset of
+    /// a real WASI interface member (e.g. `"now" (func (result u64))` for `monotonic-clock`, or
+    /// `"error" (type (sub resource))` for `wasi:io/error`), so wasmtime's structural import matching
+    /// RESOLVES it when that interface is linked and REFUSES it (unknown import) when it is not — unlike
+    /// a nullary `(func)` stub, which no real interface structurally matches, so wasmtime would reject
+    /// it whether or not the interface were linked (the hollow-test trap: Security review F1).
+    fn import_component(iface: &str, export_decl: &str) -> Vec<u8> {
+        wasm(&format!(
+            r#"(component
+                (import "{iface}" (instance (export {export_decl})))
+                (core module $m
+                    (memory (export "memory") 1)
+                    (func (export "run") (result i32) i32.const 0))
+                (core instance $i (instantiate $m))
+                (func $run (result (result (error string)))
+                    (canon lift (core func $i "run") (memory (core memory $i "memory"))))
+                (export "run" (func $run)))"#
+        ))
+    }
+
+    /// The test embedder: registers `uchron:engine/engine` (`log`, for the cell-link mirror),
+    /// `test:probe/probe` (`ping`, which records the per-invocation embedder slot), and — under the
+    /// `sql` feature — `test:sql/probe` (`touch`, which opens a transaction so `finalize` acts on it).
+    struct TestHost {
+        /// Every embedder-slot value `ping` observed, in call order — proves per-call isolation.
+        observed_slots: Arc<StdMutex<Vec<u32>>>,
+    }
+
+    impl TestHost {
+        fn new() -> Self {
+            Self {
+                observed_slots: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl HostInterfaces for TestHost {
+        fn add_to_linker(&self, linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
+            // `uchron:engine/engine` — a `log` with a string param, matching the cell import. Never
+            // called by the mirror component; present so the component LINKS.
+            linker.instance("uchron:engine/engine")?.func_wrap(
+                "log",
+                |_c: StoreContextMut<'_, HostState>, (_level, _msg): (u8, String)| Ok(()),
+            )?;
+            // `test:probe/probe` `ping` — reads THIS invocation's embedder slot and records it.
+            let observed = self.observed_slots.clone();
+            linker.instance("test:probe/probe")?.func_wrap(
+                "ping",
+                move |mut c: StoreContextMut<'_, HostState>, (): ()| {
+                    let slot = *c
+                        .data_mut()
+                        .embedder_state()
+                        .downcast_ref::<u32>()
+                        .expect("embedder slot is a u32 in these tests");
+                    observed.lock().unwrap().push(slot);
+                    Ok(())
+                },
+            )?;
+            // `test:sql/probe` `touch` — forces a transaction open so the finalize path has work.
+            #[cfg(feature = "sql")]
+            linker.instance("test:sql/probe")?.func_wrap_async(
+                "touch",
+                |mut c: StoreContextMut<'_, HostState>, (): ()| {
+                    Box::new(async move {
+                        c.data_mut()
+                            .sql
+                            .begin_for_test("db")
+                            .await
+                            .map_err(|e| wasmtime::Error::msg(format!("{e:?}")))?;
+                        Ok(())
+                    })
+                },
+            )?;
+            Ok(())
+        }
+    }
+
+    fn engine_with_host(limits: Limits) -> (HandlerEngine, Arc<TestHost>) {
+        let host = Arc::new(TestHost::new());
+        let engine = HandlerEngine::new(limits, 16)
+            .expect("engine builds")
+            .with_host_interfaces(host.clone());
+        (engine, host)
+    }
+
+    // ---- The two uchron refusals, now successes -------------------------------------------------
+
+    #[tokio::test]
+    async fn request_lane_refuses_but_world_lane_links_the_engine_import() {
+        let cell = wasm(CELL_COMPONENT);
+        let (engine, _host) = engine_with_host(Limits::default());
+
+        // REPRODUCE the request-lane refusal uchron pins (handlers_surface.rs): the import is unknown.
+        let request_err = engine
+            .precompile_and_serialize_request("cell", &cell)
+            .expect_err("request lane cannot serve uchron:engine/engine");
+        match request_err {
+            HandlerError::Compile(msg) => assert!(
+                msg.contains("uchron:engine/engine"),
+                "request-lane refusal should name the missing import: {msg}"
+            ),
+            other => panic!("expected a compile refusal, got {other:?}"),
+        }
+
+        // The world lane LINKS it (the embedder supplied the import) and runs `run`.
+        engine
+            .precompile_and_serialize_world("cell", &cell)
+            .expect("world lane links the embedder import");
+        let results = engine
+            .call_export("cell", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .await
+            .expect("run returns");
+        assert_eq!(results.len(), 1, "run returns one result<_, string>");
+    }
+
+    #[tokio::test]
+    async fn request_lane_refuses_but_world_lane_invokes_a_run_export() {
+        let run_only = wasm(RUN_ONLY_COMPONENT);
+        // A fresh engine WITHOUT any embedder — the world lane still serves a no-import `run` cell.
+        let engine = HandlerEngine::new(Limits::default(), 16).expect("engine builds");
+
+        // REPRODUCE the request-lane refusal: a `run` export is not a wasi:http/proxy handler.
+        let request_err = engine
+            .precompile_and_serialize_request("run", &run_only)
+            .expect_err("request lane cannot invoke a run export");
+        match request_err {
+            HandlerError::Compile(msg) => assert!(
+                msg.contains("wasi:http/proxy"),
+                "request-lane refusal should name the proxy world: {msg}"
+            ),
+            other => panic!("expected a compile refusal, got {other:?}"),
+        }
+
+        // The world lane compiles + invokes `run` directly.
+        engine
+            .precompile_and_serialize_world("run", &run_only)
+            .expect("world lane compiles a run-export component");
+        let results = engine
+            .call_export("run", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .await
+            .expect("run returns");
+        assert_eq!(results.len(), 1);
+    }
+
+    // ---- Artifact fingerprint parity (§4): serialize on one engine, hydrate + run on another ----
+
+    #[tokio::test]
+    async fn world_artifact_serializes_and_hydrates_under_one_fingerprint() {
+        let cell = wasm(CELL_COMPONENT);
+        // Producer: compile + serialize the portable artifact.
+        let (producer, _h1) = engine_with_host(Limits::default());
+        let artifact = producer
+            .precompile_and_serialize_world("cell", &cell)
+            .expect("world artifact serializes");
+
+        // Consumer: a SEPARATE engine of the same config hydrates the artifact (no cranelift) and runs
+        // it — proving the world-lane artifact is portable and the deterministic posture is applied on
+        // the hydrate path too (the embedder import still resolves).
+        let (consumer, _h2) = engine_with_host(Limits::default());
+        assert!(
+            !consumer.world_component_warm("cell"),
+            "not resident before hydrate"
+        );
+        consumer
+            .hydrate_world_artifact("cell", &artifact)
+            .expect("world artifact hydrates");
+        assert!(
+            consumer.world_component_warm("cell"),
+            "resident after hydrate"
+        );
+        let results = consumer
+            .call_export("cell", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .await
+            .expect("hydrated world component runs");
+        assert_eq!(results.len(), 1);
+
+        // The fingerprint that PARTITIONS the durable cache is engine-config-derived and
+        // world-independent, so the SAME fingerprint covers request-lane and world-lane artifacts —
+        // one durable partitioning serves both lanes (§4). Equal across two same-config engines.
+        assert_eq!(
+            producer.artifact_fingerprint(),
+            consumer.artifact_fingerprint(),
+            "same engine config ⇒ same artifact fingerprint for both lanes"
+        );
+    }
+
+    // ---- Security focus: deterministic wasi:io-only posture (binding, not vacuous — Sec review F1) --
+
+    /// The world lane links `wasi:io` and NOTHING ELSE of WASI. The fixtures here are TYPE-CORRECT
+    /// subsets of the real WASI 0.2.12 interfaces (the version wasmtime-wasi 50 registers), so each one
+    /// actually binds to wasmtime's structural import matching:
+    /// - a **positive control** — a type-correct `wasi:io` import — MUST resolve, proving the test is
+    ///   not vacuous and the fixture version/type still matches wasmtime-wasi (a bump that breaks the
+    ///   match fails HERE, loudly, instead of letting the negatives pass for the wrong reason);
+    /// - the **negatives** — type-correct `wasi:clocks` / `wasi:random` / `wasi:filesystem` imports —
+    ///   MUST be refused, because the deterministic lane does not link them.
+    ///
+    /// Mutation proof (Security review F1): swapping `build_world_linker`'s
+    /// `wasmtime_wasi_io::add_to_linker_async` for the full `wasmtime_wasi::p2::add_to_linker_async`
+    /// links clocks/random/filesystem too, so every negative below RESOLVES and this test goes RED.
+    /// (The earlier nullary-`(func)` fixtures matched no real interface, so wasmtime refused them with
+    /// the SAME message whether or not WASI was linked — the test passed vacuously under that swap.)
+    #[tokio::test]
+    async fn world_lane_posture_is_wasi_io_only() {
+        let (engine, _host) = engine_with_host(Limits::default());
+
+        // POSITIVE CONTROL + version-drift tripwire: a type-correct `wasi:io/error` import (the `error`
+        // resource, which the lane DOES link) must resolve. If this ever fails, the WASI fixture type or
+        // version drifted from wasmtime-wasi — update the `@0.2.12` fixtures — rather than the negatives
+        // silently passing for the wrong reason.
+        let io_positive =
+            import_component("wasi:io/error@0.2.12", r#""error" (type (sub resource))"#);
+        engine
+            .precompile_and_serialize_world("io-positive", &io_positive)
+            .expect(
+                "positive control: a type-correct wasi:io import MUST resolve on the world lane — if \
+                 this fails, the WASI fixture version/type drifted from wasmtime-wasi 50; update it",
+            );
+
+        // NEGATIVES: type-correct imports of the nondeterministic WASI packages the lane must NOT link.
+        // Because they are type-correct, the full-WASI mutation (see the doc above) makes each resolve
+        // and flips the test — so these assertions genuinely bind to the io-only posture.
+        for (iface, export_decl) in [
+            (
+                "wasi:clocks/monotonic-clock@0.2.12",
+                r#""now" (func (result u64))"#,
+            ),
+            (
+                "wasi:random/random@0.2.12",
+                r#""get-random-u64" (func (result u64))"#,
+            ),
+            (
+                "wasi:filesystem/types@0.2.12",
+                r#""descriptor" (type (sub resource))"#,
+            ),
+        ] {
+            let component = import_component(iface, export_decl);
+            let err = engine
+                .precompile_and_serialize_world(iface, &component)
+                .expect_err(
+                    "the deterministic world lane must not link this nondeterministic import",
+                );
+            match err {
+                HandlerError::Compile(msg) => {
+                    let pkg = iface.split('/').next().unwrap();
+                    assert!(
+                        msg.contains(pkg),
+                        "refusal for {iface} should name the unresolved import: {msg}"
+                    );
+                }
+                other => panic!("expected a compile refusal for {iface}, got {other:?}"),
+            }
+        }
+    }
+
+    // ---- Security focus: Limits (epoch + fuel) enforcement on the lane -------------------------
+
+    // Multi-thread: the spinning guest fiber must not starve the epoch-ticker task (a current-thread
+    // runtime would never advance the epoch, so the deadline could never fire).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn world_lane_enforces_the_epoch_wall_clock_timeout() {
+        let spin = wasm(SPIN_COMPONENT);
+        // A tight wall-clock epoch budget, fuel UNMETERED — so the loop is cut by the epoch, not fuel.
+        let limits = Limits {
+            timeout_ms: 50,
+            fuel: None,
+            ..Limits::default()
+        };
+        let (engine, _host) = engine_with_host(limits);
+        engine
+            .precompile_and_serialize_world("spin", &spin)
+            .expect("compiles");
+        let err = engine
+            .call_export("spin", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .await
+            .expect_err("an infinite loop must hit the epoch deadline");
+        assert!(
+            matches!(err, HandlerError::Timeout),
+            "expected Timeout, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn world_lane_enforces_the_cpu_fuel_budget() {
+        let spin = wasm(SPIN_COMPONENT);
+        // A small fuel budget, generous wall-clock — so the loop is cut by FUEL, not the epoch.
+        let limits = Limits {
+            timeout_ms: 60_000,
+            fuel: Some(100_000),
+            ..Limits::default()
+        };
+        let (engine, _host) = engine_with_host(limits);
+        engine
+            .precompile_and_serialize_world("spin", &spin)
+            .expect("compiles");
+        let err = engine
+            .call_export("spin", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .await
+            .expect_err("an infinite loop must exhaust the fuel budget");
+        assert!(
+            matches!(err, HandlerError::OutOfFuel),
+            "expected OutOfFuel, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_world_component_is_a_clear_error() {
+        let (engine, _host) = engine_with_host(Limits::default());
+        let err = engine
+            .call_export(
+                "never-compiled",
+                Bindings::new("test"),
+                Box::new(0u32),
+                "run",
+                &[],
+            )
+            .await
+            .expect_err("a non-resident world component cannot be called");
+        assert!(matches!(err, HandlerError::Compile(_)), "got {err:?}");
+    }
+
+    // ---- Security focus: per-invocation embedder-slot isolation --------------------------------
+
+    #[tokio::test]
+    async fn embedder_slot_is_isolated_per_invocation() {
+        let component = call_host_component("test:probe/probe", "ping", false);
+        let (engine, host) = engine_with_host(Limits::default());
+        engine
+            .precompile_and_serialize_world("ping", &component)
+            .expect("compiles");
+
+        // Two calls with DIFFERENT embedder state. Each `ping` must see exactly its own call's slot —
+        // no leak from the first into the second, no reuse of a shared box.
+        engine
+            .call_export("ping", Bindings::new("test"), Box::new(7u32), "run", &[])
+            .await
+            .expect("first call");
+        engine
+            .call_export("ping", Bindings::new("test"), Box::new(42u32), "run", &[])
+            .await
+            .expect("second call");
+
+        let observed = host.observed_slots.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![7u32, 42u32],
+            "each invocation's host function saw ONLY its own embedder slot"
+        );
+    }
+
+    // ---- Security focus: commit-on-Ok / rollback-on-trap SQL finalize --------------------------
+
+    #[cfg(feature = "sql")]
+    mod sql_finalize {
+        use super::*;
+        use async_trait::async_trait;
+        use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A SQL backend double whose single transaction records whether it was committed or rolled
+        /// back, so the world lane's finalize decision is observable.
+        struct RecordingBackend {
+            committed: Arc<AtomicBool>,
+            rolledback: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl SqlBackend for RecordingBackend {
+            async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+                Ok(Box::new(RecordingTx {
+                    committed: self.committed.clone(),
+                    rolledback: self.rolledback.clone(),
+                }))
+            }
+        }
+
+        struct RecordingTx {
+            committed: Arc<AtomicBool>,
+            rolledback: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl SqlTransaction for RecordingTx {
+            async fn query(&mut self, _sql: &str, _p: &[SqlValue]) -> Result<SqlRows, SqlError> {
+                unreachable!("the finalize test never issues a query")
+            }
+            async fn execute(&mut self, _sql: &str, _p: &[SqlValue]) -> Result<u64, SqlError> {
+                unreachable!("the finalize test never issues a statement")
+            }
+            async fn commit(self: Box<Self>) -> Result<(), SqlError> {
+                self.committed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn rollback(self: Box<Self>) -> Result<(), SqlError> {
+                self.rolledback.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        /// Drive `call_export` once against a `touch`-then-`{trap?}` component and report whether the
+        /// enclosing transaction was committed or rolled back.
+        /// A component whose core `start` (run at INSTANTIATION) calls `touch` (opening a transaction)
+        /// then `unreachable`-traps — so the trap surfaces from `instantiate_async`, BEFORE any export
+        /// call. Exercises the F2 finalize-on-instantiation-failure path.
+        fn touch_then_trap_at_instantiation() -> Vec<u8> {
+            wasm(
+                r#"(component
+                    (import "test:sql/probe" (instance $p (export "touch" (func))))
+                    (alias export $p "touch" (func $t))
+                    (core func $t_core (canon lower (func $t)))
+                    (core module $m
+                        (import "host" "touch" (func $touch))
+                        (memory (export "memory") 1)
+                        (func $start call $touch unreachable)
+                        (start $start)
+                        (func (export "run") (result i32) i32.const 0))
+                    (core instance $i (instantiate $m
+                        (with "host" (instance (export "touch" (func $t_core))))))
+                    (func $run (result (result (error string)))
+                        (canon lift (core func $i "run") (memory (core memory $i "memory"))))
+                    (export "run" (func $run)))"#,
+            )
+        }
+
+        async fn run_once(trap_after: bool) -> (bool, bool, Result<Vec<Val>, HandlerError>) {
+            let component = call_host_component("test:sql/probe", "touch", trap_after);
+            let (engine, _host) = engine_with_host(Limits::default());
+            engine
+                .precompile_and_serialize_world("touch", &component)
+                .expect("compiles");
+            let committed = Arc::new(AtomicBool::new(false));
+            let rolledback = Arc::new(AtomicBool::new(false));
+            let backend = Arc::new(RecordingBackend {
+                committed: committed.clone(),
+                rolledback: rolledback.clone(),
+            });
+            let bindings = Bindings::new("test").with_sql("db", backend);
+            let result = engine
+                .call_export("touch", bindings, Box::new(0u32), "run", &[])
+                .await;
+            (
+                committed.load(Ordering::SeqCst),
+                rolledback.load(Ordering::SeqCst),
+                result,
+            )
+        }
+
+        #[tokio::test]
+        async fn clean_return_commits_the_session() {
+            let (committed, rolledback, result) = run_once(false).await;
+            assert!(result.is_ok(), "run returned cleanly: {result:?}");
+            assert!(
+                committed,
+                "a clean Ok must COMMIT the enclosing transaction"
+            );
+            assert!(!rolledback, "a clean Ok must not roll back");
+        }
+
+        #[tokio::test]
+        async fn a_trap_rolls_back_the_session() {
+            // Reproduce-first: the guest opens a transaction, then traps. The world lane MUST roll the
+            // transaction back, never commit it.
+            let (committed, rolledback, result) = run_once(true).await;
+            assert!(
+                matches!(result, Err(HandlerError::Trap(_))),
+                "the guest trap surfaces as Trap: {result:?}"
+            );
+            assert!(
+                rolledback,
+                "a trap must ROLL BACK the enclosing transaction"
+            );
+            assert!(!committed, "a trap must never commit");
+        }
+
+        #[tokio::test]
+        async fn an_instantiation_trap_rolls_back_the_session() {
+            // Security review F2, reproduce-first: a transaction opened from a core `start` during
+            // instantiation, then a trap BEFORE any export runs. `call_export` must EXPLICITLY roll the
+            // session back on the `instantiate_async` error path — not leave it to backend drop.
+            let component = touch_then_trap_at_instantiation();
+            let (engine, _host) = engine_with_host(Limits::default());
+            engine
+                .precompile_and_serialize_world("inst-trap", &component)
+                .expect("compiles");
+            let committed = Arc::new(AtomicBool::new(false));
+            let rolledback = Arc::new(AtomicBool::new(false));
+            let backend = Arc::new(RecordingBackend {
+                committed: committed.clone(),
+                rolledback: rolledback.clone(),
+            });
+            let bindings = Bindings::new("test").with_sql("db", backend);
+            let result = engine
+                .call_export("inst-trap", bindings, Box::new(0u32), "run", &[])
+                .await;
+            assert!(
+                matches!(result, Err(HandlerError::Trap(_))),
+                "the instantiation trap surfaces as Trap: {result:?}"
+            );
+            assert!(
+                rolledback.load(Ordering::SeqCst),
+                "an instantiation trap must ROLL BACK a transaction opened during instantiation"
+            );
+            assert!(
+                !committed.load(Ordering::SeqCst),
+                "an instantiation trap must never commit"
+            );
+        }
     }
 }

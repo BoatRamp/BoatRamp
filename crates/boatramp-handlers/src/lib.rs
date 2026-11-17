@@ -132,8 +132,8 @@ pub use engine::SessionBatch;
 #[cfg(feature = "engine")]
 pub use engine::{
     DEFAULT_DNS_RESOLVE_BUDGET, DEFAULT_PROMOTED_SPLICE_CAP, GuestDnsPublishNs, HandlerEngine,
-    HandlerError, Lane, Limits, MAX_CONSUMER_ERROR_LEN, ServeTiming, build_engine,
-    build_engine_pooling, empty_body,
+    HandlerError, HostInterfaces, HostState, Lane, Limits, MAX_CONSUMER_ERROR_LEN, ServeTiming,
+    build_engine, build_engine_pooling, empty_body,
 };
 #[cfg(feature = "engine")]
 pub use instance_stats::{
@@ -143,6 +143,11 @@ pub use instance_stats::{
 pub use logging::{LogSink, LogStream};
 #[cfg(feature = "sql")]
 pub use tenant::{Axis as TenantAxis, HostTenancy, ScopeFact, TenantDenied};
+/// Re-exported for the host-world lane (U7): `call_export` takes and returns `wasmtime`'s component
+/// [`Val`], so an embedder can name it as `boatramp_handlers::Val` without an explicit `wasmtime` dep
+/// line of its own.
+#[cfg(feature = "engine")]
+pub use wasmtime::component::Val;
 
 /// Contract-evolution invariants checked against the host WIT text itself, so a
 /// mistake in `wit/world.wit` fails a fast unit test rather than a deployed guest.

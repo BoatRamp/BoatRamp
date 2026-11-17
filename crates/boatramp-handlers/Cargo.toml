@@ -243,6 +243,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 async-trait.workspace = true
 # Mint a throwaway CA + leaf for the guest-egress extra-CA loopback-TLS handshake gate.
 rcgen = "0.13"
+# Assemble the host-world-lane (U7) test components from WAT inline (no wasm toolchain needed),
+# exactly as uchron's `boatramp-compat/tests/handlers_surface.rs` does.
+wat = "1"
 
 [lints]
 workspace = true
