@@ -513,6 +513,7 @@ async fn launch_and_publish(
         replica: 0,
         spec,
         artifact,
+        redaction: Default::default(),
     };
     let inst = backend
         .launch(&req)

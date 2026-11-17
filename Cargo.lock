@@ -1825,6 +1825,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1898,10 +1899,12 @@ dependencies = [
 name = "boatramp-guestlog"
 version = "0.62.1"
 dependencies = [
+ "aho-corasick",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

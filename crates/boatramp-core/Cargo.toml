@@ -133,6 +133,11 @@ ipnet.workspace = true
 sha2.workspace = true
 hex.workspace = true
 lru.workspace = true
+# The per-workload guest-log redaction SET (`compute::RedactionSet`) — the resolved
+# secret-sourced env VALUES the reconcile collects at launch — is held in a zeroizing
+# buffer so the plaintext is scrubbed from memory when the launch request drops, never
+# lingering as a stray copy of the injected credentials.
+zeroize = "1"
 # Claim-transform tenant-key derivation (`claim_extract`): a linear-time (RE2, no
 # backtracking) matcher for the `token` source's template/regex, with HIR shape
 # analysis at apply (`regex-syntax`). Host-side only.

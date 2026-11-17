@@ -30,9 +30,13 @@
 //! in-memory pipes + a temp file — no real jail or daemon required.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+
+mod redact;
+pub use redact::{MIN_SECRET_LEN, REDACTED_PLACEHOLDER, Redactor};
 
 /// Max bytes buffered for a single logical (newline-delimited) line before it is
 /// truncated. Bounds the pump's per-line memory against a no-newline flood.
@@ -100,6 +104,11 @@ pub fn sanitize_line(text: &str) -> String {
 /// - the line text is [`sanitize_line`]d before it reaches `tracing` or the sink
 ///   (a single trailing `\r` is stripped first, so a CRLF line is not left ending in
 ///   a replacement glyph — matching the old `str::lines()` behavior);
+/// - when a [`Redactor`] is supplied, each line's exact secret-sourced env VALUES are
+///   replaced with [`REDACTED_PLACEHOLDER`] (one pass, alongside the sanitize pass)
+///   before the line reaches EITHER `tracing` or the file — so neither sink leaks an
+///   injected credential a guest printed. `None` forwards unredacted (the admin opt-out
+///   / a workload with no secret-sourced env);
 /// - the structured `container` / `stream` fields are passed as their own key-values
 ///   (never interpolated into the message), so a crafted line cannot forge them.
 ///
@@ -122,6 +131,7 @@ pub async fn pump<R: AsyncBufRead + Unpin>(
     stream: &'static str,
     sink: mpsc::Sender<GuestLine>,
     keep_draining: bool,
+    redactor: Option<Arc<Redactor>>,
 ) -> std::io::Result<u64> {
     let mut n = 0u64;
     let mut buf: Vec<u8> = Vec::new();
@@ -141,7 +151,7 @@ pub async fn pump<R: AsyncBufRead + Unpin>(
             if !buf.is_empty() || overflowed {
                 n += 1;
                 let dst = sink_open.then_some(&sink);
-                let _ = emit(&buf, overflowed, id, stream, dst).await;
+                let _ = emit(&buf, overflowed, id, stream, dst, redactor.as_deref()).await;
             }
             break;
         }
@@ -152,7 +162,7 @@ pub async fn pump<R: AsyncBufRead + Unpin>(
                 reader.consume(pos + 1);
                 n += 1;
                 let dst = sink_open.then_some(&sink);
-                let sent = emit(&buf, overflowed, id, stream, dst).await;
+                let sent = emit(&buf, overflowed, id, stream, dst, redactor.as_deref()).await;
                 if sink_open && !sent {
                     // The writer task is gone.
                     sink_open = false;
@@ -193,18 +203,31 @@ fn append_bounded(buf: &mut Vec<u8>, src: &[u8], overflowed: &mut bool) {
 /// forward to the file writer. Returns `false` ONLY when a present sink's `send`
 /// failed (writer gone); `None` (already draining) returns `true`. `send().await` is
 /// the back-pressure point.
+///
+/// Redaction (when `redactor` is `Some`) runs on the raw, CR-trimmed text BEFORE
+/// `sanitize_line`, so the match is against the exact bytes boatramp injected (the
+/// placeholder itself is control-free and survives the sanitize pass). It applies to
+/// the SINGLE `text` that feeds BOTH `tracing` and the file, so neither sink can leak a
+/// value the other redacts.
 async fn emit(
     raw: &[u8],
     overflowed: bool,
     id: &str,
     stream: &'static str,
     sink: Option<&mpsc::Sender<GuestLine>>,
+    redactor: Option<&Redactor>,
 ) -> bool {
     // Strip a single trailing CR so a CRLF line is not left ending in a replacement
     // glyph; an interior `\r` is still neutralized by `sanitize_line`.
     let lossy = String::from_utf8_lossy(raw);
     let trimmed = lossy.strip_suffix('\r').unwrap_or(&lossy);
-    let mut text = sanitize_line(trimmed);
+    // Redact exact secret VALUES first (on the raw text, so a match is byte-for-byte what
+    // was injected), THEN sanitize the result for structured logging + file framing.
+    let redacted = match redactor {
+        Some(r) => r.redact(trimmed),
+        None => std::borrow::Cow::Borrowed(trimmed),
+    };
+    let mut text = sanitize_line(&redacted);
     if overflowed {
         text.push_str(TRUNCATION_MARKER);
     }
@@ -374,7 +397,9 @@ mod tests {
     async fn pump_forwards_lines_and_counts() {
         let input = b"hello\nworld\n".as_slice();
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(input, "web-0", "stdout", tx, true).await.unwrap();
+        let n = pump(input, "web-0", "stdout", tx, true, None)
+            .await
+            .unwrap();
         assert_eq!(n, 2);
         assert_eq!(
             rx.recv().await.unwrap(),
@@ -391,7 +416,7 @@ mod tests {
     async fn pump_handles_unterminated_final_line() {
         let input = b"partial".as_slice();
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(input, "w-0", "stderr", tx, true).await.unwrap();
+        let n = pump(input, "w-0", "stderr", tx, true, None).await.unwrap();
         assert_eq!(n, 1);
         assert_eq!(rx.recv().await.unwrap().text, "partial");
     }
@@ -402,7 +427,7 @@ mod tests {
         // buffer unbounded: the emitted line is capped + marked truncated.
         let flood = vec![b'A'; MAX_LINE_BYTES * 4];
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(flood.as_slice(), "w-0", "stdout", tx, true)
+        let n = pump(flood.as_slice(), "w-0", "stdout", tx, true, None)
             .await
             .unwrap();
         assert_eq!(n, 1, "the whole flood is ONE (truncated) logical line");
@@ -423,7 +448,7 @@ mod tests {
         input.push(b'\n');
         input.extend_from_slice(b"after\n");
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(input.as_slice(), "w-0", "stdout", tx, true)
+        let n = pump(input.as_slice(), "w-0", "stdout", tx, true, None)
             .await
             .unwrap();
         assert_eq!(n, 2);
@@ -443,6 +468,7 @@ mod tests {
             "stdout",
             tx,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -496,8 +522,8 @@ mod tests {
         };
         let out = mk("o");
         let err = mk("e");
-        let p_out = pump(out.as_slice(), "web-0", "stdout", tx.clone(), true);
-        let p_err = pump(err.as_slice(), "web-0", "stderr", tx, true);
+        let p_out = pump(out.as_slice(), "web-0", "stdout", tx.clone(), true, None);
+        let p_err = pump(err.as_slice(), "web-0", "stderr", tx, true, None);
         let (a, b) = tokio::join!(p_out, p_err);
 
         assert_eq!(
@@ -529,7 +555,7 @@ mod tests {
         for i in 0..1000 {
             input.extend_from_slice(format!("l-{i}\n").as_bytes());
         }
-        let n = pump(input.as_slice(), "web-0", "stdout", tx, false)
+        let n = pump(input.as_slice(), "web-0", "stdout", tx, false, None)
             .await
             .unwrap();
         assert!(
@@ -546,7 +572,7 @@ mod tests {
         let marker = "MIRROR_MARK_ready_31";
         let line = format!("{marker}\n");
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(line.as_bytes(), "web-0", "stdout", tx, true)
+        let n = pump(line.as_bytes(), "web-0", "stdout", tx, true, None)
             .await
             .unwrap();
         assert_eq!(n, 1);
@@ -643,8 +669,8 @@ mod tests {
         ));
         let out = BufReader::new(b"app started\napp ready\n".as_slice());
         let err = BufReader::new(b"a warning\n".as_slice());
-        let p1 = pump(out, "w-0", "stdout", tx.clone(), true);
-        let p2 = pump(err, "w-0", "stderr", tx, true);
+        let p1 = pump(out, "w-0", "stdout", tx.clone(), true, None);
+        let p2 = pump(err, "w-0", "stderr", tx, true, None);
         let (a, b) = tokio::join!(p1, p2);
         assert_eq!(a.unwrap() + b.unwrap(), 3, "3 lines total");
         writer.await.unwrap().unwrap();
@@ -653,5 +679,97 @@ mod tests {
         assert!(s.contains("stdout: app ready\n"));
         assert!(s.contains("stderr: a warning\n"));
         assert_eq!(s.lines().count(), 3);
+    }
+
+    /// Redaction binds in BOTH sinks: a guest line carrying an injected secret value is
+    /// redacted in the per-container FILE **and** in the `boatramp::guest` tracing stream
+    /// (the single `emit` feeds both), while a hardcoded literal NOT in the redaction set
+    /// passes through untouched. Mutation-sensitive: if the redact step is removed (or the
+    /// backend's opt-out passed `None`), the secret would appear in both — the
+    /// `!contains(SECRET)` assertions go RED. Pairs with `remote_pump_passes_through...`
+    /// which proves the `None` path leaks (the opt-out parity behavior), so the two
+    /// together prove the redaction is what removes the secret.
+    #[tokio::test]
+    async fn pump_redacts_injected_secret_in_both_file_and_tracing_but_not_a_literal() {
+        let buf = install_tracing_capture();
+        // Unique, long, secret-shaped value + a benign literal that is NOT a set member.
+        let secret = "postgres://u:P%40ss_UNIQ_4b19d7e2@bramp-db-x.flycast:5432/app";
+        let literal = "LOG_LEVEL=debug"; // operator literal — never in the redaction set
+        let redactor = Redactor::build([secret]).expect("the DSN qualifies");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = log_path(dir.path(), "redact-0");
+        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+        let writer = tokio::spawn(write_lines_rotating(
+            path.clone(),
+            rx,
+            DEFAULT_FILE_CAP_BYTES,
+        ));
+        let input = format!("DATABASE_URL={secret} {literal}\n");
+        let n = pump(
+            input.as_bytes(),
+            "redact-0",
+            "stdout",
+            tx,
+            true,
+            Some(redactor),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+        writer.await.unwrap().unwrap();
+
+        // (1) FILE: secret gone, placeholder present, literal survives.
+        let file = read_file(&path);
+        assert!(
+            !file.contains(secret),
+            "secret leaked into the file: {file}"
+        );
+        assert!(
+            file.contains(REDACTED_PLACEHOLDER),
+            "file missing the placeholder: {file}"
+        );
+        assert!(
+            file.contains(literal),
+            "a hardcoded literal must NOT be redacted: {file}"
+        );
+
+        // (2) TRACING: the SAME line, redacted, reached the guest tracing stream too.
+        let logged = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            logged.contains(REDACTED_PLACEHOLDER),
+            "tracing missing the placeholder: {logged}"
+        );
+        assert!(
+            !logged.contains(secret),
+            "secret leaked into the tracing stream: {logged}"
+        );
+    }
+
+    /// The opt-out / no-secret-env parity: with `None` (the admin opt-out, or a workload
+    /// with no secret-sourced env), the line is forwarded UNREDACTED — proving redaction
+    /// is a function of the supplied redactor and that disabling it restores the prior
+    /// (documented parity) behavior. The complement of the test above.
+    #[tokio::test]
+    async fn pump_without_a_redactor_forwards_unredacted() {
+        let secret = "postgres://u:P%40ss_OPTOUT_55aa@bramp-db-y.flycast:5432/app";
+        let dir = tempfile::tempdir().unwrap();
+        let path = log_path(dir.path(), "optout-0");
+        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+        let writer = tokio::spawn(write_lines_rotating(
+            path.clone(),
+            rx,
+            DEFAULT_FILE_CAP_BYTES,
+        ));
+        let input = format!("DATABASE_URL={secret}\n");
+        pump(input.as_bytes(), "optout-0", "stdout", tx, true, None)
+            .await
+            .unwrap();
+        writer.await.unwrap().unwrap();
+        let file = read_file(&path);
+        assert!(
+            file.contains(secret),
+            "with no redactor the value is forwarded as-is (opt-out parity): {file}"
+        );
     }
 }

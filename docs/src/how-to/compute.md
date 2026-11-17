@@ -617,6 +617,33 @@ hand-set **literal** env value (no `{{…}}`) is left untouched; a template that
 be fully rendered (an unknown placeholder, an unset secret) is left in place and
 logged, so a typo is diagnosable rather than silently half-filled.
 
+#### Guest-log secret redaction
+
+boatramp forwards a workload's own stdout/stderr into observability — the per-container
+file `<data_dir>/compute/logs/<id>.log` and the `boatramp::guest` tracing target (which
+commonly ships to a central aggregator). A guest that prints its own environment (an
+accidental `echo $DATABASE_URL`, a crash dump, a debug handler) would otherwise land its
+injected credentials there. Because boatramp is the **injector**, it knows the exact
+secret values and **redacts them out of the forwarded stream by default**: the resolved
+`{{sql.*}}` managed-DB DSN/password, an unsealed `{{secret.<NAME>}}` / `boatramp:<name>`
+value, an external-vault value, and managed-service-generated keys are each replaced with
+`‹redacted›` in both sinks. Redaction is scoped by **provenance, not name**: only values
+that came from a secret source are redacted — a hardcoded/literal env value
+(`LOG_LEVEL=debug`) is never touched.
+
+This is **defense-in-depth, best-effort** (mirroring CI masking like GitHub Actions
+`::add-mask::` and GitLab masked variables), not the primary control — which remains
+short-lived credentials and guests not printing secrets. It matches an **exact,
+contiguous** occurrence of a secret value, and only values at or above an 8-character
+floor. **Out of scope** (and *not* defended): a guest that base64/hex/URL-encodes a
+secret, splits it across lines, or prints a derived substring — the exact-value match
+misses those, as every CI masker does.
+
+A node operator can turn redaction off with the node-global, System·Admin-only
+`[compute].redact_guest_log_secrets = false` (env
+`BOATRAMP_COMPUTE_REDACT_GUEST_LOG_SECRETS=false`), which forwards guest logs unredacted;
+it is never a tenant-reachable setting.
+
 ### Reachability & tenancy
 
 - **Host** is the managed DB workload's **internal-DNS name** (`pg-<ident>` — see

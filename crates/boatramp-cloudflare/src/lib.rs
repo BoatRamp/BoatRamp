@@ -423,6 +423,7 @@ mod tests {
                 artifact: Artifact::Image {
                     reference: "registry/app:1".into(),
                 },
+                redaction: Default::default(),
             })
             .await
             .unwrap_err();

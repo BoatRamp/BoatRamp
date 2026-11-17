@@ -279,6 +279,9 @@ pub async fn build_compute(
                     .with_data_dir(data_dir)
                     .with_writable_root_allowed(!strict)
                     .with_cap_add_allowed(!strict)
+                    // Node-global guest-log secret redaction (System·Admin opt-out; on by
+                    // default). Never a tenant knob.
+                    .with_guest_log_redaction(cfg.redact_guest_log_secrets)
                     .with_ephemeral_timeout(std::time::Duration::from_secs(
                         cfg.docker_ephemeral_timeout_secs,
                     ));
@@ -354,6 +357,9 @@ pub async fn build_compute(
                     // Single-tenant posture (`!strict`) may honor `cap_add`; multi-tenant
                     // keeps every capability dropped.
                     let c = c.with_cap_add_allowed(!strict);
+                    // Node-global guest-log secret redaction (System·Admin opt-out; on by
+                    // default). Never a tenant knob.
+                    let c = c.with_guest_log_redaction(cfg.redact_guest_log_secrets);
                     // Point each container's resolv.conf at the internal DNS on the
                     // bridge gateway when the resolver is enabled (default on). The
                     // node starts the resolver task (see `spawn_internal_dns`); the

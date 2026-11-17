@@ -66,6 +66,7 @@ async fn docker_round_trip() {
         replica: 0,
         spec: spec.clone(),
         artifact,
+        redaction: Default::default(),
     };
     let instance = backend.launch(&req).await.expect("launch");
     assert_eq!(
@@ -180,6 +181,7 @@ async fn docker_per_project_network_dns_and_cross_project_isolation() {
             replica: 0,
             spec: spec.clone(),
             artifact,
+            redaction: Default::default(),
         };
         backend.launch(&req).await.expect("launch")
     }
@@ -337,6 +339,7 @@ async fn docker_resolves_long_managed_db_workload_by_short_alias() {
             replica: 0,
             spec: spec.clone(),
             artifact,
+            redaction: Default::default(),
         };
         backend.launch(&req).await.expect("launch")
     }
@@ -448,6 +451,7 @@ async fn docker_recreate_on_spec_change_replaces_container_and_reattaches_projec
             replica: 0,
             spec: spec.clone(),
             artifact,
+            redaction: Default::default(),
         };
         backend.launch(&req).await.expect("launch")
     }
@@ -807,6 +811,7 @@ async fn docker_reconcile_heals_a_producer_carrying_a_stale_managed_db_alias_on_
             replica: 0,
             spec: spec.clone(),
             artifact,
+            redaction: Default::default(),
         };
         backend.launch(&req).await.expect("launch")
     }
@@ -1028,6 +1033,31 @@ impl std::io::Write for CaptureWriter {
     }
 }
 
+/// Install ONCE a process-global fmt subscriber over a SHARED buffer and return it, so
+/// several tracing-capturing live gates (guest-log forwarding + secret redaction) coexist
+/// in one shared `--ignored` run: `set_global_default` can only win once, so the two tests
+/// must share the subscriber rather than each racing to install its own (the loser would
+/// capture nothing and its tracing assertion would spuriously fail). Each test asserts on
+/// its OWN unique markers / secret, so the shared buffer stays unambiguous. (Mirrors the
+/// `OnceLock` capture the boatramp-guestlog unit tests use.)
+static TRACING_CAPTURE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> =
+    std::sync::OnceLock::new();
+fn install_tracing_capture() -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    TRACING_CAPTURE
+        .get_or_init(|| {
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let w = buf.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || CaptureWriter(w.clone()))
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            buf
+        })
+        .clone()
+}
+
 /// The **guest-log forwarding** live gate (v0.64.0 observability parity). Proves,
 /// against a REAL Docker daemon, that a long-running container launched on the docker
 /// backend has its stdout AND stderr forwarded into boatramp observability through the
@@ -1056,20 +1086,11 @@ async fn docker_log_forwarding_to_the_shared_sink() {
         return;
     }
 
-    // Capture `boatramp::guest` tracing into an in-memory buffer via a global
-    // subscriber (the forwarder emits from background threads). This gate is run in
-    // isolation by the capability job, so it owns the process-global default.
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let w = buf.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(move || CaptureWriter(w.clone()))
-        .finish();
-    // `.ok()`: another test in a shared run may already hold the global default; the
-    // FILE assertion is independent of tracing capture, and in the isolated gated run
-    // this install wins.
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    // Capture `boatramp::guest` tracing into a SHARED in-memory buffer via the one
+    // process-global subscriber (the forwarder emits from background threads). Shared so
+    // this gate and the redaction gate coexist in the broad `--ignored` run; assertions
+    // use UNIQUE markers below.
+    let buf = install_tracing_capture();
 
     let data_dir = tempfile::tempdir().expect("temp data_dir");
     let backend = DockerBackend::connect()
@@ -1097,6 +1118,7 @@ async fn docker_log_forwarding_to_the_shared_sink() {
         replica: 0,
         spec: spec.clone(),
         artifact,
+        redaction: Default::default(),
     };
     let instance = backend.launch(&req).await.expect("launch");
 
@@ -1159,6 +1181,130 @@ async fn docker_log_forwarding_to_the_shared_sink() {
         "DOCKER GUEST-LOG FORWARDING OK: a long-running docker-backend container's stdout \
          ({marker_out}) + stderr ({marker_err}) were forwarded into {} AND mirrored to the \
          boatramp::guest tracing target tagged container={id}",
+        path.display()
+    );
+}
+
+/// The **guest-log secret redaction** live gate (PLAN-guest-log-secret-redaction). Proves,
+/// against a REAL Docker daemon, that when a workload's launch carries a secret-sourced
+/// redaction set, a container that prints that value has it REDACTED out of BOTH shared
+/// sinks — the per-container file `<data_dir>/compute/logs/<id>.log` AND the
+/// `boatramp::guest` tracing target — while a hardcoded LITERAL value (not in the set)
+/// passes through untouched (provenance scoping, end-to-end). Reproduce-first +
+/// mutation-sensitive: with the redactor removed (or the admin opt-out), the secret would
+/// appear in both and the `!contains(secret)` assertions go RED.
+///
+/// `#[ignore]` + env-gated (needs a daemon); the capability gate greps the final success
+/// marker, printed ONLY after the file AND tracing redaction assertions AND the
+/// literal-survives assertion all hold — a silent skip or a one-sided redact cannot earn
+/// it.
+///
+/// Run it:
+/// ```sh
+/// BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+///   docker_log_redaction -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a reachable Docker daemon; set BOATRAMP_TEST_DOCKER=1 and run with --ignored"]
+async fn docker_log_redaction_to_the_shared_sink() {
+    if std::env::var("BOATRAMP_TEST_DOCKER").is_err() {
+        eprintln!("skipping docker test: set BOATRAMP_TEST_DOCKER=1 (needs a reachable daemon)");
+        return;
+    }
+
+    // Shared global tracing capture (unique secret/markers keep this gate's assertions
+    // unambiguous even when it shares the buffer with the forwarding gate).
+    let buf = install_tracing_capture();
+
+    let data_dir = tempfile::tempdir().expect("temp data_dir");
+    // Redaction ON by default (no `.with_guest_log_redaction(false)`).
+    let backend = DockerBackend::connect()
+        .expect("connect to docker")
+        .with_data_dir(data_dir.path());
+
+    // A secret-shaped value (what a `{{sql.*}}` DSN looks like) carried in the launch's
+    // redaction set, plus a hardcoded literal that is NOT in the set. The container prints
+    // BOTH to stdout (as an `echo $DATABASE_URL`-style leak would), then stays alive.
+    let secret = "postgres://app:S3cr3tP%40ss_LIVE_7b2e9@bramp-db-live.flycast:5432/appdb";
+    let literal = "LOG_LEVEL_IS_debug_a_literal_value";
+    let mut spec = spec();
+    spec.entrypoint = vec![
+        "sh".into(),
+        "-c".into(),
+        format!("echo SECRET={secret}; echo LITERAL={literal}; sleep 30"),
+    ];
+
+    let artifact = backend
+        .materialize("default", "logredact", &spec, None)
+        .await
+        .expect("materialize (pull)");
+    // Populate the per-launch redaction set with the secret-sourced value (the reconcile's
+    // `launch_one` does this from the resolved binding/managed-DB env in production).
+    let mut redaction = boatramp_core::compute::RedactionSet::new();
+    redaction.push(secret.to_string());
+    let req = LaunchRequest {
+        project: "default".into(),
+        workload: "logredact".into(),
+        replica: 0,
+        spec: spec.clone(),
+        artifact,
+        redaction,
+    };
+    let instance = backend.launch(&req).await.expect("launch");
+
+    let id = compute_instance_id("default", "logredact", 0);
+    let path = data_dir
+        .path()
+        .join("compute")
+        .join("logs")
+        .join(format!("{id}.log"));
+    // Wait until BOTH lines have been forwarded (the literal is the later line, so seeing
+    // it means the secret line was already processed too).
+    let mut file_contents = String::new();
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Ok(s) = std::fs::read_to_string(&path)
+            && s.contains(literal)
+        {
+            file_contents = s;
+            break;
+        }
+    }
+
+    backend.stop(&instance.handle).await.expect("stop");
+
+    // (1) FILE: the secret is gone + replaced by the placeholder; the literal survives.
+    assert!(
+        !file_contents.contains(secret),
+        "secret leaked into the log file {}: {file_contents:?}",
+        path.display()
+    );
+    assert!(
+        file_contents.contains(boatramp_guestlog::REDACTED_PLACEHOLDER),
+        "placeholder missing from the log file: {file_contents:?}"
+    );
+    assert!(
+        file_contents.contains(literal),
+        "a hardcoded literal (not secret-sourced) must NOT be redacted: {file_contents:?}"
+    );
+
+    // (2) TRACING: the same redaction holds in the `boatramp::guest` stream.
+    let logged = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    assert!(
+        !logged.contains(secret),
+        "secret leaked into the tracing stream: {logged}"
+    );
+    assert!(
+        logged.contains(boatramp_guestlog::REDACTED_PLACEHOLDER),
+        "placeholder missing from the tracing stream: {logged}"
+    );
+
+    // The single success marker the capability gate greps for — printed ONLY after the
+    // file + tracing redaction AND the literal-survives assertions all held.
+    println!(
+        "DOCKER GUEST-LOG REDACTION OK: a container's printed secret-sourced value was \
+         redacted to the placeholder in {} AND in the boatramp::guest tracing target \
+         (container={id}), while the hardcoded literal survived (provenance scoping)",
         path.display()
     );
 }

@@ -21,6 +21,13 @@ description = "The shared guest-log sink for boatramp compute backends: drain a 
 tokio = { workspace = true, features = ["sync", "io-util"] }
 # Each drained guest line is mirrored to the structured tracing sink.
 tracing.workspace = true
+# The secret redactor's matcher: one Aho-Corasick DFA per workload, scanning each
+# drained line in one pass independent of the number of secrets (sub-linear in N).
+aho-corasick.workspace = true
+# The per-workload redaction SET (the resolved secret-sourced env values) is held in a
+# zeroizing buffer so the plaintext is scrubbed from memory on forwarder teardown /
+# container exit, never lingering past the sink's lifetime.
+zeroize = "1"
 
 [dev-dependencies]
 # Rotation + file-framing tests write to a real temp path.
