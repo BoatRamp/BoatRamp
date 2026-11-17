@@ -208,7 +208,7 @@ resolves to. Takes the common `--server` flag.
 | `show <name>` | Print one project's full record. |
 | `doctor` | Scan for resource identifiers the v0.7.0 strict slug allowlist no longer accepts (`Project·Read`, read-only) — a CI preflight for that breaking cutover. Lists each non-conforming name, why it fails, what it affects, and a suggested fix; exits non-zero if any are found. |
 | `rm <name>` | Delete a project. Refused (with an enumeration of what remains) while it still owns resources, and always for the reserved `default`. `--force` cascades the teardown (deprovision managed DBs, remove compute workloads + volumes, delete functions + sites, clear secrets + GraphQL safelist, then remove the project); `--dry-run` prints what would be destroyed and changes nothing; `--force` prompts for a typed-name confirmation unless `--yes`/`-y` (required when stdin isn't a terminal). |
-| `migrate {apply,dry-run,baseline,status}` | Drive the project's owner-gated schema migrations for a managed database. The mutating verbs run as the project's non-superuser owner role and need `Project·Admin`; `status` needs `Project·Read`. See [In-app schema migrations](../how-to/in-app-migrations.md). |
+| `migrate {apply,dry-run,baseline,status}` | Drive the project's owner-gated schema migrations for a managed database — **the ordered, ledger-tracked migration mechanism** (`--dir migrations/` applies in filename order, stops on the first failure, records each step in `schema_migrations`). The mutating verbs run as the project's non-superuser owner role and need `Project·Admin`; `status` needs `Project·Read`. The trigger verbs **wait** for a still-provisioning managed backend to become ready (bounded, default 120 s; `--wait-ready-secs <n>` / `--no-wait`). See [In-app schema migrations](../how-to/in-app-migrations.md). |
 | `repair [--apply]` | Repair a managed tenant's provisioning drift (the owner-model retrofit that unblocks `migrate`). Defaults to a dry-run; `--apply` converges. Fixes provisioning only — never touches schema or data. `Project·Admin`. |
 | `tenant-secrets {set,rotate,ls,rm}` | Manage the project's **per-tenant** sealed secrets — each tenant's own third-party credential, sealed server-side under `(tenant, name)`, each verb taking `--tenant <t>`. Distinct from the per-project `boatramp secrets` env store. Mutating verbs need `Secrets·Write`; `ls` needs `Secrets·Read`. |
 | `export <name> --out <file>` | Stream the project (managed-DB dumps + control-plane KV slice + blobs) to a portable `BRPROJ` bundle, from a **running node** (`Project·Admin` on the project). See [Export, import & clone a project](../how-to/clone-project.md). |
@@ -540,10 +540,16 @@ See [Send email from a function](../how-to/send-email.md).
 
 Operator SQL to a managed database. See [Handler bindings](../how-to/handler-bindings.md).
 
+> **`exec` is the single-SCRIPT escape hatch — not the migration mechanism.** To evolve a schema,
+> use the ordered, ledger-tracked runner [`boatramp project migrate --dir migrations/ --db <db>
+> apply`](#boatramp-project) (applies in filename order, stops on the first failure, records each
+> step in `schema_migrations` so a re-run is a no-op). Reach for `sql exec` only for a one-off
+> ad-hoc script. See [Run owner-gated schema migrations](../how-to/in-app-migrations.md).
+
 | Sub-action | Description |
 | --- | --- |
-| `exec [--db <name>] [--file <path>]` | Apply a migration **script** (multiple statements — `CREATE EXTENSION`, tables, RLS, chained DDL/DML) to a managed database, from `--file` or stdin. `--db` is the binding name (empty = the site's default database). |
-| `query <sql> [--db <name>]` | Run one row-returning query and print the result (add the global `--output-format json` for structured rows). |
+| `exec [--db <name>] [--file <path>] [--wait-ready-secs <n>] [--no-wait]` | Run a single ad-hoc SQL **script** (multiple statements — `CREATE EXTENSION`, tables, RLS, chained DDL/DML) against a managed database, from `--file` or stdin — the one-off escape hatch (for an ordered migration SET use `project migrate`, above). `--db` is the binding name (`default` = the project's default database). On a managed-pg cold start it **waits** for the backend to become ready (bounded, default 120 s; `--no-wait` to fail fast). |
+| `query <sql> [--db <name>] [--wait-ready-secs <n>] [--no-wait]` | Run one row-returning query and print the result (add the global `--output-format json` for structured rows). Waits on a still-provisioning backend like `exec`. |
 | `ping [--db <name>]` | Actively TCP-probe each replica of a managed database — a reachability check that bypasses the stored-health gate `query` trips on (distinguishes "the DB is down" from "up but the resolver won't serve it"). Admin-scoped. |
 | `move --db <name> --to <name> [--site <site>]` | **Relocate** a managed libsql database to a new binding name, data intact — vacuum-copies to the destination, verifies it, then removes the source. `--db` is the **source** binding (default = the site's default database); `--to` is the **destination** binding and must not already exist; `--site` falls back to `[publish].site`. Local single-node only — a remote/sqld backend is refused. Destructive; node-level `System·Admin` (not the project-scoped right `exec`/`query`/`ping` use). |
 

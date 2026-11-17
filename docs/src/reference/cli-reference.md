@@ -2147,7 +2147,7 @@ Reap stuck ORPHANED compute replicas — a replica with NO desired workload AND 
 
 ## `boatramp sql`
 
-Operator SQL to a managed database: apply a migration script or run a query
+Operator SQL to a managed database: run a single ad-hoc script (the escape hatch — use `project migrate` for an ordered migration set) or one query
 
 **Usage:** `boatramp sql [OPTIONS] <COMMAND>`
 
@@ -2157,7 +2157,7 @@ Operator SQL to a managed database: apply a migration script or run a query
 
 ### `boatramp sql exec`
 
-Apply a migration **script** (multiple statements — `CREATE EXTENSION`, tables, RLS, chained DDL/DML) to a managed database. Reads from `--file` or standard input
+Run a single ad-hoc SQL **script** (multiple statements — `CREATE EXTENSION`, tables, RLS, chained DDL/DML) against a managed database, from `--file` or standard input. This is the one-off **escape hatch** — for an ordered, ledger-tracked schema-migration set use `boatramp project migrate --dir migrations/ --db <db> apply` (applies in filename order, stops on the first failure, and records each step in `schema_migrations` so a re-run is a no-op). A still-provisioning managed backend is waited for (see `--wait-ready-secs`)
 
 **Usage:** `boatramp sql exec [OPTIONS]`
 
@@ -2165,6 +2165,8 @@ Apply a migration **script** (multiple statements — `CREATE EXTENSION`, tables
 | --- | --- | --- | --- | --- |
 | `--db <DB>` | — | `default` | — | The database binding name (`default` = the project's default database) |
 | `--file <FILE>` | — | — | — | Read the script from this file instead of standard input |
+| `--wait-ready-secs <SECS>` | — | `120` | — | Max seconds to wait for a still-provisioning managed database to become ready before failing (`0` = don't wait — fail immediately if the backend isn't ready). The default covers a managed backend's first cold start (image pull + init). While waiting, the command honours the server's retryable `503` + `Retry-After` |
+| `--no-wait` | — | — | — | Don't wait for a provisioning managed database — fail immediately if it isn't ready yet (for scripting / CI). Equivalent to `--wait-ready-secs 0` |
 
 ### `boatramp sql query`
 
@@ -2176,6 +2178,8 @@ Run one row-returning query against a managed database and print the result
 | --- | --- | --- | --- | --- |
 | `<SQL>` | — | — | — | The SQL query (a single statement) |
 | `--db <DB>` | — | `default` | — | The database binding name (`default` = the project's default database) |
+| `--wait-ready-secs <SECS>` | — | `120` | — | Max seconds to wait for a still-provisioning managed database to become ready before failing (`0` = don't wait — fail immediately if the backend isn't ready). The default covers a managed backend's first cold start (image pull + init). While waiting, the command honours the server's retryable `503` + `Retry-After` |
+| `--no-wait` | — | — | — | Don't wait for a provisioning managed database — fail immediately if it isn't ready yet (for scripting / CI). Equivalent to `--wait-ready-secs 0` |
 
 ### `boatramp sql ping`
 
@@ -2779,6 +2783,8 @@ Apply every pending step, in order (`Project·Admin`). Already-recorded steps ar
 | `-f, --file <FILE>` | — | — | — | A pre-authored canonical bundle: a JSON `{ "steps": [ { "id": "…", … } ] }` document |
 | `-d, --dir <DIR>` | — | — | — | A migrations directory the CLI assembles into the bundle (see the naming convention in the command help). One file per step; applied in lexicographic filename order |
 | `--json` | — | — | — | Emit the raw `MigrationReport` JSON instead of a human summary |
+| `--wait-ready-secs <SECS>` | — | `120` | — | Max seconds to wait for a still-provisioning managed database to become ready before failing (`0` = don't wait — fail immediately if the backend isn't ready). The default covers a managed backend's first cold start (image pull + init). While waiting, the command honours the server's retryable `503` + `Retry-After` |
+| `--no-wait` | — | — | — | Don't wait for a provisioning managed database — fail immediately if it isn't ready yet (for scripting / CI). Equivalent to `--wait-ready-secs 0` |
 
 #### `boatramp project migrate dry-run`
 
@@ -2792,6 +2798,8 @@ Preview which steps WOULD apply, running nothing (`Project·Admin`)
 | `-f, --file <FILE>` | — | — | — | A pre-authored canonical bundle: a JSON `{ "steps": [ { "id": "…", … } ] }` document |
 | `-d, --dir <DIR>` | — | — | — | A migrations directory the CLI assembles into the bundle (see the naming convention in the command help). One file per step; applied in lexicographic filename order |
 | `--json` | — | — | — | Emit the raw `MigrationReport` JSON instead of a human summary |
+| `--wait-ready-secs <SECS>` | — | `120` | — | Max seconds to wait for a still-provisioning managed database to become ready before failing (`0` = don't wait — fail immediately if the backend isn't ready). The default covers a managed backend's first cold start (image pull + init). While waiting, the command honours the server's retryable `503` + `Retry-After` |
+| `--no-wait` | — | — | — | Don't wait for a provisioning managed database — fail immediately if it isn't ready yet (for scripting / CI). Equivalent to `--wait-ready-secs 0` |
 
 #### `boatramp project migrate baseline`
 
@@ -2806,6 +2814,8 @@ Record a prefix as already-applied WITHOUT running it — adopt a pre-existing /
 | `-d, --dir <DIR>` | — | — | — | A migrations directory the CLI assembles into the bundle (see the naming convention in the command help). One file per step; applied in lexicographic filename order |
 | `--up-to <UP_TO>` | — | — | — | Baseline the prefix through (and including) this step id; omit for the whole set |
 | `--json` | — | — | — | Emit the raw `MigrationReport` JSON instead of a human summary |
+| `--wait-ready-secs <SECS>` | — | `120` | — | Max seconds to wait for a still-provisioning managed database to become ready before failing (`0` = don't wait — fail immediately if the backend isn't ready). The default covers a managed backend's first cold start (image pull + init). While waiting, the command honours the server's retryable `503` + `Retry-After` |
+| `--no-wait` | — | — | — | Don't wait for a provisioning managed database — fail immediately if it isn't ready yet (for scripting / CI). Equivalent to `--wait-ready-secs 0` |
 
 #### `boatramp project migrate status`
 

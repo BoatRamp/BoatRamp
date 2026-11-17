@@ -104,6 +104,7 @@ mod forward;
 mod join;
 mod logs;
 mod manage;
+mod managed_wait;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod migrate;
@@ -252,7 +253,8 @@ enum Command {
     Gateway(gateway::GatewayArgs),
     /// Manage Firecracker microVM compute workloads.
     Compute(compute::ComputeArgs),
-    /// Operator SQL to a managed database: apply a migration script or run a query.
+    /// Operator SQL to a managed database: run a single ad-hoc script (the escape hatch — use
+    /// `project migrate` for an ordered migration set) or one query.
     Sql(sql::SqlArgs),
     /// Inspect a project's declared managed databases (read-only: `db ls|get|status`).
     /// Declaring/provisioning is done via the manifest `databases:` block (`boatramp

@@ -1,7 +1,17 @@
-//! `boatramp sql` — operator SQL access to a **managed** database: apply a
-//! migration script (`exec`) or run a single query (`query`). The server connects
-//! using the database's sealed managed credential (resolved server-side — the
-//! credential never reaches the client) and runs the SQL; admin-scoped.
+//! `boatramp sql` — operator SQL access to a **managed** database: run a single ad-hoc SQL
+//! script (`exec`) or one query (`query`). The server connects using the database's sealed
+//! managed credential (resolved server-side — the credential never reaches the client) and runs
+//! the SQL; admin-scoped.
+//!
+//! **`exec` is the single-SCRIPT escape hatch, not the migration mechanism.** For an *ordered,
+//! tracked* schema-migration set — applied in filename order, stop-on-first-failure, recorded in
+//! the `schema_migrations` ledger so a re-run is a no-op — use
+//! [`boatramp project migrate --dir migrations/ --db <db> apply`](crate::project_migrate). Reach
+//! for `exec` only for a one-off script (a quick fix, a REPL-style DDL), not a versioned migration.
+//!
+//! On a managed-pg **cold start** the backend answers not-ready with a retryable `503` +
+//! `Retry-After`; `exec` / `query` **wait** on it by default (bounded; `--wait-ready-secs` /
+//! `--no-wait`) via the shared [`crate::managed_wait`] helper, rather than failing immediately.
 
 use clap::Subcommand;
 
@@ -64,6 +74,23 @@ fn validate_db(db: &str) -> Result<()> {
     })
 }
 
+/// Build the error for a non-success `sql exec` / `sql query` response. A **`503`** means the
+/// managed backend is still provisioning *after* the bounded readiness wait was spent — a
+/// transient state, so the message hints the cure (wait longer, or reach for the ordered migration
+/// runner) instead of reading like a terminal failure. Every other status keeps the plain reason.
+fn sql_op_error(verb: &str, db: &str, status: reqwest::StatusCode, text: &str) -> Error {
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        Error::Server(format!(
+            "sql {verb}: managed database `{db}` is still provisioning ({status}): {text}\n  \
+             it may just need more time — retry, or wait longer with `--wait-ready-secs <N>` \
+             (`--no-wait` to fail fast); for an ordered, ledger-tracked migration set use \
+             `boatramp project migrate --dir migrations/ --db {db} apply`"
+        ))
+    } else {
+        Error::Server(format!("sql {verb} failed: {status}: {text}"))
+    }
+}
+
 /// Arguments for `boatramp sql`.
 #[derive(Debug, clap::Args)]
 pub struct SqlArgs {
@@ -77,9 +104,12 @@ pub struct SqlArgs {
 
 #[derive(Debug, Subcommand)]
 enum SqlCommand {
-    /// Apply a migration **script** (multiple statements — `CREATE EXTENSION`,
-    /// tables, RLS, chained DDL/DML) to a managed database. Reads from `--file` or
-    /// standard input.
+    /// Run a single ad-hoc SQL **script** (multiple statements — `CREATE EXTENSION`, tables, RLS,
+    /// chained DDL/DML) against a managed database, from `--file` or standard input. This is the
+    /// one-off **escape hatch** — for an ordered, ledger-tracked schema-migration set use
+    /// `boatramp project migrate --dir migrations/ --db <db> apply` (applies in filename order,
+    /// stops on the first failure, and records each step in `schema_migrations` so a re-run is a
+    /// no-op). A still-provisioning managed backend is waited for (see `--wait-ready-secs`).
     Exec {
         /// The database binding name (`default` = the project's default database).
         #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
@@ -87,6 +117,8 @@ enum SqlCommand {
         /// Read the script from this file instead of standard input.
         #[arg(long)]
         file: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        wait: crate::managed_wait::WaitFlags,
     },
     /// Run one row-returning query against a managed database and print the result.
     Query {
@@ -95,6 +127,8 @@ enum SqlCommand {
         /// The database binding name (`default` = the project's default database).
         #[arg(long, default_value = boatramp_core::project::DEFAULT_DB_NAME)]
         db: String,
+        #[command(flatten)]
+        wait: crate::managed_wait::WaitFlags,
     },
     /// Actively probe each replica of a managed database — a TCP reachability check
     /// that BYPASSES the stored-health gate `query` trips on. Distinguishes "the DB is
@@ -242,7 +276,7 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<SqlOutput> {
     let seg = client::project_seg(&client::resolve_project(config), "sql");
 
     let out = match args.command {
-        SqlCommand::Exec { db, file } => {
+        SqlCommand::Exec { db, file, wait } => {
             validate_db(&db)?;
             let sql = match file {
                 Some(path) => std::fs::read_to_string(path)?,
@@ -253,37 +287,34 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<SqlOutput> {
                     s
                 }
             };
-            let resp = http
-                .post(format!("{server}/api/{seg}/{db}/exec"))
-                .json(&serde_json::json!({ "sql": sql }))
-                .send()
-                .await?;
+            // Hold the body in memory so a readiness retry re-issues cleanly (stdin is read once).
+            let url = format!("{server}/api/{seg}/{db}/exec");
+            let body = serde_json::json!({ "sql": sql });
+            let resp = crate::managed_wait::send_with_ready_wait(wait.policy(), || {
+                http.post(url.as_str()).json(&body).send()
+            })
+            .await?;
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(Error::Server(format!(
-                    "sql exec failed: {status}: {}",
-                    text.trim()
-                )));
+                return Err(sql_op_error("exec", &db, status, text.trim()));
             }
-            // The migration applied; the former stdout was empty and the ack rode stderr.
+            // The script applied; the former stdout was empty and the ack rode stderr.
             tracing::info!("ok");
             SqlOutput::Exec
         }
-        SqlCommand::Query { db, sql } => {
+        SqlCommand::Query { db, sql, wait } => {
             validate_db(&db)?;
-            let resp = http
-                .post(format!("{server}/api/{seg}/{db}/query"))
-                .json(&serde_json::json!({ "sql": sql }))
-                .send()
-                .await?;
+            let url = format!("{server}/api/{seg}/{db}/query");
+            let body = serde_json::json!({ "sql": sql });
+            let resp = crate::managed_wait::send_with_ready_wait(wait.policy(), || {
+                http.post(url.as_str()).json(&body).send()
+            })
+            .await?;
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(Error::Server(format!(
-                    "sql query failed: {status}: {}",
-                    text.trim()
-                )));
+                return Err(sql_op_error("query", &db, status, text.trim()));
             }
             let data: serde_json::Value = resp.json().await?;
             SqlOutput::Query { data }
@@ -575,5 +606,146 @@ mod tests {
         for bad in ["a/b", "..", "a b", "proj*"] {
             assert!(validate_db(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    // A `503` carrying the not-ready hint is formatted so the operator sees the cure.
+    #[test]
+    fn not_ready_exec_error_hints_the_wait_and_migrate_cures() {
+        let err = sql_op_error(
+            "exec",
+            "appdb",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "managed database not ready: no healthy replica",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("--wait-ready-secs"), "hints the wait: {msg}");
+        assert!(
+            msg.contains("project migrate --dir"),
+            "steers to the ordered migration runner: {msg}"
+        );
+        // A non-503 keeps the plain reason (no cure clutter).
+        let plain = sql_op_error(
+            "exec",
+            "appdb",
+            reqwest::StatusCode::BAD_REQUEST,
+            "syntax error",
+        )
+        .to_string();
+        assert!(!plain.contains("--wait-ready-secs"), "plain error: {plain}");
+    }
+
+    /// Reproduce-first for `sql exec`: a managed backend that answers not-ready (`503` +
+    /// `Retry-After`) twice, then succeeds — the Exec path must BLOCK on the wait-loop, then apply
+    /// once ready (here after exactly 3 attempts). (MUTATION PROOF: drop the wait in
+    /// `managed_wait::send_with_ready_wait` and this fails on the first 503.)
+    #[tokio::test]
+    async fn sql_exec_waits_through_pending_then_applies() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_route = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/api/sql/default/exec",
+            axum::routing::post(move || {
+                let hits = Arc::clone(&hits_route);
+                async move {
+                    use axum::response::IntoResponse;
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [(axum::http::header::RETRY_AFTER, "0")],
+                            "managed database not ready: no healthy replica\n",
+                        )
+                            .into_response()
+                    } else {
+                        axum::http::StatusCode::NO_CONTENT.into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // A migration script in a temp file (so the Exec path doesn't read stdin).
+        let script = std::env::temp_dir().join(format!("br-sqlexec-{}.sql", std::process::id()));
+        std::fs::write(&script, "CREATE TABLE t (id int);").unwrap();
+
+        let args = SqlArgs {
+            server: Some(format!("http://127.0.0.1:{}", addr.port())),
+            command: SqlCommand::Exec {
+                db: boatramp_core::project::DEFAULT_DB_NAME.into(),
+                file: Some(script.clone()),
+                wait: crate::managed_wait::WaitFlags::waiting(10),
+            },
+        };
+        let out = run(args, &ProjectConfig::default()).await;
+        let _ = std::fs::remove_file(&script);
+        assert!(matches!(out, Ok(SqlOutput::Exec)), "exec applied: {out:?}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "two not-ready attempts, then the applied one"
+        );
+    }
+
+    /// A never-ready backend with `--no-wait` fails FAST (one attempt) and surfaces the not-ready
+    /// hint — never a hang, never a silent terminal error.
+    #[tokio::test]
+    async fn sql_exec_no_wait_fails_fast_with_the_hint() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_route = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/api/sql/default/exec",
+            axum::routing::post(move || {
+                let hits = Arc::clone(&hits_route);
+                async move {
+                    use axum::response::IntoResponse;
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [(axum::http::header::RETRY_AFTER, "0")],
+                        "managed database not ready: starting\n",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let script = std::env::temp_dir().join(format!("br-sqlexec-nw-{}.sql", std::process::id()));
+        std::fs::write(&script, "SELECT 1;").unwrap();
+        let args = SqlArgs {
+            server: Some(format!("http://127.0.0.1:{}", addr.port())),
+            command: SqlCommand::Exec {
+                db: boatramp_core::project::DEFAULT_DB_NAME.into(),
+                file: Some(script.clone()),
+                wait: crate::managed_wait::WaitFlags::never(),
+            },
+        };
+        let out = run(args, &ProjectConfig::default()).await;
+        let _ = std::fs::remove_file(&script);
+        match out {
+            Err(Error::Server(msg)) => {
+                assert!(msg.contains("--wait-ready-secs"), "carries the hint: {msg}");
+            }
+            other => panic!("expected a not-ready Server error, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "--no-wait makes exactly one attempt"
+        );
     }
 }

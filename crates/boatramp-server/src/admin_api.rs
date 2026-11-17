@@ -1364,7 +1364,7 @@ pub(super) async fn sql_exec(
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, format!("sql exec failed: {e}\n")).into_response(),
+        Err(e) => sql_op_error_response("exec", &e),
     }
 }
 
@@ -1397,7 +1397,7 @@ pub(super) async fn sql_query(
             };
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, format!("sql query failed: {e}\n")).into_response(),
+        Err(e) => sql_op_error_response("query", &e),
     }
 }
 
@@ -1489,6 +1489,51 @@ pub(super) async fn sql_status(
 /// `handler_dispatch`/`function_runtime` (which are `handlers`-feature-gated) — so the constant
 /// lives here, un-gated, reachable with or without the `handlers` feature.
 pub(crate) const SQL_NOT_READY_RETRY_AFTER_SECS: u32 = 2;
+
+/// Map an operator-SQL (`exec` / `query`) failure to a response. A **transient** managed-not-ready
+/// ([`SqlError::Unavailable`](boatramp_core::sql::SqlError::Unavailable) — the managed backend is
+/// still starting / has no healthy replica) becomes a **retryable `503` + `Retry-After`** — the
+/// SAME hint the WS4 `sql_status` readiness probe and the serve-time binding gate advertise — so a
+/// still-provisioning backend is WAITED by the client (the CLI's `--wait-ready-secs` loop binds the
+/// 503), never surfaced as a terminal `400`. Every other `SqlError` (a real syntax/constraint/
+/// transport failure) stays a `400`. Shared by [`sql_exec`] and [`sql_query`] so both honour the
+/// same 400-vs-503 split (a transient provisioning state must not masquerade as a terminal error).
+fn sql_op_error_response(verb: &str, err: &boatramp_core::sql::SqlError) -> Response {
+    if err.is_unavailable() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                axum::http::header::RETRY_AFTER,
+                SQL_NOT_READY_RETRY_AFTER_SECS.to_string(),
+            )],
+            format!("sql {verb} failed: managed database not ready: {err}\n"),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("sql {verb} failed: {err}\n"),
+        )
+            .into_response()
+    }
+}
+
+/// A **retryable `503` + `Retry-After`** for a managed database that is still starting — the one
+/// response shape every managed-not-ready surface uses (the migrate `E::Unavailable` /
+/// `E::Sql(unavailable)` arms here, mirroring [`sql_op_error_response`] and `sql_status`), so a
+/// client's bounded readiness wait binds the 503 regardless of which operation hit the not-ready
+/// state. `reason` is the sanitized not-ready detail.
+fn managed_not_ready_response(reason: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(
+            axum::http::header::RETRY_AFTER,
+            SQL_NOT_READY_RETRY_AFTER_SECS.to_string(),
+        )],
+        format!("managed database not ready: {reason}\n"),
+    )
+        .into_response()
+}
 
 /// Render [`OperatorSql::readiness`](boatramp_core::sql::OperatorSql::readiness)'s result as
 /// `sql_status`'s JSON body: the shared `readiness_to_json` vocabulary (`database_status`
@@ -1708,13 +1753,14 @@ fn migration_error_response(e: boatramp_core::sql::MigrationError) -> Response {
                 .to_string(),
         )
             .into_response(),
-        // A managed DB still starting — retryable, mirrors the v0.4.19 readiness gate.
-        E::Unavailable(m) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::RETRY_AFTER, "1")],
-            format!("managed database not ready: {m}\n"),
-        )
-            .into_response(),
+        // A managed DB still starting — retryable, mirrors the v0.4.19 readiness gate. Advertises
+        // the SAME `Retry-After` the WS4 `sql_status` probe and the exec/query 503 use, so every
+        // managed-not-ready surface the migrate client can hit speaks one retry hint.
+        E::Unavailable(m) => managed_not_ready_response(&m),
+        // A backend still starting can ALSO surface through `From<SqlError>` (the substrate's
+        // preflight returns `SqlError::Unavailable`, converted into `E::Sql`) — a transient
+        // not-ready, so it is retryable exactly like `E::Unavailable`, never a terminal 400.
+        E::Sql(inner) if inner.is_unavailable() => managed_not_ready_response(&inner.to_string()),
         // The requested set is inconsistent with the recorded ledger — a conflict.
         E::PrefixDivergence(m) => (
             StatusCode::CONFLICT,
@@ -7008,6 +7054,146 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// An `OperatorSql` whose `exec`/`query` return a chosen error — so the handler's
+    /// 400-vs-503 split is testable without a live database.
+    struct FakeErrSql(boatramp_core::sql::SqlError);
+
+    #[async_trait::async_trait]
+    impl boatramp_core::sql::OperatorSql for FakeErrSql {
+        async fn exec_script(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), boatramp_core::sql::SqlError> {
+            Err(self.0.clone())
+        }
+        async fn query(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<boatramp_core::sql::SqlRows, boatramp_core::sql::SqlError> {
+            Err(self.0.clone())
+        }
+        async fn ping(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<boatramp_core::sql::SqlPingReplica>, boatramp_core::sql::SqlError> {
+            Ok(vec![])
+        }
+        async fn readiness(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<boatramp_core::sql::SqlReadiness, boatramp_core::sql::SqlError> {
+            Ok(boatramp_core::sql::SqlReadiness::NotManaged)
+        }
+        async fn dependents_of_workload(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<String>, boatramp_core::sql::SqlError> {
+            Ok(vec![])
+        }
+    }
+
+    /// A still-provisioning managed backend (`SqlError::Unavailable`) hit by `sql exec` / `sql query`
+    /// must surface a **retryable `503` + `Retry-After`** — NOT a terminal `400` — so the CLI's
+    /// bounded readiness wait binds it (the tokenfield "transient not-ready surfaced as a
+    /// non-retryable 400" report). A genuine error (syntax/constraint/transport) stays a `400`.
+    #[tokio::test]
+    async fn sql_exec_query_not_ready_is_a_retryable_503_not_a_terminal_400() {
+        use boatramp_core::sql::SqlError;
+
+        // Not-ready → 503 + Retry-After, for BOTH exec and query.
+        for verb in ["exec", "query"] {
+            let op: Arc<dyn boatramp_core::sql::OperatorSql> =
+                Arc::new(FakeErrSql(SqlError::unavailable("no healthy replica yet")));
+            let resp = if verb == "exec" {
+                sql_exec(
+                    Extension(ProjectContext("exampleorg".into())),
+                    Extension(Some(op)),
+                    Path("default".into()),
+                    Json(SqlExecRequest {
+                        sql: "CREATE TABLE t (id int)".into(),
+                    }),
+                )
+                .await
+            } else {
+                sql_query(
+                    Extension(ProjectContext("exampleorg".into())),
+                    Extension(Some(op)),
+                    Path("default".into()),
+                    Json(SqlQueryRequest {
+                        sql: "SELECT 1".into(),
+                    }),
+                )
+                .await
+            };
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{verb}: a transient not-ready must be a retryable 503"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                Some(SQL_NOT_READY_RETRY_AFTER_SECS.to_string().as_str()),
+                "{verb}: the not-ready 503 advertises Retry-After"
+            );
+        }
+
+        // A genuine error stays a terminal 400 (never waited).
+        let op: Arc<dyn boatramp_core::sql::OperatorSql> =
+            Arc::new(FakeErrSql(SqlError::Syntax("near \"CRATE\"".into())));
+        let resp = sql_exec(
+            Extension(ProjectContext("exampleorg".into())),
+            Extension(Some(op)),
+            Path("default".into()),
+            Json(SqlExecRequest {
+                sql: "CRATE TABLE t".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a real syntax error stays a terminal 400"
+        );
+    }
+
+    /// The migrate error mapping mirrors the same 400-vs-503 split: a managed backend still
+    /// starting is a retryable `503` whether it arrives as `MigrationError::Unavailable` OR
+    /// via `From<SqlError>` as `MigrationError::Sql(SqlError::Unavailable)` (the substrate's
+    /// preflight path) — and a real SQL failure stays a `400`.
+    #[test]
+    fn migration_error_response_maps_transient_not_ready_to_503() {
+        use boatramp_core::sql::{MigrationError, SqlError};
+
+        for e in [
+            MigrationError::Unavailable("starting".into()),
+            MigrationError::Sql(SqlError::unavailable("no healthy replica")),
+        ] {
+            let resp = migration_error_response(e);
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a transient not-ready is a retryable 503"
+            );
+            assert!(
+                resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+                "the not-ready 503 advertises Retry-After"
+            );
+        }
+
+        // A real backend error (not a transient) stays a terminal 400.
+        let resp = migration_error_response(MigrationError::Sql(SqlError::Syntax("boom".into())));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// cap-req #28 B2: `boatramp db status` (`/api/.../databases/{name}/status`) and

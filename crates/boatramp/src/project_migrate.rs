@@ -158,6 +158,8 @@ enum MigrateCommand {
         /// Emit the raw `MigrationReport` JSON instead of a human summary.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        wait: crate::managed_wait::WaitFlags,
     },
     /// Preview which steps WOULD apply, running nothing (`Project·Admin`).
     DryRun {
@@ -169,6 +171,8 @@ enum MigrateCommand {
         /// Emit the raw `MigrationReport` JSON instead of a human summary.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        wait: crate::managed_wait::WaitFlags,
     },
     /// Record a prefix as already-applied WITHOUT running it — adopt a pre-existing / populated
     /// database (`Project·Admin`). `--up-to <id>` records through that id inclusive; omitted
@@ -185,6 +189,8 @@ enum MigrateCommand {
         /// Emit the raw `MigrationReport` JSON instead of a human summary.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        wait: crate::managed_wait::WaitFlags,
     },
     /// Show the applied-migration ledger, in order (`Project·Read`).
     Status {
@@ -202,17 +208,31 @@ enum MigrateCommand {
 /// active `--project`, whose segment selects the target project's migrate surface).
 pub async fn run(args: MigrateArgs, cp: &ControlPlane) -> Result<()> {
     match args.command {
-        MigrateCommand::Apply { db, source, json } => {
+        MigrateCommand::Apply {
+            db,
+            source,
+            json,
+            wait,
+        } => {
             validate_db(&db)?;
             let bundle = resolve_bundle(cp, &source).await?;
-            let report = cp.migrate_trigger(&db, "apply", &bundle, None).await?;
+            let report = cp
+                .migrate_trigger(&db, "apply", &bundle, None, wait.policy())
+                .await?;
             render_report(&report, json)?;
             fail_if_step_failed(report)?;
         }
-        MigrateCommand::DryRun { db, source, json } => {
+        MigrateCommand::DryRun {
+            db,
+            source,
+            json,
+            wait,
+        } => {
             validate_db(&db)?;
             let bundle = resolve_bundle(cp, &source).await?;
-            let report = cp.migrate_trigger(&db, "dry-run", &bundle, None).await?;
+            let report = cp
+                .migrate_trigger(&db, "dry-run", &bundle, None, wait.policy())
+                .await?;
             render_report(&report, json)?;
             // A dry-run never fails a pending step, but a bundle-level failure still surfaces.
             fail_if_step_failed(report)?;
@@ -222,11 +242,12 @@ pub async fn run(args: MigrateArgs, cp: &ControlPlane) -> Result<()> {
             source,
             up_to,
             json,
+            wait,
         } => {
             validate_db(&db)?;
             let bundle = resolve_bundle(cp, &source).await?;
             let report = cp
-                .migrate_trigger(&db, "baseline", &bundle, up_to.as_deref())
+                .migrate_trigger(&db, "baseline", &bundle, up_to.as_deref(), wait.policy())
                 .await?;
             render_report(&report, json)?;
             fail_if_step_failed(report)?;
@@ -538,7 +559,9 @@ mod tests {
         // `apply -f file` with the default db + no --json. The default `--db` is the
         // reserved `default` name (v0.5.0), never the empty string.
         match parse(&["migrate", "apply", "-f", "m.json"]) {
-            Ok(MigrateCommand::Apply { db, source, json }) => {
+            Ok(MigrateCommand::Apply {
+                db, source, json, ..
+            }) => {
                 assert_eq!(db, boatramp_core::project::DEFAULT_DB_NAME);
                 assert_eq!(source.file, Some(PathBuf::from("m.json")));
                 assert_eq!(source.dir, None);
