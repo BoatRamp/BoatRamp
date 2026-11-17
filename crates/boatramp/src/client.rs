@@ -1417,12 +1417,18 @@ impl ControlPlane {
     /// [`MigrationReport`](boatramp_core::sql::MigrationReport) with `failed` set — returned
     /// as `Ok` so the caller can show which step failed and exit non-zero. A bundle/ledger
     /// error (`400`/`409`/`501`/`503`) is surfaced verbatim as [`ClientError::Refused`].
+    ///
+    /// A still-provisioning managed backend answers a retryable `503` + `Retry-After`; `wait`
+    /// bounds how long to wait on it (via the shared [`crate::managed_wait`] helper) before
+    /// surfacing it, so a cold-start migration blocks until the DB is ready rather than failing
+    /// immediately.
     pub async fn migrate_trigger(
         &self,
         db: &str,
         verb: &str,
         bundle: &str,
         up_to: Option<&str>,
+        wait: crate::managed_wait::WaitPolicy,
     ) -> Result<boatramp_core::sql::MigrationReport> {
         let seg = project_seg(&self.project, "migrate");
         let Self {
@@ -1430,11 +1436,12 @@ impl ControlPlane {
             base: server,
             ..
         } = self;
-        let resp = client
-            .post(format!("{server}/api/{seg}/{db}/{verb}"))
-            .json(&serde_json::json!({ "bundle": bundle, "up_to": up_to }))
-            .send()
-            .await?;
+        let url = format!("{server}/api/{seg}/{db}/{verb}");
+        let body = serde_json::json!({ "bundle": bundle, "up_to": up_to });
+        let resp = crate::managed_wait::send_with_ready_wait(wait, || {
+            client.post(url.as_str()).json(&body).send()
+        })
+        .await?;
         let status = resp.status();
         // 200 = clean; 422 = a step failed but the body is still a full report (halted at
         // the failing step, prefix applied). Both carry a `MigrationReport` to render.
@@ -1442,8 +1449,15 @@ impl ControlPlane {
             Ok(resp.json().await?)
         } else {
             let body = resp.text().await.unwrap_or_default();
+            // A `503` after the wait budget was spent is the still-provisioning case — hint the
+            // cure (raise the wait) rather than reading like a terminal refusal.
+            let hint = if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                " — the managed database is still provisioning; retry or raise `--wait-ready-secs`"
+            } else {
+                ""
+            };
             Err(ClientError::Refused(format!(
-                "schema migrate {verb} refused ({status}): {}",
+                "schema migrate {verb} refused ({status}){hint}: {}",
                 body.trim()
             )))
         }
@@ -3284,6 +3298,115 @@ mod tests {
             resp.status(),
             reqwest::StatusCode::UNAUTHORIZED,
             "wrong-origin proof → 401"
+        );
+    }
+
+    /// Reproduce-first for the `project migrate` trigger path: a managed backend that answers
+    /// not-ready (`503` + `Retry-After`) twice, then returns a clean `MigrationReport` — the
+    /// trigger must BLOCK on the shared readiness wait, then succeed once ready (3 attempts). A
+    /// `no_wait` policy against an always-not-ready route fails FAST (one attempt) with the hint.
+    /// (MUTATION PROOF: drop the wait in `managed_wait::send_with_ready_wait` and the waits-then-
+    /// succeeds case fails on the first 503.)
+    #[tokio::test]
+    async fn migrate_trigger_waits_through_pending_then_succeeds() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let apply_hits = Arc::new(AtomicUsize::new(0));
+        let apply_route = Arc::clone(&apply_hits);
+        let dryrun_hits = Arc::new(AtomicUsize::new(0));
+        let dryrun_route = Arc::clone(&dryrun_hits);
+
+        let app = axum::Router::new()
+            .route(
+                "/api/migrate/appdb/apply",
+                axum::routing::post(move || {
+                    let hits = Arc::clone(&apply_route);
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst);
+                        if n < 2 {
+                            (
+                                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                                [(axum::http::header::RETRY_AFTER, "0")],
+                                "managed database not ready\n",
+                            )
+                                .into_response()
+                        } else {
+                            (
+                                reqwest::StatusCode::OK,
+                                r#"{"newly_applied":[],"already_applied":[],"pending":[],"failed":null}"#,
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/migrate/appdb/dry-run",
+                axum::routing::post(move || {
+                    let hits = Arc::clone(&dryrun_route);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                            [(axum::http::header::RETRY_AFTER, "0")],
+                            "managed database not ready\n",
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cp = ControlPlane::new(
+            format!("http://127.0.0.1:{}", addr.port()),
+            build_client(None, None, None, None),
+            boatramp_core::project::DEFAULT_PROJECT.into(),
+        );
+
+        // Waits through two not-ready answers, then applies.
+        let report = cp
+            .migrate_trigger(
+                "appdb",
+                "apply",
+                &"a".repeat(64),
+                None,
+                crate::managed_wait::WaitPolicy::new(std::time::Duration::from_secs(10)),
+            )
+            .await
+            .expect("the migrate trigger waits then succeeds");
+        assert!(report.newly_applied.is_empty());
+        assert_eq!(
+            apply_hits.load(Ordering::SeqCst),
+            3,
+            "two not-ready attempts, then the applied one"
+        );
+
+        // `no_wait` surfaces the not-ready 503 immediately (one attempt) with the cure hint.
+        let err = cp
+            .migrate_trigger(
+                "appdb",
+                "dry-run",
+                &"a".repeat(64),
+                None,
+                crate::managed_wait::WaitPolicy::no_wait(),
+            )
+            .await
+            .expect_err("no_wait fails fast on a not-ready backend");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--wait-ready-secs"),
+            "the refusal hints the wait cure: {msg}"
+        );
+        assert_eq!(
+            dryrun_hits.load(Ordering::SeqCst),
+            1,
+            "no_wait makes exactly one attempt"
         );
     }
 }

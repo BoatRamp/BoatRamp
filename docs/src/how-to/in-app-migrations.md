@@ -304,6 +304,14 @@ boatramp splits "couldn't attempt the request" from "a step ran but failed":
   unparsable bundle, a raw `CREATE EXTENSION` in a `sql` step, or an extension not on the
   allowlist).
 
+> **Cold-start wait.** On a managed-database cold start the trigger verbs (`apply` / `dry-run` /
+> `baseline`) answer not-ready with that retryable `503` + `Retry-After` — and the CLI **waits** on
+> it by default (bounded, ~120 s — enough to cover a first image pull — honoring the server's
+> `Retry-After`), so `boatramp project migrate … apply` run right after an `apply` that provisions
+> the database blocks until it is ready rather than failing immediately. Tune it with
+> `--wait-ready-secs <n>` (`0` or `--no-wait` to fail fast for scripting). The `sql exec` / `sql
+> query` escape hatches wait the same way.
+
 ## How it stays safe
 
 The migration surface runs owner-authority DDL — from a `sql` step or a function's
