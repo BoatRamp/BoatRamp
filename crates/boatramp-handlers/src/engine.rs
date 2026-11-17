@@ -643,6 +643,10 @@ impl HostState {
     /// world store before the guest runs, so it is `Some` wherever the embedder's interfaces are
     /// reachable; the `expect` is an engine invariant (the embedder's interfaces are linked **only**
     /// on the world lane, whose store this method is reached through), never guest-triggerable.
+    ///
+    /// The infallible `&mut (dyn Any + Send)` is deliberate (Security review F5): returning a
+    /// `Result`/`Option` here would push an impossible-case branch into every embedder host function
+    /// for a condition that cannot occur, so the invariant is enforced by construction, not the type.
     pub fn embedder_state(&mut self) -> &mut (dyn Any + Send) {
         self.embedder
             .as_deref_mut()
@@ -2464,6 +2468,18 @@ impl HandlerEngine {
     /// lane's behavior. Called once at engine build. Without it, the world lane still works for a
     /// component that imports no embedder interface (it offers `wasi:io` + boatramp's capabilities),
     /// but a component importing one fails to link with a clear missing-import error.
+    ///
+    /// # Security — the component's declared world is NOT the security boundary
+    /// The world lane offers boatramp's FULL grantable capability set (the same set as the request
+    /// lane), each gated by the per-invocation grant it was given and the node posture. boatramp does
+    /// **no** validation that a component only imports the capabilities its honest WIT world declares,
+    /// so a crafted component can import ANY offered capability regardless of its advertised world. The
+    /// only thing that bounds the authority a world component can actually exercise is therefore (a)
+    /// the per-invocation [`Bindings`] the embedder passes to [`call_export`](Self::call_export), and
+    /// (b) the engine's node posture. **The embedder MUST pass a MINIMAL `Bindings` per invocation** —
+    /// grant only the capabilities that invocation legitimately needs — because an ungranted capability
+    /// fails `access-denied` but a granted one is reachable whether or not the component's world
+    /// mentions it.
     #[must_use]
     pub fn with_host_interfaces(mut self, host_interfaces: Arc<dyn HostInterfaces>) -> Self {
         self.host_interfaces = Some(host_interfaces);
@@ -2566,6 +2582,13 @@ impl HandlerEngine {
     /// may already be inside an enclosing transaction), so acquiring a request/async permit here could
     /// deadlock or wrongly bound it. The memory/epoch/fuel bounds (the engine's sync `Limits`) still
     /// apply through `new_store`.
+    ///
+    /// # Security — `bindings` is the authority boundary
+    /// `bindings` is the ONLY per-invocation bound on the host authority this component can exercise
+    /// (together with the node posture): the lane offers boatramp's full capability set and does NOT
+    /// check that the component only imports what its declared world advertises, so pass a MINIMAL
+    /// `Bindings` granting only what this invocation legitimately needs. See
+    /// [`with_host_interfaces`](Self::with_host_interfaces) for the full rationale.
     pub async fn call_export(
         &self,
         hash: &str,
@@ -2595,10 +2618,19 @@ impl HandlerEngine {
         // Move the embedder slot into THIS store so the embedder's host functions can downcast it.
         // Per-store ⇒ per-invocation isolation (dropped with the store when the call returns).
         store.data_mut().embedder = Some(host_state);
-        let instance = pre
-            .instantiate_async(&mut store)
-            .await
-            .map_err(|e| classify(&e, store.data().oom()))?;
+        let instance = match pre.instantiate_async(&mut store).await {
+            Ok(instance) => instance,
+            Err(e) => {
+                // A component may call a host import (e.g. a `sql-query`) from a core `start` during
+                // instantiation and then trap. Finalize (roll back) the SQL session on this early
+                // return too, so such a transaction is EXPLICITLY rolled back — symmetric with the
+                // missing-export and post-call paths, never left to backend drop semantics.
+                let err = classify(&e, store.data().oom());
+                #[cfg(feature = "sql")]
+                store.data_mut().sql.finalize(false).await;
+                return Err(err);
+            }
+        };
         let func = match instance.get_func(&mut store, export) {
             Some(f) => f,
             None => {
@@ -6009,12 +6041,17 @@ mod u7_host_world_lane_tests {
         ))
     }
 
-    /// A `run` component that imports interface `iface` with a no-arg func `func` but never calls it —
-    /// for the deterministic-posture tests (the import must be UNRESOLVABLE on the world lane).
-    fn import_only_component(iface: &str, func: &str) -> Vec<u8> {
+    /// A `run` component that imports interface `iface` exposing exactly `export_decl` (the inner of a
+    /// `(export …)` in an instance type), and never calls it. `export_decl` is a TYPE-CORRECT subset of
+    /// a real WASI interface member (e.g. `"now" (func (result u64))` for `monotonic-clock`, or
+    /// `"error" (type (sub resource))` for `wasi:io/error`), so wasmtime's structural import matching
+    /// RESOLVES it when that interface is linked and REFUSES it (unknown import) when it is not — unlike
+    /// a nullary `(func)` stub, which no real interface structurally matches, so wasmtime would reject
+    /// it whether or not the interface were linked (the hollow-test trap: Security review F1).
+    fn import_component(iface: &str, export_decl: &str) -> Vec<u8> {
         wasm(&format!(
             r#"(component
-                (import "{iface}" (instance (export "{func}" (func))))
+                (import "{iface}" (instance (export {export_decl})))
                 (core module $m
                     (memory (export "memory") 1)
                     (func (export "run") (result i32) i32.const 0))
@@ -6191,23 +6228,62 @@ mod u7_host_world_lane_tests {
         );
     }
 
-    // ---- Security focus: deterministic wasi:io-only posture ------------------------------------
+    // ---- Security focus: deterministic wasi:io-only posture (binding, not vacuous — Sec review F1) --
 
+    /// The world lane links `wasi:io` and NOTHING ELSE of WASI. The fixtures here are TYPE-CORRECT
+    /// subsets of the real WASI 0.2.12 interfaces (the version wasmtime-wasi 50 registers), so each one
+    /// actually binds to wasmtime's structural import matching:
+    /// - a **positive control** — a type-correct `wasi:io` import — MUST resolve, proving the test is
+    ///   not vacuous and the fixture version/type still matches wasmtime-wasi (a bump that breaks the
+    ///   match fails HERE, loudly, instead of letting the negatives pass for the wrong reason);
+    /// - the **negatives** — type-correct `wasi:clocks` / `wasi:random` / `wasi:filesystem` imports —
+    ///   MUST be refused, because the deterministic lane does not link them.
+    ///
+    /// Mutation proof (Security review F1): swapping `build_world_linker`'s
+    /// `wasmtime_wasi_io::add_to_linker_async` for the full `wasmtime_wasi::p2::add_to_linker_async`
+    /// links clocks/random/filesystem too, so every negative below RESOLVES and this test goes RED.
+    /// (The earlier nullary-`(func)` fixtures matched no real interface, so wasmtime refused them with
+    /// the SAME message whether or not WASI was linked — the test passed vacuously under that swap.)
     #[tokio::test]
-    async fn world_lane_offers_no_clocks_random_or_filesystem() {
+    async fn world_lane_posture_is_wasi_io_only() {
         let (engine, _host) = engine_with_host(Limits::default());
-        // Each of these nondeterministic WASI interfaces must be UNRESOLVABLE on the world lane, so a
-        // cell that imports one is refused at compile — the posture is physically wasi:io-only.
-        for (iface, func) in [
-            ("wasi:clocks/wall-clock", "now"),
-            ("wasi:clocks/monotonic-clock", "now"),
-            ("wasi:random/random", "get-random-bytes"),
-            ("wasi:filesystem/preopens", "get-directories"),
+
+        // POSITIVE CONTROL + version-drift tripwire: a type-correct `wasi:io/error` import (the `error`
+        // resource, which the lane DOES link) must resolve. If this ever fails, the WASI fixture type or
+        // version drifted from wasmtime-wasi — update the `@0.2.12` fixtures — rather than the negatives
+        // silently passing for the wrong reason.
+        let io_positive =
+            import_component("wasi:io/error@0.2.12", r#""error" (type (sub resource))"#);
+        engine
+            .precompile_and_serialize_world("io-positive", &io_positive)
+            .expect(
+                "positive control: a type-correct wasi:io import MUST resolve on the world lane — if \
+                 this fails, the WASI fixture version/type drifted from wasmtime-wasi 50; update it",
+            );
+
+        // NEGATIVES: type-correct imports of the nondeterministic WASI packages the lane must NOT link.
+        // Because they are type-correct, the full-WASI mutation (see the doc above) makes each resolve
+        // and flips the test — so these assertions genuinely bind to the io-only posture.
+        for (iface, export_decl) in [
+            (
+                "wasi:clocks/monotonic-clock@0.2.12",
+                r#""now" (func (result u64))"#,
+            ),
+            (
+                "wasi:random/random@0.2.12",
+                r#""get-random-u64" (func (result u64))"#,
+            ),
+            (
+                "wasi:filesystem/types@0.2.12",
+                r#""descriptor" (type (sub resource))"#,
+            ),
         ] {
-            let component = import_only_component(iface, func);
+            let component = import_component(iface, export_decl);
             let err = engine
                 .precompile_and_serialize_world(iface, &component)
-                .expect_err("the deterministic world lane must refuse a nondeterministic import");
+                .expect_err(
+                    "the deterministic world lane must not link this nondeterministic import",
+                );
             match err {
                 HandlerError::Compile(msg) => {
                     let pkg = iface.split('/').next().unwrap();
@@ -6367,6 +6443,29 @@ mod u7_host_world_lane_tests {
 
         /// Drive `call_export` once against a `touch`-then-`{trap?}` component and report whether the
         /// enclosing transaction was committed or rolled back.
+        /// A component whose core `start` (run at INSTANTIATION) calls `touch` (opening a transaction)
+        /// then `unreachable`-traps — so the trap surfaces from `instantiate_async`, BEFORE any export
+        /// call. Exercises the F2 finalize-on-instantiation-failure path.
+        fn touch_then_trap_at_instantiation() -> Vec<u8> {
+            wasm(
+                r#"(component
+                    (import "test:sql/probe" (instance $p (export "touch" (func))))
+                    (alias export $p "touch" (func $t))
+                    (core func $t_core (canon lower (func $t)))
+                    (core module $m
+                        (import "host" "touch" (func $touch))
+                        (memory (export "memory") 1)
+                        (func $start call $touch unreachable)
+                        (start $start)
+                        (func (export "run") (result i32) i32.const 0))
+                    (core instance $i (instantiate $m
+                        (with "host" (instance (export "touch" (func $t_core))))))
+                    (func $run (result (result (error string)))
+                        (canon lift (core func $i "run") (memory (core memory $i "memory"))))
+                    (export "run" (func $run)))"#,
+            )
+        }
+
         async fn run_once(trap_after: bool) -> (bool, bool, Result<Vec<Val>, HandlerError>) {
             let component = call_host_component("test:sql/probe", "touch", trap_after);
             let (engine, _host) = engine_with_host(Limits::default());
@@ -6415,6 +6514,40 @@ mod u7_host_world_lane_tests {
                 "a trap must ROLL BACK the enclosing transaction"
             );
             assert!(!committed, "a trap must never commit");
+        }
+
+        #[tokio::test]
+        async fn an_instantiation_trap_rolls_back_the_session() {
+            // Security review F2, reproduce-first: a transaction opened from a core `start` during
+            // instantiation, then a trap BEFORE any export runs. `call_export` must EXPLICITLY roll the
+            // session back on the `instantiate_async` error path — not leave it to backend drop.
+            let component = touch_then_trap_at_instantiation();
+            let (engine, _host) = engine_with_host(Limits::default());
+            engine
+                .precompile_and_serialize_world("inst-trap", &component)
+                .expect("compiles");
+            let committed = Arc::new(AtomicBool::new(false));
+            let rolledback = Arc::new(AtomicBool::new(false));
+            let backend = Arc::new(RecordingBackend {
+                committed: committed.clone(),
+                rolledback: rolledback.clone(),
+            });
+            let bindings = Bindings::new("test").with_sql("db", backend);
+            let result = engine
+                .call_export("inst-trap", bindings, Box::new(0u32), "run", &[])
+                .await;
+            assert!(
+                matches!(result, Err(HandlerError::Trap(_))),
+                "the instantiation trap surfaces as Trap: {result:?}"
+            );
+            assert!(
+                rolledback.load(Ordering::SeqCst),
+                "an instantiation trap must ROLL BACK a transaction opened during instantiation"
+            );
+            assert!(
+                !committed.load(Ordering::SeqCst),
+                "an instantiation trap must never commit"
+            );
         }
     }
 }
