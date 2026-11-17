@@ -460,20 +460,43 @@ fn render_applied(
             writeln!(w, "  {kind} {}: {}", s.name, s.reason)?;
         }
     }
+    if a.completed_with_deferrals() {
+        writeln!(
+            w,
+            "{} site config(s) DEFERRED (data synced; config awaits deploy:apply):",
+            a.deferred_count()
+        )?;
+        for d in &a.deferred {
+            writeln!(w, "  site {}: {}", d.site, d.reason)?;
+        }
+    }
     for note in a.notes.iter().chain(notes.iter()) {
         writeln!(w, "note: {note}")?;
+    }
+    // The deferral summary rides ABOVE the final status line (exit 0): "N deferred — run deploy:apply".
+    if let Some(summary) = a.deferred_summary() {
+        writeln!(w, "{summary}")?;
     }
     if a.is_noop() {
         writeln!(
             w,
             "(converged — this apply changed nothing at the destination)"
         )?;
-    } else if a.completed_with_skips() {
-        writeln!(
-            w,
-            "(applied WITH {} skipped — fix the dependency and resync, or --strict to refuse)",
-            a.skipped_count()
-        )?;
+    } else if a.completed_with_skips() || a.completed_with_deferrals() {
+        let mut tail = Vec::new();
+        if a.completed_with_skips() {
+            tail.push(format!(
+                "{} skipped — fix the dependency and resync, or --strict to refuse",
+                a.skipped_count()
+            ));
+        }
+        if a.completed_with_deferrals() {
+            tail.push(format!(
+                "{} deferred — run deploy:apply to finish them",
+                a.deferred_count()
+            ));
+        }
+        writeln!(w, "(applied WITH {})", tail.join("; "))?;
     } else {
         writeln!(w, "(applied)")?;
     }
@@ -751,6 +774,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
         only_blob_keys,
         drop_soft_deleted: args.drop_soft_deleted,
         data_skip_notes: Vec::new(),
+        dest_secret_names: None,
     };
     let applied = apply_sync(&plan, &mut exec).await?;
     // Surface any KV-stratum records the dest skipped-and-reported (PLAN rule 3) in the operator
@@ -832,6 +856,12 @@ struct CliSyncExecutor {
     /// `run()` so a human/CI sees the DISTINCT "applied WITH skips" outcome and can run the
     /// `--only-blobs` repair.
     data_skip_notes: Vec<String>,
+    /// The destination's sealed secret NAMES (`GET /api/secrets`), fetched once + cached, for the
+    /// sites-rewrite coherence check: a carried `[handlers].secrets` `boatramp:<name>` reference to a
+    /// name absent here is a not-yet-sealed secret ⇒ the site is DEFERRED to `deploy:apply`. `None` =
+    /// not yet fetched; the inner `None` (fetch failed — no `[secrets]` envelope / transient) means
+    /// "can't determine — don't defer" (never mask an infra fault as a deferral).
+    dest_secret_names: Option<Option<BTreeSet<String>>>,
 }
 
 /// MEDIUM-2 (cross-tenant path-traversal guard): validate a SOURCE-derived resource `name` BEFORE
@@ -949,6 +979,65 @@ impl CliSyncExecutor {
         self.data_transferred = true;
         Ok(())
     }
+
+    /// Detect the control-plane a carried/rewritten site `cfg` references that the DESTINATION does
+    /// not have yet, so `apply_sync` can DEFER the config to a later `deploy:apply` instead of
+    /// hard-failing the run after the data plane already landed (sync-sites-defer). The concrete,
+    /// in-config reference is the `[handlers].secrets` pool: a `boatramp:<name>` entry resolves
+    /// against the project's SEALED secrets, so a name not yet sealed on the destination is
+    /// incoherent until `deploy:apply` seals it. (`env:`/bare host-env references resolve from the
+    /// operator environment — never the sealed store — so they are not a sync coherence concern; and
+    /// a function a handler points at is deployed by the SAME `deploy:apply` that owns the deferred
+    /// config.) Returns the missing references as `secret:<name>`; empty ⇒ coherent. FAIL-OPEN on an
+    /// enumeration fault (no `[secrets]` envelope → `501`, or a transient): we cannot positively
+    /// prove a secret is absent, so we do NOT defer — the write proceeds and a real error still
+    /// surfaces, never masking an infra fault as a deferral.
+    async fn missing_site_secret_refs(
+        &mut self,
+        cfg: &boatramp_core::config::SiteConfig,
+    ) -> Vec<String> {
+        // The `boatramp:<name>` secrets this config needs sealed on the destination.
+        let needed = referenced_boatramp_secrets(cfg);
+        if needed.is_empty() {
+            return Vec::new();
+        }
+        // Enumerate the destination's sealed secret NAMES once, cached. Fail-open on any fault.
+        if self.dest_secret_names.is_none() {
+            let fetched = self
+                .dest_cp
+                .list_secret_names()
+                .await
+                .ok()
+                .map(|names| names.into_iter().collect::<BTreeSet<String>>());
+            self.dest_secret_names = Some(fetched);
+        }
+        let Some(Some(sealed)) = self.dest_secret_names.as_ref() else {
+            return Vec::new(); // can't determine — don't defer
+        };
+        needed
+            .into_iter()
+            .filter(|n| !sealed.contains(n))
+            .map(|n| format!("secret:{n}"))
+            .collect()
+    }
+}
+
+/// The `boatramp:<name>` SEALED secrets a site `cfg` references through its `[handlers].secrets`
+/// pool — the names that must be sealed on a destination for the config to be coherent. `env:`/bare
+/// host-env references resolve from the operator environment (never the sealed store), so they are
+/// excluded; an empty `name` after the prefix is ignored. Pure + unit-testable (the network-free
+/// half of [`CliSyncExecutor::missing_site_secret_refs`]).
+fn referenced_boatramp_secrets(cfg: &boatramp_core::config::SiteConfig) -> BTreeSet<String> {
+    let Some(handlers) = cfg.handlers.as_ref() else {
+        return BTreeSet::new();
+    };
+    handlers
+        .secrets
+        .values()
+        .filter_map(|r| r.strip_prefix("boatramp:"))
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -1105,6 +1194,17 @@ impl SyncExecutor for CliSyncExecutor {
         {
             return Ok(false);
         }
+        // Sites-rewrite coherence (sync-sites-defer): if this config's handlers reference a secret
+        // not sealed on the destination YET, DEFER it (write NOTHING) to a later `deploy:apply`
+        // rather than failing the run after the data plane already landed. `apply_sync` catches
+        // `IncoherentSiteConfig`, records the deferral, and finishes the run with exit 0.
+        let missing = self.missing_site_secret_refs(cfg).await;
+        if !missing.is_empty() {
+            return Err(SyncApplyError::IncoherentSiteConfig {
+                site: site.to_string(),
+                missing,
+            });
+        }
         match self.dest_cp.put_site_config(site, cfg).await {
             Ok(()) => Ok(true),
             // The node's host-uniqueness hijack guard refuses a double-claim with `409 Conflict`.
@@ -1137,6 +1237,44 @@ mod tests {
     #[derive(clap::Subcommand)]
     enum Cmd {
         Sync(SyncArgs),
+    }
+
+    /// The sites-rewrite coherence check (sync-sites-defer) keys off exactly the `boatramp:<name>`
+    /// references in a site's `[handlers].secrets` pool: those are the SEALED secrets a destination
+    /// must have for the config to be coherent. `env:`/bare host-env refs resolve from the operator
+    /// environment, not the sealed store, so they are NOT a sync coherence concern and must be
+    /// ignored — else a coherent config would be falsely deferred.
+    #[test]
+    fn referenced_boatramp_secrets_selects_only_sealed_refs() {
+        use boatramp_core::config::{HandlersSiteConfig, SiteConfig};
+        let mut handlers = HandlersSiteConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        handlers
+            .secrets
+            .insert("STRIPE".into(), "boatramp:STRIPE_KEY".into());
+        handlers
+            .secrets
+            .insert("HOSTVAR".into(), "env:SOME_HOST_VAR".into());
+        handlers
+            .secrets
+            .insert("BARE".into(), "PLAIN_HOST_VAR".into());
+        handlers
+            .secrets
+            .insert("OTHER".into(), "boatramp:OAUTH_SECRET".into());
+        let cfg = SiteConfig {
+            handlers: Some(handlers),
+            ..Default::default()
+        };
+        let got = referenced_boatramp_secrets(&cfg);
+        let want: BTreeSet<String> = ["STRIPE_KEY".to_string(), "OAUTH_SECRET".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(got, want, "only boatramp:<name> sealed refs count");
+
+        // No handlers / no secrets ⇒ nothing referenced (a coherent site never defers).
+        assert!(referenced_boatramp_secrets(&SiteConfig::default()).is_empty());
     }
 
     fn parse(argv: &[&str]) -> std::result::Result<SyncArgs, clap::Error> {
@@ -1269,6 +1407,7 @@ mod tests {
             only_blob_keys: Vec::new(),
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
+            dest_secret_names: None,
         }
     }
 
@@ -1413,6 +1552,7 @@ mod tests {
             only_blob_keys: vec!["hblob/dst/web/assets/poison.jpg".to_string()],
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
+            dest_secret_names: None,
         };
 
         exec.transfer_data().await.expect("data transfer ok");
@@ -1554,6 +1694,7 @@ mod tests {
             only_blob_keys: Vec::new(),
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
+            dest_secret_names: None,
         };
 
         let mut excludes = BTreeSet::new();
@@ -1644,6 +1785,7 @@ mod tests {
             only_blob_keys: Vec::new(),
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
+            dest_secret_names: None,
         };
         let err = exec
             .carry_kv_stratum(Piece::History, &[], &BTreeSet::new())
@@ -1759,6 +1901,7 @@ mod tests {
             only_blob_keys: Vec::new(),
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
+            dest_secret_names: None,
         };
 
         let cfg = boatramp_core::config::SiteConfig::default();

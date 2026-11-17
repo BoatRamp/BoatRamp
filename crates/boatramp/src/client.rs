@@ -846,6 +846,32 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// List the NAMES of the project's sealed secrets (`GET /api/secrets` — names + metadata, never
+    /// values). Used by `project sync` to detect a site config whose `[handlers].secrets` references
+    /// a `boatramp:<name>` secret not yet sealed on the destination, so it can DEFER that config to a
+    /// later `deploy:apply` rather than fail the run. A node with no `[secrets]` envelope answers
+    /// `501`, surfaced as an error the caller treats as "can't determine — don't defer".
+    pub async fn list_secret_names(&self) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct NameOnly {
+            name: String,
+        }
+        let seg = project_seg(&self.project, "secrets");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let metas: Vec<NameOnly> = client
+            .get(format!("{server}/api/{seg}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(metas.into_iter().map(|m| m.name).collect())
+    }
+
     /// Fetch the project's tenancy schema (the per-table tenant-key map). A project
     /// that declared none returns the default schema (`tenant_id`, no tables).
     pub async fn get_project_tenancy(&self) -> Result<boatramp_core::tenancy::TenancySchema> {
