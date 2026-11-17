@@ -118,11 +118,19 @@ fn chown_dir(_path: &Path, _uid: u32, _gid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The reserved prefix the native `container` backend gives a per-(project, workload)
+/// SCOPED volume directory (`<data_dir>/compute/volumes/@<scope>/…`). Docker's own
+/// volumes are FLAT, so this backend must never create or remove an `@`-prefixed entry —
+/// otherwise, on a node whose `data_dir` is SHARED with a native-container backend
+/// (Bind mode), a docker `remove_volume("@<victimscope>")` would `remove_dir_all` another
+/// backend's scoped PGDATA. Mirrors the native backend's `SCOPE_DIR_PREFIX` guard.
+const SCOPE_DIR_PREFIX: &str = "@";
+
 /// Reject a volume whose `name` or `mount` could escape its sandboxed location
 /// (mirrors the native-container guard): `name` backs a docker volume / a
 /// `<data_dir>/compute/volumes/<name>` bind, so it must be a single normal path
-/// component; `mount` is the in-container target, so it must be absolute with no
-/// `..`/`.`.
+/// component and must NOT claim the reserved `@`-scope prefix; `mount` is the
+/// in-container target, so it must be absolute with no `..`/`.`.
 fn validate_volume(name: &str, mount: &str) -> Result<(), BackendError> {
     use std::path::Component;
     let name_ok = matches!(
@@ -132,6 +140,14 @@ fn validate_volume(name: &str, mount: &str) -> Result<(), BackendError> {
     if !name_ok {
         return Err(BackendError::Launch(format!(
             "invalid volume name {name:?}: must be a single path component"
+        )));
+    }
+    // DiD (Finding 4): never let a docker operation address a native-container scoped
+    // volume dir (`@<scope>`) when the two backends share a `data_dir`.
+    if name.starts_with(SCOPE_DIR_PREFIX) {
+        return Err(BackendError::Launch(format!(
+            "invalid volume name {name:?}: the {SCOPE_DIR_PREFIX:?} prefix is reserved for \
+             per-(project, workload) volume scopes (owned by the native container backend)"
         )));
     }
     let m = Path::new(mount);
@@ -1034,6 +1050,13 @@ impl ComputeBackend for DockerBackend {
                         continue;
                     }
                     if let Some(name) = entry.file_name().to_str().map(str::to_owned) {
+                        // Skip a native-container SCOPED volume dir (`@<scope>`) when the
+                        // two backends share a `data_dir` — it is not a docker volume, and
+                        // listing it would let the docker `compute volume rm` endpoint
+                        // target another backend's PGDATA (Finding 4).
+                        if name.starts_with(SCOPE_DIR_PREFIX) {
+                            continue;
+                        }
                         out.push(VolumeInfo {
                             name,
                             size_bytes: 0,
@@ -1054,11 +1077,14 @@ impl ComputeBackend for DockerBackend {
     /// daemon volume is addressed with the `boatramp-` prefix (Named) / the host bind
     /// directory (Bind), so this can only ever touch a volume THIS backend created.
     ///
-    /// `force: false` deliberately: the daemon refuses (409) to remove a volume still
-    /// attached to a container, which fails loudly rather than silently wiping data out
-    /// from under a live replica — the drop path stops the workload's container FIRST,
-    /// so by the time it reclaims the volume nothing is attached. A 404 (already gone)
-    /// is the idempotent `Ok(false)`.
+    /// In **Named** mode `force: false` is deliberate: the daemon refuses (409) to remove
+    /// a volume still attached to a container, failing loudly rather than wiping data from
+    /// under a live replica; a 404 (already gone) is the idempotent `Ok(false)`. **Bind**
+    /// mode is a plain `remove_dir_all` with NO such in-use guard (a bind mount is just a
+    /// host path), so it relies on the caller having stopped the workload's container
+    /// first — which the drop path does (stop, then reclaim). This is the raw removal; the
+    /// "still referenced by a registered workload" refusal lives one layer up in
+    /// [`ComputeVolumes`](boatramp_core::compute::ComputeVolumes).
     async fn remove_volume(&self, name: &str) -> Result<bool, BackendError> {
         // Reject a traversing / multi-component name before building any path or daemon
         // volume name from it (mirrors `stage_volumes`' guard; the mount is irrelevant
@@ -2376,11 +2402,16 @@ mod tests {
         assert!(named.remove_volume("../etc").await.is_err());
         assert!(named.remove_volume("a/b").await.is_err());
         assert!(named.remove_volume("/abs").await.is_err());
-        // Same guard in Bind mode (the host-path removal), also before touching the fs.
+        // DiD (Finding 4): a native-container SCOPED volume dir (`@<scope>`) is never a
+        // docker volume — docker must refuse to address one even when the `data_dir` is
+        // shared, so it can't `remove_dir_all` another backend's PGDATA.
+        assert!(named.remove_volume("@acme@pg-x").await.is_err());
+        // Same guards in Bind mode (the host-path removal), all before touching the fs.
         let docker2 = Docker::connect_with_defaults().unwrap();
         let bind = DockerBackend::with_client(docker2).with_volume_mode(DockerVolumeMode::Bind);
         assert!(bind.remove_volume("..").await.is_err());
         assert!(bind.remove_volume("x/y").await.is_err());
+        assert!(bind.remove_volume("@acme@pg-x").await.is_err());
     }
 
     #[tokio::test]
@@ -2397,12 +2428,17 @@ mod tests {
         // Nothing staged yet ⇒ empty list.
         assert!(backend.list_volumes().await.unwrap().is_empty());
 
-        // Stage two managed-DB data volumes (what a `launch` creates for a Single DB).
+        // Stage two managed-DB data volumes (what a `launch` creates for a Single DB), plus
+        // a native-container SCOPED volume dir (`@<scope>`) as if the two backends shared
+        // this `data_dir` — docker must IGNORE the latter (Finding 4).
         let vols = data.path().join("compute").join("volumes");
         tokio::fs::create_dir_all(vols.join("bramp-db-acme-app"))
             .await
             .unwrap();
         tokio::fs::create_dir_all(vols.join("bramp-db-acme-other"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(vols.join("@acme@bramp-db-acme-app"))
             .await
             .unwrap();
 
@@ -2413,7 +2449,11 @@ mod tests {
             .into_iter()
             .map(|v| v.name)
             .collect();
-        assert_eq!(listed, vec!["bramp-db-acme-app", "bramp-db-acme-other"]);
+        assert_eq!(
+            listed,
+            vec!["bramp-db-acme-app", "bramp-db-acme-other"],
+            "a native-container `@<scope>` dir is not a docker volume and must be excluded"
+        );
 
         // Drop ONE volume: it existed, and only it is removed (the sibling survives — the
         // per-(project,workload) scope: a drop never touches another DB's data).
@@ -2422,6 +2462,12 @@ mod tests {
         assert!(
             vols.join("bramp-db-acme-other").exists(),
             "dropping one managed DB must not remove a sibling's volume"
+        );
+        // The native scoped dir is untouched (docker refuses the `@` name outright).
+        assert!(backend.remove_volume("@acme@bramp-db-acme-app").await.is_err());
+        assert!(
+            vols.join("@acme@bramp-db-acme-app").exists(),
+            "docker must never remove a native-container scoped volume dir"
         );
 
         // Idempotent: removing the now-absent volume reports `false`, never an error.

@@ -1018,10 +1018,25 @@ pub async fn deprovision_tenant(
             //    same-name re-provision `initdb`s afresh against its NEW credential
             //    instead of silently re-attaching this dropped DB's stale, OLD-credential
             //    volume (the "data volume was initialized with a different credential"
-            //    auth failure). Scoped to THIS workload's own derived volume name
-            //    (`managed_volume_name(workload, is_default=false)` — a `SingleDrop` is
-            //    never the reserved default), per-(project, workload): a sibling DB's
-            //    volume is never touched.
+            //    auth failure). Scoped to THIS workload's own data, per-(project,
+            //    workload): a sibling DB's volume is never touched.
+            //
+            //    A managed DB's data lives under DIFFERENT layouts per backend, so BOTH
+            //    reclaim surfaces are called (each no-ops on the backend that doesn't own
+            //    that layout — idempotent + backend-namespaced):
+            //      * FLAT (`remove_volume(managed_volume_name(workload, false))`) — the
+            //        remote-docker named volume `boatramp-<workload>` / its Bind dir.
+            //      * SCOPED (`remove_scoped_volume(compute_volume_scope(project,
+            //        workload))`) — the native `container` backend's
+            //        `<data_dir>/compute/volumes/@<scope>/…` PGDATA (whose `remove_volume`
+            //        REJECTS the `@`-scope name, so only the scoped call reaches it) AND
+            //        the k8s PVC `data-<workload>`. Without this the scoped PGDATA survives
+            //        the drop → a same-name re-provision re-attaches it (the stale-cred
+            //        failure, on container/k8s) AND — because step 2 just dropped the
+            //        observed replica-state the orphan reaper keys off — nothing is left to
+            //        reclaim it, so it would be stranded permanently.
+            //    `managed_volume_name`/`compute_volume_scope`(workload, is_default=false): a
+            //    `SingleDrop` is never the reserved default install.
             if let Some(backends) = backends {
                 match deploy.list_replica_states(proj, &workload).await {
                     Ok(states) => {
@@ -1045,11 +1060,12 @@ pub async fn deprovision_tenant(
                     ),
                 }
                 let vol = managed_volume_name(&workload, false);
+                let scope = boatramp_core::compute::compute_volume_scope(project, &workload);
                 for backend in backends.values() {
+                    // FLAT layout (remote-docker). `Unsupported` ⇒ not this backend's
+                    // layout (e.g. cloudflare); the scoped call below owns container/k8s.
                     match backend.remove_volume(&vol).await {
                         Ok(_) => {}
-                        // A backend that owns no local volume (cloudflare / another
-                        // node's) reports `Unsupported` — simply not the owner.
                         Err(boatramp_core::compute::BackendError::Unsupported) => {}
                         // The DB + credential drop already succeeded; a volume that could
                         // not be reclaimed is an operator-recoverable orphan
@@ -1059,9 +1075,24 @@ pub async fn deprovision_tenant(
                             workload = %workload,
                             volume = %vol,
                             error = %e,
-                            "managed-DB drop: could not reclaim the data volume (the drop \
-                             itself succeeded); reclaim it with `compute volume rm` so a \
-                             same-name re-provision initializes fresh"
+                            "managed-DB drop: could not reclaim the (flat) data volume (the \
+                             drop itself succeeded); reclaim it with `compute volume rm` so \
+                             a same-name re-provision initializes fresh"
+                        ),
+                    }
+                    // SCOPED layout (native `container` PGDATA + k8s PVC). Default
+                    // `Ok(false)` for a backend without scoped staging (docker/cloudflare).
+                    match backend.remove_scoped_volume(&scope).await {
+                        Ok(_) => {}
+                        Err(boatramp_core::compute::BackendError::Unsupported) => {}
+                        Err(e) => tracing::warn!(
+                            workload = %workload,
+                            scope = %scope,
+                            error = %e,
+                            "managed-DB drop: could not reclaim the (scoped) data volume \
+                             (the drop itself succeeded); the orphan reaper no longer tracks \
+                             this replica, so reclaim it with `compute volume rm` to avoid a \
+                             stranded volume + a stale-credential re-provision"
                         ),
                     }
                 }
@@ -2616,6 +2647,14 @@ impl NodeTenantDeprovisioner {
         .await
         {
             Ok(()) => {
+                // The binding's sealed credential was just torn down (and, for Single, its
+                // data volume reclaimed): INVALIDATE any serve-process-cached `sql` binding
+                // backend for this `(project, binding)` so a same-name project/site recreate
+                // re-resolves rather than serving the old cached credential until a serve
+                // restart (Finding 2) — mirroring the `db drop database` path. Keyed by the
+                // enumeration `name`, matching how `drop_database` bumps + how the caches
+                // stamp. Monotonic + scoped: it can only ever force a re-resolve.
+                boatramp_core::sql::sql_binding_epochs().bump(project, name);
                 if matches!(scope, TenantScope::Site) {
                     tracing::info!(
                         binding = name,
@@ -3728,14 +3767,24 @@ mod tests {
         }
     }
 
-    /// A compute backend that RECORDS every `remove_volume(name)` call, so the
-    /// managed-DB drop's data-volume reclaim (papercut-a) is observable without a live
-    /// daemon. Every other method is an unreachable stub — the deprovision path under
-    /// test registers desired state but launches nothing, so no replica/health call
-    /// reaches here.
+    /// Records of a [`RecordingVolumeBackend`]'s reclaim calls: the FLAT
+    /// `remove_volume(name)` names and the SCOPED `remove_scoped_volume(scope)` scopes.
+    /// Both must fire on a Single drop so the reclaim covers every backend layout
+    /// (docker-flat + native-container/k8s-scoped) — papercut-a Finding 1.
+    #[derive(Clone, Default)]
+    struct VolumeReclaimLog {
+        flat: Arc<std::sync::Mutex<Vec<String>>>,
+        scoped: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// A compute backend that RECORDS every `remove_volume(name)` + `remove_scoped_volume(
+    /// scope)` call, so the managed-DB drop's data-volume reclaim (papercut-a) is
+    /// observable on BOTH layouts without a live daemon. Every other method is an
+    /// unreachable stub — the deprovision path under test registers desired state but
+    /// launches nothing, so no replica/health call reaches here.
     #[derive(Clone, Default)]
     struct RecordingVolumeBackend {
-        removed: Arc<std::sync::Mutex<Vec<String>>>,
+        log: VolumeReclaimLog,
     }
     #[_async_trait]
     impl boatramp_core::compute::ComputeBackend for RecordingVolumeBackend {
@@ -3789,22 +3838,29 @@ mod tests {
             &self,
             name: &str,
         ) -> std::result::Result<bool, boatramp_core::compute::BackendError> {
-            self.removed.lock().unwrap().push(name.to_string());
+            self.log.flat.lock().unwrap().push(name.to_string());
+            Ok(true)
+        }
+        async fn remove_scoped_volume(
+            &self,
+            scope: &str,
+        ) -> std::result::Result<bool, boatramp_core::compute::BackendError> {
+            self.log.scoped.lock().unwrap().push(scope.to_string());
             Ok(true)
         }
     }
 
-    /// A one-backend registry over a [`RecordingVolumeBackend`], plus a handle to its
-    /// recorded `remove_volume` names.
-    fn recording_registry() -> (BackendRegistry, Arc<std::sync::Mutex<Vec<String>>>) {
+    /// A one-backend registry over a [`RecordingVolumeBackend`], plus the
+    /// [`VolumeReclaimLog`] capturing its FLAT + SCOPED reclaim calls.
+    fn recording_registry() -> (BackendRegistry, VolumeReclaimLog) {
         let backend = RecordingVolumeBackend::default();
-        let removed = backend.removed.clone();
+        let log = backend.log.clone();
         let mut reg: BackendRegistry = std::collections::BTreeMap::new();
         reg.insert(
             "fake".to_string(),
             Arc::new(backend) as Arc<dyn boatramp_core::compute::ComputeBackend>,
         );
-        (reg, removed)
+        (reg, log)
     }
 
     fn shared_binding() -> ExternalDatabaseConfig {
@@ -4093,7 +4149,7 @@ mod tests {
         // observable: a dropped Single tenant's dedicated data volume MUST be removed so
         // a same-name re-provision `initdb`s fresh against its new credential instead of
         // re-attaching the dropped DB's stale, old-credential volume.
-        let (backends, removed) = recording_registry();
+        let (backends, log) = recording_registry();
         let deprovisioner = NodeTenantDeprovisioner::new(
             deploy.clone(),
             kv.clone(),
@@ -4113,8 +4169,8 @@ mod tests {
             "default-project guard: the single-tenant install must never be dropped"
         );
         assert!(
-            removed.lock().unwrap().is_empty(),
-            "a no-op default-project delete must never remove any volume"
+            log.flat.lock().unwrap().is_empty() && log.scoped.lock().unwrap().is_empty(),
+            "a no-op default-project delete must never remove any volume (flat or scoped)"
         );
 
         // Deleting `acme` tears down EXACTLY acme's workload + credential.
@@ -4137,14 +4193,21 @@ mod tests {
             "acme delete must not touch the default install's credential"
         );
         // REPRODUCE-FIRST GATE (papercut-a): the drop reclaimed EXACTLY acme's dedicated
-        // data volume (the derived workload name, per-(project, workload)) and nothing
-        // else — so a same-name re-provision can never re-attach the stale volume.
-        // MUTATION: drop the `remove_volume` block in `deprovision_tenant`'s `SingleDrop`
-        // arm and this is empty → fail.
+        // data volume on BOTH backend layouts — the FLAT name (docker) and the SCOPED name
+        // `<project>@<workload>` (native `container` PGDATA + k8s PVC, Finding 1) — and
+        // nothing else, so a same-name re-provision can never re-attach the stale volume on
+        // ANY backend. MUTATION: drop either reclaim call in `deprovision_tenant`'s
+        // `SingleDrop` arm and the corresponding assertion is empty → fail.
+        let scope = boatramp_core::compute::compute_volume_scope("acme", &acme_wl);
         assert_eq!(
-            &*removed.lock().unwrap(),
+            &*log.flat.lock().unwrap(),
             std::slice::from_ref(&acme_wl),
-            "the Single drop must reclaim exactly acme's own data volume ({acme_wl})"
+            "the Single drop must reclaim exactly acme's own FLAT data volume ({acme_wl})"
+        );
+        assert_eq!(
+            &*log.scoped.lock().unwrap(),
+            std::slice::from_ref(&scope),
+            "the Single drop must reclaim exactly acme's own SCOPED data volume ({scope})"
         );
     }
 
@@ -4198,7 +4261,7 @@ mod tests {
 
         // The deprovisioner has an EMPTY node-static map — it must STILL find + tear down the
         // project-declared database by enumerating the project's own declarations.
-        let (backends, removed) = recording_registry();
+        let (backends, log) = recording_registry();
         let deprovisioner = NodeTenantDeprovisioner::new(
             deploy.clone(),
             kv.clone(),
@@ -4207,6 +4270,8 @@ mod tests {
             DEFAULT_DEPROVISION_GRACE_SECS,
             backends,
         );
+        // Precondition for the Finding-2 epoch gate: the binding starts at epoch 0.
+        let epoch_before = boatramp_core::sql::sql_binding_epochs().epoch("acme", "orphanapp");
         deprovisioner.deprovision_project("acme").await;
 
         assert!(
@@ -4221,12 +4286,28 @@ mod tests {
             kv.get(&cred).await.unwrap().is_none(),
             "the project-declared tenant's sealed credential must be gone"
         );
-        // The enumerated declared tenant's data volume is reclaimed too (its derived
-        // workload name) — the same stale-volume class covered for the static path.
+        // The enumerated declared tenant's data volume is reclaimed too, on BOTH layouts
+        // (FLAT docker name + SCOPED native-container/k8s), the same stale-volume class
+        // covered for the static path (Finding 1).
+        let scope = boatramp_core::compute::compute_volume_scope("acme", &wl);
         assert_eq!(
-            &*removed.lock().unwrap(),
+            &*log.flat.lock().unwrap(),
             std::slice::from_ref(&wl),
-            "the declared Single tenant's own data volume must be reclaimed on project delete"
+            "the declared Single tenant's FLAT data volume must be reclaimed on project delete"
+        );
+        assert_eq!(
+            &*log.scoped.lock().unwrap(),
+            std::slice::from_ref(&scope),
+            "the declared Single tenant's SCOPED data volume must be reclaimed on project delete"
+        );
+        // FINDING 2 GATE: a project delete that reclaims the volume must ALSO bump the
+        // binding's credential epoch, so a same-name project recreate doesn't serve the old
+        // cached credential until a serve restart. MUTATION: drop the deprovisioner's
+        // `sql_binding_epochs().bump(...)` and the epoch stays at `epoch_before` → fail.
+        assert_eq!(
+            boatramp_core::sql::sql_binding_epochs().epoch("acme", "orphanapp"),
+            epoch_before + 1,
+            "project/site delete of a managed binding must bump its credential epoch"
         );
     }
 
