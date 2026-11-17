@@ -699,7 +699,7 @@ fn build_upstream_head(plan: &SplicePlan, req: &FastReq, client_ip: IpAddr) -> V
         .as_deref()
         .unwrap_or(plan.resolved.host.as_str());
     push_header(&mut out, "host", host.as_bytes());
-    for (name, value) in req.headers.iter() {
+    for (name, value) in &req.headers {
         let lname = name.as_str(); // HeaderName is always lowercase
         if lname == "host"
             || HOP_BY_HOP.contains(&lname)
@@ -757,7 +757,7 @@ fn build_downstream_head(resp: &FinalResp, upstream: &Upstream, framing: &RespFr
         .unwrap_or("");
     let mut out: Vec<u8> = format!("HTTP/1.1 {status} {reason}\r\n").into_bytes();
     let is_chunked = matches!(framing, RespFraming::Chunked);
-    for (name, value) in resp.headers.iter() {
+    for (name, value) in &resp.headers {
         let lk = name.as_str(); // always lowercase
         // Drop Content-Length when forwarding chunked (defense in depth — a CL+TE response
         // was already rejected by `resolve_response_framing`).
@@ -1313,7 +1313,7 @@ fn build_interim_head(head: &boatramp_http::h1::ResponseHead) -> Vec<u8> {
     let status = head.status.as_u16();
     let reason = head.status.canonical_reason().unwrap_or("");
     let mut out: Vec<u8> = format!("HTTP/1.1 {status} {reason}\r\n").into_bytes();
-    for (name, value) in head.headers.iter() {
+    for (name, value) in &head.headers {
         if HOP_BY_HOP.contains(&name.as_str()) {
             continue;
         }
@@ -2286,7 +2286,7 @@ mod tests {
         let read = timeout(Duration::from_secs(5), client.read_to_end(&mut out)).await;
         assert!(
             read.is_ok(),
-            "client hung — a 1xx interim response was mis-framed as the final (F-5)"
+            "client hung — a 1xx interim response was wrongly framed as the final (F-5)"
         );
         let text = String::from_utf8_lossy(&out);
         assert!(
