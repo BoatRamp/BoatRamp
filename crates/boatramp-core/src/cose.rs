@@ -386,6 +386,15 @@ pub enum TokenError {
     /// The token is past its `exp`.
     #[error("token expired")]
     Expired,
+    /// A **presented** delegation chain ends at an *intermediate* (unsealed)
+    /// holder — a terminal block that names a further `cnf` holder (not the root's
+    /// own key). Such a prefix could be a truncation of a longer, more-narrowed
+    /// chain, so accepting it without a per-request proof of possession of
+    /// `leaf_cnf` would let a holder of that key strip the trailing narrowing
+    /// blocks and recover the parent's authority ([`verify_presented`]). Refused
+    /// for any consumer that cannot prove PoP of the leaf.
+    #[error("token unsealed: {0}")]
+    Unsealed(String),
 }
 
 /// Mints tokens by signing the COSE `ToBeSigned` bytes. Async so a remote KMS
@@ -2348,6 +2357,78 @@ pub fn verify_credential(
     })
 }
 
+impl VerifiedChain {
+    /// Whether the presented chain ends in a **sealed** leaf: a terminal block
+    /// that names **no** next holder (`cnf` absent), *or* names the **root's own
+    /// verifying key**. A sealed leaf has no presentable extension — to append a
+    /// further (narrowing) block you must sign with the leaf's declared `cnf`,
+    /// which is either absent or the root key the presenter does not hold — so no
+    /// un-presented narrowing can exist beyond what is shown. An **unsealed** leaf
+    /// names a further holder that could delegate on, so a prefix ending there may
+    /// be a *truncation* of a longer, more-narrowed chain; it is trustworthy only
+    /// with a per-request proof of possession of [`leaf_cnf`](Self::leaf_cnf).
+    ///
+    /// Matches uchron RFC-009 §7 `cose::check_sealed` (the sealed-presentation rule
+    /// that closes the chain-truncation privilege-escalation, finding C1): "the
+    /// last block must name no holder, or the root's verifying key".
+    pub fn leaf_is_sealed(&self, root_public: &TokenPublicKey) -> bool {
+        match &self.leaf_cnf {
+            // No next holder named — the chain is terminal and cannot be extended.
+            None => true,
+            // Names the root's own key: only the root signer could extend it, and a
+            // client presenting a chain never holds the root signing key — so (as in
+            // uchron's issuer re-root on self-narrow) this is an un-extendable leaf.
+            Some(cnf) => cnf == &root_public.to_hex(),
+        }
+    }
+}
+
+/// Verify a **presented** credential for a consumer that has **no** per-request
+/// proof of possession (a cookie, an in-process channel, a protected-preview or
+/// identity gate): exactly [`verify_credential`], but additionally **requires a
+/// sealed leaf** ([`VerifiedChain::leaf_is_sealed`]).
+///
+/// This closes the chain-prefix **truncation** escalation (uchron RFC-009 §7, C1):
+/// a delegation block is not bound to the blocks after it, so every prefix of a
+/// chain is itself a valid chain. A holder who possesses an *intermediate* `cnf`
+/// key could otherwise strip the trailing narrowing blocks, present the shorter
+/// prefix (which ends at a key it holds), and recover the parent's **un-narrowed**
+/// authority. Requiring a sealed leaf refuses any prefix that ends at an
+/// intermediate (further-delegatable) holder, so the only chains accepted are
+/// terminal ones with no un-presented narrowing.
+///
+/// A **PoP-capable** caller (DPoP) must *not* route through this: it calls
+/// [`verify_credential`] and then proves possession of
+/// [`VerifiedChain::leaf_cnf`] per request, which treats the (possibly unsealed)
+/// leaf as the endpoint by binding the request to that exact key — so a prefix
+/// ending at a key the presenter does not hold fails the PoP check instead. The
+/// two are the complementary halves of "a presented chain must end in a sealed
+/// leaf, **or** the caller must prove PoP of `leaf_cnf`".
+///
+/// Note on the minting side: boatramp only ever narrows a credential **offline, on
+/// the holder's side** ([`attenuate`], the `token attenuate` CLI), where the
+/// narrower already holds the broader authority — so there is no presentable
+/// prefix to escalate *to*. An *issuer-side* narrowing (the host appending a
+/// narrowing block to a credential it signs and hands out) would have to **re-root**
+/// — mint a fresh root whose leaf names the root's own key — exactly as uchron's
+/// `attenuate_as_issuer` does, so that the handed-out credential has no presentable
+/// prefix. boatramp performs no such issuer-side narrowing today.
+pub fn verify_presented(
+    credential: &str,
+    root_public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<VerifiedChain, TokenError> {
+    let verified = verify_credential(credential, root_public, now_unix)?;
+    if !verified.leaf_is_sealed(root_public) {
+        return Err(TokenError::Unsealed(
+            "presented credential ends at an intermediate holder (unsealed leaf); \
+             present the sealed delegate, or prove possession of the leaf cnf"
+                .into(),
+        ));
+    }
+    Ok(verified)
+}
+
 /// The bound facts of a per-request **proof-of-possession** (DPoP-style). The
 /// client signs these with the token's holder (`cnf`) key; the server rebuilds
 /// them from the actual request + its configured origin and verifies the proof
@@ -3695,6 +3776,174 @@ mod tests {
             &Right::new(Resource::Site, Some("shop".into()), Action::Read),
             NOW
         ));
+    }
+
+    // ---- Chain-prefix truncation (the sealed-presentation class) -----------
+
+    /// The EXPLOIT WITNESS (uchron RFC-009 §7 C1). A delegation block is not bound
+    /// to the blocks *after* it, so every prefix of a chain is itself a valid chain.
+    /// A holder who possesses an intermediate `cnf` key can strip the trailing
+    /// narrowing blocks, present the shorter prefix, and — because the leaf it ends
+    /// at is a key it legitimately holds — recover the parent's *un-narrowed*
+    /// authority. `verify_credential` walks the prefix happily; the narrowing caveat
+    /// simply disappears. This test pins that un-sealed behavior so the fix
+    /// (`verify_presented`) can be shown to close it.
+    #[tokio::test]
+    async fn witness_truncating_a_narrowed_chain_recovers_unnarrowed_authority() {
+        use crate::authz::{Action, Resource, Right};
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Es256); // the intermediate holder
+        let h2 = LocalSigner::generate(TokenAlg::Es256); // the narrowed delegate
+
+        // root(cnf = h1)  →  block1(narrow to read-only on "blog", cnf = h2)
+        let token =
+            delegatable_root(&root, &h1.public_key(), vec![GrantedRole::global("admin")]).await;
+        let narrow = Caveats {
+            read_only: true,
+            only_site: Some("blog".into()),
+            ..Default::default()
+        };
+        let full = attenuate(&token, &h1, &narrow, Some(&h2.public_key()), NOW)
+            .await
+            .unwrap();
+
+        // The legitimate full chain enforces the narrowing: read-only, blog-only.
+        let v_full = verify_credential(&full, &root_pub, NOW).unwrap();
+        assert!(v_full.caveats.read_only);
+        assert_eq!(v_full.caveats.only_site.as_deref(), Some("blog"));
+        let write_blog = Right::new(Resource::Site, Some("blog".into()), Action::Write);
+        assert!(
+            !v_full.caveats.allows(&write_blog, NOW),
+            "the narrowed chain forbids writes"
+        );
+
+        // EXPLOIT: strip block1 and present JUST the root prefix. Its leaf `cnf` is
+        // h1 — a key the stripper possesses — so under the un-sealed engine the
+        // prefix is ACCEPTED, and the read-only/only-site caveat is GONE.
+        let prefix = &token; // the root block alone = the stripped prefix
+        let v_strip = verify_credential(prefix, &root_pub, NOW).unwrap();
+        assert!(
+            v_strip.caveats.is_empty(),
+            "WITNESS: the narrowing caveat vanished — authority was recovered"
+        );
+        assert!(
+            v_strip.caveats.allows(&write_blog, NOW),
+            "WITNESS: the stripped prefix regains WRITE authority the chain forbade"
+        );
+        assert_eq!(v_strip.leaf_cnf, Some(h1.public_key().to_hex()));
+
+        // THE FIX: `verify_presented` refuses the stripped prefix — its leaf `cnf`
+        // (h1) is an intermediate holder, neither absent nor the root's own key, so
+        // the chain is unsealed and the truncation is rejected.
+        assert!(
+            !v_strip.leaf_is_sealed(&root_pub),
+            "the root prefix ends at an intermediate holder → unsealed"
+        );
+        assert!(
+            matches!(
+                verify_presented(prefix, &root_pub, NOW),
+                Err(TokenError::Unsealed(_))
+            ),
+            "verify_presented must REJECT the truncated prefix"
+        );
+    }
+
+    /// `verify_presented` accepts a legitimately narrowed chain that ends in a
+    /// **sealed** leaf (the common `token attenuate` default: `next_holder = None`,
+    /// so the terminal block names no further holder), and still enforces its
+    /// caveats — so legitimate full-chain verification is preserved.
+    #[tokio::test]
+    async fn verify_presented_accepts_a_sealed_narrowed_chain() {
+        use crate::authz::{Action, Resource, Right};
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Es256);
+        let token =
+            delegatable_root(&root, &h1.public_key(), vec![GrantedRole::global("admin")]).await;
+
+        // Narrow to read-only on "blog" and SEAL (no next holder).
+        let narrow = Caveats {
+            read_only: true,
+            only_site: Some("blog".into()),
+            ..Default::default()
+        };
+        let sealed = attenuate(&token, &h1, &narrow, None, NOW).await.unwrap();
+
+        let v = verify_presented(&sealed, &root_pub, NOW).expect("a sealed chain verifies");
+        assert!(v.leaf_is_sealed(&root_pub));
+        assert_eq!(v.leaf_cnf, None, "a sealed leaf names no next holder");
+        // Caveats are still enforced on the sealed chain.
+        assert!(v.caveats.allows(
+            &Right::new(Resource::Site, Some("blog".into()), Action::Read),
+            NOW
+        ));
+        assert!(!v.caveats.allows(
+            &Right::new(Resource::Site, Some("blog".into()), Action::Write),
+            NOW
+        ));
+
+        // A plain (non-delegatable) token is sealed too (no cnf at all).
+        let plain = mint(&claims(), &root).await.unwrap();
+        let vp = verify_presented(&plain, &root_pub, NOW).expect("a plain token verifies");
+        assert!(vp.leaf_is_sealed(&root_pub));
+    }
+
+    /// `verify_presented` refuses a chain whose terminal block still names a
+    /// further holder (an onward-delegatable leaf) — even the *full*, untruncated
+    /// chain — because without a PoP of that leaf the verifier cannot tell it from
+    /// a truncation. The PoP-capable path (`verify_credential` + `verify_pop`) is
+    /// what accepts such a leaf, by binding the request to it.
+    #[tokio::test]
+    async fn verify_presented_refuses_an_unsealed_onward_delegatable_leaf() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Es256);
+        let h2 = LocalSigner::generate(TokenAlg::Es256);
+        let token =
+            delegatable_root(&root, &h1.public_key(), vec![GrantedRole::global("admin")]).await;
+        let narrow = Caveats {
+            read_only: true,
+            ..Default::default()
+        };
+        // Full chain, but the leaf still names h2 (onward-delegatable).
+        let onward = attenuate(&token, &h1, &narrow, Some(&h2.public_key()), NOW)
+            .await
+            .unwrap();
+        // `verify_credential` accepts it (leaf_cnf = h2, for a PoP-capable caller).
+        assert_eq!(
+            verify_credential(&onward, &root_pub, NOW).unwrap().leaf_cnf,
+            Some(h2.public_key().to_hex())
+        );
+        // `verify_presented` refuses it — the leaf is unsealed.
+        assert!(matches!(
+            verify_presented(&onward, &root_pub, NOW),
+            Err(TokenError::Unsealed(_))
+        ));
+    }
+
+    /// A terminal block that names the **root's own verifying key** is treated as
+    /// sealed (uchron's issuer re-root / self-narrow endpoint): a client never
+    /// holds the root signing key, so it cannot extend such a leaf.
+    #[tokio::test]
+    async fn verify_presented_treats_a_root_keyed_leaf_as_sealed() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Es256);
+        let token =
+            delegatable_root(&root, &h1.public_key(), vec![GrantedRole::global("admin")]).await;
+        // Narrow, naming the ROOT's own key as the next holder.
+        let caveats = Caveats {
+            read_only: true,
+            ..Default::default()
+        };
+        let chain = attenuate(&token, &h1, &caveats, Some(&root_pub), NOW)
+            .await
+            .unwrap();
+        let v = verify_presented(&chain, &root_pub, NOW)
+            .expect("a leaf naming the root key is a sealed endpoint");
+        assert_eq!(v.leaf_cnf, Some(root_pub.to_hex()));
+        assert!(v.leaf_is_sealed(&root_pub));
     }
 
     #[tokio::test]
