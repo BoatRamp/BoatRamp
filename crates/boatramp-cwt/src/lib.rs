@@ -32,12 +32,20 @@
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use ciborium::value::Value as CborValue;
-use coset::cwt::{ClaimsSet, ClaimsSetBuilder, Timestamp};
+use coset::cwt::{ClaimsSetBuilder, Timestamp};
 use coset::{
     Algorithm as CoseAlg, CborSerializable, CoseSign1, CoseSign1Builder, HeaderBuilder,
     TaggedCborSerializable, iana,
 };
+
+// (U8–U10, #6) Re-export the foreign types this engine's public API speaks, so a
+// consumer need not add a direct `coset` / `ciborium` dependency (nor pin its
+// version independently): `ClaimsSet` is the claim-set type `sign_claims` /
+// `verify_envelope` / `CredentialChain::root_claims` traffic in, and `Value`
+// (aliased `CborValue`) is the CBOR model the `NarrowingCaveats` wire form uses.
+pub use ciborium::Value;
+pub use ciborium::value::Value as CborValue;
+pub use coset::cwt::ClaimsSet;
 
 /// Max blocks in a presented delegation chain — a resource bound checked *before*
 /// any signature verification.
@@ -94,6 +102,30 @@ pub enum TokenError {
     /// The token is past its `exp`.
     #[error("token expired")]
     Expired,
+    /// The protected-header algorithm does not match the *trusted key's*
+    /// algorithm. A distinct, typed authenticity failure (a specialization of
+    /// [`Invalid`](Self::Invalid)) so a consumer can detect algorithm confusion
+    /// (`none`/ES↔Ed swap) by **variant** rather than by matching the error text.
+    /// Classified exactly like [`Invalid`](Self::Invalid) (unauthenticated).
+    #[error("token invalid: algorithm mismatch")]
+    AlgMismatch,
+    /// A delegation step would **widen** authority: either the consumer
+    /// [`meet`](NarrowingCaveats::meet) is not a true lower bound (a buggy/hostile
+    /// impl — caught fail-closed), or a block names *looser* restrictions than are
+    /// already in force (a block that narrows nothing — an attenuation mistake or a
+    /// truncation attempt). A typed variant so a consumer need not match on the
+    /// old `Claims("… must only narrow …")` text. Always a rejection, fail-closed.
+    #[error("token widened: {0}")]
+    Widened(String),
+    /// A **presented** delegation chain ends at an *intermediate* (unsealed)
+    /// holder — a terminal block that names a further `cnf` holder (not the root's
+    /// own key). Such a prefix could be a truncation of a longer, more-narrowed
+    /// chain, so accepting it without a per-request proof of possession of
+    /// `leaf_cnf` would let a holder of that key strip the trailing narrowing
+    /// blocks and recover the parent's authority ([`verify_presented`]). Refused
+    /// for any consumer that cannot prove PoP of the leaf (uchron RFC-009 §7, C1).
+    #[error("token unsealed: {0}")]
+    Unsealed(String),
 }
 
 /// Mints tokens by signing the COSE `ToBeSigned` bytes. Async so a remote KMS
@@ -318,12 +350,52 @@ pub async fn sign_claims_bytes(
     claims: ClaimsSet,
     signer: &dyn Signer,
 ) -> Result<Vec<u8>, TokenError> {
+    sign_claims_bytes_inner(claims, signer, None).await
+}
+
+/// Like [`sign_claims`], additionally stamping a **protected-header `kid`** (RFC
+/// 9052 key id). Because the `kid` sits in the *protected* header it is covered by
+/// the signature (part of the `ToBeSigned`), so it cannot be swapped; a verifier
+/// may read it **unverified** with [`peek_protected_kid`] to *select* the right
+/// verifying key from a set (newest-first multi-key rotation) before doing the
+/// full verify.
+///
+/// **Wire note:** stamping a `kid` changes the signed bytes — a token minted with
+/// a `kid` differs from one minted without. This is **opt-in**; the plain
+/// [`sign_claims`] / [`sign_claims_bytes`] path (what boatramp mints today) is
+/// byte-for-byte unchanged, so existing tokens are unaffected.
+pub async fn sign_claims_with_kid(
+    claims: ClaimsSet,
+    signer: &dyn Signer,
+    kid: &[u8],
+) -> Result<String, TokenError> {
+    let bytes = sign_claims_bytes_with_kid(claims, signer, kid).await?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// [`sign_claims_bytes`] with a protected-header `kid` — see [`sign_claims_with_kid`].
+pub async fn sign_claims_bytes_with_kid(
+    claims: ClaimsSet,
+    signer: &dyn Signer,
+    kid: &[u8],
+) -> Result<Vec<u8>, TokenError> {
+    sign_claims_bytes_inner(claims, signer, Some(kid)).await
+}
+
+async fn sign_claims_bytes_inner(
+    claims: ClaimsSet,
+    signer: &dyn Signer,
+    kid: Option<&[u8]>,
+) -> Result<Vec<u8>, TokenError> {
     let payload = claims
         .to_vec()
         .map_err(|e| TokenError::Build(e.to_string()))?;
-    let header = HeaderBuilder::new().algorithm(signer.alg().iana()).build();
+    let mut header = HeaderBuilder::new().algorithm(signer.alg().iana());
+    if let Some(kid) = kid {
+        header = header.key_id(kid.to_vec());
+    }
     let mut sign1 = CoseSign1Builder::new()
-        .protected(header)
+        .protected(header.build())
         .payload(payload)
         .build();
     let tbs = sign1.tbs_data(&[]);
@@ -331,6 +403,40 @@ pub async fn sign_claims_bytes(
     sign1
         .to_tagged_vec()
         .map_err(|e| TokenError::Build(e.to_string()))
+}
+
+/// Peek the **unverified** protected-header `kid` of a presented token (or the
+/// first block of a chain) **without verifying the signature**. For newest-first
+/// multi-key *selection* only: the bytes are attacker-controlled until a full
+/// verify ([`verify_envelope`] / [`verify_credential`]) confirms the signature, so
+/// never read authority from them — use them only to *choose* a candidate key.
+/// `None` when absent or the token can't be parsed.
+pub fn peek_protected_kid(token: &str) -> Option<Vec<u8>> {
+    let blocks = decode_credential(token).ok()?;
+    let first = blocks.first()?;
+    let sign1 = CoseSign1::from_tagged_slice(first).ok()?;
+    let kid = &sign1.protected.header.key_id;
+    (!kid.is_empty()).then(|| kid.clone())
+}
+
+/// Decode a presented token's CWT [`ClaimsSet`] **without verifying the
+/// signature** (the first block, for a chain). **Untrusted:** for key selection /
+/// routing only (e.g. reading an issuer/`kid`-like claim to pick a verifying key
+/// before a full verify); never read authority or make a trust decision from it.
+/// Re-verify with [`verify_envelope`] / [`verify_credential`] before trusting any
+/// claim. Enforces the same size/depth bounds as [`decode_credential`].
+pub fn peek_unverified_claims(token: &str) -> Result<ClaimsSet, TokenError> {
+    let blocks = decode_credential(token)?;
+    let first = blocks
+        .first()
+        .ok_or_else(|| TokenError::Invalid("empty credential".into()))?;
+    let sign1 =
+        CoseSign1::from_tagged_slice(first).map_err(|e| TokenError::Invalid(e.to_string()))?;
+    let payload = sign1
+        .payload
+        .as_ref()
+        .ok_or_else(|| TokenError::Invalid("no payload".into()))?;
+    ClaimsSet::from_slice(payload).map_err(|e| TokenError::Invalid(e.to_string()))
 }
 
 /// Decode a presented credential into its ordered blocks (raw tagged
@@ -415,7 +521,10 @@ pub fn verify_envelope_bytes(
 
     let want = CoseAlg::Assigned(public.alg().iana());
     if sign1.protected.header.alg.as_ref() != Some(&want) {
-        return Err(TokenError::Invalid("algorithm mismatch".into()));
+        // Algorithm pinning (defeats `none`/ES↔Ed confusion): the token is verified
+        // with the *trusted key's* algorithm, never the attacker-controlled header.
+        // A dedicated variant so a consumer detects this by type, not error text.
+        return Err(TokenError::AlgMismatch);
     }
     sign1.verify_signature(&[], |sig, tbs| public.verify(tbs, sig))?;
 
@@ -547,9 +656,18 @@ pub trait NarrowingCaveats: Sized + Clone + Default {
     /// decodes with [`from_cbor`](Self::from_cbor)).
     fn to_cbor(&self) -> CborValue;
 
-    /// Decode a block's caveats from CBOR. **Must never panic** on hostile input —
-    /// unknown/ill-typed entries are ignored.
-    fn from_cbor(value: &CborValue) -> Self;
+    /// Decode a block's caveats from CBOR. **Must never panic** on hostile input.
+    ///
+    /// **Fallible (U8–U10, #3):** an entry the vocabulary cannot interpret — an
+    /// unknown restriction key, or a known key with the wrong CBOR type — must be
+    /// **refused** with a reason (`Err`), not silently dropped. Silently ignoring a
+    /// restriction the verifier does not understand could *widen* authority (the
+    /// dropped narrowing goes unreported), so decoding **fails closed**: the chain
+    /// walk propagates the error and rejects the whole credential rather than honor
+    /// a partially-understood one. (This replaces the previous "unknown/ill-typed
+    /// entries are ignored" contract, which could map a narrowing to deny-all with
+    /// no reason surfaced.)
+    fn from_cbor(value: &CborValue) -> Result<Self, TokenError>;
 
     /// An expiry this caveat imposes, if any. [`attenuate`] stamps it as the
     /// block's `exp` claim, and the chain walk folds it into the credential's
@@ -567,6 +685,10 @@ pub trait NarrowingCaveats: Sized + Clone + Default {
 /// payload is read as authority. The [`caveats`](Self::caveats) are the
 /// engine-verified monotone intersection of every block, and [`exp`](Self::exp)
 /// the min across the chain.
+///
+/// (U8–U10, #9) Derives [`Debug`] (when the caveat vocabulary `C` is `Debug`), so
+/// a consumer can log / `assert_eq!` a verified chain directly.
+#[derive(Debug)]
 pub struct CredentialChain<C: NarrowingCaveats> {
     /// The verified **root** block's CWT claim set — the sole authority source.
     pub root_claims: ClaimsSet,
@@ -619,17 +741,61 @@ pub async fn attenuate<C: NarrowingCaveats>(
     encode_chain(blocks)
 }
 
+/// Read a block's `exp` as Unix seconds (no enforcement) — the raw value the walk
+/// min-folds. `None` when absent. Enforcement is separate (see [`walk_chain`]).
+fn block_exp(claims: &ClaimsSet) -> Option<u64> {
+    match claims.expiration_time {
+        Some(Timestamp::WholeSeconds(s)) => Some(s.max(0) as u64),
+        _ => None,
+    }
+}
+
 /// Verify a presented credential — a plain token *or* a delegation chain — against
 /// the root public key at `now_unix`. Walks the chain (each block under its
 /// parent's `cnf`, PoP-style), **verifies every caveat step only narrows**
-/// (fail-closed), folds the expiry by `min`, and returns the **root's** claim set
-/// and `cti`. Resource bounds ([`MAX_CHAIN_BYTES`]/[`MAX_CHAIN_DEPTH`]) are enforced
-/// *before* any signature verification. Revocation (root `cti`) stays the caller's
-/// job.
+/// (fail-closed), folds the expiry by `min`, enforces it, and returns the
+/// **root's** claim set and `cti`. Resource bounds
+/// ([`MAX_CHAIN_BYTES`]/[`MAX_CHAIN_DEPTH`]) are enforced *before* any signature
+/// verification. Revocation (root `cti`) stays the caller's job.
+///
+/// **Truncation note:** this accepts *any valid prefix* of a chain, so its leaf may
+/// be an intermediate holder. A caller with **no** per-request proof of possession
+/// of the leaf must use [`verify_presented`] (which additionally requires a sealed
+/// leaf); a PoP-capable caller uses this plus a proof against
+/// [`CredentialChain::leaf_cnf`]. See [`verify_presented`] (uchron RFC-009 §7, C1).
 pub fn verify_credential<C: NarrowingCaveats>(
     credential: &str,
     root_public: &TokenPublicKey,
     now_unix: u64,
+) -> Result<CredentialChain<C>, TokenError> {
+    walk_chain(credential, root_public, Some(now_unix))
+}
+
+/// Like [`verify_credential`], but **does not enforce expiry** — it proves
+/// *authenticity* (signatures, PoP `cnf` binding, the engine-verified monotone
+/// narrowing) and returns the chain with its min-folded effective
+/// [`exp`](CredentialChain::exp) for the caller to check against its **own** clock
+/// (U8–U10, #2). A consumer whose time is not the wall clock — uchron runs expiry
+/// on a hybrid logical clock — needs "authentic" and "expired" as *separate*
+/// outcomes: it calls this, then [`CredentialChain::is_expired_at`] (or compares
+/// `exp` itself). `verify_credential(c, k, now)` is exactly this plus a
+/// `now > exp` ⇒ [`TokenError::Expired`] check.
+pub fn verify_credential_unexpired<C: NarrowingCaveats>(
+    credential: &str,
+    root_public: &TokenPublicKey,
+) -> Result<CredentialChain<C>, TokenError> {
+    walk_chain(credential, root_public, None)
+}
+
+/// The chain walk shared by [`verify_credential`] (enforcing) and
+/// [`verify_credential_unexpired`] (authenticity only). `enforce_expiry_at =
+/// Some(now)` applies the per-block `now > exp` ⇒ [`TokenError::Expired`] check at
+/// exactly the points the enforcing verifier always has; `None` skips it (the
+/// returned `exp` is still the min-fold, for the caller's own clock).
+fn walk_chain<C: NarrowingCaveats>(
+    credential: &str,
+    root_public: &TokenPublicKey,
+    enforce_expiry_at: Option<u64>,
 ) -> Result<CredentialChain<C>, TokenError> {
     let blocks = decode_credential(credential)?;
     let (root_bytes, children) = blocks
@@ -639,8 +805,25 @@ pub fn verify_credential<C: NarrowingCaveats>(
     let root_claims = verify_envelope_bytes(root_bytes, root_public)?;
     let cti = claim_cti(&root_claims)?;
 
-    let mut effective_exp = check_exp(&root_claims, now_unix)?;
-    let mut caveats = C::default();
+    // (U8–U10, #8) Read caveats on the ROOT block too (previously never read): a
+    // root that self-restricts is honored as the initial accumulator rather than
+    // silently ignored. Every root boatramp/uchron mint today carries none, so the
+    // accumulator still starts at `default()` (the lattice top) for them — but a
+    // root that *does* carry caveats now has them enforced, fail-safe. Decoding is
+    // the same fallible path as a block's (#3): an undecodable root caveat refuses.
+    let mut caveats = match text_claim(&root_claims, C::CAVEATS_CLAIM) {
+        Some(v) => C::from_cbor(v)?,
+        None => C::default(),
+    };
+
+    let root_exp = block_exp(&root_claims);
+    if let Some(now) = enforce_expiry_at
+        && let Some(exp) = root_exp
+        && now > exp
+    {
+        return Err(TokenError::Expired);
+    }
+    let mut effective_exp = root_exp;
     let mut parent_cnf = claim_text(&root_claims, C::CNF_CLAIM);
 
     for block in children {
@@ -662,24 +845,54 @@ pub fn verify_credential<C: NarrowingCaveats>(
             return Err(TokenError::Claims("not a delegation block".into()));
         }
 
+        // (#3) Decode this block's caveats fail-closed: an unknown restriction key
+        // (or an ill-typed one) refuses the whole credential rather than silently
+        // dropping a narrowing the verifier can't interpret.
+        let block_caveats = match text_claim(&claims, C::CAVEATS_CLAIM) {
+            Some(v) => C::from_cbor(v)?,
+            None => C::default(),
+        };
+
         // Anti-escalation: a block's authority is never read — only its caveats
         // narrow. The engine folds with the consumer `meet`, then VERIFIES the
         // result is narrower-or-equal than BOTH the accumulator and this block. A
         // consumer `meet` that widens (buggy or adversarial) is caught here and the
         // whole credential rejected — a widening chain is structurally impossible.
-        let block_caveats = text_claim(&claims, C::CAVEATS_CLAIM)
-            .map(C::from_cbor)
-            .unwrap_or_default();
         let tightened = caveats.meet(&block_caveats);
         if !tightened.is_narrower_or_equal(&caveats)
             || !tightened.is_narrower_or_equal(&block_caveats)
         {
-            return Err(TokenError::Claims(
-                "delegation caveats must only narrow authority".into(),
+            return Err(TokenError::Widened(
+                "delegation meet is not a lower bound (consumer meet widens authority)".into(),
             ));
         }
+
+        // (U8–U10, #4) Report a block that TRIES to widen: the accumulator is
+        // *strictly* narrower than this block, so the block names looser
+        // restrictions than are already in force and narrows nothing (the honest
+        // `meet` just absorbs it). Previously unreported — now a typed rejection, so
+        // an attenuation mistake / truncation attempt surfaces instead of hiding. A
+        // block that adds no caveat at all (the lattice top — e.g. a pure
+        // re-delegation that only names the next holder) is *not* flagged.
+        let block_is_top = C::default().is_narrower_or_equal(&block_caveats);
+        if !block_is_top
+            && caveats.is_narrower_or_equal(&block_caveats)
+            && !block_caveats.is_narrower_or_equal(&caveats)
+        {
+            return Err(TokenError::Widened(
+                "a delegation block tries to widen the running authority".into(),
+            ));
+        }
+
         caveats = tightened;
-        effective_exp = min_opt(effective_exp, check_exp(&claims, now_unix)?);
+        let be = block_exp(&claims);
+        if let Some(now) = enforce_expiry_at
+            && let Some(exp) = be
+            && now > exp
+        {
+            return Err(TokenError::Expired);
+        }
+        effective_exp = min_opt(effective_exp, be);
         parent_cnf = claim_text(&claims, C::CNF_CLAIM);
     }
 
@@ -692,6 +905,85 @@ pub fn verify_credential<C: NarrowingCaveats>(
         // key (or the root's, for a plain token) — the leaf a PoP proof binds to.
         leaf_cnf: parent_cnf,
     })
+}
+
+/// The **sealed-leaf** predicate (uchron RFC-009 §7, finding C1). A presented
+/// chain's terminal holder (`leaf_cnf`) is *sealed* iff it names **no** next holder
+/// (`None`), **or** names the **root's own verifying key** — in both cases the leaf
+/// has no presentable extension (to append a further narrowing block you must sign
+/// with the leaf's declared `cnf`, which is either absent or the root signing key a
+/// client never holds). An **unsealed** leaf names a further holder that could
+/// delegate on, so a prefix ending there may be a *truncation* of a longer,
+/// more-narrowed chain. This is the single source of truth for the rule, shared by
+/// [`CredentialChain::leaf_is_sealed`] and the thin consumer layers.
+pub fn leaf_cnf_is_sealed(leaf_cnf: Option<&str>, root_public: &TokenPublicKey) -> bool {
+    match leaf_cnf {
+        None => true,
+        Some(cnf) => cnf == root_public.to_hex(),
+    }
+}
+
+impl<C: NarrowingCaveats> CredentialChain<C> {
+    /// Whether this presented chain ends in a **sealed** leaf — see
+    /// [`leaf_cnf_is_sealed`] and [`verify_presented`] (uchron RFC-009 §7, C1). A
+    /// sealed leaf has no un-presented narrowing beyond what is shown; an unsealed
+    /// leaf is trustworthy only with a per-request PoP of [`leaf_cnf`](Self::leaf_cnf).
+    pub fn leaf_is_sealed(&self, root_public: &TokenPublicKey) -> bool {
+        leaf_cnf_is_sealed(self.leaf_cnf.as_deref(), root_public)
+    }
+
+    /// Whether the credential's effective [`exp`](Self::exp) is past `now_unix`.
+    /// Pairs with [`verify_credential_unexpired`] (authenticity without expiry
+    /// enforcement) so a consumer on a non-wall clock separates "authentic" from
+    /// "expired" (U8–U10, #2). `None` (no expiry) is never expired.
+    pub fn is_expired_at(&self, now_unix: u64) -> bool {
+        matches!(self.exp, Some(exp) if now_unix > exp)
+    }
+}
+
+/// Verify a **presented** credential for a consumer that has **no** per-request
+/// proof of possession (a cookie, an in-process channel, a protected-preview or
+/// identity gate): exactly [`verify_credential`], but additionally **requires a
+/// sealed leaf** ([`CredentialChain::leaf_is_sealed`]).
+///
+/// This closes the chain-prefix **truncation** escalation (uchron RFC-009 §7, C1):
+/// a delegation block is not bound to the blocks after it, so every prefix of a
+/// chain is itself a valid chain. A holder who possesses an *intermediate* `cnf`
+/// key could otherwise strip the trailing narrowing blocks, present the shorter
+/// prefix (which ends at a key it holds), and recover the parent's **un-narrowed**
+/// authority. Requiring a sealed leaf refuses any prefix that ends at an
+/// intermediate (further-delegatable) holder, so the only chains accepted are
+/// terminal ones with no un-presented narrowing.
+///
+/// A **PoP-capable** caller (DPoP) must *not* route through this: it calls
+/// [`verify_credential`] and then proves possession of
+/// [`CredentialChain::leaf_cnf`] per request, which treats the (possibly unsealed)
+/// leaf as the endpoint by binding the request to that exact key — so a prefix
+/// ending at a key the presenter does not hold fails the PoP check instead. The two
+/// are the complementary halves of "a presented chain must end in a sealed leaf,
+/// **or** the caller must prove PoP of `leaf_cnf`".
+///
+/// **Minting note:** a consumer that narrows only *offline, on the holder's side*
+/// (boatramp's `attenuate` / `token attenuate`) has no presentable prefix to
+/// escalate *to*, because the narrower already holds the broader authority. An
+/// *issuer-side* narrowing (a host appending a narrowing block to a credential it
+/// signs and hands out) must **re-root** — mint a fresh root whose leaf names the
+/// root's own key — so the handed-out credential has no presentable prefix (uchron's
+/// `attenuate_as_issuer`). boatramp performs no such issuer-side narrowing today.
+pub fn verify_presented<C: NarrowingCaveats>(
+    credential: &str,
+    root_public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<CredentialChain<C>, TokenError> {
+    let verified = verify_credential(credential, root_public, now_unix)?;
+    if !verified.leaf_is_sealed(root_public) {
+        return Err(TokenError::Unsealed(
+            "presented credential ends at an intermediate holder (unsealed leaf); \
+             present the sealed delegate, or prove possession of the leaf cnf"
+                .into(),
+        ));
+    }
+    Ok(verified)
 }
 
 #[cfg(test)]
@@ -719,8 +1011,13 @@ mod tests {
         fn to_cbor(&self) -> CborValue {
             CborValue::Bool(self.0)
         }
-        fn from_cbor(value: &CborValue) -> Self {
-            Self(matches!(value, CborValue::Bool(true)))
+        fn from_cbor(value: &CborValue) -> Result<Self, TokenError> {
+            match value {
+                CborValue::Bool(b) => Ok(Self(*b)),
+                // Fallible (#3): an ill-typed caveat refuses rather than silently
+                // decoding to the top (which would drop the narrowing).
+                _ => Err(TokenError::Claims("read_only caveat must be a bool".into())),
+            }
         }
     }
 
@@ -749,8 +1046,44 @@ mod tests {
         fn to_cbor(&self) -> CborValue {
             CborValue::Bool(self.0)
         }
-        fn from_cbor(value: &CborValue) -> Self {
-            Self(matches!(value, CborValue::Bool(true)))
+        fn from_cbor(value: &CborValue) -> Result<Self, TokenError> {
+            match value {
+                CborValue::Bool(b) => Ok(Self(*b)),
+                _ => Err(TokenError::Claims("widening caveat must be a bool".into())),
+            }
+        }
+    }
+
+    // An ORDERED vocabulary with a non-top "looser" value, so a block that NARROWS
+    // NOTHING yet is not the lattice top is expressible — the case the #4
+    // block-widened report catches. `Floor(n)`: a numeric restriction floor where a
+    // HIGHER `n` is NARROWER; `0` is the top (unrestricted). `meet` is the max
+    // (tightest wins); the order is `self ⊒ other ⇔ self.0 >= other.0`.
+    #[derive(Clone, Copy, Default, Debug, PartialEq)]
+    struct Floor(u8);
+
+    impl NarrowingCaveats for Floor {
+        const KIND_CLAIM: &'static str = "k";
+        const CNF_CLAIM: &'static str = "cnf";
+        const CAVEATS_CLAIM: &'static str = "cav";
+        const DELEGATION_KIND: &'static str = "delegation";
+
+        fn meet(&self, deeper: &Self) -> Self {
+            Self(self.0.max(deeper.0))
+        }
+        fn is_narrower_or_equal(&self, other: &Self) -> bool {
+            self.0 >= other.0
+        }
+        fn to_cbor(&self) -> CborValue {
+            CborValue::Integer(self.0.into())
+        }
+        fn from_cbor(value: &CborValue) -> Result<Self, TokenError> {
+            match value {
+                CborValue::Integer(i) => u8::try_from(*i)
+                    .map(Self)
+                    .map_err(|_| TokenError::Claims("floor out of range".into())),
+                _ => Err(TokenError::Claims("floor caveat must be an integer".into())),
+            }
         }
     }
 
@@ -810,15 +1143,15 @@ mod tests {
             .await
             .unwrap();
 
-        // The engine's monotonicity check catches the widening and fails closed.
-        // (Match rather than `expect_err`: `CredentialChain` carries no `Debug`.)
-        let err = match verify_credential::<Widening>(&c2, &root_pub, 1_000) {
-            Ok(_) => panic!("a widening chain must be rejected"),
-            Err(e) => e,
-        };
+        // The engine's monotonicity check catches the widening and fails closed,
+        // now with the typed `Widened` variant (U8–U10, #1/#4) rather than a
+        // text-matched `Claims`.
         assert!(
-            matches!(err, TokenError::Claims(m) if m.contains("narrow")),
-            "widening must be rejected with a narrowing-violation claim error",
+            matches!(
+                verify_credential::<Widening>(&c2, &root_pub, 1_000),
+                Err(TokenError::Widened(_))
+            ),
+            "a widening consumer meet must be rejected with TokenError::Widened",
         );
 
         // Sanity: the SAME chain shape with the honest `ReadOnly` vocabulary (whose
@@ -832,5 +1165,258 @@ mod tests {
             .unwrap();
         let ok = verify_credential::<ReadOnly>(&c2b, &root_pub, 1_000).unwrap();
         assert_eq!(ok.caveats, ReadOnly(true));
+    }
+
+    // ---- C1: sealed-leaf / chain-prefix truncation -------------------------
+
+    /// The engine-level exploit witness + fix (uchron RFC-009 §7, C1), on the
+    /// GENERIC `CredentialChain<C>` so any consumer vocabulary gets truncation
+    /// resistance by construction. A stripped prefix recovers the un-narrowed
+    /// caveat under `verify_credential`; `verify_presented` refuses it (unsealed
+    /// leaf), and still accepts a legitimately-narrowed chain that seals its leaf.
+    #[tokio::test]
+    async fn verify_presented_seals_against_truncation() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Ed25519);
+        let h1_pub = h1.public_key();
+        let h2 = LocalSigner::generate(TokenAlg::Ed25519);
+        let h2_pub = h2.public_key();
+
+        // root(cnf = h1) → block1(read-only, cnf = h2): the legitimate narrowed chain.
+        let token = mint_root(&root, &h1_pub).await;
+        let narrowed = attenuate(&token, &h1, &ReadOnly(true), Some(&h2_pub), 1_000)
+            .await
+            .unwrap();
+        let v = verify_credential::<ReadOnly>(&narrowed, &root_pub, 1_000).unwrap();
+        assert_eq!(v.caveats, ReadOnly(true));
+        assert_eq!(v.leaf_cnf, Some(h2_pub.to_hex()));
+
+        // WITNESS: the root prefix ALONE drops the narrowing — authority recovered —
+        // and `verify_credential` accepts it (its leaf, h1, is a key the stripper holds).
+        let stripped = verify_credential::<ReadOnly>(&token, &root_pub, 1_000).unwrap();
+        assert_eq!(
+            stripped.caveats,
+            ReadOnly(false),
+            "WITNESS: truncation recovers the un-narrowed caveat"
+        );
+        assert_eq!(stripped.leaf_cnf, Some(h1_pub.to_hex()));
+        assert!(
+            !stripped.leaf_is_sealed(&root_pub),
+            "the prefix ends at an intermediate holder → unsealed"
+        );
+
+        // FIX: `verify_presented` refuses the truncated prefix...
+        assert!(matches!(
+            verify_presented::<ReadOnly>(&token, &root_pub, 1_000),
+            Err(TokenError::Unsealed(_))
+        ));
+        // ...and also the FULL chain whose leaf is still onward-delegatable (h2):
+        // without a PoP of that leaf the verifier can't tell it from a truncation.
+        assert!(matches!(
+            verify_presented::<ReadOnly>(&narrowed, &root_pub, 1_000),
+            Err(TokenError::Unsealed(_))
+        ));
+
+        // A SEALED narrowed chain (next_holder = None) verifies and still narrows.
+        let sealed = attenuate(&token, &h1, &ReadOnly(true), None, 1_000)
+            .await
+            .unwrap();
+        let vs = verify_presented::<ReadOnly>(&sealed, &root_pub, 1_000).unwrap();
+        assert!(vs.leaf_is_sealed(&root_pub));
+        assert_eq!(vs.leaf_cnf, None);
+        assert_eq!(vs.caveats, ReadOnly(true));
+
+        // A plain token (no `cnf` at all) is sealed too.
+        let plain = {
+            let claims = ClaimsSetBuilder::new()
+                .cwt_id(random_cti().unwrap())
+                .text_claim("k".to_string(), CborValue::Text("role".to_string()))
+                .build();
+            sign_claims(claims, &root).await.unwrap()
+        };
+        assert!(
+            verify_presented::<ReadOnly>(&plain, &root_pub, 1_000)
+                .unwrap()
+                .leaf_is_sealed(&root_pub)
+        );
+    }
+
+    /// A terminal block that names the **root's own verifying key** is sealed
+    /// (uchron's issuer re-root / self-narrow endpoint): a client never holds the
+    /// root signing key, so it cannot extend such a leaf.
+    #[tokio::test]
+    async fn verify_presented_treats_a_root_keyed_leaf_as_sealed() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Ed25519);
+        let token = mint_root(&root, &h1.public_key()).await;
+        let chain = attenuate(&token, &h1, &ReadOnly(true), Some(&root_pub), 1_000)
+            .await
+            .unwrap();
+        let v = verify_presented::<ReadOnly>(&chain, &root_pub, 1_000)
+            .expect("a leaf naming the root key is a sealed endpoint");
+        assert_eq!(v.leaf_cnf, Some(root_pub.to_hex()));
+        assert!(v.leaf_is_sealed(&root_pub));
+    }
+
+    // ---- Ergonomics (U8–U10) ----------------------------------------------
+
+    /// (#4) A block that tries to WIDEN — names looser restrictions than are in
+    /// force, narrowing nothing, yet is not the lattice top — is reported with
+    /// `TokenError::Widened` rather than silently absorbed. Controls: a
+    /// further-narrowing block and a pure re-delegation (top) block are accepted.
+    #[tokio::test]
+    async fn engine_reports_a_block_that_tries_to_widen() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Ed25519);
+        let h1_pub = h1.public_key();
+        let h2 = LocalSigner::generate(TokenAlg::Ed25519);
+        let h2_pub = h2.public_key();
+
+        let token = mint_root(&root, &h1_pub).await;
+        // Block 1 raises the floor to 5 (narrow), delegating onward to h2.
+        let c1 = attenuate(&token, &h1, &Floor(5), Some(&h2_pub), 1_000)
+            .await
+            .unwrap();
+        // Block 2 names floor 2 — LOOSER than the 5 in force: narrows nothing, not top.
+        let c2 = attenuate(&c1, &h2, &Floor(2), None, 1_000).await.unwrap();
+        assert!(matches!(
+            verify_credential::<Floor>(&c2, &root_pub, 1_000),
+            Err(TokenError::Widened(_))
+        ));
+
+        // Control: a block that FURTHER narrows (floor 8 ≥ 5) is accepted.
+        let c2b = attenuate(&c1, &h2, &Floor(8), None, 1_000).await.unwrap();
+        assert_eq!(
+            verify_credential::<Floor>(&c2b, &root_pub, 1_000)
+                .unwrap()
+                .caveats,
+            Floor(8)
+        );
+        // Control: a pure re-delegation (the top, floor 0) is NOT flagged.
+        let c2c = attenuate(&c1, &h2, &Floor(0), None, 1_000).await.unwrap();
+        assert_eq!(
+            verify_credential::<Floor>(&c2c, &root_pub, 1_000)
+                .unwrap()
+                .caveats,
+            Floor(5)
+        );
+    }
+
+    /// (#3) A block whose caveat is undecodable for the vocabulary (here, the wrong
+    /// CBOR type) refuses the whole credential (fail-closed) rather than silently
+    /// decoding to the top and dropping the narrowing.
+    #[tokio::test]
+    async fn engine_refuses_an_undecodable_block_caveat() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Ed25519);
+        let token = mint_root(&root, &h1.public_key()).await;
+
+        // A delegation block whose `cav` is text, not the bool ReadOnly expects.
+        let claims = ClaimsSetBuilder::new()
+            .cwt_id(random_cti().unwrap())
+            .text_claim("k".to_string(), CborValue::Text("delegation".to_string()))
+            .text_claim("cav".to_string(), CborValue::Text("not-a-bool".to_string()))
+            .build();
+        let block = sign_claims_bytes(claims, &h1).await.unwrap();
+        let mut blocks = decode_credential(&token).unwrap();
+        blocks.push(block);
+        let chain = encode_chain(blocks).unwrap();
+        assert!(matches!(
+            verify_credential::<ReadOnly>(&chain, &root_pub, 1_000),
+            Err(TokenError::Claims(_))
+        ));
+    }
+
+    /// (#8) A root that self-restricts (carries a caveats claim) has it honored as
+    /// the initial accumulator, rather than silently ignored.
+    #[tokio::test]
+    async fn root_caveats_are_read_as_the_initial_accumulator() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let claims = ClaimsSetBuilder::new()
+            .cwt_id(random_cti().unwrap())
+            .text_claim("k".to_string(), CborValue::Text("role".to_string()))
+            .text_claim("cav".to_string(), ReadOnly(true).to_cbor())
+            .build();
+        let token = sign_claims(claims, &root).await.unwrap();
+        assert_eq!(
+            verify_credential::<ReadOnly>(&token, &root_pub, 1_000)
+                .unwrap()
+                .caveats,
+            ReadOnly(true),
+            "a self-restricting root's caveats are honored, not ignored"
+        );
+    }
+
+    /// (#2) Authenticity and expiry are separable: `verify_credential_unexpired`
+    /// returns an AUTHENTIC chain past its `exp` (carrying the effective expiry),
+    /// while the enforcing `verify_credential` returns `Expired`. An inauthentic
+    /// token still fails the unexpired path.
+    #[tokio::test]
+    async fn unexpired_verify_separates_authenticity_from_expiry() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let claims = ClaimsSetBuilder::new()
+            .cwt_id(random_cti().unwrap())
+            .text_claim("k".to_string(), CborValue::Text("role".to_string()))
+            .expiration_time(Timestamp::WholeSeconds(2_000))
+            .build();
+        let token = sign_claims(claims, &root).await.unwrap();
+
+        assert!(matches!(
+            verify_credential::<ReadOnly>(&token, &root_pub, 3_000),
+            Err(TokenError::Expired)
+        ));
+        let v = verify_credential_unexpired::<ReadOnly>(&token, &root_pub).unwrap();
+        assert_eq!(v.exp, Some(2_000));
+        assert!(v.is_expired_at(3_000));
+        assert!(!v.is_expired_at(1_500));
+
+        let other = LocalSigner::generate(TokenAlg::Es256).public_key();
+        assert!(verify_credential_unexpired::<ReadOnly>(&token, &other).is_err());
+    }
+
+    /// (#5) A protected-header `kid` is stamped (signed-over), peekable WITHOUT the
+    /// verifying key for key selection, and the token still verifies; a plain token
+    /// peeks as `None`. Unverified claims are readable for routing.
+    #[tokio::test]
+    async fn kid_is_stamped_and_peekable_without_verifying() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let kid = b"key-2026-11";
+        let claims = ClaimsSetBuilder::new()
+            .cwt_id(random_cti().unwrap())
+            .text_claim("k".to_string(), CborValue::Text("role".to_string()))
+            .build();
+        let token = sign_claims_with_kid(claims, &root, kid).await.unwrap();
+
+        assert_eq!(peek_protected_kid(&token).as_deref(), Some(&kid[..]));
+        assert!(verify_envelope(&token, &root_pub).is_ok());
+
+        let plain = {
+            let c = ClaimsSetBuilder::new()
+                .cwt_id(random_cti().unwrap())
+                .text_claim("k".to_string(), CborValue::Text("role".to_string()))
+                .build();
+            sign_claims(c, &root).await.unwrap()
+        };
+        assert_eq!(peek_protected_kid(&plain), None);
+
+        let peeked = peek_unverified_claims(&token).unwrap();
+        assert_eq!(claim_text(&peeked, "k").as_deref(), Some("role"));
+    }
+
+    /// (#9) `CredentialChain` is `Debug`.
+    #[tokio::test]
+    async fn credential_chain_is_debug() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let h1 = LocalSigner::generate(TokenAlg::Ed25519);
+        let token = mint_root(&root, &h1.public_key()).await;
+        let v = verify_credential::<ReadOnly>(&token, &root.public_key(), 1_000).unwrap();
+        assert!(!format!("{v:?}").is_empty());
     }
 }

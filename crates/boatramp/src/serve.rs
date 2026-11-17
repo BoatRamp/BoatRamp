@@ -4271,7 +4271,13 @@ impl boatramp_cluster::http::ClientWriteAuthz for MeshWriteAuthz {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let Ok(verified) = boatramp_core::cose::verify(token, &self.public, now) else {
+        // Verify the capability with its OWN kind check (`br_kind == cluster-write`):
+        // since 8(b) the generic `cose::verify` is the ROLE path and refuses a
+        // non-role kind, so the mesh write gate uses the kind-checked sibling —
+        // which also strengthens domain separation (a role token that happened to
+        // carry a `cluster-write` grant is now rejected here, not just role-checked).
+        let Ok(verified) = boatramp_core::cose::verify_cluster_write(token, &self.public, now)
+        else {
             return false;
         };
         verified.roles.iter().any(|r| r.name == "cluster-write")
