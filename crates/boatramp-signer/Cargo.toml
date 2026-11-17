@@ -51,8 +51,13 @@ signer-pkcs11 = ["dep:cryptoki", "dep:hex", "dep:async-trait", "dep:aws-lc-rs"]
 
 [dependencies]
 # The token format (`cose`) + the `Signer` trait the backends implement, and the
-# `GrantedRole`/`Claims` vocabulary the live-round-trip helper mints over.
-boatramp-core = { workspace = true, features = ["authz"] }
+# `Claims` vocabulary the live-round-trip helper mints over — all in the `cose`
+# module, so request only `cose` (NOT the `authz` union: `cedar` would pull
+# `cedar-policy` and flip serde_json's `preserve_order`, breaking a downstream
+# consumer's canonical-JSON hashes). The `GrantedRole` vocabulary the helper also
+# uses lives in the always-on `boatramp_core::authz` re-export of `boatramp-types`,
+# so no authz feature is needed. `boatramp-server` requests `authz` itself anyway.
+boatramp-core = { workspace = true, features = ["cose"] }
 thiserror.workspace = true
 
 # Backend plumbing — all optional, pulled only by the feature that needs them so a

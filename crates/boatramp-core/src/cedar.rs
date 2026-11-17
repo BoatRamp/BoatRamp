@@ -313,6 +313,241 @@ fn is_safe_ident(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Generic Cedar compile / validate / authorize for consumers that bring their
+/// **own** Cedar vocabulary (schema + policy text), rather than boatramp's
+/// [`AuthzPolicy`] model above.
+///
+/// The rest of this module hard-codes boatramp's RBAC vocabulary — it *generates*
+/// Cedar policy text from an [`AuthzPolicy`]. A downstream product with a different
+/// policy model (its own entity types, actions and schema) cannot reuse that
+/// generator, and today has to depend on `cedar-policy` directly to parse and
+/// validate its own policies. This module lets it drive the identical
+/// `cedar-policy` engine — already pulled in by the `cedar` feature — through
+/// boatramp-core instead, so it never has to add `cedar-policy` to its own
+/// `Cargo.toml` (and never pins a second, possibly divergent, Cedar version).
+///
+/// Nothing here touches boatramp's own Cedar usage; it is a parallel, additive
+/// entry point built on raw Cedar text.
+pub mod generic {
+    use std::str::FromStr;
+
+    use cedar_policy::{
+        Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema,
+        ValidationMode, Validator,
+    };
+
+    /// An error from the [generic](self) Cedar entry points. Each variant carries a
+    /// human-readable description of the failing stage (the underlying `cedar-policy`
+    /// error rendered to a `String`, so the caller never has to name a `cedar-policy`
+    /// type).
+    #[derive(Debug, thiserror::Error)]
+    pub enum GenericCedarError {
+        /// The schema text failed to parse (Cedar schema format).
+        #[error("cedar schema parse error: {0}")]
+        Schema(String),
+        /// The policy text failed to parse.
+        #[error("cedar policy parse error: {0}")]
+        Policy(String),
+        /// The policies parsed but did not type-check against the schema. The string
+        /// lists each validation error.
+        #[error("cedar policy validation failed: {0}")]
+        Validation(String),
+        /// A principal/action/resource entity-uid string did not parse.
+        #[error("cedar entity-uid parse error: {0}")]
+        EntityUid(String),
+        /// The entities JSON failed to parse (or did not conform to the schema).
+        #[error("cedar entities parse error: {0}")]
+        Entities(String),
+        /// The context JSON failed to parse.
+        #[error("cedar context parse error: {0}")]
+        Context(String),
+        /// The request did not conform to the schema (bad principal/action/resource
+        /// shape for the action's `appliesTo`, or a malformed context).
+        #[error("cedar request construction error: {0}")]
+        Request(String),
+    }
+
+    /// A consumer's own Cedar schema plus a policy set that has been type-checked
+    /// against it — ready to authorize caller-supplied requests. Construct one with
+    /// [`compile_and_validate`](Self::compile_and_validate); it owns the parsed
+    /// [`Schema`], [`PolicySet`] and an [`Authorizer`] internally and exposes only
+    /// `cedar-policy`-free surface, so the consumer need not depend on `cedar-policy`.
+    #[derive(Debug)]
+    pub struct CompiledPolicySet {
+        schema: Schema,
+        policies: PolicySet,
+        authorizer: Authorizer,
+    }
+
+    impl CompiledPolicySet {
+        /// Parse `schema_src` (Cedar schema format) and `policies_src` (Cedar policy
+        /// text), then **strictly validate** the policies against the schema. Returns
+        /// the compiled set on success, or the first failing stage's error
+        /// ([schema parse](GenericCedarError::Schema) → [policy
+        /// parse](GenericCedarError::Policy) → [validation](GenericCedarError::Validation)).
+        ///
+        /// This is the generic analogue of [`CompiledCedar::compile`](super::CompiledCedar::compile),
+        /// but driven entirely by the caller's own Cedar text instead of boatramp's
+        /// [`AuthzPolicy`](super::AuthzPolicy) vocabulary.
+        pub fn compile_and_validate(
+            schema_src: &str,
+            policies_src: &str,
+        ) -> Result<Self, GenericCedarError> {
+            let schema = Schema::from_str(schema_src)
+                .map_err(|e| GenericCedarError::Schema(e.to_string()))?;
+            let policies = PolicySet::from_str(policies_src)
+                .map_err(|e| GenericCedarError::Policy(e.to_string()))?;
+            let result =
+                Validator::new(schema.clone()).validate(&policies, ValidationMode::default());
+            if !result.validation_passed() {
+                let errs = result
+                    .validation_errors()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(GenericCedarError::Validation(errs));
+            }
+            Ok(Self {
+                schema,
+                policies,
+                authorizer: Authorizer::new(),
+            })
+        }
+
+        /// Authorize one request against the compiled policies. The principal,
+        /// action and resource are Cedar entity-uid strings (e.g. `User::"alice"`,
+        /// `Action::"view"`, `Photo::"vacation"`); `entities_json` is the entity store
+        /// in Cedar's [JSON entity format]; `context_json`, when `Some`, is a JSON
+        /// object of context attributes. Everything is parsed against the compiled
+        /// schema, so a request that does not conform is a loud
+        /// [`Request`](GenericCedarError::Request) / [`Entities`](GenericCedarError::Entities)
+        /// error rather than a silent deny.
+        ///
+        /// Returns `true` iff the decision is `Allow`. No `cedar-policy` type appears
+        /// in the signature, so the caller stays free of a direct `cedar-policy`
+        /// dependency.
+        ///
+        /// [JSON entity format]: https://docs.cedarpolicy.com/auth/entities-syntax.html
+        pub fn is_authorized_json(
+            &self,
+            principal: &str,
+            action: &str,
+            resource: &str,
+            context_json: Option<&str>,
+            entities_json: &str,
+        ) -> Result<bool, GenericCedarError> {
+            let principal: EntityUid = principal
+                .parse()
+                .map_err(|e| GenericCedarError::EntityUid(format!("{e}")))?;
+            let action: EntityUid = action
+                .parse()
+                .map_err(|e| GenericCedarError::EntityUid(format!("{e}")))?;
+            let resource: EntityUid = resource
+                .parse()
+                .map_err(|e| GenericCedarError::EntityUid(format!("{e}")))?;
+            let context = match context_json {
+                Some(c) => Context::from_json_str(c, None)
+                    .map_err(|e| GenericCedarError::Context(e.to_string()))?,
+                None => Context::empty(),
+            };
+            let entities = Entities::from_json_str(entities_json, Some(&self.schema))
+                .map_err(|e| GenericCedarError::Entities(e.to_string()))?;
+            let request = Request::new(principal, action, resource, context, Some(&self.schema))
+                .map_err(|e| GenericCedarError::Request(e.to_string()))?;
+            let decision = self
+                .authorizer
+                .is_authorized(&request, &self.policies, &entities)
+                .decision();
+            Ok(matches!(decision, Decision::Allow))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A small NON-boatramp Cedar vocabulary (users viewing photos) — nothing
+        /// from boatramp's `BR::` RBAC model.
+        const SCHEMA: &str = r#"
+            entity User;
+            entity Photo;
+            action "view" appliesTo { principal: [User], resource: [Photo] };
+        "#;
+
+        const POLICY: &str = r#"
+            permit(
+                principal == User::"alice",
+                action == Action::"view",
+                resource == Photo::"vacation"
+            );
+        "#;
+
+        const ENTITIES: &str = r#"[
+            { "uid": { "type": "User",  "id": "alice" },    "attrs": {}, "parents": [] },
+            { "uid": { "type": "User",  "id": "bob" },      "attrs": {}, "parents": [] },
+            { "uid": { "type": "Photo", "id": "vacation" }, "attrs": {}, "parents": [] }
+        ]"#;
+
+        #[test]
+        fn compiles_and_validates_a_foreign_schema() {
+            CompiledPolicySet::compile_and_validate(SCHEMA, POLICY)
+                .expect("a well-typed foreign schema + policy must compile and validate");
+        }
+
+        #[test]
+        fn authorizes_against_a_foreign_schema() {
+            let compiled = CompiledPolicySet::compile_and_validate(SCHEMA, POLICY).unwrap();
+            // The permitted (principal, resource) pair → Allow.
+            assert!(
+                compiled
+                    .is_authorized_json(
+                        r#"User::"alice""#,
+                        r#"Action::"view""#,
+                        r#"Photo::"vacation""#,
+                        None,
+                        ENTITIES,
+                    )
+                    .unwrap()
+            );
+            // A different principal → Deny (no matching permit).
+            assert!(
+                !compiled
+                    .is_authorized_json(
+                        r#"User::"bob""#,
+                        r#"Action::"view""#,
+                        r#"Photo::"vacation""#,
+                        None,
+                        ENTITIES,
+                    )
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn validation_rejects_policy_against_undefined_action() {
+            // `Action::"delete"` is not in the schema → strict validation must fail
+            // (proving we really type-check, not just parse).
+            let bad_policy = r#"permit(principal, action == Action::"delete", resource);"#;
+            let err = CompiledPolicySet::compile_and_validate(SCHEMA, bad_policy)
+                .expect_err("a policy over an undefined action must fail validation");
+            assert!(
+                matches!(err, GenericCedarError::Validation(_)),
+                "expected a Validation error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn malformed_schema_is_a_schema_error() {
+            let err = CompiledPolicySet::compile_and_validate("this is not a schema", POLICY)
+                .expect_err("a malformed schema must error");
+            assert!(
+                matches!(err, GenericCedarError::Schema(_)),
+                "expected a Schema error, got {err:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
