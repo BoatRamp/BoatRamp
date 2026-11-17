@@ -267,6 +267,33 @@ impl DockerBackend {
         self.docker.ping().await.is_ok()
     }
 
+    /// Root for per-container guest-log files (`<data_dir>/compute/logs`), the SAME
+    /// convention the native container backend uses.
+    fn logs_dir(&self) -> PathBuf {
+        self.data_dir.join("compute").join("logs")
+    }
+
+    /// Spawn the background guest-log forwarder for a just-launched long-running
+    /// container. Observability parity with the native backend: it attaches to the
+    /// container's stdout/stderr, decodes the multiplexed Docker frame stream into
+    /// lines, and feeds the SAME shared sink (`tracing` target `boatramp::guest` +
+    /// `<data_dir>/compute/logs/<id>.log`). Detached — it NEVER blocks the launch
+    /// path — and ends cleanly when the container exits or is removed.
+    ///
+    /// `docker_container_id` is the daemon's opaque id (what we attach to);
+    /// `log_id` is the stable boatramp instance id used for the tracing tag + the
+    /// per-container log-file name (matching the native backend's keying).
+    fn spawn_log_forwarder(&self, docker_container_id: String, log_id: String) {
+        let docker = self.docker.clone();
+        let logs_dir = self.logs_dir();
+        tokio::spawn(forward_container_logs(
+            docker,
+            docker_container_id,
+            log_id,
+            logs_dir,
+        ));
+    }
+
     /// Validate + stage the spec's persistent volumes into bollard [`Mount`]s: each
     /// name/mount is checked for traversal, and a `Bind`-mode volume's host
     /// directory is created (idempotent) so the daemon can bind it. A named volume
@@ -809,6 +836,17 @@ impl ComputeBackend for DockerBackend {
             .await
             .map_err(|e| BackendError::Launch(format!("start {name}: {e}")))?;
 
+        // Forward the container's stdout/stderr into boatramp observability — the same
+        // sink the native container backend uses (tracing `boatramp::guest` +
+        // `<data_dir>/compute/logs/<id>.log`), reaching observability parity. A
+        // detached background task; it never blocks the launch path and stops when the
+        // container exits/removes. The log-file + tracing tag are keyed by the stable
+        // boatramp instance id (matching the native backend), not the daemon's id.
+        self.spawn_log_forwarder(
+            created.id.clone(),
+            compute_instance_id(&req.project, &req.workload, req.replica),
+        );
+
         // Reachable endpoint: the published host loopback port (default), or the
         // container's bridge IP + in-container port (`Bridge`).
         let (host, endpoint_port) = match self.endpoint {
@@ -1332,6 +1370,186 @@ const EPHEMERAL_STDERR_CAP: usize = 64 * 1024;
 /// name (the daemon rejects a duplicate name). Combined with the process-start nanos.
 static EPHEMERAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// Guest-log forwarding (observability parity with the native container backend)
+// ---------------------------------------------------------------------------
+
+/// In-memory bytes buffered per stream between the Docker frame demux and the shared
+/// line pump. A full buffer back-pressures the frame reader (then the daemon),
+/// bounding memory without dropping lines.
+const LOG_DUPLEX_CAP: usize = 64 * 1024;
+
+/// Max reconnect attempts after a transient attach/stream error before the forwarder
+/// ends cleanly. Bounded so a flapping daemon can never spin the forwarder.
+const LOG_MAX_RECONNECTS: u32 = 5;
+
+/// Why an attach/follow pass returned.
+enum FollowOutcome {
+    /// The attach stream ended normally (container stopped/removed) — stop.
+    Ended,
+    /// A transient attach/stream error — reconnect if the container is still running.
+    Transient,
+}
+
+/// Whether `container_id` is still present + running on the daemon. Decides whether a
+/// dropped attach stream means "container gone" (stop) or "transient disconnect".
+async fn container_is_running(docker: &Docker, container_id: &str) -> bool {
+    match docker.inspect_container(container_id, None).await {
+        Ok(info) => info.state.and_then(|s| s.running).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// The background guest-log forwarder: own one rotating writer for the container's
+/// whole life and (re)attach to its stdout/stderr, demuxing the multiplexed Docker
+/// frame stream into the shared bounded sink. Best-effort + resilient: a failed logs
+/// dir create or a gone container ends it cleanly; a transient daemon disconnect
+/// reconnects with capped backoff. Never panics, never busy-loops.
+async fn forward_container_logs(
+    docker: Docker,
+    docker_container_id: String,
+    log_id: String,
+    logs_dir: PathBuf,
+) {
+    if let Err(e) = tokio::fs::create_dir_all(&logs_dir).await {
+        // Operator-facing diagnostic on the module target (NOT the guest stream, and
+        // without the daemon socket); no guest logs captured, container unaffected.
+        tracing::debug!(
+            container = %log_id,
+            error = %e,
+            "docker guest-log forward: cannot create logs dir; skipping capture"
+        );
+        return;
+    }
+    let path = boatramp_guestlog::log_path(&logs_dir, &log_id);
+    let (tx, rx) = tokio::sync::mpsc::channel(boatramp_guestlog::CHANNEL_CAP);
+    // One rotating writer owns the file across reconnects (appending).
+    let writer = tokio::spawn(boatramp_guestlog::write_lines_rotating(
+        path,
+        rx,
+        boatramp_guestlog::DEFAULT_FILE_CAP_BYTES,
+    ));
+
+    let mut attempt: u32 = 0;
+    loop {
+        // Replay the container's existing output only on the FIRST attach (the
+        // container is started just before the forwarder spawns). A reconnect follows
+        // live only, so a transient blip does not re-dump the whole backlog.
+        let replay_backlog = attempt == 0;
+        match attach_and_forward(&docker, &docker_container_id, &log_id, &tx, replay_backlog).await
+        {
+            FollowOutcome::Ended => break,
+            FollowOutcome::Transient => {
+                attempt += 1;
+                if attempt > LOG_MAX_RECONNECTS
+                    || !container_is_running(&docker, &docker_container_id).await
+                {
+                    break;
+                }
+                // Capped exponential backoff so a flapping daemon never busy-loops.
+                let backoff = std::time::Duration::from_millis(100u64 << u32::min(attempt, 6));
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+    drop(tx); // close the channel → the writer drains + flushes + exits
+    let _ = writer.await;
+}
+
+/// Attach to a container's stdout/stderr and forward one follow pass through the sink.
+async fn attach_and_forward(
+    docker: &Docker,
+    docker_container_id: &str,
+    log_id: &str,
+    tx: &tokio::sync::mpsc::Sender<boatramp_guestlog::GuestLine>,
+    replay_backlog: bool,
+) -> FollowOutcome {
+    let attach = match docker
+        .attach_container(
+            docker_container_id,
+            Some(AttachContainerOptions::<String> {
+                stdin: Some(false),
+                stdout: Some(true),
+                stderr: Some(true),
+                stream: Some(true),
+                logs: Some(replay_backlog),
+                detach_keys: None,
+            }),
+        )
+        .await
+    {
+        Ok(a) => a,
+        Err(_e) => {
+            // Never echo the daemon socket/url into a log; a plain diagnostic only.
+            tracing::debug!(container = %log_id, "docker guest-log forward: attach failed");
+            return FollowOutcome::Transient;
+        }
+    };
+    forward_frame_stream(attach.output, log_id, tx).await
+}
+
+/// Demux a multiplexed Docker attach frame stream into per-stream byte pipes and
+/// reuse the shared [`boatramp_guestlog::pump`] (line-splitting + per-line cap +
+/// sanitize + tracing) on each, feeding the shared writer `tx`. Pure over the frame
+/// stream, so it is unit-tested with a synthetic `LogOutput` stream (no daemon).
+async fn forward_frame_stream<S>(
+    mut output: S,
+    log_id: &str,
+    tx: &tokio::sync::mpsc::Sender<boatramp_guestlog::GuestLine>,
+) -> FollowOutcome
+where
+    S: futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
+
+    // One in-memory pipe per stream: the read half (as AsyncBufRead) is drained by
+    // the shared pump; the write half receives the demuxed frame payloads.
+    let (mut out_w, out_r) = tokio::io::duplex(LOG_DUPLEX_CAP);
+    let (mut err_w, err_r) = tokio::io::duplex(LOG_DUPLEX_CAP);
+    let (id_out, tx_out) = (log_id.to_string(), tx.clone());
+    let p_out = tokio::spawn(async move {
+        boatramp_guestlog::pump(tokio::io::BufReader::new(out_r), &id_out, "stdout", tx_out).await
+    });
+    let (id_err, tx_err) = (log_id.to_string(), tx.clone());
+    let p_err = tokio::spawn(async move {
+        boatramp_guestlog::pump(tokio::io::BufReader::new(err_r), &id_err, "stderr", tx_err).await
+    });
+
+    let mut outcome = FollowOutcome::Ended;
+    while let Some(frame) = output.next().await {
+        match frame {
+            Ok(LogOutput::StdOut { message }) => {
+                // A write error means the stdout pump ended (writer gone); stop.
+                if out_w.write_all(&message).await.is_err() {
+                    break;
+                }
+            }
+            Ok(LogOutput::StdErr { message }) | Ok(LogOutput::Console { message }) => {
+                if err_w.write_all(&message).await.is_err() {
+                    break;
+                }
+            }
+            Ok(LogOutput::StdIn { .. }) => {}
+            Err(_e) => {
+                tracing::debug!(
+                    container = %log_id,
+                    "docker guest-log forward: attach stream error"
+                );
+                outcome = FollowOutcome::Transient;
+                break;
+            }
+        }
+    }
+    // Close the write halves → the pumps see EOF, drain any buffered partial line, and
+    // finish. `tx` stays open (owned by the caller) so the writer persists across a
+    // reconnect.
+    drop(out_w);
+    drop(err_w);
+    let _ = p_out.await;
+    let _ = p_err.await;
+    outcome
+}
+
 /// A unique, daemon-safe container name for a one-shot ephemeral run.
 fn ephemeral_container_name() -> String {
     let nanos = std::time::SystemTime::now()
@@ -1450,6 +1668,168 @@ impl DockerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    // --- guest-log forwarding: the demux wiring over a synthetic frame stream ---
+
+    /// A synthetic multiplexed attach stream (always-`Ok` frames), like bollard's.
+    fn frame_stream(
+        frames: Vec<LogOutput>,
+    ) -> impl futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin {
+        futures::stream::iter(frames.into_iter().map(Ok))
+    }
+
+    /// A `MakeWriter` over a shared buffer so a `tracing` fmt subscriber's output can
+    /// be asserted. Installed ONCE as the global default so events from the pump's
+    /// spawned tasks (any thread) are captured.
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    static TRACING_CAPTURE: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    fn install_tracing_capture() -> Arc<Mutex<Vec<u8>>> {
+        TRACING_CAPTURE
+            .get_or_init(|| {
+                let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+                let w = buf.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_writer(move || CaptureWriter(w.clone()))
+                    .finish();
+                let _ = tracing::subscriber::set_global_default(subscriber);
+                buf
+            })
+            .clone()
+    }
+
+    async fn spawn_writer(
+        path: std::path::PathBuf,
+    ) -> (
+        tokio::sync::mpsc::Sender<boatramp_guestlog::GuestLine>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(boatramp_guestlog::CHANNEL_CAP);
+        let writer = tokio::spawn(boatramp_guestlog::write_lines_rotating(
+            path,
+            rx,
+            boatramp_guestlog::DEFAULT_FILE_CAP_BYTES,
+        ));
+        (tx, writer)
+    }
+
+    /// The forwarder reassembles lines across frame boundaries, routes each stream to
+    /// its own tag, folds `Console` into stderr, and writes exactly one physical line
+    /// per logical line — the core demux contract (mutating any of these turns it RED).
+    #[tokio::test]
+    async fn forward_frame_stream_demuxes_both_streams_into_the_shared_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = boatramp_guestlog::log_path(dir.path(), "demux-0");
+        let (tx, writer) = spawn_writer(path.clone()).await;
+        // A stdout line is split mid-word across two frames, with a stderr frame
+        // interleaved between them.
+        let stream = frame_stream(vec![
+            LogOutput::StdOut {
+                message: Bytes::from_static(b"app star"),
+            },
+            LogOutput::StdErr {
+                message: Bytes::from_static(b"warn-1\n"),
+            },
+            LogOutput::StdOut {
+                message: Bytes::from_static(b"ted\napp ready\n"),
+            },
+            LogOutput::Console {
+                message: Bytes::from_static(b"console-line\n"),
+            },
+        ]);
+        let _ = forward_frame_stream(stream, "demux-0", &tx).await;
+        drop(tx);
+        writer.await.unwrap().unwrap();
+
+        let s = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            s.contains("stdout: app started\n"),
+            "stdout line reassembled across frames: {s}"
+        );
+        assert!(s.contains("stdout: app ready\n"), "{s}");
+        assert!(s.contains("stderr: warn-1\n"), "{s}");
+        assert!(
+            s.contains("stderr: console-line\n"),
+            "Console folds into stderr: {s}"
+        );
+        assert_eq!(
+            s.lines().count(),
+            4,
+            "one physical line per logical line: {s}"
+        );
+    }
+
+    /// A single huge no-newline frame must not grow the file/memory without bound: it
+    /// is capped to ONE truncated line by the shared sink's per-line cap.
+    #[tokio::test]
+    async fn forward_frame_stream_caps_a_no_newline_flood() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = boatramp_guestlog::log_path(dir.path(), "flood-0");
+        let (tx, writer) = spawn_writer(path.clone()).await;
+        let mut flood = vec![b'A'; boatramp_guestlog::MAX_LINE_BYTES * 8];
+        flood.push(b'\n'); // close the line so it flushes
+        let stream = frame_stream(vec![LogOutput::StdOut {
+            message: Bytes::from(flood),
+        }]);
+        let _ = forward_frame_stream(stream, "flood-0", &tx).await;
+        drop(tx);
+        writer.await.unwrap().unwrap();
+
+        let s = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(s.lines().count(), 1, "the whole flood is ONE capped line");
+        let physical = s.lines().next().unwrap();
+        assert!(
+            physical.len() < boatramp_guestlog::MAX_LINE_BYTES * 2,
+            "line bounded by the per-line cap (got {} for an {}-byte flood)",
+            physical.len(),
+            boatramp_guestlog::MAX_LINE_BYTES * 8
+        );
+    }
+
+    /// Each forwarded line is ALSO mirrored to structured `tracing` on the
+    /// `boatramp::guest` target, tagged with the container id + stream — the other half
+    /// of sink parity with the native backend.
+    #[tokio::test]
+    async fn forward_frame_stream_mirrors_lines_to_tracing() {
+        let buf = install_tracing_capture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = boatramp_guestlog::log_path(dir.path(), "tracing-0");
+        let (tx, writer) = spawn_writer(path.clone()).await;
+        let marker = "GUESTLOG_TRACE_MARK_42";
+        let stream = frame_stream(vec![LogOutput::StdOut {
+            message: Bytes::from(format!("{marker}\n").into_bytes()),
+        }]);
+        // forward_frame_stream awaits its pump tasks, so every `tracing::info!` has
+        // fired (synchronously into the fmt subscriber) by the time it returns.
+        let _ = forward_frame_stream(stream, "tracing-0", &tx).await;
+        drop(tx);
+        writer.await.unwrap().unwrap();
+
+        let logged = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            logged.contains(marker),
+            "line mirrored to tracing: {logged}"
+        );
+        assert!(logged.contains("boatramp::guest"), "guest target: {logged}");
+        assert!(
+            logged.contains("tracing-0"),
+            "container tag present: {logged}"
+        );
+        assert!(logged.contains("stdout"), "stream tag present: {logged}");
+    }
 
     /// Build a `ContainerState` with a given `Status` (+ optional running bool / health),
     /// the shape `inspect` returns, for the pure health-mapping tests.

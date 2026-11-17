@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use boatramp_core::compute::{ComputeBackend, Health, LaunchRequest};
+use boatramp_core::compute::{ComputeBackend, Health, LaunchRequest, compute_instance_id};
 use boatramp_docker::DockerBackend;
 use boatramp_types::compute::{ComputeSpec, IsolationRequirement, RestartPolicy, RootSource};
 
@@ -1010,5 +1010,155 @@ async fn docker_reconcile_heals_a_producer_carrying_a_stale_managed_db_alias_on_
          alias was flagged for recreate, relaunched with the short alias {short_alias}, reached by \
          a sibling (HEAL) over that alias, and then reported needs_redeploy=false (idempotent)",
         db_workload.len()
+    );
+}
+
+/// A `MakeWriter` over a shared buffer so the forwarder's `tracing` output can be
+/// asserted in the live gate (the forwarder runs on background runtime threads, so a
+/// GLOBAL subscriber is needed to capture across threads).
+#[derive(Clone)]
+struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The **guest-log forwarding** live gate (v0.64.0 observability parity). Proves,
+/// against a REAL Docker daemon, that a long-running container launched on the docker
+/// backend has its stdout AND stderr forwarded into boatramp observability through the
+/// SAME shared sink the native container backend uses:
+///
+/// 1. the lines appear in the per-container log file
+///    `<data_dir>/compute/logs/<instance-id>.log`, each framed `<stream>: <line>` so
+///    stdout and stderr are distinguishable; AND
+/// 2. the same lines are mirrored to structured `tracing` on the `boatramp::guest`
+///    target, tagged with the container id + stream.
+///
+/// `#[ignore]` + env-gated (needs a daemon); the capability gate greps the final
+/// success marker, printed ONLY after both the file AND the tracing assertions hold —
+/// it cannot be earned by a silent skip or a one-sided forward.
+///
+/// Run it:
+/// ```sh
+/// BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+///   docker_log_forwarding -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a reachable Docker daemon; set BOATRAMP_TEST_DOCKER=1 and run with --ignored"]
+async fn docker_log_forwarding_to_the_shared_sink() {
+    if std::env::var("BOATRAMP_TEST_DOCKER").is_err() {
+        eprintln!("skipping docker test: set BOATRAMP_TEST_DOCKER=1 (needs a reachable daemon)");
+        return;
+    }
+
+    // Capture `boatramp::guest` tracing into an in-memory buffer via a global
+    // subscriber (the forwarder emits from background threads). This gate is run in
+    // isolation by the capability job, so it owns the process-global default.
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let w = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || CaptureWriter(w.clone()))
+        .finish();
+    // `.ok()`: another test in a shared run may already hold the global default; the
+    // FILE assertion is independent of tracing capture, and in the isolated gated run
+    // this install wins.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    let data_dir = tempfile::tempdir().expect("temp data_dir");
+    let backend = DockerBackend::connect()
+        .expect("connect to docker")
+        .with_data_dir(data_dir.path());
+
+    let marker_out = "BRAMP_STDOUT_9f3c1";
+    let marker_err = "BRAMP_STDERR_7a2d8";
+    let mut spec = spec();
+    // Emit a known line to stdout AND stderr, then stay alive so the forwarder follows
+    // a long-running workload (not a one-shot).
+    spec.entrypoint = vec![
+        "sh".into(),
+        "-c".into(),
+        format!("echo {marker_out}; echo {marker_err} 1>&2; sleep 30"),
+    ];
+
+    let artifact = backend
+        .materialize("default", "logfwd", &spec, None)
+        .await
+        .expect("materialize (pull)");
+    let req = LaunchRequest {
+        project: "default".into(),
+        workload: "logfwd".into(),
+        replica: 0,
+        spec: spec.clone(),
+        artifact,
+    };
+    let instance = backend.launch(&req).await.expect("launch");
+
+    // The forwarder is a detached background task; give it a moment to attach, replay
+    // the container's startup output, and flush it to the file.
+    let id = compute_instance_id("default", "logfwd", 0);
+    let path = data_dir
+        .path()
+        .join("compute")
+        .join("logs")
+        .join(format!("{id}.log"));
+    let mut file_contents = String::new();
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Ok(s) = std::fs::read_to_string(&path)
+            && s.contains(marker_out)
+            && s.contains(marker_err)
+        {
+            file_contents = s;
+            break;
+        }
+    }
+
+    backend.stop(&instance.handle).await.expect("stop");
+
+    // (1) Both streams reached the per-container log file, each framed by its stream.
+    assert!(
+        file_contents.contains(&format!("stdout: {marker_out}")),
+        "stdout line not forwarded to {}: {:?}",
+        path.display(),
+        file_contents
+    );
+    assert!(
+        file_contents.contains(&format!("stderr: {marker_err}")),
+        "stderr line not forwarded to {}: {:?}",
+        path.display(),
+        file_contents
+    );
+
+    // (2) The same lines were mirrored to structured tracing on `boatramp::guest`,
+    // tagged with the container id + stream.
+    let logged = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    assert!(
+        logged.contains(marker_out) && logged.contains(marker_err),
+        "lines not mirrored to tracing: {logged}"
+    );
+    assert!(
+        logged.contains("boatramp::guest"),
+        "guest target missing: {logged}"
+    );
+    assert!(logged.contains(&id), "container id tag missing: {logged}");
+    assert!(
+        logged.contains("stdout") && logged.contains("stderr"),
+        "stream tags missing: {logged}"
+    );
+
+    // The single success marker the capability gate greps for — printed ONLY after
+    // both the file AND the tracing assertions held.
+    println!(
+        "DOCKER GUEST-LOG FORWARDING OK: a long-running docker-backend container's stdout \
+         ({marker_out}) + stderr ({marker_err}) were forwarded into {} AND mirrored to the \
+         boatramp::guest tracing target tagged container={id}",
+        path.display()
     );
 }

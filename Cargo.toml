@@ -43,6 +43,11 @@ members = [
   "crates/boatramp-cluster",
   "crates/boatramp-firecracker",
   "crates/boatramp-container",
+  # The shared guest-log sink (bounded, injection-safe) used by BOTH the native
+  # container backend and the remote-Docker backend: one sink, two backends. Tiny +
+  # cross-platform (only tokio + tracing), so the remote-Docker client does not drag
+  # in the native self-jail sandbox's Linux-only tree just to reuse the sink.
+  "crates/boatramp-guestlog",
   "crates/boatramp-docker",
   "crates/boatramp-vz",
   # The Kubernetes compute backend (mailroom #26): managed compute as native k8s
@@ -151,6 +156,8 @@ boatramp-cluster = { path = "crates/boatramp-cluster", version = "0.62.1" }
 boatramp-acme = { path = "crates/boatramp-acme", version = "0.62.1" }
 boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.62.1" }
 boatramp-container = { path = "crates/boatramp-container", version = "0.62.1" }
+# The shared guest-log sink both compute backends forward through (one sink, two backends).
+boatramp-guestlog = { path = "crates/boatramp-guestlog", version = "0.62.1" }
 boatramp-docker = { path = "crates/boatramp-docker", version = "0.62.1" }
 boatramp-vz = { path = "crates/boatramp-vz", version = "0.62.1" }
 boatramp-k8s = { path = "crates/boatramp-k8s", version = "0.62.1" }

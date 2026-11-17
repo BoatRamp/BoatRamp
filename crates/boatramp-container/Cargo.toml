@@ -16,12 +16,18 @@ description = "Native Linux container backend for boatramp tier-2 compute: the s
 [dependencies]
 boatramp-types.workspace = true
 serde.workspace = true
-# Async runtime + IO. Cross-platform: the guest-log sink (`logsink`) drains the
-# worker's stdout/stderr over tokio pipes + an mpsc channel, and is unit-tested
-# on every host. `sync` = the log mpsc; `time` = the health-probe timeout.
+# Async runtime + IO. Cross-platform: the self-jail worker drains its stdout/stderr
+# into the shared guest-log sink over tokio pipes + an mpsc channel. `sync` = the
+# log mpsc; `time` = the health-probe timeout.
 tokio = { workspace = true, features = ["sync", "time"] }
 # Guest-log lines are mirrored to the structured tracing sink.
 tracing.workspace = true
+# The shared guest-log sink (bounded `pump` → rotating `write_lines_rotating`).
+# Lifted out of this crate (v0.64.0) so the remote-Docker backend forwards guest
+# logs through the SAME sink — one sink, two backends. Re-exported below as
+# `boatramp_container::logsink` for path stability. Cross-platform, so it sits in
+# the base dep set (compiled + unit-tested on every host, as the old module was).
+boatramp-guestlog.workspace = true
 
 # The self-jail worker (`worker`, Linux-only) applies the sandbox plan with real
 # syscalls (no external `unshare`/`nsenter`/`capsh`): `nix` for namespaces /

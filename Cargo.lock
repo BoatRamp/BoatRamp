@@ -1775,6 +1775,7 @@ dependencies = [
  "async-trait",
  "boatramp-core",
  "boatramp-firecracker",
+ "boatramp-guestlog",
  "boatramp-types",
  "bytes",
  "caps",
@@ -1849,12 +1850,17 @@ version = "0.62.1"
 dependencies = [
  "async-trait",
  "boatramp-core",
+ "boatramp-guestlog",
  "boatramp-types",
  "bollard",
+ "bytes",
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1886,6 +1892,16 @@ dependencies = [
  "vm-memory",
  "vm-superio",
  "vmm-sys-util",
+]
+
+[[package]]
+name = "boatramp-guestlog"
+version = "0.62.1"
+dependencies = [
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
