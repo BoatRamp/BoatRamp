@@ -34,7 +34,12 @@ tracing.workspace = true
 
 [dev-dependencies]
 # `docker_live` integration test (self-skips without a daemon) needs a runtime.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "fs"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "time",
+  "fs",
+] }
 boatramp-types.workspace = true
 serde_json.workspace = true
 # The run_ephemeral default-bridge regression gate stands up a default-bridge target

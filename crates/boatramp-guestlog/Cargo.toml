@@ -28,7 +28,12 @@ tempfile = "3"
 # Capture `tracing` events into an in-memory buffer to assert a drained line is
 # mirrored to tracing with its `container`/`stream` fields.
 tracing-subscriber.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "io-util"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "io-util",
+] }
 
 [lints]
 workspace = true
