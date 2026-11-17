@@ -2699,6 +2699,54 @@ mod tests {
         );
     }
 
+    /// DEFER covers UNDEPLOYED SUBGRAPHS, not only secrets: a site whose data synced and whose
+    /// secrets are all sealed BUT whose `handlers.graphql.subgraphs` names subgraphs not registered
+    /// on the destination defers the SAME way (one `IncoherentSiteConfig` path, `missing` naming the
+    /// `subgraph:<name>`s) and is named in the exit-0 summary. The engine is reference-agnostic — the
+    /// executor classifies which refs are missing — so this reuses the mechanism, no second path.
+    #[tokio::test]
+    async fn apply_defers_a_site_with_an_undeployed_subgraph() {
+        let selection = selection_apply(&[Piece::Sites, Piece::Domains], &[], &[], false);
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "admin".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([("admin".into(), cfg_with("admin.example.com", true))]),
+            // Secrets all sealed; the gap is two unregistered subgraphs (construens's admin case).
+            incoherent_sites: BTreeMap::from([(
+                "admin".to_string(),
+                vec![
+                    "subgraph:pack-admin".to_string(),
+                    "subgraph:catalog".to_string(),
+                ],
+            )]),
+            ..Default::default()
+        };
+        let report = apply_sync(&plan, &mut exec)
+            .await
+            .expect("apply ok (deferred)");
+
+        assert_eq!(report.deferred_count(), 1);
+        let d = &report.deferred[0];
+        assert_eq!(d.site, "admin");
+        assert_eq!(d.missing, vec!["subgraph:pack-admin", "subgraph:catalog"]);
+        assert!(
+            !exec.dest_sites.contains_key("admin"),
+            "nothing written for the deferred site"
+        );
+        let summary = report.deferred_summary().expect("a deferral summary");
+        assert!(
+            summary.contains("deploy:apply") && summary.contains("admin"),
+            "{summary}"
+        );
+    }
+
     /// NO-REGRESSION: a sync with NO incoherent configs defers nothing — every site applies and the
     /// deferral surface stays empty.
     #[tokio::test]

@@ -73,8 +73,9 @@ pub(crate) use admin_api::{
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
     delete_graphql_safelist, delete_graphql_subgraph, get_graphql_supergraph,
-    list_graphql_safelist, post_graphql_compose, put_graphql_function_subgraph,
-    put_graphql_sql_subgraph, put_graphql_subgraph, register_graphql_safelist,
+    list_graphql_safelist, list_graphql_subgraphs, post_graphql_compose,
+    put_graphql_function_subgraph, put_graphql_sql_subgraph, put_graphql_subgraph,
+    register_graphql_safelist,
 };
 /// The server-side controller backing the guest `admin` capability (project self-config).
 #[cfg(feature = "admin")]

@@ -775,6 +775,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig, server: String) -> Resu
         drop_soft_deleted: args.drop_soft_deleted,
         data_skip_notes: Vec::new(),
         dest_secret_names: None,
+        dest_subgraph_names: None,
     };
     let applied = apply_sync(&plan, &mut exec).await?;
     // Surface any KV-stratum records the dest skipped-and-reported (PLAN rule 3) in the operator
@@ -862,6 +863,12 @@ struct CliSyncExecutor {
     /// not yet fetched; the inner `None` (fetch failed — no `[secrets]` envelope / transient) means
     /// "can't determine — don't defer" (never mask an infra fault as a deferral).
     dest_secret_names: Option<Option<BTreeSet<String>>>,
+    /// The destination's registered GraphQL subgraph NAMES (`GET /api/graphql/subgraphs`), fetched
+    /// once + cached, for the same coherence check: a carried `[handlers].graphql.subgraphs` include
+    /// naming a subgraph absent here is not-yet-registered ⇒ the site is DEFERRED to `deploy:apply`.
+    /// Same three-state as `dest_secret_names` (outer `None` = unfetched, inner `None` = fetch
+    /// faulted → fail-open, don't defer).
+    dest_subgraph_names: Option<Option<BTreeSet<String>>>,
 }
 
 /// MEDIUM-2 (cross-tenant path-traversal guard): validate a SOURCE-derived resource `name` BEFORE
@@ -982,51 +989,95 @@ impl CliSyncExecutor {
 
     /// Detect the control-plane a carried/rewritten site `cfg` references that the DESTINATION does
     /// not have yet, so `apply_sync` can DEFER the config to a later `deploy:apply` instead of
-    /// hard-failing the run after the data plane already landed (sync-sites-defer). The concrete,
-    /// in-config reference is the `[handlers].secrets` pool: a `boatramp:<name>` entry resolves
-    /// against the project's SEALED secrets, so a name not yet sealed on the destination is
-    /// incoherent until `deploy:apply` seals it. (`env:`/bare host-env references resolve from the
-    /// operator environment — never the sealed store — so they are not a sync coherence concern; and
-    /// a function a handler points at is deployed by the SAME `deploy:apply` that owns the deferred
-    /// config.) Returns the missing references as `secret:<name>`; empty ⇒ coherent. FAIL-OPEN on an
-    /// enumeration fault (no `[secrets]` envelope → `501`, or a transient): we cannot positively
-    /// prove a secret is absent, so we do NOT defer — the write proceeds and a real error still
-    /// surfaces, never masking an infra fault as a deferral.
-    async fn missing_site_secret_refs(
-        &mut self,
-        cfg: &boatramp_core::config::SiteConfig,
-    ) -> Vec<String> {
-        // The `boatramp:<name>` secrets this config needs sealed on the destination.
-        let needed = referenced_boatramp_secrets(cfg);
-        if needed.is_empty() {
-            return Vec::new();
+    /// hard-failing the run after the data plane already landed (sync-sites-defer). Two reference
+    /// classes live IN the stored `SiteConfig` and are checkable at sync time:
+    ///
+    /// - `[handlers].secrets` `boatramp:<name>` entries — a project SEALED secret; a name not sealed
+    ///   on the destination is incoherent until `deploy:apply` seals it. (`env:`/bare host-env refs
+    ///   resolve from the operator environment, never the sealed store, so they are NOT a sync
+    ///   concern.)
+    /// - `[handlers].graphql.subgraphs` include-list entries — a registered federation subgraph; a
+    ///   name not registered on the destination is incoherent until `deploy:apply` registers it (the
+    ///   node ALSO rejects it at the config write, but probing it here defers cleanly BEFORE the
+    ///   write, and correctly handles a destination with an empty registry).
+    ///
+    /// Returns the missing references as `secret:<name>` / `subgraph:<name>` (reusing the single
+    /// `IncoherentSiteConfig` defer path — no second mechanism); empty ⇒ coherent. Each class FAILS
+    /// OPEN on an enumeration fault (no `[secrets]` envelope → `501`, a registry read error, or a
+    /// transient): we never mask an infra fault as a deferral — the write proceeds and a real error
+    /// still surfaces.
+    ///
+    /// BOUNDARY — what is NOT probed here, by design: a handler that points at a FUNCTION is NOT a
+    /// field of the stored `SiteConfig`. The gateway's upstreams are host:port targets (not wasm
+    /// functions), and the handler→function wiring + `guest_mediated` function names live in the
+    /// `deploy:apply` DEPLOYMENT MANIFEST, which `sync` does not carry. Function deploy is therefore
+    /// `deploy:apply`'s own domain — the very command this deferral points the operator to — and the
+    /// node does NOT reject a site-config write for an undeployed function, so there is nothing to
+    /// probe or catch here. (If a future node DID surface an undeployed-function ref as a write
+    /// error, the generic `Err(other)` arm would still hard-fail it; it is only ever a deferral when
+    /// detected as one of the SiteConfig reference classes above.)
+    async fn missing_site_refs(&mut self, cfg: &boatramp_core::config::SiteConfig) -> Vec<String> {
+        let mut missing = Vec::new();
+
+        // --- secrets: `[handlers].secrets` boatramp:<name> vs the dest's sealed secret names ---
+        let needed_secrets = referenced_boatramp_secrets(cfg);
+        if !needed_secrets.is_empty() {
+            if self.dest_secret_names.is_none() {
+                let fetched = self
+                    .dest_cp
+                    .list_secret_names()
+                    .await
+                    .ok()
+                    .map(|names| names.into_iter().collect::<BTreeSet<String>>());
+                self.dest_secret_names = Some(fetched);
+            }
+            if let Some(Some(sealed)) = self.dest_secret_names.as_ref() {
+                missing.extend(missing_refs(&needed_secrets, sealed, "secret"));
+            }
+            // else: can't determine (enumeration faulted) — fail open, don't defer on secrets.
         }
-        // Enumerate the destination's sealed secret NAMES once, cached. Fail-open on any fault.
-        if self.dest_secret_names.is_none() {
-            let fetched = self
-                .dest_cp
-                .list_secret_names()
-                .await
-                .ok()
-                .map(|names| names.into_iter().collect::<BTreeSet<String>>());
-            self.dest_secret_names = Some(fetched);
+
+        // --- subgraphs: `[handlers].graphql.subgraphs` vs the dest's registered subgraph names ---
+        let needed_subgraphs = referenced_subgraphs(cfg);
+        if !needed_subgraphs.is_empty() {
+            if self.dest_subgraph_names.is_none() {
+                let fetched = self
+                    .dest_cp
+                    .list_subgraph_names()
+                    .await
+                    .ok()
+                    .map(|names| names.into_iter().collect::<BTreeSet<String>>());
+                self.dest_subgraph_names = Some(fetched);
+            }
+            if let Some(Some(registered)) = self.dest_subgraph_names.as_ref() {
+                missing.extend(missing_refs(&needed_subgraphs, registered, "subgraph"));
+            }
+            // else: can't determine (enumeration faulted) — fail open, don't defer on subgraphs.
         }
-        let Some(Some(sealed)) = self.dest_secret_names.as_ref() else {
-            return Vec::new(); // can't determine — don't defer
-        };
-        needed
-            .into_iter()
-            .filter(|n| !sealed.contains(n))
-            .map(|n| format!("secret:{n}"))
-            .collect()
+
+        missing
     }
+}
+
+/// The `<prefix>:<name>` references in `needed` that are NOT present in `present` — the pure
+/// "what does the destination lack" comparison shared by the secret + subgraph probes. Pure +
+/// unit-testable (the network-free half of [`CliSyncExecutor::missing_site_refs`]).
+fn missing_refs(
+    needed: &BTreeSet<String>,
+    present: &BTreeSet<String>,
+    prefix: &str,
+) -> Vec<String> {
+    needed
+        .iter()
+        .filter(|n| !present.contains(*n))
+        .map(|n| format!("{prefix}:{n}"))
+        .collect()
 }
 
 /// The `boatramp:<name>` SEALED secrets a site `cfg` references through its `[handlers].secrets`
 /// pool — the names that must be sealed on a destination for the config to be coherent. `env:`/bare
 /// host-env references resolve from the operator environment (never the sealed store), so they are
-/// excluded; an empty `name` after the prefix is ignored. Pure + unit-testable (the network-free
-/// half of [`CliSyncExecutor::missing_site_secret_refs`]).
+/// excluded; an empty `name` after the prefix is ignored. Pure + unit-testable.
 fn referenced_boatramp_secrets(cfg: &boatramp_core::config::SiteConfig) -> BTreeSet<String> {
     let Some(handlers) = cfg.handlers.as_ref() else {
         return BTreeSet::new();
@@ -1037,6 +1088,23 @@ fn referenced_boatramp_secrets(cfg: &boatramp_core::config::SiteConfig) -> BTree
         .filter_map(|r| r.strip_prefix("boatramp:"))
         .filter(|n| !n.is_empty())
         .map(str::to_string)
+        .collect()
+}
+
+/// The registered federation subgraphs a site `cfg` references through its
+/// `[handlers].graphql.subgraphs` include list — the names that must be registered on a destination
+/// for the config to compose coherently. **Absent ⇒ "all registered subgraphs"** (the node's
+/// default), which names no specific subgraph, so it yields empty (nothing to defer on). Pure +
+/// unit-testable.
+fn referenced_subgraphs(cfg: &boatramp_core::config::SiteConfig) -> BTreeSet<String> {
+    cfg.handlers
+        .as_ref()
+        .and_then(|h| h.graphql.as_ref())
+        .and_then(|g| g.subgraphs.as_ref())
+        .into_iter()
+        .flatten()
+        .filter(|n| !n.is_empty())
+        .cloned()
         .collect()
 }
 
@@ -1195,10 +1263,10 @@ impl SyncExecutor for CliSyncExecutor {
             return Ok(false);
         }
         // Sites-rewrite coherence (sync-sites-defer): if this config's handlers reference a secret
-        // not sealed on the destination YET, DEFER it (write NOTHING) to a later `deploy:apply`
-        // rather than failing the run after the data plane already landed. `apply_sync` catches
-        // `IncoherentSiteConfig`, records the deferral, and finishes the run with exit 0.
-        let missing = self.missing_site_secret_refs(cfg).await;
+        // not sealed / a subgraph not registered on the destination YET, DEFER it (write NOTHING) to
+        // a later `deploy:apply` rather than failing the run after the data plane already landed.
+        // `apply_sync` catches `IncoherentSiteConfig`, records the deferral, and finishes with exit 0.
+        let missing = self.missing_site_refs(cfg).await;
         if !missing.is_empty() {
             return Err(SyncApplyError::IncoherentSiteConfig {
                 site: site.to_string(),
@@ -1275,6 +1343,49 @@ mod tests {
 
         // No handlers / no secrets ⇒ nothing referenced (a coherent site never defers).
         assert!(referenced_boatramp_secrets(&SiteConfig::default()).is_empty());
+    }
+
+    /// Subgraph coherence (sync-sites-defer, completeness pass): the sites-rewrite check extracts a
+    /// site's `handlers.graphql.subgraphs` include list — the registered subgraphs the destination
+    /// must have — and `missing_refs` reports the ones the destination lacks as `subgraph:<name>`.
+    /// Absent `subgraphs` (⇒ "all registered", the node default) references nothing; an empty
+    /// include is ignored.
+    #[test]
+    fn referenced_subgraphs_and_missing_refs_select_undeployed_subgraphs() {
+        use boatramp_core::config::{HandlerGraphqlConfig, HandlersSiteConfig, SiteConfig};
+        let cfg = SiteConfig {
+            handlers: Some(HandlersSiteConfig {
+                enabled: true,
+                graphql: Some(HandlerGraphqlConfig {
+                    enabled: true,
+                    federated: true,
+                    subgraphs: Some(vec!["pack-admin".into(), "catalog".into()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let referenced = referenced_subgraphs(&cfg);
+        let want: BTreeSet<String> = ["pack-admin".to_string(), "catalog".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(referenced, want);
+
+        // Only `catalog` is registered on the destination ⇒ `pack-admin` defers.
+        let registered: BTreeSet<String> = ["catalog".to_string()].into_iter().collect();
+        assert_eq!(
+            missing_refs(&referenced, &registered, "subgraph"),
+            vec!["subgraph:pack-admin".to_string()]
+        );
+        // Both registered ⇒ nothing missing (coherent).
+        let both: BTreeSet<String> = ["pack-admin".to_string(), "catalog".to_string()]
+            .into_iter()
+            .collect();
+        assert!(missing_refs(&referenced, &both, "subgraph").is_empty());
+
+        // Absent subgraphs field (⇒ all registered) references nothing — never defers.
+        assert!(referenced_subgraphs(&SiteConfig::default()).is_empty());
     }
 
     fn parse(argv: &[&str]) -> std::result::Result<SyncArgs, clap::Error> {
@@ -1408,6 +1519,7 @@ mod tests {
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
             dest_secret_names: None,
+            dest_subgraph_names: None,
         }
     }
 
@@ -1553,6 +1665,7 @@ mod tests {
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
             dest_secret_names: None,
+            dest_subgraph_names: None,
         };
 
         exec.transfer_data().await.expect("data transfer ok");
@@ -1695,6 +1808,7 @@ mod tests {
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
             dest_secret_names: None,
+            dest_subgraph_names: None,
         };
 
         let mut excludes = BTreeSet::new();
@@ -1786,6 +1900,7 @@ mod tests {
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
             dest_secret_names: None,
+            dest_subgraph_names: None,
         };
         let err = exec
             .carry_kv_stratum(Piece::History, &[], &BTreeSet::new())
@@ -1902,6 +2017,7 @@ mod tests {
             drop_soft_deleted: false,
             data_skip_notes: Vec::new(),
             dest_secret_names: None,
+            dest_subgraph_names: None,
         };
 
         let cfg = boatramp_core::config::SiteConfig::default();
