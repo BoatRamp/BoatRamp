@@ -1379,9 +1379,15 @@ static EPHEMERAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// bounding memory without dropping lines.
 const LOG_DUPLEX_CAP: usize = 64 * 1024;
 
-/// Max reconnect attempts after a transient attach/stream error before the forwarder
-/// ends cleanly. Bounded so a flapping daemon can never spin the forwarder.
+/// Max CONSECUTIVE rapid reconnect attempts after a transient attach/stream error
+/// before the forwarder ends cleanly. Bounded so a flapping daemon can never spin the
+/// forwarder; reset after a pass that streamed for [`LOG_RECONNECT_BUDGET_RESET`].
 const LOG_MAX_RECONNECTS: u32 = 5;
+
+/// A follow pass that streamed at least this long before a transient error was a
+/// healthy connection (not rapid flapping), so the reconnect budget is reset — only a
+/// genuine burst of back-to-back failures exhausts [`LOG_MAX_RECONNECTS`].
+const LOG_RECONNECT_BUDGET_RESET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Why an attach/follow pass returned.
 enum FollowOutcome {
@@ -1423,23 +1429,35 @@ async fn forward_container_logs(
     }
     let path = boatramp_guestlog::log_path(&logs_dir, &log_id);
     let (tx, rx) = tokio::sync::mpsc::channel(boatramp_guestlog::CHANNEL_CAP);
-    // One rotating writer owns the file across reconnects (appending).
-    let writer = tokio::spawn(boatramp_guestlog::write_lines_rotating(
+    // One rotating writer owns the file across reconnects (appending); it logs its own
+    // warn if it dies on an IO error (never silent).
+    let writer = tokio::spawn(boatramp_guestlog::run_file_writer(
         path,
         rx,
         boatramp_guestlog::DEFAULT_FILE_CAP_BYTES,
+        log_id.clone(),
     ));
 
+    // The reconnect budget counts CONSECUTIVE rapid blips, not a container's lifetime:
+    // an attach pass that streamed for a real interval resets it, so only genuine rapid
+    // flapping exhausts the cap. The running-check + capped backoff still prevent a
+    // busy-loop.
     let mut attempt: u32 = 0;
     loop {
         // Replay the container's existing output only on the FIRST attach (the
         // container is started just before the forwarder spawns). A reconnect follows
         // live only, so a transient blip does not re-dump the whole backlog.
         let replay_backlog = attempt == 0;
+        let pass_started = std::time::Instant::now();
         match attach_and_forward(&docker, &docker_container_id, &log_id, &tx, replay_backlog).await
         {
             FollowOutcome::Ended => break,
             FollowOutcome::Transient => {
+                // A pass that streamed for a while was a healthy connection, not rapid
+                // flapping — forgive the earlier blips so the budget bounds only a burst.
+                if pass_started.elapsed() >= LOG_RECONNECT_BUDGET_RESET {
+                    attempt = 0;
+                }
                 attempt += 1;
                 if attempt > LOG_MAX_RECONNECTS
                     || !container_is_running(&docker, &docker_container_id).await
@@ -1453,7 +1471,7 @@ async fn forward_container_logs(
         }
     }
     drop(tx); // close the channel → the writer drains + flushes + exits
-    let _ = writer.await;
+    let _ = writer.await; // run_file_writer already logged any IO error
 }
 
 /// Attach to a container's stdout/stderr and forward one follow pass through the sink.
@@ -1506,13 +1524,30 @@ where
     // the shared pump; the write half receives the demuxed frame payloads.
     let (mut out_w, out_r) = tokio::io::duplex(LOG_DUPLEX_CAP);
     let (mut err_w, err_r) = tokio::io::duplex(LOG_DUPLEX_CAP);
+    // `keep_draining = false`: the REMOTE path has no local guest pipe to protect (the
+    // reader is an in-memory duplex fed from the attach stream), so the pump may stop
+    // once the writer is gone and let the forwarder wind down.
     let (id_out, tx_out) = (log_id.to_string(), tx.clone());
     let p_out = tokio::spawn(async move {
-        boatramp_guestlog::pump(tokio::io::BufReader::new(out_r), &id_out, "stdout", tx_out).await
+        boatramp_guestlog::pump(
+            tokio::io::BufReader::new(out_r),
+            &id_out,
+            "stdout",
+            tx_out,
+            false,
+        )
+        .await
     });
     let (id_err, tx_err) = (log_id.to_string(), tx.clone());
     let p_err = tokio::spawn(async move {
-        boatramp_guestlog::pump(tokio::io::BufReader::new(err_r), &id_err, "stderr", tx_err).await
+        boatramp_guestlog::pump(
+            tokio::io::BufReader::new(err_r),
+            &id_err,
+            "stderr",
+            tx_err,
+            false,
+        )
+        .await
     });
 
     let mut outcome = FollowOutcome::Ended;

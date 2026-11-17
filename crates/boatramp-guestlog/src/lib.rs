@@ -97,23 +97,41 @@ pub fn sanitize_line(text: &str) -> String {
 /// - a logical line is capped at [`MAX_LINE_BYTES`]; past the cap it is truncated
 ///   (with [`TRUNCATION_MARKER`]) and the overflow discarded to the next newline, so
 ///   a no-newline flood cannot grow the buffer without bound;
-/// - the line text is [`sanitize_line`]d before it reaches `tracing` or the sink;
+/// - the line text is [`sanitize_line`]d before it reaches `tracing` or the sink
+///   (a single trailing `\r` is stripped first, so a CRLF line is not left ending in
+///   a replacement glyph — matching the old `str::lines()` behavior);
 /// - the structured `container` / `stream` fields are passed as their own key-values
 ///   (never interpolated into the message), so a crafted line cannot forge them.
 ///
-/// A send failure (the writer task is gone) ends the pump cleanly. Pure over its IO
-/// args.
+/// **Writer-death behavior (`keep_draining`)** — what happens when the sink (the file
+/// writer task) closes while the guest is still producing output:
+/// - `true` (the NATIVE, local-process path): the pump keeps draining-and-discarding
+///   the reader to EOF, so the guest's stdout/stderr OS pipe stays drained and the
+///   guest never hits `EPIPE`/`SIGPIPE` on its next write. Lines still mirror to
+///   `tracing` (an independent sink) even once the file is gone. This preserves the
+///   core invariant this module exists for: the launcher must never drop the guest's
+///   pipe reader while the guest runs.
+/// - `false` (the DOCKER, remote path): there is no local guest pipe to protect (the
+///   reader is an in-memory pipe fed from the daemon attach stream), so the pump may
+///   stop once the sink is gone and let the forwarder wind down.
+///
+/// Pure over its IO args.
 pub async fn pump<R: AsyncBufRead + Unpin>(
     mut reader: R,
     id: &str,
     stream: &'static str,
     sink: mpsc::Sender<GuestLine>,
+    keep_draining: bool,
 ) -> std::io::Result<u64> {
     let mut n = 0u64;
     let mut buf: Vec<u8> = Vec::new();
     // The current logical line already hit the cap: keep discarding its bytes until
     // the next newline (resync) instead of buffering them.
     let mut overflowed = false;
+    // The sink is still accepting lines. Once a send fails (writer task gone) this
+    // flips false; with `keep_draining` the pump keeps reading (to protect the guest's
+    // pipe) but stops sending.
+    let mut sink_open = true;
 
     loop {
         let chunk = reader.fill_buf().await?;
@@ -122,7 +140,8 @@ pub async fn pump<R: AsyncBufRead + Unpin>(
             // overflow that never saw its closing newline).
             if !buf.is_empty() || overflowed {
                 n += 1;
-                let _ = emit(&buf, overflowed, id, stream, &sink).await;
+                let dst = sink_open.then_some(&sink);
+                let _ = emit(&buf, overflowed, id, stream, dst).await;
             }
             break;
         }
@@ -132,8 +151,15 @@ pub async fn pump<R: AsyncBufRead + Unpin>(
                 append_bounded(&mut buf, &chunk[..pos], &mut overflowed);
                 reader.consume(pos + 1);
                 n += 1;
-                if !emit(&buf, overflowed, id, stream, &sink).await {
-                    break; // writer gone — stop draining
+                let dst = sink_open.then_some(&sink);
+                let sent = emit(&buf, overflowed, id, stream, dst).await;
+                if sink_open && !sent {
+                    // The writer task is gone.
+                    sink_open = false;
+                    if !keep_draining {
+                        break; // remote path: nothing local to protect — stop.
+                    }
+                    // local path: fall through and keep draining to EOF.
                 }
                 buf.clear();
                 overflowed = false;
@@ -163,21 +189,30 @@ fn append_bounded(buf: &mut Vec<u8>, src: &[u8], overflowed: &mut bool) {
     }
 }
 
-/// Emit one logical line to `tracing` + `sink`. Returns `false` iff the sink is
-/// closed (writer gone). `send().await` is the back-pressure point.
+/// Emit one logical line: always mirror to `tracing`, and — when `sink` is `Some` —
+/// forward to the file writer. Returns `false` ONLY when a present sink's `send`
+/// failed (writer gone); `None` (already draining) returns `true`. `send().await` is
+/// the back-pressure point.
 async fn emit(
     raw: &[u8],
     overflowed: bool,
     id: &str,
     stream: &'static str,
-    sink: &mpsc::Sender<GuestLine>,
+    sink: Option<&mpsc::Sender<GuestLine>>,
 ) -> bool {
-    let mut text = sanitize_line(&String::from_utf8_lossy(raw));
+    // Strip a single trailing CR so a CRLF line is not left ending in a replacement
+    // glyph; an interior `\r` is still neutralized by `sanitize_line`.
+    let lossy = String::from_utf8_lossy(raw);
+    let trimmed = lossy.strip_suffix('\r').unwrap_or(&lossy);
+    let mut text = sanitize_line(trimmed);
     if overflowed {
         text.push_str(TRUNCATION_MARKER);
     }
     tracing::info!(target: "boatramp::guest", container = id, stream, "{text}");
-    sink.send(GuestLine { stream, text }).await.is_ok()
+    match sink {
+        Some(s) => s.send(GuestLine { stream, text }).await.is_ok(),
+        None => true,
+    }
 }
 
 /// The single ordered writer with a bounded, rotating file.
@@ -214,6 +249,28 @@ pub async fn write_lines_rotating(
         written = written.saturating_add(len);
     }
     Ok(())
+}
+
+/// Run [`write_lines_rotating`] as a spawned task and log a diagnostic if it stops on
+/// an IO error (file create / rotate / write — ENOSPC, EISDIR, EMFILE, …) rather than
+/// swallowing it. Both backends spawn THIS so a dead writer is never silent; the guest
+/// is unaffected (the native pump keeps its stdout/stderr drained — see [`pump`]'s
+/// `keep_draining`).
+pub async fn run_file_writer(
+    path: PathBuf,
+    rx: mpsc::Receiver<GuestLine>,
+    cap_bytes: u64,
+    container: String,
+) {
+    if let Err(e) = write_lines_rotating(path, rx, cap_bytes).await {
+        tracing::warn!(
+            target: "boatramp::guest",
+            container = %container,
+            error = %e,
+            "guest-log writer stopped on an IO error; per-container file capture ended \
+             (the guest is unaffected and still mirrors to tracing)"
+        );
+    }
 }
 
 /// The one physical line written per logical line: `<stream>: <sanitized-text>\n`.
@@ -317,7 +374,7 @@ mod tests {
     async fn pump_forwards_lines_and_counts() {
         let input = b"hello\nworld\n".as_slice();
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(input, "web-0", "stdout", tx).await.unwrap();
+        let n = pump(input, "web-0", "stdout", tx, true).await.unwrap();
         assert_eq!(n, 2);
         assert_eq!(
             rx.recv().await.unwrap(),
@@ -334,7 +391,7 @@ mod tests {
     async fn pump_handles_unterminated_final_line() {
         let input = b"partial".as_slice();
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(input, "w-0", "stderr", tx).await.unwrap();
+        let n = pump(input, "w-0", "stderr", tx, true).await.unwrap();
         assert_eq!(n, 1);
         assert_eq!(rx.recv().await.unwrap().text, "partial");
     }
@@ -345,7 +402,9 @@ mod tests {
         // buffer unbounded: the emitted line is capped + marked truncated.
         let flood = vec![b'A'; MAX_LINE_BYTES * 4];
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(flood.as_slice(), "w-0", "stdout", tx).await.unwrap();
+        let n = pump(flood.as_slice(), "w-0", "stdout", tx, true)
+            .await
+            .unwrap();
         assert_eq!(n, 1, "the whole flood is ONE (truncated) logical line");
         let line = rx.recv().await.unwrap();
         assert!(
@@ -364,10 +423,119 @@ mod tests {
         input.push(b'\n');
         input.extend_from_slice(b"after\n");
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(input.as_slice(), "w-0", "stdout", tx).await.unwrap();
+        let n = pump(input.as_slice(), "w-0", "stdout", tx, true)
+            .await
+            .unwrap();
         assert_eq!(n, 2);
         assert!(rx.recv().await.unwrap().text.ends_with(TRUNCATION_MARKER));
         assert_eq!(rx.recv().await.unwrap().text, "after");
+    }
+
+    #[tokio::test]
+    async fn pump_strips_a_trailing_cr_from_crlf_lines() {
+        // A CRLF line yields `hello\r` between the split; the trailing CR is stripped
+        // (not turned into U+FFFD), matching the old `str::lines()` behavior. An
+        // interior CR is still neutralized.
+        let (tx, mut rx) = mpsc::channel(8);
+        let n = pump(
+            b"hello\r\nmid\rtext\r\n".as_slice(),
+            "w-0",
+            "stdout",
+            tx,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            rx.recv().await.unwrap().text,
+            "hello",
+            "trailing CR stripped"
+        );
+        let second = rx.recv().await.unwrap().text;
+        assert!(!second.ends_with('\r') && !second.contains('\r'));
+        assert!(
+            second.starts_with("mid") && second.ends_with("text"),
+            "interior CR neutralized, trailing CR stripped: {second:?}"
+        );
+    }
+
+    /// MEDIUM-1: when the file writer dies mid-run (here: its path is a directory, so
+    /// `File::create` fails and `rx` drops), the NATIVE pump (`keep_draining = true`)
+    /// must keep draining the guest reader to EOF — if it `break`s instead, it would
+    /// drop the guest's stdout pipe reader and the running guest would `EPIPE`. It must
+    /// also surface the writer error via a `tracing::warn!`. Mutation-sensitive: with
+    /// the old break-on-send-failure behavior the pumps stop early and the counts drop
+    /// below the line totals.
+    #[tokio::test]
+    async fn native_pump_drains_guest_and_warns_when_the_file_writer_dies() {
+        let buf = install_tracing_capture();
+        let dir = tempfile::tempdir().unwrap();
+        // Make the "log file" a DIRECTORY so the writer's `File::create` fails → the
+        // writer task returns Err and drops `rx`.
+        let bad = log_path(dir.path(), "web-0");
+        std::fs::create_dir(&bad).unwrap();
+
+        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+        let writer = tokio::spawn(run_file_writer(
+            bad,
+            rx,
+            DEFAULT_FILE_CAP_BYTES,
+            "web-0".into(),
+        ));
+
+        // Two guest streams each emit far more lines than the channel can buffer, so
+        // the writer's death forces a send failure mid-stream.
+        let n_lines: usize = 2000;
+        let mk = |tag: &str| {
+            let mut v = Vec::new();
+            for i in 0..n_lines {
+                v.extend_from_slice(format!("{tag}-{i}\n").as_bytes());
+            }
+            v
+        };
+        let out = mk("o");
+        let err = mk("e");
+        let p_out = pump(out.as_slice(), "web-0", "stdout", tx.clone(), true);
+        let p_err = pump(err.as_slice(), "web-0", "stderr", tx, true);
+        let (a, b) = tokio::join!(p_out, p_err);
+
+        assert_eq!(
+            a.unwrap() as usize,
+            n_lines,
+            "stdout drained to EOF despite the dead writer (guest pipe protected)"
+        );
+        assert_eq!(
+            b.unwrap() as usize,
+            n_lines,
+            "stderr drained to EOF despite the dead writer"
+        );
+        writer.await.unwrap();
+
+        let logged = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            logged.contains("guest-log writer stopped"),
+            "the writer death is logged: {logged}"
+        );
+    }
+
+    /// The DOCKER/remote counterpart: `keep_draining = false` lets the pump stop once
+    /// the sink is gone (no local pipe to protect), so the forwarder can wind down.
+    #[tokio::test]
+    async fn remote_pump_stops_after_the_sink_closes() {
+        let (tx, rx) = mpsc::channel::<GuestLine>(1);
+        drop(rx); // sink gone before the first send
+        let mut input = Vec::new();
+        for i in 0..1000 {
+            input.extend_from_slice(format!("l-{i}\n").as_bytes());
+        }
+        let n = pump(input.as_slice(), "web-0", "stdout", tx, false)
+            .await
+            .unwrap();
+        assert!(
+            (n as usize) < 1000,
+            "remote pump stops once the sink closes, got {n}"
+        );
     }
 
     #[tokio::test]
@@ -378,7 +546,9 @@ mod tests {
         let marker = "MIRROR_MARK_ready_31";
         let line = format!("{marker}\n");
         let (tx, mut rx) = mpsc::channel(8);
-        let n = pump(line.as_bytes(), "web-0", "stdout", tx).await.unwrap();
+        let n = pump(line.as_bytes(), "web-0", "stdout", tx, true)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
         assert_eq!(rx.recv().await.unwrap().text, marker);
 
@@ -473,8 +643,8 @@ mod tests {
         ));
         let out = BufReader::new(b"app started\napp ready\n".as_slice());
         let err = BufReader::new(b"a warning\n".as_slice());
-        let p1 = pump(out, "w-0", "stdout", tx.clone());
-        let p2 = pump(err, "w-0", "stderr", tx);
+        let p1 = pump(out, "w-0", "stdout", tx.clone(), true);
+        let p2 = pump(err, "w-0", "stderr", tx, true);
         let (a, b) = tokio::join!(p1, p2);
         assert_eq!(a.unwrap() + b.unwrap(), 3, "3 lines total");
         writer.await.unwrap().unwrap();

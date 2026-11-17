@@ -2048,18 +2048,23 @@ impl ContainerBackend {
             .map_err(|e| BackendError::Launch(format!("create logs dir: {e}")))?;
         let path = logsink::log_path(&logs_dir, id);
         let (tx, rx) = tokio::sync::mpsc::channel(logsink::CHANNEL_CAP);
-        tokio::spawn(logsink::write_lines_rotating(
+        // The writer logs its own warn if it dies on an IO error (never silent).
+        tokio::spawn(logsink::run_file_writer(
             path,
             rx,
             logsink::DEFAULT_FILE_CAP_BYTES,
+            id.to_string(),
         ));
+        // `keep_draining = true`: this is the LOCAL process path — the pump owns the
+        // worker's real stdout/stderr pipe. If the writer dies it MUST keep draining to
+        // EOF (never drop the reader), or the running guest EPIPEs on its next write.
         let (id_out, tx_out) = (id.to_string(), tx.clone());
         tokio::spawn(async move {
-            let _ = logsink::pump(stdout, &id_out, "stdout", tx_out).await;
+            let _ = logsink::pump(stdout, &id_out, "stdout", tx_out, true).await;
         });
         let id_err = id.to_string();
         tokio::spawn(async move {
-            let _ = logsink::pump(stderr, &id_err, "stderr", tx).await;
+            let _ = logsink::pump(stderr, &id_err, "stderr", tx, true).await;
         });
         Ok(())
     }
