@@ -984,6 +984,24 @@ pub(super) async fn get_graphql_supergraph(
     }
 }
 
+/// `GET /api/projects/{proj}/graphql/subgraphs` — the NAMES of the project's currently-registered
+/// federation subgraphs, as a JSON array. **Empty-safe**: an unregistered/empty registry returns
+/// `[]`, never an error (unlike the composed [`get_graphql_supergraph`] read, which fails closed
+/// when the registry is empty or does not compose). Read-only (`Project·Read`, via the
+/// `/api/graphql/*` prefix rule in `authz::Right::required`). This is the destination-side
+/// enumeration `project sync`'s sites-rewrite coherence check reads to decide whether a carried
+/// site config's `handlers.graphql.subgraphs` include list names a subgraph NOT yet registered on
+/// the destination — if so it DEFERS the config to a `deploy:apply` (which owns subgraph
+/// registration) rather than failing the run after the data plane landed.
+#[cfg(feature = "handlers")]
+pub(super) async fn list_graphql_subgraphs(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+) -> Response {
+    let names = crate::graphql_registry::subgraph_names(deploy.kv().as_ref(), &project.0).await;
+    axum::Json(names).into_response()
+}
+
 /// GET the active dynamic daemon config + its generation hash.
 pub(super) async fn get_daemon_config(
     State(deploy): State<DeployStore>,

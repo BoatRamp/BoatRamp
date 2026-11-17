@@ -998,6 +998,29 @@ pub enum SyncApplyError {
         /// The conflict detail (which host, held by whom).
         message: String,
     },
+    /// The destination cannot COHERENTLY accept this site config YET: its handlers reference
+    /// control-plane that this sync does not carry and the destination does not already have — a
+    /// handler `secrets` reference to a secret not sealed on the destination, or a handler that
+    /// points at a function not deployed there. The write seam
+    /// ([`SyncExecutor::write_dest_site_config`]) returns this INSTEAD of writing the config, so the
+    /// engine DEFERS the site: nothing is written for it, the already-landed data plane is left
+    /// untouched, and the operator finishes it with `deploy:apply` (which OWNS function deploy +
+    /// secret sealing). Under the default posture the engine CATCHES this and records a deferred
+    /// site (exit 0, "N deferred — run deploy:apply"); under `--strict` it refuses the whole run.
+    /// Distinct from [`Skip`](Self::DomainConflict)/incoherent-dependency because the data itself
+    /// synced fine and the config is coherent — it is only WAITING on a `deploy:apply` the operator
+    /// was going to run anyway (matching the `sync --exclude-sites` + `deploy:apply` workaround).
+    #[error(
+        "site `{site}` deferred — handler references not present on the destination: {}",
+        missing.join(", ")
+    )]
+    IncoherentSiteConfig {
+        /// The site whose config references control-plane absent from the destination.
+        site: String,
+        /// The missing references (e.g. `secret:STRIPE_KEY`, `function:resize`) — what `deploy:apply`
+        /// must supply before the config is coherent.
+        missing: Vec<String>,
+    },
     /// A `SiteConfig` rewrite / (de)serialize failure.
     #[error("site config rewrite failed: {0}")]
     Rewrite(String),
@@ -1084,9 +1107,14 @@ pub trait SyncExecutor: Send {
     /// `site/`+`current/`, rebuild the routing index, enforce the host-uniqueness hijack guard
     /// ([`crate::deploy::DeployStore::set_site_config`]). MUST return
     /// [`SyncApplyError::DomainConflict`] when a carried host is already a LIVE owner in a different
-    /// project/site (the exclusive-domain guard). MUST be idempotent (same body ⇒ same hash ⇒
-    /// pointer no-op). Returns `true` iff the write actually CHANGED the destination (so the report
-    /// can distinguish a real carry from an idempotent no-op).
+    /// project/site (the exclusive-domain guard), and SHOULD return
+    /// [`SyncApplyError::IncoherentSiteConfig`] (WITHOUT writing) when the config's handlers
+    /// reference control-plane not present on the destination after this sync — a handler `secrets`
+    /// reference to a secret not sealed there, or a handler that points at a function not deployed
+    /// there — so the engine DEFERS the site to a subsequent `deploy:apply` instead of failing the
+    /// run after the data plane already landed. MUST be idempotent (same body ⇒ same hash ⇒ pointer
+    /// no-op). Returns `true` iff the write actually CHANGED the destination (so the report can
+    /// distinguish a real carry from an idempotent no-op).
     async fn write_dest_site_config(
         &mut self,
         site: &str,
@@ -1103,6 +1131,24 @@ pub struct SkippedItem {
     /// The item name.
     pub name: String,
     /// Why it was skipped (incoherent dependency, or an exclusive-domain double-claim).
+    pub reason: String,
+}
+
+/// One site the apply DEFERRED (did not write) because its config is coherent + its data synced,
+/// but its handlers reference control-plane the destination does not have YET — a secret not sealed
+/// there, or a function not deployed there. The sync completes with **exit 0**; the operator runs
+/// `deploy:apply` (which owns function deploy + secret sealing) to finish the deferred configs. The
+/// destination's prior, coherent state for the site is left intact (never half-applied) — the same
+/// end-state as excluding the site (`sync --exclude-sites`) and letting a later `deploy:apply`
+/// apply it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredSite {
+    /// The site whose config write was deferred.
+    pub site: String,
+    /// The missing references that must exist on the destination first (e.g. `secret:STRIPE_KEY`,
+    /// `function:resize`) — exactly what a `deploy:apply` supplies.
+    pub missing: Vec<String>,
+    /// A human reason: which references are missing and how to finish (run `deploy:apply`).
     pub reason: String,
 }
 
@@ -1131,6 +1177,10 @@ pub struct SyncApplyReport {
     pub unchanged: Vec<String>,
     /// Items SKIPPED (incoherent, or exclusive-domain) with reasons — never half-applied.
     pub skipped: Vec<SkippedItem>,
+    /// Site configs DEFERRED to a subsequent `deploy:apply` — their data synced fine, but their
+    /// handlers reference a secret not sealed / a function not deployed on the destination yet. The
+    /// sync still completes (exit 0); these wait for `deploy:apply`. Never half-applied.
+    pub deferred: Vec<DeferredSite>,
     /// Items explicitly dropped by a per-item `--exclude-site`/`--exclude-db`.
     pub dropped: Vec<String>,
     /// Whether identity was `fresh` (source-sealed secrets dropped).
@@ -1155,6 +1205,36 @@ impl SyncApplyReport {
         !self.skipped.is_empty()
     }
 
+    /// How many site configs were DEFERRED to a `deploy:apply` (their data synced; their config
+    /// awaits function deploy / secret sealing). A non-zero count is NOT a failure — the sync
+    /// succeeded; the operator just finishes with `deploy:apply`.
+    #[must_use]
+    pub fn deferred_count(&self) -> usize {
+        self.deferred.len()
+    }
+
+    /// Whether the apply completed WITH deferred site configs (the distinct "exit 0, N deferred —
+    /// run deploy:apply" outcome).
+    #[must_use]
+    pub fn completed_with_deferrals(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
+    /// The operator-facing one-line summary of the deferral, or `None` when nothing was deferred:
+    /// `N site config(s) deferred — run deploy:apply to finish them: a, b`.
+    #[must_use]
+    pub fn deferred_summary(&self) -> Option<String> {
+        if self.deferred.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = self.deferred.iter().map(|d| d.site.as_str()).collect();
+        Some(format!(
+            "{} site config(s) deferred — run deploy:apply to finish them: {}",
+            self.deferred.len(),
+            names.join(", ")
+        ))
+    }
+
     /// Whether this apply changed NOTHING at the destination — every carried item was an idempotent
     /// no-op and nothing was created/transferred. The converged resync signal.
     #[must_use]
@@ -1166,6 +1246,9 @@ impl SyncApplyReport {
             && self.databases_carried.is_empty()
             && self.sites_carried.is_empty()
             && self.sites_rewritten.is_empty()
+            // A deferral means a site config is WAITING on a `deploy:apply`; the run is not a
+            // "converged — nothing to do" no-op even if no bytes moved this time.
+            && self.deferred.is_empty()
     }
 }
 
@@ -1222,7 +1305,7 @@ pub async fn apply_sync(
     // The site names the apply did NOT carry (skipped-or-dropped) — their `current/`/`alias/`
     // dependants must be excluded from the history/domains stratum carries so a carry never leaves a
     // pointer to a site body that was not written (coherence).
-    let uncarried_sites: BTreeSet<String> = plan
+    let mut uncarried_sites: BTreeSet<String> = plan
         .items
         .iter()
         .filter(|i| {
@@ -1339,6 +1422,41 @@ pub async fn apply_sync(
                         kind: ItemKind::Site,
                         name: site,
                         reason: format!("exclusive-domain conflict: {message}"),
+                    });
+                }
+                Err(SyncApplyError::IncoherentSiteConfig { site, missing }) => {
+                    // The config is coherent + its data synced, but its handlers reference a secret
+                    // not sealed / a function not deployed on the destination YET. DEFER the config
+                    // (write NOTHING for this site — the dest's prior state is intact; the
+                    // already-landed data plane is untouched) and finish the run with exit 0, telling
+                    // the operator to run `deploy:apply` (which owns function deploy + secret
+                    // sealing). This is NOT a hard-fail: the sync succeeded; the config is WAITING.
+                    // `--strict` turns a deferral into an all-or-nothing refusal, like a skip.
+                    if plan.strict {
+                        return Err(SyncApplyError::StrictRefused {
+                            count: 1,
+                            detail: format!(
+                                "  - site `{site}`: handler references not present on the \
+                                 destination: {}",
+                                missing.join(", ")
+                            ),
+                        });
+                    }
+                    // Its `current/`/`alias/` dependants must NOT be carried (coherence — never
+                    // leave a pointer to a site body that was not written); exclude it from the
+                    // site-dependent strata carries below exactly as a skipped/dropped site is.
+                    uncarried_sites.insert(site.clone());
+                    let reason = format!(
+                        "handlers reference control-plane not present on the destination [{}] — a \
+                         secret not sealed or a function not deployed yet; the data synced and the \
+                         destination's prior state for this site is left intact. Run `deploy:apply` \
+                         (it owns function deploy + secret sealing) to finish it",
+                        missing.join(", ")
+                    );
+                    report.deferred.push(DeferredSite {
+                        site,
+                        missing,
+                        reason,
                     });
                 }
                 Err(other) => return Err(other),
@@ -1973,6 +2091,10 @@ mod tests {
         /// Hosts already LIVE-owned by a DIFFERENT owner — carrying one is an exclusive-domain
         /// conflict (the write-time hijack guard).
         live_hosts_elsewhere: BTreeSet<String>,
+        /// Sites whose config the destination cannot coherently accept yet (handler references to a
+        /// secret not sealed / a function not deployed): site name → the missing references. Models
+        /// the real executor's pre-write coherence probe → [`SyncApplyError::IncoherentSiteConfig`].
+        incoherent_sites: BTreeMap<String, Vec<String>>,
         /// Target keyspace the engine asked a stratum carry to write — recorded for the tenancy
         /// assertion (every prefix must be target-owned).
         carried_prefixes: Vec<String>,
@@ -2051,6 +2173,16 @@ mod tests {
             site: &str,
             cfg: &SiteConfig,
         ) -> Result<bool, SyncApplyError> {
+            // Pre-write coherence probe (models the real executor): a site whose handlers reference
+            // control-plane the destination does not have yet DEFERS — nothing is written for it.
+            if let Some(missing) = self.incoherent_sites.get(site)
+                && !missing.is_empty()
+            {
+                return Err(SyncApplyError::IncoherentSiteConfig {
+                    site: site.to_string(),
+                    missing: missing.clone(),
+                });
+            }
             // Exclusive-domain hijack guard: refuse a carried host live-owned by another owner.
             for host in cfg.domains.exact_hosts() {
                 if self.live_hosts_elsewhere.contains(host) {
@@ -2409,6 +2541,264 @@ mod tests {
             .expect_err("strict refuses up front");
         assert!(matches!(err, SyncApplyError::StrictRefused { .. }));
         assert!(!exec.dest_exists, "nothing provisioned on a strict refusal");
+    }
+
+    /// DEFER (sync-sites-defer): a site whose DATA synced fine but whose config references a secret
+    /// not sealed / a function not deployed on the destination is DEFERRED to a `deploy:apply` — NOT
+    /// a hard-fail after the data plane landed. The run completes (exit 0 ⇔ `apply_sync` returns
+    /// `Ok`), the data plane is intact, nothing is written for the site, and the deferral names the
+    /// missing references + points at `deploy:apply`. MUTATION WITNESS: revert the sites-loop
+    /// `IncoherentSiteConfig` arm to `return Err(other)` and this `.expect("…")` panics (the run
+    /// aborts with the error instead of deferring), so this gate BINDS the defer behavior.
+    #[tokio::test]
+    async fn apply_defers_an_incoherent_site_config_and_still_exits_ok() {
+        // pg (data) + sites + domains: the data plane transfers in step 2, the site in step 5.
+        let selection =
+            selection_apply(&[Piece::Pg, Piece::Sites, Piece::Domains], &[], &[], false);
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "admin".into(),
+                has_domains: true,
+                db_bindings: vec![], // coherent at PLAN level (no dangling DB) — Carry, not Skip.
+            }],
+            ..Default::default()
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([("admin".into(), cfg_with("admin.example.com", true))]),
+            // The destination has neither the secret sealed nor the function deployed YET.
+            incoherent_sites: BTreeMap::from([(
+                "admin".to_string(),
+                vec![
+                    "secret:STRIPE_KEY".to_string(),
+                    "function:resize".to_string(),
+                ],
+            )]),
+            ..Default::default()
+        };
+        // Returns Ok — exit 0, NOT the pre-fix hard-fail. (If the arm is reverted, this panics.)
+        let report = apply_sync(&plan, &mut exec)
+            .await
+            .expect("apply ok (deferred)");
+
+        // The data plane LANDED (the whole point — the deferral must not roll it back).
+        assert!(report.dest_created, "absent dest created");
+        assert!(
+            report.pg_transferred,
+            "pg data transferred before the site deferred"
+        );
+        assert!(exec.pg_synced, "pg is on the destination");
+
+        // The site was DEFERRED, not written and not hard-failed.
+        assert_eq!(report.deferred_count(), 1);
+        assert!(report.sites_carried.is_empty() && report.sites_rewritten.is_empty());
+        assert!(
+            report.skipped.is_empty(),
+            "a defer is distinct from an incoherent skip"
+        );
+        let d = &report.deferred[0];
+        assert_eq!(d.site, "admin");
+        assert_eq!(d.missing, vec!["secret:STRIPE_KEY", "function:resize"]);
+        assert!(
+            d.reason.contains("deploy:apply"),
+            "the reason points at deploy:apply"
+        );
+        assert!(
+            !exec.dest_sites.contains_key("admin"),
+            "nothing written for the deferred site — the dest's prior state is intact"
+        );
+
+        // The operator-facing summary: exit-0, N deferred, names the sites + deploy:apply.
+        let summary = report.deferred_summary().expect("a deferral summary");
+        assert!(summary.contains("1 site config(s) deferred"), "{summary}");
+        assert!(
+            summary.contains("deploy:apply") && summary.contains("admin"),
+            "{summary}"
+        );
+        assert!(report.completed_with_deferrals());
+        assert!(!report.is_noop(), "data moved — not a converged no-op");
+
+        // HAND-OFF: once `deploy:apply` has sealed the secret + deployed the function (modelled by
+        // clearing the incoherence), a re-sync of the SAME plan now writes the config and defers
+        // nothing — the deferred config is left in a state the follow-up picks up.
+        exec.incoherent_sites.clear();
+        let _ = exec.take_writes();
+        let report2 = apply_sync(&plan, &mut exec).await.expect("resync ok");
+        assert!(
+            report2.deferred.is_empty(),
+            "nothing deferred after the refs exist"
+        );
+        assert_eq!(report2.sites_carried, vec!["admin".to_string()]);
+        assert!(
+            exec.dest_sites.contains_key("admin"),
+            "the config lands on the resync"
+        );
+    }
+
+    /// DEFER is PER-SITE: a coherent site in the same run is applied normally; only the incoherent
+    /// one defers. The deferred site's `current/`/`alias/` dependants are EXCLUDED from the
+    /// site-dependent strata carries (coherence — never a pointer to a body that was not written).
+    #[tokio::test]
+    async fn apply_defers_only_the_incoherent_site_and_excludes_its_dependants() {
+        let selection = selection_apply(
+            &[Piece::Sites, Piece::Domains, Piece::History],
+            &[],
+            &[],
+            false,
+        );
+        let inventory = SyncInventory {
+            sites: vec![
+                SiteItem {
+                    name: "web".into(),
+                    has_domains: true,
+                    db_bindings: vec![],
+                },
+                SiteItem {
+                    name: "admin".into(),
+                    has_domains: true,
+                    db_bindings: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([
+                ("web".into(), cfg_with("web.example.com", true)),
+                ("admin".into(), cfg_with("admin.example.com", true)),
+            ]),
+            incoherent_sites: BTreeMap::from([(
+                "admin".to_string(),
+                vec!["secret:API_KEY".to_string()],
+            )]),
+            ..Default::default()
+        };
+        let report = apply_sync(&plan, &mut exec).await.expect("apply ok");
+
+        // The coherent site applied; the incoherent one deferred.
+        assert_eq!(report.sites_carried, vec!["web".to_string()]);
+        assert_eq!(report.deferred_count(), 1);
+        assert_eq!(report.deferred[0].site, "admin");
+        assert!(exec.dest_sites.contains_key("web") && !exec.dest_sites.contains_key("admin"));
+
+        // The deferred site's `current/` pointer was EXCLUDED from the history stratum carry, and
+        // the carried site's was NOT — so no history pointer dangles at an un-written body.
+        assert!(
+            exec.excluded_prefixes
+                .iter()
+                .any(|p| p == "project/dst/current/admin"),
+            "deferred site's current/ excluded: {:?}",
+            exec.excluded_prefixes
+        );
+        assert!(
+            !exec
+                .excluded_prefixes
+                .iter()
+                .any(|p| p == "project/dst/current/web"),
+            "carried site's current/ not excluded"
+        );
+    }
+
+    /// DEFER covers UNDEPLOYED SUBGRAPHS, not only secrets: a site whose data synced and whose
+    /// secrets are all sealed BUT whose `handlers.graphql.subgraphs` names subgraphs not registered
+    /// on the destination defers the SAME way (one `IncoherentSiteConfig` path, `missing` naming the
+    /// `subgraph:<name>`s) and is named in the exit-0 summary. The engine is reference-agnostic — the
+    /// executor classifies which refs are missing — so this reuses the mechanism, no second path.
+    #[tokio::test]
+    async fn apply_defers_a_site_with_an_undeployed_subgraph() {
+        let selection = selection_apply(&[Piece::Sites, Piece::Domains], &[], &[], false);
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "admin".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([("admin".into(), cfg_with("admin.example.com", true))]),
+            // Secrets all sealed; the gap is two unregistered subgraphs (construens's admin case).
+            incoherent_sites: BTreeMap::from([(
+                "admin".to_string(),
+                vec![
+                    "subgraph:pack-admin".to_string(),
+                    "subgraph:catalog".to_string(),
+                ],
+            )]),
+            ..Default::default()
+        };
+        let report = apply_sync(&plan, &mut exec)
+            .await
+            .expect("apply ok (deferred)");
+
+        assert_eq!(report.deferred_count(), 1);
+        let d = &report.deferred[0];
+        assert_eq!(d.site, "admin");
+        assert_eq!(d.missing, vec!["subgraph:pack-admin", "subgraph:catalog"]);
+        assert!(
+            !exec.dest_sites.contains_key("admin"),
+            "nothing written for the deferred site"
+        );
+        let summary = report.deferred_summary().expect("a deferral summary");
+        assert!(
+            summary.contains("deploy:apply") && summary.contains("admin"),
+            "{summary}"
+        );
+    }
+
+    /// NO-REGRESSION: a sync with NO incoherent configs defers nothing — every site applies and the
+    /// deferral surface stays empty.
+    #[tokio::test]
+    async fn apply_without_incoherence_defers_nothing() {
+        let selection =
+            selection_apply(&[Piece::Pg, Piece::Sites, Piece::Domains], &[], &[], false);
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "web".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([("web".into(), cfg_with("web.example.com", true))]),
+            ..Default::default() // incoherent_sites empty
+        };
+        let report = apply_sync(&plan, &mut exec).await.expect("apply ok");
+        assert!(report.deferred.is_empty() && !report.completed_with_deferrals());
+        assert!(report.deferred_summary().is_none());
+        assert_eq!(report.sites_carried, vec!["web".to_string()]);
+        assert!(exec.dest_sites.contains_key("web"));
+    }
+
+    /// `--strict` turns a deferral into an all-or-nothing refusal (like a skip): the operator asked
+    /// for coherent-or-nothing, so a config waiting on `deploy:apply` refuses the whole run.
+    #[tokio::test]
+    async fn apply_strict_refuses_a_deferred_site() {
+        let selection = selection_apply(&[Piece::Sites, Piece::Domains], &[], &[], true); // strict
+        let inventory = SyncInventory {
+            sites: vec![SiteItem {
+                name: "admin".into(),
+                has_domains: true,
+                db_bindings: vec![],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_sync(&selection, &inventory, &DestState::Absent, "src", "dst");
+        let mut exec = FakeExecutor {
+            source_sites: BTreeMap::from([("admin".into(), cfg_with("admin.example.com", true))]),
+            incoherent_sites: BTreeMap::from([(
+                "admin".to_string(),
+                vec!["secret:API_KEY".to_string()],
+            )]),
+            ..Default::default()
+        };
+        let err = apply_sync(&plan, &mut exec)
+            .await
+            .expect_err("strict refuses");
+        assert!(matches!(err, SyncApplyError::StrictRefused { .. }));
     }
 
     /// TENANCY: every KV-stratum carry the engine requests is confined to the TARGET's OWN owned

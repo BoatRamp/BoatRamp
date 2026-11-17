@@ -784,6 +784,10 @@ pub fn router_with_fast(
             "/api/graphql/safelist/{hash}",
             axum::routing::delete(delete_graphql_safelist),
         )
+        // Read-only listing of the project's registered subgraph NAMES (empty-safe `[]`, unlike
+        // the composed `supergraph` read). `project sync` reads it to detect a carried site config
+        // whose `graphql.subgraphs` names an unregistered subgraph and DEFER it to `deploy:apply`.
+        .route("/api/graphql/subgraphs", get(list_graphql_subgraphs))
         .route("/api/graphql/supergraph", get(get_graphql_supergraph));
     // An `Auth` clone for the `/mcp` channel gate (captured before `auth` is moved
     // into the API's `require_auth` layer below) + the node's canonical origin, for
