@@ -15,18 +15,24 @@
 //! possession), caveats intersected, `not_after` folded into the effective `exp`,
 //! and roles taken from the **root only** (the anti-escalation invariant).
 
-use ciborium::value::Value as CborValue;
-use coset::cwt::{ClaimsSet, ClaimsSetBuilder, Timestamp};
+// `CborValue` (the CBOR value model) and `ClaimsSet` (the CWT claim-set) are the
+// foreign types this module's API speaks; `pub use` re-exports them through
+// boatramp-core::cose for consumers that only depend on boatramp-core (U8–U10, #6),
+// while they remain usable internally under the same names.
+pub use ciborium::value::Value as CborValue;
+pub use coset::cwt::ClaimsSet;
+use coset::cwt::{ClaimsSetBuilder, Timestamp};
 
 use boatramp_types::authz::GrantedRole;
 
 // The generic COSE_Sign1/CWT engine lives in `boatramp-cwt`. These re-exports keep
 // boatramp-core's public API byte-for-byte: `boatramp_core::cose::{TokenError,
 // Signer, LocalSigner, TokenPublicKey, TokenAlg, MAX_CHAIN_*, p256_der_sig_to_raw}`
-// resolve exactly as before, now pointing at the shared engine.
+// resolve exactly as before, now pointing at the shared engine. The newest-first
+// key-selection helpers (`peek_*`, U8–U10, #5) surface here too.
 pub use boatramp_cwt::{
     LocalSigner, MAX_CHAIN_BYTES, MAX_CHAIN_DEPTH, NarrowingCaveats, Signer, TokenAlg, TokenError,
-    TokenPublicKey, p256_der_sig_to_raw,
+    TokenPublicKey, p256_der_sig_to_raw, peek_protected_kid, peek_unverified_claims,
 };
 // Low-level engine helpers this module's boatramp-specific mint/verify functions
 // call (private, as they were before the extraction).
@@ -219,9 +225,20 @@ pub const POP_SKEW_SECS: u64 = 30;
 /// stream through unbound (a documented gap — those carry their own content hash).
 pub const POP_MAX_BODY_HASH_BYTES: usize = 1024 * 1024;
 
-/// Text claim key for the holder key (RFC 8747 `cnf`, here the holder's public key
-/// `"<alg>:<hex>"`): the key that may mint the next delegation block. Present only
-/// on a *delegatable* token / block.
+/// Text claim key for the holder key (the holder's public key `"<alg>:<hex>"`): the
+/// key that may mint the next delegation block. Present only on a *delegatable*
+/// token / block.
+///
+/// **RFC-8747 flag (U8–U10, #7):** the holder is carried as this bare private-use
+/// *text* claim, NOT as a structured RFC-8747 `cnf` claim (CWT claim key 8, a map
+/// whose member — `COSE_Key` / `kid` / `jwk` — states the confirmation method).
+/// Moving to the RFC-8747 form would **change the wire bytes** of every delegatable
+/// token (`mint_delegatable`, every `attenuate` block, every `cnf`-bound overlay
+/// capability) and break verification of all existing boatramp tokens — so it is
+/// **not changed here** (STOP-and-flag, per the task's compatibility rule). A
+/// future migration is additive: mint both forms during an overlap, read the
+/// RFC-8747 `cnf` first and fall back to this text claim, then retire the text
+/// claim once all issuers/verifiers are upgraded (a release-gated wire change).
 const CLAIM_CNF: &str = "br_cnf";
 /// Text claim key for a delegation block's narrowing caveats (a CBOR map).
 const CLAIM_CAVEATS: &str = "br_caveats";
@@ -367,25 +384,52 @@ impl NarrowingCaveats for Caveats {
         CborValue::Map(map)
     }
 
-    /// Decode from the CBOR produced by [`to_cbor`](NarrowingCaveats::to_cbor);
-    /// unknown/ill-typed entries are ignored (never a panic on a hostile token).
-    fn from_cbor(value: &CborValue) -> Self {
+    /// Decode from the CBOR produced by [`to_cbor`](NarrowingCaveats::to_cbor).
+    /// **Fallible (U8–U10, #3):** an unknown restriction key — or a known key with
+    /// the wrong CBOR type — **refuses** the token with a reason, fail-closed,
+    /// rather than silently dropping a narrowing the verifier can't interpret
+    /// (which could *widen* authority). Never panics on a hostile token.
+    fn from_cbor(value: &CborValue) -> Result<Self, TokenError> {
         let mut caveats = Self::default();
         let CborValue::Map(entries) = value else {
-            return caveats;
+            return Err(TokenError::Claims("caveats must be a CBOR map".into()));
         };
         for (k, v) in entries {
-            let CborValue::Text(key) = k else { continue };
-            match (key.as_str(), v) {
-                ("only_site", CborValue::Text(s)) => caveats.only_site = Some(s.clone()),
-                ("read_only", CborValue::Bool(b)) => caveats.read_only = *b,
-                ("not_after", CborValue::Integer(i)) => {
-                    caveats.not_after = u64::try_from(*i).ok();
+            let CborValue::Text(key) = k else {
+                return Err(TokenError::Claims("caveat key must be text".into()));
+            };
+            match key.as_str() {
+                "only_site" => match v {
+                    CborValue::Text(s) => caveats.only_site = Some(s.clone()),
+                    _ => return Err(TokenError::Claims("only_site caveat must be text".into())),
+                },
+                "read_only" => match v {
+                    CborValue::Bool(b) => caveats.read_only = *b,
+                    _ => return Err(TokenError::Claims("read_only caveat must be a bool".into())),
+                },
+                "not_after" => match v {
+                    CborValue::Integer(i) => {
+                        caveats.not_after = Some(u64::try_from(*i).map_err(|_| {
+                            TokenError::Claims("not_after caveat out of range".into())
+                        })?);
+                    }
+                    _ => {
+                        return Err(TokenError::Claims(
+                            "not_after caveat must be an integer".into(),
+                        ));
+                    }
+                },
+                // An UNKNOWN restriction key is refused with a reason: a verifier that
+                // cannot interpret a caveat must not silently honor the rest (it might
+                // be a narrowing that would otherwise be dropped). Fail-closed.
+                other => {
+                    return Err(TokenError::Claims(format!(
+                        "unknown caveat restriction {other:?}"
+                    )));
                 }
-                _ => {}
             }
         }
-        caveats
+        Ok(caveats)
     }
 
     /// Fold `not_after` into the block's `exp` so the standard expiry check (min
@@ -653,7 +697,38 @@ pub fn verify(
 ) -> Result<VerifiedToken, TokenError> {
     let claims = verify_envelope(token, public)?;
     let exp = check_exp(&claims, now_unix)?;
-    role_token(&claims, exp)
+    let token = role_token(&claims, exp)?;
+    // 8(b) — domain separation: `verify` is the ROLE path, so it accepts ONLY a
+    // `br_kind == KIND_ROLE` token, symmetric with every sibling verifier (each
+    // rejects on `br_kind != its own kind`). A join / session / s3-session /
+    // overlay / cluster-write / capability / context token — or another
+    // vocabulary's token — is refused here rather than returned for the caller to
+    // re-check. A non-role token with its own role grants (e.g. a `cluster-write`
+    // capability) has a dedicated kind-checked verifier ([`verify_cluster_write`]).
+    if token.kind != KIND_ROLE {
+        return Err(TokenError::Claims("not a role token".into()));
+    }
+    Ok(token)
+}
+
+/// Verify a **cluster-write capability** ([`KIND_CLUSTER_WRITE`]) against `public`
+/// at `now_unix`: signature + alg pin + `exp` + an exact `br_kind` check, returning
+/// its role set. The kind-checked sibling of [`verify`] for the mesh client-write
+/// gate — so a `cluster-write` capability is verified as exactly that, and a role /
+/// join / any-other-kind token presented in its place is rejected (domain
+/// separation). The caller still checks the returned roles for `cluster-write`.
+pub fn verify_cluster_write(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<VerifiedToken, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    let exp = check_exp(&claims, now_unix)?;
+    let token = role_token(&claims, exp)?;
+    if token.kind != KIND_CLUSTER_WRITE {
+        return Err(TokenError::Claims("not a cluster-write capability".into()));
+    }
+    Ok(token)
 }
 
 /// Assemble a [`VerifiedToken`] from an already-verified claim set (shared by
@@ -2023,6 +2098,56 @@ pub struct VerifiedChain {
     pub leaf_cnf: Option<String>,
 }
 
+impl VerifiedChain {
+    /// Whether this presented chain ends in a **sealed** leaf: a terminal block
+    /// naming **no** next holder (`leaf_cnf == None`), or naming the **root's own
+    /// verifying key**. A sealed leaf has no un-presented narrowing beyond what is
+    /// shown, so a prefix ending there cannot be a truncation of a longer chain.
+    /// See [`verify_presented`] (uchron RFC-009 §7, C1). Delegates to the generic
+    /// engine's single source of truth so the rule stays identical everywhere.
+    pub fn leaf_is_sealed(&self, root_public: &TokenPublicKey) -> bool {
+        boatramp_cwt::leaf_cnf_is_sealed(self.leaf_cnf.as_deref(), root_public)
+    }
+
+    /// Whether the credential's effective [`exp`](Self::exp) is past `now_unix`.
+    /// Pairs with [`verify_credential_unexpired`] so a caller on a non-wall clock
+    /// can separate "authentic" from "expired" (U8–U10, #2).
+    pub fn is_expired_at(&self, now_unix: u64) -> bool {
+        matches!(self.exp, Some(exp) if now_unix > exp)
+    }
+}
+
+/// Project a generic engine [`CredentialChain`](boatramp_cwt::CredentialChain) over
+/// [`Caveats`] into boatramp's [`VerifiedChain`] (roles/kind from the verified root).
+fn project_chain(
+    chain: boatramp_cwt::CredentialChain<Caveats>,
+) -> Result<VerifiedChain, TokenError> {
+    let root = role_token(&chain.root_claims, chain.exp)?;
+    // 8(b) / M1 — domain separation on the CHAIN/role-gate path. This is the single
+    // choke point for [`verify_credential`] (RBAC authz), [`verify_presented`]
+    // (whoami + the preview "any valid token" gate), and [`verify_credential_unexpired`],
+    // so the root-kind check belongs here, symmetric with [`verify`]. Without it, a
+    // sealed, root-signed non-role credential — notably the per-node `cluster-write`
+    // capability (`kind = cluster-write`, no `cnf` ⇒ sealed, non-expiring) — would be
+    // accepted as a valid ROLE credential at every control-plane role gate (C1 can't
+    // reject it: it's sealed), letting a captured capability view protected previews
+    // and disclose its role at whoami. A legit role token / delegation chain carries
+    // root `kind = KIND_ROLE` (delegation blocks are KIND_DELEGATION, but only the
+    // ROOT claims are read here); every other kind has its own verifier, and the
+    // mesh-write gate uses [`verify_cluster_write`], not this path.
+    if root.kind != KIND_ROLE {
+        return Err(TokenError::Claims("not a role token".into()));
+    }
+    Ok(VerifiedChain {
+        roles: root.roles,
+        kind: root.kind,
+        cti: chain.cti,
+        exp: chain.exp,
+        caveats: chain.caveats,
+        leaf_cnf: chain.leaf_cnf,
+    })
+}
+
 /// Append a **restrict-only** delegation block to a credential, signed by the
 /// holder key the previous block declared (`cnf`). Fully offline/client-side (no
 /// root key): the holder proves possession by signing, and can only *narrow* via
@@ -2060,15 +2185,40 @@ pub fn verify_credential(
     // This layer projects boatramp's roles/kind from that root, so the result is
     // byte-for-byte the pre-extraction `VerifiedChain`.
     let chain = boatramp_cwt::verify_credential::<Caveats>(credential, root_public, now_unix)?;
-    let root = role_token(&chain.root_claims, chain.exp)?;
-    Ok(VerifiedChain {
-        roles: root.roles,
-        kind: root.kind,
-        cti: chain.cti,
-        exp: chain.exp,
-        caveats: chain.caveats,
-        leaf_cnf: chain.leaf_cnf,
-    })
+    project_chain(chain)
+}
+
+/// Verify a **presented** credential for a gate with **no per-request proof of
+/// possession** (the protected-preview gate, `whoami`): exactly
+/// [`verify_credential`], but additionally **requires a sealed leaf**
+/// ([`VerifiedChain::leaf_is_sealed`]). This closes the chain-prefix **truncation**
+/// escalation (uchron RFC-009 §7, C1): a holder of an *intermediate* `cnf` key
+/// could otherwise strip the trailing narrowing blocks and present the shorter
+/// prefix to recover the parent's un-narrowed authority. A PoP-capable path keeps
+/// [`verify_credential`] + a per-request proof against
+/// [`leaf_cnf`](VerifiedChain::leaf_cnf) instead (the complementary half of the
+/// sealed-or-PoP rule). Thin layer over [`boatramp_cwt::verify_presented`].
+pub fn verify_presented(
+    credential: &str,
+    root_public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<VerifiedChain, TokenError> {
+    let chain = boatramp_cwt::verify_presented::<Caveats>(credential, root_public, now_unix)?;
+    project_chain(chain)
+}
+
+/// Like [`verify_credential`], but **does not enforce expiry** — it proves
+/// authenticity (signatures, PoP `cnf` binding, the engine-verified monotone
+/// narrowing) and returns the chain with its min-folded
+/// [`exp`](VerifiedChain::exp) for the caller to check against its own clock
+/// ([`VerifiedChain::is_expired_at`]). Surfaces the engine's authentic-vs-expired
+/// separation (U8–U10, #2). Thin layer over [`boatramp_cwt::verify_credential_unexpired`].
+pub fn verify_credential_unexpired(
+    credential: &str,
+    root_public: &TokenPublicKey,
+) -> Result<VerifiedChain, TokenError> {
+    let chain = boatramp_cwt::verify_credential_unexpired::<Caveats>(credential, root_public)?;
+    project_chain(chain)
 }
 
 /// The bound facts of a per-request **proof-of-possession** (DPoP-style). The
@@ -2648,9 +2798,11 @@ mod tests {
         let es = LocalSigner::generate(TokenAlg::Es256);
         let token = mint(&claims(), &es).await.unwrap();
         let ed_key = LocalSigner::generate(TokenAlg::Ed25519).public_key();
+        // (U8–U10, #1) The algorithm-pin failure now has a dedicated typed variant,
+        // so algorithm confusion is detected by variant, not error text.
         assert!(matches!(
             verify(&token, &ed_key, NOW),
-            Err(TokenError::Invalid(_))
+            Err(TokenError::AlgMismatch)
         ));
     }
 
@@ -2882,12 +3034,13 @@ mod tests {
             Err(TokenError::Claims(_))
         ));
 
-        // A join token verified as a role token carries kind="join" and no roles,
-        // so the RBAC layer grants it nothing.
+        // 8(b): the ROLE verifier refuses a join token outright (domain
+        // separation) — it is not returned for the caller to re-check its kind.
         let join = mint_join(3600, NOW, &signer).await.unwrap();
-        let v = verify(&join, &public, NOW).unwrap();
-        assert_eq!(v.kind, KIND_JOIN);
-        assert!(v.roles.is_empty());
+        assert!(matches!(
+            verify(&join, &public, NOW),
+            Err(TokenError::Claims(_))
+        ));
     }
 
     #[test]
@@ -3373,22 +3526,15 @@ mod tests {
         let public = signer.public_key();
 
         // (a) An S3-session token cannot be redeemed as a role / capability / context / session /
-        //     join token. `verify()` is kind-agnostic by contract (it returns `br_kind` for the
-        //     caller to gate), so the role-path guarantee is that it reports a kind that is NOT
-        //     `KIND_ROLE` — any role-gated caller then rejects it. The strongly-typed verifiers
-        //     reject it outright via their own exact-kind checks.
+        //     join token. Since 8(b), the role verifier `verify()` enforces `br_kind == KIND_ROLE`,
+        //     so it REFUSES the s3-session outright (the strongest domain separation); every
+        //     strongly-typed verifier likewise rejects it via its own exact-kind check.
         let s3 = mint_s3_session(&s3_scope_key(), 300, NOW, &signer)
             .await
             .unwrap();
-        let as_role = verify(&s3, &public, NOW + 1).unwrap();
-        assert_eq!(
-            as_role.kind, KIND_S3_SESSION,
-            "an s3-session's kind must be distinct from KIND_ROLE so a role-gated path rejects it"
-        );
-        assert_ne!(as_role.kind, KIND_ROLE);
         assert!(
-            as_role.roles.is_empty(),
-            "an s3-session carries no RBAC roles"
+            matches!(verify(&s3, &public, NOW + 1), Err(TokenError::Claims(_))),
+            "an s3-session must be refused by the role verifier (domain separation)"
         );
         assert!(verify_capability(&s3, &public, NOW + 1, "acme").is_err());
         assert!(verify_context(&s3, &public, NOW + 1).is_err());
@@ -4128,5 +4274,399 @@ mod tests {
         // A proof naming a DIFFERENT jti does not verify against this challenge (no cross-replay).
         let other = join_challenge("different-jti", &enrollee_pub.to_hex(), proof_iat);
         assert!(enrollee_pub.verify(&other, &sig).is_err());
+    }
+
+    // ---- C1: sealed presentation (chain-prefix truncation) -----------------
+
+    /// Reproduce-first exploit witness + fix with boatramp's REAL vocabulary
+    /// (roles + `Caveats`): a holder of an intermediate `cnf` key strips the
+    /// trailing narrowing block and presents the root prefix to recover the parent's
+    /// un-narrowed (WRITE) authority — `verify_credential` accepts it; the fix
+    /// `verify_presented` refuses it (unsealed leaf), yet still verifies + narrows a
+    /// legitimately-sealed chain. (uchron RFC-009 §7, C1.)
+    #[tokio::test]
+    async fn verify_presented_refuses_a_truncated_prefix_and_accepts_a_sealed_narrowed_chain() {
+        use crate::authz::{Action, Resource, Right};
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Es256); // the intermediate holder
+        let h2 = LocalSigner::generate(TokenAlg::Es256); // the narrowed delegate
+
+        // root(cnf = h1) → block1(read-only + only-site=blog, cnf = h2)
+        let token =
+            delegatable_root(&root, &h1.public_key(), vec![GrantedRole::global("admin")]).await;
+        let narrow = Caveats {
+            read_only: true,
+            only_site: Some("blog".into()),
+            ..Default::default()
+        };
+        let full = attenuate(&token, &h1, &narrow, Some(&h2.public_key()), NOW)
+            .await
+            .unwrap();
+        let write_blog = Right::new(Resource::Site, Some("blog".into()), Action::Write);
+
+        // The legitimate full chain enforces the narrowing (no writes).
+        let v_full = verify_credential(&full, &root_pub, NOW).unwrap();
+        assert!(!v_full.caveats.allows(&write_blog, NOW));
+
+        // WITNESS: strip block1, present the root prefix. Its leaf `cnf` (h1) is a key
+        // the stripper holds, so `verify_credential` accepts it and the caveat is GONE.
+        let stripped = verify_credential(&token, &root_pub, NOW).unwrap();
+        assert!(
+            stripped.caveats.is_empty(),
+            "WITNESS: the narrowing vanished — authority recovered"
+        );
+        assert!(
+            stripped.caveats.allows(&write_blog, NOW),
+            "WITNESS: the stripped prefix regains WRITE the chain forbade"
+        );
+        assert!(
+            !stripped.leaf_is_sealed(&root_pub),
+            "the prefix is unsealed"
+        );
+
+        // FIX: `verify_presented` refuses the truncated prefix (unsealed leaf = h1)...
+        assert!(matches!(
+            verify_presented(&token, &root_pub, NOW),
+            Err(TokenError::Unsealed(_))
+        ));
+        // ...and the full onward-delegatable chain (leaf = h2) presented without a PoP.
+        assert!(matches!(
+            verify_presented(&full, &root_pub, NOW),
+            Err(TokenError::Unsealed(_))
+        ));
+
+        // A SEALED narrowed chain (next_holder = None) verifies AND still narrows.
+        let sealed = attenuate(&token, &h1, &narrow, None, NOW).await.unwrap();
+        let vs = verify_presented(&sealed, &root_pub, NOW).expect("a sealed chain verifies");
+        assert!(vs.leaf_is_sealed(&root_pub));
+        assert_eq!(vs.leaf_cnf, None);
+        assert_eq!(vs.roles, vec![GrantedRole::global("admin")]);
+        assert!(vs.caveats.allows(
+            &Right::new(Resource::Site, Some("blog".into()), Action::Read),
+            NOW
+        ));
+        assert!(
+            !vs.caveats.allows(&write_blog, NOW),
+            "the sealed chain still forbids writes"
+        );
+
+        // A plain (non-delegatable) role token is sealed too.
+        let plain = mint(&claims(), &root).await.unwrap();
+        assert!(
+            verify_presented(&plain, &root_pub, NOW)
+                .unwrap()
+                .leaf_is_sealed(&root_pub)
+        );
+    }
+
+    /// A terminal block naming the ROOT's own key is a sealed endpoint (issuer
+    /// re-root): a client never holds the root signing key.
+    #[tokio::test]
+    async fn verify_presented_treats_a_root_keyed_leaf_as_sealed() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Es256);
+        let token =
+            delegatable_root(&root, &h1.public_key(), vec![GrantedRole::global("admin")]).await;
+        let chain = attenuate(
+            &token,
+            &h1,
+            &Caveats {
+                read_only: true,
+                ..Default::default()
+            },
+            Some(&root_pub),
+            NOW,
+        )
+        .await
+        .unwrap();
+        let v = verify_presented(&chain, &root_pub, NOW)
+            .expect("a leaf naming the root key is a sealed endpoint");
+        assert_eq!(v.leaf_cnf, Some(root_pub.to_hex()));
+        assert!(v.leaf_is_sealed(&root_pub));
+    }
+
+    // ---- 8(b): the role verifier requires its kind -------------------------
+
+    /// `verify` (the role path) accepts ONLY `br_kind == KIND_ROLE`; a join token,
+    /// and a `cluster-write` capability, are refused. The `cluster-write` kind has a
+    /// dedicated verifier that accepts it and rejects a role token (domain separation).
+    #[tokio::test]
+    async fn verify_requires_the_role_kind_and_cluster_write_has_its_own() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+
+        let role = mint(&claims(), &signer).await.unwrap();
+        assert!(verify(&role, &public, NOW).is_ok());
+
+        let join = mint_join(3600, NOW, &signer).await.unwrap();
+        assert!(matches!(
+            verify(&join, &public, NOW),
+            Err(TokenError::Claims(_))
+        ));
+
+        let cw = mint(
+            &Claims {
+                roles: vec![GrantedRole::global("cluster-write")],
+                kind: KIND_CLUSTER_WRITE.to_string(),
+                ttl_secs: Some(3600),
+                now_unix: NOW,
+            },
+            &signer,
+        )
+        .await
+        .unwrap();
+        // The role verifier refuses the cluster-write kind...
+        assert!(matches!(
+            verify(&cw, &public, NOW),
+            Err(TokenError::Claims(_))
+        ));
+        // ...its kind-checked sibling accepts it and returns the grant...
+        let v = verify_cluster_write(&cw, &public, NOW).unwrap();
+        assert!(v.roles.iter().any(|r| r.name == "cluster-write"));
+        // ...and the sibling refuses a role token (reverse domain separation).
+        assert!(matches!(
+            verify_cluster_write(&role, &public, NOW),
+            Err(TokenError::Claims(_))
+        ));
+    }
+
+    /// M1 — the CHAIN/role-gate path (`verify_credential`/`verify_presented`/
+    /// `verify_credential_unexpired`, all via `project_chain`, which feeds RBAC,
+    /// whoami, and the preview gate) must enforce the root kind too, not only
+    /// `cose::verify`. A per-node `cluster-write` capability (kind=cluster-write,
+    /// roles=[cluster-write], NO cnf ⇒ SEALED and non-expiring, root-signed) must
+    /// NOT be accepted as a role credential at those gates — C1 can't reject it
+    /// (it's sealed), so only the kind check does. **Mutation-proof:** removing the
+    /// `project_chain` kind check makes these entry points ACCEPT the capability and
+    /// disclose its role, reddening this test.
+    #[tokio::test]
+    async fn the_chain_path_refuses_a_non_role_root() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+
+        // The per-node cluster-write capability: non-role kind, sealed (no cnf),
+        // non-expiring — exactly the shape `build_mesh_write_gate` mints.
+        let cw = mint(
+            &Claims {
+                roles: vec![GrantedRole::global("cluster-write")],
+                kind: KIND_CLUSTER_WRITE.to_string(),
+                ttl_secs: None,
+                now_unix: NOW,
+            },
+            &signer,
+        )
+        .await
+        .unwrap();
+        // It is sealed (so C1's verify_presented would not reject it on sealing)...
+        assert!(
+            verify_credential(&cw, &public, NOW)
+                .err()
+                .is_some_and(|e| matches!(e, TokenError::Claims(_))),
+            "the chain path must refuse a non-role (cluster-write) root"
+        );
+        // ...yet every project_chain entry point refuses it on the kind check.
+        assert!(matches!(
+            verify_presented(&cw, &public, NOW),
+            Err(TokenError::Claims(_))
+        ));
+        assert!(matches!(
+            verify_credential_unexpired(&cw, &public),
+            Err(TokenError::Claims(_))
+        ));
+
+        // No legitimate flow breaks: a real role token still verifies through the
+        // chain path, and the mesh-write gate accepts the capability via its OWN
+        // verifier (`verify_cluster_write`, which never routes through project_chain).
+        let role = mint(&claims(), &signer).await.unwrap();
+        assert!(verify_credential(&role, &public, NOW).is_ok());
+        assert!(verify_presented(&role, &public, NOW).is_ok());
+        assert!(
+            verify_cluster_write(&cw, &public, NOW)
+                .unwrap()
+                .roles
+                .iter()
+                .any(|r| r.name == "cluster-write"),
+            "the mesh-write gate still accepts the cluster-write capability"
+        );
+    }
+
+    // ---- Ergonomics (U8–U10) at the boatramp layer -------------------------
+
+    /// (#3) A delegation block carrying an UNKNOWN caveat restriction key refuses the
+    /// whole credential with a reason, fail-closed — never a silent deny-all/drop.
+    #[tokio::test]
+    async fn an_unknown_caveat_key_refuses_the_credential_with_a_reason() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Es256);
+        let token =
+            delegatable_root(&root, &h1.public_key(), vec![GrantedRole::global("admin")]).await;
+        // Hand-craft a delegation block whose caveats map carries an unknown key.
+        let bad = CborValue::Map(vec![(
+            CborValue::Text("wormhole".into()),
+            CborValue::Bool(true),
+        )]);
+        let claims = ClaimsSetBuilder::new()
+            .cwt_id(random_cti().unwrap())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_DELEGATION.to_string()),
+            )
+            .text_claim(CLAIM_CAVEATS.to_string(), bad)
+            .build();
+        let block = sign_claims_bytes(claims, &h1).await.unwrap();
+        let mut blocks = decode_credential(&token).unwrap();
+        blocks.push(block);
+        let chain = encode_chain(blocks).unwrap();
+        let err = verify_credential(&chain, &root_pub, NOW).unwrap_err();
+        assert!(
+            matches!(&err, TokenError::Claims(m) if m.contains("unknown caveat")),
+            "an unknown caveat key must refuse with a reason, got {err:?}"
+        );
+    }
+
+    /// (#4) A deeper block that tries to EXTEND the lifetime (a looser `not_after`
+    /// than in force) narrows nothing and is reported as `Widened`, instead of being
+    /// silently absorbed. A block that further shortens is accepted.
+    #[tokio::test]
+    async fn a_block_that_extends_the_lifetime_is_reported_as_widening() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Es256);
+        let h2 = LocalSigner::generate(TokenAlg::Es256);
+        let token =
+            delegatable_root(&root, &h1.public_key(), vec![GrantedRole::global("admin")]).await;
+        let c1 = attenuate(
+            &token,
+            &h1,
+            &Caveats {
+                not_after: Some(NOW + 100),
+                ..Default::default()
+            },
+            Some(&h2.public_key()),
+            NOW,
+        )
+        .await
+        .unwrap();
+        // block2 names a LATER not_after (NOW+500): it narrows nothing → Widened.
+        let c2 = attenuate(
+            &c1,
+            &h2,
+            &Caveats {
+                not_after: Some(NOW + 500),
+                ..Default::default()
+            },
+            None,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            verify_credential(&c2, &root_pub, NOW),
+            Err(TokenError::Widened(_))
+        ));
+        // Control: a block that FURTHER shortens (NOW+50) is accepted.
+        let c2b = attenuate(
+            &c1,
+            &h2,
+            &Caveats {
+                not_after: Some(NOW + 50),
+                ..Default::default()
+            },
+            None,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            verify_credential(&c2b, &root_pub, NOW).unwrap().exp,
+            Some(NOW + 50)
+        );
+    }
+
+    /// (#2) Authenticity and expiry are separate outcomes:
+    /// `verify_credential_unexpired` returns an AUTHENTIC chain (roles + caveats
+    /// intact) past its `exp`, carrying the effective expiry, while the enforcing
+    /// `verify_credential` returns `Expired`.
+    #[tokio::test]
+    async fn unexpired_verify_returns_an_authentic_expired_chain() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Es256);
+        let token =
+            delegatable_root(&root, &h1.public_key(), vec![GrantedRole::global("admin")]).await;
+        let narrowed = attenuate(
+            &token,
+            &h1,
+            &Caveats {
+                read_only: true,
+                not_after: Some(NOW + 100),
+                ..Default::default()
+            },
+            None,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verify_credential(&narrowed, &root_pub, NOW + 500),
+            Err(TokenError::Expired)
+        ));
+        let v = verify_credential_unexpired(&narrowed, &root_pub).unwrap();
+        assert_eq!(v.roles, vec![GrantedRole::global("admin")]);
+        assert!(v.caveats.read_only);
+        assert_eq!(v.exp, Some(NOW + 100));
+        assert!(v.is_expired_at(NOW + 500));
+        assert!(!v.is_expired_at(NOW + 50));
+    }
+
+    /// (#8) A root that self-restricts (carries a caveats claim) now has it read as
+    /// the initial accumulator rather than silently ignored — fail-safe, since a
+    /// root caveat can only subtract.
+    #[tokio::test]
+    async fn a_self_restricting_root_is_honored() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let caveats = Caveats {
+            read_only: true,
+            ..Default::default()
+        };
+        let claims = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(NOW as i64))
+            .cwt_id(random_cti().unwrap())
+            .text_claim(
+                CLAIM_ROLES.to_string(),
+                roles_to_cbor(&[GrantedRole::global("admin")]),
+            )
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_ROLE.to_string()),
+            )
+            .text_claim(
+                CLAIM_CAVEATS.to_string(),
+                NarrowingCaveats::to_cbor(&caveats),
+            )
+            .build();
+        let token = sign_claims(claims, &root).await.unwrap();
+        let v = verify_credential(&token, &root_pub, NOW).unwrap();
+        assert!(
+            v.caveats.read_only,
+            "a self-restricting root's caveats are honored, not ignored"
+        );
+        assert_eq!(v.roles, vec![GrantedRole::global("admin")]);
+    }
+
+    /// (#5, #6) The newest-first key-selection helpers and the foreign-type
+    /// re-exports resolve through `boatramp_core::cose`.
+    #[test]
+    fn peek_helpers_and_foreign_types_are_reexported() {
+        let _peek: fn(&str) -> Option<Vec<u8>> = crate::cose::peek_protected_kid;
+        let _peek_claims: fn(&str) -> Result<crate::cose::ClaimsSet, TokenError> =
+            crate::cose::peek_unverified_claims;
+        let _v: crate::cose::CborValue = crate::cose::CborValue::Bool(true);
+        let _c: crate::cose::ClaimsSet = ClaimsSetBuilder::new().build();
     }
 }

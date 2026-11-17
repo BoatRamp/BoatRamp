@@ -7,6 +7,28 @@ versions.
 
 ## [Unreleased]
 
+### Security
+
+- **`boatramp-cwt` / control-plane tokens: closed a chain-prefix _truncation_ escalation and
+  tightened token-kind domain separation.** A presented delegation credential is now verified
+  "sealed-or-PoP": the non-proof-of-possession gates (protected previews, `whoami`) require a
+  _sealed_ leaf (the terminal block names no further holder, or the root's own key), so a holder of
+  an intermediate delegation key can no longer strip the trailing narrowing blocks and present the
+  shorter prefix to recover the parent's un-narrowed authority; the caveat-enforcing authz path keeps
+  its per-request proof-of-possession of the leaf key. The role verifiers now also enforce the token
+  kind on **both** the plain-token path (`cose::verify`) and the chain/role-gate path
+  (`verify_credential`/`verify_presented`), so a sealed, root-signed non-role credential — such as a
+  node's internal `cluster-write` capability — is no longer accepted as a role credential at any
+  control-plane role gate.
+
+### Changed
+
+- **A holder-bound (`cnf`) or attenuated control-plane token presented WITHOUT a proof-of-possession
+  is now rejected (401) at the "any valid token" gates — protected previews and `whoami` — where it
+  was previously accepted as a plain bearer.** This closes the truncation vector above and is
+  consistent with how the authz path already treats such tokens. Present the sealed delegate (no
+  onward `cnf`), or include the per-request `Boatramp-PoP` proof.
+
 ## [0.59.2]
 
 ### Fixed

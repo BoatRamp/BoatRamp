@@ -250,7 +250,10 @@ impl Auth {
         let Some(inner) = &self.inner else {
             return false;
         };
-        let Ok(verified) = inner.verify_credential_any(bearer, now_unix()).await else {
+        // No per-request PoP here, so require a SEALED presentation (C1): an unsealed
+        // (onward-delegatable) prefix is refused rather than honored as a plain
+        // bearer — truncation resistance by construction.
+        let Ok(verified) = inner.verify_presented_any(bearer, now_unix()).await else {
             return false;
         };
         !inner.is_revoked_or_unreadable(&verified.cti).await
@@ -379,7 +382,9 @@ impl Auth {
     /// check fails.
     pub async fn verify_bearer_roles(&self, bearer: &str) -> Option<Vec<authz::GrantedRole>> {
         let inner = self.inner.as_ref()?;
-        let verified = inner.verify_credential_any(bearer, now_unix()).await.ok()?;
+        // `whoami` has no per-request PoP, so require a SEALED presentation (C1, as
+        // `verify_bearer`): an unsealed prefix cannot disclose the root's roles.
+        let verified = inner.verify_presented_any(bearer, now_unix()).await.ok()?;
         if inner.is_revoked_or_unreadable(&verified.cti).await {
             return None;
         }
@@ -464,6 +469,15 @@ impl Auth {
         // a `cnf` token is presented with a proof or not at all). Never silently
         // accept it as a plain bearer (the anti-downgrade invariant). The
         // `require_pop` knob additionally forbids a non-`cnf` token fleet-wide.
+        //
+        // This is also the caveat-enforcing path's defense against chain-prefix
+        // TRUNCATION (the PoP half of `cose::verify_presented`, C1): the proof must
+        // verify against `leaf_cnf` — the *terminal* holder of the presented chain —
+        // so a delegate can only present a prefix ending at a key it actually holds
+        // (its own position). It cannot strip the trailing narrowing blocks to a
+        // shorter prefix ending at a parent holder key it does not possess: that
+        // prefix's `leaf_cnf` is the parent's key, and the PoP against it fails. A
+        // sealed leaf (`leaf_cnf == None`) has no un-presented narrowing by construction.
         match &verified.leaf_cnf {
             Some(leaf_cnf) => {
                 inner.verify_pop(leaf_cnf, pop_proof, method, path, bearer, body_hash, now)?;
@@ -618,6 +632,35 @@ impl AuthInner {
             Err(primary_err) => {
                 for anchor in self.rotation_anchors().await {
                     if let Ok(v) = cose::verify_credential(bearer, &anchor, now) {
+                        return Ok(v);
+                    }
+                }
+                Err(primary_err)
+            }
+        }
+    }
+
+    /// Like [`verify_credential_any`](Self::verify_credential_any), but for a gate
+    /// with **no per-request proof of possession** (the protected-preview gate,
+    /// `whoami`): routes through [`cose::verify_presented`], so a credential whose
+    /// terminal block names a further (`cnf`) holder — a prefix a holder of that key
+    /// could extend with a narrowing block — is **refused**. These gates then accept
+    /// only a *sealed* credential (a terminal leaf naming no holder, or the root's
+    /// own key), never an intermediate prefix whose narrowing blocks may have been
+    /// stripped (C1). The caveat-enforcing authz path keeps
+    /// [`verify_credential_any`](Self::verify_credential_any) + a per-request PoP of
+    /// `leaf_cnf` instead (the complementary half of the sealed-or-PoP rule). The
+    /// same make-before-break rotation-anchor fallback as the credential path.
+    async fn verify_presented_any(
+        &self,
+        bearer: &str,
+        now: u64,
+    ) -> Result<cose::VerifiedChain, TokenError> {
+        match cose::verify_presented(bearer, &self.public, now) {
+            Ok(v) => Ok(v),
+            Err(primary_err) => {
+                for anchor in self.rotation_anchors().await {
+                    if let Ok(v) = cose::verify_presented(bearer, &anchor, now) {
                         return Ok(v);
                     }
                 }
@@ -1628,6 +1671,114 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// C1 — the production defense against chain-prefix truncation. A delegator (h1)
+    /// holds root(cnf = h1), narrows it read-only delegating onward to h2, and h2
+    /// uses the narrowed chain with a PoP of h2. h2 then STRIPS the narrowing block
+    /// and presents the root prefix alone to recover WRITE authority. The prefix's
+    /// `leaf_cnf` is h1 — a key h2 does NOT hold — so the authz path's
+    /// PoP-against-leaf requirement refuses it; and the non-PoP `whoami` / preview
+    /// gates refuse the unsealed prefix outright.
+    #[tokio::test]
+    async fn truncating_a_narrowed_chain_is_refused() {
+        let root = holder();
+        let h1 = holder();
+        let h2 = holder();
+        let now = now_unix();
+        let base = cose::mint_delegatable(&admin_claims(now), &h1.public_key(), &root)
+            .await
+            .unwrap();
+        let read_only = cose::attenuate(
+            &base,
+            &h1,
+            &cose::Caveats::restrict(None, true, None),
+            Some(&h2.public_key()),
+            now,
+        )
+        .await
+        .unwrap();
+        let auth = auth_with(&root, false);
+
+        // The legitimate narrowed chain: h2 reads with a valid PoP of h2.
+        let read_proof = proof(&h2, &read_only, "GET", PATH, ORIGIN, None, now).await;
+        assert!(
+            auth.authorize(&read_only, "GET", PATH, Some(&read_proof), None)
+                .await
+                .is_ok(),
+            "the narrowed read is allowed for the leaf holder"
+        );
+
+        // EXPLOIT: strip the narrowing block, present the root prefix `base`. Its
+        // leaf_cnf is h1; h2 can only sign a PoP with h2 → the PoP of the prefix fails
+        // against h1, so the truncation is REFUSED (no WRITE recovery).
+        let forged_proof = proof(&h2, &base, "GET", PATH, ORIGIN, None, now).await;
+        assert!(
+            auth.authorize(&base, "GET", PATH, Some(&forged_proof), None)
+                .await
+                .is_err(),
+            "a stripped prefix ending at a key the delegate does not hold must be refused"
+        );
+        // The prefix carries the un-narrowed authority (the thing the gates deny).
+        let v = cose::verify_credential(&base, &root.public_key(), now).unwrap();
+        assert!(
+            v.caveats.is_empty(),
+            "the prefix is un-narrowed (engine view)"
+        );
+        assert!(
+            !v.leaf_is_sealed(&root.public_key()),
+            "the prefix is unsealed"
+        );
+
+        // The non-PoP identity/preview gates refuse the unsealed prefix outright...
+        assert!(
+            auth.verify_bearer_roles(&base).await.is_none(),
+            "whoami must not disclose roles for an unsealed prefix"
+        );
+        assert!(
+            !auth.verify_bearer(&base).await,
+            "the preview gate must refuse an unsealed prefix"
+        );
+        // ...but a plain (sealed) admin token is still honored by those gates.
+        let plain = admin_token(&root).await;
+        assert!(auth.verify_bearer(&plain).await);
+        assert!(auth.verify_bearer_roles(&plain).await.is_some());
+    }
+
+    /// M1 — a captured per-node `cluster-write` capability (kind=cluster-write,
+    /// roles=[cluster-write], NO cnf ⇒ sealed, non-expiring, root-signed) must NOT
+    /// pass the control-plane role gates. It is sealed, so C1 does not reject it;
+    /// the chain path's root-kind check (`project_chain`) does. The preview gate and
+    /// whoami refuse it, while a plain admin role token still works.
+    #[tokio::test]
+    async fn cluster_write_capability_is_refused_at_the_role_gates() {
+        let root = holder();
+        let now = now_unix();
+        let auth = auth_with(&root, false);
+        let cw = cose::mint(
+            &Claims {
+                roles: vec![GrantedRole::global("cluster-write")],
+                kind: cose::KIND_CLUSTER_WRITE.to_string(),
+                ttl_secs: None,
+                now_unix: now,
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !auth.verify_bearer(&cw).await,
+            "the preview gate must refuse a cluster-write capability"
+        );
+        assert!(
+            auth.verify_bearer_roles(&cw).await.is_none(),
+            "whoami must not disclose a cluster-write capability's role"
+        );
+        // A plain admin role token is still honored.
+        let admin = admin_token(&root).await;
+        assert!(auth.verify_bearer(&admin).await);
+        assert!(auth.verify_bearer_roles(&admin).await.is_some());
     }
 
     #[tokio::test]
