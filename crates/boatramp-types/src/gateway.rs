@@ -297,10 +297,27 @@ pub fn resolve_gateway<'a>(
     GatewayResolution::NoMatch
 }
 
+/// Reject an upstream that sets BOTH a fixed `host_header` and `preserve_host` — the two are
+/// mutually exclusive `Host`-forwarding choices and setting both is ambiguous. Both tiers enforce
+/// this so neither an imperative mutation, a declarative `apply`, nor a deploy bundle can persist the
+/// contradiction.
+fn check_host_forward(name: &str, up: &Upstream) -> Result<(), crate::ConfigError> {
+    if up.host_header.is_some() && up.preserve_host {
+        return Err(crate::ConfigError::parse(format!(
+            "gateway upstream `{name}` sets both `host_header` (a fixed Host override) and \
+             `preserve_host` (forward the client's Host) — they are mutually exclusive; set one"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a **site/operator** gateway: every route references a declared upstream, and every route
 /// pattern + reserved-path glob compiles. (The private-upstream trust decision is the operator's to
 /// make, bounded by the node posture at serve — not refused here.)
 pub fn validate_site_gateway(site: &GatewayConfig) -> Result<(), crate::ConfigError> {
+    for (name, up) in &site.upstreams {
+        check_host_forward(name, up)?;
+    }
     for route in &site.routes {
         Pattern::compile(&route.matches)?;
         if !site.upstreams.contains_key(&route.upstream) {
@@ -355,6 +372,7 @@ pub fn validate_project_gateway(
         }
     }
     for (name, up) in &project.upstreams {
+        check_host_forward(name, up)?;
         if up.shared {
             return Err(crate::ConfigError::parse(format!(
                 "project gateway upstream `{name}` sets `shared` — only a site/operator upstream may \
@@ -584,6 +602,18 @@ pub struct Upstream {
     /// Override the `Host` header sent upstream (many internal apps vhost).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_header: Option<String>,
+    /// Forward the client's **original inbound `Host`** to the upstream unchanged, for a backend
+    /// that virtual-host-routes by the real request domain (e.g. one loopback origin fronting many
+    /// published domains). Opt-in; the DEFAULT (false) is unchanged — the `Host` is rewritten to the
+    /// upstream's own authority. Mutually exclusive with a fixed `host_header` (both set is a config
+    /// error, rejected by [`validate_site_gateway`] + refused at the CLI). SECURITY: this only
+    /// chooses the `Host` *header value* forwarded to the already-resolved, operator-declared target
+    /// — it never influences which upstream is dialed (the dial address is pinned from the configured
+    /// `target`, not from any request header), so it cannot be turned into SSRF or cross-upstream
+    /// confusion. It does forward a client-controllable value to the backend, which is the operator's
+    /// explicit per-upstream choice.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub preserve_host: bool,
     /// Strip this path prefix before forwarding (publish `/app/*` → upstream `/`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strip_prefix: Option<String>,
@@ -729,7 +759,36 @@ impl Default for Discovery {
     }
 }
 
+/// How the forwarded request's `Host` header is chosen for an upstream — the single source of truth
+/// for the precedence, so every forward path (userspace TCP / unix / upgrade + the splice fast-path)
+/// agrees by construction and the rule can never drift between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostForward<'a> {
+    /// No operator choice: rewrite `Host` to the upstream's own authority (the default, unchanged).
+    UpstreamAuthority,
+    /// Forward this fixed, operator-configured value (`host_header`).
+    Fixed(&'a str),
+    /// Forward the client's original inbound `Host` unchanged (`preserve_host`).
+    PreserveClient,
+}
+
 impl Upstream {
+    /// Decide how this upstream's forwarded `Host` is chosen (see [`HostForward`]). Precedence: a
+    /// fixed `host_header` wins (a config with both it and `preserve_host` is rejected at
+    /// validate/CLI time, so this precedence is only a defensive tiebreak), else `preserve_host`
+    /// forwards the client's own `Host`, else the upstream authority (default).
+    ///
+    /// This is deliberately NOT a routing input: it is read only on the *forward* leg, after the
+    /// site/route match has already been decided on the client's verified `Host` → domain. So no
+    /// `Host`/`host_header` value can ever change which site or upstream a request resolves to.
+    pub fn host_forward(&self) -> HostForward<'_> {
+        match (self.host_header.as_deref(), self.preserve_host) {
+            (Some(v), _) => HostForward::Fixed(v),
+            (None, true) => HostForward::PreserveClient,
+            (None, false) => HostForward::UpstreamAuthority,
+        }
+    }
+
     /// The static backend list: the `targets` pool if non-empty, else the single
     /// `target` if set, else empty. (DNS-discovered backends are resolved
     /// separately by the serving layer; see `discover`.)
@@ -1375,5 +1434,124 @@ mod tests {
         );
 
         println!("GATEWAY MUTATION GATE OK: reserved-path precedence + egress allowlist both hold");
+    }
+
+    #[test]
+    fn host_forward_precedence() {
+        // Default (neither set): rewrite to the upstream authority — unchanged behavior.
+        let plain = Upstream {
+            target: "http://127.0.0.1:9099".into(),
+            ..Default::default()
+        };
+        assert_eq!(plain.host_forward(), HostForward::UpstreamAuthority);
+
+        // A fixed `host_header` forwards that value.
+        let fixed = Upstream {
+            target: "http://127.0.0.1:9099".into(),
+            host_header: Some("api-dev.internal".into()),
+            ..Default::default()
+        };
+        assert_eq!(fixed.host_forward(), HostForward::Fixed("api-dev.internal"));
+
+        // `preserve_host` forwards the client's own Host.
+        let preserve = Upstream {
+            target: "http://127.0.0.1:9099".into(),
+            preserve_host: true,
+            ..Default::default()
+        };
+        assert_eq!(preserve.host_forward(), HostForward::PreserveClient);
+
+        // A fixed value wins the (invalid) both-set case defensively — but such a config is
+        // rejected by the validators (see below), so this is only a tiebreak.
+        let both = Upstream {
+            target: "http://127.0.0.1:9099".into(),
+            host_header: Some("api-dev.internal".into()),
+            preserve_host: true,
+            ..Default::default()
+        };
+        assert_eq!(both.host_forward(), HostForward::Fixed("api-dev.internal"));
+    }
+
+    #[test]
+    fn validate_rejects_both_host_header_and_preserve_host() {
+        // Both set on a SITE upstream → rejected (ambiguous).
+        let mut site = GatewayConfig::default();
+        site.upstreams.insert(
+            "rev".into(),
+            Upstream {
+                target: "http://127.0.0.1:9099".into(),
+                host_header: Some("api-dev.internal".into()),
+                preserve_host: true,
+                ..Default::default()
+            },
+        );
+        site.routes.push(GatewayRoute {
+            matches: "/**".into(),
+            upstream: "rev".into(),
+        });
+        assert!(validate_site_gateway(&site).is_err());
+
+        // Either one alone → accepted.
+        let mut ok_fixed = GatewayConfig::default();
+        ok_fixed.upstreams.insert(
+            "rev".into(),
+            Upstream {
+                target: "http://127.0.0.1:9099".into(),
+                host_header: Some("api-dev.internal".into()),
+                ..Default::default()
+            },
+        );
+        ok_fixed.routes.push(GatewayRoute {
+            matches: "/**".into(),
+            upstream: "rev".into(),
+        });
+        assert!(validate_site_gateway(&ok_fixed).is_ok());
+
+        let mut ok_preserve = GatewayConfig::default();
+        ok_preserve.upstreams.insert(
+            "rev".into(),
+            Upstream {
+                target: "http://127.0.0.1:9099".into(),
+                preserve_host: true,
+                ..Default::default()
+            },
+        );
+        ok_preserve.routes.push(GatewayRoute {
+            matches: "/**".into(),
+            upstream: "rev".into(),
+        });
+        assert!(validate_site_gateway(&ok_preserve).is_ok());
+
+        // The project-tier validator rejects it too (a public target so the bright line is clear).
+        let mut proj = GatewayConfig::default();
+        proj.upstreams.insert(
+            "x".into(),
+            Upstream {
+                target: "https://api.example.com".into(),
+                host_header: Some("v".into()),
+                preserve_host: true,
+                ..Default::default()
+            },
+        );
+        assert!(validate_project_gateway(&proj, None, None).is_err());
+    }
+
+    #[test]
+    fn preserve_host_round_trips_and_omits_by_default() {
+        let up = Upstream {
+            target: "http://127.0.0.1:9099".into(),
+            preserve_host: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&up).unwrap();
+        assert!(json.contains("\"preserve_host\":true"));
+        assert_eq!(serde_json::from_str::<Upstream>(&json).unwrap(), up);
+        // A default upstream omits the field on the wire (back-compat: old configs still parse).
+        let plain = serde_json::to_string(&Upstream {
+            target: "http://x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!plain.contains("preserve_host"));
     }
 }

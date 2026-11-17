@@ -1785,6 +1785,7 @@ Declare or replace an upstream. Give a single positional `target`, a pool of `--
 | `--discover-scheme <DISCOVER_SCHEME>` | — | `http` | — | Scheme for DNS-discovered backends |
 | `--discover-refresh-secs <DISCOVER_REFRESH_SECS>` | — | `30` | — | Re-resolve the discovered pool at most this often (seconds) |
 | `--host-header <HOST_HEADER>` | — | — | — | Override the `Host` header sent upstream |
+| `--preserve-host` | — | — | — | Forward the client's ORIGINAL `Host` to the upstream unchanged, for a backend that virtual-host-routes by the real request domain (e.g. one loopback origin fronting many published domains). Mutually exclusive with `--host-header`; the default (neither) rewrites `Host` to the upstream's own authority |
 | `--strip-prefix <STRIP_PREFIX>` | — | — | — | Strip this path prefix before forwarding (`/app` → upstream `/`) |
 | `--connect-timeout-ms <CONNECT_TIMEOUT_MS>` | — | — | — | Connect timeout (milliseconds) |
 | `--request-timeout-ms <REQUEST_TIMEOUT_MS>` | — | — | — | Overall request timeout (milliseconds) |

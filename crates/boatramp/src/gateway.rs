@@ -215,6 +215,12 @@ enum UpstreamCommand {
         /// Override the `Host` header sent upstream.
         #[arg(long)]
         host_header: Option<String>,
+        /// Forward the client's ORIGINAL `Host` to the upstream unchanged, for a backend
+        /// that virtual-host-routes by the real request domain (e.g. one loopback origin
+        /// fronting many published domains). Mutually exclusive with `--host-header`; the
+        /// default (neither) rewrites `Host` to the upstream's own authority.
+        #[arg(long, conflicts_with = "host_header")]
+        preserve_host: bool,
         /// Strip this path prefix before forwarding (`/app` → upstream `/`).
         #[arg(long)]
         strip_prefix: Option<String>,
@@ -376,6 +382,7 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<GatewayOut
             discover_scheme,
             discover_refresh_secs,
             host_header,
+            preserve_host,
             strip_prefix,
             connect_timeout_ms,
             request_timeout_ms,
@@ -431,6 +438,7 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<GatewayOut
                     active_health,
                     discover,
                     host_header,
+                    preserve_host,
                     strip_prefix,
                     connect_timeout_ms,
                     request_timeout_ms,
@@ -577,6 +585,9 @@ fn write_gateway(gateway: &GatewayConfig, w: &mut dyn std::io::Write) -> std::io
         let mut notes = Vec::new();
         if let Some(h) = &up.host_header {
             notes.push(format!("host={h}"));
+        }
+        if up.preserve_host {
+            notes.push("host=preserve-client".to_string());
         }
         if let Some(p) = &up.strip_prefix {
             notes.push(format!("strip={p}"));

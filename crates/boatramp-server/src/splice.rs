@@ -692,12 +692,24 @@ fn build_upstream_head(plan: &SplicePlan, req: &FastReq, client_ip: IpAddr) -> V
         out.extend_from_slice(q.as_bytes());
     }
     out.extend_from_slice(b" HTTP/1.1\r\n");
-    // Host: the upstream's own authority (explicit override, else the target host).
-    let host = plan
-        .upstream
-        .host_header
-        .as_deref()
-        .unwrap_or(plan.resolved.host.as_str());
+    // Host (same `Upstream::host_forward` precedence as the userspace proxy, so the two paths agree):
+    //  - Fixed:  the operator-configured `host_header`.
+    //  - PreserveClient: the client's own inbound Host, forwarded unchanged (for a backend that
+    //    vhost-routes by the real request domain).
+    //  - UpstreamAuthority (default): the pinned target's own host.
+    // Forward-leg only; the host→site match already ran (and re-ran via `reverify`) on the client's
+    // verified domain, never on this value.
+    let client_host = req
+        .headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let host = match plan.upstream.host_forward() {
+        boatramp_core::gateway::HostForward::Fixed(hh) => hh,
+        boatramp_core::gateway::HostForward::PreserveClient => {
+            client_host.unwrap_or(plan.resolved.host.as_str())
+        }
+        boatramp_core::gateway::HostForward::UpstreamAuthority => plan.resolved.host.as_str(),
+    };
     push_header(&mut out, "host", host.as_bytes());
     for (name, value) in &req.headers {
         let lname = name.as_str(); // HeaderName is always lowercase
@@ -2101,6 +2113,192 @@ mod tests {
             let _ = splice_conn(server_side, peer, plan, ctx, serve).await;
         });
         client
+    }
+
+    /// Build a pinned [`SplicePlan`]/[`SpliceCtx`] like [`direct_plan_ctx`], but for site
+    /// `api-dev` (domain `api-dev.tokenfield.ai`) with a `host_header` / `preserve_host` set on the
+    /// single upstream — so the splice fast-path's `Host`-forwarding can be driven directly on every
+    /// target (the head forward + `reverify` are platform-independent; only the body zero-copy is
+    /// Linux-only).
+    async fn hostroute_plan_ctx(
+        up_addr: SocketAddr,
+        host_header: Option<&str>,
+        preserve_host: bool,
+    ) -> (SplicePlan, SpliceCtx) {
+        use boatramp_core::config::{DomainConfig, SiteConfig};
+        use boatramp_core::deploy::{DeployStore, Manifest};
+        use boatramp_core::gateway::{GatewayConfig, GatewayRoute, Upstream};
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::security::SecurityProfile;
+
+        let deploy = DeployStore::new(
+            Arc::new(boatramp_storage::FsStorage::new(std::env::temp_dir())),
+            Arc::new(MemoryKv::new()),
+        );
+        let up = Upstream {
+            target: format!("http://{up_addr}"),
+            host_header: host_header.map(str::to_string),
+            preserve_host,
+            ..Default::default()
+        };
+        let cfg = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("api-dev.tokenfield.ai".into()),
+                ..Default::default()
+            },
+            gateway: Some(GatewayConfig {
+                upstreams: std::iter::once(("rev".to_string(), up.clone())).collect(),
+                routes: vec![GatewayRoute {
+                    matches: "/**".into(),
+                    upstream: "rev".into(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        deploy
+            .set_site_config(ProjectRef::DEFAULT, "api-dev", &cfg)
+            .await
+            .unwrap();
+        let id = deploy.put_manifest(&Manifest::default()).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "api-dev", &id)
+            .await
+            .unwrap();
+        let posture = SecurityProfile::Dev.preset();
+        let resolved = proxy::resolve_target(
+            &format!("http://{up_addr}"),
+            proxy::GatewayTargetPolicy::Operator,
+            &posture,
+        )
+        .await
+        .unwrap();
+        let plan = SplicePlan {
+            resolved,
+            upstream: up,
+            site: "api-dev".to_string(),
+            project: ProjectRef::DEFAULT.as_str().to_string(),
+            target: format!("http://{up_addr}"),
+        };
+        let ctx = SpliceCtx {
+            deploy,
+            posture,
+            daemon: None,
+            read_timeout: boatramp_http::h1::DEFAULT_READ_TIMEOUT,
+        };
+        (plan, ctx)
+    }
+
+    /// A mock upstream for the splice tests that records every `Host:` it receives into `seen` and
+    /// replies `200 OK` with a tiny fixed body. Keeps the connection open (keep-alive origin).
+    async fn spawn_recording_upstream(seen: Arc<std::sync::Mutex<Vec<String>>>) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        match s.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    for line in text.lines() {
+                        if let Some(h) = line
+                            .strip_prefix("host: ")
+                            .or_else(|| line.strip_prefix("Host: "))
+                        {
+                            seen.lock().unwrap().push(h.trim().to_string());
+                        }
+                    }
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nUP")
+                        .await;
+                    loop {
+                        match s.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Fix (splice fast-path): `preserve_host` on a spliced upstream forwards the client's ORIGINAL
+    /// `Host` to the backend unchanged — the Host-forwarding parity with the userspace proxy. The
+    /// fast-path reaches the backend (the request is forwarded, not 404'd at the edge). Mutation
+    /// proof: reverting the `PreserveClient` arm in `build_upstream_head` forwards the upstream
+    /// authority (`127.0.0.1:<port>`) instead → this assertion fails.
+    #[tokio::test]
+    async fn splice_preserve_host_forwards_the_clients_real_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let up_addr = spawn_recording_upstream(seen.clone()).await;
+        let (plan, ctx) = hostroute_plan_ctx(up_addr, None, true).await;
+        let mut client = spawn_splice_conn(plan, ctx).await;
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: api-dev.tokenfield.ai\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let read = timeout(Duration::from_secs(5), client.read_to_end(&mut out)).await;
+        assert!(read.is_ok(), "client hung");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("200 OK"),
+            "expected the spliced 200, got: {text}"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["api-dev.tokenfield.ai".to_string()],
+            "preserve_host must forward the client's real Host on the splice path"
+        );
+    }
+
+    /// Splice fast-path parity: a fixed `host_header` is forwarded verbatim (locks the override
+    /// against the Host-forward rework), and the request IS forwarded (reaches the backend) — there
+    /// is no edge-404 from setting `host_header`.
+    #[tokio::test]
+    async fn splice_fixed_host_header_is_forwarded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let up_addr = spawn_recording_upstream(seen.clone()).await;
+        let (plan, ctx) = hostroute_plan_ctx(up_addr, Some("api-dev.internal"), false).await;
+        let mut client = spawn_splice_conn(plan, ctx).await;
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: api-dev.tokenfield.ai\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let read = timeout(Duration::from_secs(5), client.read_to_end(&mut out)).await;
+        assert!(read.is_ok(), "client hung");
+        assert!(String::from_utf8_lossy(&out).contains("200 OK"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["api-dev.internal".to_string()],
+            "a fixed host_header must be forwarded verbatim on the splice path"
+        );
     }
 
     /// Reproduce-first (F-3, response-queue desync): a second response the upstream appends

@@ -1324,12 +1324,25 @@ async fn proxy_upstream(
     if let Some(h) = &requested_host {
         out_headers.append(HeaderName::from_static("x-forwarded-host"), h.clone());
     }
-    // Host header: explicit override, else (no Host set) the upstream's own host,
-    // which hyper fills from the URI authority.
-    if let Some(hh) = &upstream.host_header
-        && let Ok(v) = HeaderValue::from_str(hh)
-    {
-        out_headers.insert(header::HOST, v);
+    // Host header (see `Upstream::host_forward` for the single-source precedence):
+    //  - Fixed:  the operator-configured `host_header` value.
+    //  - PreserveClient: the client's own inbound Host, forwarded unchanged.
+    //  - UpstreamAuthority (default): leave Host unset here, so `UpstreamClient::send` fills it from
+    //    the pinned URI authority (the upstream's own host) — unchanged behavior.
+    // This is a forward-leg-only decision; the site/route was already matched on the client's
+    // verified domain, so no header here can change which upstream was selected.
+    match upstream.host_forward() {
+        boatramp_core::gateway::HostForward::Fixed(hh) => {
+            if let Ok(v) = HeaderValue::from_str(hh) {
+                out_headers.insert(header::HOST, v);
+            }
+        }
+        boatramp_core::gateway::HostForward::PreserveClient => {
+            if let Some(h) = &requested_host {
+                out_headers.insert(header::HOST, h.clone());
+            }
+        }
+        boatramp_core::gateway::HostForward::UpstreamAuthority => {}
     }
     // Request header set/overrides (skip any that are malformed rather than
     // failing the whole request).
@@ -1437,10 +1450,18 @@ async fn proxy_upstream_unix(
         Some(q) => format!("{forwarded}?{q}"),
         None => forwarded.into_owned(),
     };
-    let host = upstream
-        .host_header
-        .clone()
-        .unwrap_or_else(|| "localhost".to_string());
+    // Host: fixed override, the client's own Host (preserve), or `localhost` (the unix default, which
+    // has no authority of its own). Forward-leg only — never a routing input.
+    let host = match upstream.host_forward() {
+        boatramp_core::gateway::HostForward::Fixed(hh) => hh.to_string(),
+        boatramp_core::gateway::HostForward::PreserveClient => parts
+            .headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| "localhost".to_string()),
+        boatramp_core::gateway::HostForward::UpstreamAuthority => "localhost".to_string(),
+    };
 
     let mut builder = hyper::Request::builder()
         .method(parts.method.clone())
@@ -1523,6 +1544,27 @@ fn upgrade_transport(scheme: &str) -> Option<bool> {
     }
 }
 
+/// The `Host` to forward on an upgrade (WebSocket) request, by the upstream's
+/// [`host_forward`](boatramp_core::gateway::Upstream::host_forward) precedence: a fixed
+/// `host_header`, the client's own inbound Host (`preserve_host`), or `default_host` (the resolved
+/// upstream authority, or `localhost` for a unix socket) when neither is set. Forward-leg only — the
+/// route was already matched on the client's verified domain.
+fn upgrade_host(
+    upstream: &boatramp_core::gateway::Upstream,
+    client_headers: &HeaderMap,
+    default_host: &str,
+) -> String {
+    match upstream.host_forward() {
+        boatramp_core::gateway::HostForward::Fixed(hh) => hh.to_string(),
+        boatramp_core::gateway::HostForward::PreserveClient => client_headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| default_host.to_string()),
+        boatramp_core::gateway::HostForward::UpstreamAuthority => default_host.to_string(),
+    }
+}
+
 /// Proxy an HTTP **upgrade** (WebSocket) to a gateway upstream: forward the
 /// handshake over a hyper client connection and, on `101`, bridge the two
 /// upgraded byte streams in both directions. Supports `http`/`ws` (plaintext),
@@ -1585,10 +1627,7 @@ async fn proxy_upgrade(
                         .into_response();
                 }
             };
-            let host = upstream
-                .host_header
-                .clone()
-                .unwrap_or_else(|| "localhost".to_string());
+            let host = upgrade_host(upstream, &req_headers, "localhost");
             return upgrade_over(
                 hyper_util::rt::TokioIo::new(stream),
                 method,
@@ -1665,7 +1704,7 @@ async fn proxy_upgrade(
             return (StatusCode::BAD_GATEWAY, "gateway upstream unreachable\n").into_response();
         }
     };
-    let host_hdr = upstream.host_header.clone().unwrap_or_else(|| host.clone());
+    let host_hdr = upgrade_host(upstream, &req_headers, &host);
     // `wss`/`https`: complete the TLS handshake to the upstream first, then run the
     // WebSocket upgrade over the encrypted stream. SNI + cert verification use the
     // resolved upstream host against the platform's webpki roots.

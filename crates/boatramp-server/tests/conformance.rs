@@ -552,6 +552,166 @@ async fn gateway_proxies_to_declared_upstream() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// A mock upstream that **virtual-host-routes**: it returns `200` only when the
+/// `Host` it receives equals `expected`, and `404` otherwise — modelling a backend
+/// (tokenfield's loopback origin) that fronts many domains and routes strictly by
+/// `Host`. Every response still echoes `x-saw-host` so a test sees what was forwarded.
+async fn spawn_vhost_upstream(expected: &'static str) -> u16 {
+    let app = axum::Router::new().fallback(move |req: Request<Body>| async move {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let status = if host == expected {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        let mut resp = axum::response::Response::new(Body::from(format!("VH:{host}")));
+        *resp.status_mut() = status;
+        resp.headers_mut()
+            .insert("x-saw-host", host.parse().unwrap());
+        resp
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    port
+}
+
+/// Build a gateway site `api-dev` (domain `api-dev.tokenfield.ai`, route `/**` → `rev`) whose single
+/// upstream targets `port`, with the given `host_header` / `preserve_host`. Mirrors tokenfield's
+/// exact topology.
+async fn seed_hostroute_site(
+    deploy: &DeployStore,
+    port: u16,
+    host_header: Option<&str>,
+    preserve_host: bool,
+) {
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "test",
+            &SiteConfig {
+                domains: DomainConfig {
+                    primary: Some("api-dev.tokenfield.ai".into()),
+                    ..Default::default()
+                },
+                gateway: Some(GatewayConfig {
+                    reserved_paths: Vec::new(),
+                    upstreams: BTreeMap::from([(
+                        "rev".to_string(),
+                        Upstream {
+                            target: format!("http://127.0.0.1:{port}"),
+                            host_header: host_header.map(str::to_string),
+                            preserve_host,
+                            ..Default::default()
+                        },
+                    )]),
+                    routes: vec![GatewayRoute {
+                        matches: "/**".into(),
+                        upstream: "rev".into(),
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// Reproduce-first + fix (tokenfield host-routing): a backend that vhost-routes by the real request
+/// domain. The DEFAULT (`Host` rewritten to the upstream authority) sends `127.0.0.1:<port>` → the
+/// backend 404s (the symptom: a 404 relayed from a backend that never recognised the Host). The fix
+/// — `preserve_host` — forwards the client's real `Host` (`api-dev.tokenfield.ai`) → `200`. A fixed
+/// `host_header` set to that same vhost also forwards it (the pre-existing override, confirmed to
+/// forward its value). Mutation proof: reverting the `PreserveClient` arm in `proxy_upstream` makes
+/// the preserve case forward the authority again → it 404s → this test fails.
+#[tokio::test]
+async fn gateway_preserve_host_lets_a_vhost_backend_route_by_real_domain() {
+    let port = spawn_vhost_upstream("api-dev.tokenfield.ai").await;
+
+    // DEFAULT: Host rewritten to the upstream authority → the vhost backend 404s (the gap).
+    let deploy = seed().await;
+    seed_hostroute_site(&deploy, port, None, false).await;
+    let mut req = get("/anything");
+    req.headers_mut()
+        .insert(header::HOST, "api-dev.tokenfield.ai".parse().unwrap());
+    let (status, headers, _) = send_gw(&deploy, req).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "default rewrites Host to the upstream authority, which a vhost backend 404s"
+    );
+    assert_eq!(headers["x-saw-host"], format!("127.0.0.1:{port}"));
+
+    // FIX — preserve_host: the client's real Host is forwarded → the vhost backend serves it.
+    let deploy = seed().await;
+    seed_hostroute_site(&deploy, port, None, true).await;
+    let mut req = get("/anything");
+    req.headers_mut()
+        .insert(header::HOST, "api-dev.tokenfield.ai".parse().unwrap());
+    let (status, headers, body) = send_gw(&deploy, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "preserve_host must forward the client's real Host so the vhost backend routes it"
+    );
+    assert_eq!(headers["x-saw-host"], "api-dev.tokenfield.ai");
+    assert_eq!(String::from_utf8_lossy(&body), "VH:api-dev.tokenfield.ai");
+
+    // A FIXED host_header set to the backend's known vhost also forwards that value (the override
+    // already worked; this locks it so a regression in the Host-forward rework is caught).
+    let deploy = seed().await;
+    seed_hostroute_site(&deploy, port, Some("api-dev.tokenfield.ai"), false).await;
+    let mut req = get("/anything");
+    req.headers_mut()
+        .insert(header::HOST, "api-dev.tokenfield.ai".parse().unwrap());
+    let (status, headers, _) = send_gw(&deploy, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-saw-host"], "api-dev.tokenfield.ai");
+}
+
+/// SECURITY (foci #1): the inbound site/route match is keyed on the client's `Host` → verified
+/// domain, NEVER on the upstream's `host_header`. Set `host_header` to a value (`evil.example`) that
+/// is NOT the site's domain: a request whose real Host is the site domain still matches + forwards
+/// (with `Host: evil.example` sent to the backend), while a request whose Host is the `host_header`
+/// value does NOT resolve to this site at all. So no crafted `Host`/`host_header` can steer routing.
+#[tokio::test]
+async fn gateway_inbound_match_ignores_host_header_value() {
+    let port = spawn_mock_upstream().await; // echoes x-saw-host, always 200
+    let deploy = seed().await;
+    seed_hostroute_site(&deploy, port, Some("evil.example"), false).await;
+
+    // Real client Host = the verified domain → matches the site, forwards with the override.
+    let mut req = get("/anything");
+    req.headers_mut()
+        .insert(header::HOST, "api-dev.tokenfield.ai".parse().unwrap());
+    let (status, headers, _) = send_gw(&deploy, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers["x-saw-host"], "evil.example",
+        "host_header is forwarded only as the upstream Host"
+    );
+
+    // Client Host = the host_header VALUE (`evil.example`), which is not a domain of this site →
+    // it must NOT resolve to the site's gateway (no upstream hit). It falls through to normal
+    // serving for the default/unmatched host (a 404 with no upstream header).
+    let mut req = get("/anything");
+    req.headers_mut()
+        .insert(header::HOST, "evil.example".parse().unwrap());
+    let (_, headers, _) = send_gw(&deploy, req).await;
+    assert!(
+        !headers.contains_key("x-upstream"),
+        "a request whose Host equals the host_header value must NOT reach the site's upstream — \
+         the inbound match keys on the verified domain, not host_header"
+    );
+}
+
 /// Under the strict `multi-tenant` default, a site-declared upstream
 /// resolving to a private/loopback address is refused. Site config is
 /// `site-write`; only the operator posture can permit private upstreams.

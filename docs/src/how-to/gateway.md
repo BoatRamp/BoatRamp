@@ -99,14 +99,47 @@ boatramp gateway upstream add api \
 
 ## Rewrite the forwarded request
 
-On a route, override the upstream `Host` header, strip a path prefix, and set
-timeouts:
+On an upstream, control the `Host` header sent to the backend, strip a path prefix,
+and set timeouts:
 
 ```sh
-boatramp gateway route add /app --upstream api \
+boatramp gateway upstream add api http://10.0.0.5:8080 \
   --host-header app.internal --strip-prefix /app \
   --connect-timeout-ms 2000 --request-timeout-ms 30000 --site my-site
 ```
+
+### Choosing the forwarded `Host`
+
+The `Host` header the backend receives is independent of which site the request
+matched — routing is always decided on the client's own (verified-domain) `Host`,
+never on anything you set here. You have three choices:
+
+| Mode | How | Backend receives |
+|------|-----|------------------|
+| **Upstream authority** (default) | neither flag | the upstream's own host, e.g. `10.0.0.5:8080` |
+| **Fixed override** | `--host-header app.internal` | exactly `app.internal` on every request |
+| **Preserve client Host** | `--preserve-host` | the client's original `Host`, e.g. `api-dev.example.com` |
+
+`--host-header` and `--preserve-host` are mutually exclusive.
+
+Use **`--preserve-host`** when one backend fronts many domains and routes strictly
+by the request `Host` (a virtual-host origin). Without it, the default rewrite sends
+the backend the upstream's address (`10.0.0.5:8080`), which such a backend does not
+recognise — so it returns its own `404`/`421` for the unknown vhost. Preserving the
+client `Host` lets the backend route by the real published domain:
+
+```sh
+# api-dev.example.com and app-dev.example.com both front one vhost-routing origin.
+boatramp gateway upstream add rev http://127.0.0.1:9099 --preserve-host --site api-dev
+boatramp gateway route add /** rev --site api-dev
+```
+
+> **Security:** `--preserve-host` forwards a client-controllable `Host` to your
+> backend — it is an explicit, per-upstream opt-in. It only sets the forwarded
+> header value; it never changes which upstream is dialed (the connection is always
+> pinned to the upstream's configured `target`), so it cannot be turned into SSRF or
+> cross-upstream confusion. Enable it only when your backend is prepared to receive
+> the real request `Host`.
 
 ## Tune upstream memory vs throughput
 
