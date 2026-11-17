@@ -53,9 +53,12 @@ pub mod dns_server;
 /// container's namespaces + `execvp` a one-shot command, capturing its output.
 #[cfg(target_os = "linux")]
 pub mod exec;
-/// The guest-log sink: drain the worker's (guest's) stdout/stderr to `tracing`
-/// + a per-container log file. Cross-platform + unit-tested.
-pub mod logsink;
+/// The guest-log sink: drain the worker's (guest's) stdout/stderr to `tracing` + a
+/// per-container log file. Lifted into the shared [`boatramp_guestlog`] crate
+/// (v0.64.0) so the remote-Docker backend forwards guest logs through the SAME sink
+/// (one sink, two backends). Re-exported here so `boatramp_container::logsink::…`
+/// keeps resolving.
+pub use boatramp_guestlog as logsink;
 pub mod net;
 /// Writing a container's `/etc/resolv.conf` (points the guest at the internal
 /// resolver on the bridge gateway). Pure filesystem work; cross-platform + tested.

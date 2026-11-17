@@ -1124,7 +1124,7 @@ jobs:
             || { echo "::error::sync blob-transfer robustness never reached the success marker (silent skip, or the mid-stream 503 was not ridden past / a blob was lost)" >&2; exit 1; }
 
   docker-compute-net:
-    name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability + managed-DB alias upgrade heal
+    name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability + managed-DB alias upgrade heal + guest-log forwarding to the shared sink
     # The docker compute backend puts every long-lived workload on its per-project user-defined
     # network as the PRIMARY attachment (the sole tenancy boundary) so siblings resolve each other
     # by name over docker's embedded DNS. The one-shot export/import client (run_ephemeral), by
@@ -1175,3 +1175,20 @@ jobs:
             || { echo "::error::long managed-DB workload (> 63-octet name) never reached its short-alias resolution marker (silent skip or the Docker-29 RFC-1035 label-cap regression — SD record for the over-long alias not published)" >&2; exit 1; }
           grep -q 'DOCKER MANAGED-DB ALIAS UPGRADE HEAL OK' docker-net.log \
             || { echo "::error::managed-DB alias UPGRADE auto-heal never reached its success marker (silent skip or a regression — a producer carrying a STALE pre-fix long alias was not flagged for recreate, not re-aliased to the current short label, or not idempotent afterwards)" >&2; exit 1; }
+
+      - name: Guest-log forwarding to the shared sink (hard gate)
+        run: |
+          set -o pipefail
+          # Observability parity (v0.64.0): a long-running container launched on the docker backend
+          # must have its stdout AND stderr forwarded through the SAME shared sink the native
+          # container backend uses — the per-container file `<data_dir>/compute/logs/<id>.log`
+          # (each line framed `<stream>: <line>`) AND the `boatramp::guest` tracing target (tagged
+          # container + stream). Run in ISOLATION (by test name) so the gate owns the process-global
+          # tracing subscriber the assertion captures. The marker prints ONLY after BOTH the file and
+          # the tracing assertions hold — a silent skip or a one-sided forward cannot earn it.
+          BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+            docker_log_forwarding -- --ignored --nocapture 2>&1 | tee docker-logfwd.log
+          grep -qE 'test result: ok' docker-logfwd.log \
+            || { echo "::error::docker guest-log forwarding gate did not pass (a failure or silent skip)" >&2; exit 1; }
+          grep -q 'DOCKER GUEST-LOG FORWARDING OK' docker-logfwd.log \
+            || { echo "::error::docker guest-log forwarding never reached its success marker (silent skip, or stdout/stderr did not reach BOTH the per-container log file and the boatramp::guest tracing target)" >&2; exit 1; }

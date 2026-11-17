@@ -1043,9 +1043,11 @@ impl ComputeBackend for ContainerBackend {
         let cgroup = format!("/sys/fs/cgroup/boatramp/{id}");
         let _ = std::fs::write(format!("{cgroup}/cgroup.kill"), b"1");
         let _ = std::fs::remove_dir(&cgroup);
-        // Discard the captured guest log (best-effort; the pumps see EOF when the
-        // cgroup is killed and their writer task then drains + exits).
-        let _ = std::fs::remove_file(logsink::log_path(&self.logs_dir(), &id));
+        // Discard the captured guest log + any rotated backup (best-effort; the pumps
+        // see EOF when the cgroup is killed and their writer task then drains + exits).
+        let log = logsink::log_path(&self.logs_dir(), &id);
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(logsink::backup_path(&log));
         VethNetwork::for_vm(&id, &self.bridge)
             .teardown()
             .await
@@ -2021,9 +2023,15 @@ impl ContainerBackend {
         Ok(mapping)
     }
 
-    /// Wire the guest-log sink: a single writer appends to
-    /// `<logs_dir>/<id>.log`, fed by one pump per stream. The pumps own the
+    /// Wire the guest-log sink: a single rotating writer appends to
+    /// `<logs_dir>/<id>.log`, fed by one bounded pump per stream. The pumps own the
     /// worker's stdout/stderr pipes and run until the guest exits (EOF).
+    ///
+    /// Bounded + injection-safe via the shared [`logsink`] sink: each line is capped
+    /// and sanitized, the pump-to-writer channel is bounded (a flood back-pressures
+    /// the pipe rather than queuing unbounded lines), and the file rotates at a size
+    /// cap. Only a FAILED logs-dir create fails the launch; the per-container file is
+    /// owned by the writer task (its create/rotation never aborts a running guest).
     async fn spawn_log_capture<O, E>(
         &self,
         id: &str,
@@ -2039,18 +2047,24 @@ impl ContainerBackend {
             .await
             .map_err(|e| BackendError::Launch(format!("create logs dir: {e}")))?;
         let path = logsink::log_path(&logs_dir, id);
-        let file = tokio::fs::File::create(&path).await.map_err(|e| {
-            BackendError::Launch(format!("create guest log {}: {e}", path.display()))
-        })?;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(logsink::write_lines(file, rx));
+        let (tx, rx) = tokio::sync::mpsc::channel(logsink::CHANNEL_CAP);
+        // The writer logs its own warn if it dies on an IO error (never silent).
+        tokio::spawn(logsink::run_file_writer(
+            path,
+            rx,
+            logsink::DEFAULT_FILE_CAP_BYTES,
+            id.to_string(),
+        ));
+        // `keep_draining = true`: this is the LOCAL process path — the pump owns the
+        // worker's real stdout/stderr pipe. If the writer dies it MUST keep draining to
+        // EOF (never drop the reader), or the running guest EPIPEs on its next write.
         let (id_out, tx_out) = (id.to_string(), tx.clone());
         tokio::spawn(async move {
-            let _ = logsink::pump(stdout, &id_out, "stdout", tx_out).await;
+            let _ = logsink::pump(stdout, &id_out, "stdout", tx_out, true).await;
         });
         let id_err = id.to_string();
         tokio::spawn(async move {
-            let _ = logsink::pump(stderr, &id_err, "stderr", tx).await;
+            let _ = logsink::pump(stderr, &id_err, "stderr", tx, true).await;
         });
         Ok(())
     }

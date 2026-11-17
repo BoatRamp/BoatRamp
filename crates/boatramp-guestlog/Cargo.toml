@@ -1,0 +1,34 @@
+[package]
+name = "boatramp-guestlog"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The shared guest-log sink for boatramp compute backends: drain a launched container's stdout/stderr line-by-line, mirror each line to tracing, and append to a bounded per-container log file. One sink, every backend."
+
+[dependencies]
+# Async line draining over tokio pipes (`io-util`) + the single-writer mpsc
+# (`sync`). `io-util` is already in the workspace tokio feature set; `sync` is the
+# addition this sink needs. Cross-platform — the whole crate compiles + unit-tests
+# on every host (no real jail / daemon required).
+tokio = { workspace = true, features = ["sync", "io-util"] }
+# Each drained guest line is mirrored to the structured tracing sink.
+tracing.workspace = true
+
+[dev-dependencies]
+# Rotation + file-framing tests write to a real temp path.
+tempfile = "3"
+# Capture `tracing` events into an in-memory buffer to assert a drained line is
+# mirrored to tracing with its `container`/`stream` fields.
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "io-util"] }
+
+[lints]
+workspace = true

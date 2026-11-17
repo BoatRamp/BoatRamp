@@ -15,21 +15,38 @@ description = "Remote-Docker compute backend for boatramp: run workloads on an e
 
 [dependencies]
 boatramp-core.workspace = true
+# The shared guest-log sink: at container launch the backend attaches to the
+# container's stdout/stderr, demuxes the multiplexed Docker frame stream into lines,
+# and forwards them through the SAME bounded sink the native backend uses (`tracing`
+# + `<data_dir>/compute/logs/<id>.log`) — one sink, two backends. A tiny crate
+# (tokio + tracing only), so the cross-platform remote client stays free of the
+# native self-jail sandbox's Linux tree.
+boatramp-guestlog.workspace = true
 async-trait.workspace = true
 bollard.workspace = true
 futures.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["time", "io-util"] }
+# `sync` = the pump→writer mpsc; `time` = reconnect backoff; `io-util` = the
+# per-stream in-memory pipes (`duplex`) feeding the pumps.
+tokio = { workspace = true, features = ["sync", "time", "io-util"] }
+# Operator-facing diagnostics for the background log forwarder (attach/reconnect).
+tracing.workspace = true
 
 [dev-dependencies]
 # `docker_live` integration test (self-skips without a daemon) needs a runtime.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "fs"] }
 boatramp-types.workspace = true
 serde_json.workspace = true
 # The run_ephemeral default-bridge regression gate stands up a default-bridge target
 # via the raw Engine API and drives `run_ephemeral` (a `futures` AsyncWrite sink).
 bollard.workspace = true
 futures.workspace = true
+# Build synthetic `LogOutput` frames for the log-forwarder demux unit test.
+bytes.workspace = true
+# A real temp `data_dir` for the forwarder file-sink unit + live tests.
+tempfile = "3"
+# Capture `tracing` events in-process to assert a forwarded line reaches tracing.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
