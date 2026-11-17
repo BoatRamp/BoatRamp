@@ -404,3 +404,140 @@ async fn advertises_max_concurrent_streams_setting() {
         "must advertise SETTINGS_MAX_CONCURRENT_STREAMS=256"
     );
 }
+
+// --- regression: >128 KiB single-chunk body must complete with END_STREAM ----------
+//
+// boatramp-requests #32: a static text asset > 128 KiB (served, in production, as a
+// `Body::Stream` whose single item is the whole file — the http_serve bridge wraps every
+// body as a one-item stream) stalled over HTTP/2 and never completed. The streamed-body
+// path ends a response with a *separate zero-length END_STREAM DATA frame*. That frame is
+// exempt from flow control (RFC 7540 §6.9.1) and the writer emits it regardless of the
+// window — but the mux used to re-queue a stream for the writer only while its send window
+// was open, so when the body's final bytes left the window at exactly 0 the END_STREAM
+// marker was stranded in the outbox, the stream dropped out of the ready queue, and nothing
+// ever re-drove it. The peer received the whole body but hung forever waiting for
+// END_STREAM. The fix re-queues a stream whenever its next frame can make progress —
+// including a zero-length (flow-control-exempt) END_STREAM frame — not only when the window
+// is open.
+
+/// Connect with an `h2` client configured with explicit flow-control windows and max
+/// frame size, so a test can pin the exact window the server sees.
+async fn connect_tuned<H: Handler>(
+    handler: H,
+    stream_window: u32,
+    conn_window: u32,
+    max_frame: u32,
+) -> h2::client::SendRequest<Bytes> {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    tokio::spawn(async move {
+        let _ = serve_connection_mux(server_io, handler).await;
+    });
+    let mut builder = h2::client::Builder::new();
+    builder
+        .initial_window_size(stream_window)
+        .initial_connection_window_size(conn_window)
+        .max_frame_size(max_frame);
+    let (send_request, connection) = builder.handshake(client_io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    send_request.ready().await.unwrap()
+}
+
+/// A handler that returns `size` bytes as a `Body::Stream` whose single item is the whole
+/// body (the production shape for a cached/mmapped static file), with a matching
+/// `content-length` — so the mux appends a trailing zero-length END_STREAM frame.
+struct SingleChunkStream(usize);
+impl Handler for SingleChunkStream {
+    async fn handle(&self, _req: Request) -> Response {
+        let n = self.0;
+        let src = tokio_stream::iter(std::iter::once(Bytes::from(vec![b'x'; n])));
+        let mut r = response(200, boatramp_http::h2::Body::stream(src));
+        r.headers_mut()
+            .insert("content-length", n.to_string().parse().unwrap());
+        r
+    }
+}
+
+/// Reproduce-first (#32): a single body chunk larger than `MAX_OUT_FRAME` (128 KiB) must
+/// be delivered in full *and* the stream closed with END_STREAM, even when the peer's
+/// stream window is exactly consumed by the body (so the trailing END_STREAM marker lands
+/// on a closed window).
+///
+/// The client grants a stream window EXACTLY equal to the body and never replenishes it
+/// (the body is read but capacity is never released, so no stream WINDOW_UPDATE is sent).
+/// A large connection window + max-frame make the server emit 128 KiB DATA frames and run
+/// the stream window to 0 on the body's final byte — the exact condition that stranded the
+/// END_STREAM frame. The body stream must END (not hang): with the re-queue fix reverted,
+/// `data()` returns the whole 200 KiB and then blocks forever, tripping the timeout.
+#[tokio::test]
+async fn large_single_chunk_body_completes_with_end_stream() {
+    const BODY: usize = 200 * 1024; // > MAX_OUT_FRAME (128 KiB)
+    let mut client = connect_tuned(SingleChunkStream(BODY), BODY as u32, 1 << 20, 1 << 20).await;
+    let response = get(&mut client, "/big").await.unwrap();
+    assert_eq!(response.status(), 200);
+    // Read the whole body WITHOUT releasing the stream window (no WINDOW_UPDATE), then
+    // require the stream to END — i.e. END_STREAM must arrive on its own.
+    let fut = async {
+        let mut body = response.into_body();
+        let mut got = 0usize;
+        while let Some(chunk) = body.data().await {
+            got += chunk.unwrap().len();
+        }
+        got
+    };
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+        .await
+        .expect("END_STREAM never arrived: the >128 KiB single-chunk body stalled (#32)");
+    assert_eq!(got, BODY, "the full >128 KiB body must be delivered");
+}
+
+/// Fairness: two concurrent >128 KiB single-chunk bodies, each with its stream window
+/// exactly consumed by its body, must BOTH complete with END_STREAM — no starvation and
+/// no deadlock when both streams need the flow-control-exempt END_STREAM re-queue.
+#[tokio::test]
+async fn two_large_single_chunk_bodies_both_complete() {
+    const BODY: usize = 200 * 1024;
+    // Shared connection window comfortably covers both bodies; each stream window is
+    // exactly its body size and never replenished.
+    let mut client = connect_tuned(SingleChunkStream(BODY), BODY as u32, 1 << 20, 1 << 20).await;
+    let r1 = get(&mut client, "/a");
+    client = client.ready().await.unwrap();
+    let r2 = get(&mut client, "/b");
+
+    let read_full = |resp: h2::client::ResponseFuture| async move {
+        let response = resp.await.unwrap();
+        assert_eq!(response.status(), 200);
+        let mut body = response.into_body();
+        let mut got = 0usize;
+        while let Some(chunk) = body.data().await {
+            got += chunk.unwrap().len();
+        }
+        got
+    };
+
+    let run = async move { tokio::join!(read_full(r1), read_full(r2)) };
+    let (n1, n2) = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+        .await
+        .expect("one of two concurrent >128 KiB single-chunk bodies stalled (#32)");
+    assert_eq!((n1, n2), (BODY, BODY));
+}
+
+/// A >128 KiB single-chunk body under a *small* initial stream window must still stream
+/// fully and end with END_STREAM: the body stalls and resumes across WINDOW_UPDATE frames
+/// (the flow-controlled DATA path is unchanged), and the trailing END_STREAM marker is sent
+/// once the body is drained. Here the client releases capacity, so those updates flow.
+#[tokio::test]
+async fn large_single_chunk_body_resumes_on_window_updates() {
+    const BODY: usize = 200 * 1024;
+    // Default-ish 64 KiB windows << body, so the server must stall and resume repeatedly.
+    let mut client = connect_tuned(SingleChunkStream(BODY), 65_535, 65_535, 16_384).await;
+    let response = get(&mut client, "/big").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let fut = read_body(response.into_body());
+    let body = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+        .await
+        .expect("windowed >128 KiB single-chunk body did not resume to completion");
+    assert_eq!(body.len(), BODY);
+    assert!(body.iter().all(|&b| b == b'x'));
+}

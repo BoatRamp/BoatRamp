@@ -1358,21 +1358,30 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, batch: &mut Batch) {
             }
         }
 
-        // Requeue if the stream has more to send and can make progress now: the next
-        // frame is HEADERS (never flow-controlled) or DATA with an open window. Only
-        // one DATA frame is emitted per visit, so requeuing gives round-robin fairness
-        // across streams; a window-blocked stream drops out of `ready` and is
-        // re-readied on WINDOW_UPDATE.
-        let next_headers = matches!(
-            s.streams.get(&id).and_then(|st| st.outbox.front()),
-            Some(OutFrame::Headers { .. })
-        );
+        // Requeue if the stream's next frame can make progress *now*. Only one DATA
+        // frame is emitted per visit, so requeuing (rather than looping here) gives
+        // round-robin fairness across streams; a stream that can't progress drops out of
+        // `ready` and is re-readied by `mark_ready` on a WINDOW_UPDATE / SETTINGS bump.
+        //
+        // A frame can make progress when it needs no flow-control window — a HEADERS
+        // frame, or a *zero-length* DATA frame (the streamed-body END_STREAM marker,
+        // which is exempt from flow control per RFC 7540 §6.9.1) — or when it is a
+        // non-empty DATA frame and both windows are open. The zero-length case is
+        // essential: a stream whose only remaining output is the END_STREAM marker, left
+        // with a closed window by its body's final bytes, must still be re-queued or the
+        // response never completes (the peer has the whole body but never sees
+        // END_STREAM). `build_batch` already emits such a frame regardless of the window;
+        // this makes sure the stream is scheduled to be visited so it can.
         let has_win = {
             let st = s.streams.get(&id);
             st.is_some_and(|st| st.send_window > 0) && s.conn_send_window > 0
         };
-        let more = s.streams.get(&id).is_some_and(|st| !st.outbox.is_empty());
-        if more && (next_headers || has_win) {
+        let next_sendable = match s.streams.get(&id).and_then(|st| st.outbox.front()) {
+            Some(OutFrame::Headers { .. }) => true,
+            Some(OutFrame::Data { bytes, off, .. }) => bytes.len() - *off == 0 || has_win,
+            None => false,
+        };
+        if next_sendable {
             if let Some(st) = s.streams.get_mut(&id) {
                 st.queued = true;
             }
