@@ -106,7 +106,11 @@ pub enum Artifact {
 /// Held in a [`Zeroizing`](zeroize::Zeroizing) buffer so the plaintext is scrubbed from
 /// memory when the request drops, and carries a **redacting [`Debug`]** so it never
 /// prints a secret value (it is a transient launch-request field, never persisted or
-/// serialized).
+/// serialized). The zeroizing is **best-effort**: the same values are co-resident,
+/// unzeroized, in the sibling [`LaunchRequest::spec`]'s `env` map (a plain `BTreeMap` the
+/// backend must hand to the container/VM as its environment, by design) — that is the
+/// larger residue, inherent to injecting env at all. This buffer just avoids keeping an
+/// extra non-scrubbed copy and keeps the set out of `Debug`/serialization.
 #[derive(Clone, Default)]
 pub struct RedactionSet(zeroize::Zeroizing<Vec<String>>);
 

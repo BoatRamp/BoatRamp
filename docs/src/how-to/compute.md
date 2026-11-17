@@ -634,10 +634,23 @@ that came from a secret source are redacted — a hardcoded/literal env value
 This is **defense-in-depth, best-effort** (mirroring CI masking like GitHub Actions
 `::add-mask::` and GitLab masked variables), not the primary control — which remains
 short-lived credentials and guests not printing secrets. It matches an **exact,
-contiguous** occurrence of a secret value, and only values at or above an 8-character
-floor. **Out of scope** (and *not* defended): a guest that base64/hex/URL-encodes a
-secret, splits it across lines, or prints a derived substring — the exact-value match
-misses those, as every CI masker does.
+contiguous** occurrence of a secret value, and only values **at or above an 8-character
+floor** — a short secret can't blanket-redact benign output. That floor applies to a
+short `{{secret.<NAME>}}` value too: an operator-stored secret under 8 characters (a PIN,
+a 6-char key) is **not** redacted, matching GitLab's refusal to mask a short variable;
+treat such a value as unmaskable in logs (or lengthen it).
+
+**Out of scope** (and *not* defended): a guest that base64/hex/URL-encodes a secret,
+splits it across lines, or prints a derived substring — the exact-value match misses
+those, as every CI masker does. One substring case to keep in mind: a client workload
+collects its whole rendered **DSN** as one value, so a guest that prints the full
+`$DATABASE_URL` is redacted, but a guest — or an ORM that logs connection parameters
+individually — that prints the **bare password on its own** (a substring of the DSN,
+never injected into that client as a standalone value) is **not** redacted there. (The
+managed-DB *server* workload collects its `POSTGRES_PASSWORD` as its own value, so the
+bare password is covered on the server side. If a client must print discrete connection
+parts, inject them as discrete `{{sql.password}}` / `{{sql.user}}` env vars so each is a
+redactable value in its own right.)
 
 A node operator can turn redaction off with the node-global, System·Admin-only
 `[compute].redact_guest_log_secrets = false` (env

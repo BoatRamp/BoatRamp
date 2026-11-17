@@ -21,6 +21,17 @@
 //!   leaks — if a guest base64/hex/URL-encodes a secret, splits it across lines, or
 //!   prints a derived substring, the exact-value match misses it. We do NOT attempt
 //!   heuristic/regex scrubbing of unknown secret shapes (an aggregator-layer concern).
+//!   One concrete substring case worth calling out: a consuming workload collects the
+//!   whole rendered **DSN** (e.g. `postgres://user:pass@host/db`) as one value, so a
+//!   guest that prints the full `$DATABASE_URL` is covered, but a guest (or an ORM) that
+//!   logs the **bare password on its own** — a substring of the DSN, never injected as a
+//!   standalone value into *that* workload — is NOT redacted there. (The managed-DB
+//!   *server* workload collects its `POSTGRES_PASSWORD` as its own value, so the bare
+//!   password IS covered on the server side.)
+//! - **Below the length floor (documented):** a secret-sourced value shorter than
+//!   [`MIN_SECRET_LEN`] is not redacted, including a short operator-stored
+//!   `{{secret.<NAME>}}` value (a PIN, a short key) — matching GitLab's refusal to mask a
+//!   variable under 8 characters. See [`MIN_SECRET_LEN`].
 //!
 //! The redaction SET itself is held in a [`Zeroizing`] buffer and scrubbed from memory
 //! when the [`Redactor`] drops (forwarder teardown / container exit), and is NEVER
@@ -40,7 +51,12 @@ use zeroize::Zeroizing;
 /// under 8 characters for exactly this reason). Real injected credentials — a DSN, a
 /// password, a minted token, a generated key — are comfortably longer; the floor only
 /// drops pathologically short values where the over-redaction cost would exceed the
-/// leak-prevention benefit. We deliberately do NOT add a charset/entropy guard on top:
+/// leak-prevention benefit. The floor applies to EVERY secret-sourced value uniformly —
+/// including an operator-stored `{{secret.<NAME>}}` value — so a short operator secret (a
+/// PIN, a 6-char key) below 8 characters is NOT redacted, exactly as GitLab refuses to
+/// mask a short variable. An operator who stores a genuinely short secret should treat it
+/// as unmaskable in logs (or lengthen it). We deliberately do NOT add a charset/entropy
+/// guard on top:
 /// a managed-DB DSN (`postgres://…`) is highly structured and low-entropy as a whole, so
 /// an entropy test would wrongly *skip* it and leak it — and a false *skip* is strictly
 /// worse than the benign over-redaction the length floor already bounds. Provenance
@@ -61,15 +77,21 @@ pub const REDACTED_PLACEHOLDER: &str = "\u{2039}redacted\u{203a}";
 /// pumps via an `Arc`) and dropped when the log forwarder tears down — at which point
 /// the [`Zeroizing`] buffer scrubs the plaintext secret bytes from memory.
 ///
-/// **Plaintext-in-memory lifecycle.** The authoritative copy of the redaction set lives
-/// in [`secrets`](Self::secrets), a [`Zeroizing`]`<Vec<String>>` scrubbed on drop. The
-/// Aho-Corasick automaton necessarily holds its own *derived* representation of the same
-/// bytes (it is built from them); that representation is freed — not cryptographically
-/// scrubbed — when the automaton drops at teardown. Both live only within the same trust
-/// boundary that already holds these plaintext values to inject them into the guest (the
-/// launcher / backend process), and only for the forwarder's lifetime, so the automaton
-/// residue adds no exposure beyond what that boundary already holds. This is the
-/// practical limit of in-memory scrubbing for a substring matcher and is accepted.
+/// **Plaintext-in-memory lifecycle (best-effort — see caveat).** The authoritative copy
+/// of the redaction set lives in [`secrets`](Self::secrets), a
+/// [`Zeroizing`]`<Vec<String>>` scrubbed on drop; the Aho-Corasick automaton also holds a
+/// *derived* representation of the same bytes, freed — not scrubbed — at teardown.
+///
+/// The zeroizing here is deliberately **best-effort, not a guarantee the secret bytes are
+/// gone from the process**: the SAME plaintext is co-resident, UNzeroized, in the
+/// workload's `spec.env` (a plain `BTreeMap<String, String>` the launch path hands to the
+/// backend to set the container/VM environment, by design — the guest must receive these
+/// values). That `spec.env` copy — not this automaton — is the larger, longer-lived
+/// residue, and it is inherent to injecting env at all. So this zeroizing narrows the
+/// redactor's OWN footprint (and keeps the set out of `Debug`/serialization), but it does
+/// not and cannot make the launcher/backend process secret-free while a workload is being
+/// launched. Everything here lives within that same trust boundary, which already holds
+/// the plaintext to inject it; the redactor adds no exposure beyond it.
 pub struct Redactor {
     /// The matcher. One pass per line, O(line length), independent of the set size.
     ac: AhoCorasick,
