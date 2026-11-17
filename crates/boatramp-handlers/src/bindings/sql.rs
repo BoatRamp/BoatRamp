@@ -339,6 +339,16 @@ impl SqlSession {
         Ok(self.txns.get_mut(&key).expect("inserted above").as_mut())
     }
 
+    /// Test-only seam (U7 host-world-lane finalize test): force a read-write transaction open on
+    /// `name` so a subsequent [`finalize`](Self::finalize) has something to commit/roll back, without
+    /// hand-writing a wasm guest that issues the `sql-query` canonical ABI. Exercises the exact
+    /// `txn` → `begin_with_gucs` path a real guest query takes. `pub(crate)` so the engine's
+    /// `call_export` finalize test (an embedder host function) can reach it.
+    #[cfg(test)]
+    pub(crate) async fn begin_for_test(&mut self, name: &str) -> Result<(), SqlError> {
+        self.txn(name, false).await.map(|_| ())
+    }
+
     /// Close every open transaction: `commit` if `commit`, else `rollback`.
     /// Independent per database; a no-op for databases that were never used.
     pub async fn finalize(&mut self, commit: bool) {
