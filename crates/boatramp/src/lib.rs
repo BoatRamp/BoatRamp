@@ -420,11 +420,14 @@ fn run() -> Result<(), CliError> {
     // A re-exec'd `boatramp __vm-relay <label>` is the scoped VM substrate's SEPARATE least-authority
     // client-byte RELAY process (owner S1 decision 2026-11-14 — a dedicated process, NOT a widening
     // of the secret-blind root). It validates its non-secret launch contract (the VmRelayDescriptor +
-    // the inherited pre-bound listener fd) then, in this scaffold increment, REFUSES fail-closed (its
-    // own least-authority profile + the byte pipe over the vsock UDS are the next increment). Handled
-    // HERE in the pre-runtime single-threaded window, matching `argv[1]` EXACTLY (out of the clap
-    // enum). Cross-platform: the refusal is platform-independent; the real relay is Linux-only once
-    // wired. Never reached in production today (`resolve_spawn_backend` refuses `substrate: vm`).
+    // the inherited pre-bound listener fd), installs its OWN least-authority seccomp/Landlock profile
+    // fail-closed `Enforced` (installed HERE, on this main thread, before any runtime — so TSYNC
+    // covers the later per-client worker threads), then runs the Model-A copy-relay behind that wall:
+    // accept each client + splice opaque bytes to the frontend-in-guest over the vsock UDS. Matching
+    // `argv[1]` EXACTLY (out of the clap enum). Cross-platform entry; the real relay is Linux+sandbox
+    // only (elsewhere it refuses to serve unprofiled). Not reached in production YET
+    // (`resolve_spawn_backend` still refuses `substrate: vm` — the supervise-dispatch flip + live gate
+    // are the next increment).
     if std::env::args().nth(1).as_deref() == Some(privsep::VM_RELAY_SUBCOMMAND) {
         return privsep::run_vm_relay(&std::env::args().nth(2).unwrap_or_default());
     }

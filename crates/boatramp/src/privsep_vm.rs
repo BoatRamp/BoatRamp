@@ -454,9 +454,16 @@ mod imp {
     /// public TCP `listener`; here it accepts each client and relays the client's bytes to the
     /// frontend-in-guest over a fresh vsock connection, splicing bytes both ways. The relay carries
     /// ONLY untrusted client bytes — NEVER key material (the scoped frontend holds no key; the HARD
-    /// EXCLUSION). Runs on its own thread for the node's life; a guest death EOFs the dials (the
-    /// firecracker child, supervised separately, is the authoritative `FailNodeClosed` signal).
-    fn run_relay(
+    /// EXCLUSION). Runs for the node's life; a guest death EOFs the dials (the firecracker child,
+    /// supervised separately, is the authoritative `FailNodeClosed` signal).
+    ///
+    /// Two callers, ONE byte-pipe (reuse, not parallelize): the in-root relay THREAD spawned by
+    /// [`launch_frontend_vm`] (the live-gate path), and the SEPARATE least-authority relay PROCESS
+    /// ([`crate::privsep::run_vm_relay`], the owner's S1 placement — this runs it on the relay
+    /// process's main thread, behind its own Enforced least-authority profile). It returns when
+    /// `accept` ends (the pre-bound listener closed); the separate process reads that return as
+    /// `FailNodeClosed`.
+    pub(crate) fn run_relay(
         label: String,
         listener: std::net::TcpListener,
         uds_path: PathBuf,
@@ -772,6 +779,78 @@ mod imp {
     mod tests {
         use super::Cpio;
 
+        /// Socketpair/loopback proof of the relay's BYTE TRANSPARENCY (the Model-A copy-relay the
+        /// separate `__vm-relay` process runs behind its profile): a loopback TCP pair stands in for
+        /// (client peer ↔ the relay's client side) and a `UnixStream` socketpair for (the relay's
+        /// guest side ↔ a fake guest). The relay must move bytes UNCHANGED in BOTH directions — it is
+        /// a transparent pipe, the parse is in the guest — including arbitrary non-UTF8 / NUL bytes
+        /// (the "opaque client bytes" contract), and must propagate a half-close so a client EOF tears
+        /// down the guest leg. No key material is involved: the relay only ever sees these raw bytes.
+        #[test]
+        fn relay_splices_opaque_bytes_both_ways_and_propagates_half_close() {
+            use std::io::{Read, Write};
+            use std::net::{TcpListener, TcpStream};
+            use std::os::unix::net::UnixStream;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+            let addr = listener.local_addr().unwrap();
+            // The "client peer" (the connect end) — split into a write + read handle so each can be
+            // closed independently (and ALL copies dropped to signal EOF to the relay).
+            let client_peer = TcpStream::connect(addr).expect("connect loopback");
+            let mut client_w = client_peer.try_clone().unwrap();
+            let mut client_r = client_peer;
+            let (relay_client_side, _peer) = listener.accept().expect("accept loopback");
+            // The fake guest (the far end of the vsock stand-in) — likewise split.
+            let (relay_guest_side, fake_guest) = UnixStream::pair().expect("vsock stand-in pair");
+            let mut guest_w = fake_guest.try_clone().unwrap();
+            let mut guest_r = fake_guest;
+
+            // The relay runs its transparent byte pipe between the two.
+            let relay = std::thread::spawn(move || {
+                super::splice_bidirectional(relay_client_side, relay_guest_side);
+            });
+
+            // client → guest: arbitrary opaque bytes (NUL + 0xFF included) arrive unchanged.
+            let to_guest: &[u8] = b"REQ \x00\xff\x01 opaque client bytes";
+            client_w.write_all(to_guest).unwrap();
+            let mut got = vec![0u8; to_guest.len()];
+            guest_r.read_exact(&mut got).unwrap();
+            assert_eq!(
+                got.as_slice(),
+                to_guest,
+                "client→guest bytes must be opaque/unchanged"
+            );
+
+            // guest → client: likewise unchanged.
+            let to_client: &[u8] = b"RESP \x02\xfe\x00 opaque guest bytes";
+            guest_w.write_all(to_client).unwrap();
+            let mut got2 = vec![0u8; to_client.len()];
+            client_r.read_exact(&mut got2).unwrap();
+            assert_eq!(
+                got2.as_slice(),
+                to_client,
+                "guest→client bytes must be opaque/unchanged"
+            );
+
+            // Half-close: the client closes (both halves) → the relay's client→guest leg reads EOF and
+            // shuts the guest WRITE half → the guest read drains to EOF (a dead client reliably tears
+            // the guest leg down rather than hanging).
+            drop(client_w);
+            drop(client_r);
+            let mut tail = Vec::new();
+            guest_r
+                .read_to_end(&mut tail)
+                .expect("guest read drains to EOF after client close");
+
+            // Then the fake guest closing (every handle) ends the relay's guest→client leg → the relay
+            // byte-pipe returns cleanly (the separate process reads that return as FailNodeClosed).
+            drop(guest_w);
+            drop(guest_r);
+            relay
+                .join()
+                .expect("the relay byte-pipe returns after both legs close");
+        }
+
         /// Pure CI gate for the in-process newc cpio writer (no KVM needed): every entry's header is
         /// exactly 110 bytes, aligned to 4, with the magic + the TRAILER. This catches a mis-sized
         /// header (the live gate once found a 115-byte header) in CI, not only on a real boot.
@@ -824,7 +903,7 @@ mod imp {
 #[cfg(target_os = "linux")]
 pub use imp::{VmLaunch, launch_frontend_vm};
 #[cfg(target_os = "linux")]
-pub(crate) use imp::{guest_accept_serve_loop, vsock_bind_listen};
+pub(crate) use imp::{guest_accept_serve_loop, run_relay, vsock_bind_listen};
 
 // ============================================================================================
 // Cross-platform surface. The VM substrate needs AF_VSOCK + firecracker + KVM (Linux only — the `imp`

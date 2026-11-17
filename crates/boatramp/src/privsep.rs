@@ -483,6 +483,25 @@ fn normalized_data_dir(config: &ServerConfig, cwd: &Path) -> PathBuf {
     boatramp_server::sandbox::lexically_normalize(&abs)
 }
 
+/// Make `raw` absolute (against `cwd`) + lexically normalized, then `fs::canonicalize` it if it
+/// already exists (resolving symlinks) — the SAME transform
+/// [`boatramp_server::sandbox::SandboxDerivationInputs::into_normalized`] applies to every instance's
+/// grants (WS-C contract #1), so an fd-based Landlock install grants the REAL paths and a
+/// `..`/symlink/relative spelling cannot slip a different path past the (lexical) policy.
+/// `current_exe()` is already absolute + canonical; a config path (or the vsock UDS path) may be
+/// relative. Shared by the root self-profile install ([`supervise`]) and the separate VM relay's
+/// profile install ([`run_vm_relay`]) — one normalize helper, not two.
+#[cfg(unix)]
+fn normalize_for_landlock(raw: &Path, cwd: &Path) -> PathBuf {
+    let abs = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        cwd.join(raw)
+    };
+    let lexical = boatramp_server::sandbox::lexically_normalize(&abs);
+    std::fs::canonicalize(&lexical).unwrap_or(lexical)
+}
+
 // =============================================================================
 // The feature-instance: the materialization-by-construction gate (§2.2)
 // =============================================================================
@@ -902,12 +921,20 @@ pub fn run_vm_guest() -> Result<(), CliError> {
 /// [`VmRelayDescriptor`] (over [`PRIVSEP_VM_RELAY_ENV`]) + the inherited pre-bound listener fd (over
 /// [`PRIVSEP_FDS_ENV`] / [`PrivsepChildFds`]).
 ///
-/// **SCAFFOLD STATE (S1, this increment):** it reads + validates that NON-SECRET contract, then
-/// REFUSES fail-closed — the relay's OWN least-authority seccomp/Landlock profile (and running the
-/// byte pipe behind it) is the next Security-reviewed, Linux-live-gated increment. It is never
-/// reached in production today: [`resolve_spawn_backend`] refuses `substrate: vm` before any relay
-/// is spawned, so this entry exists for dispatch completeness + to pin the root→relay contract as
-/// reachable, exercised code (not an unused seam).
+/// Flow: read + validate the NON-SECRET contract (the descriptor + the inherited listener fd), then
+/// INSTALL the relay's OWN least-authority profile fail-closed [`Enforced`] (no bind/listen/socketpair,
+/// no key-lock, `execve`/`fork` hard-killed; FS view = own binary + the ONE vsock UDS —
+/// [`boatramp_server::sandbox::derive_relay_profile`]) and, ONLY behind that wall, run the Model-A
+/// copy-relay ([`crate::privsep_vm::run_relay`]): accept each client on the root-bound listener and
+/// splice OPAQUE bytes both ways to the frontend-in-guest over the vsock UDS. If the profile cannot be
+/// installed [`Enforced`] (a build/platform without the Linux seccomp+Landlock wall), it REFUSES to
+/// serve — a byte-relay of untrusted client data never runs unprofiled.
+///
+/// It carries NO authority and NO key material (the secret-blindness invariant + the S2 lint forbid a
+/// key-material link crossing here), and scrubs its own environ first (inv10). It is not reached in
+/// production YET: [`resolve_spawn_backend`] still refuses `substrate: vm` before any relay is spawned
+/// (the supervise-dispatch flip + the Linux live gate are the next increment); this entry + the
+/// profile are the unit/socketpair-proven primitive they build on.
 pub fn run_vm_relay(label: &str) -> Result<(), CliError> {
     crate::init_tracing();
     // The relay handles untrusted client bytes; scrub any inherited live credential first (inv10).
@@ -929,17 +956,93 @@ pub fn run_vm_relay(label: &str) -> Result<(), CliError> {
         instance = %label,
         guest_port = descriptor.guest_port,
         listener_fd,
-        "[privsep] __vm-relay: launch contract validated (secret-blind client-byte relay); the \
-         least-authority profile + byte-pipe wiring are the next increment — refusing fail-closed"
+        "[privsep] __vm-relay: launch contract validated (secret-blind client-byte relay); \
+         installing the least-authority profile next, then relaying"
     );
-    Err(fail(format!(
-        "the separate-process VM client-byte relay (S1, owner-resolved) is scaffolded — its \
-         least-authority seccomp/Landlock profile + the byte pipe over the vsock UDS {uds} are the \
-         next Security-reviewed increment; refusing to serve unprofiled (no VM frontend is \
-         operator-launched yet — resolve_spawn_backend refuses substrate: vm)",
-        uds = descriptor.uds_path.display(),
-    ))
-    .into())
+
+    // The relay splices UNTRUSTED client bytes, so it serves ONLY behind its own Enforced
+    // least-authority seccomp/Landlock profile. On a build/platform without the Linux
+    // seccomp+Landlock wall the profile cannot install → refuse to serve (fail-closed; never
+    // relay a byte unprofiled).
+    #[cfg(all(target_os = "linux", feature = "sandbox"))]
+    let result: Result<(), CliError> =
+        run_vm_relay_confined(label, &descriptor, listener_fd).map_err(|e| fail(e).into());
+    #[cfg(not(all(target_os = "linux", feature = "sandbox")))]
+    let result: Result<(), CliError> = {
+        let _ = (listener_fd, &descriptor);
+        Err(fail(
+            "the separate-process VM client-byte relay refuses to serve: its Enforced \
+             least-authority seccomp/Landlock profile needs Linux + the `sandbox` feature, which \
+             this build/platform lacks — a relay of untrusted client bytes never runs unprofiled"
+                .to_string(),
+        )
+        .into())
+    };
+    result
+}
+
+/// Install the separate relay process's OWN least-authority profile fail-closed [`Enforced`], then run
+/// the Model-A copy-relay behind it (Linux + `sandbox` only — the seccomp+Landlock wall is the
+/// relay's containment). Factored out so the install-then-relay sequence is the one place the profile
+/// is derived, installed, and enforced; a non-`Enforced` install returns `Err` (the caller fails the
+/// node closed). Returns `Err` if the relay loop ever ends — the relay runs for the node's life.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn run_vm_relay_confined(
+    label: &str,
+    descriptor: &VmRelayDescriptor,
+    listener_fd: i32,
+) -> Result<(), String> {
+    use std::os::fd::FromRawFd;
+
+    // Contract #1 (WS-C): normalize the own-binary + vsock-UDS paths the Landlock view grants, so the
+    // fd-based install grants the REAL paths (a `..`/symlink/relative spelling cannot slip a different
+    // path past the lexical policy). The relay holds NO backend authority, so there is no
+    // authority-state grant (contract #2 is vacuous) — the view is categorically narrower than any
+    // instance's.
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let current_exe = std::env::current_exe().map_err(|e| format!("resolving current exe: {e}"))?;
+    let exe_norm = normalize_for_landlock(&current_exe, &cwd);
+    let uds_norm = normalize_for_landlock(&descriptor.uds_path, &cwd);
+
+    // Derive + install the relay's bespoke least-authority profile, fail-closed Enforced (the SAME
+    // install_derived + enforce_privsep_status machinery the root + every instance uses — one install
+    // path, not a second). It is strictly narrower than any instance: no bind/listen/socketpair, no
+    // key-lock, execve/execveat + fork/vfork hard-killed; the FS view is the own binary (read+execute)
+    // + the ONE vsock UDS. Anything less than Enforced REFUSES (never relay a byte unprofiled).
+    let profile = boatramp_server::sandbox::derive_relay_profile(&exe_norm, &uds_norm);
+    let status = boatramp_server::sandbox::enforce_privsep_status(
+        boatramp_server::sandbox::install_derived(&profile),
+    )
+    .map_err(|e| format!("installing the __vm-relay least-authority profile: {e}"))?;
+    tracing::info!(
+        instance = %label,
+        ?status,
+        seccomp_allow = profile.seccomp_allow.len(),
+        seccomp_kill = profile.seccomp_kill.len(),
+        ro = profile.policy.read_only_paths.len(),
+        "[privsep] __vm-relay: least-authority profile installed + ENFORCED (no \
+         bind/listen/socketpair, no key-lock, exec+fork hard-killed; FS view = own binary + the one \
+         vsock UDS)"
+    );
+
+    // Adopt the inherited pre-bound public TCP listener (the root bound it + dup2'd it onto this fd —
+    // the relay's profile denies `bind`, so the listener MUST arrive pre-bound).
+    // SAFETY: `listener_fd` is the fd the root dup'd into this child + named in the fd map; the relay
+    // owns it exclusively.
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
+
+    // Run the Model-A copy-relay behind the wall: accept each client, dial the frontend-in-guest over
+    // the vsock UDS, and splice OPAQUE bytes both ways — NO parse, and NEVER key material (the scoped
+    // frontend holds no key; the secret-blindness invariant + the S2 lint forbid a key-material link
+    // here, so every byte is treated as opaque). The ONE existing PrivsepChildFds fd-pass carried the
+    // listener — no new mechanism. It runs for the node's life; when `accept` ends (the listener
+    // closed), it returns and we signal FailNodeClosed.
+    crate::privsep_vm::run_relay(label.to_string(), listener, uds_norm, descriptor.guest_port);
+    Err(
+        "the __vm-relay client-byte relay loop ended — the pre-bound public listener closed; \
+         FailNodeClosed (tearing the relay down rather than serving with a dead listener)"
+            .to_string(),
+    )
 }
 
 // =============================================================================
@@ -2568,8 +2671,8 @@ mod supervise {
         //    instances — `enforce_privsep_status`). The caller already refused a non-Linux/no-
         //    `sandbox` build before reaching here, so on this path the install is a real Linux one.
         let cwd = std::env::current_dir().map_err(|e| err(format!("cwd: {e}")))?;
-        let exe_norm = normalize_for_landlock(&current_exe, &cwd);
-        let config_norm = normalize_for_landlock(config_path, &cwd);
+        let exe_norm = super::normalize_for_landlock(&current_exe, &cwd);
+        let config_norm = super::normalize_for_landlock(config_path, &cwd);
         let profile = boatramp_server::sandbox::derive_root_profile(&exe_norm, &config_norm);
         let status = match boatramp_server::sandbox::enforce_privsep_status(
             boatramp_server::sandbox::install_derived(&profile),
@@ -2641,23 +2744,6 @@ mod supervise {
             let _ = child.kill();
             let _ = child.wait();
         }
-    }
-
-    /// Make `raw` absolute (against `cwd`) + lexically normalized, then `fs::canonicalize` it if it
-    /// already exists (resolving symlinks) — the SAME transform
-    /// [`boatramp_server::sandbox::SandboxDerivationInputs::into_normalized`] applies to every
-    /// instance's grants (WS-C contract #1), so the root's fd-based Landlock install grants the
-    /// REAL config-file / own-binary paths and a `..`/symlink/relative spelling cannot slip a
-    /// different path past the (lexical) policy. `current_exe()` is already absolute + canonical;
-    /// the config path may be relative (the serve default `boatramp.cfg`).
-    fn normalize_for_landlock(raw: &Path, cwd: &Path) -> std::path::PathBuf {
-        let abs = if raw.is_absolute() {
-            raw.to_path_buf()
-        } else {
-            cwd.join(raw)
-        };
-        let lexical = boatramp_server::sandbox::lexically_normalize(&abs);
-        std::fs::canonicalize(&lexical).unwrap_or(lexical)
     }
 }
 
@@ -5042,6 +5128,57 @@ mod tests {
             fds.links.is_empty(),
             "the relay holds no feature-links — only the listener fd"
         );
+    }
+
+    /// The `__vm-relay` process installs a profile derived from ITS launch descriptor's vsock UDS (+
+    /// its own binary) and NOTHING else — tying the S1 boundary contract (the descriptor) to the
+    /// least-authority wall [`run_vm_relay`] installs. Pure (the live seccomp/Landlock install is the
+    /// Linux gate): the FS view is exactly own-binary + the ONE UDS (no config/data_dir/key), and the
+    /// seccomp shape is the secret-blind relay shape (accept+dial, but no bind/listen/socketpair, no
+    /// key-lock, `execve`/`fork` hard-killed).
+    #[test]
+    fn vm_relay_descriptor_drives_a_least_authority_secret_blind_profile() {
+        let exe = PathBuf::from("/usr/local/bin/boatramp");
+        let descriptor = VmRelayDescriptor {
+            label: "edge".to_string(),
+            uds_path: PathBuf::from("/run/brvsk-3-7.sock"),
+            guest_port: crate::privsep_vm::DEFAULT_GUEST_VSOCK_PORT,
+        };
+        // The EXACT derivation `run_vm_relay` performs (own binary + the descriptor's UDS).
+        let profile = boatramp_server::sandbox::derive_relay_profile(&exe, &descriptor.uds_path);
+
+        // FS view = own binary (read+execute) + the ONE vsock UDS, nothing else.
+        assert_eq!(
+            profile.policy.read_only_paths,
+            vec![exe.clone(), descriptor.uds_path.clone()],
+            "the relay sees only its own binary + the one vsock UDS — no config/data_dir/key"
+        );
+        assert_eq!(profile.policy.execute_paths, vec![exe]);
+        assert!(profile.policy.read_write_paths.is_empty());
+
+        let allows = |n: &str| profile.seccomp_allow.iter().any(|x| x == n);
+        let kills = |n: &str| profile.seccomp_kill.iter().any(|x| x == n);
+        // Accepts clients + dials the guest, but binds/listens/execs nothing and locks no key.
+        for keep in ["accept4", "connect", "socket", "shutdown"] {
+            assert!(allows(keep), "relay keeps the byte-pipe verb {keep}");
+        }
+        for deny in [
+            "bind",
+            "listen",
+            "socketpair",
+            "mlock",
+            "munlock",
+            "execve",
+            "execveat",
+        ] {
+            assert!(
+                !allows(deny),
+                "relay must DENY {deny} (secret-blind least-authority)"
+            );
+        }
+        for kill in ["execve", "execveat", "fork", "vfork"] {
+            assert!(kills(kill), "relay must hard-kill {kill}");
+        }
     }
 
     /// An explicit `relay` marker (a serving splice) is NEVER designated for the authority grammar —

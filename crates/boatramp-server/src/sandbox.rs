@@ -827,6 +827,119 @@ pub fn derive_root_profile(current_exe: &Path, config_file: &Path) -> DerivedPro
     }
 }
 
+// =============================================================================
+// The separate VM client-byte RELAY's OWN bespoke self-profile (scoped privsep VM substrate, S1 —
+// owner-resolved 2026-11-14; `crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md` §S1 item 1)
+// =============================================================================
+//
+// The scoped VM substrate needs a HOST-side client-byte relay: the root binds the privileged public
+// TCP listener, and a process accepts each client and splices its bytes to the frontend-in-guest over
+// firecracker's vsock UDS bridge (Model A). That relay needs `accept4`/`connect`/`read`/`write` —
+// which the secret-blind root's networkless TCB-floor self-profile ([`ROOT_NET_STRIP`]) forbids. The
+// owner RESOLVED the placement as a SEPARATE least-authority relay process (`__vm-relay`), NOT a
+// widening of the root (a relay bug, parsing untrusted client bytes, stays OUT of the root's TCB
+// floor). The relay carries ONLY untrusted client bytes — NEVER key material (a scoped static-parser
+// frontend holds no key; `check_vm_secret_blindness_closure` refuses any other VM shape before spawn),
+// so the relay is itself secret-blind.
+//
+// Like the root ([`derive_root_profile`]), the relay is the supervisor's OWN non-`HostAuthority`
+// process, so its profile is BESPOKE — derived directly from what the relay code does, NOT forced
+// through the per-capability [`derive_profile`] — and carried as a [`DerivedProfile`] installed through
+// the SAME [`install_derived`] + [`enforce_privsep_status`] machinery (no second install mechanism).
+// It is the TCB-critical surface in the VM path (new least-authority code parsing untrusted bytes), so
+// it is the tightest shape that still lets the relay accept+dial+splice: strictly narrower than any
+// instance (no `bind`/`listen`/`socketpair`, no key-lock, `execve`/`fork` hard-killed) and, on the
+// exec dimension, tighter than the root (the root retains `execve` for its re-exec primitive; the relay
+// re-execs NOTHING, so `execve`/`execveat` stay denied AND killed).
+
+/// Networking syscalls stripped from the relay's allow-set. The relay NEVER binds a listener
+/// (`bind`/`listen` — the root passes the public listener pre-bound and `dup2`s the fd in) and NEVER
+/// opens a `socketpair(2)` link (it holds no feature-links — unlike a host-side instance, whose
+/// `local` link is a socketpair). It DOES `socket`+`connect` the firecracker vsock UDS and
+/// `accept`/`accept4` clients on the inherited listener, and reads/writes/`shutdown`s both ends — so
+/// this strips ONLY the listener-bind + socketpair verbs, a SUBSET of [`ROOT_NET_STRIP`] (the root
+/// strips ALL networking because its supervise loop does no socket I/O; the relay is the opposite
+/// shape — it is all socket I/O). [`KEY_LOCK`] is stripped too (the relay holds no key to `mlock`).
+const RELAY_NET_STRIP: &[&str] = &["bind", "listen", "socketpair"];
+
+/// Derive the separate VM client-byte relay's seccomp ALLOW-set (design §S1 item 1): the Phase-0
+/// [`ALLOWED`] baseline MINUS the listener-bind + socketpair verbs ([`RELAY_NET_STRIP`]) MINUS
+/// key-locking ([`KEY_LOCK`]). Unlike [`root_supervisor_allowlist`] it does NOT re-add [`EXEC_SPAWN`]
+/// — the relay is `exec`'d ONCE by the root and then re-execs NOTHING, so `execve`/`execveat` stay
+/// default-denied AND hard-killed (see [`relay_supervisor_killlist`]), making the relay strictly
+/// tighter than the root on the exec dimension. The result keeps exactly the socket verbs the relay
+/// needs (`socket`/`connect`/`accept`/`accept4`/`shutdown` + the read/write + send/recv/sockopt
+/// family) and is a STRICT SUBSET of [`ALLOWED`] (it adds no syscall the monolith lacks — no `execve`
+/// like the root, no sandbox-install family like `exec.compute`). Everything else is `EPERM`. Sorted +
+/// de-duplicated.
+pub fn relay_supervisor_allowlist() -> Vec<String> {
+    let strip: BTreeSet<&str> = RELAY_NET_STRIP
+        .iter()
+        .copied()
+        .chain(KEY_LOCK.iter().copied())
+        .collect();
+    let set: BTreeSet<String> = ALLOWED
+        .iter()
+        .copied()
+        .filter(|s| !strip.contains(s))
+        .map(str::to_string)
+        .collect();
+    set.into_iter().collect()
+}
+
+/// Derive the separate VM client-byte relay's seccomp KILL-set (hard `SECCOMP_RET_KILL_PROCESS`): the
+/// FULL [`KILL_SURFACE`], `execve`/`execveat` + `fork`/`vfork` INCLUDED. The relay spawns nothing and
+/// execs nothing — its per-client worker threads use `clone`/`CLONE_THREAD` (which stays allowed via
+/// [`ALLOWED`]), so killing the process-creation + exec families is a real, audited `SIGSYS` wall with
+/// no legitimate use to block. Neither the root's `execve` carve-out ([`root_supervisor_killlist`])
+/// nor the `exec.compute` fork carve-out ([`derive_seccomp_killlist`]) applies — the relay kills the
+/// whole surface, so its kill-set is a SUPERSET of every instance's. Sorted + de-duplicated.
+pub fn relay_supervisor_killlist() -> Vec<String> {
+    let set: BTreeSet<String> = KILL_SURFACE.iter().copied().map(str::to_string).collect();
+    set.into_iter().collect()
+}
+
+/// The separate VM client-byte relay's Landlock FS policy (design §S1 item 1): READ + EXECUTE on its
+/// OWN binary (the execute-pin, the SAME `current_exe` shape as [`root_supervisor_policy`] — defence
+/// in depth, since `execve` is also seccomp-killed) plus READ on the ONE firecracker vsock UDS it
+/// dials, and NOTHING else — NO config, NO `data_dir`, NO §1.2 key input, NO instance state. The relay
+/// holds no backend authority, so (WS-C contract #2) there is no `authority_state_dirs` to grant; the
+/// view is categorically narrower than any instance's.
+///
+/// NOTE: Landlock's `AccessFs` vocabulary does not mediate `connect(2)` to an AF_UNIX socket, so the
+/// UDS grant is NOT the load-bearing wall for reaching the guest (the hypervisor boundary + the
+/// seccomp socket-verb set are) — it is a minimal, intent-documenting grant (and defence-in-depth for
+/// any future ABI that governs socket-path resolution). The EXECUTE-pin is on the own binary ALONE:
+/// [`linux::build_ruleset`] STRIPS `Execute` from the read grant and re-grants it only on
+/// `execute_paths`. `read_write_paths` is empty — the relay writes no file. Both paths MUST already be
+/// made absolute + normalized by the caller (WS-C contract #1: [`lexically_normalize`] /
+/// `fs::canonicalize`) so the fd-based install grants the real paths.
+pub fn relay_supervisor_policy(current_exe: &Path, vsock_uds: &Path) -> SandboxPolicy {
+    SandboxPolicy {
+        // Informational (not granted by `install_derived`); names the one path the relay dials.
+        data_dir: vsock_uds.to_path_buf(),
+        read_only_paths: vec![current_exe.to_path_buf(), vsock_uds.to_path_buf()],
+        read_write_paths: Vec::new(),
+        execute_paths: vec![current_exe.to_path_buf()],
+    }
+}
+
+/// Derive the separate VM client-byte relay's complete bespoke self-profile (design §S1 item 1): the
+/// tight seccomp allow/kill lists ([`relay_supervisor_allowlist`] / [`relay_supervisor_killlist`]) +
+/// the Landlock policy ([`relay_supervisor_policy`]). Carried as a [`DerivedProfile`] so the relay
+/// installs it through the SAME [`install_derived`] + [`enforce_privsep_status`] machinery every
+/// instance (and the root) uses (no second install mechanism); the `posture` is
+/// [`SandboxPosture::Strict`] (categorically the tightest). `current_exe` + `vsock_uds` MUST already be
+/// normalized.
+pub fn derive_relay_profile(current_exe: &Path, vsock_uds: &Path) -> DerivedProfile {
+    DerivedProfile {
+        posture: SandboxPosture::Strict,
+        seccomp_allow: relay_supervisor_allowlist(),
+        seccomp_kill: relay_supervisor_killlist(),
+        policy: relay_supervisor_policy(current_exe, vsock_uds),
+    }
+}
+
 /// The access an instance's held crown-jewel key path needs under Landlock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAccess {
@@ -3120,6 +3233,188 @@ mod privsep_derivation_tests {
         assert_eq!(profile.policy, root_supervisor_policy(&exe, &config));
         // The profile install path ([`install_derived`]) grants only read_only/read_write — so the
         // bespoke policy's two RO paths are the complete FS view.
+        assert_eq!(profile.policy.read_only_paths.len(), 2);
+    }
+
+    // ---- The separate VM client-byte relay's bespoke self-profile (scoped VM substrate, S1) ----
+
+    #[test]
+    fn relay_allowlist_keeps_accept_connect_but_no_bind_listen_socketpair_keylock_or_exec() {
+        let allow = relay_supervisor_allowlist();
+
+        // The relay DOES accept clients on the inherited listener + dial the guest over the vsock UDS,
+        // and splice bytes both ways — so the connecting/accepting/byte verbs it needs survive.
+        for s in [
+            "socket", "connect", "accept", "accept4", "shutdown", "read", "write",
+        ] {
+            assert!(has(&allow, s), "the relay byte-pipe needs {s}");
+        }
+
+        // NO listener-bind verbs: the root binds the privileged public listener and passes the fd
+        // pre-bound — the relay never binds/listens. NO `socketpair`: the relay holds no feature-link
+        // (unlike a host-side instance's `local` socketpair). NO key-locking: the relay holds no key
+        // material (the HARD EXCLUSION). NO exec: it is exec'd ONCE by the root and re-execs NOTHING.
+        //
+        // These are LITERAL names, NOT a loop over `RELAY_NET_STRIP` — a tautology (every element of
+        // the strip set is denied by construction) would not bind, so dropping a name from the strip
+        // set could silently re-admit it. With the literals, removing (say) `bind` from
+        // `RELAY_NET_STRIP` re-admits it to the allow-set and REDDENS this test (the mutation guard).
+        for denied in [
+            "bind",       // listener-bind: the fd arrives pre-bound
+            "listen",     // ditto
+            "socketpair", // no feature-link
+            "mlock",      // KEY_LOCK: holds no key material
+            "munlock",    // KEY_LOCK
+            "execve",     // re-execs nothing (tighter than the root, which retains execve)
+            "execveat",   // ditto
+        ] {
+            assert!(
+                !has(&allow, denied),
+                "the relay must DENY {denied} (least-authority, secret-blind, re-execs nothing)"
+            );
+        }
+        // And the literal forbidden set is EXACTLY the authority dimensions the profile strips (so the
+        // guard above tracks the real strip set, not a stale hand-list): the net/socketpair strip +
+        // key-lock, with exec deliberately never re-added (unlike the root).
+        let stripped: BTreeSet<&str> = RELAY_NET_STRIP
+            .iter()
+            .copied()
+            .chain(KEY_LOCK.iter().copied())
+            .collect();
+        assert_eq!(
+            stripped,
+            ["bind", "listen", "socketpair", "mlock", "munlock"]
+                .into_iter()
+                .collect::<BTreeSet<&str>>(),
+            "the relay strip set (RELAY_NET_STRIP ∪ KEY_LOCK) must stay exactly these five verbs"
+        );
+
+        // Every allowed name is in the Phase-0 baseline — a STRICT SUBSET, adding NOTHING (no execve
+        // like the root, no sandbox-install family like exec.compute).
+        let baseline: BTreeSet<String> = ALLOWED.iter().map(|s| (*s).to_string()).collect();
+        for s in &allow {
+            assert!(
+                baseline.contains(s),
+                "the relay allow-set must stay within the Phase-0 ALLOWED baseline: {s} is foreign"
+            );
+        }
+        assert!(
+            allow.len() < baseline.len(),
+            "the relay allow-set must be strictly tighter than the Phase-0 baseline"
+        );
+
+        // Strictly narrower than the BROADEST instance profile (the monolith `ALL`): the relay's allow
+        // is a strict subset of what an instance holding every capability gets (it drops the
+        // listener-bind + socketpair + key-lock verbs the monolith keeps, and adds none of the
+        // exec/fork/sandbox-install family an `exec.compute` instance gains).
+        let broadest: BTreeSet<String> =
+            derive_seccomp_allowlist(&all_caps()).into_iter().collect();
+        let relay: BTreeSet<String> = allow.iter().cloned().collect();
+        assert!(
+            relay.is_subset(&broadest) && relay.len() < broadest.len(),
+            "the relay allow-set must be a STRICT subset of the broadest instance profile"
+        );
+    }
+
+    #[test]
+    fn relay_killlist_is_the_full_surface_including_exec_and_fork() {
+        let kill = relay_supervisor_killlist();
+        // The relay execs + forks NOTHING — unlike the root (keeps execve) and exec.compute (keeps
+        // execve + fork), the relay hard-SIGSYS-kills the whole exec + process-creation surface.
+        for s in ["execve", "execveat", "fork", "vfork"] {
+            assert!(
+                has(&kill, s),
+                "the relay must hard-kill {s} (it spawns + execs nothing)"
+            );
+        }
+        // And the rest of the escape / code-injection surface.
+        for s in [
+            "ptrace",
+            "mount",
+            "pivot_root",
+            "setns",
+            "unshare",
+            "bpf",
+            "keyctl",
+        ] {
+            assert!(
+                has(&kill, s),
+                "the relay must still hard-kill the escape syscall {s}"
+            );
+        }
+        // It is EXACTLY the full, unmodified KILL_SURFACE (no carve-out).
+        let expected: BTreeSet<String> = KILL_SURFACE.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(kill.iter().cloned().collect::<BTreeSet<_>>(), expected);
+
+        // A SUPERSET of every instance's kill-set (strictly so for an exec.compute instance, which
+        // carves execve + fork OUT of its kill-set). No instance kills more than the relay.
+        for caps in [frontend(), all_caps(), caps(&[HostAuthority::ExecCompute])] {
+            let inst: BTreeSet<String> = derive_seccomp_killlist(&caps).into_iter().collect();
+            let relay: BTreeSet<String> = kill.iter().cloned().collect();
+            assert!(
+                inst.is_subset(&relay),
+                "the relay must kill at least as much as every instance (missing coverage vs {caps:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_policy_grants_only_own_binary_and_the_one_uds_no_config_no_data_dir_no_key() {
+        let exe = PathBuf::from("/usr/local/bin/boatramp");
+        let uds = PathBuf::from("/run/brvsk-3-4242.sock");
+        let policy = relay_supervisor_policy(&exe, &uds);
+
+        // The FS view is EXACTLY the own binary (RO + execute) + the ONE vsock UDS (RO). Nothing is
+        // read-write — the relay writes no file.
+        assert_eq!(policy.read_only_paths, vec![exe.clone(), uds.clone()]);
+        assert!(policy.read_write_paths.is_empty());
+
+        // EXECUTE is pinned to the own binary ALONE (never the UDS): `build_ruleset` strips Execute
+        // from the read grant and re-grants it only on `execute_paths`.
+        assert_eq!(policy.execute_paths, vec![exe.clone()]);
+        assert!(
+            !policy.execute_paths.contains(&uds),
+            "the vsock UDS must never be executable"
+        );
+
+        // No config, no data_dir, no §1.2 key input, no instance state is anywhere in the view — the
+        // relay cannot open a crown-jewel key file even by accident (it is secret-blind).
+        let forbidden = [
+            PathBuf::from("/srv/node/secrets/kek"),
+            PathBuf::from("/srv/node/secrets/signer.sealed"),
+            PathBuf::from("/etc/boatramp/boatramp.cfg"), // config
+            PathBuf::from("/var/lib/boatramp/data"),     // a data_dir
+            PathBuf::from("/var/lib/boatramp/data/kv"),  // a backend state subtree
+        ];
+        let granted: BTreeSet<&PathBuf> = policy
+            .read_only_paths
+            .iter()
+            .chain(policy.read_write_paths.iter())
+            .collect();
+        for f in &forbidden {
+            assert!(
+                !granted.contains(f),
+                "a key/config/data_dir path must be ABSENT from the relay's FS view: {f:?}"
+            );
+            for g in &granted {
+                assert!(
+                    !path_contains(g, f),
+                    "no relay grant {g:?} may be an ancestor of the forbidden path {f:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn derive_relay_profile_ties_the_bespoke_lists_and_policy_together() {
+        let exe = PathBuf::from("/usr/local/bin/boatramp");
+        let uds = PathBuf::from("/run/brvsk-3-4242.sock");
+        let profile = derive_relay_profile(&exe, &uds);
+        assert_eq!(profile.posture, SandboxPosture::Strict);
+        assert_eq!(profile.seccomp_allow, relay_supervisor_allowlist());
+        assert_eq!(profile.seccomp_kill, relay_supervisor_killlist());
+        assert_eq!(profile.policy, relay_supervisor_policy(&exe, &uds));
+        // The install path grants only read_only/read_write — the two RO paths are the full FS view.
         assert_eq!(profile.policy.read_only_paths.len(), 2);
     }
 }
