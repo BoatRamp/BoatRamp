@@ -29,6 +29,30 @@ versions.
   consistent with how the authz path already treats such tokens. Present the sealed delegate (no
   onward `cnf`), or include the per-request `Boatramp-PoP` proof.
 
+### Fixed
+
+- **`db drop database` now reclaims a dedicated (`tenant: single`) managed database's data volume as
+  part of the drop, so a same-name re-provision initializes fresh against its new credential.**
+  Previously the drop tore down the container + binding + sealed credential but LEFT the workload's
+  docker/host data volume behind; re-provisioning a managed Postgres of the same name on the
+  **docker** backend then silently re-attached that stale volume (whose cluster was `initdb`-ed with
+  the OLD credential), so the fresh credential never took and every connection failed
+  `password authentication failed … data volume was initialized with a different credential`. The
+  Single-tenant drop (the explicit `db drop database`, and the project/site delete that tears a
+  tenant down — never a restart/reconcile/heal, which reattach the same volume) now stops the
+  container and removes its per-`(project, workload)` data volume. The remote-Docker backend also
+  gained `remove_volume`/`list_volumes`, so `compute volume rm` (and `GET /api/compute/volumes`) work
+  against docker-managed volumes.
+- **A managed database re-provisioned with a fresh credential is now picked up LIVE by running
+  handlers, with no `serve` restart.** The serve process caches a managed `sql` binding's resolved
+  backend (with its credential) for the process lifetime; after a `db drop database` + re-create
+  minted a new credential, a running handler kept using the stale cached credential and failed auth
+  until the serve was restarted. The drop now bumps a per-`(project, database)` credential epoch that
+  the binding caches (the static per-tenant composite cache and the apply-declared resolver cache)
+  consult, so the next use after a re-provision re-resolves and rebuilds against the new credential.
+  The rebuild is atomic (the backend is swapped whole under the cache lock) and scoped to exactly the
+  re-provisioned binding.
+
 ## [0.59.2]
 
 ### Fixed

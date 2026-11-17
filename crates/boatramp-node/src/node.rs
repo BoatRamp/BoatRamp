@@ -993,6 +993,10 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
                 envelope,
                 static_dbs,
                 deprovision_grace_secs,
+                // A project/site delete reclaims a Single tenant's data volume too — hand
+                // it a clone of the backend registry (cloned before the reconcile loop
+                // consumes the original below).
+                compute_backends.clone(),
             )) as Arc<_>
         });
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]

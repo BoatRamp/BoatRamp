@@ -6525,6 +6525,10 @@ impl NodeProjectExport {
             &self.deploy,
             &self.kv,
             envelope,
+            // No volume reclaim here: this is the `Shared`-Postgres soft-deprovision
+            // (non-zero grace → a recoverable `__deleted_` tombstone), which never routes
+            // to the `SingleDrop` arm, so no backend registry is needed.
+            None,
             cfg,
             project,
             "",

@@ -852,6 +852,12 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
             &self.deploy,
             &self.kv,
             &self.envelope,
+            // An EXPLICIT operator drop of a dedicated (Single) managed DB reclaims its
+            // data volume as part of the teardown (so a same-name re-provision `initdb`s
+            // fresh against its new credential) — hand it the backends to stop the
+            // container + remove the volume. Inert for a Shared drop (a DB inside a
+            // shared server, no per-DB volume).
+            Some(&self.backends),
             &binding,
             project,
             "",
@@ -859,6 +865,13 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         )
         .await
         .map_err(DeclareError::Other)?;
+        // A managed DB's credential was just deleted (and, for Single, its data volume
+        // reclaimed): INVALIDATE any serve-process-cached `sql` binding backend for this
+        // `(project, database)` so a re-provision's FRESH credential is picked up live on
+        // the next handler use, with no serve restart (papercut-b). Scoped to exactly
+        // this binding; monotonic, so it can only ever force a re-resolve, never serve a
+        // staler credential.
+        boatramp_core::sql::sql_binding_epochs().bump(project, name);
         Ok(DropDatabaseOutcome {
             database: physical,
             retained_roles: Vec::new(),
@@ -927,6 +940,10 @@ impl ManagedDbDeclare for NodeManagedDbDeclare {
         )
         .await
         .map_err(DeclareError::Other)?;
+        // The orphan's credential was just deleted — invalidate any cached `sql` binding
+        // backend for this `(project, name)` so a re-provision's fresh credential is
+        // picked up live (papercut-b), same as the declared drop above.
+        boatramp_core::sql::sql_binding_epochs().bump(project, name);
         Ok(DropDatabaseOutcome {
             database: outcome.database,
             retained_roles: outcome.retained_roles,

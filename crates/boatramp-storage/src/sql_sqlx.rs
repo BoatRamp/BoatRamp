@@ -336,10 +336,22 @@ struct PerTenantEntry {
     allow_preview: bool,
     /// The tenant grain (`tenant_scope == Site`) — selects the cache key shape.
     site_scoped: bool,
-    cache: std::sync::Mutex<
-        std::collections::HashMap<String, Arc<dyn boatramp_core::sql::SqlBackend>>,
-    >,
+    /// The resolved per-tenant backends, keyed by the tenant-cache key. Each is stamped
+    /// with the [`SqlBindingEpochs`](boatramp_core::sql::SqlBindingEpochs) generation it
+    /// was resolved at; a lookup whose stamp is behind the binding's current epoch is
+    /// treated as a MISS and rebuilt — so a managed-DB re-provision (which bumps the
+    /// epoch on the preceding drop) is picked up live, with its fresh credential, on the
+    /// next request (papercut-b), with no serve restart.
+    cache: EpochStampedTenantCache,
 }
+
+/// The per-tenant resolved-backend cache: each resolved backend keyed by the tenant-cache
+/// key and stamped with the [`SqlBindingEpochs`](boatramp_core::sql::SqlBindingEpochs)
+/// generation it was resolved at (see [`PerTenantEntry::cache`]).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+type EpochStampedTenantCache = std::sync::Mutex<
+    std::collections::HashMap<String, (u64, Arc<dyn boatramp_core::sql::SqlBackend>)>,
+>;
 
 /// The `(project, site)`-derived key under which a per-tenant binding caches its
 /// resolved backend. Mirrors the tenant grain: a project tenant caches by project;
@@ -433,31 +445,45 @@ impl CompositeSqlBackends {
         !self.external.is_empty() || !self.per_tenant.is_empty() || self.declared.is_some()
     }
 
-    /// Resolve a per-tenant binding for `(project, site)`, caching the result by the
-    /// binding's tenant grain so a hot path re-uses the connection. The lock is held
+    /// Resolve a per-tenant binding `name` for `(project, site)`, caching the result by
+    /// the binding's tenant grain so a hot path re-uses the connection. The lock is held
     /// only for the map read/insert, never across the resolver's `.await`.
+    ///
+    /// Each cache entry is stamped with the binding's
+    /// [`SqlBindingEpochs`](boatramp_core::sql::SqlBindingEpochs) generation: a hit whose
+    /// stamp is behind the current epoch is discarded and REBUILT, so a managed-DB
+    /// re-provision with a fresh credential (the preceding drop bumped the epoch) is
+    /// picked up live on the next request — no serve restart (papercut-b). The rebuild
+    /// swaps the whole backend `Arc` atomically under the cache lock, so a caller ever
+    /// sees only the old or the fully-rebuilt backend, never a half-updated one. `name`
+    /// is normalized to the binding's canonical key (`""` → the reserved default name)
+    /// so the epoch matches the one the operator drop bumps.
     async fn resolve_per_tenant(
         &self,
         entry: &PerTenantEntry,
+        name: &str,
         project: &str,
         site: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
         let key = tenant_cache_key(project, site, entry.site_scoped);
-        if let Some(hit) = entry
+        let epoch = boatramp_core::sql::sql_binding_epochs().epoch(project, declared_name(name));
+        // A hit is only valid while its credential generation is current; a stale stamp
+        // (a re-provision bumped the epoch) falls through to a rebuild.
+        if let Some((stamp, backend)) = entry
             .cache
             .lock()
             .expect("per-tenant sql cache poisoned")
             .get(&key)
-            .cloned()
+            && *stamp == epoch
         {
-            return Ok(hit);
+            return Ok(Arc::clone(backend));
         }
         let backend = entry.resolver.resolve(project, site).await?;
         entry
             .cache
             .lock()
             .expect("per-tenant sql cache poisoned")
-            .insert(key, backend.clone());
+            .insert(key, (epoch, backend.clone()));
         Ok(backend)
     }
 }
@@ -516,7 +542,7 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
         // (the isolation perimeter), keyed by (project, site) per its grain. The
         // default binding is matched under `""` ⇄ `"default"` (see `lookup`).
         if let Some(entry) = lookup(&self.per_tenant, name) {
-            return self.resolve_per_tenant(entry, project, site).await;
+            return self.resolve_per_tenant(entry, name, project, site).await;
         }
         // A bring-your-own external database is a single *shared* endpoint by design
         // (see the type docs): every project/site opening the name reaches it.
@@ -552,7 +578,7 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
                 // A preview shares its parent tenant's managed database (there is no
                 // separate per-preview managed server); the parent's isolation still
                 // holds. Gated by `allow_preview` exactly like the shared-external case.
-                return self.resolve_per_tenant(entry, project, site).await;
+                return self.resolve_per_tenant(entry, name, project, site).await;
             }
             return Err(SqlError::Other(format!(
                 "managed database `{name}` is not available to preview deployments \
@@ -1928,6 +1954,58 @@ mod tests {
             *resolver.calls.lock().unwrap(),
             1,
             "project grain ⇒ two sites of one project share one cached resolve"
+        );
+    }
+
+    /// REPRODUCE-FIRST GATE (papercut-b): a managed-DB re-provision mints a FRESH
+    /// credential, but the composite caches the resolved per-tenant backend for the
+    /// process lifetime — so a running handler kept using the OLD credential until a
+    /// serve restart. Bumping the binding's credential epoch (what the drop that precedes
+    /// a re-provision does) must INVALIDATE the cached backend so the next `sql.open()`
+    /// re-resolves (picks up the new credential), with no restart.
+    ///
+    /// MUTATION: drop the `*stamp == epoch` guard in `resolve_per_tenant` (always treat a
+    /// hit as valid) and the resolver is never called again after the bump → the final
+    /// count stays `1` → fail. Uses a project name unique to this test so the
+    /// process-global epoch registry can't interfere with a sibling test.
+    #[tokio::test]
+    async fn per_tenant_cache_rebuilds_on_credential_epoch_bump() {
+        use boatramp_core::sql::SqlBackends;
+
+        let project = "acme-reprov-epoch"; // unique: isolates the process-global epoch
+        let name = "reprovdb";
+        let resolver = std::sync::Arc::new(TenantTagResolver {
+            calls: std::sync::Mutex::new(0),
+        });
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_per_tenant(name, resolver.clone(), /* site_scoped */ false, false);
+
+        // First open resolves + caches; a second open is a cache hit (no new resolve).
+        let _ = composite.database(project, "s", name).await.unwrap();
+        let _ = composite.database(project, "s", name).await.unwrap();
+        assert_eq!(
+            *resolver.calls.lock().unwrap(),
+            1,
+            "steady state: the per-tenant backend is cached (one resolve)"
+        );
+
+        // A managed-DB drop (then re-provision) bumps this binding's credential epoch.
+        boatramp_core::sql::sql_binding_epochs().bump(project, name);
+
+        // The next open now sees a stale stamp → rebuilds → the fresh credential is live,
+        // with no serve restart.
+        let _ = composite.database(project, "s", name).await.unwrap();
+        assert_eq!(
+            *resolver.calls.lock().unwrap(),
+            2,
+            "a credential-epoch bump invalidates the cache ⇒ the next open re-resolves"
+        );
+        // …and settles: a further open is cached again at the new epoch (no re-resolve).
+        let _ = composite.database(project, "s", name).await.unwrap();
+        assert_eq!(
+            *resolver.calls.lock().unwrap(),
+            2,
+            "after the rebuild the new-epoch backend is cached (no churn per request)"
         );
     }
 
