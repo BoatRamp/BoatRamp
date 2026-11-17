@@ -667,6 +667,13 @@ pub trait NarrowingCaveats: Sized + Clone + Default {
     /// a partially-understood one. (This replaces the previous "unknown/ill-typed
     /// entries are ignored" contract, which could map a narrowing to deny-all with
     /// no reason surfaced.)
+    ///
+    /// **Versioning (L2):** because an unknown key is refused, fail-closed decoding
+    /// strictly *versions* the caveat vocabulary — a token carrying a NEW caveat key
+    /// is **rejected by every OLDER verifier** that predates it. So any addition to a
+    /// consumer's caveat vocabulary is a wire change that must be rolled out to all
+    /// verifiers before any issuer mints it, coordinated via the same
+    /// shim-alignment / wire-version discipline as any other guest-facing wire change.
     fn from_cbor(value: &CborValue) -> Result<Self, TokenError>;
 
     /// An expiry this caveat imposes, if any. [`attenuate`] stamps it as the

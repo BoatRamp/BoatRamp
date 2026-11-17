@@ -2123,6 +2123,21 @@ fn project_chain(
     chain: boatramp_cwt::CredentialChain<Caveats>,
 ) -> Result<VerifiedChain, TokenError> {
     let root = role_token(&chain.root_claims, chain.exp)?;
+    // 8(b) / M1 — domain separation on the CHAIN/role-gate path. This is the single
+    // choke point for [`verify_credential`] (RBAC authz), [`verify_presented`]
+    // (whoami + the preview "any valid token" gate), and [`verify_credential_unexpired`],
+    // so the root-kind check belongs here, symmetric with [`verify`]. Without it, a
+    // sealed, root-signed non-role credential — notably the per-node `cluster-write`
+    // capability (`kind = cluster-write`, no `cnf` ⇒ sealed, non-expiring) — would be
+    // accepted as a valid ROLE credential at every control-plane role gate (C1 can't
+    // reject it: it's sealed), letting a captured capability view protected previews
+    // and disclose its role at whoami. A legit role token / delegation chain carries
+    // root `kind = KIND_ROLE` (delegation blocks are KIND_DELEGATION, but only the
+    // ROOT claims are read here); every other kind has its own verifier, and the
+    // mesh-write gate uses [`verify_cluster_write`], not this path.
+    if root.kind != KIND_ROLE {
+        return Err(TokenError::Claims("not a role token".into()));
+    }
     Ok(VerifiedChain {
         roles: root.roles,
         kind: root.kind,
@@ -4415,6 +4430,66 @@ mod tests {
             verify_cluster_write(&role, &public, NOW),
             Err(TokenError::Claims(_))
         ));
+    }
+
+    /// M1 — the CHAIN/role-gate path (`verify_credential`/`verify_presented`/
+    /// `verify_credential_unexpired`, all via `project_chain`, which feeds RBAC,
+    /// whoami, and the preview gate) must enforce the root kind too, not only
+    /// `cose::verify`. A per-node `cluster-write` capability (kind=cluster-write,
+    /// roles=[cluster-write], NO cnf ⇒ SEALED and non-expiring, root-signed) must
+    /// NOT be accepted as a role credential at those gates — C1 can't reject it
+    /// (it's sealed), so only the kind check does. **Mutation-proof:** removing the
+    /// `project_chain` kind check makes these entry points ACCEPT the capability and
+    /// disclose its role, reddening this test.
+    #[tokio::test]
+    async fn the_chain_path_refuses_a_non_role_root() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+
+        // The per-node cluster-write capability: non-role kind, sealed (no cnf),
+        // non-expiring — exactly the shape `build_mesh_write_gate` mints.
+        let cw = mint(
+            &Claims {
+                roles: vec![GrantedRole::global("cluster-write")],
+                kind: KIND_CLUSTER_WRITE.to_string(),
+                ttl_secs: None,
+                now_unix: NOW,
+            },
+            &signer,
+        )
+        .await
+        .unwrap();
+        // It is sealed (so C1's verify_presented would not reject it on sealing)...
+        assert!(
+            verify_credential(&cw, &public, NOW)
+                .err()
+                .is_some_and(|e| matches!(e, TokenError::Claims(_))),
+            "the chain path must refuse a non-role (cluster-write) root"
+        );
+        // ...yet every project_chain entry point refuses it on the kind check.
+        assert!(matches!(
+            verify_presented(&cw, &public, NOW),
+            Err(TokenError::Claims(_))
+        ));
+        assert!(matches!(
+            verify_credential_unexpired(&cw, &public),
+            Err(TokenError::Claims(_))
+        ));
+
+        // No legitimate flow breaks: a real role token still verifies through the
+        // chain path, and the mesh-write gate accepts the capability via its OWN
+        // verifier (`verify_cluster_write`, which never routes through project_chain).
+        let role = mint(&claims(), &signer).await.unwrap();
+        assert!(verify_credential(&role, &public, NOW).is_ok());
+        assert!(verify_presented(&role, &public, NOW).is_ok());
+        assert!(
+            verify_cluster_write(&cw, &public, NOW)
+                .unwrap()
+                .roles
+                .iter()
+                .any(|r| r.name == "cluster-write"),
+            "the mesh-write gate still accepts the cluster-write capability"
+        );
     }
 
     // ---- Ergonomics (U8–U10) at the boatramp layer -------------------------

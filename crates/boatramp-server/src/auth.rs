@@ -1745,6 +1745,42 @@ mod tests {
         assert!(auth.verify_bearer_roles(&plain).await.is_some());
     }
 
+    /// M1 — a captured per-node `cluster-write` capability (kind=cluster-write,
+    /// roles=[cluster-write], NO cnf ⇒ sealed, non-expiring, root-signed) must NOT
+    /// pass the control-plane role gates. It is sealed, so C1 does not reject it;
+    /// the chain path's root-kind check (`project_chain`) does. The preview gate and
+    /// whoami refuse it, while a plain admin role token still works.
+    #[tokio::test]
+    async fn cluster_write_capability_is_refused_at_the_role_gates() {
+        let root = holder();
+        let now = now_unix();
+        let auth = auth_with(&root, false);
+        let cw = cose::mint(
+            &Claims {
+                roles: vec![GrantedRole::global("cluster-write")],
+                kind: cose::KIND_CLUSTER_WRITE.to_string(),
+                ttl_secs: None,
+                now_unix: now,
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !auth.verify_bearer(&cw).await,
+            "the preview gate must refuse a cluster-write capability"
+        );
+        assert!(
+            auth.verify_bearer_roles(&cw).await.is_none(),
+            "whoami must not disclose a cluster-write capability's role"
+        );
+        // A plain admin role token is still honored.
+        let admin = admin_token(&root).await;
+        assert!(auth.verify_bearer(&admin).await);
+        assert!(auth.verify_bearer_roles(&admin).await.is_some());
+    }
+
     #[tokio::test]
     async fn a_proof_cannot_be_replayed_on_the_same_node() {
         let root = holder();
