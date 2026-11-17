@@ -67,11 +67,16 @@ pub struct SpliceCtx {
     pub posture: SecurityPosture,
     pub daemon: Option<Arc<crate::DaemonRuntime>>,
     /// Idle read timeout for the splice fast-path's own socket reads once a connection is
-    /// served: the per-request client head read on a kept-alive connection (N-1) and every
-    /// upstream read (N-5). Set to [`boatramp_http::h1::DEFAULT_READ_TIMEOUT`] so a
-    /// slow-loris / stalled peer on the fast-path is bounded exactly like the normal
-    /// [`boatramp_http::serve_connection`] path the fast-path bypasses. (Request #1's
-    /// non-consuming peek is separately bounded by [`PEEK_TIMEOUT`].)
+    /// served: the per-request client head read on a kept-alive connection (N-1), every
+    /// buffered upstream read via [`UpstreamConn::fill`] (N-5), and the upstream-readable
+    /// wait inside the fixed-length (Content-Length) kernel-`splice()` zero-copy path
+    /// ([`splice_body`] — the last N-5 sibling, so a trusted upstream that declares a
+    /// Content-Length, delivers part, then stalls without closing is bounded too). Set to
+    /// [`boatramp_http::h1::DEFAULT_READ_TIMEOUT`] so a slow-loris / stalled peer on the
+    /// fast-path is bounded exactly like the normal [`boatramp_http::serve_connection`] path
+    /// the fast-path bypasses. (Request #1's non-consuming peek is separately bounded by
+    /// [`PEEK_TIMEOUT`].) It bounds only no-progress stalls — a transfer moving bytes is never
+    /// affected (the splice idle timeout resets on each `splice()` that moves `> 0` bytes).
     pub read_timeout: std::time::Duration,
 }
 
@@ -1116,7 +1121,10 @@ impl UpstreamConn {
         let remaining = total - from_buf as u64;
         if remaining > 0 {
             // `from_buf == buf.len()` here (we took all of buf), so nothing is stranded.
-            splice_body(&self.sock, &*client, remaining as usize).await?;
+            // Pass the same per-read idle timeout the rest of the forwarder uses (N-5): it
+            // bounds a STALL on the upstream-readable wait inside `splice_body` without
+            // touching the zero-copy move itself (the splice() syscall is unchanged).
+            splice_body(&self.sock, &*client, remaining as usize, self.read_timeout).await?;
         }
         Ok(!trailing)
     }
@@ -1374,8 +1382,24 @@ fn parse_chunk_size_line(buf: &[u8]) -> SizeLine {
 /// Move exactly `n` bytes `src`→`dst` via `splice()` — no userspace copy of the
 /// payload. Linux only; unavailable elsewhere (callers never reach it because
 /// [`classify`] resolves nothing on non-Linux — see [`splice_supported`]).
+///
+/// `read_timeout` is a per-read **idle** timeout on the upstream (`src`) side only —
+/// reset on every iteration, i.e. after every `splice()` that moves `> 0` bytes — so a
+/// transfer making progress is never affected and only a genuine no-progress stall is
+/// bounded. It wraps the `READABLE` readiness `.await` ONLY; the `splice()` syscall that
+/// performs the zero-copy move is untouched (no throughput change). It is the fixed-length
+/// (Content-Length) sibling of the N-5 idle bound [`UpstreamConn::fill`] applies to every
+/// other upstream read: a trusted upstream that declares `Content-Length: N`, delivers part
+/// of the body, then stalls without closing is failed closed (`TimedOut` → the caller closes
+/// the client) instead of pinning this task forever. The client (`dst`) write-readiness wait
+/// is deliberately NOT bounded here — client backpressure is throughput, not an upstream stall.
 #[cfg(target_os = "linux")]
-async fn splice_body(src: &TcpStream, dst: &TcpStream, mut n: usize) -> io::Result<()> {
+async fn splice_body(
+    src: &TcpStream,
+    dst: &TcpStream,
+    mut n: usize,
+    read_timeout: std::time::Duration,
+) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::ptr;
     use tokio::io::Interest;
@@ -1391,9 +1415,15 @@ async fn splice_body(src: &TcpStream, dst: &TcpStream, mut n: usize) -> io::Resu
     let result = async {
         while n > 0 {
             let want = n.min(1 << 16);
-            // src socket → pipe (into an empty pipe, so only src readiness blocks)
-            let in_n = src
-                .async_io(Interest::READABLE, || {
+            // src socket → pipe (into an empty pipe, so only src readiness blocks).
+            // Bound ONLY the readable-readiness wait with the per-read idle timeout: a
+            // fresh timeout is created each iteration, so it is reset on every successful
+            // splice() that moves bytes (`n -= in_n` then loop) and fires only when no
+            // bytes move within the window (the upstream stalled without closing). The
+            // splice() syscall inside the closure is unchanged — zero-copy is preserved.
+            let in_n = match tokio::time::timeout(
+                read_timeout,
+                src.async_io(Interest::READABLE, || {
                     let r = unsafe {
                         libc::splice(src_fd, ptr::null_mut(), pw, ptr::null_mut(), want, flags)
                     };
@@ -1402,8 +1432,21 @@ async fn splice_body(src: &TcpStream, dst: &TcpStream, mut n: usize) -> io::Resu
                     } else {
                         Ok(r as usize)
                     }
-                })
-                .await?;
+                }),
+            )
+            .await
+            {
+                Ok(r) => r?,
+                Err(_elapsed) => {
+                    // Idle stall: the upstream owes Content-Length bytes but delivered none
+                    // within the window. Fail closed so the caller closes the client (which
+                    // signals the truncation) rather than pinning this task forever (N-5).
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream splice read timed out",
+                    ));
+                }
+            };
             if in_n == 0 {
                 // Upstream closed before delivering Content-Length: the response is
                 // truncated. Fail so the caller closes the client connection (which
@@ -1444,7 +1487,12 @@ async fn splice_body(src: &TcpStream, dst: &TcpStream, mut n: usize) -> io::Resu
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn splice_body(_src: &TcpStream, _dst: &TcpStream, _n: usize) -> io::Result<()> {
+async fn splice_body(
+    _src: &TcpStream,
+    _dst: &TcpStream,
+    _n: usize,
+    _read_timeout: std::time::Duration,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "splice is linux-only",
@@ -2838,6 +2886,250 @@ mod tests {
         assert!(
             text.contains("partial-body"),
             "the partial close-delimited body was not forwarded before closing: {text}"
+        );
+    }
+
+    /// Reproduce-first (N-5 last sibling, fixed-length splice stall): a trusted upstream that
+    /// declares `Content-Length: N`, delivers part of the body, then holds the connection open
+    /// sending nothing more (never closing) must be bounded by the idle read timeout on the
+    /// splice fast-path's own upstream-readable wait — the client is CLOSED ~`read_timeout`
+    /// after the stall, not pinned forever. This is the Content-Length kernel-`splice()`
+    /// zero-copy path (`forward_length` → `splice_body`); pre-fix its `async_io(READABLE)`
+    /// readiness wait had NO timeout (the N-1/N-5 fix bounded every other upstream read but
+    /// deliberately left this perf-critical path), so the splice awaited the promised bytes
+    /// forever.
+    ///
+    /// Linux-only: this exercises the real kernel `splice()` move (off Linux the move is
+    /// unsupported and the path is never reached). Drives `splice_conn` directly with a short
+    /// injected `read_timeout` so the assertion is a tight wall-clock bound.
+    ///
+    /// Mutation proof: revert the `tokio::time::timeout(..)` wrap around the `READABLE` wait in
+    /// `splice_body` and this `read_to_end` never returns → the outer 5s timeout fires →
+    /// `read.is_err()` → the assertion fails (the test hangs to its outer bound).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stalled_length_splice_upstream_is_closed_by_the_read_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        // Upstream: declare a 1 MiB Content-Length, deliver a 12-byte partial body, then HOLD
+        // the connection open forever — never close, never send the remaining ~1 MiB. The
+        // forwarder drains the 12 buffered bytes and enters `splice_body` for the remainder,
+        // which is where the (pre-fix unbounded) upstream-readable wait stalls.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => break,
+                        }
+                    }
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\npartial-body",
+                        )
+                        .await;
+                    // Never close, never send the rest — a stalled fixed-length origin.
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let (plan, mut ctx) = direct_plan_ctx(up_addr).await;
+        // A short idle read timeout so the test is a tight wall-clock bound (production uses
+        // DEFAULT_READ_TIMEOUT; the value is just threaded through to `splice_body`).
+        ctx.read_timeout = Duration::from_millis(500);
+        let mut client = spawn_splice_conn(plan, ctx).await;
+        client
+            .write_all(b"GET /p HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        // The property under test: the client is closed by the idle timeout (read_to_end
+        // completes) rather than hanging forever waiting for the promised 1 MiB.
+        let read = timeout(Duration::from_secs(5), client.read_to_end(&mut out)).await;
+        assert!(
+            read.is_ok(),
+            "a stalled fixed-length (Content-Length) upstream left the splice fast-path (and the \
+             client) hanging — no idle read timeout on the splice upstream-readable wait (N-5 \
+             sibling)"
+        );
+        // The partial body it DID send is forwarded before the fail-closed close.
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("partial-body"),
+            "the partial fixed-length body was not forwarded before closing: {text}"
+        );
+    }
+
+    /// No-regression (fixed-length splice to completion + keep-alive reuse): a full
+    /// `Content-Length` body larger than the buffered prefix is moved end-to-end through the
+    /// kernel-`splice()` zero-copy path, and the connection is REUSED for a second request.
+    /// Guards that the idle-timeout wrap does not disturb the normal full-body CL path.
+    ///
+    /// Linux-only: exercises the real kernel `splice()` move. Uses the production
+    /// `DEFAULT_READ_TIMEOUT` (the transfer makes continuous progress → the idle timeout never
+    /// fires).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn full_length_body_splices_to_completion_and_keepalive_reuse_works() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const BODY: usize = 100 * 1024; // 100 KiB: exceeds the fill buffer → the splice path runs
+
+        // Keep-alive upstream: a full fixed-length body per request, connection held open.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        // Read one full request head, then answer.
+                        loop {
+                            match s.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                                Ok(_) => break,
+                            }
+                        }
+                        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {BODY}\r\n\r\n");
+                        let body = vec![b'x'; BODY];
+                        if s.write_all(head.as_bytes()).await.is_err()
+                            || s.write_all(&body).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (plan, ctx) = direct_plan_ctx(up_addr).await; // production DEFAULT_READ_TIMEOUT
+        let mut client = spawn_splice_conn(plan, ctx).await;
+
+        // Request 1 (keep-alive: no `Connection: close`) — full body spliced to completion.
+        client
+            .write_all(b"GET /a HTTP/1.1\r\nHost: test.local\r\n\r\n")
+            .await
+            .unwrap();
+        let r1 = read_one_response(&mut client).await;
+        assert!(
+            r1.starts_with("HTTP/1.1 200"),
+            "request 1 not served: {:.80}",
+            r1
+        );
+        let body1 = &r1[r1.find("\r\n\r\n").unwrap() + 4..];
+        assert_eq!(
+            body1.len(),
+            BODY,
+            "request 1 body was not spliced to completion ({} of {BODY} bytes)",
+            body1.len()
+        );
+
+        // Request 2 on the SAME connection — the keep-alive reuse path after a clean splice.
+        client
+            .write_all(b"GET /b HTTP/1.1\r\nHost: test.local\r\n\r\n")
+            .await
+            .unwrap();
+        let r2 = read_one_response(&mut client).await;
+        assert!(
+            r2.starts_with("HTTP/1.1 200"),
+            "request 2 not served: {:.80}",
+            r2
+        );
+        let body2 = &r2[r2.find("\r\n\r\n").unwrap() + 4..];
+        assert_eq!(
+            body2.len(),
+            BODY,
+            "request 2 body (keep-alive reuse) was not spliced to completion ({} of {BODY} bytes)",
+            body2.len()
+        );
+    }
+
+    /// No-regression (slow-but-progressing fixed-length splice): a transfer that makes steady
+    /// progress — each slice well within the idle window, but the WHOLE transfer taking longer
+    /// than the idle window — must complete untruncated. This proves the splice idle timeout is
+    /// reset on every `splice()` that moves bytes (per-read idle), NOT a bound on total transfer
+    /// duration: a genuinely slow-but-progressing upstream is never affected.
+    ///
+    /// Linux-only: exercises the real kernel `splice()` move. `read_timeout` is 400 ms; the
+    /// upstream sends eight 8 KiB slices with 120 ms gaps (each gap < 400 ms, total ≈ 1 s >
+    /// 400 ms) — so a (buggy) total-duration bound would time out mid-transfer and truncate.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn slow_but_progressing_length_splice_is_not_timed_out() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, sleep, timeout};
+
+        const SLICE: usize = 8 * 1024;
+        const SLICES: usize = 8;
+        const BODY: usize = SLICE * SLICES; // 64 KiB
+
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => break,
+                        }
+                    }
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {BODY}\r\n\r\n");
+                    if s.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let slice = vec![b'y'; SLICE];
+                    for _ in 0..SLICES {
+                        // Gap before each slice: < read_timeout individually, but the sum of
+                        // the gaps exceeds read_timeout — only a per-read idle reset survives.
+                        sleep(Duration::from_millis(120)).await;
+                        if s.write_all(&slice).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Hold open; the client sent `Connection: close`, so the forwarder closes.
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let (plan, mut ctx) = direct_plan_ctx(up_addr).await;
+        ctx.read_timeout = Duration::from_millis(400);
+        let mut client = spawn_splice_conn(plan, ctx).await;
+        client
+            .write_all(b"GET /s HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let read = timeout(Duration::from_secs(10), client.read_to_end(&mut out)).await;
+        assert!(read.is_ok(), "slow-but-progressing splice transfer hung");
+        let text = String::from_utf8_lossy(&out);
+        let body_len = text.len() - (text.find("\r\n\r\n").unwrap() + 4);
+        assert_eq!(
+            body_len, BODY,
+            "a slow-but-progressing fixed-length body was truncated ({body_len} of {BODY} bytes) — \
+             the splice idle timeout must reset on each splice() that moves bytes, not bound the \
+             total transfer duration"
         );
     }
 
