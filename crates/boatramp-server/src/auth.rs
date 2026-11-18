@@ -11,7 +11,7 @@
 
 use boatramp_core::time::now_unix;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -822,7 +822,10 @@ impl AuthInner {
             // state (the parsed policy + compiled authorizer), so a panic that poisoned
             // it elsewhere must not take down every subsequent authorization. The store
             // read + currency check above are unaffected; worst case we recompile.
-            let cache = self.policy_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .policy_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(c) = cache.as_ref()
                 && c.matches(stored_bytes.as_deref())
             {
@@ -860,7 +863,10 @@ impl AuthInner {
         {
             // Recover from a poisoned lock rather than panic (U11 Security review
             // INFO-1); see the read site above.
-            let mut cache = self.policy_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self
+                .policy_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             *cache = Some(CachedPolicy {
                 bytes: stored_bytes,
                 policy: Arc::clone(&policy),
