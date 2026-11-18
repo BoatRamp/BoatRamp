@@ -817,10 +817,15 @@ impl AuthInner {
         // unchanged. The store read above already happened (and fenced / failed closed), so this
         // only skips the parse + Cedar compile, never the currency check.
         {
+            // Recover from a poisoned lock rather than panic-cascading the authz path
+            // (U11 Security review INFO-1): the cache holds only derived, re-derivable
+            // state (the parsed policy + compiled authorizer), so a panic that poisoned
+            // it elsewhere must not take down every subsequent authorization. The store
+            // read + currency check above are unaffected; worst case we recompile.
             let cache = self
                 .policy_cache
                 .lock()
-                .expect("policy cache mutex poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(c) = cache.as_ref()
                 && c.matches(stored_bytes.as_deref())
             {
@@ -856,10 +861,12 @@ impl AuthInner {
         let policy = Arc::new(policy);
         let compiled = Arc::new(compiled);
         {
+            // Recover from a poisoned lock rather than panic (U11 Security review
+            // INFO-1); see the read site above.
             let mut cache = self
                 .policy_cache
                 .lock()
-                .expect("policy cache mutex poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             *cache = Some(CachedPolicy {
                 bytes: stored_bytes,
                 policy: Arc::clone(&policy),

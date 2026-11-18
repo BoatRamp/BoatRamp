@@ -535,7 +535,24 @@ pub mod generic {
             Self::from_schema(schema, policies_src)
         }
 
-        /// Shared tail of the two constructors: parse + strictly validate the
+        /// Like [`compile_and_validate_json_schema`](Self::compile_and_validate_json_schema),
+        /// but the JSON schema is handed in as an already-parsed
+        /// [`serde_json::Value`] rather than a string (U11 fold-up) — so a consumer
+        /// (uchron) whose policy tooling already holds the schema as a
+        /// `serde_json::Value` need not serialize it back to a string only for this
+        /// crate to re-parse it. It goes through `Schema::from_json_value` and then the
+        /// SAME strict-validation path (`from_schema`) as the string constructor; the
+        /// policies are still Cedar policy text and the validation is identical.
+        pub fn compile_and_validate_json_schema_value(
+            schema_json: serde_json::Value,
+            policies_src: &str,
+        ) -> Result<Self, GenericCedarError> {
+            let schema = Schema::from_json_value(schema_json)
+                .map_err(|e| GenericCedarError::Schema(e.to_string()))?;
+            Self::from_schema(schema, policies_src)
+        }
+
+        /// Shared tail of the constructors: parse + strictly validate the
         /// policies against an already-parsed `schema`, then build the compile-once
         /// `CedarEngine`.
         fn from_schema(schema: Schema, policies_src: &str) -> Result<Self, GenericCedarError> {
@@ -775,6 +792,37 @@ pub mod generic {
             // A malformed JSON schema is a Schema error, not a panic.
             let err = CompiledPolicySet::compile_and_validate_json_schema("{ not json", POLICY)
                 .expect_err("malformed JSON schema must error");
+            assert!(matches!(err, GenericCedarError::Schema(_)), "got {err:?}");
+        }
+
+        /// (U11 fold-up) The `serde_json::Value` constructor compiles + validates +
+        /// authorizes identically to the string JSON-schema constructor — a consumer
+        /// that already holds the schema as a parsed `Value` need not re-serialize it.
+        #[test]
+        fn compiles_and_authorizes_with_a_json_schema_value() {
+            let schema_value: serde_json::Value =
+                serde_json::from_str(JSON_SCHEMA).expect("JSON_SCHEMA parses to a Value");
+            let compiled =
+                CompiledPolicySet::compile_and_validate_json_schema_value(schema_value, POLICY)
+                    .expect("a well-typed JSON-value schema + policy must compile and validate");
+            assert!(
+                compiled
+                    .is_authorized_json(
+                        r#"User::"alice""#,
+                        r#"Action::"view""#,
+                        r#"Photo::"vacation""#,
+                        None,
+                        ENTITIES,
+                    )
+                    .unwrap()
+            );
+            // A well-formed JSON Value that is not a valid schema is a Schema error,
+            // not a panic.
+            let err = CompiledPolicySet::compile_and_validate_json_schema_value(
+                serde_json::json!({ "": { "entityTypes": 42 } }),
+                POLICY,
+            )
+            .expect_err("a malformed schema Value must error");
             assert!(matches!(err, GenericCedarError::Schema(_)), "got {err:?}");
         }
 
