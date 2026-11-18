@@ -656,8 +656,15 @@ async fn launch_from_registered_spec(
     spec.env
         .insert("POSTGRES_DB".to_string(), DATABASE.to_string());
 
+    // Launch under the TENANT's own project — exactly as the production reconcile does
+    // (`list_compute_workloads_all` yields this workload under its stored project, and
+    // `launch_one` is called with THAT project), so the compute identity + the
+    // per-`(project, workload)` volume scope (`compute_volume_scope(TENANT, …)`) match what
+    // the shipped drop (`deprovision_tenant`, called with `TENANT`) reclaims. (A non-default
+    // tenant launched under a bare `"default"` would land its volume at the wrong,
+    // unprefixed scope — the drop would then miss it, and Assertion 5 below could not see it.)
     let artifact = backend
-        .materialize("default", &workload.name, &spec, None)
+        .materialize(TENANT, &workload.name, &spec, None)
         .await
         .map_err(|e| format!("materialize (pull) image: {e}"))?;
     if !matches!(artifact, Artifact::Rootfs { .. }) {
@@ -677,7 +684,7 @@ async fn launch_from_registered_spec(
         .first()
         .map(|v| v.name.clone())
         .ok_or_else(|| "managed Single spec must carry a data volume".to_string())?;
-    let scope = boatramp_core::compute::compute_volume_scope("default", &workload.name);
+    let scope = boatramp_core::compute::compute_volume_scope(TENANT, &workload.name);
     let vol_dir = data_dir
         .join("compute")
         .join("volumes")
@@ -685,7 +692,7 @@ async fn launch_from_registered_spec(
         .join(&vol_name);
 
     let req = LaunchRequest {
-        project: "default".into(),
+        project: TENANT.into(),
         workload: workload.name.clone(),
         replica: 0,
         spec,
