@@ -53,10 +53,97 @@ pub enum CedarError {
     Policy(String),
 }
 
-/// A compiled Cedar authorizer generated from an [`AuthzPolicy`].
-pub struct CompiledCedar {
+/// A richer authorization outcome than a bare `bool`: the allow/deny decision plus
+/// the Cedar diagnostics — which policies *determined* it and any per-policy
+/// evaluation errors. Shared by boatramp's own RBAC path ([`CompiledCedar`]) and the
+/// generic adoptable entry ([`generic::CompiledPolicySet`]), so both run the one
+/// engine and both can surface *why* a request was allowed or denied (U11-4c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthzDecision {
+    /// Whether the decision is `Allow` (a `Deny`, including the default-deny when no
+    /// policy matched, is `false`).
+    pub allow: bool,
+    /// The ids of the policies that **determined** the decision (Cedar's `reason`
+    /// set): the satisfied `permit`s behind an `Allow`, or the `forbid`s behind a
+    /// `Deny`. Empty on a default-deny (no policy applied). Sorted for a stable order
+    /// (`reason` is an unordered set).
+    pub determining_policies: Vec<String>,
+    /// Human-readable per-policy evaluation errors (Cedar's `errors`). A policy that
+    /// errors mid-evaluation (e.g. a missing attribute) is *skipped* by Cedar rather
+    /// than failing the whole request, so these are diagnostics — surfaced so a
+    /// consumer can log/alert on a policy that is silently not applying — not a hard
+    /// authorization failure.
+    pub errors: Vec<String>,
+}
+
+impl AuthzDecision {
+    /// Project a Cedar `Response` into the crate's decision shape (allow/deny +
+    /// determining policies + diagnostics).
+    fn from_response(resp: &cedar_policy::Response) -> Self {
+        let mut determining_policies: Vec<String> = resp
+            .diagnostics()
+            .reason()
+            .map(ToString::to_string)
+            .collect();
+        determining_policies.sort();
+        let errors: Vec<String> = resp
+            .diagnostics()
+            .errors()
+            .map(ToString::to_string)
+            .collect();
+        Self {
+            allow: matches!(resp.decision(), Decision::Allow),
+            determining_policies,
+            errors,
+        }
+    }
+}
+
+/// The one Cedar decision engine shared by boatramp's own RBAC authorizer
+/// ([`CompiledCedar`]) and the generic adoptable entry
+/// ([`generic::CompiledPolicySet`]): a **compile-once** [`PolicySet`] + [`Authorizer`],
+/// evaluated many times. Nothing here re-parses or recompiles policy text per call —
+/// that is the whole point (U11-4b: boatramp's hot path previously recompiled the
+/// `PolicySet` from generated Cedar text on *every* request; see
+/// `boatramp-server`'s `AuthInner::policy` cache). Both callers build their
+/// per-request [`Request`] + [`Entities`] — the **minimal differing seam**: boatramp
+/// projects its fixed RBAC vocabulary into entities, a generic consumer brings its
+/// own — and hand them to the SAME [`evaluate`](Self::evaluate), so uchron adopts the
+/// exact decision path boatramp runs (U11-4d: one engine, not two parallel copies).
+#[derive(Debug)]
+struct CedarEngine {
     policies: PolicySet,
     authorizer: Authorizer,
+}
+
+impl CedarEngine {
+    /// Wrap an already-parsed [`PolicySet`] in a fresh [`Authorizer`]. The expensive
+    /// work (parsing/compiling the policy text) happened at the caller's `compile`
+    /// step; `Authorizer::new` is cheap and stateless.
+    fn new(policies: PolicySet) -> Self {
+        Self {
+            policies,
+            authorizer: Authorizer::new(),
+        }
+    }
+
+    /// Evaluate one already-built request + entity store against the compiled
+    /// policies, returning the rich [`AuthzDecision`]. This is the single line both
+    /// the RBAC and generic paths funnel through.
+    fn evaluate(&self, request: &Request, entities: &Entities) -> AuthzDecision {
+        AuthzDecision::from_response(&self.authorizer.is_authorized(
+            request,
+            &self.policies,
+            entities,
+        ))
+    }
+}
+
+/// A compiled Cedar authorizer generated from an [`AuthzPolicy`].
+pub struct CompiledCedar {
+    /// The shared, compile-once decision engine (the same type the generic entry
+    /// runs on — U11-4d).
+    engine: CedarEngine,
     /// Roles carrying at least one target-scoped template — the principal gets a
     /// `<role>_sites` attribute for each (always present, possibly empty), so the
     /// site-scoping `when` guards never hit a missing attribute.
@@ -85,8 +172,7 @@ impl CompiledCedar {
             .map(|(name, _)| name.clone())
             .collect();
         Ok(Self {
-            policies,
-            authorizer: Authorizer::new(),
+            engine: CedarEngine::new(policies),
             scoped_roles,
         })
     }
@@ -95,13 +181,18 @@ impl CompiledCedar {
     ///
     /// Default-deny: any entity/request construction error yields `false`.
     pub fn authorize(&self, roles: &[GrantedRole], required: &Right) -> bool {
-        matches!(self.decide(roles, required), Ok(Decision::Allow))
+        self.decide(roles, required).is_ok_and(|d| d.allow)
     }
 
     /// The fallible core of [`authorize`](Self::authorize): build the per-request
-    /// entities + request and run the authorizer. Kept private but exercised
-    /// directly (unwrapped) by the differential test so construction bugs are loud.
-    fn decide(&self, roles: &[GrantedRole], required: &Right) -> Result<Decision, Box<dyn Error>> {
+    /// entities + request and run the SHARED [`CedarEngine`]. Kept private but
+    /// exercised directly (unwrapped) by the differential test so construction bugs
+    /// are loud. Returns the rich [`AuthzDecision`]; `authorize` projects its `allow`.
+    fn decide(
+        &self,
+        roles: &[GrantedRole],
+        required: &Right,
+    ) -> Result<AuthzDecision, Box<dyn Error>> {
         let principal_uid = uid("Principal", "self");
         let action_uid = uid("Action", required.action.as_str());
         let (resource_uid, resource) = resource_entity(required)?;
@@ -120,6 +211,10 @@ impl CompiledCedar {
                 )?);
             }
         }
+        // Schema-free (`None`): boatramp's RBAC vocabulary is generated and internally
+        // consistent, so it does not validate requests against a Cedar schema — the
+        // generic path (which takes a consumer's own schema) is the one that passes
+        // `Some(schema)`. This is the minimal differing seam from the shared engine.
         let entities = Entities::from_entities(entities, None)?;
 
         let request = Request::new(
@@ -129,10 +224,7 @@ impl CompiledCedar {
             Context::empty(),
             None,
         )?;
-        Ok(self
-            .authorizer
-            .is_authorized(&request, &self.policies, &entities)
-            .decision())
+        Ok(self.engine.evaluate(&request, &entities))
     }
 }
 
@@ -332,9 +424,10 @@ pub mod generic {
     use std::str::FromStr;
 
     use cedar_policy::{
-        Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema,
-        ValidationMode, Validator,
+        Context, Entities, EntityUid, PolicySet, Request, Schema, ValidationMode, Validator,
     };
+
+    use super::{AuthzDecision, CedarEngine};
 
     /// An error from the [generic](self) Cedar entry points. Each variant carries a
     /// human-readable description of the failing stage (the underlying `cedar-policy`
@@ -369,22 +462,52 @@ pub mod generic {
 
     /// A consumer's own Cedar schema plus a policy set that has been type-checked
     /// against it — ready to authorize caller-supplied requests. Construct one with
-    /// [`compile_and_validate`](Self::compile_and_validate); it owns the parsed
-    /// [`Schema`], [`PolicySet`] and an [`Authorizer`] internally and exposes only
-    /// `cedar-policy`-free surface, so the consumer need not depend on `cedar-policy`.
+    /// [`compile_and_validate`](Self::compile_and_validate) (Cedar-text schema) or
+    /// [`compile_and_validate_json_schema`](Self::compile_and_validate_json_schema)
+    /// (JSON schema). It owns the parsed [`Schema`] and the SAME compile-once
+    /// `CedarEngine` boatramp's own authorizer runs on (U11-4d),
+    /// and exposes only a `cedar-policy`-free surface, so the consumer need not depend
+    /// on `cedar-policy`.
+    ///
+    /// **Hot path (U11-4c/4b):** parse the (slowly-changing) entity store and context
+    /// ONCE with [`prepare_entities`](Self::prepare_entities) /
+    /// [`prepare_context`](Self::prepare_context), then call
+    /// [`evaluate`](Self::evaluate) per request — no per-call JSON parse. The
+    /// all-in-JSON [`is_authorized_json`](Self::is_authorized_json) remains as a
+    /// convenience, implemented over exactly that path.
     #[derive(Debug)]
     pub struct CompiledPolicySet {
         schema: Schema,
-        policies: PolicySet,
-        authorizer: Authorizer,
+        engine: CedarEngine,
     }
 
+    /// A Cedar entity store parsed + validated against a [`CompiledPolicySet`]'s
+    /// schema ONCE (via [`prepare_entities`](CompiledPolicySet::prepare_entities)) and
+    /// reusable across many [`evaluate`](CompiledPolicySet::evaluate) calls — the
+    /// pre-parse that moves the old per-request JSON cost off the hot path. Opaque:
+    /// it wraps a `cedar-policy` type so the consumer never names one.
+    #[derive(Debug, Clone)]
+    pub struct PreparedEntities(Entities);
+
+    /// A Cedar request context parsed ONCE (via
+    /// [`prepare_context`](CompiledPolicySet::prepare_context)) and reusable across
+    /// evaluations. Opaque, like [`PreparedEntities`].
+    #[derive(Debug, Clone)]
+    pub struct PreparedContext(Context);
+
+    /// A Cedar entity uid (a principal / action / resource reference) parsed ONCE
+    /// (via [`prepare_uid`](CompiledPolicySet::prepare_uid)) and reusable. Opaque,
+    /// like [`PreparedEntities`].
+    #[derive(Debug, Clone)]
+    pub struct PreparedUid(EntityUid);
+
     impl CompiledPolicySet {
-        /// Parse `schema_src` (Cedar schema format) and `policies_src` (Cedar policy
-        /// text), then **strictly validate** the policies against the schema. Returns
-        /// the compiled set on success, or the first failing stage's error
-        /// ([schema parse](GenericCedarError::Schema) → [policy
-        /// parse](GenericCedarError::Policy) → [validation](GenericCedarError::Validation)).
+        /// Parse `schema_src` (**Cedar schema format** — the human-readable syntax)
+        /// and `policies_src` (Cedar policy text), then **strictly validate** the
+        /// policies against the schema. Returns the compiled set on success, or the
+        /// first failing stage's error ([schema parse](GenericCedarError::Schema) →
+        /// [policy parse](GenericCedarError::Policy) →
+        /// [validation](GenericCedarError::Validation)).
         ///
         /// This is the generic analogue of [`CompiledCedar::compile`](super::CompiledCedar::compile),
         /// but driven entirely by the caller's own Cedar text instead of boatramp's
@@ -395,6 +518,27 @@ pub mod generic {
         ) -> Result<Self, GenericCedarError> {
             let schema = Schema::from_str(schema_src)
                 .map_err(|e| GenericCedarError::Schema(e.to_string()))?;
+            Self::from_schema(schema, policies_src)
+        }
+
+        /// Like [`compile_and_validate`](Self::compile_and_validate), but the schema
+        /// is given in Cedar's **JSON schema format** rather than the human-readable
+        /// Cedar schema syntax (U11-4c) — for a consumer (uchron) whose policy tooling
+        /// emits or stores its schema as JSON. The policies are still Cedar policy
+        /// text, and the validation is identical.
+        pub fn compile_and_validate_json_schema(
+            schema_json: &str,
+            policies_src: &str,
+        ) -> Result<Self, GenericCedarError> {
+            let schema = Schema::from_json_str(schema_json)
+                .map_err(|e| GenericCedarError::Schema(e.to_string()))?;
+            Self::from_schema(schema, policies_src)
+        }
+
+        /// Shared tail of the two constructors: parse + strictly validate the
+        /// policies against an already-parsed `schema`, then build the compile-once
+        /// `CedarEngine`.
+        fn from_schema(schema: Schema, policies_src: &str) -> Result<Self, GenericCedarError> {
             let policies = PolicySet::from_str(policies_src)
                 .map_err(|e| GenericCedarError::Policy(e.to_string()))?;
             let result =
@@ -409,19 +553,84 @@ pub mod generic {
             }
             Ok(Self {
                 schema,
-                policies,
-                authorizer: Authorizer::new(),
+                engine: CedarEngine::new(policies),
             })
         }
 
-        /// Authorize one request against the compiled policies. The principal,
-        /// action and resource are Cedar entity-uid strings (e.g. `User::"alice"`,
-        /// `Action::"view"`, `Photo::"vacation"`); `entities_json` is the entity store
-        /// in Cedar's [JSON entity format]; `context_json`, when `Some`, is a JSON
-        /// object of context attributes. Everything is parsed against the compiled
-        /// schema, so a request that does not conform is a loud
-        /// [`Request`](GenericCedarError::Request) / [`Entities`](GenericCedarError::Entities)
-        /// error rather than a silent deny.
+        /// Parse an entity store (Cedar's [JSON entity format]) against the compiled
+        /// schema **once**, returning a reusable [`PreparedEntities`]. Parse the store
+        /// that is stable across a batch of requests here, then pass it to many
+        /// [`evaluate`](Self::evaluate) calls so none of them re-parses it.
+        ///
+        /// [JSON entity format]: https://docs.cedarpolicy.com/auth/entities-syntax.html
+        pub fn prepare_entities(
+            &self,
+            entities_json: &str,
+        ) -> Result<PreparedEntities, GenericCedarError> {
+            Entities::from_json_str(entities_json, Some(&self.schema))
+                .map(PreparedEntities)
+                .map_err(|e| GenericCedarError::Entities(e.to_string()))
+        }
+
+        /// Parse a request context (a JSON object of attributes) **once**, returning a
+        /// reusable [`PreparedContext`].
+        pub fn prepare_context(
+            &self,
+            context_json: &str,
+        ) -> Result<PreparedContext, GenericCedarError> {
+            Context::from_json_str(context_json, None)
+                .map(PreparedContext)
+                .map_err(|e| GenericCedarError::Context(e.to_string()))
+        }
+
+        /// Parse one entity-uid string (e.g. `User::"alice"`) **once**, returning a
+        /// reusable [`PreparedUid`] for use as a principal / action / resource.
+        pub fn prepare_uid(&self, uid: &str) -> Result<PreparedUid, GenericCedarError> {
+            uid.parse()
+                .map(PreparedUid)
+                .map_err(|e| GenericCedarError::EntityUid(format!("{e}")))
+        }
+
+        /// Authorize one request from **pre-parsed** inputs, returning the rich
+        /// [`AuthzDecision`](super::AuthzDecision) (allow/deny + the determining
+        /// policies + diagnostics) rather than a bare `bool` (U11-4c). The entity
+        /// store and context are parsed once (via [`prepare_entities`](Self::prepare_entities)
+        /// / [`prepare_context`](Self::prepare_context)) and reused, so this hot path
+        /// pays no JSON parse — the per-call cost the old
+        /// [`is_authorized_json`](Self::is_authorized_json) incurred. Runs the SAME
+        /// `CedarEngine` as boatramp's own authorizer (U11-4d).
+        ///
+        /// The request is still constructed against the compiled schema, so a request
+        /// that does not conform is a loud [`Request`](GenericCedarError::Request)
+        /// error rather than a silent deny. No `cedar-policy` type appears in the
+        /// signature.
+        pub fn evaluate(
+            &self,
+            principal: &PreparedUid,
+            action: &PreparedUid,
+            resource: &PreparedUid,
+            context: Option<&PreparedContext>,
+            entities: &PreparedEntities,
+        ) -> Result<AuthzDecision, GenericCedarError> {
+            let context = context.map(|c| c.0.clone()).unwrap_or_else(Context::empty);
+            let request = Request::new(
+                principal.0.clone(),
+                action.0.clone(),
+                resource.0.clone(),
+                context,
+                Some(&self.schema),
+            )
+            .map_err(|e| GenericCedarError::Request(e.to_string()))?;
+            Ok(self.engine.evaluate(&request, &entities.0))
+        }
+
+        /// Authorize one request entirely from JSON/strings — the convenience form of
+        /// [`evaluate`](Self::evaluate). The principal, action and resource are Cedar
+        /// entity-uid strings (e.g. `User::"alice"`, `Action::"view"`,
+        /// `Photo::"vacation"`); `entities_json` is the entity store in Cedar's
+        /// [JSON entity format]; `context_json`, when `Some`, is a JSON object of
+        /// context attributes. Everything is parsed per call, so prefer
+        /// [`evaluate`](Self::evaluate) with pre-parsed inputs on a hot path.
         ///
         /// Returns `true` iff the decision is `Allow`. No `cedar-policy` type appears
         /// in the signature, so the caller stays free of a direct `cedar-policy`
@@ -436,29 +645,14 @@ pub mod generic {
             context_json: Option<&str>,
             entities_json: &str,
         ) -> Result<bool, GenericCedarError> {
-            let principal: EntityUid = principal
-                .parse()
-                .map_err(|e| GenericCedarError::EntityUid(format!("{e}")))?;
-            let action: EntityUid = action
-                .parse()
-                .map_err(|e| GenericCedarError::EntityUid(format!("{e}")))?;
-            let resource: EntityUid = resource
-                .parse()
-                .map_err(|e| GenericCedarError::EntityUid(format!("{e}")))?;
-            let context = match context_json {
-                Some(c) => Context::from_json_str(c, None)
-                    .map_err(|e| GenericCedarError::Context(e.to_string()))?,
-                None => Context::empty(),
-            };
-            let entities = Entities::from_json_str(entities_json, Some(&self.schema))
-                .map_err(|e| GenericCedarError::Entities(e.to_string()))?;
-            let request = Request::new(principal, action, resource, context, Some(&self.schema))
-                .map_err(|e| GenericCedarError::Request(e.to_string()))?;
-            let decision = self
-                .authorizer
-                .is_authorized(&request, &self.policies, &entities)
-                .decision();
-            Ok(matches!(decision, Decision::Allow))
+            let principal = self.prepare_uid(principal)?;
+            let action = self.prepare_uid(action)?;
+            let resource = self.prepare_uid(resource)?;
+            let context = context_json.map(|c| self.prepare_context(c)).transpose()?;
+            let entities = self.prepare_entities(entities_json)?;
+            Ok(self
+                .evaluate(&principal, &action, &resource, context.as_ref(), &entities)?
+                .allow)
         }
     }
 
@@ -545,6 +739,94 @@ pub mod generic {
                 "expected a Schema error, got {err:?}"
             );
         }
+
+        /// The same vocabulary expressed in Cedar's **JSON schema format** (U11-4c):
+        /// `compile_and_validate_json_schema` must compile + validate + authorize
+        /// identically to the Cedar-text constructor.
+        const JSON_SCHEMA: &str = r#"{
+            "": {
+                "entityTypes": { "User": {}, "Photo": {} },
+                "actions": {
+                    "view": {
+                        "appliesTo": {
+                            "principalTypes": ["User"],
+                            "resourceTypes": ["Photo"]
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        #[test]
+        fn compiles_and_authorizes_with_a_json_schema() {
+            let compiled = CompiledPolicySet::compile_and_validate_json_schema(JSON_SCHEMA, POLICY)
+                .expect("a well-typed JSON schema + policy must compile and validate");
+            assert!(
+                compiled
+                    .is_authorized_json(
+                        r#"User::"alice""#,
+                        r#"Action::"view""#,
+                        r#"Photo::"vacation""#,
+                        None,
+                        ENTITIES,
+                    )
+                    .unwrap()
+            );
+            // A malformed JSON schema is a Schema error, not a panic.
+            let err = CompiledPolicySet::compile_and_validate_json_schema("{ not json", POLICY)
+                .expect_err("malformed JSON schema must error");
+            assert!(matches!(err, GenericCedarError::Schema(_)), "got {err:?}");
+        }
+
+        /// (U11-4c) The pre-parsed `evaluate` path: prepare the entity store + uids
+        /// ONCE, evaluate many times, and get a rich `AuthzDecision` whose `allow`
+        /// matches `is_authorized_json` and whose `determining_policies` names the
+        /// satisfied permit on an Allow (and is empty on a default-deny).
+        #[test]
+        fn prepared_evaluate_matches_json_and_reports_diagnostics() {
+            let compiled = CompiledPolicySet::compile_and_validate(SCHEMA, POLICY).unwrap();
+            let entities = compiled.prepare_entities(ENTITIES).unwrap();
+            let view = compiled.prepare_uid(r#"Action::"view""#).unwrap();
+            let vacation = compiled.prepare_uid(r#"Photo::"vacation""#).unwrap();
+            let alice = compiled.prepare_uid(r#"User::"alice""#).unwrap();
+            let bob = compiled.prepare_uid(r#"User::"bob""#).unwrap();
+
+            // Allow: alice → the decision is Allow, names a determining policy, no errors.
+            let allow = compiled
+                .evaluate(&alice, &view, &vacation, None, &entities)
+                .unwrap();
+            assert!(allow.allow);
+            assert!(
+                !allow.determining_policies.is_empty(),
+                "an Allow must name the satisfied permit, got {allow:?}"
+            );
+            assert!(allow.errors.is_empty(), "no evaluation errors: {allow:?}");
+
+            // Deny (default): bob → not allowed, no determining policy.
+            let deny = compiled
+                .evaluate(&bob, &view, &vacation, None, &entities)
+                .unwrap();
+            assert!(!deny.allow);
+            assert!(
+                deny.determining_policies.is_empty(),
+                "a default-deny names no policy, got {deny:?}"
+            );
+
+            // The prepared path agrees with the all-JSON convenience, which is now
+            // implemented over it.
+            assert_eq!(
+                allow.allow,
+                compiled
+                    .is_authorized_json(
+                        r#"User::"alice""#,
+                        r#"Action::"view""#,
+                        r#"Photo::"vacation""#,
+                        None,
+                        ENTITIES,
+                    )
+                    .unwrap()
+            );
+        }
     }
 }
 
@@ -590,8 +872,7 @@ mod tests {
                         let oracle = expected_set.allows(&required);
                         // Unwrap `decide` so a construction bug panics loudly with
                         // the offending inputs instead of silently denying.
-                        let got = cedar.decide(roles, &required).expect("cedar decide")
-                            == Decision::Allow;
+                        let got = cedar.decide(roles, &required).expect("cedar decide").allow;
                         assert_eq!(
                             got, oracle,
                             "mismatch: roles={roles:?} required={required:?} (cedar={got} oracle={oracle})"
@@ -766,6 +1047,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// (U11-4b benchmark) Measure the per-call parse + Cedar-compile cost that the
+    /// authz hot-path cache removes, on the REAL default RBAC policy (multiple roles ×
+    /// right-templates → a non-trivial `PolicySet`), exercising the actual
+    /// `CompiledCedar::compile` + `authorize` path — not a micro-case. Not a gate; run
+    /// explicitly:
+    /// `cargo test -p boatramp-core --features authz -- --ignored --nocapture authz_compile_cost`.
+    #[test]
+    #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+    fn authz_compile_cost_benchmark() {
+        use std::time::Instant;
+
+        let policy = AuthzPolicy::default_policy();
+        // The exact stored form the hot path deserializes per request today.
+        let bytes = serde_json::to_vec(&policy).expect("serialize default policy");
+        let roles = [GrantedRole::scoped("publisher", "acme/blog")];
+        let required = Right::new(Resource::Site, Some("acme/blog".to_string()), Action::Write);
+        let iters = 5_000u32;
+
+        // OLD hot path: deserialize + compile + decide on EVERY call (what boatramp's
+        // `AuthInner::policy` did per request before the cache).
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let p: AuthzPolicy = serde_json::from_slice(&bytes).expect("parse");
+            let compiled = CompiledCedar::compile(&p).expect("compile");
+            std::hint::black_box(compiled.authorize(&roles, &required));
+        }
+        let old = t0.elapsed();
+
+        // NEW hot path: compile ONCE (the cache hit), decide on every call.
+        let compiled = CompiledCedar::compile(&policy).expect("compile");
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(compiled.authorize(&roles, &required));
+        }
+        let new = t1.elapsed();
+
+        let old_us = old.as_micros() as f64 / f64::from(iters);
+        let new_us = new.as_micros() as f64 / f64::from(iters);
+        eprintln!(
+            "\nU11-4b authz compile-cost benchmark ({iters} iters, default policy):\n  \
+             per-request recompile (parse+compile+decide): {old:?} total, {old_us:.2} µs/call\n  \
+             cached compile (decide only):                 {new:?} total, {new_us:.2} µs/call\n  \
+             parse+compile removed per call:               ~{:.2} µs  ({:.0}x faster)\n",
+            old_us - new_us,
+            old_us / new_us.max(f64::MIN_POSITIVE),
+        );
+        // Sanity: the decide-only path must be strictly cheaper than recompiling each call.
+        assert!(
+            new < old,
+            "cached decide must be faster than per-call recompile"
+        );
     }
 
     #[test]

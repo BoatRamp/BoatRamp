@@ -309,11 +309,12 @@ pub(super) async fn cluster_join(
             // A signature/framing failure is unauthenticated (401); an authentic
             // token that is expired or the wrong kind is forbidden (403).
             let code = match err {
-                // An algorithm-pin failure is a specialization of Invalid — both are
-                // authenticity failures (401), not an authentic-but-wrong token (403).
-                cose::TokenError::Invalid(_) | cose::TokenError::AlgMismatch => {
-                    StatusCode::UNAUTHORIZED
-                }
+                // An algorithm-pin failure is a specialization of Invalid, and a
+                // chain resource-bound failure (`Bounds`) is a framing failure — all
+                // are authenticity failures (401), not an authentic-but-wrong token (403).
+                cose::TokenError::Invalid(_)
+                | cose::TokenError::AlgMismatch
+                | cose::TokenError::Bounds(_) => StatusCode::UNAUTHORIZED,
                 _ => StatusCode::FORBIDDEN,
             };
             return (code, format!("invalid join token: {err}\n")).into_response();
@@ -1461,11 +1462,12 @@ pub(super) async fn overlay_enroll(
         Ok(v) => v,
         Err(err) => {
             let code = match err {
-                // An algorithm-pin failure is a specialization of Invalid — both are
-                // authenticity failures (401), not an authentic-but-wrong token (403).
-                cose::TokenError::Invalid(_) | cose::TokenError::AlgMismatch => {
-                    StatusCode::UNAUTHORIZED
-                }
+                // An algorithm-pin failure is a specialization of Invalid, and a
+                // chain resource-bound failure (`Bounds`) is a framing failure — all
+                // are authenticity failures (401), not an authentic-but-wrong token (403).
+                cose::TokenError::Invalid(_)
+                | cose::TokenError::AlgMismatch
+                | cose::TokenError::Bounds(_) => StatusCode::UNAUTHORIZED,
                 _ => StatusCode::FORBIDDEN,
             };
             return (code, format!("invalid overlay-enroll invitation: {err}\n")).into_response();
