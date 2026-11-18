@@ -56,6 +56,19 @@ versions.
   cache) consult, so the next use after a re-provision (including a same-name project recreate)
   re-resolves and rebuilds against the new credential. The rebuild is atomic (the backend is swapped
   whole under the cache lock) and scoped to exactly the re-provisioned binding.
+- **A compute node now advertises its REAL schedulable memory instead of a hardcoded 1 GiB.**
+  `[compute].mem_mib = 0` (the default) previously advertised a fixed `1024` MiB to the scheduler
+  regardless of the host's actual RAM, so any workload requesting more than 1 GiB (e.g. a docker
+  workload with `mem_mib = 2048`) failed the placement fit-check (`node.free_mem_mib >= spec.mem_mib`)
+  on EVERY node — even a 64 GiB box — with an opaque placement shortfall. vCPUs were already
+  host-detected; only memory was hardcoded. The node now **auto-detects** its memory total (the
+  smaller of `/proc/meminfo` `MemTotal` and the process's cgroup limit — cgroup v2 `memory.max`, else
+  cgroup v1 — so a containerized node advertises its cgroup ceiling, not the whole host) and advertises
+  that minus an OS/boatramp reserve. A new `[compute].mem_reserve_mib` (env
+  `BOATRAMP_COMPUTE_MEM_RESERVE_MIB`) tunes the headroom; `0` (default) uses the policy of the larger of
+  1 GiB or 6.25% of the detected total. An explicit non-zero `[compute].mem_mib` still pins the
+  advertised capacity verbatim. Detection failure (non-Linux / unreadable) falls back to the
+  conservative legacy 1 GiB so an undetectable host never over-advertises into OOM.
 
 ## [0.59.2]
 

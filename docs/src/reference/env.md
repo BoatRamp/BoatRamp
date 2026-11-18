@@ -124,7 +124,8 @@ over its file value; an unset one defers to the file/default). See
 | `BOATRAMP_COMPUTE_BRIDGE` | `compute.bridge` | Bridge the container veths / VM taps attach to (default `br-boatramp`). |
 | `BOATRAMP_COMPUTE_SUBNET` | `compute.subnet` | Guest IP subnet (default `10.0.0.0/24`). |
 | `BOATRAMP_COMPUTE_VCPUS` | `compute.vcpus` | vCPUs advertised as schedulable (`0` = detect from the host). |
-| `BOATRAMP_COMPUTE_MEM_MIB` | `compute.mem_mib` | Memory (MiB) advertised as schedulable (`0` = a 1 GiB default). |
+| `BOATRAMP_COMPUTE_MEM_MIB` | `compute.mem_mib` | Memory (MiB) advertised as schedulable (`0` = auto-detect the host/cgroup total minus `mem_reserve_mib`). |
+| `BOATRAMP_COMPUTE_MEM_RESERVE_MIB` | `compute.mem_reserve_mib` | OS + boatramp memory headroom (MiB) held back when `mem_mib` auto-detects (`0` = larger of 1 GiB or 6.25%). |
 | `BOATRAMP_COMPUTE_REGION` | `compute.region` | This node's region tag for nearest-replica routing. |
 | `BOATRAMP_COMPUTE_SQL_SHIM_URL` | `compute.sql_shim_url` | Guest-reachable base URL of the compute SQL shim (enables a workload's `--bind sql`). |
 | `BOATRAMP_COMPUTE_BLOB_SHIM_URL` | `compute.blob_shim_url` | Guest-reachable base URL of the compute blob shim (enables a workload's `--bind blob`). |
