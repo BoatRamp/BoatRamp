@@ -753,6 +753,32 @@ pub trait ComputeBackend: Send + Sync {
         false
     }
 
+    /// Re-discover a RUNNING replica's live routable [`Endpoint`], for the reconcile to
+    /// detect an endpoint that drifted out from under the stored record **while the
+    /// container keeps running under a stable identity** (so [`health`](Self::health)
+    /// never flips and no Stop/Launch is planned). The motivating case is the docker
+    /// `Published` mode: it publishes an **ephemeral** host port (`-p 127.0.0.1::<port>`,
+    /// `host_port "0"`), and docker **REASSIGNS that host port on every in-place
+    /// `--restart` restart** — an app that crash-exits (e.g. an OOM `137`) is relaunched
+    /// by its restart policy under the SAME container name with a NEW host port. The
+    /// container is `running` again, so `health` (run-state only) keeps reporting
+    /// `Healthy` and nothing recreates it — yet the stored [`Endpoint`] still points at
+    /// the dead old port, so the gateway dials it and 502s **forever** (the only recovery
+    /// is a manual `compute restart`, which drops the state so the next reconcile Launches
+    /// a fresh replica and re-discovers the port). The reconcile calls this each tick for
+    /// a running replica and RE-POINTS the stored endpoint when it differs, so routing
+    /// follows the live port with no container churn.
+    ///
+    /// `None` (the default) means the endpoint **cannot drift** for this backend (a fixed
+    /// in-container port, `Bridge` mode, an external DSN) or the replica is **not
+    /// currently resolvable** (down / restarting / gone) — in which case the stored
+    /// endpoint is left as-is and the normal health + plan path owns it. A backend MUST
+    /// return `None` rather than a guess, so a transient inspect failure never clobbers a
+    /// good endpoint.
+    async fn observed_endpoint(&self, _handle: &InstanceHandle) -> Option<Endpoint> {
+        None
+    }
+
     /// **Affirmative liveness** of a replica's backing container/VM, for the orphan
     /// reaper's fail-closed "is it gone?" decision — DISTINCT from [`health`](Self::health),
     /// which conflates *gone* with merely *unreachable*. Returns:
@@ -2477,6 +2503,28 @@ pub async fn reconcile_once(
                         state.healthy = now_healthy;
                         changed = true;
                     }
+                }
+                // 1b) Re-point the endpoint if the running replica's live address drifted
+                // out from under the stored record. The gateway routes to the STORED
+                // `endpoint` (see `compute_endpoints`), so an endpoint that moves while the
+                // container keeps running under a stable identity must be written back or
+                // the gateway dials a dead address. The concrete case: docker's `Published`
+                // mode publishes an EPHEMERAL host port that docker REASSIGNS on every
+                // in-place `--restart` restart — an OOM-crashing app (`137`) is relaunched
+                // by its restart policy under the same container name with a NEW host port,
+                // the container is `running` again (so the health refresh above keeps
+                // `healthy: yes` and nothing plans a Stop/Launch), yet the stored endpoint
+                // still points at the dead old port → the gateway 502s forever (healing
+                // only on a manual `compute restart`). Re-pointing makes routing follow the
+                // live port with no container churn. Only for a `Running` replica; `None`
+                // ⇒ the endpoint can't drift (fixed port / Bridge / external) or the
+                // replica isn't currently resolvable — leave the stored endpoint untouched.
+                if state.phase == ReplicaPhase::Running
+                    && let Some(ep) = backend.observed_endpoint(&state.handle).await
+                    && ep != state.endpoint
+                {
+                    state.endpoint = ep;
+                    changed = true;
                 }
                 // 2) Advance SERVICE-level readiness (distinct from `healthy`). A managed
                 // DB gets a real `SELECT 1` probe + its derived post-launch provisioning
@@ -5069,6 +5117,167 @@ mod tests {
         assert_eq!(woken[0].phase, ReplicaPhase::Running);
         assert!(woken[0].snapshot.is_none());
         assert!(woken[0].healthy);
+    }
+
+    /// A backend whose running replica's live endpoint DRIFTS out from under the stored
+    /// record while it stays healthy — the docker `--restart` ephemeral-host-port
+    /// reassignment shape: `launch` returns `:8080`, `health` is always `Healthy`, but
+    /// `observed_endpoint` reports the replica now lives at `:9090` (docker reassigned the
+    /// published host port on an in-place crash-restart under the same container name).
+    struct DriftingEndpointBackend;
+
+    #[async_trait]
+    impl ComputeBackend for DriftingEndpointBackend {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: false,
+                persistent_volumes: false,
+                max_vcpus: None,
+                max_mem_mib: None,
+            }
+        }
+        async fn materialize(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _spec: &ComputeSpec,
+            _pull_auth: Option<&RegistryAuth>,
+        ) -> Result<Artifact, BackendError> {
+            Ok(Artifact::Image {
+                reference: "img:latest".into(),
+            })
+        }
+        async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
+            Ok(Instance {
+                handle: InstanceHandle {
+                    project: req.project.clone(),
+                    workload: req.workload.clone(),
+                    replica: req.replica,
+                    backend_ref: format!("fake-{}", req.replica),
+                },
+                // The port the FIRST launch discovered.
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                },
+            })
+        }
+        async fn stop(&self, _handle: &InstanceHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn health(&self, _handle: &InstanceHandle) -> Result<Health, BackendError> {
+            // The container is still `running` (docker's restart policy relaunched it in
+            // place), so run-state health stays Healthy — the whole reason nothing else
+            // re-points the endpoint.
+            Ok(Health::Healthy)
+        }
+        async fn observed_endpoint(&self, _handle: &InstanceHandle) -> Option<Endpoint> {
+            // The in-place restart reassigned the ephemeral host port: the live endpoint
+            // is now :9090, not the :8080 the stored record still carries.
+            Some(Endpoint {
+                scheme: Scheme::Http,
+                host: "127.0.0.1".into(),
+                port: 9090,
+            })
+        }
+    }
+
+    /// Regression (docker-stale-endpoint): a reconcile tick must RE-POINT a running,
+    /// still-healthy replica's stored endpoint to the backend's live endpoint when it
+    /// drifted — docker reassigns the published ephemeral host port on every in-place
+    /// `--restart` restart (an OOM-crashing app relaunches under the same container name
+    /// with a NEW port), the container stays `running` (health keeps `yes`), and the
+    /// gateway routes to the STORED endpoint — so without re-pointing it dials the dead
+    /// old port and 502s forever. The fix must make routing follow the live port WITHOUT
+    /// a Stop/Launch recreate. Fails before the fix (endpoint stuck at `:8080`).
+    #[tokio::test]
+    async fn reconcile_repoints_a_running_replicas_drifted_endpoint_without_churn() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        let s = spec(1, 128);
+        let hash = deploy.put_compute_spec(&s).await.unwrap();
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash,
+                    replicas: 1,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let nodes = vec![fake_node()];
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(DriftingEndpointBackend));
+        let policy = BackendPolicy::default();
+
+        // Pass 1: launch the replica — it records the FIRST-discovered endpoint (:8080).
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((r.launched, r.stopped), (1, 0), "{:?}", r.errors);
+        let after_launch = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        assert_eq!(after_launch.len(), 1);
+        assert_eq!(
+            after_launch[0].endpoint.url(),
+            "http://127.0.0.1:8080",
+            "first launch records the discovered port"
+        );
+
+        // Pass 2: the replica is still running + healthy (docker relaunched it in place),
+        // but its live endpoint drifted to :9090. The reconcile must re-point the STORED
+        // endpoint to follow it — and must NOT recreate the replica to do so.
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (r.launched, r.stopped),
+            (0, 0),
+            "endpoint re-point must not churn the replica: {:?}",
+            r.errors
+        );
+        let after_drift = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        assert_eq!(after_drift.len(), 1, "same replica, not a recreate");
+        assert!(
+            after_drift[0].healthy,
+            "stays healthy (container is running)"
+        );
+        assert_eq!(
+            after_drift[0].endpoint.url(),
+            "http://127.0.0.1:9090",
+            "the stored endpoint must FOLLOW the drifted live port (the gateway routes to it)"
+        );
     }
 
     #[tokio::test]

@@ -1032,6 +1032,56 @@ impl ComputeBackend for DockerBackend {
         !container_alias_is_current(live_aliases, &expected_alias)
     }
 
+    /// Re-discover a running container's live published host port (the reconcile's
+    /// endpoint re-point — see [`ComputeBackend::observed_endpoint`]). Only the
+    /// `Published` mode drifts: docker reassigns the ephemeral host port on every
+    /// in-place `--restart` restart, so a crash-looping (e.g. OOM `137`) app is
+    /// relaunched under the SAME container name with a NEW host port while the stored
+    /// endpoint keeps the dead old one. `Bridge` mode routes to the container's bridge
+    /// IP + the fixed in-container port, which an in-place restart preserves, so it does
+    /// not drift here (returns `None`). Returns `None` — never a guess — for a container
+    /// that is not currently `running` (restarting / exited / gone: it has no live
+    /// published port, and its (un)health is the plan path's business), for an inspect
+    /// failure, or for a no-port workload (nothing published). Reads the port straight
+    /// off the single inspect rather than re-inspecting via `published_host_port`.
+    async fn observed_endpoint(&self, handle: &InstanceHandle) -> Option<Endpoint> {
+        if self.endpoint != DockerEndpoint::Published {
+            return None;
+        }
+        let name = match decode_ref(&handle.backend_ref) {
+            Some((n, _, _)) => n,
+            None => container_name(&handle.project, &handle.workload, handle.replica),
+        };
+        let info = self.docker.inspect_container(&name, None).await.ok()?;
+        // Only a genuinely RUNNING container has a live published port to re-read. A
+        // restarting/exited/created one momentarily has no (or a torn-down) binding —
+        // routing to it is pointless and the normal health→Stop/Launch path owns it.
+        if !matches!(
+            info.state.as_ref().and_then(|s| s.status),
+            Some(ContainerStateStatusEnum::RUNNING)
+        ) {
+            return None;
+        }
+        // The workload publishes a single container port; take the first live host-port
+        // binding. (A no-port workload has an empty port map → `None`, correctly skipped.)
+        let port = info
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.ports.as_ref())
+            .and_then(|ports| {
+                ports
+                    .values()
+                    .flatten() // Option<Vec<PortBinding>> → the Vecs that are Some
+                    .flatten() // Vec<PortBinding> → each PortBinding
+                    .find_map(|b| b.host_port.as_ref().and_then(|hp| hp.parse::<u16>().ok()))
+            })?;
+        Some(Endpoint {
+            scheme: Scheme::Http,
+            host: "127.0.0.1".to_string(),
+            port,
+        })
+    }
+
     /// List this backend's persistent volumes (the host-side backing for a spec's
     /// [`VolumeRef`]s), so `GET /api/compute/volumes` can surface a docker-managed
     /// volume for operator reclamation. Only volumes this backend owns are reported —
