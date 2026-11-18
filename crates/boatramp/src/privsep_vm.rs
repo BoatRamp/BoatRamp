@@ -106,6 +106,7 @@ impl VmAssets {
 mod imp {
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -334,6 +335,54 @@ mod imp {
         uds_path: PathBuf,
     }
 
+    /// The DEDICATED, non-world-writable runtime root under which each VM's single-socket vsock-UDS
+    /// directory is created (0700) — replacing world-writable `std::env::temp_dir()` (`/tmp`, mode
+    /// 1777), whose shared, world-writable namespace exposed a TOCTOU/connect surface around
+    /// firecracker's socket. Prefers an explicit `$RUNTIME_DIRECTORY` (systemd `RuntimeDirectory=`,
+    /// already a 0700 per-service dir under `/run`), else `/run/boatramp-vm` (created 0700 under `/run`
+    /// — a root-owned 0755 tmpfs, NOT world-writable). The relay's minimal mount-ns root binds exactly
+    /// this per-VM dir, so a `/run`-based location stays reachable to the relay while every OTHER host
+    /// UDS path is removed. Fail-closed: if a non-world-writable 0700 root cannot be established, returns
+    /// `Err` — NEVER a silent fall-back to `/tmp`.
+    fn vm_vsock_runtime_root() -> io::Result<PathBuf> {
+        let base = match std::env::var_os("RUNTIME_DIRECTORY") {
+            Some(d) if !d.is_empty() => {
+                // systemd may pass a colon-separated list; the first entry is this service's own dir.
+                let first = d.to_string_lossy();
+                let first = first.split(':').next().unwrap_or_default();
+                if first.is_empty() {
+                    PathBuf::from("/run/boatramp-vm")
+                } else {
+                    PathBuf::from(first).join("vm-relay")
+                }
+            }
+            _ => PathBuf::from("/run/boatramp-vm"),
+        };
+        std::fs::create_dir_all(&base).map_err(|e| {
+            io::Error::other(format!(
+                "creating the VM vsock runtime root {}: {e}",
+                base.display()
+            ))
+        })?;
+        // Lock it to 0700 and VERIFY it is not world-writable (fail-closed — a world-writable runtime
+        // root would reopen the very TOCTOU/connect surface this moves away from `/tmp` to close).
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            io::Error::other(format!(
+                "locking the VM vsock runtime root {} to 0700: {e}",
+                base.display()
+            ))
+        })?;
+        let mode = std::fs::metadata(&base)?.permissions().mode();
+        if mode & 0o002 != 0 {
+            return Err(io::Error::other(format!(
+                "the VM vsock runtime root {} is world-writable (mode {:o}) — refusing fail-closed",
+                base.display(),
+                mode & 0o777
+            )));
+        }
+        Ok(base)
+    }
+
     fn boot_firecracker(
         assets: &VmAssets,
         work_dir: &Path,
@@ -342,16 +391,22 @@ mod imp {
     ) -> io::Result<BootedVm> {
         verify_guest_kernel(&assets.guest_kernel, assets.guest_kernel_sha256.as_deref())?;
         // The vsock UDS path must fit `sockaddr_un.sun_path` (SUN_LEN ≈ 108 bytes) — a deep work_dir
-        // would overflow it — so the UDS lives at a SHORT unique path under the runtime temp dir, while
-        // the (long-path-tolerant) initramfs / config / console stay in `work_dir`. It goes in a
-        // DEDICATED per-VM directory holding ONLY this socket, so the relay's Landlock FS view can grant
-        // that one directory (Landlock cannot O_PATH-open a socket inode on static-musl —
-        // `boatramp_server::sandbox::relay_supervisor_policy`) while staying tight.
-        let uds_dir =
-            std::env::temp_dir().join(format!("brvsk-{}-{}", guest_cid, std::process::id()));
+        // would overflow it — so the UDS lives at a SHORT unique path under a DEDICATED, NON-world-
+        // writable runtime root ([`vm_vsock_runtime_root`] — NOT world-writable `/tmp`, which exposed a
+        // TOCTOU/connect surface around firecracker's socket), while the (long-path-tolerant) initramfs
+        // / config / console stay in `work_dir`. The per-VM dir is mode 0700 and holds ONLY this socket,
+        // so the relay's Landlock FS view can grant that one directory (Landlock cannot O_PATH-open a
+        // socket inode on static-musl — `boatramp_server::sandbox::relay_supervisor_policy`) while
+        // staying tight. Fail-closed: if a non-world-writable runtime root can't be set up, refuse.
+        let runtime_root = vm_vsock_runtime_root()?;
+        let uds_dir = runtime_root.join(format!("brvsk-{}-{}", guest_cid, std::process::id()));
         let _ = std::fs::remove_dir_all(&uds_dir); // a stale dir from a prior run would block the bind
         std::fs::create_dir_all(&uds_dir)
             .map_err(|e| io::Error::other(format!("creating the vsock UDS dir: {e}")))?;
+        // 0700 (owner-only): the single-socket dir is reachable ONLY by the firecracker-booting node and
+        // the relay (same uid 0) — remove the world-traversable/connect surface of the old `/tmp` dir.
+        std::fs::set_permissions(&uds_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| io::Error::other(format!("locking the vsock UDS dir to 0700: {e}")))?;
         let uds_path = uds_dir.join("vsock.sock");
         let config_path = work_dir.join("firecracker.json");
         // Raw firecracker machine config: kernel + initrd + vsock, `drives: []`, no
