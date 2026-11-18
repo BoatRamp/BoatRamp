@@ -47,7 +47,16 @@
 //! 4. **Operator path reaches the tenant DB:** through [`NodeOperatorSql`] (project
 //!    `exampleorg`) `SELECT current_database(), current_user` reaches the tenant's
 //!    `pg-<ident>` database + user — NOT a bare `pg`/`default`.
-//! 5. Print a single success marker only after every assertion held.
+//! 5. **Drop reclaims the SCOPED PGDATA + a re-provision initializes fresh (papercut-a /
+//!    Finding-1 native-container proof):** drive the SHIPPED drop
+//!    ([`deprovision_tenant`] with the backend registry) — it stops the container and
+//!    reclaims the native `container` SCOPED volume
+//!    (`<data_dir>/compute/volumes/@<scope>/…`, via `remove_scoped_volume`), NOT merely
+//!    the docker FLAT name — so the on-disk scoped dir is GONE; then re-provision the same
+//!    tenant (which mints a NEW credential), relaunch (fresh `initdb` on the now-empty
+//!    volume), and prove the SHIPPED resolver authenticates with the NEW credential live
+//!    (no stale-volume "password authentication failed" re-provision failure).
+//! 6. Print the success markers only after every assertion held.
 //!
 //! No host `psql` is needed — every connection goes through boatramp's own Postgres
 //! backend (sqlx), exactly as [`single_volume_live`] does.
@@ -96,8 +105,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_container::ContainerBackend;
 use boatramp_core::compute::{
-    Artifact, ComputeBackend, InstanceHandle, LaunchRequest, ObservedInstance, PrivilegeDirective,
-    ReplicaPhase,
+    Artifact, BackendRegistry, ComputeBackend, InstanceHandle, LaunchRequest, ObservedInstance,
+    PrivilegeDirective, ReplicaPhase, compute_volume_scope,
 };
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
@@ -107,7 +116,7 @@ use boatramp_core::sql::{OperatorSql, SqlBackend, SqlValue};
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use boatramp_node::managed_sql::{ManagedSqlCredentials, NodeOperatorSql};
-use boatramp_node::tenant_sql::{NodeTenantSqlResolver, provision_tenant};
+use boatramp_node::tenant_sql::{NodeTenantSqlResolver, deprovision_tenant, provision_tenant};
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -300,6 +309,14 @@ async fn single_tenant_reachable_credential_stable_and_operator_reaches_it() {
         "SINGLE RECONCILE OK: one tenant workload, reachable no-restart, credential stable \
          across reconcile, operator path reaches tenant DB"
     );
+    // A SECOND marker for the drop → reclaim-scoped-PGDATA → re-provision → fresh-credential
+    // authenticates lifecycle (papercut-a / Finding-1 native-container proof, Assertion 5).
+    // The capability gate greps for this one specifically, so a build that ran only the
+    // older assertions (or silently skipped) fails the job.
+    println!(
+        "SINGLE REPROVISION OK: drop reclaimed the scoped PGDATA; a same-name re-provision \
+         initialized fresh and authenticates with its NEW credential (no stale-volume failure)"
+    );
 }
 
 /// The assertion outcome plus every launched container handle, so the caller can tear the
@@ -491,6 +508,110 @@ async fn drive(
     eprintln!(
         "assertion 4: operator SELECT current_database(),current_user = ({op_db:?}, {op_user:?}) \
          — reaches the tenant DB  OK"
+    );
+
+    // === Assertion 5 (DROP RECLAIMS THE SCOPED PGDATA + A RE-PROVISION INITIALIZES FRESH
+    // AGAINST A NEW CREDENTIAL — the papercut-a / Finding-1 native-container runtime proof):
+    // the fix must reclaim the SCOPED volume layout the native `container` backend uses
+    // (`<data_dir>/compute/volumes/@<scope>/…`), not just the docker FLAT name — otherwise a
+    // same-name re-provision re-attaches the dropped DB's stale, OLD-credential PGDATA and
+    // auth fails. Drive the SHIPPED drop through `deprovision_tenant` with the real backend
+    // registry, assert the scoped dir is GONE on disk, re-provision (which mints a NEW
+    // credential), relaunch (fresh initdb on the now-empty volume), and prove the resolver
+    // authenticates with the NEW credential live. ===
+    let old_pw = creds
+        .password(TENANT, &workload_name)
+        .await
+        .map_err(|e| format!("read the pre-drop credential: {e}"))?;
+    // The scoped PGDATA dir the launch staged (the native `container` layout). It must
+    // exist now (a populated, initdb'd volume) and be GONE after the drop.
+    let scope = compute_volume_scope(TENANT, &workload_name);
+    let scoped_dir = data_dir
+        .join("compute")
+        .join("volumes")
+        .join(format!("@{scope}"));
+    if !scoped_dir.is_dir() {
+        return Err(format!(
+            "pre-drop: the tenant's scoped PGDATA dir {scoped_dir:?} should exist"
+        ));
+    }
+
+    // The drop stops the running container, reclaims the volume (BOTH layouts), and deletes
+    // the workload + credential. Hand it a registry holding THIS container backend so the
+    // scoped reclaim actually fires. grace=0 ⇒ immediate SingleDrop. The current container's
+    // observed replica-state (published by the launch) is what the drop stops + clears, so
+    // pop its handle — the drop owns its teardown now.
+    let dropped = handles
+        .pop()
+        .expect("a launched handle present before the drop");
+    let mut reg: BackendRegistry = std::collections::BTreeMap::new();
+    reg.insert(
+        backend.id().to_string(),
+        backend.clone() as Arc<dyn ComputeBackend>,
+    );
+    deprovision_tenant(deploy, kv, envelope, Some(&reg), &binding, TENANT, "", 0)
+        .await
+        .map_err(|e| format!("drop (deprovision_tenant): {e}"))?;
+    let _ = &dropped; // its container was stopped + removed by the drop above
+
+    // The SCOPED PGDATA must be gone — the stale-credential volume can no longer be
+    // re-attached (the Finding-1 proof: a docker-flat-only reclaim would leave this dir).
+    if scoped_dir.exists() {
+        return Err(format!(
+            "FINDING 1: the drop left the scoped PGDATA dir {scoped_dir:?} behind — a same-name \
+             re-provision would re-attach the stale, old-credential volume (the \
+             docker-flat-only reclaim gap)"
+        ));
+    }
+    // The workload desired-state is gone too (the drop deleted it).
+    if deploy
+        .get_compute_workload(proj, &workload_name)
+        .await
+        .map_err(|e| format!("re-check workload after drop: {e}"))?
+        .is_some()
+    {
+        return Err("the drop did not remove the tenant's workload desired-state".to_string());
+    }
+    eprintln!("assertion 5a: drop reclaimed the SCOPED PGDATA dir {scoped_dir:?}  OK");
+
+    // Re-provision the SAME tenant: it mints a FRESH credential (the drop deleted the old
+    // one) and re-registers the workload.
+    provision_tenant(deploy, kv, envelope, &binding, TENANT, "")
+        .await
+        .map_err(|e| format!("re-provision after drop: {e}"))?;
+    let new_pw = creds
+        .password(TENANT, &workload_name)
+        .await
+        .map_err(|e| format!("read the re-provisioned credential: {e}"))?;
+    if new_pw == old_pw {
+        return Err(
+            "re-provision did not mint a NEW credential — the drop must delete the old sealed \
+             credential so the re-provision mints a fresh one"
+                .to_string(),
+        );
+    }
+
+    // Relaunch from the re-registered spec. The scoped volume was removed, so the backend
+    // stages a FRESH empty one and the container `initdb`s against the NEW credential.
+    let handle3 = launch_from_registered_spec(deploy, creds, backend, data_dir, &workload_name)
+        .await
+        .map_err(|e| format!("relaunch after re-provision: {e}"))?;
+    handles.push(handle3);
+
+    // The SHIPPED resolver must authenticate LIVE with the NEW credential — proving the
+    // fresh initdb took and a re-provision is reachable with no stale-volume auth failure.
+    let resolved3 = resolve_tenant_backend(deploy, kv, envelope, &binding).await?;
+    let user_reprov = wait_for_authenticated_query(&resolved3).await?;
+    if user_reprov != APP_USER {
+        return Err(format!(
+            "after drop + re-provision, current_user was {user_reprov:?}, expected {APP_USER:?} \
+             — the re-provision did not initialize fresh against its new credential (a surviving \
+             stale volume would fail auth here)"
+        ));
+    }
+    eprintln!(
+        "assertion 5b: after drop + re-provision, SELECT current_user = {user_reprov:?} with a \
+         FRESH credential (initdb took, no stale-volume auth failure)  OK"
     );
 
     Ok(())

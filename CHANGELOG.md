@@ -29,6 +29,34 @@ versions.
   consistent with how the authz path already treats such tokens. Present the sealed delegate (no
   onward `cnf`), or include the per-request `Boatramp-PoP` proof.
 
+### Fixed
+
+- **`db drop database` now reclaims a dedicated (`tenant: single`) managed database's data volume as
+  part of the drop, on every compute backend, so a same-name re-provision initializes fresh against
+  its new credential.** Previously the drop tore down the container + binding + sealed credential but
+  LEFT the workload's data volume behind; re-provisioning a managed Postgres of the same name then
+  silently re-attached that stale volume (whose cluster was `initdb`-ed with the OLD credential), so
+  the fresh credential never took and every connection failed `password authentication failed … data
+  volume was initialized with a different credential`. The Single-tenant drop (the explicit `db drop
+  database`, and the project/site delete that tears a tenant down — never a restart/reconcile/heal,
+  which reattach the same volume) now stops the container and removes its per-`(project, workload)`
+  data volume across BOTH on-node layouts: the FLAT docker named volume / bind dir, and the SCOPED
+  native-`container` PGDATA (`<data_dir>/compute/volumes/@<scope>/…`) and the Kubernetes PVC
+  (`data-<workload>`). The remote-Docker backend also gained `remove_volume`/`list_volumes` (it had
+  neither), so `compute volume rm` and `GET /api/compute/volumes` now work against docker-managed
+  volumes; docker refuses to address a native-container `@<scope>` directory when the two backends
+  share a `data_dir`.
+- **A managed database re-provisioned with a fresh credential is now picked up LIVE by running
+  handlers, with no `serve` restart.** The serve process caches a managed `sql` binding's resolved
+  backend (with its credential) for the process lifetime; after a `db drop database` + re-create
+  minted a new credential, a running handler kept using the stale cached credential and failed auth
+  until the serve was restarted. The credential-deleting paths — `db drop database`, the
+  `--orphan` drop, AND a project/site delete — now bump a per-`(project, database)` credential epoch
+  that the binding caches (the static per-tenant composite cache and the apply-declared resolver
+  cache) consult, so the next use after a re-provision (including a same-name project recreate)
+  re-resolves and rebuilds against the new credential. The rebuild is atomic (the backend is swapped
+  whole under the cache lock) and scoped to exactly the re-provisioned binding.
+
 ## [0.59.2]
 
 ### Fixed

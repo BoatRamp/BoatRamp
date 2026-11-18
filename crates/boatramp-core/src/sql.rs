@@ -1652,6 +1652,78 @@ pub enum PreviewSqlMode {
     Shared,
 }
 
+/// A process-global registry of managed-DB **binding credential epochs** — a cheap,
+/// in-memory, per-`(project, binding)` generation counter that lets a serve process
+/// INVALIDATE its cached `sql` binding backends the instant a managed database is
+/// re-provisioned with a fresh credential, with no serve restart.
+///
+/// # Why it exists
+///
+/// A compute-backed managed `sql` binding resolves, per tenant, to a backend built with
+/// the binding's **sealed credential**, and the serve-process caches that backend for
+/// the process lifetime (the composite's per-tenant cache + the declared-DB resolver's
+/// positive cache both do). When an operator `db drop database`s a managed DB and
+/// re-provisions it under the same name, a BRAND-NEW credential is minted (the drop
+/// deleted the old sealed one). The cached backend still holds the OLD credential, so a
+/// running handler keeps failing auth until the serve is restarted (the only thing that
+/// rebuilt the cache) — the "stale cached sql binding credential" papercut.
+///
+/// # How it fixes it
+///
+/// The drop (the authoritative event that makes a cached credential stale — it deletes
+/// the sealed credential) [`bump`](Self::bump)s the `(project, name)` epoch. Each cache
+/// stamps the epoch it resolved at, and on every lookup compares it to the current epoch;
+/// a mismatch forces a rebuild, which re-resolves the (now fresh) credential and swaps
+/// the backend atomically under the cache's own lock — so a re-provision's new credential
+/// is picked up LIVE, on the next handler use, with no restart.
+///
+/// # Safety
+///
+/// The counter is **monotonic** and scoped to exactly one `(project, binding)`: a bump
+/// can only ever force a re-resolve of THAT binding, never serve a staler credential and
+/// never widen any authority. A missing entry reads as epoch `0` (the never-bumped
+/// steady state), so an un-dropped binding behaves exactly as before.
+#[derive(Debug, Default)]
+pub struct SqlBindingEpochs {
+    inner: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl SqlBindingEpochs {
+    /// The map key for a `(project, binding-name)` pair. Both are validated resource
+    /// identifiers (no `/`), so a plain `/` join is unambiguous.
+    fn key(project: &str, name: &str) -> String {
+        format!("{project}/{name}")
+    }
+
+    /// Bump (increment) the epoch for `(project, name)` and return the new value. Called
+    /// by the managed-DB drop paths when a binding's credential is deleted, so any cached
+    /// backend resolved at the prior epoch is invalidated on its next use.
+    pub fn bump(&self, project: &str, name: &str) -> u64 {
+        let mut guard = self.inner.lock().expect("sql-binding-epochs poisoned");
+        let slot = guard.entry(Self::key(project, name)).or_insert(0);
+        *slot += 1;
+        *slot
+    }
+
+    /// The current epoch for `(project, name)` — `0` when it was never bumped. A cache
+    /// records this at resolve time and rebuilds when it later disagrees.
+    pub fn epoch(&self, project: &str, name: &str) -> u64 {
+        let guard = self.inner.lock().expect("sql-binding-epochs poisoned");
+        guard.get(&Self::key(project, name)).copied().unwrap_or(0)
+    }
+}
+
+/// The process-global [`SqlBindingEpochs`]. A single shared instance so the managed-DB
+/// drop path (which deletes the credential) and the serve-process `sql` binding caches
+/// (which must re-resolve it) agree on the generation without any constructor wiring —
+/// the invalidation is inherently process-local, cross-cutting, and need not be durable
+/// or shared across nodes (each serve process caches its own backends).
+pub fn sql_binding_epochs() -> &'static SqlBindingEpochs {
+    static EPOCHS: std::sync::LazyLock<SqlBindingEpochs> =
+        std::sync::LazyLock::new(SqlBindingEpochs::default);
+    &EPOCHS
+}
+
 /// Resolves a site's named SQL databases to [`SqlBackend`]s — the seam the
 /// server's handler runtime uses to obtain a per-site database on demand
 /// (opening/caching it lazily). The concrete mapping (a libsql file per site,
@@ -2941,5 +3013,50 @@ mod reserved_session_writes_tests {
         assert!(!rejected("SET @x = 1, @y = 2"));
         assert!(!rejected("SELECT 42 INTO @myvar"));
         assert!(!rejected("SELECT total INTO @t FROM orders WHERE id = $1"));
+    }
+}
+
+#[cfg(test)]
+mod sql_binding_epochs_tests {
+    use super::SqlBindingEpochs;
+
+    #[test]
+    fn unbumped_is_zero_and_bump_is_monotonic_and_scoped() {
+        let epochs = SqlBindingEpochs::default();
+        // A never-bumped binding reads as epoch 0 (the steady state a cache stamps at).
+        assert_eq!(epochs.epoch("acme", "app"), 0);
+
+        // Bump increments and returns the new value; the epoch read agrees.
+        assert_eq!(epochs.bump("acme", "app"), 1);
+        assert_eq!(epochs.epoch("acme", "app"), 1);
+        assert_eq!(epochs.bump("acme", "app"), 2);
+        assert_eq!(epochs.epoch("acme", "app"), 2);
+
+        // Scoped per (project, name): a different binding / project is untouched — a drop
+        // of one managed DB never invalidates another's cache.
+        assert_eq!(epochs.epoch("acme", "other"), 0);
+        assert_eq!(epochs.epoch("globex", "app"), 0);
+        epochs.bump("globex", "app");
+        assert_eq!(epochs.epoch("globex", "app"), 1);
+        assert_eq!(
+            epochs.epoch("acme", "app"),
+            2,
+            "sibling bump must not bleed over"
+        );
+    }
+
+    #[test]
+    fn project_and_name_do_not_collide_across_the_slash_boundary() {
+        // The `/` join must not let `(a, b/c)` and `(a/b, c)` alias — both project and
+        // name are `/`-free validated identifiers, so this can't happen in practice, but
+        // guard the key scheme anyway.
+        let epochs = SqlBindingEpochs::default();
+        epochs.bump("a", "app");
+        assert_eq!(epochs.epoch("a", "app"), 1);
+        assert_eq!(
+            epochs.epoch("a/app", ""),
+            0,
+            "a different (project, name) pair must be a distinct slot"
+        );
     }
 }

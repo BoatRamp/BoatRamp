@@ -3886,6 +3886,9 @@ async fn project_sync_idempotency_orphan_recovery_live() {
         &deploy,
         &kv,
         &envelope,
+        // Shared-Postgres soft-deprovision (non-zero grace) — never the `SingleDrop`
+        // arm, so no backend registry / volume reclaim is involved.
+        None,
         &binding,
         &dest,
         "",
@@ -3997,6 +4000,9 @@ async fn project_sync_idempotency_orphan_recovery_live() {
         envelope.clone(),
         BTreeMap::new(),
         0,
+        // This declared tenant is `Shared` → the drop never routes to the `SingleDrop`
+        // arm, so no backend registry / volume reclaim is exercised here.
+        BTreeMap::new(),
     );
     deprovisioner.deprovision_project(&decl).await;
     let (_c, after_rm) = psql(

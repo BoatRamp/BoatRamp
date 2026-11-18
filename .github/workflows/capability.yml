@@ -391,7 +391,7 @@ jobs:
           grep -q 'SINGLE VOLUME ISOLATION OK' single-vol.log \
             || { echo "::error::single-mode volume isolation never reached the success marker (silent skip or shared-volume regression?)" >&2; exit 1; }
 
-      - name: Single-mode reconcile stability holds live (hard gate — the v0.3.12 fixes)
+      - name: Single-mode reconcile stability + drop/re-provision lifecycle hold live (hard gate — v0.3.12 fixes + managed-DB re-provision Finding 1)
         run: |
           set -o pipefail
           BIN="$(realpath target/debug/boatramp)"
@@ -408,23 +408,32 @@ jobs:
           # (reachable), (3) after a boot-style reconcile (stop + relaunch on the same volume,
           # initdb skipped) the credential is STILL valid (the P1 == P2 core), and (4) the
           # `NodeOperatorSql` operator path reaches the tenant's OWN database + user (not a
-          # bare `pg`/`default`). No host DB client is needed — every connect goes through
-          # boatramp's own pg backend. --test-threads=1 so the launches don't contend on the
-          # single test bridge. The `sql-postgres` feature pulls the tenant_sql/managed_sql
-          # data plane in.
+          # bare `pg`/`default`). It THEN drives the SHIPPED drop (`deprovision_tenant` with
+          # the backend registry) and asserts (5) the native `container` SCOPED PGDATA dir
+          # `<data_dir>/compute/volumes/@<scope>/…` is REMOVED (the managed-DB re-provision
+          # Finding-1 proof — a docker-FLAT-only reclaim would strand it here, so this is the
+          # ONLY backend that catches that gap), then RE-PROVISIONS the same tenant (mints a
+          # NEW credential) and proves a relaunch `initdb`s fresh + the resolver authenticates
+          # with the NEW credential live (no stale-volume failure). No host DB client is
+          # needed. --test-threads=1 so the launches don't contend on the single test bridge.
+          # The `sql-postgres` feature pulls the tenant_sql/managed_sql data plane in.
           timeout -k 30 900 sudo -E env "PATH=$PATH" "BOATRAMP_BIN=$BIN" \
             cargo test -p boatramp-node --features sql-postgres \
             --test single_reconcile_live \
             -- --ignored --test-threads=1 --nocapture 2>&1 | tee single-reconcile.log
           # A silent skip (missing BOATRAMP_BIN) still prints `test result: ok` — the exact
-          # trap the project's anti-silent-skip rule guards against. Gate on the success marker
-          # that prints ONLY after the no-split, reachable-no-restart, credential-stable, AND
-          # operator-reaches-tenant assertions all held, so a skip or a regression (Bug 1 or
-          # Bug 2) fails the job.
+          # trap the project's anti-silent-skip rule guards against. Gate on BOTH success
+          # markers: the first prints only after the no-split, reachable-no-restart,
+          # credential-stable, AND operator-reaches-tenant assertions held; the second ONLY
+          # after the drop reclaimed the scoped PGDATA AND a re-provision authenticated with a
+          # fresh credential — so a skip, a v0.3.12 regression, OR a docker-flat-only volume
+          # reclaim (Finding 1) fails the job.
           grep -qE 'test result: ok' single-reconcile.log \
             || { echo "::error::single-mode reconcile stability test did not pass" >&2; exit 1; }
           grep -q 'SINGLE RECONCILE OK:' single-reconcile.log \
             || { echo "::error::single-mode reconcile stability never reached the success marker (silent skip or a v0.3.12 regression?)" >&2; exit 1; }
+          grep -q 'SINGLE REPROVISION OK:' single-reconcile.log \
+            || { echo "::error::managed-DB drop/re-provision never reached its marker (silent skip, OR the Finding-1 gap — the drop did not reclaim the native-container SCOPED PGDATA, so a same-name re-provision re-attached a stale, old-credential volume)" >&2; exit 1; }
 
       - name: Project export/import round-trip holds live (hard gate — the env-clone pipeline)
         run: |

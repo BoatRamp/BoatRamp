@@ -63,6 +63,11 @@ use crate::tenant_sql::NodeTenantSqlResolver;
 /// and never re-reads the store.
 const NEGATIVE_TTL: Duration = Duration::from_secs(3);
 
+/// The positive-cache map: a resolved per-tenant backend keyed by tenant grain, each
+/// stamped with the [`SqlBindingEpochs`](boatramp_core::sql::SqlBindingEpochs) generation
+/// it was resolved at (see the field doc on [`NodeDeclaredDbResolver::resolved`]).
+type EpochStampedBackendCache = Mutex<HashMap<String, (u64, Arc<dyn SqlBackend>)>>;
+
 /// The node's [`DeclaredDbResolver`]: bridges the per-project declarative store into the
 /// serve-time `sql` binding composite (cap-req #28 B). See the module docs.
 pub struct NodeDeclaredDbResolver {
@@ -77,16 +82,18 @@ pub struct NodeDeclaredDbResolver {
     /// tenant grain — so a hot path reuses the connection pool instead of re-provisioning +
     /// reconnecting each `sql.open()`. Mirrors the composite's own per-tenant cache.
     ///
-    /// This positive cache has NO expiry (a backend, once resolved, is kept for the life of
-    /// the process), so a managed-DB credential ROTATION or revocation is not observed until
-    /// the serve process restarts (cap-req #28 review, F3). This is deliberately the SAME
-    /// lifetime the static per-tenant path has (the composite's own per-tenant cache and
-    /// `NodeTenantSqlResolver` cache a resolved backend for the process lifetime too), so the
-    /// declared fallback adds no new staleness window beyond the inherited one. It is keyed by
-    /// tenant grain, so it is NEVER a cross-tenant exposure — a stale entry only ever re-serves
-    /// the SAME tenant its own (now-rotated) backend. Left as-is on purpose (behavior unchanged):
-    /// a bounded TTL here would also expire the SQL connection pool a hot path depends on.
-    resolved: Mutex<HashMap<String, Arc<dyn SqlBackend>>>,
+    /// Each entry is stamped with the binding's
+    /// [`SqlBindingEpochs`](boatramp_core::sql::SqlBindingEpochs) generation: a hit whose
+    /// stamp is behind the binding's current epoch is discarded and rebuilt. A managed-DB
+    /// drop (the authoritative staleness event — it deletes the sealed credential) bumps
+    /// that epoch, so a same-name RE-PROVISION's fresh credential is picked up live on the
+    /// next `sql.open()` with no serve restart (papercut-b) — closing the "a credential
+    /// rotation is not observed until restart" window the previous no-expiry cache had
+    /// (cap-req #28 review, F3). Still keyed by tenant grain, so it is NEVER a cross-tenant
+    /// exposure — a stale entry only ever re-served (and now re-resolves) the SAME tenant's
+    /// own backend. The stamp carries no TTL, so a hot path's pool is untouched when the
+    /// epoch has not moved.
+    resolved: EpochStampedBackendCache,
     /// Negative cache: `(project, name)` → expiry, for names the project has NOT declared
     /// (see [`NEGATIVE_TTL`]).
     negative: Mutex<HashMap<String, Instant>>,
@@ -210,14 +217,19 @@ impl DeclaredDbResolver for NodeDeclaredDbResolver {
 
         let site_scoped = matches!(binding.tenant_scope, TenantScope::Site);
         let key = Self::positive_key(project, site, name, site_scoped);
-        if let Some(hit) = self
+        // The binding's current credential generation (`name` is already the canonical
+        // declared name here — the composite default-aliases `""` → `"default"` before
+        // calling us, matching what the operator drop bumps). A cached backend stamped at
+        // an older epoch is stale (a re-provision minted a new credential), so rebuild it.
+        let epoch = boatramp_core::sql::sql_binding_epochs().epoch(project, name);
+        if let Some((stamp, hit)) = self
             .resolved
             .lock()
             .expect("declared-db resolved cache poisoned")
             .get(&key)
-            .cloned()
+            && *stamp == epoch
         {
-            return Ok(Some(hit));
+            return Ok(Some(Arc::clone(hit)));
         }
 
         // Resolve with the SAME per-tenant machinery a static managed binding uses: it
@@ -239,7 +251,7 @@ impl DeclaredDbResolver for NodeDeclaredDbResolver {
         self.resolved
             .lock()
             .expect("declared-db resolved cache poisoned")
-            .insert(key, backend.clone());
+            .insert(key, (epoch, backend.clone()));
         Ok(Some(backend))
     }
 }
@@ -389,6 +401,67 @@ mod tests {
             matches!(outcome, Ok(true)),
             "a declared default must resolve to a managed backend, not fall through to the \
              libsql default: {outcome:?}"
+        );
+    }
+
+    /// REPRODUCE-FIRST GATE (papercut-b, declared/apply path): the positive cache keeps a
+    /// resolved backend for the process lifetime, so a managed-DB RE-PROVISION's fresh
+    /// credential was invisible until a serve restart. Bumping the binding's credential
+    /// epoch (what a drop does) must invalidate the cache so the next `resolve` REBUILDS
+    /// the backend (re-resolving the new credential), live. Proven by backend identity: a
+    /// cache hit returns the SAME `Arc`; a post-bump rebuild returns a DIFFERENT one.
+    ///
+    /// MUTATION: drop the `*stamp == epoch` guard in `resolve` (always return the hit) and
+    /// the post-bump resolve returns the SAME `Arc` → the `!ptr_eq` assertion fails. Uses
+    /// a project unique to this test to isolate the process-global epoch registry.
+    #[tokio::test]
+    async fn declared_cache_rebuilds_on_credential_epoch_bump() {
+        let project = "acme-declared-epoch"; // unique: isolates the process-global epoch
+        let d = deploy();
+        d.set_project_database(ProjectRef::new(project), &single_default())
+            .await
+            .expect("seed declaration");
+        let r = resolver(d, &BTreeMap::new());
+
+        // First resolve builds + caches the backend; a second is a cache HIT (same Arc).
+        let a = r
+            .resolve(project, "", "default")
+            .await
+            .unwrap()
+            .expect("declared default resolves");
+        let a2 = r
+            .resolve(project, "", "default")
+            .await
+            .unwrap()
+            .expect("cache hit");
+        assert!(
+            Arc::ptr_eq(&a, &a2),
+            "steady state: the declared backend is cached (same Arc reused)"
+        );
+
+        // A drop (preceding a re-provision) bumps this binding's credential epoch.
+        boatramp_core::sql::sql_binding_epochs().bump(project, "default");
+
+        // The next resolve now REBUILDS (a different Arc) — the fresh credential is picked
+        // up live, no serve restart.
+        let b = r
+            .resolve(project, "", "default")
+            .await
+            .unwrap()
+            .expect("post-bump resolve rebuilds");
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "a credential-epoch bump must invalidate the cache ⇒ the next resolve rebuilds"
+        );
+        // …and settles: a further resolve is cached again at the new epoch (same as `b`).
+        let b2 = r
+            .resolve(project, "", "default")
+            .await
+            .unwrap()
+            .expect("cached at new epoch");
+        assert!(
+            Arc::ptr_eq(&b, &b2),
+            "after the rebuild the new-epoch backend is cached (no per-request churn)"
         );
     }
 }
