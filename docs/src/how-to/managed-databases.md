@@ -199,6 +199,13 @@ To declare, change, or tear down a database itself, edit the manifest and `apply
 use the imperative teardown verb `boatramp db drop database <name> -y`, with `--orphan`
 for an undeclared orphan left by a prior failed sync/`rm`) — not this command.
 
+Dropping a **dedicated (`tenant: single`)** database — the explicit `db drop database`,
+and the project/site delete that tears a tenant down — also **reclaims its data volume**
+along with the sealed credential (a restart/reconcile/heal never does — those re-attach the
+same volume). So a later same-name re-provision mints a fresh credential and initializes a
+clean volume rather than silently re-attaching the dropped database's stale,
+old-credential data (which would fail authentication).
+
 ### Restart a managed database (and apply a pending config change)
 
 Some config changes only take effect when the database **starts** — most notably flipping
