@@ -541,3 +541,51 @@ async fn large_single_chunk_body_resumes_on_window_updates() {
     assert_eq!(body.len(), BODY);
     assert!(body.iter().all(|&b| b == b'x'));
 }
+
+/// Reproduce-first guard for the shape boatramp-requests #32 was reported to *still* stall on
+/// (the identity-encoding static-serve path): a single-chunk streamed body LARGER than the
+/// window, so a NON-EMPTY DATA remainder follows the first `MAX_OUT_FRAME` — and the window is
+/// replenished *exactly* enough to finish the body, leaving the trailing zero-length END_STREAM
+/// marker on a **closed** window. The original #32 tests only closed the window with the whole
+/// body (no remainder) or replenished it generously (the END_STREAM marker kept an open window),
+/// so neither exercised a non-empty remainder whose final bytes re-close the window onto the
+/// END_STREAM marker.
+///
+/// The peer grants a stream window of exactly `MAX_OUT_FRAME` and a large connection window (so
+/// the first DATA frame is a full 128 KiB and a 38 903-byte remainder is left), then — holding
+/// capacity through that first window — releases EXACTLY the remainder in one WINDOW_UPDATE. The
+/// body's final bytes drive the stream window back to 0, so the END_STREAM marker again lands on a
+/// closed window, now behind a non-empty remainder that itself had to be re-driven by the
+/// WINDOW_UPDATE. With the `build_batch` zero-length re-queue reverted this hangs to the timeout
+/// (the END_STREAM marker is stranded and the stream never completes); with it, the body + the
+/// END_STREAM marker are delivered in full.
+#[tokio::test]
+async fn large_body_nonempty_remainder_closes_window_on_end_stream() {
+    const BODY: usize = 169_975; // 128 KiB first frame + a 38 903-byte non-empty remainder
+    const WINDOW: u32 = 128 * 1024; // == MAX_OUT_FRAME: the first DATA frame consumes it whole
+    // Large connection window + max-frame: the stream window is the sole limiter, and the first
+    // DATA frame is a full MAX_OUT_FRAME so a *non-empty* remainder follows it.
+    let mut client = connect_tuned(SingleChunkStream(BODY), WINDOW, 1 << 20, 1 << 20).await;
+    let response = get(&mut client, "/big").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let fut = async {
+        let mut body = response.into_body();
+        let mut got = 0usize;
+        let mut released = false;
+        while let Some(chunk) = body.data().await {
+            got += chunk.unwrap().len();
+            // Hold capacity through the whole first window, then grant EXACTLY the remainder:
+            // the body's last bytes re-close the stream window at 0, stranding the trailing
+            // END_STREAM marker there unless the writer re-queues a flow-control-exempt frame.
+            if !released && got >= WINDOW as usize {
+                let _ = body.flow_control().release_capacity(BODY - WINDOW as usize);
+                released = true;
+            }
+        }
+        got
+    };
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+        .await
+        .expect("END_STREAM stranded on a closed window after a non-empty remainder (#32 shape)");
+    assert_eq!(got, BODY, "the full >128 KiB body must be delivered");
+}
