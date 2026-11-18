@@ -1133,7 +1133,7 @@ jobs:
             || { echo "::error::sync blob-transfer robustness never reached the success marker (silent skip, or the mid-stream 503 was not ridden past / a blob was lost)" >&2; exit 1; }
 
   docker-compute-net:
-    name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability + managed-DB alias upgrade heal + guest-log forwarding to the shared sink + guest-log secret redaction
+    name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability + managed-DB alias upgrade heal + guest-log forwarding to the shared sink + guest-log secret redaction + managed-DB drop/re-provision volume reclaim
     # The docker compute backend puts every long-lived workload on its per-project user-defined
     # network as the PRIMARY attachment (the sole tenancy boundary) so siblings resolve each other
     # by name over docker's embedded DNS. The one-shot export/import client (run_ephemeral), by
@@ -1220,3 +1220,39 @@ jobs:
             || { echo "::error::docker guest-log redaction gate did not pass (a failure or silent skip)" >&2; exit 1; }
           grep -q 'DOCKER GUEST-LOG REDACTION OK' docker-logredact.log \
             || { echo "::error::docker guest-log redaction never reached its success marker (silent skip, or a secret-sourced value was NOT redacted in the file and/or the boatramp::guest tracing target, or a hardcoded literal was over-redacted)" >&2; exit 1; }
+
+      - name: Pre-pull the managed-Postgres (pgvector) image
+        run: docker pull pgvector/pgvector:pg16
+
+      - name: Managed-DB drop/re-provision volume reclaim holds on the docker backend (hard gate — the papercut's FLAT docker layout, Finding 1 sibling)
+        run: |
+          set -o pipefail
+          # The DOCKER analog of the native-container `single_reconcile_live` Assertion 5 (the
+          # managed-DB re-provision papercut). `single_reconcile_live` is native-container-only by
+          # construction — it asserts the SCOPED on-disk PGDATA dir
+          # (`<data_dir>/compute/volumes/@<scope>/…`, reclaimed by `remove_scoped_volume`) is gone.
+          # The remote-Docker backend uses a completely different FLAT layout: a daemon-managed
+          # named volume `boatramp-<workload>` reclaimed by `remove_volume` (which, with
+          # `list_volumes`, the fix ADDED to the docker backend — it had neither). This drives the
+          # SHIPPED drop (`deprovision_tenant` with a docker backend registry) against the runner's
+          # REAL docker daemon and asserts: a non-default `exampleorg` Single tenant managed
+          # Postgres launches on the docker backend + the SHIPPED resolver authenticates on its
+          # published host-loopback port; the drop stops+removes the container and reclaims the FLAT
+          # named volume (gone from `list_volumes`); and a same-name RE-PROVISION mints a NEW
+          # credential, relaunches onto a fresh (empty) named volume + `initdb`s, and authenticates
+          # with that NEW credential — no stale-volume "password authentication failed" failure.
+          # No host psql; the `sql-postgres` feature pulls the tenant_sql/managed_sql data plane in.
+          # --test-threads=1 so the one launch does not contend. A silent skip (no
+          # BOATRAMP_TEST_DOCKER) still prints `test result: ok`, so BOTH markers are hard-gated:
+          # the first after reachable+authenticate, the second ONLY after the drop reclaimed the
+          # FLAT named volume AND a re-provision authenticated fresh — so a skip, a regression, OR a
+          # missing docker `remove_volume` reclaim (the pre-fix docker papercut) fails the job.
+          BOATRAMP_TEST_DOCKER=1 timeout -k 30 600 cargo test -p boatramp-node --features sql-postgres \
+            --test single_reconcile_docker_live \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee docker-reprovision.log
+          grep -qE 'test result: ok' docker-reprovision.log \
+            || { echo "::error::docker managed-DB re-provision gate did not pass (a failure or silent skip)" >&2; exit 1; }
+          grep -q 'DOCKER SINGLE RECONCILE OK:' docker-reprovision.log \
+            || { echo "::error::docker managed-DB reachable/authenticate never reached its success marker (silent skip or a regression?)" >&2; exit 1; }
+          grep -q 'DOCKER SINGLE REPROVISION OK:' docker-reprovision.log \
+            || { echo "::error::docker managed-DB drop/re-provision never reached its marker (silent skip, OR the FLAT docker named-volume reclaim did not fire — a same-name re-provision re-attached a stale, old-credential cluster)" >&2; exit 1; }
