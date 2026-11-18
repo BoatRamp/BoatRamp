@@ -569,6 +569,7 @@ async fn launch_from_registered_spec(
         replica: 0,
         spec,
         artifact,
+        redaction: Default::default(),
     };
     let inst = backend
         .launch(&req)

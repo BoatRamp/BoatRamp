@@ -1124,7 +1124,7 @@ jobs:
             || { echo "::error::sync blob-transfer robustness never reached the success marker (silent skip, or the mid-stream 503 was not ridden past / a blob was lost)" >&2; exit 1; }
 
   docker-compute-net:
-    name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability + managed-DB alias upgrade heal + guest-log forwarding to the shared sink
+    name: docker compute backend — per-project-net DNS + cross-project isolation + recreate-on-redeploy resolution + one-shot default-bridge reachability + managed-DB alias upgrade heal + guest-log forwarding to the shared sink + guest-log secret redaction
     # The docker compute backend puts every long-lived workload on its per-project user-defined
     # network as the PRIMARY attachment (the sole tenancy boundary) so siblings resolve each other
     # by name over docker's embedded DNS. The one-shot export/import client (run_ephemeral), by
@@ -1192,3 +1192,22 @@ jobs:
             || { echo "::error::docker guest-log forwarding gate did not pass (a failure or silent skip)" >&2; exit 1; }
           grep -q 'DOCKER GUEST-LOG FORWARDING OK' docker-logfwd.log \
             || { echo "::error::docker guest-log forwarding never reached its success marker (silent skip, or stdout/stderr did not reach BOTH the per-container log file and the boatramp::guest tracing target)" >&2; exit 1; }
+
+      - name: Guest-log secret redaction in the shared sink (hard gate)
+        run: |
+          set -o pipefail
+          # Secret redaction (PLAN-guest-log-secret-redaction): a container that prints a
+          # SECRET-SOURCED value carried in its launch's redaction set must have that value
+          # redacted to the placeholder in BOTH the per-container file
+          # `<data_dir>/compute/logs/<id>.log` AND the `boatramp::guest` tracing target,
+          # while a hardcoded LITERAL value (not in the set) passes through untouched
+          # (provenance scoping, end-to-end). Redaction is ON by default. Run in ISOLATION
+          # (by test name) so the gate owns the shared tracing capture; the marker prints
+          # ONLY after the file + tracing redaction AND the literal-survives assertions all
+          # hold — a silent skip or a one-sided redact cannot earn it.
+          BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+            docker_log_redaction -- --ignored --nocapture 2>&1 | tee docker-logredact.log
+          grep -qE 'test result: ok' docker-logredact.log \
+            || { echo "::error::docker guest-log redaction gate did not pass (a failure or silent skip)" >&2; exit 1; }
+          grep -q 'DOCKER GUEST-LOG REDACTION OK' docker-logredact.log \
+            || { echo "::error::docker guest-log redaction never reached its success marker (silent skip, or a secret-sourced value was NOT redacted in the file and/or the boatramp::guest tracing target, or a hardcoded literal was over-redacted)" >&2; exit 1; }

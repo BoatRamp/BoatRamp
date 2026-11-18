@@ -834,6 +834,7 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS",
     "BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES",
     "BOATRAMP_COMPUTE_INTERNAL_DNS",
+    "BOATRAMP_COMPUTE_REDACT_GUEST_LOG_SECRETS",
     "BOATRAMP_COMPUTE_DNS_UPSTREAM",
     "BOATRAMP_COMPUTE_DNS_DOMAIN",
     "BOATRAMP_COMPUTE_PG_CLIENT_IMAGE",
@@ -1372,6 +1373,24 @@ pub struct ComputeConfig {
     /// leaves each image's own `/etc/resolv.conf`.
     #[serde(default = "default_internal_dns")]
     pub internal_dns: bool,
+    /// **Guest-log secret redaction** (PLAN-guest-log-secret-redaction): redact the exact
+    /// VALUES of a workload's secret-sourced env (the resolved `{{sql.*}}` managed-DB
+    /// DSN/password, an unsealed `boatramp:<name>` secret-store ref, an external-vault
+    /// value, a managed-service generated key) out of the forwarded guest-log stream —
+    /// both the per-container file `<data_dir>/compute/logs/<id>.log` AND the
+    /// `boatramp::guest` tracing target — so a guest that prints its own environment does
+    /// not leak an injected credential into observability. Exact-value, best-effort
+    /// (encoded/split/transformed leaks are out of scope). Default **on**.
+    ///
+    /// This is the node-global **admin opt-out** (System·Admin node config — NEVER a
+    /// tenant-reachable knob): `false` forwards guest logs unredacted (the pre-redaction
+    /// parity behavior). Rationale: a compromised node admin already holds these secrets,
+    /// so an admin-controlled opt-out adds no exposure beyond what such an admin already
+    /// has; a tenant must never be able to disable redaction (for their own or any other
+    /// tenant's logs), which node-global admin config guarantees. Env:
+    /// `BOATRAMP_COMPUTE_REDACT_GUEST_LOG_SECRETS`.
+    #[serde(default = "default_redact_guest_log_secrets")]
+    pub redact_guest_log_secrets: bool,
     /// The upstream resolver the internal DNS forwards non-internal queries to
     /// (external names + non-`A`/`AAAA` types), so the resolver is the guest's single
     /// nameserver. `"host:port"`; default `1.1.1.1:53`.
@@ -1453,6 +1472,12 @@ pub struct ComputeConfig {
 /// Default for [`ComputeConfig::internal_dns`] — on (activates only with the
 /// container backend + bridge).
 fn default_internal_dns() -> bool {
+    true
+}
+
+/// Default for [`ComputeConfig::redact_guest_log_secrets`] — **on**. Secret-sourced env
+/// values are redacted from the forwarded guest-log stream unless a node admin opts out.
+fn default_redact_guest_log_secrets() -> bool {
     true
 }
 
@@ -1558,6 +1583,7 @@ impl Default for ComputeConfig {
             kv_shim_max_value_bytes: None,
             managed_db_privilege: ManagedDbPrivilege::default(),
             internal_dns: default_internal_dns(),
+            redact_guest_log_secrets: default_redact_guest_log_secrets(),
             dns_upstream: default_dns_upstream(),
             dns_domain: default_dns_domain(),
             client_image_rootfs: BTreeMap::new(),

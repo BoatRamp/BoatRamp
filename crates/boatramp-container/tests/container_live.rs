@@ -164,6 +164,7 @@ async fn container_live_launch_and_hold() {
         replica: 0,
         spec,
         artifact,
+        redaction: Default::default(),
     };
     let inst = backend.launch(&req).await.expect("launch container");
     let id = format!("{}-{}", inst.handle.workload, inst.handle.replica);
@@ -283,6 +284,7 @@ async fn run_pg_e2e(host_root: bool) {
         replica: 0,
         spec,
         artifact,
+        redaction: Default::default(),
     };
     let inst = backend
         .launch(&req)
@@ -410,6 +412,7 @@ async fn launch_managed_pg(
         replica: 0,
         spec: spec.clone(),
         artifact,
+        redaction: Default::default(),
     };
     backend
         .launch(&req)
@@ -1206,6 +1209,7 @@ async fn container_criu_roundtrip() {
         replica: 0,
         spec,
         artifact,
+        redaction: Default::default(),
     };
     let inst = backend.launch(&req).await.expect("launch");
     let nonce1 = probe_nonce(&inst.endpoint.host, inst.endpoint.port);
@@ -1285,6 +1289,7 @@ async fn container_exec_runs_command_and_round_trips_stdin() {
         replica: 0,
         spec,
         artifact,
+        redaction: Default::default(),
     };
     let inst = backend.launch(&req).await.expect("launch container");
 

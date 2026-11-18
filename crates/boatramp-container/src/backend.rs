@@ -508,6 +508,15 @@ pub struct ContainerBackend {
     /// `adopt_legacy_data_volume` designation; else `None`). Set by
     /// [`Self::with_legacy_data_claimant`].
     legacy_data_claimant: Option<(String, String)>,
+    /// Whether the guest-log forwarder **redacts secret-sourced env values** out of the
+    /// forwarded stream (the per-container log file + the `boatramp::guest` tracing
+    /// target). On by default; a node operator opts OUT via the node-global
+    /// `[compute].redact_guest_log_secrets = false` (System·Admin config — never a tenant
+    /// knob), wired by [`Self::with_guest_log_redaction`]. When off, logs forward
+    /// unredacted (the documented parity behavior). The redaction SET itself is per-launch
+    /// (carried in [`LaunchRequest::redaction`]); this flag only decides whether to apply
+    /// it.
+    redact_guest_log_secrets: bool,
 }
 
 impl ContainerBackend {
@@ -545,6 +554,9 @@ impl ContainerBackend {
             require_pinned_client_image: false,
             ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
             legacy_data_claimant: None,
+            // Secret redaction of the guest-log stream is ON by default; a node operator
+            // opts out via `with_guest_log_redaction(false)`.
+            redact_guest_log_secrets: true,
         })
     }
 
@@ -566,6 +578,16 @@ impl ContainerBackend {
     #[must_use]
     pub fn with_require_pinned_client_image(mut self, require: bool) -> Self {
         self.require_pinned_client_image = require;
+        self
+    }
+
+    /// Enable/disable **guest-log secret redaction** (default enabled). The node wires this
+    /// from the node-global `[compute].redact_guest_log_secrets` (System·Admin config);
+    /// `false` forwards guest logs unredacted. See
+    /// [`redact_guest_log_secrets`](Self::redact_guest_log_secrets).
+    #[must_use]
+    pub fn with_guest_log_redaction(mut self, enabled: bool) -> Self {
+        self.redact_guest_log_secrets = enabled;
         self
     }
 
@@ -2037,6 +2059,7 @@ impl ContainerBackend {
         id: &str,
         stdout: O,
         stderr: E,
+        redactor: Option<std::sync::Arc<logsink::Redactor>>,
     ) -> Result<(), BackendError>
     where
         O: tokio::io::AsyncBufRead + Unpin + Send + 'static,
@@ -2057,16 +2080,29 @@ impl ContainerBackend {
         ));
         // `keep_draining = true`: this is the LOCAL process path — the pump owns the
         // worker's real stdout/stderr pipe. If the writer dies it MUST keep draining to
-        // EOF (never drop the reader), or the running guest EPIPEs on its next write.
-        let (id_out, tx_out) = (id.to_string(), tx.clone());
+        // EOF (never drop the reader), or the running guest EPIPEs on its next write. The
+        // one `redactor` (shared via the Arc) redacts each line in BOTH pumps before it
+        // reaches the file or `tracing` (`None` ⇒ forward unredacted).
+        let (id_out, tx_out, r_out) = (id.to_string(), tx.clone(), redactor.clone());
         tokio::spawn(async move {
-            let _ = logsink::pump(stdout, &id_out, "stdout", tx_out, true).await;
+            let _ = logsink::pump(stdout, &id_out, "stdout", tx_out, true, r_out).await;
         });
         let id_err = id.to_string();
         tokio::spawn(async move {
-            let _ = logsink::pump(stderr, &id_err, "stderr", tx, true).await;
+            let _ = logsink::pump(stderr, &id_err, "stderr", tx, true, redactor).await;
         });
         Ok(())
+    }
+
+    /// Build this launch's guest-log redactor from the request's secret-sourced redaction
+    /// set — unless the node-global opt-out ([`Self::redact_guest_log_secrets`]) is off, or
+    /// the set is empty (no secret-sourced env), in which case there is no redactor and the
+    /// stream forwards unredacted.
+    fn build_log_redactor(&self, req: &LaunchRequest) -> Option<std::sync::Arc<logsink::Redactor>> {
+        if !self.redact_guest_log_secrets || req.redaction.is_empty() {
+            return None;
+        }
+        logsink::Redactor::build(req.redaction.values().iter().cloned())
     }
 
     /// The launch body (host veth → spawn worker → netns handshake → signal go).
@@ -2227,7 +2263,8 @@ impl ContainerBackend {
         // first write past the pipe buffer would `EPIPE`. The pumps + writer own
         // the pipe handles and run until the guest exits (EOF), so we can detach
         // the child handle without killing or awaiting it.
-        self.spawn_log_capture(id, cstdout, cstderr).await?;
+        self.spawn_log_capture(id, cstdout, cstderr, self.build_log_redactor(req))
+            .await?;
         drop(child);
 
         Ok(Instance {

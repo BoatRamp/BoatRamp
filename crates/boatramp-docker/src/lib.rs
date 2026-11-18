@@ -187,6 +187,15 @@ pub struct DockerBackend {
     /// the backstop never kills legitimate work (the real unreachable-DSN hang is bounded
     /// far tighter by the client's own connect timeout).
     ephemeral_timeout: std::time::Duration,
+    /// Whether the guest-log forwarder **redacts secret-sourced env values** out of the
+    /// forwarded stream (the per-container log file + the `boatramp::guest` tracing
+    /// target). On by default; a node operator opts OUT via the node-global
+    /// `[compute].redact_guest_log_secrets = false` (System·Admin config — never a tenant
+    /// knob), wired by [`Self::with_guest_log_redaction`]. When off, logs forward
+    /// unredacted (the documented parity behavior). The redaction SET is per-launch
+    /// (carried in [`LaunchRequest::redaction`]); this flag only decides whether to apply
+    /// it.
+    redact_guest_log_secrets: bool,
 }
 
 impl DockerBackend {
@@ -203,6 +212,7 @@ impl DockerBackend {
             writable_root_allowed: false,
             cap_add_allowed: false,
             ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
+            redact_guest_log_secrets: true,
         })
     }
 
@@ -216,6 +226,7 @@ impl DockerBackend {
             writable_root_allowed: false,
             cap_add_allowed: false,
             ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
+            redact_guest_log_secrets: true,
         }
     }
 
@@ -231,6 +242,16 @@ impl DockerBackend {
     /// Select how a launched workload's endpoint is reported (see [`DockerEndpoint`]).
     pub fn with_endpoint(mut self, endpoint: DockerEndpoint) -> Self {
         self.endpoint = endpoint;
+        self
+    }
+
+    /// Enable/disable **guest-log secret redaction** (default enabled). The node wires this
+    /// from the node-global `[compute].redact_guest_log_secrets` (System·Admin config);
+    /// `false` forwards guest logs unredacted. See
+    /// [`redact_guest_log_secrets`](Self::redact_guest_log_secrets).
+    #[must_use]
+    pub fn with_guest_log_redaction(mut self, enabled: bool) -> Self {
+        self.redact_guest_log_secrets = enabled;
         self
     }
 
@@ -283,7 +304,12 @@ impl DockerBackend {
     /// `docker_container_id` is the daemon's opaque id (what we attach to);
     /// `log_id` is the stable boatramp instance id used for the tracing tag + the
     /// per-container log-file name (matching the native backend's keying).
-    fn spawn_log_forwarder(&self, docker_container_id: String, log_id: String) {
+    fn spawn_log_forwarder(
+        &self,
+        docker_container_id: String,
+        log_id: String,
+        redactor: Option<std::sync::Arc<boatramp_guestlog::Redactor>>,
+    ) {
         let docker = self.docker.clone();
         let logs_dir = self.logs_dir();
         tokio::spawn(forward_container_logs(
@@ -291,7 +317,22 @@ impl DockerBackend {
             docker_container_id,
             log_id,
             logs_dir,
+            redactor,
         ));
+    }
+
+    /// Build this launch's guest-log redactor from the request's secret-sourced redaction
+    /// set — unless the node-global opt-out ([`Self::redact_guest_log_secrets`]) is off, or
+    /// the set is empty (no secret-sourced env), in which case the forwarder runs with no
+    /// redactor and the stream forwards unredacted.
+    fn build_log_redactor(
+        &self,
+        req: &LaunchRequest,
+    ) -> Option<std::sync::Arc<boatramp_guestlog::Redactor>> {
+        if !self.redact_guest_log_secrets || req.redaction.is_empty() {
+            return None;
+        }
+        boatramp_guestlog::Redactor::build(req.redaction.values().iter().cloned())
     }
 
     /// Validate + stage the spec's persistent volumes into bollard [`Mount`]s: each
@@ -845,6 +886,7 @@ impl ComputeBackend for DockerBackend {
         self.spawn_log_forwarder(
             created.id.clone(),
             compute_instance_id(&req.project, &req.workload, req.replica),
+            self.build_log_redactor(req),
         );
 
         // Reachable endpoint: the published host loopback port (default), or the
@@ -1416,6 +1458,7 @@ async fn forward_container_logs(
     docker_container_id: String,
     log_id: String,
     logs_dir: PathBuf,
+    redactor: Option<std::sync::Arc<boatramp_guestlog::Redactor>>,
 ) {
     if let Err(e) = tokio::fs::create_dir_all(&logs_dir).await {
         // Operator-facing diagnostic on the module target (NOT the guest stream, and
@@ -1449,7 +1492,15 @@ async fn forward_container_logs(
         // live only, so a transient blip does not re-dump the whole backlog.
         let replay_backlog = attempt == 0;
         let pass_started = std::time::Instant::now();
-        match attach_and_forward(&docker, &docker_container_id, &log_id, &tx, replay_backlog).await
+        match attach_and_forward(
+            &docker,
+            &docker_container_id,
+            &log_id,
+            &tx,
+            replay_backlog,
+            redactor.clone(),
+        )
+        .await
         {
             FollowOutcome::Ended => break,
             FollowOutcome::Transient => {
@@ -1481,6 +1532,7 @@ async fn attach_and_forward(
     log_id: &str,
     tx: &tokio::sync::mpsc::Sender<boatramp_guestlog::GuestLine>,
     replay_backlog: bool,
+    redactor: Option<std::sync::Arc<boatramp_guestlog::Redactor>>,
 ) -> FollowOutcome {
     let attach = match docker
         .attach_container(
@@ -1503,7 +1555,7 @@ async fn attach_and_forward(
             return FollowOutcome::Transient;
         }
     };
-    forward_frame_stream(attach.output, log_id, tx).await
+    forward_frame_stream(attach.output, log_id, tx, redactor).await
 }
 
 /// Demux a multiplexed Docker attach frame stream into per-stream byte pipes and
@@ -1514,6 +1566,7 @@ async fn forward_frame_stream<S>(
     mut output: S,
     log_id: &str,
     tx: &tokio::sync::mpsc::Sender<boatramp_guestlog::GuestLine>,
+    redactor: Option<std::sync::Arc<boatramp_guestlog::Redactor>>,
 ) -> FollowOutcome
 where
     S: futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin,
@@ -1527,7 +1580,7 @@ where
     // `keep_draining = false`: the REMOTE path has no local guest pipe to protect (the
     // reader is an in-memory duplex fed from the attach stream), so the pump may stop
     // once the writer is gone and let the forwarder wind down.
-    let (id_out, tx_out) = (log_id.to_string(), tx.clone());
+    let (id_out, tx_out, r_out) = (log_id.to_string(), tx.clone(), redactor.clone());
     let p_out = tokio::spawn(async move {
         boatramp_guestlog::pump(
             tokio::io::BufReader::new(out_r),
@@ -1535,6 +1588,7 @@ where
             "stdout",
             tx_out,
             false,
+            r_out,
         )
         .await
     });
@@ -1546,6 +1600,7 @@ where
             "stderr",
             tx_err,
             false,
+            redactor,
         )
         .await
     });
@@ -1785,7 +1840,7 @@ mod tests {
                 message: Bytes::from_static(b"console-line\n"),
             },
         ]);
-        let _ = forward_frame_stream(stream, "demux-0", &tx).await;
+        let _ = forward_frame_stream(stream, "demux-0", &tx, None).await;
         drop(tx);
         writer.await.unwrap().unwrap();
 
@@ -1819,7 +1874,7 @@ mod tests {
         let stream = frame_stream(vec![LogOutput::StdOut {
             message: Bytes::from(flood),
         }]);
-        let _ = forward_frame_stream(stream, "flood-0", &tx).await;
+        let _ = forward_frame_stream(stream, "flood-0", &tx, None).await;
         drop(tx);
         writer.await.unwrap().unwrap();
 
@@ -1849,7 +1904,7 @@ mod tests {
         }]);
         // forward_frame_stream awaits its pump tasks, so every `tracing::info!` has
         // fired (synchronously into the fmt subscriber) by the time it returns.
-        let _ = forward_frame_stream(stream, "tracing-0", &tx).await;
+        let _ = forward_frame_stream(stream, "tracing-0", &tx, None).await;
         drop(tx);
         writer.await.unwrap().unwrap();
 
@@ -1864,6 +1919,57 @@ mod tests {
             "container tag present: {logged}"
         );
         assert!(logged.contains("stdout"), "stream tag present: {logged}");
+    }
+
+    /// Guest-log secret redaction binds in the docker forwarder's demux path: a secret
+    /// value supplied to the forwarder (the per-launch redaction set) is replaced with the
+    /// placeholder in BOTH the per-container FILE and the `boatramp::guest` tracing stream,
+    /// while a benign line is untouched. Mutation-sensitive: dropping the redactor (the
+    /// opt-out / a removed redact step) leaves the secret in both → the `!contains` RED.
+    #[tokio::test]
+    async fn forward_frame_stream_redacts_a_secret_in_both_file_and_tracing() {
+        let buf = install_tracing_capture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = boatramp_guestlog::log_path(dir.path(), "redact-fwd-0");
+        let (tx, writer) = spawn_writer(path.clone()).await;
+        // A unique, long secret value (≥ the min-length floor) carried in the per-launch set.
+        let secret = "postgres://u:P%40ss_FWD_UNIQ_c0ffee99@bramp-db-z.flycast:5432/app";
+        let redactor = boatramp_guestlog::Redactor::build([secret]).expect("qualifies");
+        let stream = frame_stream(vec![
+            LogOutput::StdOut {
+                message: Bytes::from(format!("DATABASE_URL={secret}\n").into_bytes()),
+            },
+            LogOutput::StdErr {
+                message: Bytes::from_static(b"benign stderr line\n"),
+            },
+        ]);
+        let _ = forward_frame_stream(stream, "redact-fwd-0", &tx, Some(redactor)).await;
+        drop(tx);
+        writer.await.unwrap().unwrap();
+
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !file.contains(secret),
+            "secret leaked into the file: {file}"
+        );
+        assert!(
+            file.contains(boatramp_guestlog::REDACTED_PLACEHOLDER),
+            "file missing the placeholder: {file}"
+        );
+        assert!(
+            file.contains("benign stderr line"),
+            "benign line survives: {file}"
+        );
+
+        let logged = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            !logged.contains(secret),
+            "secret leaked into tracing: {logged}"
+        );
+        assert!(
+            logged.contains(boatramp_guestlog::REDACTED_PLACEHOLDER),
+            "tracing missing the placeholder: {logged}"
+        );
     }
 
     /// Build a `ContainerState` with a given `Status` (+ optional running bool / health),

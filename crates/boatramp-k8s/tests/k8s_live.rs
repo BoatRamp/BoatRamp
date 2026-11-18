@@ -94,6 +94,7 @@ async fn k8s_phase2_generic_exec_logs_volumes_round_trip() {
             reference: TEST_IMAGE.to_string(),
         },
         spec: spec.clone(),
+        redaction: Default::default(),
     };
 
     // (1) launch the generic workload → Deployment + Service.
@@ -193,6 +194,7 @@ async fn k8s_phase1_managed_postgres_statefulset_brings_up_pgvector() {
             reference: image.clone(),
         },
         spec,
+        redaction: Default::default(),
     };
 
     // (1) launch → StatefulSet + Service(pgtest) + PVC(data-pgtest).
@@ -326,6 +328,7 @@ async fn k8s_strict_managed_postgres_boots_under_read_only_root() {
             reference: image.clone(),
         },
         spec,
+        redaction: Default::default(),
     };
 
     // (1) launch → StatefulSet + Service + PVC under the strict (hardened) posture.

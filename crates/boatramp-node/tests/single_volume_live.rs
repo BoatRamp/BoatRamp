@@ -419,6 +419,7 @@ async fn provision_and_launch_tenant(
         replica: 0,
         spec,
         artifact,
+        redaction: Default::default(),
     };
     let inst = backend
         .launch(&req)

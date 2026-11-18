@@ -454,6 +454,7 @@ async fn launch_with_env(
         replica: 0,
         spec,
         artifact,
+        redaction: Default::default(),
     };
     let inst = backend
         .launch(&req)

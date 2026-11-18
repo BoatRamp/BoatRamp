@@ -91,6 +91,71 @@ pub enum Artifact {
     },
 }
 
+/// The per-workload **guest-log redaction set**: the resolved VALUES of env vars whose
+/// SOURCE is a secret (the `{{sql.*}}` managed-DB DSN/password, an unsealed
+/// `boatramp:<name>` secret-store ref, an external-vault value, a managed-service
+/// generated key), collected at env-resolution time (see [`launch_one`]) so a backend
+/// can redact them out of the forwarded guest-log stream.
+///
+/// Provenance, not name: a value lands here ONLY when it was *injected by a
+/// secret-bearing resolver* (the binding resolver or the managed-DB server-init env) —
+/// never an operator-set literal. The distinction is exactly the one `launch_one`
+/// already makes when folding the resolved env into the spec (a hand-set literal wins and
+/// is NOT collected; an injected/templated value IS).
+///
+/// Held in a [`Zeroizing`](zeroize::Zeroizing) buffer so the plaintext is scrubbed from
+/// memory when the request drops, and carries a **redacting [`Debug`]** so it never
+/// prints a secret value (it is a transient launch-request field, never persisted or
+/// serialized). The zeroizing is **best-effort**: the same values are co-resident,
+/// unzeroized, in the sibling [`LaunchRequest::spec`]'s `env` map (a plain `BTreeMap` the
+/// backend must hand to the container/VM as its environment, by design) — that is the
+/// larger residue, inherent to injecting env at all. This buffer just avoids keeping an
+/// extra non-scrubbed copy and keeps the set out of `Debug`/serialization.
+#[derive(Clone, Default)]
+pub struct RedactionSet(zeroize::Zeroizing<Vec<String>>);
+
+impl RedactionSet {
+    /// An empty set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(zeroize::Zeroizing::new(Vec::new()))
+    }
+
+    /// Record one secret-sourced resolved value.
+    pub fn push(&mut self, value: String) {
+        self.0.push(value);
+    }
+
+    /// The collected secret VALUES (to build a backend-side matcher from). Backends feed
+    /// these into `boatramp_guestlog::Redactor::build`, which applies the min-length floor
+    /// and de-dups.
+    #[must_use]
+    pub fn values(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether nothing was collected (a workload with no secret-sourced env).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// How many secret-sourced values were collected (diagnostics only — never exposes a
+    /// value).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Redacting `Debug`: a count, never a value — so the set cannot leak through a
+/// `{:?}` of the enclosing [`LaunchRequest`].
+impl std::fmt::Debug for RedactionSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RedactionSet(<{} secret-sourced values>)", self.0.len())
+    }
+}
+
 /// The request to launch one replica.
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -107,6 +172,12 @@ pub struct LaunchRequest {
     pub spec: ComputeSpec,
     /// The materialized artifact for `spec`.
     pub artifact: Artifact,
+    /// The secret-sourced env VALUES to redact from this workload's forwarded guest-log
+    /// stream (see [`RedactionSet`]). Populated by [`launch_one`] from the resolved
+    /// binding / managed-DB env; empty for a workload with no secret-sourced env. A
+    /// backend builds its per-workload log redactor from this (unless the node-global
+    /// redaction opt-out is set). Transient — never persisted or serialized.
+    pub redaction: RedactionSet,
 }
 
 /// An opaque handle to a launched replica (for `stop`/`health`).
@@ -2941,17 +3012,26 @@ async fn launch_one(
     // injected as the binding default. No pre-existing workload has `{{` in an env value,
     // so this only activates the new managed-DB templating path.
     let mut spec = spec.clone();
+    // Collect the secret-sourced redaction set AS we fold: a value from `extra_env` that
+    // is actually APPLIED to the guest env (it rendered an operator template, or filled an
+    // unset key) is secret-sourced — it came from the binding resolver / managed-DB
+    // server-init env, not an operator literal — so it is recorded for guest-log redaction.
+    // A hand-set operator literal that WINS is NOT recorded (provenance, not name). This
+    // reuses the exact distinction the fold already makes; see [`RedactionSet`].
+    let mut redaction = RedactionSet::new();
     for (k, v) in extra_env {
         match spec.env.get(k) {
-            // Operator templated this var — take the rendered value.
+            // Operator templated this var — take the rendered (secret-sourced) value.
             Some(existing) if existing.contains("{{") => {
                 spec.env.insert(k.clone(), v.clone());
+                redaction.push(v.clone());
             }
-            // Hand-set literal — operator wins, keep it.
+            // Hand-set literal — operator wins, keep it (NOT secret-sourced).
             Some(_) => {}
-            // Unset — inject the binding default.
+            // Unset — inject the binding default (secret-sourced).
             None => {
                 spec.env.insert(k.clone(), v.clone());
+                redaction.push(v.clone());
             }
         }
     }
@@ -2967,6 +3047,7 @@ async fn launch_one(
             replica,
             spec: spec.clone(),
             artifact,
+            redaction,
         })
         .await?;
     // Probe readiness right after launch instead of asserting `healthy: true`
@@ -4474,6 +4555,7 @@ mod tests {
                 replica: 0,
                 spec: s,
                 artifact,
+                redaction: Default::default(),
             })
             .await
             .unwrap();
@@ -4482,6 +4564,123 @@ mod tests {
         backend.stop(&inst.handle).await.unwrap();
         // Default snapshot/restore: unsupported.
         assert!(backend.snapshot(&inst.handle).await.unwrap().is_none());
+    }
+
+    /// A backend that records the `LaunchRequest.redaction` set + the final `spec.env`
+    /// it was handed, so a test can assert what `launch_one` collected for redaction.
+    #[derive(Clone, Default)]
+    struct RedactionCaptureBackend {
+        redaction: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        env: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    }
+
+    #[async_trait]
+    impl ComputeBackend for RedactionCaptureBackend {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: false,
+                persistent_volumes: false,
+                max_vcpus: None,
+                max_mem_mib: None,
+            }
+        }
+        async fn materialize(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _spec: &ComputeSpec,
+            _pull_auth: Option<&RegistryAuth>,
+        ) -> Result<Artifact, BackendError> {
+            Ok(Artifact::Image {
+                reference: "img:latest".into(),
+            })
+        }
+        async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
+            *self.redaction.lock().unwrap() = req.redaction.values().to_vec();
+            *self.env.lock().unwrap() = req.spec.env.clone();
+            Ok(Instance {
+                handle: InstanceHandle {
+                    project: req.project.clone(),
+                    workload: req.workload.clone(),
+                    replica: req.replica,
+                    backend_ref: "fake".into(),
+                },
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                },
+            })
+        }
+        async fn stop(&self, _handle: &InstanceHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn health(&self, _handle: &InstanceHandle) -> Result<Health, BackendError> {
+            Ok(Health::Healthy)
+        }
+    }
+
+    /// Provenance scoping: `launch_one` collects into `LaunchRequest.redaction` exactly the
+    /// resolved values that are SECRET-SOURCED — a value that rendered an operator template
+    /// (`{{…}}`) or filled an unset key — and NEVER an operator-set literal that won. This
+    /// is the seam the guest-log redaction binds to; if the collection is removed the set is
+    /// empty and this test goes RED (mutation-sensitive).
+    #[tokio::test]
+    async fn launch_one_collects_secret_sourced_env_not_operator_literals() {
+        let backend = RedactionCaptureBackend::default();
+        let mut s = spec(1, 128);
+        // One operator TEMPLATE (filled by a secret-sourced resolver) + one operator
+        // hardcoded LITERAL (operator wins; not secret).
+        s.env.insert("DB_URL".into(), "{{sql.dsn}}".into());
+        s.env.insert("LOG_LEVEL".into(), "debug".into());
+
+        // The resolver's output: the rendered DSN replaces the template; an injected TOKEN
+        // fills an unset key; a LOG_LEVEL default is OVERRIDDEN by the operator literal.
+        let dsn = "postgres://app:S3cr3t@bramp-db-abc.flycast:5432/app".to_string();
+        let token = "minted-token-0123456789abcdef".to_string();
+        let extra_env = vec![
+            ("DB_URL".to_string(), dsn.clone()),
+            ("TOKEN".to_string(), token.clone()),
+            ("LOG_LEVEL".to_string(), "info-from-resolver".to_string()),
+        ];
+
+        let _ = launch_one(
+            &backend, "default", "w", 0, 1, None, &s, "spec-a", &extra_env, None, None,
+        )
+        .await
+        .expect("launch");
+
+        let collected = backend.redaction.lock().unwrap().clone();
+        assert!(
+            collected.contains(&dsn),
+            "the rendered secret DSN must be collected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&token),
+            "the injected token (unset key) must be collected: {collected:?}"
+        );
+        assert!(
+            !collected.iter().any(|v| v == "debug"),
+            "an operator LITERAL must NOT be collected: {collected:?}"
+        );
+        assert!(
+            !collected.iter().any(|v| v == "info-from-resolver"),
+            "a resolver default OVERRIDDEN by an operator literal must NOT be collected: {collected:?}"
+        );
+        assert_eq!(collected.len(), 2, "exactly the two secret-sourced values");
+
+        // And the operator literal survived into the launched env (fold unchanged).
+        let env = backend.env.lock().unwrap().clone();
+        assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("debug"));
+        assert_eq!(
+            env.get("DB_URL"),
+            Some(&dsn),
+            "template rendered to the secret value"
+        );
     }
 
     /// A backend whose replicas launch but are **not yet ready** — `health` returns
