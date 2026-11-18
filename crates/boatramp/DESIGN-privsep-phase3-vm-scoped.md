@@ -175,12 +175,48 @@ follow-ups, now closed:
   by O_PATH-opening the granted path, and the `landlock` crate cannot open a SOCKET inode on the shipped
   static-musl build (`ENXIO` → the Landlock layer fails → `install_derived` → `Partial` →
   `enforce_privsep_status` REFUSES → the relay would never serve on musl). `relay_supervisor_policy` now
-  grants the uds's PARENT DIRECTORY (a regular dir opens everywhere, and covers `connect(2)` path
-  resolution); `boot_firecracker` nests the UDS in a DEDICATED per-VM directory holding only that
-  socket, so the grant stays tight. A latent bug on the shipped target, found + fixed here.
+  grants the uds's PARENT DIRECTORY (a regular dir opens everywhere, so the install's O_PATH open of the
+  IN-view grant succeeds); `boot_firecracker` nests the UDS in a DEDICATED per-VM directory holding only
+  that socket, so the grant stays tight. A latent bug on the shipped target, found + fixed here. NOTE
+  the dir grant does NOT block an OUT-of-view pathname-UDS `connect(2)` — Landlock's `AccessFs` does not
+  mediate UDS connect at all (see INFO-1 below); that pivot is closed by the mount-ns, not this view.
 - **LOW-2 — the F2 shed-path warning is rate-limited** (`ShedWarnSampler`): at most one warning per 5s,
   each with a running "N sheds since the last warning" summary — so the availability defence can't turn
   into a log/CPU/disk-amplification DoS of its own under the very flood it sheds. O(1), fixed state.
+
+### Pre-VM-go-live hardening — two INFO items from a follow-up Security review (landed 2026-11-18)
+
+A pre-go-live Security review of the relay flagged two residual INFO items (both TCB-adjacent;
+fail-closed; validated on lighthouse kernel 6.12 + the GHA runner). The VM substrate stays
+prod-gated-off (`resolve_spawn_backend` refuses `substrate: vm`); these mitigations touch the RELAY
+ONLY (no monolith/root/instance/container change).
+
+- **INFO-1 — pathname-`AF_UNIX` egress: a minimal mount-ns `pivot_root`.** The empty netns (MED-1)
+  closes all IP egress and every ABSTRACT-namespace UDS, but a **pathname** `AF_UNIX` socket is NOT
+  netns-scoped, and Landlock's `AccessFs` does not mediate `connect(2)` to a UDS (the relay's dir-grant
+  governs the install's O_PATH opens, not the kernel's `unix_find_other` path walk). The open question —
+  does the narrow Landlock dir-view block an out-of-view pathname-UDS `connect()`? — is now **settled
+  EMPIRICALLY**: the new `relay_mount_ns_contains_pathname_uds_pivot` live gate's no-mount-ns mutation
+  arm connects an out-of-view host UDS SUCCESSFULLY under the netns + dir-view alone, i.e. the pivot was
+  OPEN (a compromised relay could reach `/run/docker.sock`, a dbus/systemd/postgres socket, … for a
+  local pivot). The robust fix: `sandbox::enter_minimal_mount_ns` enters a private mount namespace and
+  `pivot_root`s into a minimal tmpfs root holding ONLY the relay's own binary (execute-pin) + the one
+  vsock-UDS dir (bind-mounted at their real absolute paths), so NO host UDS path resolves. Reuses the
+  `boatramp-container` worker's mount-ns/`pivot_root` idiom. Done in `run_vm_relay_confined`'s
+  pre-profile window (the profile hard-kills `unshare`/`mount`/`pivot_root`), using the inherited
+  `CAP_SYS_ADMIN`, then ALL caps are dropped and the profile installed from inside the minimal root.
+  Layered UNDER the netns + F1 + the seccomp set (a different mechanism — no LSM hook, no route). The
+  gate is mutation-verified (remove the mount-ns ⇒ the out-of-view connect reopens) and runs on the
+  real runner. The relay stays uid 0 (never setuids); the mount-ns, not a uid drop, is the wall.
+- **INFO-2 — per-VM vsock dir perms.** `boot_firecracker` created the per-VM dir `brvsk-{cid}-{pid}`
+  under `std::env::temp_dir()` (world-writable `/tmp`, mode 1777) at the default 0755 — a TOCTOU/connect
+  surface around firecracker's socket. It now creates it mode 0700 under a DEDICATED, non-world-writable
+  runtime root (`vm_vsock_runtime_root`: `$RUNTIME_DIRECTORY` else `/run/boatramp-vm`, both under `/run`
+  — root-owned, NOT world-writable), verified non-world-writable fail-closed. The dir stays single-
+  socket (only `vsock.sock`; config/console stay in `work_dir`) so the relay's RO dir grant stays tight,
+  and the relay's minimal mount-ns root binds exactly this dir so a `/run`-based location stays reachable
+  while every OTHER host UDS path is removed. Fail-closed if the runtime root can't be set up (NEVER a
+  silent fall-back to `/tmp`).
 
 Toward **O4 full capability parity** (backends in VMs, owner 2026-11-14), S1's separated relay is the
 transport prerequisite; the inward backend relay (§1d), guest net/egress, and secret-blind cred

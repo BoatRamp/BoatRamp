@@ -1401,3 +1401,325 @@ fn relay_empty_netns_contains_udp_egress() {
         "{NETNS_MARKER} (via sudo -n re-exec; see the child's probe detail above if captured)"
     );
 }
+
+// =============================================================================
+// VM RELAY — PATHNAME-AF_UNIX egress containment (INFO-1), a FRESH-EMPTY-netns + MINIMAL mount-ns
+// pivot_root. Scoped privsep VM substrate, S1 follow-up from the F1/F2 Security review (2026-11-18).
+// =============================================================================
+//
+// The F1/F2 Security review left one open question: the empty netns (MED-1) closes all IP egress and
+// every ABSTRACT-namespace AF_UNIX socket, but a **pathname** AF_UNIX socket is NOT netns-scoped, and
+// Landlock's `AccessFs` does not mediate `connect(2)` to a UDS (the relay's dir-grant governs the
+// install's O_PATH opens, not the kernel's `unix_find_other` path walk). So: does the relay's narrow
+// Landlock FS view (own binary + the one vsock dir) ALSO block an out-of-view pathname-UDS `connect()`
+// (e.g. to `/run/docker.sock`, a dbus/systemd/postgres socket) for a local pivot — or is that pivot
+// OPEN?
+//
+// This gate SETTLES it empirically against the real kernel AND proves the fix, in ONE mutation-verified
+// probe. BOTH arms hold the netns + the dropped caps + the Enforced relay profile CONSTANT; the ONLY
+// difference is the minimal mount-ns (`sandbox::enter_minimal_mount_ns`):
+//   • arm A (mount-ns ON  — the production relay's full containment): the out-of-view host UDS must be
+//     UNREACHABLE (`connect` DENIED, ENOENT — the pivot_root minimal root holds no host UDS path),
+//     while the IN-view vsock dial + the inherited-listener accept still work.
+//   • arm B (mount-ns OFF — the MUTATION, = netns + caps + Landlock dir-view ALONE): the SAME out-of-
+//     view `connect` must SUCCEED. This is the empirical answer to the open question — the pivot IS
+//     open under the Landlock dir-view alone — AND it proves the mount-ns is the load-bearing wall that
+//     closes it (not a broken harness).
+//
+// Reuses the SAME production primitives the relay uses (`enter_empty_netns` + `enter_minimal_mount_ns`
+// + `drop_all_capabilities`/`clear_current_capabilities` + `derive_relay_profile`), so the gate and the
+// production path can never drift. Self-elevates via passwordless `sudo -n` (the CAP_SYS_ADMIN the
+// unshares need); the CI `live gate (privsep)` job greps the `PRIVSEP VM RELAY PATHUDS OK` marker.
+
+/// The success marker the CI gate greps (printed on the OUTER process's stdout).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+const PATHUDS_MARKER: &str = "PRIVSEP VM RELAY PATHUDS OK";
+
+/// Grandchild probe verdicts for the pathname-UDS gate (reported via `_exit`, like the netns gate).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+mod pathuds_probe_codes {
+    pub const CONTAINED: i32 = 80; // out-of-view pathname-UDS connect DENIED (the mount-ns closed it)
+    pub const ESCAPED: i32 = 81; // out-of-view connect SUCCEEDED (pivot open / the mutation signal)
+    pub const UNIX_BLOCKED: i32 = 82; // the IN-view vsock dial failed (the mount-ns broke the legit dial)
+    pub const ACCEPT_BLOCKED: i32 = 83; // accept() on the inherited root-netns listener failed
+    pub const SETUP_FAILED: i32 = 84; // socket/plumbing failure (not a verdict)
+    pub const INSTALL_FAILED: i32 = 85; // the relay profile did not install Enforced
+    pub const UNSHARE_FAILED: i32 = 86; // enter_empty_netns failed (no CAP_SYS_ADMIN?)
+    pub const MOUNTNS_FAILED: i32 = 87; // enter_minimal_mount_ns failed (the pivot_root wall)
+    pub const CAPDROP_FAILED: i32 = 88; // drop/clear capabilities failed
+}
+
+/// `connect(2)` a pathname `AF_UNIX` socket; returns whether the connect SUCCEEDED. Shared by the
+/// in-view vsock dial and the out-of-view pivot probe (no post-fork allocation — a stack `sockaddr_un`).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn try_connect_pathname_uds(path_c: &std::ffi::CStr) -> bool {
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: a zeroed sockaddr_un filled with the NUL-terminated pathname (bounds-checked).
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path_c.to_bytes_with_nul();
+    if bytes.len() > addr.sun_path.len() {
+        unsafe { libc::close(fd) };
+        return false;
+    }
+    for (dst, &b) in addr.sun_path.iter_mut().zip(bytes.iter()) {
+        *dst = b as libc::c_char;
+    }
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    unsafe { libc::close(fd) };
+    rc == 0
+}
+
+/// Fork ONE grandchild standing in for the contained relay: enter the empty netns, OPTIONALLY enter the
+/// minimal mount-ns (`mount_ns`), drop ALL caps, install the Enforced relay profile, then (a) dial the
+/// IN-view vsock UDS, (b) accept() the inherited listener, (c) attempt the OUT-of-view pathname-UDS
+/// `connect()` — `_exit`ing a [`pathuds_probe_codes`] verdict. The profile is derived in the PARENT.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn fork_pathuds_grandchild(
+    mount_ns: bool,
+    listener_fd: i32,
+    uds: &std::path::Path,
+    exe: &std::path::Path,
+    out_of_view_c: &std::ffi::CStr,
+) -> i32 {
+    use pathuds_probe_codes as code;
+
+    let profile = boatramp_server::sandbox::derive_relay_profile(exe, uds);
+    let vsock_dir = uds
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| uds.to_path_buf());
+    let uds_c = match std::ffi::CString::new(uds.to_str().expect("utf-8 uds path")) {
+        Ok(c) => c,
+        Err(_) => return code::SETUP_FAILED,
+    };
+
+    // SAFETY: a single selected test ⇒ no concurrent harness thread allocating at the fork instant (the
+    // SAME assumption the netns gate + `sandbox_live.rs`'s fork-probes rely on).
+    let pid = unsafe { libc::fork() };
+    assert!(
+        pid >= 0,
+        "fork() failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if pid == 0 {
+        // (1) MED-1 egress wall — the empty netns (the production primitive), in BOTH arms.
+        if boatramp_server::sandbox::enter_empty_netns().is_err() {
+            unsafe { libc::_exit(code::UNSHARE_FAILED) };
+        }
+        // (2) INFO-1 — the minimal mount-ns pivot_root, ONLY in arm A (the sole difference between arms).
+        if mount_ns && boatramp_server::sandbox::enter_minimal_mount_ns(exe, &vsock_dir).is_err() {
+            unsafe { libc::_exit(code::MOUNTNS_FAILED) };
+        }
+        // (3) INFO — drop ALL capabilities (prctl bounding/securebits THEN the in-process capset clear).
+        if boatramp_server::sandbox::drop_all_capabilities().is_err()
+            || boatramp_server::sandbox::clear_current_capabilities().is_err()
+        {
+            unsafe { libc::_exit(code::CAPDROP_FAILED) };
+        }
+        // (4) Install the relay's Enforced profile (both arms — so the ONLY difference is the mount-ns).
+        match boatramp_server::sandbox::linux::install_derived(&profile) {
+            Ok(boatramp_server::sandbox::SandboxStatus::Enforced) => {}
+            _ => unsafe { libc::_exit(code::INSTALL_FAILED) },
+        }
+
+        // (a) IN-view vsock dial — must still work in BOTH arms (arm A binds the vsock dir into the
+        //     minimal root). A failure here means the mount-ns broke the legitimate guest dial.
+        if !try_connect_pathname_uds(&uds_c) {
+            unsafe { libc::_exit(code::UNIX_BLOCKED) };
+        }
+        // (b) inherited root-netns listener accept() — a socket keeps its creation netns + is fd-based,
+        //     so it survives both the netns and the pivot_root.
+        let afd = unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if afd < 0 {
+            unsafe { libc::_exit(code::ACCEPT_BLOCKED) };
+        }
+        unsafe { libc::close(afd) };
+
+        // (c) THE PROBE: `connect()` an OUT-of-view host pathname-UDS. arm A (mount-ns) ⇒ the path does
+        //     not resolve in the minimal root ⇒ DENIED (CONTAINED). arm B (no mount-ns) ⇒ it resolves on
+        //     the host tree + is DAC-reachable (root owner) and Landlock does not mediate UDS connect ⇒
+        //     SUCCEEDS (ESCAPED) — the empirical "pivot is open under the dir-view alone" signal.
+        if try_connect_pathname_uds(out_of_view_c) {
+            unsafe { libc::_exit(code::ESCAPED) };
+        }
+        unsafe { libc::_exit(code::CONTAINED) };
+    }
+    // ---- the parent: reap the grandchild + decode its exit code ----
+    let mut status: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, 0) };
+    assert_eq!(
+        r,
+        pid,
+        "waitpid() failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    }
+}
+
+/// Run the INFO-1 fork-probe (we already hold CAP_SYS_ADMIN here) and print the marker on success.
+/// Mutation-verified: arm A (mount-ns ON) must be CONTAINED (out-of-view UDS connect DENIED) and arm B
+/// (mount-ns OFF) must be ESCAPED (the SAME connect SUCCEEDS) — settling that the pathname-UDS pivot is
+/// open under the Landlock dir-view alone, and that the minimal mount-ns is the wall that closes it.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn run_relay_pathuds_probe_and_report() {
+    use pathuds_probe_codes as code;
+    use std::os::fd::AsRawFd;
+
+    // Stage under root-owned `/run` (a 0755 tmpfs): the capless uid-0 grandchild traverses it as OWNER
+    // (no CAP_DAC_READ_SEARCH needed), so the relay profile's PathFd grants (the stand-in exe + the
+    // vsock dir) O_PATH-open, mirroring production (`/run/boatramp-vm`, root-owned 0700). A dedicated
+    // per-run gate dir holds the exe + the IN-view vsock dir; the OUT-of-view pivot UDS sits directly
+    // under `/run` (the realistic `/run/docker.sock`-style host-daemon socket location).
+    let gate_dir = std::path::PathBuf::from(format!("/run/br-pathuds-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&gate_dir);
+    std::fs::create_dir_all(&gate_dir).expect("create the pathuds gate dir under /run");
+    let exe = gate_dir.join("exe");
+    std::fs::write(&exe, b"stand-in exe for the relay execute-pin grant\n")
+        .expect("write stand-in exe");
+    let vsock_dir = gate_dir.join("vsk");
+    std::fs::create_dir_all(&vsock_dir).expect("create the in-view vsock dir");
+    let uds_path = vsock_dir.join("vsock.sock");
+    let _ = std::fs::remove_file(&uds_path);
+
+    // Root-netns setup, held for the whole probe: a live loopback TCP listener (the inherited-listener
+    // shape), the IN-view AF_UNIX vsock listener, and the OUT-of-view pivot AF_UNIX listener.
+    let tcp = TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener (root netns)");
+    let tcp_port = tcp.local_addr().expect("listener addr").port();
+    let _in_view =
+        std::os::unix::net::UnixListener::bind(&uds_path).expect("bind in-view vsock listener");
+
+    let out_of_view =
+        std::path::PathBuf::from(format!("/run/br-pathuds-pivot-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&out_of_view);
+    let _pivot = std::os::unix::net::UnixListener::bind(&out_of_view)
+        .expect("bind the out-of-view pivot UDS (a /run host-socket stand-in)");
+    let out_of_view_c =
+        std::ffi::CString::new(out_of_view.to_str().expect("utf-8 pivot path")).expect("no NUL");
+
+    // arm A (mount-ns ON): queue a connection for the inherited accept(), then probe WITH the mount-ns.
+    let client_on = TcpStream::connect(("127.0.0.1", tcp_port)).expect("queue a conn (arm A)");
+    let code_on = fork_pathuds_grandchild(true, tcp.as_raw_fd(), &uds_path, &exe, &out_of_view_c);
+    drop(client_on);
+    // arm B (mount-ns OFF — the MUTATION): queue another connection, probe WITHOUT the mount-ns.
+    let client_off = TcpStream::connect(("127.0.0.1", tcp_port)).expect("queue a conn (arm B)");
+    let code_off = fork_pathuds_grandchild(false, tcp.as_raw_fd(), &uds_path, &exe, &out_of_view_c);
+    drop(client_off);
+
+    let _ = std::fs::remove_dir_all(&gate_dir);
+    let _ = std::fs::remove_file(&out_of_view);
+
+    assert_eq!(
+        code_on,
+        code::CONTAINED,
+        "with the minimal mount-ns, the relay stand-in must find the OUT-of-view host pathname-UDS \
+         connect DENIED (the pivot_root minimal root holds no host UDS path) while still dialing the \
+         IN-view vsock UDS + accept()ing the inherited listener; grandchild exit was {code_on} \
+         ({}=pivot ESCAPED the mount-ns, {}=in-view vsock dial blocked, {}=inherited accept blocked, \
+         {}=setup, {}=profile not Enforced, {}=netns unshare failed, {}=mount-ns pivot_root failed, \
+         {}=capdrop failed)",
+        code::ESCAPED,
+        code::UNIX_BLOCKED,
+        code::ACCEPT_BLOCKED,
+        code::SETUP_FAILED,
+        code::INSTALL_FAILED,
+        code::UNSHARE_FAILED,
+        code::MOUNTNS_FAILED,
+        code::CAPDROP_FAILED,
+    );
+    assert_eq!(
+        code_off,
+        code::ESCAPED,
+        "MUTATION / empirical settlement: WITHOUT the minimal mount-ns step (netns + dropped caps + the \
+         Enforced Landlock dir-view ALONE), the SAME out-of-view host pathname-UDS connect must SUCCEED \
+         — proving (1) the pathname-UDS pivot IS open under the Landlock dir-view alone (AccessFs does \
+         not mediate UDS connect, and pathname UDS are not netns-scoped) and (2) the mount-ns is the \
+         thing that closes it, not a broken harness; grandchild exit was {code_off} ({}=still contained \
+         without the mount-ns, so the mutation is NOT exercising the real difference)",
+        code::CONTAINED,
+    );
+    println!(
+        "{PATHUDS_MARKER}: the netless VM relay stand-in, inside the empty netns with ALL capabilities \
+         dropped and its Enforced least-authority profile installed, had its OUT-of-view host pathname-\
+         AF_UNIX `connect()` DENIED by the minimal mount-ns pivot_root root (which holds only the own \
+         binary + the one vsock dir) while still dialing the IN-view vsock UDS + accept()ing the \
+         inherited listener; WITHOUT the mount-ns the SAME connect SUCCEEDED (so the Landlock dir-view \
+         alone does NOT close the pathname-UDS pivot — mutation-verified on the real kernel)."
+    );
+}
+
+/// INFO-1 live gate: the VM relay's minimal mount-ns `pivot_root` closes the PATHNAME-AF_UNIX local-
+/// pivot surface (connect to an out-of-view host UDS DENIED) that the empty netns + the Landlock dir-
+/// view do NOT — mutation-verified (remove the mount-ns ⇒ the out-of-view connect reopens), which also
+/// empirically SETTLES that the pivot is open under the dir-view alone. Self-elevates via `sudo -n` for
+/// the CAP_SYS_ADMIN the unshares need; on a box without passwordless sudo it SKIPS with a clear note.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live/privileged: proves the VM relay's minimal mount-ns pathname-UDS-pivot containment \
+            against the real kernel (INFO-1), mutation-verified; self-elevates via `sudo -n` for \
+            CAP_SYS_ADMIN; run via --include-ignored in the `live gate (privsep)` job"]
+fn relay_mount_ns_contains_pathname_uds_pivot() {
+    // Already privileged (the sudo re-exec below, or a harness run under sudo on lighthouse): run it.
+    if process_is_root() {
+        run_relay_pathuds_probe_and_report();
+        return;
+    }
+    // Unprivileged: re-exec THIS one test under passwordless `sudo -n` to gain CAP_SYS_ADMIN.
+    let exe = std::env::current_exe().expect("resolve the test binary path for the sudo re-exec");
+    let out = match Command::new("sudo")
+        .arg("-n")
+        .arg(&exe)
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("relay_mount_ns_contains_pathname_uds_pivot")
+        .arg("--nocapture")
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "PRIVSEP VM RELAY PATHUDS SKIPPED: could not invoke `sudo -n` to gain CAP_SYS_ADMIN for \
+                 the mount-ns probe ({e}); on CI/lighthouse (passwordless sudo) this runs for real."
+            );
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stdout.contains(PATHUDS_MARKER)
+        && (stderr.contains("a password is required")
+            || stderr.contains("a terminal is required")
+            || stderr.contains("sudo: "))
+    {
+        eprintln!(
+            "PRIVSEP VM RELAY PATHUDS SKIPPED: `sudo -n` could not elevate (no passwordless sudoers?). \
+             stderr: {stderr}"
+        );
+        return;
+    }
+    assert!(
+        stdout.contains(PATHUDS_MARKER),
+        "the root (sudo -n) re-exec of the mount-ns pathname-UDS probe did not report success.\nexit: \
+         {:?}\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        out.status.code(),
+    );
+    // Surface the marker on THIS (outer) process's stdout so the CI gate greps it on the outer log.
+    println!(
+        "{PATHUDS_MARKER} (via sudo -n re-exec; see the child's probe detail above if captured)"
+    );
+}
