@@ -109,6 +109,8 @@ mod imp {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use sha2::{Digest, Sha256};
@@ -463,6 +465,48 @@ mod imp {
     /// process's main thread, behind its own Enforced least-authority profile). It returns when
     /// `accept` ends (the pre-bound listener closed); the separate process reads that return as
     /// `FailNodeClosed`.
+    /// The MAX concurrent relayed client connections the separate `__vm-relay` process will service
+    /// at once (F2 — availability bound). `run_relay` spawned an UNBOUNDED thread-per-connection, so
+    /// a client-connection flood could exhaust host threads/memory (a DoS). This fixes the inflight
+    /// budget: at the cap, a new client is SHED (closed) rather than admitted.
+    ///
+    /// Value rationale: it matches the node's existing default per-scope connection ceiling
+    /// (`boatramp_server`'s `DEFAULT_STREAM_CONNECTIONS` = 256) — an already-blessed order of
+    /// magnitude for concurrent connections to ONE serving scope — and so bounds host growth to a
+    /// fixed budget (≤ 256 relayed connections, each holding at most the 2 `splice_bidirectional`
+    /// threads) instead of unbounded. It sits comfortably ABOVE the guest's own backpressure points
+    /// (the vsock `listen(64)` backlog + the guest's 64-deep accept channel in
+    /// [`guest_accept_serve_loop`]), so a healthy single-frontend guest is never artificially
+    /// throttled by the relay while a flood is still shed. A scoped static-parser frontend is a
+    /// single VM; this is a per-relay (per-frontend) budget.
+    pub(crate) const MAX_INFLIGHT_RELAY_CONNS: usize = 256;
+
+    /// RAII reservation for ONE inflight relayed connection: decrements the shared counter on drop
+    /// (when the per-connection splice thread ends), freeing the slot for a new client.
+    struct InflightGuard(Arc<AtomicUsize>);
+
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// WS-C admission posture (try-acquire → SHED, never block): atomically reserve one of `max`
+    /// inflight slots, returning a guard that frees it on drop, or `None` when the relay is already
+    /// at its budget (the caller then sheds the client by closing it, rather than spawning an
+    /// unbounded thread). Lock-free `fetch_add` + bounds-check, backing the over-count out if we
+    /// exceeded — the SAME `fetch_add`/`fetch_sub` inflight shape the HTTP serve path uses, and the
+    /// SAME try-acquire→shed posture the stream serve path uses (a blocking `acquire` would stall
+    /// the accept loop and the kernel listener backlog behind it).
+    fn reserve_inflight_slot(counter: &Arc<AtomicUsize>, max: usize) -> Option<InflightGuard> {
+        let prev = counter.fetch_add(1, Ordering::SeqCst);
+        if prev >= max {
+            counter.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(InflightGuard(counter.clone()))
+    }
+
     pub(crate) fn run_relay(
         label: String,
         listener: std::net::TcpListener,
@@ -471,9 +515,12 @@ mod imp {
     ) {
         tracing::info!(
             instance = %label,
+            max_inflight = MAX_INFLIGHT_RELAY_CONNS,
             "[privsep] VM relay: accepting client TCP; relaying bytes to the frontend-in-guest over \
-             vsock (client bytes only — no key material crosses the root; S1)"
+             vsock (client bytes only — no key material crosses the root; S1); inflight connections \
+             are bounded (F2)"
         );
+        let inflight = Arc::new(AtomicUsize::new(0));
         loop {
             let (client, _peer) = match listener.accept() {
                 Ok(c) => c,
@@ -482,9 +529,24 @@ mod imp {
                     return;
                 }
             };
+            // F2 — WS-C admission: reserve an inflight slot before servicing. At the cap, SHED this
+            // client (drop ⇒ close) rather than spawn an unbounded thread; the accept loop keeps
+            // running so the listener backlog is still drained. The permit is MOVED into the worker
+            // thread and held for the connection's whole life (freed when the splice ends).
+            let Some(permit) = reserve_inflight_slot(&inflight, MAX_INFLIGHT_RELAY_CONNS) else {
+                tracing::warn!(
+                    instance = %label,
+                    max_inflight = MAX_INFLIGHT_RELAY_CONNS,
+                    "[privsep] VM relay: at the inflight-connection cap — shedding a client \
+                     (closing it); availability bound (F2)"
+                );
+                drop(client);
+                continue;
+            };
             let uds = uds_path.clone();
             let label2 = label.clone();
             std::thread::spawn(move || {
+                let _permit = permit; // held for the whole connection; frees the slot on drop
                 let guest = match dial_guest(&uds, guest_port) {
                     Ok(s) => s,
                     Err(e) => {
@@ -895,6 +957,61 @@ mod imp {
             }
             assert!(saw_trailer, "the archive ends with a TRAILER!!! entry");
             assert_eq!(entries, 3, "proc dir + console dev + init file");
+        }
+
+        /// F2: the relay's inflight-connection bound is ENFORCED — `reserve_inflight_slot` admits up
+        /// to `max`, SHEDS (returns `None`) at the cap without leaking a slot, and re-admits once a
+        /// guard is dropped (the per-connection splice thread ending frees the slot). Mutation: make
+        /// `reserve_inflight_slot` always return `Some` (drop the bound check) and the shed assert
+        /// reddens.
+        #[test]
+        fn inflight_bound_admits_to_the_cap_then_sheds_and_frees_on_drop() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let max = 3usize;
+
+            // Admit exactly `max` connections — each within budget is granted.
+            let mut permits = Vec::new();
+            for i in 0..max {
+                let p = super::reserve_inflight_slot(&counter, max);
+                assert!(p.is_some(), "slot {i} within the budget must be admitted");
+                permits.push(p.unwrap());
+            }
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                max,
+                "the counter tracks admitted slots"
+            );
+
+            // At the cap, the next client is SHED (None) — and the over-count is backed out, so a
+            // shed attempt never leaks a slot (a leak would permanently shrink the usable budget).
+            assert!(
+                super::reserve_inflight_slot(&counter, max).is_none(),
+                "at the cap a new client MUST be shed (the bound is enforced)"
+            );
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                max,
+                "a shed attempt must not leak an inflight slot"
+            );
+
+            // Freeing ONE (drop the guard, as the splice thread ending would) reopens exactly one
+            // slot, which a new client can then take.
+            permits.pop();
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                max - 1,
+                "dropping a guard frees its slot"
+            );
+            assert!(
+                super::reserve_inflight_slot(&counter, max).is_some(),
+                "a freed slot must be re-admittable"
+            );
+
+            // The shipped relay budget is the documented availability bound.
+            assert_eq!(super::MAX_INFLIGHT_RELAY_CONNS, 256);
         }
     }
 }
