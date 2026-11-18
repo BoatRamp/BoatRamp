@@ -141,6 +141,25 @@ where
     };
 
     loop {
+        // Flush the transport before parking on the next frame read. Every response the
+        // previous iteration wrote (HEADERS/DATA — incl. a final END_STREAM — plus any
+        // ack / WINDOW_UPDATE / RST_STREAM) went out via `wire.write_all`, which only
+        // writes what the transport's `poll_write` *accepts*. A buffering writer
+        // (userspace rustls) accepts the plaintext but, when the TCP socket is
+        // backpressured, leaves the matching *encrypted* records queued in its own buffer
+        // and returns anyway. This driver is serial — its only await-the-next-request
+        // point is the `read_exact` below — so once an iteration has written its frames it
+        // would park here with no further `poll_write`/`poll_flush` scheduled, and that
+        // queued tail (for a completed response, no later frame ever comes) would sit
+        // unsent forever while the peer hangs waiting for bytes we already consider
+        // "written". A 0-RTT loopback never fills the socket, so this is invisible on the
+        // plaintext h2c / in-memory paths (where `flush` is a cheap no-op); a real-RTT /
+        // rate-limited / lossy userspace-TLS path fills it and strands the tail. Draining
+        // here before we idle makes the queued records reach the peer. (Mirrors the mux
+        // writer's pre-idle flush; `poll_flush` yields on backpressure without reading, so
+        // the serial order is unchanged.)
+        wire.flush().await?;
+
         // Read one frame header.
         let mut hdr = [0u8; frame::FRAME_HEADER_LEN];
         if wire.read_exact(&mut hdr).await.is_err() {

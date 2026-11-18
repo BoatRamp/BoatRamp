@@ -21,6 +21,15 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Wire<IO> {
         io.write_all(buf).await
     }
 
+    /// Flush the underlying transport, pushing any records a buffering writer has
+    /// queued out to the peer. On a plain `TcpStream` this is a cheap no-op (the
+    /// kernel already owns anything `write_all` accepted); on a userspace-TLS stream
+    /// it drains the encrypted bytes the TLS layer buffered under socket backpressure.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        let Self::Buffered(io) = self;
+        io.flush().await
+    }
+
     pub async fn shutdown(&mut self) -> io::Result<()> {
         let Self::Buffered(io) = self;
         io.shutdown().await
