@@ -187,14 +187,19 @@ versions.
   domain (and a blank domain) is refused at config load, fail-closed (only DNS-01 can satisfy a
   wildcard). This is **Concept 1** (how the node obtains its OWN cert) and is deliberately separate
   from `[serve.on_demand_tls].challenge` (Concept 2).
-- **`[serve.on_demand_tls].challenge` is now settable from a config file and the environment.** The
-  on-demand engine's challenge (Concept 2 — how it issues OTHER/tenant domains' certs) was
-  effectively unsettable: its kebab tokens (`tls-alpn-01` / `dns-01`) are not valid RON identifiers,
-  so the previous bare-variant encoding could not be written from a RON file at all. It now
-  (de)serializes as a quoted **string** in both RON (`challenge: "dns-01"`) and JSON
-  (`"challenge": "dns-01"`), and every `[serve.on_demand_tls]` scalar — including `challenge` — is
-  env-settable via `BOATRAMP_ON_DEMAND_TLS_*` (the `serve` segment dropped, like `[serve.alerts]`),
-  so the block can be configured with no config file.
+- **BREAKING (config format) — `[serve.on_demand_tls].challenge` is now a quoted string, and is
+  settable from a config file and the environment.** The on-demand engine's challenge (Concept 2 —
+  how it issues OTHER/tenant domains' certs) was effectively unsettable: its kebab tokens
+  (`tls-alpn-01` / `dns-01`) are not valid RON identifiers, so the previous bare-variant encoding
+  could not be written from a RON file at all. It now (de)serializes as a quoted **string** in both
+  RON (`challenge: "dns-01"`) and JSON (`"challenge": "dns-01"`), and every `[serve.on_demand_tls]`
+  scalar — including `challenge` — is env-settable via `BOATRAMP_ON_DEMAND_TLS_*` (the `serve`
+  segment dropped, like `[serve.alerts]`), so the block can be configured with no config file.
+  **Migration:** if you set `challenge` explicitly in the old bare-token form, quote it —
+  `challenge: dns01` → `challenge: "dns-01"` (the canonical token; parsing is lenient and
+  case-insensitive, so `"dns01"` / `"dns"` / `"dns_01"` are also accepted). The default is
+  `"tls-alpn-01"`, so a config that never set `challenge` needs no change. See
+  [Upgrade boatramp → Breaking config-file changes](docs/src/how-to/upgrade-boatramp.md).
 
 ### Fixed
 

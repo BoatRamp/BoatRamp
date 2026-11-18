@@ -77,6 +77,36 @@ Two adjacent, separate migrations — don't confuse them with the store re-key:
   evolve it with [owner-gated schema migrations](./in-app-migrations.md), not with
   a boatramp version upgrade.
 
+## Breaking config-file changes
+
+Separately from the store re-keys above, a pre-1.0 release may change the
+**format of a field in your `serve` config file**. Unlike a store migration,
+`serve` will not refuse-and-instruct here — a config it cannot parse simply
+**fails to start**, so edit the file *before* you restart on the new binary.
+Every such change is flagged **breaking** in the
+[`CHANGELOG.md`](https://github.com/BoatRamp/BoatRamp/blob/main/CHANGELOG.md)
+for the version that introduced it; read the flags for the whole span you are
+crossing.
+
+- **`serve.on_demand_tls.challenge` — unquoted enum → quoted string (changed in
+  v0.59.0; affects the v0.57 → v0.63 span).** The on-demand TLS challenge
+  selector now (de)serializes as a **quoted string** in both RON and JSON,
+  instead of a bare enum token. Migrate an explicit value:
+
+  ```ron
+  // old — bare token
+  ( serve: ( on_demand_tls: ( enabled: true, challenge: dns01 ) ) )
+  // new — quoted string (canonical kebab token)
+  ( serve: ( on_demand_tls: ( enabled: true, challenge: "dns-01" ) ) )
+  ```
+
+  The canonical tokens are `"tls-alpn-01"` (the default — a config that never
+  set `challenge` needs no change) and `"dns-01"`. Parsing is lenient and
+  case-insensitive, so the old spelling `challenge: "dns01"` is still accepted
+  (as are `"dns"` / `"dns_01"`), but the value is written back out in canonical
+  form. The same applies to the `BOATRAMP_ON_DEMAND_TLS_CHALLENGE` environment
+  variable.
+
 ## 3. Roll a cluster node by node
 
 A cluster is the same binary and the same commands as a single node. Upgrade it
