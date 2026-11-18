@@ -452,19 +452,6 @@ mod imp {
         Ok(stream)
     }
 
-    /// The host-side **client-byte relay** (Model A, design §1c): the root already bound the privileged
-    /// public TCP `listener`; here it accepts each client and relays the client's bytes to the
-    /// frontend-in-guest over a fresh vsock connection, splicing bytes both ways. The relay carries
-    /// ONLY untrusted client bytes — NEVER key material (the scoped frontend holds no key; the HARD
-    /// EXCLUSION). Runs for the node's life; a guest death EOFs the dials (the firecracker child,
-    /// supervised separately, is the authoritative `FailNodeClosed` signal).
-    ///
-    /// Two callers, ONE byte-pipe (reuse, not parallelize): the in-root relay THREAD spawned by
-    /// [`launch_frontend_vm`] (the live-gate path), and the SEPARATE least-authority relay PROCESS
-    /// ([`crate::privsep::run_vm_relay`], the owner's S1 placement — this runs it on the relay
-    /// process's main thread, behind its own Enforced least-authority profile). It returns when
-    /// `accept` ends (the pre-bound listener closed); the separate process reads that return as
-    /// `FailNodeClosed`.
     /// The MAX concurrent relayed client connections the separate `__vm-relay` process will service
     /// at once (F2 — availability bound). `run_relay` spawned an UNBOUNDED thread-per-connection, so
     /// a client-connection flood could exhaust host threads/memory (a DoS). This fixes the inflight
@@ -507,6 +494,19 @@ mod imp {
         Some(InflightGuard(counter.clone()))
     }
 
+    /// The host-side **client-byte relay** (Model A, design §1c): the root already bound the privileged
+    /// public TCP `listener`; here it accepts each client and relays the client's bytes to the
+    /// frontend-in-guest over a fresh vsock connection, splicing bytes both ways. The relay carries
+    /// ONLY untrusted client bytes — NEVER key material (the scoped frontend holds no key; the HARD
+    /// EXCLUSION). Runs for the node's life; a guest death EOFs the dials (the firecracker child,
+    /// supervised separately, is the authoritative `FailNodeClosed` signal).
+    ///
+    /// Two callers, ONE byte-pipe (reuse, not parallelize): the in-root relay THREAD spawned by
+    /// [`launch_frontend_vm`] (the live-gate path), and the SEPARATE least-authority relay PROCESS
+    /// ([`crate::privsep::run_vm_relay`], the owner's S1 placement — this runs it on the relay
+    /// process's main thread, behind its own Enforced least-authority profile). It returns when
+    /// `accept` ends (the pre-bound listener closed); the separate process reads that return as
+    /// `FailNodeClosed`.
     pub(crate) fn run_relay(
         label: String,
         listener: std::net::TcpListener,
