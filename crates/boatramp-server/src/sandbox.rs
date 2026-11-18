@@ -109,6 +109,18 @@ pub struct SandboxPolicy {
     /// pins EXACTLY its own binary so a fork can only re-exec that one trusted path). Non-existent
     /// paths are skipped at install time.
     pub execute_paths: Vec<PathBuf>,
+    /// **Deny ALL TCP via Landlock `AccessNet` (F1 — the separate VM relay ONLY).** When set,
+    /// [`linux::build_ruleset`] additionally handles `AccessNet` (`BindTcp | ConnectTcp`) with
+    /// ZERO `NetPort` allow-rules, so every TCP bind AND every TCP connect is denied. AF_UNIX
+    /// sockets (the firecracker vsock UDS the relay dials) are NOT governed by `AccessNet`, so the
+    /// relay's one legitimate dial is unaffected. `AccessNet` is a Landlock V4 right and the
+    /// privsep floor is `MIN_LANDLOCK_ABI` = V5 (⊇ V4), so the net wall is
+    /// always available at the floor; on a kernel whose Landlock ABI predates V4 the install FAILS
+    /// CLOSED (`build_ruleset` returns `Err` rather than silently omit the wall — and the V5 floor
+    /// already refuses such a kernel). `false` for EVERY other profile (monolith / root /
+    /// per-capability instance) — a strict no-op there, so no regression to any network-serving
+    /// instance or the root self-profile.
+    pub deny_all_tcp: bool,
 }
 
 impl SandboxPolicy {
@@ -138,6 +150,8 @@ impl SandboxPolicy {
             // The monolith never `execve`s once serving (its exec family is seccomp-killed), so it
             // pins nothing executable — Execute is confined to the (empty) list.
             execute_paths: Vec::new(),
+            // The monolith binds + dials freely (it IS the network server); never wall off TCP.
+            deny_all_tcp: false,
         }
     }
 
@@ -809,6 +823,9 @@ pub fn root_supervisor_policy(current_exe: &Path, config_file: &Path) -> Sandbox
         // The execute-pin: the root re-execs its own binary (and ONLY it) — read+EXECUTE on this
         // one path, while the general read grant above no longer carries Execute.
         execute_paths: vec![current_exe.to_path_buf()],
+        // The root's own TCP confinement is the seccomp `ROOT_NET_STRIP` (it does no socket I/O);
+        // the Landlock net wall is the RELAY's tool, not the root's — so it is OFF here.
+        deny_all_tcp: false,
     }
 }
 
@@ -914,6 +931,14 @@ pub fn relay_supervisor_killlist() -> Vec<String> {
 /// `execute_paths`. `read_write_paths` is empty — the relay writes no file. Both paths MUST already be
 /// made absolute + normalized by the caller (WS-C contract #1: [`lexically_normalize`] /
 /// `fs::canonicalize`) so the fd-based install grants the real paths.
+///
+/// **F1 — deny ALL TCP via Landlock `AccessNet`.** [`SandboxPolicy::deny_all_tcp`] is `true` ONLY on
+/// the relay: `AccessFs` does not govern network ops, so the FS view alone does not stop the relay
+/// (which legitimately holds `socket`/`connect` in its seccomp set to dial the vsock UDS) from
+/// `connect`-ing to an arbitrary TCP endpoint. Handling `AccessNet` with zero `NetPort` allow-rules
+/// walls off every TCP bind + connect while leaving the AF_UNIX vsock dial (not an `AccessNet`
+/// subject) untouched. See the field doc on [`SandboxPolicy::deny_all_tcp`] and
+/// [`linux::build_ruleset`] for the fail-closed sub-V4 behaviour.
 pub fn relay_supervisor_policy(current_exe: &Path, vsock_uds: &Path) -> SandboxPolicy {
     SandboxPolicy {
         // Informational (not granted by `install_derived`); names the one path the relay dials.
@@ -921,6 +946,10 @@ pub fn relay_supervisor_policy(current_exe: &Path, vsock_uds: &Path) -> SandboxP
         read_only_paths: vec![current_exe.to_path_buf(), vsock_uds.to_path_buf()],
         read_write_paths: Vec::new(),
         execute_paths: vec![current_exe.to_path_buf()],
+        // F1: the relay's ONLY legitimate dial is the AF_UNIX vsock UDS (NOT an AccessNet subject);
+        // wall off ALL TCP bind + connect so a compromised relay cannot reach the network. This is
+        // the ONE profile that sets it (strict no-op everywhere else).
+        deny_all_tcp: true,
     }
 }
 
@@ -1419,6 +1448,10 @@ pub fn derive_profile(
             read_only_paths: read_only,
             read_write_paths: read_write,
             execute_paths: execute,
+            // A per-capability instance's network posture is its seccomp set (a `listen.*` instance
+            // binds; a backend instance dials its pools) — the TCP-deny net wall is the relay's
+            // tool alone, never applied to an instance. OFF here (no regression).
+            deny_all_tcp: false,
         },
     })
 }
@@ -1731,8 +1764,8 @@ pub mod linux {
     use std::path::PathBuf;
 
     use landlock::{
-        Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-        RulesetCreated, RulesetCreatedAttr, RulesetStatus,
+        Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
+        RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
     };
 
     use super::{
@@ -1854,20 +1887,51 @@ pub mod linux {
         read_only: &[PathBuf],
         read_write: &[PathBuf],
         execute: &[PathBuf],
+        deny_all_tcp: bool,
     ) -> Result<RulesetCreated, SandboxError> {
         // Handle the FS rights the RUNNING kernel supports (clamped to the crate's max), not a
         // fixed ABI — so every FS right the kernel has is governed and `restrict_self` reports
-        // `FullyEnforced` on a kernel the crate fully knows (see [`handled_fs_abi`]).
+        // `FullyEnforced` on a kernel the crate fully knows (see [`handled_fs_abi`]). The same ABI
+        // LEVEL drives the net vocabulary below (`AccessNet::from_all` reads the ABI enum), so the
+        // dynamic-ABI handling that governs every FS right the kernel has governs every NET right
+        // too — no second kernel probe, no hardcoded ABI.
         let abi = handled_fs_abi(landlock_kernel_abi());
         // Execute STRIPPED from the general grants; re-granted below ONLY on the `execute` pin.
         let ro_access = AccessFs::from_read(abi) & !AccessFs::Execute;
         let rw_access = AccessFs::from_all(abi) & !AccessFs::Execute;
         // The execute-pin access: read + EXECUTE (so the pinned binary is readable AND runnable).
         let exec_access = AccessFs::from_read(abi);
-        let mut created = Ruleset::default()
+        let mut ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::BestEffort)
             .handle_access(AccessFs::from_all(abi))
-            .map_err(|e| SandboxError::Landlock(e.to_string()))?
+            .map_err(|e| SandboxError::Landlock(e.to_string()))?;
+        // F1 (the separate VM relay ONLY): HANDLE `AccessNet` (`BindTcp | ConnectTcp`) so that —
+        // with NO `NetPort` allow-rule added below — every TCP bind AND every TCP connect is
+        // DENIED. AF_UNIX (the firecracker vsock UDS the relay dials) is NOT an `AccessNet`
+        // subject, so the relay's one legitimate dial is unaffected.
+        if deny_all_tcp {
+            let net_access = AccessNet::from_all(abi);
+            if net_access.is_empty() {
+                // The running kernel's Landlock ABI predates `AccessNet` (V4, Linux 6.7), so the
+                // requested TCP wall CANNOT be installed. FAIL CLOSED: return `Err` rather than
+                // build a relay ruleset that silently omits the net confinement (a `None` Landlock
+                // layer → `finalize_status` → `Partial` → `enforce_privsep_status` refuses). NOTE
+                // for the Security reviewer: the privsep `MIN_LANDLOCK_ABI` = V5 (⊇ V4) floor in
+                // `status_for` ALREADY refuses any sub-V5 kernel, so a relay never actually runs on
+                // a kernel that lacks `AccessNet`; this explicit guard is defence-in-depth + a clear
+                // message (and it does not depend on the landlock crate's empty-access-right error).
+                return Err(SandboxError::Landlock(
+                    "deny-all-TCP net wall requested but this kernel's Landlock ABI predates \
+                     AccessNet (V4/Linux-6.7); refusing to build a relay ruleset without the \
+                     requested TCP confinement (the V5 privsep floor already rejects this kernel)"
+                        .to_string(),
+                ));
+            }
+            ruleset = ruleset
+                .handle_access(net_access)
+                .map_err(|e| SandboxError::Landlock(e.to_string()))?;
+        }
+        let mut created = ruleset
             .create()
             .map_err(|e| SandboxError::Landlock(e.to_string()))?;
         for (paths, access) in [
@@ -1886,6 +1950,8 @@ pub mod linux {
                     .map_err(|e| SandboxError::Landlock(e.to_string()))?;
             }
         }
+        // NO `NetPort` rule is ever added: when `deny_all_tcp` handled `AccessNet` above, the
+        // absence of any allow-rule is exactly what denies ALL TCP (bind + connect).
         Ok(created)
     }
 
@@ -2002,13 +2068,16 @@ pub mod linux {
 
     /// Build the Landlock ruleset for the given read-only / read-write roots + the execute-pin
     /// paths (read + EXECUTE; see [`build_ruleset`] — Execute is stripped from the general roots).
+    /// `deny_all_tcp` additionally walls off ALL TCP via `AccessNet` (F1 — the VM relay only; a
+    /// no-op for every other profile, which passes `false`).
     pub fn prepare_landlock(
         read_only: &[PathBuf],
         read_write: &[PathBuf],
         execute: &[PathBuf],
+        deny_all_tcp: bool,
     ) -> Result<PreparedLandlock, SandboxError> {
         Ok(PreparedLandlock {
-            created: build_ruleset(read_only, read_write, execute)?,
+            created: build_ruleset(read_only, read_write, execute, deny_all_tcp)?,
         })
     }
 
@@ -2032,6 +2101,7 @@ pub mod linux {
             &policy.read_only_paths,
             &policy.read_write_paths,
             &policy.execute_paths,
+            policy.deny_all_tcp,
         )
         .and_then(PreparedLandlock::apply)
         {
@@ -2129,6 +2199,7 @@ pub mod linux {
             &profile.policy.read_only_paths,
             &profile.policy.read_write_paths,
             &profile.policy.execute_paths,
+            profile.policy.deny_all_tcp,
         )
         .and_then(PreparedLandlock::apply)
         {
@@ -2137,7 +2208,8 @@ pub mod linux {
                 tracing::error!(
                     error = %e,
                     posture = ?profile.posture,
-                    "privsep per-instance Landlock FS confinement FAILED to apply"
+                    deny_all_tcp = profile.policy.deny_all_tcp,
+                    "privsep per-instance Landlock FS/net confinement FAILED to apply"
                 );
                 None
             }
@@ -2359,6 +2431,42 @@ pub mod linux {
                 AccessFs::from_all(handled_fs_abi(i64::MAX)),
                 AccessFs::from_all(crate_max),
                 "handled_fs_abi must saturate at the crate's max so from_all governs every FS right"
+            );
+        }
+
+        /// F1: the deny-ALL-TCP wall rests on `AccessNet` being governable at the privsep floor.
+        /// Prove (pure ABI math, no live kernel) that `AccessNet` governs BOTH TCP bind + connect
+        /// from the V5 floor up through the crate's max, and is EMPTY below V4 — the exact edge
+        /// `build_ruleset` fails closed on. If this reddens, the net wall is unavailable at the
+        /// floor and `build_ruleset`'s `deny_all_tcp` branch would wrongly refuse (or under-govern).
+        #[test]
+        fn accessnet_governs_all_tcp_from_the_privsep_floor_and_is_absent_below_v4() {
+            use landlock::{ABI, AccessNet};
+            // Governable at the V5 privsep floor and at every ABI the crate knows at/above it.
+            for abi in [MIN_LANDLOCK_ABI, ABI::V5, ABI::V6, ABI::from(i32::MAX)] {
+                let net = AccessNet::from_all(abi);
+                assert!(
+                    !net.is_empty(),
+                    "AccessNet must be governable at/above the V5 floor (abi={abi:?})"
+                );
+                assert!(
+                    net.contains(AccessNet::BindTcp) && net.contains(AccessNet::ConnectTcp),
+                    "the deny-all-TCP wall must govern BOTH TCP bind AND connect (abi={abi:?})"
+                );
+            }
+            // Below V4 there is no AccessNet — `from_all` is empty, which is the sub-V4 edge
+            // `build_ruleset` detects and FAILS CLOSED on (rather than silently omit the wall).
+            for abi in [ABI::V1, ABI::V2, ABI::V3, ABI::Unsupported] {
+                assert!(
+                    AccessNet::from_all(abi).is_empty(),
+                    "AccessNet must be ABSENT below V4 (abi={abi:?}) — build_ruleset fails closed here"
+                );
+            }
+            // The privsep floor is >= the ABI that introduced AccessNet (V4), so the net wall is
+            // always available at the floor — a regression guard on MIN_LANDLOCK_ABI.
+            assert!(
+                (MIN_LANDLOCK_ABI as i64) >= (ABI::V4 as i64),
+                "MIN_LANDLOCK_ABI must be >= V4 so the relay's AccessNet wall is always available"
             );
         }
     }
@@ -3416,5 +3524,56 @@ mod privsep_derivation_tests {
         assert_eq!(profile.policy, relay_supervisor_policy(&exe, &uds));
         // The install path grants only read_only/read_write — the two RO paths are the full FS view.
         assert_eq!(profile.policy.read_only_paths.len(), 2);
+    }
+
+    /// **F1 mutation guard (mirrors the `RELAY_NET_STRIP` "drop a verb → test reddens" pattern).**
+    /// The relay profile — and ONLY the relay profile — carries the deny-ALL-TCP `AccessNet`
+    /// posture (`SandboxPolicy::deny_all_tcp`). `build_ruleset` then handles `AccessNet` with ZERO
+    /// `NetPort` allow-rules, walling off every TCP bind + connect while leaving the AF_UNIX vsock
+    /// dial untouched. This asserts the POSTURE (the cross-platform, no-kernel proof); the LIVE
+    /// kernel proof that a TCP `connect` is actually EACCES'd under the installed profile — while
+    /// an AF_UNIX `connect` still succeeds — is the `sandbox-live` gate
+    /// (`relay_accessnet_walls_off_tcp_but_not_af_unix`).
+    ///
+    /// MUTATION: flip `relay_supervisor_policy`'s `deny_all_tcp` to `false` and the first assert
+    /// reddens; set it `true` on ANY non-relay profile (root / monolith / instance) and the
+    /// no-regression asserts redden.
+    #[test]
+    fn only_the_relay_profile_walls_off_all_tcp_via_accessnet() {
+        let exe = PathBuf::from("/usr/local/bin/boatramp");
+        let uds = PathBuf::from("/run/brvsk-3-4242.sock");
+
+        // The relay profile sets the deny-ALL-TCP posture.
+        assert!(
+            derive_relay_profile(&exe, &uds).policy.deny_all_tcp,
+            "the VM relay profile MUST wall off all TCP via AccessNet (F1)"
+        );
+        assert!(
+            relay_supervisor_policy(&exe, &uds).deny_all_tcp,
+            "relay_supervisor_policy MUST set deny_all_tcp"
+        );
+
+        // NO OTHER profile does — a strict no-op everywhere else (no regression to a network-
+        // serving instance, the root self-profile, or the monolith).
+        assert!(
+            !derive_root_profile(&exe, &uds).policy.deny_all_tcp,
+            "the root self-profile must NOT wall off TCP (it does no socket I/O; its net posture is \
+             the seccomp ROOT_NET_STRIP, and a net wall here would be an unrelated regression)"
+        );
+        assert!(
+            !SandboxPolicy::for_server("/var/lib/boatramp").deny_all_tcp,
+            "the monolith server (which binds + dials freely) must NOT wall off TCP"
+        );
+        // A per-capability instance — whether a listener frontend or an outbound-dialing backend —
+        // never gets the relay's net wall.
+        let inputs = SandboxDerivationInputs::for_instance("/var/lib/boatramp-x", None);
+        for caps in [frontend(), storage(), all_caps(), signer()] {
+            let profile = derive_profile(&caps, SandboxPosture::Derived, &inputs)
+                .expect("derive a per-capability profile");
+            assert!(
+                !profile.policy.deny_all_tcp,
+                "a per-capability instance ({caps:?}) must NOT carry the relay's TCP wall"
+            );
+        }
     }
 }

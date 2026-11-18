@@ -5155,6 +5155,12 @@ mod tests {
         );
         assert_eq!(profile.policy.execute_paths, vec![exe]);
         assert!(profile.policy.read_write_paths.is_empty());
+        // F1: the relay walls off ALL TCP (Landlock AccessNet, deny-all) — its one legitimate dial
+        // is the AF_UNIX vsock UDS, which AccessNet does not govern.
+        assert!(
+            profile.policy.deny_all_tcp,
+            "the __vm-relay profile must deny all TCP (AccessNet) — it dials only the AF_UNIX vsock"
+        );
 
         let allows = |n: &str| profile.seccomp_allow.iter().any(|x| x == n);
         let kills = |n: &str| profile.seccomp_kill.iter().any(|x| x == n);
