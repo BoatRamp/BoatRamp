@@ -2570,7 +2570,12 @@ mod tests {
             "dropping one managed DB must not remove a sibling's volume"
         );
         // The native scoped dir is untouched (docker refuses the `@` name outright).
-        assert!(backend.remove_volume("@acme@bramp-db-acme-app").await.is_err());
+        assert!(
+            backend
+                .remove_volume("@acme@bramp-db-acme-app")
+                .await
+                .is_err()
+        );
         assert!(
             vols.join("@acme@bramp-db-acme-app").exists(),
             "docker must never remove a native-container scoped volume dir"
