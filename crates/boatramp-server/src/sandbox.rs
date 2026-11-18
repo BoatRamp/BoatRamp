@@ -918,19 +918,27 @@ pub fn relay_supervisor_killlist() -> Vec<String> {
 
 /// The separate VM client-byte relay's Landlock FS policy (design §S1 item 1): READ + EXECUTE on its
 /// OWN binary (the execute-pin, the SAME `current_exe` shape as [`root_supervisor_policy`] — defence
-/// in depth, since `execve` is also seccomp-killed) plus READ on the ONE firecracker vsock UDS it
-/// dials, and NOTHING else — NO config, NO `data_dir`, NO §1.2 key input, NO instance state. The relay
-/// holds no backend authority, so (WS-C contract #2) there is no `authority_state_dirs` to grant; the
-/// view is categorically narrower than any instance's.
+/// in depth, since `execve` is also seccomp-killed) plus READ on the DIRECTORY holding the ONE
+/// firecracker vsock UDS it dials, and NOTHING else — NO config, NO `data_dir`, NO §1.2 key input, NO
+/// instance state. The relay holds no backend authority, so (WS-C contract #2) there is no
+/// `authority_state_dirs` to grant; the view is categorically narrower than any instance's.
+///
+/// **Why the UDS DIRECTORY, not the socket inode.** Landlock rules are built by O_PATH-opening the
+/// granted path. The `landlock` crate cannot open a SOCKET inode on every target (on the shipped
+/// static-musl build the open returns `ENXIO` → the whole per-instance Landlock layer fails to apply →
+/// `install_derived` reports `Partial` → `enforce_privsep_status` REFUSES → the relay would never
+/// serve). Granting the uds's PARENT DIRECTORY (a regular directory, which opens everywhere) both
+/// avoids that and covers path resolution for the `connect(2)`. The relay boots its guest with the UDS
+/// in a DEDICATED per-VM directory ([`crate::privsep_vm`]'s `boot_firecracker`) that holds ONLY that
+/// socket, so the directory grant stays tight — the relay can read exactly its own vsock dir.
 ///
 /// NOTE: Landlock's `AccessFs` vocabulary does not mediate `connect(2)` to an AF_UNIX socket, so the
-/// UDS grant is NOT the load-bearing wall for reaching the guest (the hypervisor boundary + the
-/// seccomp socket-verb set are) — it is a minimal, intent-documenting grant (and defence-in-depth for
-/// any future ABI that governs socket-path resolution). The EXECUTE-pin is on the own binary ALONE:
-/// [`linux::build_ruleset`] STRIPS `Execute` from the read grant and re-grants it only on
-/// `execute_paths`. `read_write_paths` is empty — the relay writes no file. Both paths MUST already be
-/// made absolute + normalized by the caller (WS-C contract #1: [`lexically_normalize`] /
-/// `fs::canonicalize`) so the fd-based install grants the real paths.
+/// dir grant is NOT the load-bearing wall for reaching the guest (the hypervisor boundary + the seccomp
+/// socket-verb set are). The EXECUTE-pin is on the own binary ALONE: [`linux::build_ruleset`] STRIPS
+/// `Execute` from the read grant and re-grants it only on `execute_paths`. `read_write_paths` is empty
+/// — the relay writes no file. `current_exe` + `vsock_uds` MUST already be absolute + normalized by the
+/// caller (WS-C contract #1: [`lexically_normalize`] / `fs::canonicalize`) so the fd-based install
+/// grants the real paths; the uds dir is its lexical parent.
 ///
 /// **F1 — deny ALL TCP via Landlock `AccessNet`.** [`SandboxPolicy::deny_all_tcp`] is `true` ONLY on
 /// the relay: `AccessFs` does not govern network ops, so the FS view alone does not stop the relay
@@ -938,12 +946,19 @@ pub fn relay_supervisor_killlist() -> Vec<String> {
 /// `connect`-ing to an arbitrary TCP endpoint. Handling `AccessNet` with zero `NetPort` allow-rules
 /// walls off every TCP bind + connect while leaving the AF_UNIX vsock dial (not an `AccessNet`
 /// subject) untouched. See the field doc on [`SandboxPolicy::deny_all_tcp`] and
-/// [`linux::build_ruleset`] for the fail-closed sub-V4 behaviour.
+/// [`linux::build_ruleset`] for the fail-closed sub-V4 behaviour. (netns is the LOAD-BEARING egress
+/// wall — see [`enter_empty_netns`]; this AccessNet wall + the seccomp set are defence-in-depth.)
 pub fn relay_supervisor_policy(current_exe: &Path, vsock_uds: &Path) -> SandboxPolicy {
+    // Grant the uds's DIRECTORY (a regular dir opens on every target; a socket inode does not — ENXIO
+    // on static-musl). The parent is the relay's dedicated per-VM vsock dir, holding only this socket.
+    let uds_dir = vsock_uds
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| vsock_uds.to_path_buf());
     SandboxPolicy {
         // Informational (not granted by `install_derived`); names the one path the relay dials.
         data_dir: vsock_uds.to_path_buf(),
-        read_only_paths: vec![current_exe.to_path_buf(), vsock_uds.to_path_buf()],
+        read_only_paths: vec![current_exe.to_path_buf(), uds_dir],
         read_write_paths: Vec::new(),
         execute_paths: vec![current_exe.to_path_buf()],
         // F1: the relay's ONLY legitimate dial is the AF_UNIX vsock UDS (NOT an AccessNet subject);
@@ -967,6 +982,275 @@ pub fn derive_relay_profile(current_exe: &Path, vsock_uds: &Path) -> DerivedProf
         seccomp_kill: relay_supervisor_killlist(),
         policy: relay_supervisor_policy(current_exe, vsock_uds),
     }
+}
+
+// =============================================================================
+// The VM relay's EGRESS CONTAINMENT — an empty network namespace (MED-1) + an
+// explicit capability-bounding-set drop (INFO). Scoped privsep VM substrate, S1
+// follow-ups from the F1/F2 Security review (2026-11-18).
+// =============================================================================
+//
+// F1 (the relay's Landlock `AccessNet` deny-all-TCP wall — [`relay_supervisor_policy`]) governs ONLY
+// TCP bind/connect. It leaves **UDP** egress (`socket(AF_INET, SOCK_DGRAM)` + `sendto`) open — and the
+// relay's seccomp set legitimately KEEPS `socket`/`sendto`/`connect` (it dials the AF_UNIX vsock UDS
+// and reads/writes both ends), filtering by NAME only, not by the socket's domain argument. So a
+// compromised relay could exfiltrate the spliced client byte-stream (or C2 / pivot to an internal
+// service) over UDP (MED-1), and could open a raw/packet socket if it held `CAP_NET_RAW` (INFO).
+//
+// The robust containment (Security reviewer's recommendation; the strongest primitive) is to run the
+// **netless** relay in a FRESH, EMPTY network namespace: no interfaces, loopback-only (and `lo` DOWN),
+// no route anywhere — which closes UDP **and** TCP **and** raw/packet **and** abstract-namespace-UDS
+// egress in one move, with no route to 169.254.169.254 at all. The **pathname** AF_UNIX vsock UDS
+// still dials (AF_UNIX pathname sockets are NOT netns-scoped), and the inherited, root-netns-bound
+// public TCP listener still `accept`s (a socket keeps the netns it was CREATED in). The netns is the
+// PRIMARY egress wall; F1's Landlock-TCP wall + the relay seccomp set stay ON as defence-in-depth
+// layers UNDER it (layered sandboxing, not a duplicate path).
+//
+// These two primitives are the one place that setup lives; the relay
+// ([`crate::privsep::run_vm_relay_confined`], in the `boatramp` crate) and its Linux live gate BOTH
+// call them, so the production path and the gate can never drift.
+
+/// Move the calling process into a FRESH, EMPTY (loopback-only) network namespace and VERIFY it is
+/// empty, fail-closed. The VM relay's PRIMARY egress containment (MED-1); see the section comment.
+///
+/// **Why netns is load-bearing, not Landlock `AccessNet` (F1).** F1's `AccessNet` net hook can be
+/// SILENTLY non-enforced on a kernel that REPORTS supporting it (observed on a virtualized CI runner:
+/// Landlock's FS hook enforces but the net hook is a no-op, and `restrict_self` still reports success).
+/// An empty network namespace contains egress by a different mechanism — there is simply NO route /
+/// interface, so every `connect`/`sendto` fails `ENETUNREACH` — which does NOT depend on any LSM hook
+/// actually firing. So netns is the correctness wall; F1 + the relay seccomp set are defence-in-depth.
+///
+/// **Privilege (two paths; the production relay only ever takes the first).** The preferred path is a
+/// userns-FREE `unshare(CLONE_NEWNET)`, which needs `CAP_SYS_ADMIN` — the SAME userns-free model the
+/// Container substrate's `unshare(NS/IPC/UTS/CGROUP)` uses. The relay is `fork`+`exec`'d by the
+/// privileged root and INHERITS `CAP_SYS_ADMIN`, so it ALWAYS takes this path and NEVER adds a user
+/// namespace; it uses the capability ONCE here, then drops ALL capabilities ([`drop_all_capabilities`])
+/// before installing its profile / touching a client byte. Only an UNPRIVILEGED caller (never the
+/// production relay — e.g. the CI live gate on an unprivileged runner, or a rootless node) falls back
+/// to `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, which obtains the SAME empty, loopback-only netns
+/// (the user namespace is merely the unprivileged *mechanism* to unshare the netns; it is mapped back
+/// to the real uid so file access is unchanged). Both paths yield an egress-equivalent netns and are
+/// VERIFIED loopback-only. Fail-closed: if NEITHER can enter an empty netns, return `Err` — the relay
+/// then REFUSES to serve (never a silent fall-back to a full-network relay).
+///
+/// **Ordering (load-bearing).** Call this BEFORE installing the relay's seccomp profile: the profile
+/// hard-KILLS `unshare`/`setns` (they are in [`KILL_SURFACE`]), so once the wall is up the relay can
+/// never (re-)enter or leave a namespace — this is the pre-profile window, and the only one. The
+/// inherited listener fd is adopted (`accept`ed) and the vsock UDS is dialed AFTER this, from inside
+/// the empty netns.
+#[cfg(target_os = "linux")]
+pub fn enter_empty_netns() -> std::io::Result<()> {
+    // Preferred, userns-FREE path (the production relay's path — it holds CAP_SYS_ADMIN from the root).
+    // SAFETY: `unshare(2)` with a scalar flag takes no pointers; it creates a new network namespace for
+    // THIS process and makes it the caller's immediately (no fork needed — unlike CLONE_NEWPID).
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0 {
+        // Fail-closed VERIFY: a freshly unshared netns must be loopback-only. If anything else is
+        // present (impossible absent a kernel bug), REFUSE rather than serve with a route.
+        return verify_netns_loopback_only();
+    }
+    let privileged_err = std::io::Error::last_os_error();
+    // Fallback for an UNPRIVILEGED caller (never the production relay): a user namespace grants
+    // CAP_SYS_ADMIN *within* the new userns, permitting the simultaneous netns unshare.
+    enter_empty_netns_via_userns().map_err(|fallback_err| {
+        std::io::Error::other(format!(
+            "could not enter an empty network namespace for the relay's egress wall: the userns-free \
+             unshare(CLONE_NEWNET) failed ({privileged_err}) AND the unprivileged userns+netns fallback \
+             failed ({fallback_err}) — refusing fail-closed (a relay never serves with a full network)"
+        ))
+    })
+}
+
+/// The unprivileged fallback for [`enter_empty_netns`]: enter a new user namespace + net namespace
+/// together (CLONE_NEWUSER makes the simultaneous CLONE_NEWNET permitted without host `CAP_SYS_ADMIN`),
+/// then map userns-root back to the real uid/gid so file access (the Landlock execute-pin's `PathFd`
+/// opens, even under a `0700` home) is unchanged. The resulting netns is egress-equivalent to the
+/// userns-free one. NEVER reached by the production relay (which is root). Fail-closed on any step.
+#[cfg(target_os = "linux")]
+fn enter_empty_netns_via_userns() -> std::io::Result<()> {
+    // Capture the real ids BEFORE the unshare — they become the single-id map targets.
+    // SAFETY: geteuid/getegid take no args and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    // SAFETY: `unshare(2)` with scalar flags, no pointers.
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // `setgroups=deny` is required before an unprivileged `gid_map` write; then map userns id 0 → the
+    // real uid/gid (a single-id self-map, always permitted to the userns creator).
+    std::fs::write("/proc/self/setgroups", "deny")?;
+    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
+    verify_netns_loopback_only()
+}
+
+/// Confirm the current network namespace is EMPTY: its ONLY interface is loopback (`lo`). Used to
+/// fail-closed after [`enter_empty_netns`] — proof the netns is truly empty / loopback-only (the
+/// property the Security review asks us to assert, not assume).
+#[cfg(target_os = "linux")]
+fn verify_netns_loopback_only() -> std::io::Result<()> {
+    // SAFETY: `if_nameindex()` returns an owned, NUL-terminated (if_index==0 && if_name==null) array
+    // that we free with `if_freenameindex`; we only read its entries.
+    let list = unsafe { libc::if_nameindex() };
+    if list.is_null() {
+        return Err(std::io::Error::other(format!(
+            "if_nameindex() failed while verifying the relay's empty netns is loopback-only: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut non_loopback: Vec<String> = Vec::new();
+    // SAFETY: walk the array until the terminating zero entry; each `if_name` is a valid C string.
+    let mut p = list;
+    unsafe {
+        while (*p).if_index != 0 || !(*p).if_name.is_null() {
+            if (*p).if_name.is_null() {
+                break;
+            }
+            let name = std::ffi::CStr::from_ptr((*p).if_name)
+                .to_string_lossy()
+                .into_owned();
+            if name != "lo" {
+                non_loopback.push(name);
+            }
+            p = p.add(1);
+        }
+        libc::if_freenameindex(list);
+    }
+    if non_loopback.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "the relay's network namespace is NOT empty: it exposes interface(s) {non_loopback:?} \
+             besides loopback — refusing fail-closed (the egress wall assumes a loopback-only netns)"
+        )))
+    }
+}
+
+/// Harden the calling process's capabilities against RE-acquisition, fail-closed on the load-bearing
+/// step: set `SECBIT_NOROOT` (+`_LOCKED`) so uid 0 gains NO capability at the next `execve`, EMPTY the
+/// capability BOUNDING set (every cap 0..=63, so `CAP_NET_RAW` — raw/packet sockets — and
+/// `CAP_SYS_ADMIN` cannot be regained via a file-capability `execve`), and CLEAR the ambient set.
+///
+/// **This does NOT drop the running thread's EFFECTIVE/PERMITTED caps** — `prctl` cannot. A privsep
+/// INSTANCE relies on the `execve` that FOLLOWS its `pre_exec`: with `SECBIT_NOROOT` + an empty bounding
+/// set, the post-`execve` process gets ZERO caps (the container gate's Finding-2 probe confirms this).
+/// A caller that does NOT `execve` (the VM relay) MUST additionally call [`clear_current_capabilities`]
+/// to drop the effective/permitted sets in-process.
+///
+/// Mechanism is `prctl`-only here (so it stays async-signal-safe and callable from a `pre_exec`
+/// closure, and needs no `capset` which a per-tenant child's router-seccomp filter would `EPERM`).
+/// Returns `Err` ONLY if `PR_SET_SECUREBITS` fails (the load-bearing bit); the bounding-set + ambient
+/// ops are best-effort (a high cap number `EINVAL`s on an older kernel — harmless). The ONE such
+/// sequence: both the relay ([`crate::privsep::run_vm_relay_confined`]) and every privsep instance
+/// (`spawn_wired_instance`'s `pre_exec`) call it (consolidated). A caller that still needs a capability
+/// (e.g. the relay's own `unshare`) MUST have used it BEFORE calling this (`PR_CAPBSET_DROP` /
+/// `PR_SET_SECUREBITS` themselves need `CAP_SETPCAP`, still held here).
+#[cfg(target_os = "linux")]
+pub fn drop_all_capabilities() -> std::io::Result<()> {
+    // `SECBIT_NOROOT` makes uid 0 no longer special at execve; `_LOCKED` prevents it being cleared.
+    const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
+    const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
+    // SAFETY: `prctl` with scalar args only (no pointers).
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_SECUREBITS,
+            SECBIT_NOROOT | SECBIT_NOROOT_LOCKED,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Empty the capability BOUNDING set (best-effort: a cap number the kernel doesn't know `EINVAL`s).
+    let mut cap: libc::c_ulong = 0;
+    while cap <= 63 {
+        // SAFETY: `prctl(PR_CAPBSET_DROP, cap, …)` — scalar args, no pointers.
+        unsafe {
+            libc::prctl(
+                libc::PR_CAPBSET_DROP,
+                cap,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            );
+        }
+        cap += 1;
+    }
+    // Clear the ambient set (ambient caps otherwise survive execve).
+    // SAFETY: `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, …)` — scalar args, no pointers.
+    unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        );
+    }
+    Ok(())
+}
+
+/// Clear the calling thread's EFFECTIVE, PERMITTED and INHERITABLE capability sets IN-PROCESS via
+/// `capset(2)` — the drop the VM relay needs because, unlike a privsep instance, it does NOT `execve`
+/// after dropping privileges, so [`drop_all_capabilities`]' `prctl` securebits/bounding (which only
+/// gate RE-acquisition at the next `execve`) would otherwise leave the relay serving with its full
+/// inherited root caps (incl. `CAP_SYS_ADMIN`/`CAP_NET_RAW`). Call it AFTER [`drop_all_capabilities`]
+/// (whose `PR_SET_SECUREBITS` / `PR_CAPBSET_DROP` need `CAP_SETPCAP`, still held at that point) and
+/// BEFORE installing the relay's seccomp profile (so `capset` is not yet filtered) — but AFTER the
+/// relay's one privileged op (`unshare(CLONE_NEWNET)`). Reducing one's OWN capability sets needs no
+/// privilege. Fail-closed on error.
+#[cfg(target_os = "linux")]
+pub fn clear_current_capabilities() -> std::io::Result<()> {
+    // The `capset(2)` ABI structs (the libc crate does not re-export them by name, so declare them —
+    // this is the stable kernel ABI). Header + two 32-bit data words = the 64-bit v3 layout.
+    #[repr(C)]
+    struct CapUserHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapUserData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    // `_LINUX_CAPABILITY_VERSION_3`: 64-bit caps, carried as two 32-bit data words.
+    const CAP_VERSION_3: u32 = 0x2008_0522;
+    let hdr = CapUserHeader {
+        version: CAP_VERSION_3,
+        pid: 0, // 0 == the calling thread
+    };
+    let data = [
+        CapUserData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        CapUserData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+    // SAFETY: `capset(2)` with a valid v3 header + the required 2-element data array; all-zero sets are
+    // a pure capability DROP (always permitted on one's own thread), no pointers escape the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &hdr as *const CapUserHeader,
+            data.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::other(format!(
+            "capset(clear all capability sets) failed: {} — the relay refuses to serve with \
+             undropped effective capabilities",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 /// The access an instance's held crown-jewel key path needs under Landlock.
@@ -3467,22 +3751,29 @@ mod privsep_derivation_tests {
     }
 
     #[test]
-    fn relay_policy_grants_only_own_binary_and_the_one_uds_no_config_no_data_dir_no_key() {
+    fn relay_policy_grants_only_own_binary_and_the_one_uds_dir_no_config_no_data_dir_no_key() {
         let exe = PathBuf::from("/usr/local/bin/boatramp");
-        let uds = PathBuf::from("/run/brvsk-3-4242.sock");
+        // The UDS lives in a DEDICATED per-VM directory holding only that socket (boot_firecracker).
+        let uds = PathBuf::from("/run/brvsk-3-4242/vsock.sock");
+        let uds_dir = PathBuf::from("/run/brvsk-3-4242");
         let policy = relay_supervisor_policy(&exe, &uds);
 
-        // The FS view is EXACTLY the own binary (RO + execute) + the ONE vsock UDS (RO). Nothing is
-        // read-write — the relay writes no file.
-        assert_eq!(policy.read_only_paths, vec![exe.clone(), uds.clone()]);
+        // The FS view is EXACTLY the own binary (RO + execute) + the DIRECTORY holding the ONE vsock
+        // UDS (RO — the landlock crate can't O_PATH-open a socket inode on static-musl, so the relay
+        // grants the uds's dedicated dir, which holds only that socket). Nothing is read-write.
+        assert_eq!(policy.read_only_paths, vec![exe.clone(), uds_dir.clone()]);
         assert!(policy.read_write_paths.is_empty());
+        assert!(
+            !policy.read_only_paths.contains(&uds),
+            "the relay grants the uds's DIRECTORY, not the socket inode (musl O_PATH-ENXIO)"
+        );
 
-        // EXECUTE is pinned to the own binary ALONE (never the UDS): `build_ruleset` strips Execute
-        // from the read grant and re-grants it only on `execute_paths`.
+        // EXECUTE is pinned to the own binary ALONE (never the UDS/its dir): `build_ruleset` strips
+        // Execute from the read grant and re-grants it only on `execute_paths`.
         assert_eq!(policy.execute_paths, vec![exe.clone()]);
         assert!(
-            !policy.execute_paths.contains(&uds),
-            "the vsock UDS must never be executable"
+            !policy.execute_paths.contains(&uds) && !policy.execute_paths.contains(&uds_dir),
+            "the vsock UDS / its dir must never be executable"
         );
 
         // No config, no data_dir, no §1.2 key input, no instance state is anywhere in the view — the

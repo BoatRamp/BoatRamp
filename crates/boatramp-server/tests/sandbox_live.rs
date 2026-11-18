@@ -53,13 +53,19 @@ const SERVE_SETUP_FAILED: i32 = 34; // socket/pipe/file plumbing failed (not a f
 const DERIVED_BIND_REFUSED: i32 = 41; // derived profile ON: socket allowed, bind EPERM'd (expected)
 const DERIVED_BIND_ALLOWED: i32 = 42; // OFF or a hole: bind succeeded
 const DERIVED_BIND_SETUP_FAILED: i32 = 43; // socket() itself failed (not the bind verdict)
-// F1 — the VM relay's deny-ALL-TCP Landlock AccessNet wall: a TCP `connect` must be DENIED (EACCES)
-// while an AF_UNIX `connect` (the vsock-UDS dial shape) is UNAFFECTED. Mutation-verified with the
-// relay profile OFF (the same TCP connect then succeeds against the live listener).
-const RELAY_NET_TCP_REFUSED_UNIX_OK: i32 = 61; // relay profile ON: AF_UNIX ok, TCP connect EACCES'd
-const RELAY_NET_TCP_ALLOWED: i32 = 62; // OFF or a hole: TCP connect succeeded
-const RELAY_NET_UNIX_BLOCKED: i32 = 63; // regression: AF_UNIX connect blocked (vsock dial would break)
+// MED-1 — the VM relay's EMPTY-NETWORK-NAMESPACE egress wall. Inside a fresh, loopback-only netns the
+// relay's TCP *and* UDP egress both fail by no-route (ENETUNREACH), while an AF_UNIX pathname `connect`
+// (the vsock-UDS dial shape) is UNAFFECTED (pathname AF_UNIX is not netns-scoped). This is the
+// LOAD-BEARING wall: it does NOT depend on the Landlock `AccessNet` hook actually enforcing — which a
+// virtualized runner can silently drop while reporting support (F1's wall is then a no-op, but the
+// netns has no interface, so there is simply no route). The relay profile's AccessNet + seccomp stay ON
+// as defence-in-depth. Mutation-verified: with the netns (+ profile) OFF, the SAME TCP + UDP egress
+// reach the live loopback listener / loopback.
+const RELAY_NET_CONTAINED: i32 = 61; // netns ON: AF_UNIX ok, BOTH TCP + UDP egress denied (no route)
+const RELAY_NET_EGRESS_REACHABLE: i32 = 62; // some egress (TCP and/or UDP) got out
+const RELAY_NET_UNIX_BLOCKED: i32 = 63; // regression: AF_UNIX connect blocked (the vsock dial would break)
 const RELAY_NET_SETUP_FAILED: i32 = 64; // socket() plumbing failed (not a net verdict)
+const RELAY_NET_NETNS_FAILED: i32 = 65; // could not enter the empty netns here (unprivileged userns off?)
 const SELFTEST_INSTALL_FAILED: i32 = 99; // the sandbox install itself errored in the child
 
 fn cstr(s: &str) -> CString {
@@ -293,18 +299,22 @@ fn probe_derived_bind(install: bool) -> i32 {
     wait_code(pid)
 }
 
-/// F1 LIVE probe: fork a child that (optionally) installs the SEPARATE VM relay's bespoke profile
-/// ([`sandbox::derive_relay_profile`]) on its MAIN thread, then on a SECOND (spawned, non-installing)
-/// thread exercises the relay's two network shapes against the REAL kernel:
-///   1. an AF_UNIX `connect` to `unix_path` (the shape of the firecracker vsock-UDS dial) — which
-///      the relay DOES hold `socket`/`connect` for and which Landlock `AccessNet` does NOT govern, so
-///      it must still SUCCEED; and
-///   2. an AF_INET (TCP) `connect` to `127.0.0.1:tcp_port` (a live loopback listener the parent
-///      holds) — which the relay's deny-ALL-TCP `AccessNet` wall must DENY (EACCES).
+/// MED-1 LIVE probe: fork a child that (optionally) enters a FRESH, EMPTY (loopback-only) network
+/// namespace via the production primitive [`sandbox::enter_empty_netns`], (optionally) installs the
+/// SEPARATE VM relay's bespoke profile ([`sandbox::derive_relay_profile`]) on its MAIN thread, then on
+/// a SECOND (spawned, non-installing) thread exercises the relay's network shapes against the REAL
+/// kernel:
+///   1. an AF_UNIX `connect` to `unix_path` (the firecracker vsock-UDS dial shape) — pathname AF_UNIX
+///      is NOT netns-scoped and `AccessNet` does not govern it, so it must still SUCCEED; and
+///   2. an AF_INET (TCP) `connect` to `127.0.0.1:tcp_port` (a live loopback listener the parent holds)
+///      AND a UDP `sendto` to `127.0.0.1:9` — inside the empty netns BOTH must fail by no-route
+///      (ENETUNREACH), the LOAD-BEARING containment that does not depend on the `AccessNet` hook.
 ///
-/// With the profile OFF the same TCP connect succeeds (the mutation proof). The relay profile grants
-/// FS read on `current_exe` + `unix_path` only, so the probe needs no other filesystem access.
-fn probe_relay_net(install: bool, tcp_port: u16, unix_path: &CString) -> i32 {
+/// With `netns`+`install` OFF the SAME TCP + UDP egress reach (the mutation proof). The relay profile
+/// grants FS read on `current_exe` + `unix_path` only, so the probe needs no other filesystem access.
+/// When `netns` is requested but the kernel cannot provide one here (unprivileged userns disabled),
+/// the child exits [`RELAY_NET_NETNS_FAILED`] so the caller can SKIP rather than misreport.
+fn probe_relay_net(netns: bool, install: bool, tcp_port: u16, unix_path: &CString) -> i32 {
     let profile = if install {
         let exe = std::env::current_exe().expect("test binary path for the relay execute-pin");
         let uds = PathBuf::from(
@@ -326,6 +336,11 @@ fn probe_relay_net(install: bool, tcp_port: u16, unix_path: &CString) -> i32 {
         std::io::Error::last_os_error()
     );
     if pid == 0 {
+        // (0) MED-1: enter the empty netns FIRST (the production egress wall), before the profile. On
+        //     an unprivileged runner this takes enter_empty_netns's userns+netns fallback.
+        if netns && sandbox::enter_empty_netns().is_err() {
+            unsafe { libc::_exit(RELAY_NET_NETNS_FAILED) };
+        }
         if let Some(p) = profile.as_ref()
             && sandbox::linux::install_derived(p).is_err()
         {
@@ -333,7 +348,7 @@ fn probe_relay_net(install: bool, tcp_port: u16, unix_path: &CString) -> i32 {
         }
         let unix_path = unix_path.clone();
         let handle = std::thread::spawn(move || {
-            // (1) AF_UNIX connect — the vsock-dial shape; must be UNAFFECTED by the TCP wall.
+            // (1) AF_UNIX connect — the vsock-dial shape; must be UNAFFECTED by the netns / TCP wall.
             let ufd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
             if ufd < 0 {
                 unsafe { libc::_exit(RELAY_NET_SETUP_FAILED) };
@@ -359,11 +374,11 @@ fn probe_relay_net(install: bool, tcp_port: u16, unix_path: &CString) -> i32 {
             unsafe { libc::close(ufd) };
             if !unix_ok {
                 // A live UnixListener must accept this; blocked ⇒ the vsock dial shape is broken
-                // (under the profile that is the F1 regression; without it, broken plumbing).
+                // (with the netns on, a regression; without it, broken plumbing).
                 unsafe { libc::_exit(RELAY_NET_UNIX_BLOCKED) };
             }
 
-            // (2) AF_INET (TCP) connect to the parent's live loopback listener.
+            // (2a) AF_INET (TCP) connect to the parent's live loopback listener.
             let tfd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
             if tfd < 0 {
                 unsafe { libc::_exit(RELAY_NET_SETUP_FAILED) };
@@ -382,10 +397,37 @@ fn probe_relay_net(install: bool, tcp_port: u16, unix_path: &CString) -> i32 {
             };
             let tcp_ok = trc == 0;
             unsafe { libc::close(tfd) };
-            let code = if tcp_ok {
-                RELAY_NET_TCP_ALLOWED // no wall (OFF) or a hole: TCP reachable
+
+            // (2b) UDP sendto to loopback — the residue F1/AccessNet does NOT cover; the empty netns
+            //      must deny it (no route ⇒ ENETUNREACH), the same way it denies TCP.
+            let dfd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+            if dfd < 0 {
+                unsafe { libc::_exit(RELAY_NET_SETUP_FAILED) };
+            }
+            // SAFETY: a zeroed sockaddr_in for 127.0.0.1:9 (discard) in network byte order.
+            let mut daddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            daddr.sin_family = libc::AF_INET as libc::sa_family_t;
+            daddr.sin_port = 9u16.to_be();
+            daddr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let payload = b"x";
+            let drc = unsafe {
+                libc::sendto(
+                    dfd,
+                    payload.as_ptr() as *const libc::c_void,
+                    payload.len(),
+                    0,
+                    &daddr as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            let udp_ok = drc >= 0;
+            unsafe { libc::close(dfd) };
+
+            // The relay is CONTAINED iff NEITHER TCP nor UDP egress got out (AF_UNIX stayed reachable).
+            let code = if tcp_ok || udp_ok {
+                RELAY_NET_EGRESS_REACHABLE // no netns (OFF) or a hole: egress reached
             } else {
-                RELAY_NET_TCP_REFUSED_UNIX_OK // AccessNet denied TCP; AF_UNIX stayed reachable
+                RELAY_NET_CONTAINED // the empty netns denied BOTH TCP + UDP; AF_UNIX stayed reachable
             };
             unsafe { libc::_exit(code) };
         });
@@ -653,61 +695,63 @@ fn sandbox_live_blocks_exec_and_out_of_data_dir_writes() {
          {bind_off}"
     );
 
-    // ---- F1: the VM relay's deny-ALL-TCP Landlock AccessNet wall -----------------------------------
-    // Needs AccessNet (Landlock ABI V4, Linux 6.7). The privsep floor is V5, so a real relay never
-    // runs below it; this probe runs wherever AccessNet exists (lighthouse is V5/6.12). On an older
-    // kernel it is SKIPPED with a note rather than reported as a failure (the net wall genuinely
-    // cannot be installed there — and `build_ruleset` fails closed in that case).
-    // 4 == Landlock ABI V4 (AccessNet, Linux 6.7); `landlock` is not a dev-dep here, so compare the
-    // raw ABI number the probe returns rather than naming the enum.
-    const LANDLOCK_ABI_V4: i64 = 4;
-    let relay_net_tested = if abi >= LANDLOCK_ABI_V4 {
-        // The parent holds a live loopback TCP listener + a pathname AF_UNIX listener for the whole
-        // probe, so a connect reaches a real acceptor (distinguishing an AccessNet EACCES from a
-        // mere ECONNREFUSED): OFF ⇒ both reachable; ON ⇒ TCP walled off, AF_UNIX still reachable.
-        let tcp = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback TCP probe listener");
-        let tcp_port = tcp.local_addr().expect("probe listener addr").port();
-        let unix_path = base.join("relay-net.sock");
-        let _ = std::fs::remove_file(&unix_path);
-        let _unix = UnixListener::bind(&unix_path).expect("bind AF_UNIX probe listener");
-        let unix_c = cstr(unix_path.to_str().expect("utf-8 unix probe path"));
+    // ---- MED-1: the VM relay's EMPTY-NETWORK-NAMESPACE egress wall ---------------------------------
+    // The LOAD-BEARING egress containment is the empty netns (no route ⇒ ENETUNREACH for TCP *and*
+    // UDP), NOT the Landlock `AccessNet` hook — which a virtualized runner can SILENTLY drop while
+    // reporting support (F1's wall then a no-op; the netns still contains, independent of any LSM). It
+    // needs no particular Landlock ABI. The probe enters the netns via the production primitive
+    // `sandbox::enter_empty_netns`; on this unprivileged job that takes its userns+netns fallback. If
+    // the kernel provides no unprivileged user namespace here, the probe SKIPS with a note (the privsep
+    // live-gate, run as root with the userns-free CLONE_NEWNET path, is the production-faithful proof).
+    // The parent holds a live loopback TCP listener + a pathname AF_UNIX listener so a reached egress
+    // hits a real acceptor (distinguishing containment from a mere ECONNREFUSED).
+    let tcp = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback TCP probe listener");
+    let tcp_port = tcp.local_addr().expect("probe listener addr").port();
+    let unix_path = base.join("relay-net.sock");
+    let _ = std::fs::remove_file(&unix_path);
+    let _unix = UnixListener::bind(&unix_path).expect("bind AF_UNIX probe listener");
+    let unix_c = cstr(unix_path.to_str().expect("utf-8 unix probe path"));
 
-        // ON: the relay profile walls off TCP (AccessNet) while leaving the AF_UNIX dial reachable.
-        let net_on = probe_relay_net(true, tcp_port, &unix_c);
-        assert_eq!(
-            net_on, RELAY_NET_TCP_REFUSED_UNIX_OK,
-            "relay profile ON: on a NON-installing thread, an AF_UNIX connect (the vsock-dial shape) \
-             must SUCCEED while a TCP connect is DENIED by Landlock AccessNet; child exit was \
-             {net_on} ({RELAY_NET_TCP_ALLOWED}=TCP was NOT walled off, \
-             {RELAY_NET_UNIX_BLOCKED}=AF_UNIX dial was blocked (regression), \
-             {RELAY_NET_SETUP_FAILED}=socket() plumbing)"
-        );
-        // OFF (mutation): the SAME TCP connect must now SUCCEED, proving the ON refusal is the wall,
-        // not a broken harness; the AF_UNIX dial stays reachable either way.
-        let net_off = probe_relay_net(false, tcp_port, &unix_c);
-        assert_eq!(
-            net_off, RELAY_NET_TCP_ALLOWED,
-            "relay profile OFF: the TCP connect must SUCCEED (the live listener is reachable), proving \
-             the ON AccessNet refusal is real; child exit was {net_off}"
-        );
-        true
-    } else {
+    // ON: inside the empty netns (+ the relay profile, defence-in-depth) BOTH TCP and UDP egress are
+    // denied by no-route, while the AF_UNIX vsock-dial shape stays reachable.
+    let net_on = probe_relay_net(true, true, tcp_port, &unix_c);
+    let relay_net_tested = if net_on == RELAY_NET_NETNS_FAILED {
         eprintln!(
-            "SANDBOX LIVE NOTE: skipping the relay AccessNet TCP-deny probe — this kernel's Landlock \
-             ABI is {abi} (< V4/6.7, no AccessNet). The privsep V5 floor refuses such a kernel for a \
-             real relay, and build_ruleset fails closed on the net wall there."
+            "SANDBOX LIVE NOTE: skipping the relay empty-netns egress probe — no network namespace is \
+             available here (unprivileged user namespaces disabled on this kernel/runner?). The privsep \
+             live-gate (run as root, CLONE_NEWNET) is the production-faithful proof of the same wall."
         );
         false
+    } else {
+        assert_eq!(
+            net_on, RELAY_NET_CONTAINED,
+            "relay empty-netns ON: an AF_UNIX connect (the vsock-dial shape) must SUCCEED while BOTH \
+             TCP and UDP egress are DENIED by the netns (no route) — the containment does NOT depend on \
+             the AccessNet LSM hook; child exit was {net_on} \
+             ({RELAY_NET_EGRESS_REACHABLE}=egress reached ⇒ the netns was NOT containing, \
+             {RELAY_NET_UNIX_BLOCKED}=AF_UNIX dial blocked (regression), \
+             {RELAY_NET_SETUP_FAILED}=socket() plumbing, {SELFTEST_INSTALL_FAILED}=profile install)"
+        );
+        // OFF (mutation): with NO netns and NO profile, the SAME TCP + UDP egress REACH the live
+        // loopback listener / loopback — proving the ON denial is the empty netns, not broken plumbing.
+        let net_off = probe_relay_net(false, false, tcp_port, &unix_c);
+        assert_eq!(
+            net_off, RELAY_NET_EGRESS_REACHABLE,
+            "relay empty-netns OFF: TCP + UDP egress to loopback must REACH, proving the ON containment \
+             is the empty netns, not a broken harness; child exit was {net_off}"
+        );
+        true
     };
 
     let _ = std::fs::remove_dir_all(&base);
 
     // The single marker the CI gate greps for — printed ONLY after all probes held.
     let relay_net_note = if relay_net_tested {
-        "the VM relay profile's Landlock AccessNet wall DENIED a TCP connect while an AF_UNIX connect \
-         (the vsock-dial shape) stayed reachable (F1, mutation-verified with the profile OFF)"
+        "the VM relay's EMPTY NETWORK NAMESPACE DENIED both TCP and UDP egress (no route) while the \
+         AF_UNIX vsock-dial shape stayed reachable (MED-1, mutation-verified with the netns OFF; the \
+         containment holds independently of the Landlock AccessNet hook)"
     } else {
-        "the VM relay AccessNet TCP-deny probe was SKIPPED (kernel Landlock ABI < V4/no AccessNet)"
+        "the VM relay empty-netns egress probe was SKIPPED (no unprivileged user namespace here)"
     };
     println!(
         "SANDBOX LIVE OK: on a NON-installing thread, seccomp-bpf KILLED exec* (SIGSYS) and Landlock \

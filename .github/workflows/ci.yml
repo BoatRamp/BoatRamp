@@ -1727,7 +1727,16 @@ jobs:
   #      cross-namespace SCM_RIGHTS splice. The node runs under `sudo -n` for the CAP_SYS_ADMIN the
   #      userns-free unshare needs (GitHub runners have passwordless sudo); the harness stays
   #      unprivileged. See `crates/boatramp/DESIGN-privsep-phase3-container.md`.
-  # All five are `#[ignore]`d (they fork + sandbox against the live kernel) so `--include-ignored`
+  #  (6) VM-RELAY EMPTY-NETNS EGRESS (marker `PRIVSEP VM RELAY NETNS OK`, Phase-3 VM / MED-1): the
+  #      netless `__vm-relay` runs in a FRESH, EMPTY (loopback-only) network namespace layered OVER
+  #      F1's Landlock deny-all-TCP wall + the relay seccomp set. This gate forks a relay stand-in
+  #      that enters the empty netns (`sandbox::enter_empty_netns`), drops ALL caps incl. CAP_NET_RAW
+  #      (`sandbox::drop_all_capabilities`), installs the Enforced relay profile, and proves UDP egress
+  #      is DENIED (ENETUNREACH) while the inherited root-netns listener still accept()s and the
+  #      AF_UNIX vsock-UDS dial still connects; MUTATION: a sibling WITHOUT the netns finds the SAME
+  #      UDP egress SUCCEEDS. Needs CAP_SYS_ADMIN for `unshare(CLONE_NEWNET)`; the test self-elevates
+  #      via passwordless `sudo -n` (the container-gate pattern). See DESIGN-privsep-phase3-vm-scoped.md §S1.
+  # All six are `#[ignore]`d (they fork + sandbox against the live kernel) so `--include-ignored`
   # runs them. Greps every marker + the pass count so a silent skip / compile-out fails the merge.
   live-gate-privsep:
     name: live gate (privsep)
@@ -1749,8 +1758,8 @@ jobs:
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
             --features sandbox --test privsep_live -- --include-ignored --nocapture 2>&1 | tee privsep-live.log
-          grep -qE 'test result: ok\. 5 passed' privsep-live.log \
-            || { echo "::error::privsep live gate did not run all five tests (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 6 passed' privsep-live.log \
+            || { echo "::error::privsep live gate did not run all six tests (silent skip or a failure)" >&2; exit 1; }
           grep -q 'PRIVSEP LIVE OK' privsep-live.log \
             || { echo "::error::privsep composition live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
           grep -q 'PRIVSEP SIGNER UNSEAL LIVE OK' privsep-live.log \
@@ -1761,6 +1770,8 @@ jobs:
             || { echo "::error::privsep per-tenant live gate never reached its marker (a WS-C per-tenant compute-plane spawn / execute-pin / resolver regression)" >&2; exit 1; }
           grep -q 'PRIVSEP CONTAINER SUBSTRATE OK' privsep-live.log \
             || { echo "::error::privsep container-substrate gate never reached its marker (the WIRED substrate: container must serve a real 200 from a namespace/cgroup-confined instance that self-confirmed its unshared NS/IPC/UTS/CGROUP; a regression that drops the namespace wall, or a lost CAP_SYS_ADMIN/sudo, fails here — see crates/boatramp/DESIGN-privsep-phase3-container.md)" >&2; exit 1; }
+          grep -q 'PRIVSEP VM RELAY NETNS OK' privsep-live.log \
+            || { echo "::error::privsep VM-relay empty-netns egress gate never reached its marker (MED-1: the netless relay in its empty/loopback-only network namespace must DENY UDP egress — mutation: removing the netns reopens it — while still accept()ing the inherited listener + dialing the AF_UNIX vsock UDS; a regression that drops the netns wall, or a lost CAP_SYS_ADMIN/passwordless-sudo, fails here — see crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md §S1)" >&2; exit 1; }
   # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
   # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
   # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into

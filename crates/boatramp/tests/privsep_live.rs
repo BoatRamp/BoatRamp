@@ -1061,3 +1061,343 @@ fn try_http_get(addr: &str) -> std::io::Result<String> {
     stream.read_to_end(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
+
+// =============================================================================
+// MED-1 LIVE GATE — the VM relay's EMPTY-NETWORK-NAMESPACE egress containment.
+// =============================================================================
+//
+// The F1/F2 Security review found that F1 (the relay's Landlock `AccessNet` deny-all-TCP wall) governs
+// only TCP: UDP egress (`socket(AF_INET, SOCK_DGRAM)` + `sendto`) stayed open, and the relay's seccomp
+// legitimately KEEPS `socket`/`sendto` (name-only filtering). MED-1's fix runs the netless relay in a
+// FRESH, EMPTY (loopback-only) network namespace, which has no route anywhere — closing UDP (and TCP,
+// raw, abstract-UDS) egress — while the pathname AF_UNIX vsock UDS still dials and the inherited
+// root-netns TCP listener still `accept`s (a socket keeps its creation netns).
+//
+// This gate PROVES all of that against the REAL kernel, using the SAME production primitives the relay
+// uses (`sandbox::enter_empty_netns` + `sandbox::drop_all_capabilities` + `derive_relay_profile`), and
+// MUTATION-verifies it: a grandchild WITH the netns must find UDP egress DENIED; a grandchild WITHOUT
+// it must find the SAME UDP egress SUCCEEDS (so the netns is demonstrably the thing that contains it).
+//
+// `unshare(CLONE_NEWNET)` needs CAP_SYS_ADMIN, which the relay inherits from the privileged root but a
+// unit-test harness lacks. So, exactly like `privsep_container_substrate_serves_end_to_end`, the gate
+// gains root via passwordless `sudo -n`: when it is NOT already root it re-execs THIS test under
+// `sudo -n` and asserts on the marker the root run prints; when it IS root (the re-exec, or a harness
+// already run under sudo on lighthouse) it runs the fork-probe inline. The CI `live gate (privsep)`
+// job greps the `PRIVSEP VM RELAY NETNS OK` marker on the outer log.
+
+/// The success marker the CI gate greps (printed on the OUTER process's stdout).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+const NETNS_MARKER: &str = "PRIVSEP VM RELAY NETNS OK";
+
+/// Grandchild probe verdicts (reported via `_exit` code, like `sandbox_live.rs`'s probes).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+mod netns_probe_codes {
+    pub const CONTAINED: i32 = 70; // netns ON: UDP egress DENIED, accept+AF_UNIX OK, TCP F1-denied
+    pub const UDP_ESCAPED: i32 = 71; // UDP egress SUCCEEDED (the mutation signal / a containment hole)
+    pub const UNIX_BLOCKED: i32 = 72; // AF_UNIX dial blocked — the vsock-dial shape would break
+    pub const ACCEPT_BLOCKED: i32 = 73; // accept() on the inherited root-netns listener failed
+    pub const TCP_ESCAPED: i32 = 74; // TCP egress SUCCEEDED (an F1 hole)
+    pub const SETUP_FAILED: i32 = 75; // socket/plumbing failure (not a verdict)
+    pub const INSTALL_FAILED: i32 = 76; // the relay profile did not install Enforced
+    pub const UNSHARE_FAILED: i32 = 77; // unshare(CLONE_NEWNET) failed (no CAP_SYS_ADMIN?)
+    pub const CAPDROP_FAILED: i32 = 78; // drop_all_capabilities failed (load-bearing SECBIT)
+}
+
+/// Fork ONE grandchild that stands in for the contained relay: optionally enter the empty netns, drop
+/// ALL capabilities, install the relay's Enforced profile, then exercise the relay's four network
+/// shapes against the real kernel and `_exit` a [`netns_probe_codes`] verdict. Returns the exit code.
+/// The profile is derived in the PARENT (minimising post-fork allocation, as `probe_relay_net` does).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn fork_netns_grandchild(
+    netns: bool,
+    listener_fd: i32,
+    uds_c: &std::ffi::CStr,
+    exe: &std::path::Path,
+    tcp_port: u16,
+) -> i32 {
+    use netns_probe_codes as code;
+
+    let uds = std::path::PathBuf::from(uds_c.to_str().expect("utf-8 uds path"));
+    let profile = boatramp_server::sandbox::derive_relay_profile(exe, &uds);
+
+    // SAFETY: a single selected test ⇒ no concurrent harness thread allocating at the fork instant
+    // (the malloc-after-fork hazard) — the SAME assumption `sandbox_live.rs`'s fork-probes rely on.
+    let pid = unsafe { libc::fork() };
+    assert!(
+        pid >= 0,
+        "fork() failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if pid == 0 {
+        // ---- the grandchild: set up the relay's containment, then probe egress ----
+        // (1) MED-1: enter the empty netns (the production primitive) when this is the ON arm.
+        if netns && boatramp_server::sandbox::enter_empty_netns().is_err() {
+            unsafe { libc::_exit(code::UNSHARE_FAILED) };
+        }
+        // (2) INFO: drop ALL capabilities (incl CAP_NET_RAW) — the production primitives, both arms:
+        //     the prctl bounding/securebits drop THEN the in-process capset effective-cap clear (the
+        //     relay never execs, so the effective set must be cleared here, exactly as the relay does).
+        if boatramp_server::sandbox::drop_all_capabilities().is_err()
+            || boatramp_server::sandbox::clear_current_capabilities().is_err()
+        {
+            unsafe { libc::_exit(code::CAPDROP_FAILED) };
+        }
+        // (3) F1 + the rest: install the relay's Enforced profile (both arms — so the ONLY difference
+        //     between ON and OFF is the netns, isolating it as the UDP-egress container).
+        match boatramp_server::sandbox::linux::install_derived(&profile) {
+            Ok(boatramp_server::sandbox::SandboxStatus::Enforced) => {}
+            _ => unsafe { libc::_exit(code::INSTALL_FAILED) },
+        }
+
+        // (a) accept() the connection the parent queued on the INHERITED (root-netns) listener fd —
+        //     proves a socket keeps its creation netns (the inherited-listener-accept correctness point).
+        let afd = unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if afd < 0 {
+            unsafe { libc::_exit(code::ACCEPT_BLOCKED) };
+        }
+        unsafe { libc::close(afd) };
+
+        // (b) AF_UNIX connect() to the pathname vsock-UDS shape — must work from inside the netns.
+        let ufd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if ufd < 0 {
+            unsafe { libc::_exit(code::SETUP_FAILED) };
+        }
+        // SAFETY: a zeroed sockaddr_un filled with the NUL-terminated pathname.
+        let mut uaddr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        uaddr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = uds_c.to_bytes_with_nul();
+        if bytes.len() > uaddr.sun_path.len() {
+            unsafe { libc::_exit(code::SETUP_FAILED) };
+        }
+        for (dst, &b) in uaddr.sun_path.iter_mut().zip(bytes.iter()) {
+            *dst = b as libc::c_char;
+        }
+        let urc = unsafe {
+            libc::connect(
+                ufd,
+                &uaddr as *const libc::sockaddr_un as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        unsafe { libc::close(ufd) };
+        if urc != 0 {
+            unsafe { libc::_exit(code::UNIX_BLOCKED) };
+        }
+
+        // (c) UDP egress to loopback (the MED-1 pivot): ON ⇒ the empty netns has no route, so sendto
+        //     must FAIL (ENETUNREACH); OFF ⇒ the SAME sendto reaches loopback and SUCCEEDS.
+        let udp_egressed = {
+            let dfd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+            if dfd < 0 {
+                unsafe { libc::_exit(code::SETUP_FAILED) };
+            }
+            // SAFETY: a zeroed sockaddr_in for 127.0.0.1:9 (the discard port) in network byte order.
+            let mut daddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            daddr.sin_family = libc::AF_INET as libc::sa_family_t;
+            daddr.sin_port = 9u16.to_be();
+            daddr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let payload = b"x";
+            let n = unsafe {
+                libc::sendto(
+                    dfd,
+                    payload.as_ptr() as *const libc::c_void,
+                    payload.len(),
+                    0,
+                    &daddr as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            unsafe { libc::close(dfd) };
+            n >= 0
+        };
+
+        // (d) TCP egress to the live loopback listener — F1 (Landlock AccessNet) must DENY it in BOTH
+        //     arms (the profile is installed in both), so a SUCCESS here is an F1 hole.
+        let tcp_egressed = {
+            let tfd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if tfd < 0 {
+                unsafe { libc::_exit(code::SETUP_FAILED) };
+            }
+            // SAFETY: a zeroed sockaddr_in for 127.0.0.1:tcp_port in network byte order.
+            let mut taddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            taddr.sin_family = libc::AF_INET as libc::sa_family_t;
+            taddr.sin_port = tcp_port.to_be();
+            taddr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let rc = unsafe {
+                libc::connect(
+                    tfd,
+                    &taddr as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            unsafe { libc::close(tfd) };
+            rc == 0
+        };
+
+        if tcp_egressed {
+            unsafe { libc::_exit(code::TCP_ESCAPED) };
+        }
+        if udp_egressed {
+            unsafe { libc::_exit(code::UDP_ESCAPED) };
+        }
+        unsafe { libc::_exit(code::CONTAINED) };
+    }
+    // ---- the parent: reap the grandchild + decode its exit code ----
+    let mut status: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, 0) };
+    assert_eq!(
+        r,
+        pid,
+        "waitpid() failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    }
+}
+
+/// Run the MED-1 fork-probe (we already hold CAP_SYS_ADMIN here) and print the marker on success.
+/// Mutation-verified: the netns-ON arm must be CONTAINED (UDP denied) and the netns-OFF arm must be
+/// UDP_ESCAPED (UDP succeeds) — so the netns is demonstrably the thing containing UDP egress.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn run_relay_netns_probe_and_report() {
+    use netns_probe_codes as code;
+    use std::os::fd::AsRawFd;
+
+    // The relay's REAL sequence is netns → drop ALL caps → install_derived, so the profile's Landlock
+    // PathFd grants are opened by a CAPLESS uid-0 process. In production the binary + the vsock-UDS
+    // runtime dir live under world-traversable roots (/usr, /nix/store, the runtime temp dir), so a
+    // capless root can O_PATH-open them. This harness, though, lives under a `0700` home that a capless
+    // root (no CAP_DAC_READ_SEARCH) cannot traverse — the SAME constraint the container gate handles by
+    // staging under world-traversable `/var/lib`. So we give the test's relay profile world-traversable
+    // `/tmp` FS grants (a stand-in exe + the real probe UDS); the probe never execs the exe, so any file
+    // suffices. This keeps the faithful capdrop-BEFORE-install order while letting the capless grandchild
+    // open its grants.
+    let exe = std::path::PathBuf::from(format!("/tmp/br-relay-netns-exe-{}", std::process::id()));
+    let _ = std::fs::write(&exe, b"stand-in exe for the relay execute-pin grant\n");
+    // Root-netns setup, held for the whole probe: a live loopback TCP listener (the inherited-listener
+    // shape) + a pathname AF_UNIX listener (the vsock-UDS dial shape).
+    let tcp = TcpListener::bind("127.0.0.1:0").expect("bind loopback TCP listener (root netns)");
+    let tcp_port = tcp.local_addr().expect("listener addr").port();
+    let uds_path =
+        std::path::PathBuf::from(format!("/tmp/br-relay-netns-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&uds_path);
+    let _uds =
+        std::os::unix::net::UnixListener::bind(&uds_path).expect("bind AF_UNIX probe listener");
+    let uds_c = std::ffi::CString::new(uds_path.to_str().expect("utf-8 uds path")).expect("no NUL");
+
+    // ON arm: queue a connection for its accept(), then probe WITH the empty netns.
+    let client_on = TcpStream::connect(("127.0.0.1", tcp_port)).expect("queue a conn (ON)");
+    let code_on = fork_netns_grandchild(true, tcp.as_raw_fd(), &uds_c, &exe, tcp_port);
+    drop(client_on);
+    // OFF arm (mutation): queue another connection, probe WITHOUT the netns.
+    let client_off = TcpStream::connect(("127.0.0.1", tcp_port)).expect("queue a conn (OFF)");
+    let code_off = fork_netns_grandchild(false, tcp.as_raw_fd(), &uds_c, &exe, tcp_port);
+    drop(client_off);
+
+    let _ = std::fs::remove_file(&uds_path);
+    let _ = std::fs::remove_file(&exe);
+
+    assert_eq!(
+        code_on,
+        code::CONTAINED,
+        "with the empty netns, the relay stand-in must find UDP egress DENIED (ENETUNREACH) while \
+         accept()ing the inherited root-netns listener and dialing the AF_UNIX vsock-UDS shape, with \
+         TCP still F1-denied; grandchild exit was {code_on} ({}=UDP escaped the netns, {}=AF_UNIX dial \
+         blocked, {}=inherited-listener accept blocked, {}=TCP escaped F1, {}=setup, {}=profile not \
+         Enforced, {}=unshare failed (CAP_SYS_ADMIN?), {}=capdrop failed)",
+        code::UDP_ESCAPED,
+        code::UNIX_BLOCKED,
+        code::ACCEPT_BLOCKED,
+        code::TCP_ESCAPED,
+        code::SETUP_FAILED,
+        code::INSTALL_FAILED,
+        code::UNSHARE_FAILED,
+        code::CAPDROP_FAILED,
+    );
+    assert_eq!(
+        code_off,
+        code::UDP_ESCAPED,
+        "MUTATION: WITHOUT the empty-netns step, the SAME UDP sendto to loopback must SUCCEED \
+         (F1/Landlock AccessNet governs only TCP, not UDP) — proving the netns is the thing that \
+         contains UDP egress, not a broken harness; grandchild exit was {code_off} ({}=still contained \
+         without the netns, so the mutation is NOT exercising the real difference)",
+        code::CONTAINED,
+    );
+    println!(
+        "{NETNS_MARKER}: the netless VM relay stand-in, inside a FRESH EMPTY (loopback-only) network \
+         namespace with ALL capabilities dropped (incl CAP_NET_RAW) and its Enforced least-authority \
+         profile installed, DENIED UDP egress to loopback (ENETUNREACH) and kept TCP F1-denied, while \
+         still accept()ing the inherited root-netns listener fd and dialing the AF_UNIX vsock-UDS \
+         shape; WITHOUT the netns step the SAME UDP egress SUCCEEDED (mutation-verified on the real \
+         kernel)."
+    );
+}
+
+/// MED-1 live gate: the VM relay's empty-network-namespace egress containment (UDP closed, TCP/F1
+/// closed, raw/packet closed) while the inherited listener + the AF_UNIX vsock dial still work —
+/// mutation-verified (remove the netns ⇒ UDP egress reopens). Self-elevates via `sudo -n` for the
+/// CAP_SYS_ADMIN `unshare(CLONE_NEWNET)` needs (the SAME passwordless-sudo pattern the container gate
+/// uses); on a box without passwordless sudo it SKIPS with a clear note rather than failing.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live/privileged: proves the VM relay's empty-netns UDP-egress containment against the \
+            real kernel (MED-1), mutation-verified; self-elevates via `sudo -n` for CAP_SYS_ADMIN; run \
+            via --include-ignored in the `live gate (privsep)` job"]
+fn relay_empty_netns_contains_udp_egress() {
+    // Already privileged (the sudo re-exec below, or a harness run under sudo on lighthouse): run it.
+    if process_is_root() {
+        run_relay_netns_probe_and_report();
+        return;
+    }
+    // Unprivileged: re-exec THIS one test under passwordless `sudo -n` to gain CAP_SYS_ADMIN. We do
+    // NOT pass env through sudo (strict sudoers scrub it) — the root re-exec detects its own euid.
+    let exe = std::env::current_exe().expect("resolve the test binary path for the sudo re-exec");
+    let out = match Command::new("sudo")
+        .arg("-n")
+        .arg(&exe)
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("relay_empty_netns_contains_udp_egress")
+        .arg("--nocapture")
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "PRIVSEP VM RELAY NETNS SKIPPED: could not invoke `sudo -n` to gain CAP_SYS_ADMIN for \
+                 the empty-netns probe ({e}); on CI/lighthouse (passwordless sudo) this runs for real."
+            );
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // No passwordless sudoers rule ⇒ a clear SKIP, not a failure (a dev box without it shouldn't red
+    // the suite; CI runners + lighthouse DO have it and run the real probe).
+    if !stdout.contains(NETNS_MARKER)
+        && (stderr.contains("a password is required")
+            || stderr.contains("a terminal is required")
+            || stderr.contains("sudo: "))
+    {
+        eprintln!(
+            "PRIVSEP VM RELAY NETNS SKIPPED: `sudo -n` could not elevate (no passwordless sudoers?). \
+             stderr: {stderr}"
+        );
+        return;
+    }
+    assert!(
+        stdout.contains(NETNS_MARKER),
+        "the root (sudo -n) re-exec of the empty-netns probe did not report success.\nexit: {:?}\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        out.status.code(),
+    );
+    // Surface the marker on THIS (outer) process's stdout so the CI gate greps it on the outer log.
+    println!(
+        "{NETNS_MARKER} (via sudo -n re-exec; see the child's probe detail above if captured)"
+    );
+}

@@ -343,10 +343,16 @@ mod imp {
         verify_guest_kernel(&assets.guest_kernel, assets.guest_kernel_sha256.as_deref())?;
         // The vsock UDS path must fit `sockaddr_un.sun_path` (SUN_LEN ≈ 108 bytes) — a deep work_dir
         // would overflow it — so the UDS lives at a SHORT unique path under the runtime temp dir, while
-        // the (long-path-tolerant) initramfs / config / console stay in `work_dir`.
-        let uds_path =
-            std::env::temp_dir().join(format!("brvsk-{}-{}.sock", guest_cid, std::process::id()));
-        let _ = std::fs::remove_file(&uds_path); // a stale socket from a prior run would block the bind
+        // the (long-path-tolerant) initramfs / config / console stay in `work_dir`. It goes in a
+        // DEDICATED per-VM directory holding ONLY this socket, so the relay's Landlock FS view can grant
+        // that one directory (Landlock cannot O_PATH-open a socket inode on static-musl —
+        // `boatramp_server::sandbox::relay_supervisor_policy`) while staying tight.
+        let uds_dir =
+            std::env::temp_dir().join(format!("brvsk-{}-{}", guest_cid, std::process::id()));
+        let _ = std::fs::remove_dir_all(&uds_dir); // a stale dir from a prior run would block the bind
+        std::fs::create_dir_all(&uds_dir)
+            .map_err(|e| io::Error::other(format!("creating the vsock UDS dir: {e}")))?;
+        let uds_path = uds_dir.join("vsock.sock");
         let config_path = work_dir.join("firecracker.json");
         // Raw firecracker machine config: kernel + initrd + vsock, `drives: []`, no
         // `network-interfaces` (the production `FcMachine` has no initrd/vsock fields; the bench
@@ -494,6 +500,57 @@ mod imp {
         Some(InflightGuard(counter.clone()))
     }
 
+    /// The MINIMUM interval between two emitted shed-path warnings (LOW-2). At the inflight cap the
+    /// relay sheds clients; warning on EVERY shed amplifies log/CPU/disk pressure under the very flood
+    /// F2 defends against. One warning per interval — each carrying a running summary — is enough to
+    /// surface the condition without becoming a second DoS vector.
+    const SHED_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// Rate-limiter / sampler for the F2 shed-path warning (LOW-2). Emits at most ONE warning per
+    /// [`SHED_WARN_INTERVAL`] (plus always the first shed), each summarizing the sheds since the last
+    /// one — so a flood produces a bounded trickle of warnings, never one-per-shed, yet no shed is
+    /// silently dropped from the count. O(1): three fixed scalars, NO unbounded state. The relay's
+    /// accept loop is single-threaded, so this needs no synchronization.
+    struct ShedWarnSampler {
+        /// Total sheds since the relay started (monotonic — the cumulative figure in each summary).
+        total: u64,
+        /// Sheds since the last EMITTED warning (reset to 0 whenever one is emitted).
+        since_last_warn: u64,
+        /// When the last warning was emitted; `None` ⇒ none yet (so the first shed always warns).
+        last_warn: Option<Instant>,
+    }
+
+    impl ShedWarnSampler {
+        fn new() -> Self {
+            Self {
+                total: 0,
+                since_last_warn: 0,
+                last_warn: None,
+            }
+        }
+
+        /// Record one shed at `now`. Returns `Some((total, since_last_warn))` when a warning is DUE
+        /// (the first shed, then at most once per [`SHED_WARN_INTERVAL`]), else `None`. The returned
+        /// `since_last_warn` counts the sheds this warning summarizes (this one included); it resets
+        /// after the warning is emitted so the next summary covers only the sheds that follow.
+        fn record(&mut self, now: Instant) -> Option<(u64, u64)> {
+            self.total += 1;
+            self.since_last_warn += 1;
+            let due = match self.last_warn {
+                None => true,
+                Some(t) => now.duration_since(t) >= SHED_WARN_INTERVAL,
+            };
+            if due {
+                let summary = (self.total, self.since_last_warn);
+                self.last_warn = Some(now);
+                self.since_last_warn = 0;
+                Some(summary)
+            } else {
+                None
+            }
+        }
+    }
+
     /// The host-side **client-byte relay** (Model A, design §1c): the root already bound the privileged
     /// public TCP `listener`; here it accepts each client and relays the client's bytes to the
     /// frontend-in-guest over a fresh vsock connection, splicing bytes both ways. The relay carries
@@ -521,6 +578,9 @@ mod imp {
              are bounded (F2)"
         );
         let inflight = Arc::new(AtomicUsize::new(0));
+        // LOW-2: rate-limit the shed-path warning so a connection flood can't turn the defence (F2)
+        // into a log/CPU/disk-amplification DoS of its own.
+        let mut shed_warn = ShedWarnSampler::new();
         loop {
             let (client, _peer) = match listener.accept() {
                 Ok(c) => c,
@@ -534,12 +594,20 @@ mod imp {
             // running so the listener backlog is still drained. The permit is MOVED into the worker
             // thread and held for the connection's whole life (freed when the splice ends).
             let Some(permit) = reserve_inflight_slot(&inflight, MAX_INFLIGHT_RELAY_CONNS) else {
-                tracing::warn!(
-                    instance = %label,
-                    max_inflight = MAX_INFLIGHT_RELAY_CONNS,
-                    "[privsep] VM relay: at the inflight-connection cap — shedding a client \
-                     (closing it); availability bound (F2)"
-                );
+                // LOW-2: emit at most one warning per SHED_WARN_INTERVAL, each with a running summary
+                // (the first shed always warns); the drop/close itself is unconditional.
+                if let Some((shed_total, shed_since_last_warn)) = shed_warn.record(Instant::now()) {
+                    tracing::warn!(
+                        instance = %label,
+                        max_inflight = MAX_INFLIGHT_RELAY_CONNS,
+                        shed_total,
+                        shed_since_last_warn,
+                        interval_secs = SHED_WARN_INTERVAL.as_secs(),
+                        "[privsep] VM relay: at the inflight-connection cap — shedding clients \
+                         (closing them); availability bound (F2). Rate-limited: shed_since_last_warn \
+                         clients were shed since the previous warning."
+                    );
+                }
                 drop(client);
                 continue;
             };
@@ -1012,6 +1080,51 @@ mod imp {
 
             // The shipped relay budget is the documented availability bound.
             assert_eq!(super::MAX_INFLIGHT_RELAY_CONNS, 256);
+        }
+
+        /// LOW-2: the shed-path warning is rate-limited — the FIRST shed warns, further sheds inside
+        /// the interval are counted but SILENT, and the first shed AFTER the interval warns again with
+        /// a summary covering exactly the sheds since the last warning. Mutation: make `record` always
+        /// return `Some(..)` (drop the interval gate) and the "silent inside the interval" asserts
+        /// redden. Deterministic (a synthetic `Instant` base + offsets — no sleeping).
+        #[test]
+        fn shed_warn_sampler_rate_limits_and_summarizes() {
+            use super::{SHED_WARN_INTERVAL, ShedWarnSampler};
+            use std::time::{Duration, Instant};
+
+            let t0 = Instant::now();
+            let mut s = ShedWarnSampler::new();
+
+            // The very first shed always warns: total 1, summarizing 1 shed.
+            assert_eq!(
+                s.record(t0),
+                Some((1, 1)),
+                "the first shed must warn immediately"
+            );
+            // More sheds inside the interval are counted but emit NO warning.
+            assert_eq!(s.record(t0 + Duration::from_millis(1)), None);
+            assert_eq!(
+                s.record(t0 + SHED_WARN_INTERVAL - Duration::from_millis(1)),
+                None,
+                "a shed still inside the interval must stay silent"
+            );
+            // The first shed at/after the interval warns again: total is now 4, and the summary covers
+            // the 3 sheds since the last warning (the two silent ones + this one).
+            assert_eq!(
+                s.record(t0 + SHED_WARN_INTERVAL),
+                Some((4, 3)),
+                "a shed at the interval boundary must warn with a since-last summary"
+            );
+            // The counter reset: the next shed inside the new interval is silent again.
+            assert_eq!(
+                s.record(t0 + SHED_WARN_INTERVAL + Duration::from_millis(1)),
+                None
+            );
+            // After another full interval, warn again; since-last is 2 (the silent one + this one).
+            assert_eq!(
+                s.record(t0 + SHED_WARN_INTERVAL + SHED_WARN_INTERVAL),
+                Some((6, 2))
+            );
         }
     }
 }

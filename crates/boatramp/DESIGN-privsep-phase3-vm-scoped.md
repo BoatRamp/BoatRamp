@@ -132,7 +132,59 @@ inert dead-code (`#[allow(dead_code)]` on `to_command`) until the next increment
    process serves end-to-end over the vsock bridge on lighthouse+KVM (the mechanism's serve path
    already proven; this validates the process split + its profile).
 
+### Relay egress containment — F1/F2 Security-review follow-ups (landed 2026-11-18)
+
+The relay's own least-authority profile (item 1 above) and `run_vm_relay()` entry (item 3) landed, and
+an independent Security review of them (F1 = a Landlock `AccessNet` deny-all-TCP wall,
+`SandboxPolicy::deny_all_tcp`; F2 = an inflight-connection bound) returned SHIP-WITH-FIXES with three
+follow-ups, now closed:
+
+- **MED-1 — the netless relay runs in a FRESH, EMPTY network namespace.** F1's Landlock `AccessNet`
+  governs ONLY TCP bind/connect; it left **UDP** egress open (the relay's seccomp legitimately KEEPS
+  `socket`/`sendto`/`connect` to dial the vsock UDS, and seccomp filters by name, not by the socket's
+  domain argument), so a compromised relay could `sendto` the spliced client bytes / C2 / pivot over
+  UDP. The robust fix (Security reviewer's recommendation; the strongest primitive) is
+  `unshare(CLONE_NEWNET)` into an empty, loopback-only netns with no route anywhere — closing UDP **and**
+  TCP **and** raw/packet **and** abstract-UDS egress at once, with no route to 169.254.169.254 at all.
+  It is LAYERED over F1 + the relay seccomp set (defence in depth, not a replacement). The **pathname**
+  AF_UNIX vsock UDS still dials (AF_UNIX pathname sockets are not netns-scoped) and the inherited,
+  root-netns-bound public TCP listener still `accept`s (a socket keeps its creation netns) — BOTH
+  live-proven on lighthouse (kernel 6.12), on glibc AND static-musl. Privilege path: the relay is
+  `fork`+`exec`'d by the privileged root and INHERITS root's capabilities (the SAME userns-free model
+  the Container substrate uses for its `unshare(NS/IPC/UTS/CGROUP)`); it uses `CAP_SYS_ADMIN` ONCE, in
+  `run_vm_relay_confined`'s pre-profile window (the profile hard-kills `unshare`/`setns`), then drops
+  ALL capabilities before installing the profile and touching a client byte. `enter_empty_netns()`
+  takes that userns-free `CLONE_NEWNET` path when privileged and FALLS BACK to
+  `unshare(CLONE_NEWUSER|CLONE_NEWNET)` for an UNPRIVILEGED caller (never the production relay — the
+  unprivileged `live-gate-sandbox` probe), both yielding an egress-equivalent loopback-only netns.
+  **netns is the LOAD-BEARING wall precisely because it does not depend on an LSM hook firing**: a
+  virtualized CI runner can REPORT `AccessNet` support yet silently NOT enforce the net hook (this
+  reddened `feat/privsep`'s `live-gate-sandbox` on the GHA runner — F1 alone was a no-op there), whereas
+  an empty netns simply has no route. Fail-closed: if NO empty netns can be entered / verified
+  loopback-only, the relay REFUSES to serve — never a full-network fallback. Reusable primitives in
+  `boatramp_server::sandbox`, shared by the relay and both live gates.
+- **INFO — a REAL in-process capability drop.** Two steps, both before the profile install:
+  (1) `drop_all_capabilities()` = `SECBIT_NOROOT` + bounding-set clear (incl. `CAP_NET_RAW`) + ambient
+  clear — the ONE shared sequence every privsep instance's `pre_exec` also calls (consolidated); but
+  `prctl` only gates RE-acquisition at the next `execve`. An instance drops its effective caps via the
+  `execve` that follows its `pre_exec`; the relay NEVER execs, so (2) `clear_current_capabilities()` =
+  `capset(2)` clears the EFFECTIVE/PERMITTED/INHERITABLE sets IN-PROCESS, leaving the relay with ZERO
+  capabilities while serving. The relay runs `capset` BEFORE installing its seccomp profile (so it is
+  not yet filtered) and AFTER its one privileged op (the netns unshare).
+- **Relay profile — grant the vsock UDS's DIRECTORY, not the socket inode.** Landlock rules are built
+  by O_PATH-opening the granted path, and the `landlock` crate cannot open a SOCKET inode on the shipped
+  static-musl build (`ENXIO` → the Landlock layer fails → `install_derived` → `Partial` →
+  `enforce_privsep_status` REFUSES → the relay would never serve on musl). `relay_supervisor_policy` now
+  grants the uds's PARENT DIRECTORY (a regular dir opens everywhere, and covers `connect(2)` path
+  resolution); `boot_firecracker` nests the UDS in a DEDICATED per-VM directory holding only that
+  socket, so the grant stays tight. A latent bug on the shipped target, found + fixed here.
+- **LOW-2 — the F2 shed-path warning is rate-limited** (`ShedWarnSampler`): at most one warning per 5s,
+  each with a running "N sheds since the last warning" summary — so the availability defence can't turn
+  into a log/CPU/disk-amplification DoS of its own under the very flood it sheds. O(1), fixed state.
+
 Toward **O4 full capability parity** (backends in VMs, owner 2026-11-14), S1's separated relay is the
 transport prerequisite; the inward backend relay (§1d), guest net/egress, and secret-blind cred
 delivery (key material stays in-guest / relayed by the key-holder sealer, never the root) are the
-subsequent O4 increments on this same separated-relay foundation.
+subsequent O4 increments on this same separated-relay foundation. Note the relay's empty netns is for
+the netless scoped frontend; an O4 backend-in-VM path that needs guest egress will provision it
+explicitly (a veth/slirp into the relay netns), never by removing this wall.

@@ -981,11 +981,16 @@ pub fn run_vm_relay(label: &str) -> Result<(), CliError> {
     result
 }
 
-/// Install the separate relay process's OWN least-authority profile fail-closed [`Enforced`], then run
-/// the Model-A copy-relay behind it (Linux + `sandbox` only — the seccomp+Landlock wall is the
-/// relay's containment). Factored out so the install-then-relay sequence is the one place the profile
-/// is derived, installed, and enforced; a non-`Enforced` install returns `Err` (the caller fails the
-/// node closed). Returns `Err` if the relay loop ever ends — the relay runs for the node's life.
+/// Contain the separate relay process, then run the Model-A copy-relay behind the wall (Linux +
+/// `sandbox` only). The containment is LAYERED, set up in a fixed order in the pre-serve window:
+/// (1) enter a FRESH, EMPTY (loopback-only) network namespace — the PRIMARY egress wall (MED-1), using
+/// the CAP_SYS_ADMIN the relay inherits from the root; (2) drop ALL capabilities (empty the bounding
+/// set incl. CAP_NET_RAW — INFO); (3) install the relay's OWN least-authority seccomp/Landlock profile
+/// fail-closed [`Enforced`] (F1 deny-all-TCP + no bind/listen/socketpair + exec/fork killed). Order is
+/// load-bearing: the netns + cap ops need pre-profile state (the profile hard-kills `unshare`/`setns`),
+/// and the netns needs the capability the cap-drop then removes. Any step failing returns `Err` ⇒ the
+/// caller fails the node closed (NEVER a relay with a full network / retained caps / no profile).
+/// Returns `Err` if the relay loop ever ends — the relay runs for the node's life.
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 fn run_vm_relay_confined(
     label: &str,
@@ -1003,6 +1008,36 @@ fn run_vm_relay_confined(
     let current_exe = std::env::current_exe().map_err(|e| format!("resolving current exe: {e}"))?;
     let exe_norm = normalize_for_landlock(&current_exe, &cwd);
     let uds_norm = normalize_for_landlock(&descriptor.uds_path, &cwd);
+
+    // MED-1 — PRIMARY egress containment: move the netless relay into a FRESH, EMPTY (loopback-only)
+    // network namespace BEFORE the profile install. F1's Landlock `AccessNet` deny-all-TCP wall governs
+    // only TCP, so it leaves UDP egress open (the relay's seccomp keeps `socket`/`sendto` for the vsock
+    // dial, filtering by name not domain); an empty netns has NO route anywhere, closing UDP + TCP +
+    // raw/packet + abstract-UDS egress (and any path to 169.254.169.254) in one move, while the
+    // pathname AF_UNIX vsock UDS and the inherited root-netns listener still work (a socket keeps its
+    // creation netns). Done HERE, in the pre-profile window, using the CAP_SYS_ADMIN the relay inherits
+    // from the privileged root — because the profile hard-KILLS `unshare`/`setns` (KILL_SURFACE) once
+    // enforced. Fail-closed: if the netns can't be created/verified-empty, REFUSE (never serve with a
+    // full network). The order is: adopt the listener fd (number, already in hand) → unshare netns →
+    // drop caps → install the profile → accept()/dial from inside the empty netns.
+    boatramp_server::sandbox::enter_empty_netns()
+        .map_err(|e| format!("entering the relay's empty network namespace (MED-1): {e}"))?;
+
+    // INFO — explicit capability floor, in two steps (AFTER the unshare, which needs CAP_SYS_ADMIN;
+    // BEFORE the profile install, so `capset` is not yet seccomp-filtered). Fail-closed on each.
+    // (1) prctl securebits (SECBIT_NOROOT) + EMPTY the bounding set (incl. CAP_NET_RAW) + clear ambient
+    //     — the SAME sequence every privsep instance's pre_exec performs (one path). This gates cap
+    //     RE-acquisition; it needs CAP_SETPCAP, still held here.
+    boatramp_server::sandbox::drop_all_capabilities().map_err(|e| {
+        format!("dropping the __vm-relay bounding/securebits capabilities (INFO): {e}")
+    })?;
+    // (2) capset: clear the EFFECTIVE/PERMITTED/INHERITABLE sets IN-PROCESS. An INSTANCE drops its
+    //     effective caps via the execve that follows its pre_exec; the relay NEVER execs, so without
+    //     this it would serve with its full inherited root caps (CAP_SYS_ADMIN/CAP_NET_RAW). After this
+    //     the relay holds ZERO capabilities — the transient CAP_SYS_ADMIN used for the netns unshare is
+    //     gone before any client byte is relayed, and no raw/packet socket can be opened.
+    boatramp_server::sandbox::clear_current_capabilities()
+        .map_err(|e| format!("clearing the __vm-relay effective capabilities (INFO): {e}"))?;
 
     // Derive + install the relay's bespoke least-authority profile, fail-closed Enforced (the SAME
     // install_derived + enforce_privsep_status machinery the root + every instance uses — one install
@@ -1022,7 +1057,9 @@ fn run_vm_relay_confined(
         ro = profile.policy.read_only_paths.len(),
         "[privsep] __vm-relay: least-authority profile installed + ENFORCED (no \
          bind/listen/socketpair, no key-lock, exec+fork hard-killed; FS view = own binary + the one \
-         vsock UDS)"
+         vsock UDS) — layered OVER the empty-netns egress wall (MED-1) + the dropped capability floor \
+         (INFO): UDP/TCP/raw/abstract-UDS egress all closed, only the vsock UDS + the inherited \
+         listener remain"
     );
 
     // Adopt the inherited pre-bound public TCP listener (the root bound it + dup2'd it onto this fd —
@@ -1821,39 +1858,13 @@ mod per_tenant {
                         };
                         let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim);
                     }
-                    // SECBIT_NOROOT (+ _LOCKED): uid 0 is no longer special at execve.
-                    const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
-                    const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
-                    if libc::prctl(
-                        libc::PR_SET_SECUREBITS,
-                        SECBIT_NOROOT | SECBIT_NOROOT_LOCKED,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                    ) < 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    // Empty the capability BOUNDING set (best-effort: high cap numbers EINVAL).
-                    let mut cap: libc::c_ulong = 0;
-                    while cap <= 63 {
-                        libc::prctl(
-                            libc::PR_CAPBSET_DROP,
-                            cap,
-                            0 as libc::c_ulong,
-                            0 as libc::c_ulong,
-                            0 as libc::c_ulong,
-                        );
-                        cap += 1;
-                    }
-                    // Clear the ambient set (ambient caps otherwise survive execve).
-                    libc::prctl(
-                        libc::PR_CAP_AMBIENT,
-                        libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                    );
+                    // Drop ALL capabilities (SECBIT_NOROOT load-bearing + bounding-set drop +
+                    // ambient clear) through the ONE shared, async-signal-safe `prctl` path the VM
+                    // relay also uses — consolidated so the capability floor can never drift between
+                    // the two. `SECBIT` failure ⇒ `Err` (fail-closed, as before); the rest is
+                    // best-effort. (The RLIMIT_MEMLOCK raise + the `drop_privileges`/`geteuid` gate
+                    // stay here — they are spawn-specific; the relay never holds key material.)
+                    boatramp_server::sandbox::drop_all_capabilities()?;
                 }
                 Ok(())
             });
@@ -5147,11 +5158,16 @@ mod tests {
         // The EXACT derivation `run_vm_relay` performs (own binary + the descriptor's UDS).
         let profile = boatramp_server::sandbox::derive_relay_profile(&exe, &descriptor.uds_path);
 
-        // FS view = own binary (read+execute) + the ONE vsock UDS, nothing else.
+        // FS view = own binary (read+execute) + the DIRECTORY holding the ONE vsock UDS, nothing else
+        // (Landlock cannot O_PATH-open a socket inode on static-musl, so the relay grants the uds's
+        // dedicated per-VM parent dir, which holds only that socket).
         assert_eq!(
             profile.policy.read_only_paths,
-            vec![exe.clone(), descriptor.uds_path.clone()],
-            "the relay sees only its own binary + the one vsock UDS — no config/data_dir/key"
+            vec![
+                exe.clone(),
+                descriptor.uds_path.parent().unwrap().to_path_buf()
+            ],
+            "the relay sees only its own binary + the dir holding the one vsock UDS — no config/data_dir/key"
         );
         assert_eq!(profile.policy.execute_paths, vec![exe]);
         assert!(profile.policy.read_write_paths.is_empty());
