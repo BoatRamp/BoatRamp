@@ -1017,6 +1017,74 @@ pub fn derive_relay_profile(current_exe: &Path, vsock_uds: &Path) -> DerivedProf
 // ([`crate::privsep::run_vm_relay_confined`], in the `boatramp` crate) and its Linux live gate BOTH
 // call them, so the production path and the gate can never drift.
 
+/// Compute the inclusive `[lo, hi]` file-descriptor ranges to close so that ONLY the fds in `keep`
+/// (plus the three standard streams 0/1/2, which carry the relay's tracing to stderr) survive. The
+/// ranges are the gaps BELOW, BETWEEN, and ABOVE the kept fds; the final range runs up to `u32::MAX`
+/// (`~0`) so that EVERY higher fd is foreclosed. Negative `keep` entries (an absent optional fd) are
+/// ignored. Pure + host-testable — the syscall application is [`close_inherited_fds_except`]; this
+/// split keeps the gap arithmetic unit-testable without actually closing the test harness's own fds.
+#[cfg(target_os = "linux")]
+pub(crate) fn fd_close_ranges(keep: &[i32]) -> Vec<(u32, u32)> {
+    let mut kept: Vec<u32> = keep
+        .iter()
+        .copied()
+        .filter(|&f| f >= 0)
+        .map(|f| f as u32)
+        .collect();
+    // The three standard streams are ALWAYS preserved.
+    kept.extend_from_slice(&[0, 1, 2]);
+    kept.sort_unstable();
+    kept.dedup();
+    let mut ranges = Vec::new();
+    let mut lo: u32 = 0;
+    for k in kept {
+        if k > lo {
+            ranges.push((lo, k - 1));
+        }
+        // Advance past this kept fd; if it is the maximum fd, nothing higher remains to close.
+        match k.checked_add(1) {
+            Some(next) => lo = next,
+            None => return ranges,
+        }
+    }
+    ranges.push((lo, u32::MAX));
+    ranges
+}
+
+/// Close EVERY inherited file descriptor except the three standard streams (0/1/2) and the ones in
+/// `keep`, via `close_range(2)`. The VM relay calls this FIRST — right after the `__vm-relay`
+/// re-exec, BEFORE it enters any namespace — so that no stray host fd (a **directory** fd in
+/// particular, which an `fchdir`/`openat` could pivot through to escape the minimal mount-ns root)
+/// survives CLOEXEC discipline + the re-exec into the confined relay. `keep` MUST list exactly the
+/// fds the root deliberately handed the relay ([`crate::privsep`-side `PrivsepChildFds`] — the
+/// pre-bound listener + any link fds); those are adopted LATER (the relay `accept`s the listener), so
+/// closing them would break it. Fail-closed: a `close_range` error returns `Err` and the relay then
+/// refuses to serve (never relay a client byte with a leaked host fd still open).
+#[cfg(target_os = "linux")]
+pub fn close_inherited_fds_except(keep: &[i32]) -> std::io::Result<()> {
+    for (lo, hi) in fd_close_ranges(keep) {
+        // SAFETY: `close_range(2)` takes three scalars + no pointers. It closes the OPEN fds in the
+        // inclusive range [lo, hi], silently skipping fd numbers that are not open, and returns 0 on
+        // success. `flags = 0` actually closes them (not CLOSE_RANGE_CLOEXEC).
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                lo as libc::c_uint,
+                hi as libc::c_uint,
+                0 as libc::c_uint,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::other(format!(
+                "close_range({lo}, {hi}) foreclosing stray inherited relay fds failed: {} — refusing \
+                 fail-closed (a leaked host fd must not survive into the client-byte relay)",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Move the calling process into a FRESH, EMPTY (loopback-only) network namespace and VERIFY it is
 /// empty, fail-closed. The VM relay's PRIMARY egress containment (MED-1); see the section comment.
 ///
@@ -1293,8 +1361,17 @@ pub fn clear_current_capabilities() -> std::io::Result<()> {
 /// paths the relay's Landlock policy grants — [`relay_supervisor_policy`]'s own binary + the uds's
 /// parent dir), so the binds land at the exact paths the install opens and the dial resolves. Reuses the
 /// `boatramp-container` worker's mount-ns + `pivot_root` idiom (one namespace model, not a second).
+///
+/// **Staging root + bind mechanics (hardening).** The fresh tmpfs new-root is overmounted on a DEDICATED
+/// staging mountpoint the relay controls (the vsock-dir's parent, in the relay's own runtime area), NOT
+/// on the shared `/tmp`; and the two real paths are bound from O_PATH fds opened BEFORE that overmount
+/// (through their `/proc/self/fd/N` magic symlinks). So the minimal root's correctness does not couple to
+/// WHERE the own-binary / vsock-dir live (the old `/tmp` overmount silently assumed neither was under
+/// `/tmp`), and nothing is written to any host-shared filesystem. The own-binary bind is additionally
+/// remounted `MS_RDONLY` at the mount layer (defence-in-depth over the Landlock + `execve`-seccomp block).
 #[cfg(target_os = "linux")]
 pub fn enter_minimal_mount_ns(own_binary: &Path, vsock_dir: &Path) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
     fn cstr(p: &Path) -> std::io::Result<std::ffi::CString> {
@@ -1329,9 +1406,36 @@ pub fn enter_minimal_mount_ns(own_binary: &Path, vsock_dir: &Path) -> std::io::R
         }
         Ok(())
     }
-    // Bind `src` (a file or a directory) into `newroot` at its SAME absolute path, creating the target.
-    fn bind_into_root(newroot: &Path, src: &Path, is_dir: bool) -> std::io::Result<()> {
-        let rel = src
+    // O_PATH-open a bind source so it can later be bound from its `/proc/self/fd/N` magic symlink,
+    // which resolves to the real inode even once the staging overmount hides the path — decoupling the
+    // bind from WHERE the source lives. O_PATH yields a resolve-only handle (no read/write authority).
+    fn open_opath(p: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::other("a relay bind path contains an interior NUL byte")
+        })?;
+        // SAFETY: `open(2)` with a valid NUL-terminated path + scalar flags; returns a fd or -1.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::other(format!(
+                "O_PATH-opening the relay bind source {} failed: {}",
+                p.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: `fd` is a fresh, exclusively-owned descriptor.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+    // Bind the real inode behind `src_fd` into `newroot` at `real_src`'s SAME absolute path (creating
+    // the target), via the fd's `/proc/self/fd/N` magic symlink so a path the staging overmount hid
+    // still resolves. `read_only` additionally remounts the bind READ-ONLY at the mount layer.
+    fn bind_fd_into_root(
+        newroot: &Path,
+        src_fd: std::os::fd::RawFd,
+        real_src: &Path,
+        is_dir: bool,
+        read_only: bool,
+    ) -> std::io::Result<()> {
+        let rel = real_src
             .strip_prefix("/")
             .map_err(|_| std::io::Error::other("a relay bind source is not absolute"))?;
         let target = newroot.join(rel);
@@ -1356,10 +1460,26 @@ pub fn enter_minimal_mount_ns(own_binary: &Path, vsock_dir: &Path) -> std::io::R
                     std::io::Error::other(format!("creating a relay bind-file target: {e}"))
                 })?;
         }
-        let src_c = cstr(src)?;
+        let src_c = std::ffi::CString::new(format!("/proc/self/fd/{src_fd}"))
+            .map_err(|_| std::io::Error::other("a /proc/self/fd path contains an interior NUL"))?;
         let target_c = cstr(&target)?;
         let flags = libc::MS_BIND | if is_dir { libc::MS_REC } else { 0 };
-        do_mount(&src_c, &target_c, None, flags, None, "bind")
+        do_mount(&src_c, &target_c, None, flags, None, "bind")?;
+        // Nit (b): remount the own-binary bind READ-ONLY at the mount layer (defence-in-depth — write is
+        // already Landlock- + `execve`-seccomp-blocked). The source is ignored on an `MS_REMOUNT`.
+        // Fail-closed: if the RO remount does not take, REFUSE (never serve with a writable own-binary).
+        if read_only {
+            let ignored = std::ffi::CString::new("none").expect("no interior NUL");
+            do_mount(
+                &ignored,
+                &target_c,
+                None,
+                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                None,
+                "ro-remount",
+            )?;
+        }
+        Ok(())
     }
 
     // A relative/empty grant path would bind the WRONG inode — refuse fail-closed.
@@ -1393,41 +1513,74 @@ pub fn enter_minimal_mount_ns(own_binary: &Path, vsock_dir: &Path) -> std::io::R
         "make-rprivate",
     )?;
 
-    // (3) A fresh, PRIVATE tmpfs to be the new root: overmount it on the always-present `/tmp` mount
-    //     point. Because step (2) made the tree rprivate, this overmount does NOT propagate to the host,
-    //     and — crucially — nothing is written to the SHARED underlying fs (an mkdir of a named staging
-    //     dir WOULD be visible to the host and leak an empty dir per relay start). The relay touches
-    //     only `own_binary` + `vsock_dir`, neither under `/tmp`, so overmounting `/tmp` hides nothing it
-    //     needs. After `pivot_root` this tmpfs IS `/`; it and everything created on it vanish with the ns.
-    let newroot = std::path::Path::new("/tmp");
-    let newroot_c = cstr(newroot)?;
+    // (3) Open O_PATH handles to the two real paths NOW, on the full tree, BEFORE the staging overmount
+    //     below. Each path is bound into the new root through its `/proc/self/fd/N` magic symlink, which
+    //     resolves to the real inode even once the overmount hides the path — so the minimal root's
+    //     correctness no longer couples to WHERE the own-binary / vsock-dir live (the previous `/tmp`
+    //     overmount silently assumed neither was under `/tmp`). Fail-closed on either open.
+    let exe_fd = open_opath(own_binary)?;
+    let dir_fd = open_opath(vsock_dir)?;
+
+    // (4) A fresh, PRIVATE `MS_NOSUID|MS_NODEV` tmpfs to be the new root, overmounted on a DEDICATED
+    //     staging mountpoint the relay controls: the vsock-dir's PARENT. It is guaranteed to exist (the
+    //     vsock dir does), it is the relay's OWN runtime area (not the shared, world-writable `/tmp`),
+    //     and — because the two real paths are bound from the O_PATH fds above — hiding its subtree
+    //     cannot break the binds (no path-collision coupling). Step (2) made the tree rprivate, so the
+    //     overmount does NOT propagate to the host, and everything created below lands on this ephemeral
+    //     tmpfs, so nothing is written to any host-shared filesystem (no leaked staging dir). After
+    //     `pivot_root` this tmpfs IS `/`; it and everything on it vanish with the ns. Fail-closed if
+    //     there is no suitable parent to anchor it.
+    let new_root = vsock_dir.parent().ok_or_else(|| {
+        std::io::Error::other(
+            "the relay's vsock dir has no parent to anchor its private staging root — refusing fail-closed",
+        )
+    })?;
+    if new_root == Path::new("/") || new_root.as_os_str().is_empty() {
+        return Err(std::io::Error::other(
+            "refusing `/` (or an empty path) as the relay's staging mountpoint — pivot_root needs a \
+             non-root new_root carved from the relay's own runtime area",
+        ));
+    }
+    let new_root_c = cstr(new_root)?;
     let tmpfs_opts =
         std::ffi::CString::new("mode=0700,size=1m,nr_inodes=4k").expect("no interior NUL");
     do_mount(
         &tmpfs,
-        &newroot_c,
+        &new_root_c,
         Some(&tmpfs),
         libc::MS_NOSUID | libc::MS_NODEV,
         Some(&tmpfs_opts),
         "tmpfs-newroot",
     )?;
 
-    // (4) Bind the ONLY two paths the relay needs, at their REAL absolute paths inside newroot: the own
-    //     binary (a file — the execute-pin O_PATH grant) and the vsock-UDS directory (a dir — the RO
-    //     grant plus the one socket it dials). Sources resolve on the current (private) tree where they
-    //     are NOT under `/tmp`; the bind-mounts land on the fresh tmpfs, consuming no shared-fs storage.
-    bind_into_root(newroot, own_binary, false)?;
-    bind_into_root(newroot, vsock_dir, true)?;
+    // (5) Bind the ONLY two paths the relay needs into the new root at their REAL absolute paths, from
+    //     the O_PATH fds (so a path the overmount hid still binds): the own binary (a FILE — the
+    //     execute-pin O_PATH grant, remounted READ-ONLY, nit (b)) and the vsock-UDS directory (a DIR —
+    //     the RO grant plus the one socket it dials, left writable as the relay dials it). The binds +
+    //     put_old land on the fresh tmpfs, consuming no shared-fs storage.
+    bind_fd_into_root(new_root, exe_fd.as_raw_fd(), own_binary, false, true)?;
+    bind_fd_into_root(new_root, dir_fd.as_raw_fd(), vsock_dir, true, false)?;
+    // The O_PATH handles have served their purpose; drop them BEFORE the pivot — a lingering directory
+    // O_PATH fd is itself `fchdir`-able, exactly the leaked-dir-fd surface the relay otherwise forecloses.
+    drop(exe_fd);
+    drop(dir_fd);
 
-    // (5) pivot_root: newroot becomes `/`, the old root moves to newroot/.put_old; then detach it so
+    // (6) pivot_root: new_root becomes `/`, the old root moves to new_root/.put_old; then detach it so
     //     the host tree (and every host UDS path) is unreachable from the relay.
-    let put_old = newroot.join(".put_old");
+    let put_old = new_root.join(".put_old");
     std::fs::create_dir_all(&put_old)
         .map_err(|e| std::io::Error::other(format!("creating the relay pivot put_old dir: {e}")))?;
     let put_old_c = cstr(&put_old)?;
-    // SAFETY: `pivot_root(2)` with two valid NUL-terminated absolute directory paths; newroot is a
+    // SAFETY: `pivot_root(2)` with two valid NUL-terminated absolute directory paths; new_root is a
     // fresh tmpfs mount point and put_old lives beneath it (the syscall's preconditions).
-    if unsafe { libc::syscall(libc::SYS_pivot_root, newroot_c.as_ptr(), put_old_c.as_ptr()) } != 0 {
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pivot_root,
+            new_root_c.as_ptr(),
+            put_old_c.as_ptr(),
+        )
+    } != 0
+    {
         return Err(std::io::Error::other(format!(
             "pivot_root into the relay's minimal root failed: {}",
             std::io::Error::last_os_error()
@@ -3025,6 +3178,36 @@ mod privsep_derivation_tests {
             HostAuthority::BackendBlob,
             HostAuthority::BackendMessaging,
         ])
+    }
+
+    // ---- VM relay: inherited-fd foreclosure (nit a) range arithmetic ----
+
+    /// The gap ranges preserve stdio + the kept fds, and the final range runs to `u32::MAX` so every
+    /// higher fd is foreclosed; a fd kept inside a would-be gap splits it (no kept fd is ever closed).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd_close_ranges_preserve_stdio_and_kept_and_close_the_rest() {
+        // No extra kept fds ⇒ keep only 0/1/2, then close everything from 3 up.
+        assert_eq!(fd_close_ranges(&[]), vec![(3, u32::MAX)]);
+        // A listener on fd 7 (the relay's real shape): close 3..=6 and 8..=MAX, preserve 0/1/2 + 7.
+        let r = fd_close_ranges(&[7]);
+        assert_eq!(r, vec![(3, 6), (8, u32::MAX)]);
+        // The kept fd must NEVER fall inside a closed range.
+        for &(lo, hi) in &r {
+            assert!(
+                !(lo <= 7 && 7 <= hi),
+                "fd 7 must be preserved, not in [{lo},{hi}]"
+            );
+        }
+        // A listener + two link fds, given unsorted + with a duplicate and a negative (absent) fd.
+        assert_eq!(
+            fd_close_ranges(&[9, 4, 4, -1, 7]),
+            vec![(3, 3), (5, 6), (8, 8), (10, u32::MAX)]
+        );
+        // Keeping fd 3 (adjacent to stdio) leaves no 3..low gap — just close 4.. up.
+        assert_eq!(fd_close_ranges(&[3]), vec![(4, u32::MAX)]);
+        // A negative-only keep set behaves like an empty one (the optional fd was absent).
+        assert_eq!(fd_close_ranges(&[-1]), vec![(3, u32::MAX)]);
     }
 
     // ---- Seccomp allow/kill derivation ----

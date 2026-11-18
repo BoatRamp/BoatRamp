@@ -966,7 +966,7 @@ pub fn run_vm_relay(label: &str) -> Result<(), CliError> {
     // relay a byte unprofiled).
     #[cfg(all(target_os = "linux", feature = "sandbox"))]
     let result: Result<(), CliError> =
-        run_vm_relay_confined(label, &descriptor, listener_fd).map_err(|e| fail(e).into());
+        run_vm_relay_confined(label, &descriptor, &fds, listener_fd).map_err(|e| fail(e).into());
     #[cfg(not(all(target_os = "linux", feature = "sandbox")))]
     let result: Result<(), CliError> = {
         let _ = (listener_fd, &descriptor);
@@ -999,9 +999,26 @@ pub fn run_vm_relay(label: &str) -> Result<(), CliError> {
 fn run_vm_relay_confined(
     label: &str,
     descriptor: &VmRelayDescriptor,
+    fds: &PrivsepChildFds,
     listener_fd: i32,
 ) -> Result<(), String> {
     use std::os::fd::FromRawFd;
+
+    // Nit (a) — foreclose a leaked host DIRECTORY-fd `fchdir`/`openat` escape, STRUCTURALLY. Right after
+    // the `__vm-relay` re-exec and BEFORE any namespace/profile step, close EVERY inherited fd except
+    // stdio (0/1/2 — tracing) and EXACTLY the fds the root deliberately handed this relay via
+    // [`PrivsepChildFds`] (the pre-bound public listener + any link fds — adopted LATER in `run_relay`).
+    // CLOEXEC discipline + the re-exec already drop host fds, but this makes "no host dir-fd survives
+    // into the relay" a hard `close_range` guarantee rather than a code-analysis assertion: no stray fd
+    // can be `fchdir`'d past the minimal mount-ns root below. The kept set is precisely known from the
+    // descriptor map, so this preserves it exactly. Fail-closed (never relay a byte with a stray fd open).
+    let mut keep_fds: Vec<i32> = fds.links.values().copied().collect();
+    if let Some(l) = fds.listener {
+        keep_fds.push(l);
+    }
+    boatramp_server::sandbox::close_inherited_fds_except(&keep_fds).map_err(|e| {
+        format!("foreclosing stray inherited fds before the relay confinement (nit a): {e}")
+    })?;
 
     // Contract #1 (WS-C): normalize the own-binary + vsock-UDS paths the Landlock view grants, so the
     // fd-based install grants the REAL paths (a `..`/symlink/relative spelling cannot slip a different
