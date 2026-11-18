@@ -96,7 +96,6 @@ const DATABASE: &str = "appdb";
 const APP_USER: &str = "app";
 const TENANT: &str = "exampleorg";
 const SITE: &str = "app";
-const DB_NAME: &str = "main";
 
 /// A `Storage` serving one in-memory blob for every key (the docker pull is over the
 /// daemon, not the blob store, but `ContainerBackend::new`-style constructors want one;
