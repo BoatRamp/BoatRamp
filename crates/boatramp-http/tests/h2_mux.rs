@@ -589,3 +589,122 @@ async fn large_body_nonempty_remainder_closes_window_on_end_stream() {
         .expect("END_STREAM stranded on a closed window after a non-empty remainder (#32 shape)");
     assert_eq!(got, BODY, "the full >128 KiB body must be delivered");
 }
+
+// --- regression: the writer must flush a buffering transport before it idles ----------
+//
+// boatramp-requests #32 (real-RTT reproduction): a > 128 KiB identity asset over h2-*over-TLS*
+// stalled part-way (at a variable byte count — 98 KiB, 128 KiB, …) only on a real / rate-limited
+// / lossy path, never on a 0-RTT loopback. Root cause: `write_all_vectored` only writes what the
+// transport's `poll_write` *accepts*. Userspace rustls accepts the plaintext but, when the TCP
+// socket is backpressured, leaves the matching encrypted records queued in its own buffer and
+// returns anyway; once the mux had drained the outbox it parked on `notify` with no further
+// `poll_write`/`poll_flush` scheduled, so the queued tail of the response never reached the peer
+// and the client hung waiting for bytes the server considered "written". A 0-RTT loopback never
+// fills the socket, so the records always flushed inline and the bug was invisible there.
+//
+// `FlushGatedIo` models exactly that transport: `poll_write` delivers the first `budget` bytes
+// to the peer inline (the socket had room) and then *buffers* everything else, surfacing it only
+// on `poll_flush`. With the writer's pre-park flush reverted this hangs to the timeout (the body's
+// tail sits in the buffer forever); with it, the flush drains the buffer and the body completes.
+
+/// A transport wrapper that behaves like a buffering writer under backpressure: the read side
+/// passes through; the write side delivers the first `budget` bytes inline and buffers the rest
+/// until `poll_flush`.
+struct FlushGatedIo<IO> {
+    inner: IO,
+    budget: usize,
+    staged: Vec<u8>,
+}
+
+impl<IO: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FlushGatedIo<IO> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<IO: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FlushGatedIo<IO> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.budget >= buf.len() {
+            // Room in the "socket": deliver inline (a partial write is fine, the caller loops).
+            let n = std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_write(cx, buf))?;
+            this.budget -= n;
+            std::task::Poll::Ready(Ok(n))
+        } else {
+            // "Socket" full: accept the plaintext but queue it (like rustls' encrypted buffer),
+            // and stop delivering inline until a flush drains it.
+            this.budget = 0;
+            this.staged.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        while !this.staged.is_empty() {
+            let n = std::task::ready!(
+                std::pin::Pin::new(&mut this.inner).poll_write(cx, &this.staged)
+            )?;
+            this.staged.drain(..n);
+        }
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::ready!(self.as_mut().poll_flush(cx))?;
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn buffering_transport_body_tail_is_flushed_before_the_writer_idles() {
+    const BODY: usize = 200 * 1024;
+    // Deliver the handshake + first ~140 KiB inline, then buffer the rest (the "socket" fills) —
+    // so a > 128 KiB response leaves a tail stranded in the transport buffer.
+    const BUDGET: usize = 140 * 1024;
+
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let gated = FlushGatedIo {
+        inner: server_io,
+        budget: BUDGET,
+        staged: Vec::new(),
+    };
+    tokio::spawn(async move {
+        let _ = serve_connection_mux(gated, SingleChunkStream(BODY)).await;
+    });
+    // A comfortable window so flow control is never the limiter — this is purely about the
+    // transport flush.
+    let mut builder = h2::client::Builder::new();
+    builder
+        .initial_window_size(1 << 20)
+        .initial_connection_window_size(1 << 20)
+        .max_frame_size(1 << 20);
+    let (send_request, connection) = builder.handshake::<_, Bytes>(client_io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut client = send_request.ready().await.unwrap();
+
+    let response = get(&mut client, "/big").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let fut = read_body(response.into_body());
+    let body = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+        .await
+        .expect("response tail stranded in the transport buffer — writer idled without flushing");
+    assert_eq!(body.len(), BODY, "the full body must reach the peer");
+    assert!(body.iter().all(|&b| b == b'x'));
+}

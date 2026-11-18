@@ -1209,6 +1209,7 @@ where
     // allocation source in the profile.
     let mut batch = Batch::new();
     loop {
+        let mut wrote = false;
         loop {
             batch.clear();
             build_batch(&shared, &mut hpack, &mut batch);
@@ -1216,6 +1217,23 @@ where
                 break;
             }
             write_all_vectored(&mut wr, &batch).await?;
+            wrote = true;
+        }
+        // Flush before idling. `write_all_vectored` only writes what the transport's
+        // `poll_write` accepts; a buffering writer (userspace rustls) accepts the plaintext
+        // but, when the TCP socket is backpressured, leaves the matching *encrypted* records
+        // queued in its own buffer and returns anyway. With the outbox drained the writer is
+        // about to park on `notify` with no further `poll_write`/`poll_flush` scheduled, so
+        // those queued records — the tail of the response — would sit unsent until the next
+        // frame (which, for a completed response, never comes) and the peer hangs waiting for
+        // bytes the server already considers "written". A 0-RTT loopback never fills the
+        // socket so this is invisible there; a real-RTT / rate-limited / lossy path fills it
+        // and strands the tail. Draining the transport here makes the queued records reach the
+        // peer before we park. (`flush` on a plain `TcpStream` is a cheap no-op, so the serial
+        // h1/h2 paths and h2c are unaffected; `poll_flush` yields on backpressure, releasing
+        // the split lock so the reader keeps processing inbound frames.)
+        if wrote {
+            wr.flush().await?;
         }
         {
             let s = shared.lock().unwrap();
