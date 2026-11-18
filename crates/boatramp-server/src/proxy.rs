@@ -90,14 +90,10 @@ pub(super) async fn proxy(
         Ok(resp) => {
             let status = resp.status();
             // Pass response headers through, minus hop-by-hop + content-length
-            // (we re-stream, so let the framing be recomputed).
+            // (we re-stream, so let the framing be recomputed). `append` preserves
+            // REPEATED headers — notably every `Set-Cookie` (see `forward_response_headers`).
             let mut headers = HeaderMap::new();
-            for (name, value) in resp.headers() {
-                if is_hop_by_hop(name) || name == header::CONTENT_LENGTH {
-                    continue;
-                }
-                headers.insert(name.clone(), value.clone());
-            }
+            forward_response_headers(resp.headers(), &[], &mut headers);
             // Stream the upstream body straight to the client off the pooled connection —
             // no hyper connection task, no intermediate copy (see [`ClientBody`]).
             (status, headers, Body::from_stream(resp.into_body())).into_response()
@@ -123,6 +119,29 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
         "upgrade",
     ];
     HOP.contains(&name.as_str())
+}
+
+/// Copy an upstream response's headers into the downstream `out` map, **preserving every
+/// repeated header**. This is load-bearing for authentication: HTTP permits multiple
+/// `Set-Cookie` fields and a login flow relies on it — a 303 from an upstream like Gitea
+/// carries several distinct cookies at once (the session cookie plus a CSRF cookie, often
+/// more). A [`HeaderMap::insert`] would collapse the repeats to the **last** value, silently
+/// dropping the session `Set-Cookie`, so the browser never establishes the session and is
+/// bounced back to the login page. [`HeaderMap::append`] keeps each value as a separate
+/// field, matching how the request leg (and the `splice` fast-path) already forward headers.
+///
+/// Drops hop-by-hop headers and `Content-Length` (the body is re-streamed, so the downstream
+/// framing is recomputed) plus any header named in the upstream's `header_down.remove`.
+fn forward_response_headers(upstream_headers: &HeaderMap, remove: &[String], out: &mut HeaderMap) {
+    for (name, value) in upstream_headers {
+        if is_hop_by_hop(name)
+            || name == header::CONTENT_LENGTH
+            || remove.iter().any(|h| name.as_str().eq_ignore_ascii_case(h))
+        {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
 }
 
 /// Validate a proxy target against the SSRF policy and return the parsed URL,
@@ -1364,19 +1383,7 @@ async fn proxy_upstream(
         Ok(resp) => {
             let status = resp.status();
             let mut headers = HeaderMap::new();
-            for (name, value) in resp.headers() {
-                if is_hop_by_hop(name)
-                    || name == header::CONTENT_LENGTH
-                    || upstream
-                        .header_down
-                        .remove
-                        .iter()
-                        .any(|h| name.as_str().eq_ignore_ascii_case(h))
-                {
-                    continue;
-                }
-                headers.insert(name.clone(), value.clone());
-            }
+            forward_response_headers(resp.headers(), &upstream.header_down.remove, &mut headers);
             // Response header set/overrides.
             for (name, value) in &upstream.header_down.set {
                 set_header_str(&mut headers, name, value);
@@ -1496,19 +1503,7 @@ async fn proxy_upstream_unix(
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut headers = HeaderMap::new();
-            for (name, value) in resp.headers() {
-                if is_hop_by_hop(name)
-                    || name == header::CONTENT_LENGTH
-                    || upstream
-                        .header_down
-                        .remove
-                        .iter()
-                        .any(|h| name.as_str().eq_ignore_ascii_case(h))
-                {
-                    continue;
-                }
-                headers.insert(name.clone(), value.clone());
-            }
+            forward_response_headers(resp.headers(), &upstream.header_down.remove, &mut headers);
             for (name, value) in &upstream.header_down.set {
                 set_header_str(&mut headers, name, value);
             }
@@ -1845,14 +1840,17 @@ where
             }
         });
         // Return the upstream's 101 (with its Upgrade/Sec-WebSocket-Accept headers).
+        // `append` preserves repeated headers (no hop-by-hop filter here — the upgrade
+        // handshake legitimately needs `Connection`/`Upgrade` forwarded).
         let mut headers = HeaderMap::new();
         for (name, value) in upstream_resp.headers() {
-            headers.insert(name.clone(), value.clone());
+            headers.append(name.clone(), value.clone());
         }
         return (StatusCode::SWITCHING_PROTOCOLS, headers, Body::empty()).into_response();
     }
 
-    // Upstream declined the upgrade — pass its response through.
+    // Upstream declined the upgrade — pass its response through. `append` preserves
+    // REPEATED headers — notably every `Set-Cookie` (see `forward_response_headers`).
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut headers = HeaderMap::new();
@@ -1860,7 +1858,7 @@ where
         if name == header::CONTENT_LENGTH {
             continue;
         }
-        headers.insert(name.clone(), value.clone());
+        headers.append(name.clone(), value.clone());
     }
     (status, headers, Body::new(upstream_resp.into_body())).into_response()
 }
@@ -2068,5 +2066,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(echoed.as_ref(), b"the quick brown fox jumps".as_slice());
+    }
+
+    /// Regression (gateway login / Set-Cookie drop): a login response carries SEVERAL
+    /// distinct `Set-Cookie` fields at once. `forward_response_headers` must keep EVERY one
+    /// as a separate header — a `HeaderMap::insert` (the prior behavior) collapsed the repeats
+    /// to the last value, silently dropping the session cookie so the browser was bounced back
+    /// to the login page. Hop-by-hop + `Content-Length` + the upstream's `header_down.remove`
+    /// are still dropped; other repeated headers survive too.
+    #[test]
+    fn forward_response_headers_preserves_repeated_set_cookie() {
+        // A Gitea-shaped login 303's header set: five distinct cookies, plus a hop-by-hop
+        // header, a Content-Length, and a to-be-removed header, and a repeated Vary.
+        let mut upstream = HeaderMap::new();
+        upstream.append(header::LOCATION, HeaderValue::from_static("/"));
+        for cookie in [
+            "session=abc123; Path=/; HttpOnly; Secure; SameSite=Lax",
+            "_csrf=csrftok; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax",
+            "lang=en-US; Path=/; Max-Age=2147483647",
+            "i_like_gitea=likeit; Path=/; HttpOnly; Secure",
+            "macaron_flash=; Path=/; Max-Age=0; HttpOnly",
+        ] {
+            upstream.append(header::SET_COOKIE, HeaderValue::from_static(cookie));
+        }
+        upstream.append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        upstream.append(header::VARY, HeaderValue::from_static("Cookie"));
+        upstream.append(header::CONNECTION, HeaderValue::from_static("keep-alive")); // hop-by-hop
+        upstream.append(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        upstream.append(
+            HeaderName::from_static("x-internal"),
+            HeaderValue::from_static("secret"),
+        );
+
+        let mut out = HeaderMap::new();
+        forward_response_headers(&upstream, &["x-internal".to_string()], &mut out);
+
+        // Every distinct Set-Cookie survives, as SEPARATE fields (never comma-joined).
+        let cookies: Vec<&str> = out
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            cookies.len(),
+            5,
+            "all five Set-Cookie fields must survive; got {cookies:?}"
+        );
+        assert!(
+            cookies.iter().any(|c| c.starts_with("session=")),
+            "the session cookie must not be dropped; got {cookies:?}"
+        );
+        assert!(
+            cookies.iter().any(|c| c.starts_with("_csrf=")),
+            "the CSRF cookie must survive; got {cookies:?}"
+        );
+        // No single field smuggles two cookies (a comma-join corruption).
+        for c in &cookies {
+            assert!(
+                !(c.contains("session=") && c.contains("_csrf=")),
+                "Set-Cookie fields must not be comma-joined: {c:?}"
+            );
+        }
+        // Other repeated headers survive too.
+        assert_eq!(out.get_all(header::VARY).iter().count(), 2);
+        // Hop-by-hop, Content-Length, and header_down.remove targets are dropped.
+        assert!(!out.contains_key(header::CONNECTION));
+        assert!(!out.contains_key(header::CONTENT_LENGTH));
+        assert!(!out.contains_key(HeaderName::from_static("x-internal")));
+    }
+
+    /// End-to-end over the real upstream codec: a raw mock upstream emits an actual
+    /// `303 See Other` login response with five distinct `Set-Cookie` lines on the wire; the
+    /// native client parses it and `forward_response_headers` relays it. Asserts all five
+    /// cookies reach the downstream map intact and separate — the faithful shape of the
+    /// `cad.tokenfield.ai` → Gitea login that v0.63.1's edge broke.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_login_303_relays_all_set_cookie_end_to_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const RESP: &[u8] = b"HTTP/1.1 303 See Other\r\n\
+Location: /\r\n\
+Set-Cookie: session=abc123; Path=/; HttpOnly; Secure; SameSite=Lax\r\n\
+Set-Cookie: _csrf=csrftok; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax\r\n\
+Set-Cookie: lang=en-US; Path=/; Max-Age=2147483647\r\n\
+Set-Cookie: i_like_gitea=likeit; Path=/; HttpOnly; Secure\r\n\
+Set-Cookie: macaron_flash=; Path=/; Max-Age=0; HttpOnly\r\n\
+Content-Length: 0\r\n\
+Connection: close\r\n\r\n";
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = raw.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = raw.accept().await {
+                let _ = sock.set_nodelay(true);
+                // Drain the request head, then emit the raw login 303.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(RESP).await;
+                let _ = sock.flush().await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
+        let uri = format!("http://127.0.0.1:{}/user/login", addr.port());
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = client.send(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        // Relay the upstream response headers exactly as `proxy_upstream` does.
+        let mut out = HeaderMap::new();
+        forward_response_headers(resp.headers(), &[], &mut out);
+
+        let cookies: Vec<&str> = out
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            cookies.len(),
+            5,
+            "the client must receive all five Set-Cookie fields from the 303; got {cookies:?}"
+        );
+        assert!(cookies.iter().any(|c| c.starts_with("session=")));
+        assert!(cookies.iter().any(|c| c.starts_with("_csrf=")));
     }
 }
