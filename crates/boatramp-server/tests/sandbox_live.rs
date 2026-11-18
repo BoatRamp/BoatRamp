@@ -301,6 +301,7 @@ fn probe_derived_bind(install: bool) -> i32 {
 ///      it must still SUCCEED; and
 ///   2. an AF_INET (TCP) `connect` to `127.0.0.1:tcp_port` (a live loopback listener the parent
 ///      holds) — which the relay's deny-ALL-TCP `AccessNet` wall must DENY (EACCES).
+///
 /// With the profile OFF the same TCP connect succeeds (the mutation proof). The relay profile grants
 /// FS read on `current_exe` + `unix_path` only, so the probe needs no other filesystem access.
 fn probe_relay_net(install: bool, tcp_port: u16, unix_path: &CString) -> i32 {
