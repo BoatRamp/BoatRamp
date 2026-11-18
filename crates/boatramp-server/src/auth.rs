@@ -115,6 +115,38 @@ struct AuthInner {
     /// routes authz reads cache-vs-read-through, control-plane WRITES always read through, and a
     /// store-unreachable read error FAILS CLOSED (deny / shed 503). See [`SharedAuthz`].
     shared: Option<SharedAuthz>,
+    /// Memoized compiled RBAC policy (U11-4b). The authz hot path recompiled the
+    /// Cedar `PolicySet` from the stored policy on **every** request; this caches the
+    /// parse+compile so it runs once per DISTINCT stored policy, keyed by the exact
+    /// stored bytes. A policy change (new `authz/policy` bytes) misses the cache and
+    /// recompiles, so a stale authz decision is never served after a policy update.
+    /// Does not change the MF-3 fence / MF-4 fail-closed store-read behavior — the
+    /// store is still read (and fenced) every call; only the compile is memoized.
+    policy_cache: Mutex<Option<CachedPolicy>>,
+}
+
+/// A memoized compiled RBAC policy for [`AuthInner::policy`], keyed by the exact
+/// stored policy bytes it was compiled from (U11-4b). `bytes == None` is the
+/// built-in default policy (used when `authz/policy` is absent, unreadable in a
+/// fail-open posture, malformed, or uncompilable — all of which resolve to the
+/// default). Invalidation is purely by content: a differing stored-bytes value
+/// misses this entry and triggers a recompile.
+struct CachedPolicy {
+    /// The stored policy bytes this entry compiled from, or `None` for the default.
+    bytes: Option<Vec<u8>>,
+    /// The resolved policy (the stored one, or the default on any fallback) — shared
+    /// so the caller can `normalize_grants` against the SAME policy that was compiled.
+    policy: Arc<AuthzPolicy>,
+    /// The Cedar authorizer compiled from `policy`.
+    compiled: Arc<CompiledCedar>,
+}
+
+impl CachedPolicy {
+    /// Whether this entry was compiled from exactly `bytes` (the current stored
+    /// policy, or `None` for absent/default).
+    fn matches(&self, bytes: Option<&[u8]>) -> bool {
+        self.bytes.as_deref() == bytes
+    }
 }
 
 /// The shared-mode authz guard carried by [`AuthInner`] in multi-writer mode (MF-3 + MF-4). Built by
@@ -185,6 +217,7 @@ impl Auth {
                 require_pop: false,
                 replay: PopReplayCache::new(),
                 shared: None,
+                policy_cache: Mutex::new(None),
             })),
         }
     }
@@ -205,6 +238,7 @@ impl Auth {
                     require_pop: inner.require_pop,
                     replay: inner.replay.clone(),
                     shared: Some(SharedAuthz { backing, fence }),
+                    policy_cache: Mutex::new(None),
                 })),
             },
             None => Self { inner: None },
@@ -226,6 +260,7 @@ impl Auth {
                     require_pop,
                     replay: PopReplayCache::new(),
                     shared: inner.shared.clone(),
+                    policy_cache: Mutex::new(None),
                 })),
             },
             None => Self { inner: None },
@@ -745,19 +780,22 @@ impl AuthInner {
     /// the caller can [`normalize_grants`](AuthzPolicy::normalize_grants) (legacy
     /// bare-site grants → the `default` project) with the same policy the authorizer
     /// compiled from.
-    async fn policy(&self, is_write: bool) -> Result<(AuthzPolicy, CompiledCedar), KvError> {
+    ///
+    /// **Compile cache (U11-4b):** the Cedar `PolicySet` is compiled ONCE per distinct
+    /// stored policy and memoized in [`policy_cache`](AuthInner::policy_cache), keyed
+    /// by the exact stored bytes — the per-request recompile the old path paid is
+    /// gone. The store is still read (and, in shared mode, fenced + fail-closed) on
+    /// **every** call, so the MF-3 currency fence / MF-4 fail-closed behavior is
+    /// unchanged; only the compile is cached. A policy write changes the stored bytes,
+    /// misses the cache, and recompiles — so a stale authz decision is never served
+    /// after a policy update.
+    async fn policy(
+        &self,
+        is_write: bool,
+    ) -> Result<(Arc<AuthzPolicy>, Arc<CompiledCedar>), KvError> {
         let (store, via_read_through) = self.authz_read_store(is_write);
-        let stored = match store.get(authz::POLICY_KEY).await {
-            Ok(Some(bytes)) => match serde_json::from_slice::<AuthzPolicy>(&bytes) {
-                Ok(p) => Some(p),
-                Err(err) => {
-                    // Brick-guard (KEPT): a corrupt STORED policy must never wedge the control plane
-                    // — it is logged and the default used. Only the UNREACHABLE case fails closed.
-                    tracing::warn!(%err, "authz/policy is malformed; using the default policy");
-                    None
-                }
-            },
-            Ok(None) => None,
+        let stored_bytes: Option<Vec<u8>> = match store.get(authz::POLICY_KEY).await {
+            Ok(opt) => opt,
             Err(err) => {
                 // MF-4 — a store-unreachable read FAILS CLOSED in shared mode: return the error so
                 // `authorize` sheds (503) instead of falling to the LOOSER built-in default (which
@@ -775,17 +813,60 @@ impl AuthInner {
         if via_read_through && let Some(s) = &self.shared {
             s.fence.confirm();
         }
-        let policy = stored.unwrap_or_else(AuthzPolicy::default_policy);
-        match CompiledCedar::compile(&policy) {
-            Ok(c) => Ok((policy, c)),
+        // Fast path (U11-4b): reuse the compiled authorizer when the stored policy bytes are
+        // unchanged. The store read above already happened (and fenced / failed closed), so this
+        // only skips the parse + Cedar compile, never the currency check.
+        {
+            let cache = self
+                .policy_cache
+                .lock()
+                .expect("policy cache mutex poisoned");
+            if let Some(c) = cache.as_ref()
+                && c.matches(stored_bytes.as_deref())
+            {
+                return Ok((Arc::clone(&c.policy), Arc::clone(&c.compiled)));
+            }
+        }
+        // Miss (policy changed, or first use): parse + compile — the work the old path did on
+        // every request. A malformed or uncompilable stored policy falls back to the default (and
+        // the fallback is itself cached under the bad bytes, so it is not re-parsed / re-logged
+        // every request).
+        let parsed = match &stored_bytes {
+            Some(bytes) => match serde_json::from_slice::<AuthzPolicy>(bytes) {
+                Ok(p) => p,
+                Err(err) => {
+                    // Brick-guard (KEPT): a corrupt STORED policy must never wedge the control plane
+                    // — it is logged and the default used. Only the UNREACHABLE case fails closed.
+                    tracing::warn!(%err, "authz/policy is malformed; using the default policy");
+                    AuthzPolicy::default_policy()
+                }
+            },
+            None => AuthzPolicy::default_policy(),
+        };
+        let (policy, compiled) = match CompiledCedar::compile(&parsed) {
+            Ok(c) => (parsed, c),
             Err(err) => {
                 tracing::warn!(%err, "authz/policy failed to compile; using the default policy");
                 let default = AuthzPolicy::default_policy();
                 let compiled =
                     CompiledCedar::compile(&default).expect("the default policy always compiles");
-                Ok((default, compiled))
+                (default, compiled)
             }
+        };
+        let policy = Arc::new(policy);
+        let compiled = Arc::new(compiled);
+        {
+            let mut cache = self
+                .policy_cache
+                .lock()
+                .expect("policy cache mutex poisoned");
+            *cache = Some(CachedPolicy {
+                bytes: stored_bytes,
+                policy: Arc::clone(&policy),
+                compiled: Arc::clone(&compiled),
+            });
         }
+        Ok((policy, compiled))
     }
 
     /// Load the **overlay flow policy** from `overlay/flow-policy` through the fenced authz store,
@@ -2001,6 +2082,64 @@ mod tests {
         assert!(
             allowed,
             "mutation: the fence is ignored, the stale permissive policy is served → the gate is RED"
+        );
+    }
+
+    /// (U11-4b) The compile cache is INVALIDATED on a policy change: the SAME `Auth`
+    /// authorizes an admin token under the permissive default (allow), then — after
+    /// the stored `authz/policy` is replaced with a tightened (grants-nobody) policy —
+    /// DENIES the same token, and re-ALLOWS it when the default is restored. Proves the
+    /// memoized Cedar compile never serves a stale authz decision after a policy
+    /// update (single-writer mode: every call re-reads the store; the cache keys on the
+    /// exact bytes, so a changed policy misses and recompiles).
+    #[tokio::test]
+    async fn policy_cache_invalidates_on_policy_change() {
+        let root = holder();
+        let token = admin_token(&root).await;
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        kv.put(authz::POLICY_KEY, default_policy_bytes())
+            .await
+            .unwrap();
+        let auth = Auth::with_key(root.public_key(), kv.clone());
+
+        // Default policy: admin is allowed (this compiles + caches the authorizer)...
+        assert!(
+            auth.authorize(&token, "GET", PATH, None, None)
+                .await
+                .is_ok(),
+            "admin must be allowed under the default policy"
+        );
+        // ...and again (a cache HIT on the unchanged bytes) — still allowed.
+        assert!(
+            auth.authorize(&token, "GET", PATH, None, None)
+                .await
+                .is_ok(),
+            "a second authorize (cache hit) must still allow"
+        );
+
+        // Replace the stored policy with a tightened (grants-nobody) one.
+        kv.put(authz::POLICY_KEY, tightened_policy_bytes())
+            .await
+            .unwrap();
+        let rej = auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rej.status,
+            StatusCode::FORBIDDEN,
+            "a tightened policy must take effect — the compile cache invalidated on the byte change"
+        );
+
+        // Restore the default → allowed again (recompiled on the restored bytes, not a one-shot).
+        kv.put(authz::POLICY_KEY, default_policy_bytes())
+            .await
+            .unwrap();
+        assert!(
+            auth.authorize(&token, "GET", PATH, None, None)
+                .await
+                .is_ok(),
+            "restoring the default policy must re-allow — the cache keyed on bytes, not a one-shot compile"
         );
     }
 

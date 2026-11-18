@@ -32,20 +32,27 @@
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use coset::cwt::{ClaimsSetBuilder, Timestamp};
 use coset::{
     Algorithm as CoseAlg, CborSerializable, CoseSign1, CoseSign1Builder, HeaderBuilder,
     TaggedCborSerializable, iana,
 };
 
-// (U8–U10, #6) Re-export the foreign types this engine's public API speaks, so a
-// consumer need not add a direct `coset` / `ciborium` dependency (nor pin its
+// (U8–U10, #6 · U11-3) Re-export the foreign types this engine's public API speaks,
+// so a consumer need not add a direct `coset` / `ciborium` dependency (nor pin its
 // version independently): `ClaimsSet` is the claim-set type `sign_claims` /
 // `verify_envelope` / `CredentialChain::root_claims` traffic in, and `Value`
 // (aliased `CborValue`) is the CBOR model the `NarrowingCaveats` wire form uses.
+//
+// (U11-3) Additionally re-export the claim-BUILDING helpers — `ClaimsSetBuilder`
+// (the fluent builder a consumer mints a claim set with), `ClaimName` (the claim-key
+// type `ClaimsSet::rest` is keyed by, for reading/building private-use claims) and
+// `Timestamp` (the `iat`/`exp` representation) — so a consumer can construct a token
+// end-to-end through `boatramp-cwt` without depending on `coset` directly. These are
+// also used internally by this crate (e.g. `attenuate`, `sign_claims`), so the
+// re-export doubles as the in-module import.
 pub use ciborium::Value;
 pub use ciborium::value::Value as CborValue;
-pub use coset::cwt::ClaimsSet;
+pub use coset::cwt::{ClaimName, ClaimsSet, ClaimsSetBuilder, Timestamp};
 
 /// Max blocks in a presented delegation chain — a resource bound checked *before*
 /// any signature verification.
@@ -109,6 +116,17 @@ pub enum TokenError {
     /// Classified exactly like [`Invalid`](Self::Invalid) (unauthenticated).
     #[error("token invalid: algorithm mismatch")]
     AlgMismatch,
+    /// A presented or minted delegation chain exceeds a **resource bound** — too
+    /// many blocks ([`MAX_CHAIN_DEPTH`]) or too many serialized bytes
+    /// ([`MAX_CHAIN_BYTES`]) — rejected *before* any signature verification (so a
+    /// hostile credential can't force unbounded work). A distinct, typed variant
+    /// (U11-2; previously folded into [`Invalid`](Self::Invalid)/[`Build`](Self::Build))
+    /// so a consumer can tell "too big / too deep" from other invalidity **by
+    /// variant** rather than by matching the error text. Classified exactly like
+    /// [`Invalid`](Self::Invalid): a framing / resource-bound rejection
+    /// (unauthenticated), never an authentic-but-wrong token.
+    #[error("token bounds: {0}")]
+    Bounds(String),
     /// A delegation step would **widen** authority: either the consumer
     /// [`meet`](NarrowingCaveats::meet) is not a true lower bound (a buggy/hostile
     /// impl — caught fail-closed), or a block names *looser* restrictions than are
@@ -448,7 +466,7 @@ pub fn decode_credential(credential: &str) -> Result<Vec<Vec<u8>>, TokenError> {
         .decode(credential.trim())
         .map_err(|e| TokenError::Invalid(format!("base64: {e}")))?;
     if bytes.len() > MAX_CHAIN_BYTES {
-        return Err(TokenError::Invalid("credential exceeds size bound".into()));
+        return Err(TokenError::Bounds("credential exceeds size bound".into()));
     }
     // CBOR major type 4 (0b100_xxxxx) is an array (a chain); a tagged COSE_Sign1
     // is major type 6 (tag). Peek before parsing.
@@ -462,7 +480,7 @@ pub fn decode_credential(credential: &str) -> Result<Vec<Vec<u8>>, TokenError> {
         return Err(TokenError::Invalid("malformed credential".into()));
     };
     if items.is_empty() || items.len() > MAX_CHAIN_DEPTH {
-        return Err(TokenError::Invalid(
+        return Err(TokenError::Bounds(
             "credential chain length out of bounds".into(),
         ));
     }
@@ -481,7 +499,7 @@ pub fn encode_chain(blocks: Vec<Vec<u8>>) -> Result<String, TokenError> {
     let mut buf = Vec::new();
     ciborium::into_writer(&array, &mut buf).map_err(|e| TokenError::Build(e.to_string()))?;
     if buf.len() > MAX_CHAIN_BYTES {
-        return Err(TokenError::Build(
+        return Err(TokenError::Bounds(
             "delegation chain exceeds size bound".into(),
         ));
     }
@@ -982,7 +1000,54 @@ pub fn verify_presented<C: NarrowingCaveats>(
     root_public: &TokenPublicKey,
     now_unix: u64,
 ) -> Result<CredentialChain<C>, TokenError> {
-    let verified = verify_credential(credential, root_public, now_unix)?;
+    require_sealed_leaf(
+        verify_credential(credential, root_public, now_unix)?,
+        root_public,
+    )
+}
+
+/// Verify a **presented** credential for a PoP-less consumer **without enforcing
+/// wall-clock expiry** — the sealed-leaf + authenticity half of [`verify_presented`],
+/// leaving the expiry comparison to the caller's own clock (U11-1, pairing the
+/// presented form with [`verify_credential_unexpired`]).
+///
+/// This is exactly [`verify_credential_unexpired`] plus the **sealed-leaf**
+/// requirement of [`verify_presented`]: it proves authenticity (signatures, the PoP
+/// `cnf` chain-binding, and the engine-verified monotone narrowing) **and** refuses
+/// an unsealed (onward-delegatable) leaf — closing the chain-prefix truncation
+/// escalation (C1) — but does **not** compare the min-folded
+/// [`exp`](CredentialChain::exp) against any clock. A consumer whose notion of "now"
+/// is not the wall clock — uchron runs expiry on a hybrid logical clock — calls
+/// this, then checks expiry itself with [`CredentialChain::is_expired_at`] (passing
+/// its own `now`) or by comparing [`exp`](CredentialChain::exp) directly. It no
+/// longer has to hand-compose [`verify_credential_unexpired`] +
+/// [`leaf_is_sealed`](CredentialChain::leaf_is_sealed) (and risk forgetting the
+/// sealed-leaf gate, re-opening the truncation hole).
+///
+/// `verify_presented(c, k, now)` is exactly this followed by a `now > exp` ⇒
+/// [`TokenError::Expired`] check. A **PoP-capable** caller must still route through
+/// [`verify_credential_unexpired`] + a per-request proof against
+/// [`CredentialChain::leaf_cnf`] instead — see [`verify_presented`] for why the two
+/// are complementary.
+pub fn verify_presented_unexpired<C: NarrowingCaveats>(
+    credential: &str,
+    root_public: &TokenPublicKey,
+) -> Result<CredentialChain<C>, TokenError> {
+    require_sealed_leaf(
+        verify_credential_unexpired(credential, root_public)?,
+        root_public,
+    )
+}
+
+/// The **sealed-leaf** gate shared by [`verify_presented`] (expiry-enforcing) and
+/// [`verify_presented_unexpired`] (caller-clock): pass an already-verified chain
+/// through iff its leaf is sealed ([`CredentialChain::leaf_is_sealed`]), else refuse
+/// with [`TokenError::Unsealed`]. The single source of truth for the presented-form
+/// truncation refusal (C1), so the two presented verifiers never drift apart.
+fn require_sealed_leaf<C: NarrowingCaveats>(
+    verified: CredentialChain<C>,
+    root_public: &TokenPublicKey,
+) -> Result<CredentialChain<C>, TokenError> {
     if !verified.leaf_is_sealed(root_public) {
         return Err(TokenError::Unsealed(
             "presented credential ends at an intermediate holder (unsealed leaf); \
@@ -1091,6 +1156,50 @@ mod tests {
                     .map_err(|_| TokenError::Claims("floor out of range".into())),
                 _ => Err(TokenError::Claims("floor caveat must be an integer".into())),
             }
+        }
+    }
+
+    // A caveat that carries only an EXPIRY (`not_after`), to exercise the expiry
+    // fold + the caller-clock presented verifier (U11-1). An EARLIER `not_after` is
+    // NARROWER (shorter life); the lattice top is "no expiry" (`u64::MAX`, which
+    // `not_after` reports as `None`). `meet` is the min (tightest/earliest wins).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Expiring(u64);
+
+    impl Default for Expiring {
+        fn default() -> Self {
+            Self(u64::MAX) // top: no expiry restriction
+        }
+    }
+
+    impl NarrowingCaveats for Expiring {
+        const KIND_CLAIM: &'static str = "k";
+        const CNF_CLAIM: &'static str = "cnf";
+        const CAVEATS_CLAIM: &'static str = "cav";
+        const DELEGATION_KIND: &'static str = "delegation";
+
+        fn meet(&self, deeper: &Self) -> Self {
+            Self(self.0.min(deeper.0))
+        }
+        fn is_narrower_or_equal(&self, other: &Self) -> bool {
+            // self ⊑ other iff self expires no later than other (at least as restrictive).
+            self.0 <= other.0
+        }
+        fn to_cbor(&self) -> CborValue {
+            CborValue::Integer(self.0.into())
+        }
+        fn from_cbor(value: &CborValue) -> Result<Self, TokenError> {
+            match value {
+                CborValue::Integer(i) => u64::try_from(*i)
+                    .map(Self)
+                    .map_err(|_| TokenError::Claims("expiring caveat out of range".into())),
+                _ => Err(TokenError::Claims(
+                    "expiring caveat must be an integer".into(),
+                )),
+            }
+        }
+        fn not_after(&self) -> Option<u64> {
+            (self.0 != u64::MAX).then_some(self.0)
         }
     }
 
@@ -1425,5 +1534,123 @@ mod tests {
         let token = mint_root(&root, &h1.public_key()).await;
         let v = verify_credential::<ReadOnly>(&token, &root.public_key(), 1_000).unwrap();
         assert!(!format!("{v:?}").is_empty());
+    }
+
+    // ---- U11-1: presented + caller-supplied expiry -------------------------
+
+    /// (U11-1) `verify_presented_unexpired` does the sealed-leaf + authenticity
+    /// checks of `verify_presented` but leaves expiry to the caller: an authentic,
+    /// SEALED chain past its `exp` passes (carrying the effective expiry for the
+    /// caller's own clock), while the enforcing `verify_presented` returns `Expired`.
+    /// An UNSEALED (onward-delegatable) prefix is still refused (`Unsealed`), and an
+    /// inauthentic credential still fails.
+    #[tokio::test]
+    async fn verify_presented_unexpired_seals_and_defers_expiry() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Ed25519);
+        let h1_pub = h1.public_key();
+        let h2 = LocalSigner::generate(TokenAlg::Ed25519);
+        let h2_pub = h2.public_key();
+
+        // A SEALED, narrowed chain carrying an expiry at t=2_000 (via the caveat's
+        // `not_after`, folded into the block `exp`).
+        let token = mint_root(&root, &h1_pub).await;
+        let sealed = attenuate(&token, &h1, &Expiring(2_000), None, 1_000)
+            .await
+            .unwrap();
+
+        // Past expiry: the ENFORCING presented verifier rejects with `Expired`...
+        assert!(matches!(
+            verify_presented::<Expiring>(&sealed, &root_pub, 3_000),
+            Err(TokenError::Expired)
+        ));
+        // ...but the caller-clock variant returns the AUTHENTIC chain (sealed leaf),
+        // with the effective expiry for the caller to check against its own clock.
+        let v = verify_presented_unexpired::<Expiring>(&sealed, &root_pub).unwrap();
+        assert_eq!(v.exp, Some(2_000));
+        assert!(v.is_expired_at(3_000));
+        assert!(!v.is_expired_at(1_500));
+        assert!(v.leaf_is_sealed(&root_pub));
+
+        // An UNSEALED prefix (leaf names a further holder h2) is refused even past no
+        // clock at all — the sealed-leaf gate (C1) is enforced here too.
+        let unsealed = attenuate(&token, &h1, &Expiring(2_000), Some(&h2_pub), 1_000)
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_presented_unexpired::<Expiring>(&unsealed, &root_pub),
+            Err(TokenError::Unsealed(_))
+        ));
+
+        // An inauthentic credential (wrong root key) fails regardless of expiry.
+        let other = LocalSigner::generate(TokenAlg::Es256).public_key();
+        assert!(verify_presented_unexpired::<Expiring>(&sealed, &other).is_err());
+    }
+
+    // ---- U11-2: typed chain-bounds error -----------------------------------
+
+    /// (U11-2) A too-deep chain and an over-sized credential both surface as the
+    /// typed `TokenError::Bounds(_)` (not `Invalid`/`Build`), so a consumer can tell
+    /// "too big / too deep" from other invalidity by variant.
+    #[tokio::test]
+    async fn chain_bounds_are_typed() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+
+        // Depth: a chain of MAX_CHAIN_DEPTH+1 dummy blocks is refused before verify.
+        let one = decode_credential(&mint_root(&root, &root_pub).await)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let deep = encode_chain(vec![one; MAX_CHAIN_DEPTH + 1]).unwrap();
+        assert!(matches!(
+            verify_credential::<ReadOnly>(&deep, &root_pub, 1_000),
+            Err(TokenError::Bounds(_))
+        ));
+
+        // Size: a credential larger than MAX_CHAIN_BYTES is refused before parsing.
+        let big = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(vec![0x80u8; MAX_CHAIN_BYTES + 1]);
+        assert!(matches!(
+            verify_credential::<ReadOnly>(&big, &root_pub, 1_000),
+            Err(TokenError::Bounds(_))
+        ));
+
+        // Mint side: `encode_chain` over an over-sized block set is `Bounds` too.
+        let huge_block = vec![0u8; MAX_CHAIN_BYTES];
+        assert!(matches!(
+            encode_chain(vec![huge_block, vec![0u8; MAX_CHAIN_BYTES]]),
+            Err(TokenError::Bounds(_))
+        ));
+    }
+
+    // ---- U11-3: claim-builder re-exports -----------------------------------
+
+    /// (U11-3) A consumer can build AND read a token end-to-end through the types
+    /// `boatramp-cwt` re-exports (`ClaimsSetBuilder`, `Timestamp`, `ClaimName`,
+    /// `Value`/`CborValue`, `ClaimsSet`) without a direct `coset` dependency. This
+    /// test references them via `crate::` to assert they are part of the public
+    /// surface.
+    #[tokio::test]
+    async fn claim_builder_reexports_round_trip() {
+        use crate::{ClaimName, ClaimsSet, ClaimsSetBuilder, Timestamp, Value};
+
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let claims: ClaimsSet = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(1_000))
+            .expiration_time(Timestamp::WholeSeconds(2_000))
+            .cwt_id(random_cti().unwrap())
+            .text_claim("role".to_string(), Value::Text("publisher".to_string()))
+            .build();
+        let token = sign_claims(claims, &root).await.unwrap();
+
+        let verified = verify_envelope(&token, &root.public_key()).unwrap();
+        // Read the private-use claim back by matching the re-exported `ClaimName`.
+        let role = verified.rest.iter().find_map(|(k, v)| match (k, v) {
+            (ClaimName::Text(t), Value::Text(val)) if t == "role" => Some(val.clone()),
+            _ => None,
+        });
+        assert_eq!(role.as_deref(), Some("publisher"));
     }
 }

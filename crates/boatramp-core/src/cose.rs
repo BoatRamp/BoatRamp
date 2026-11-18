@@ -3441,7 +3441,7 @@ mod tests {
         let deep = encode_chain(vec![one; MAX_CHAIN_DEPTH + 1]).unwrap();
         assert!(matches!(
             verify_credential(&deep, &pk, NOW),
-            Err(TokenError::Invalid(_))
+            Err(TokenError::Bounds(_))
         ));
 
         // Size: a credential larger than MAX_CHAIN_BYTES is refused before parsing.
@@ -3449,7 +3449,7 @@ mod tests {
             .encode(vec![0x80u8; MAX_CHAIN_BYTES + 1]);
         assert!(matches!(
             verify_credential(&big, &pk, NOW),
-            Err(TokenError::Invalid(_))
+            Err(TokenError::Bounds(_))
         ));
     }
 
