@@ -983,13 +983,17 @@ pub fn run_vm_relay(label: &str) -> Result<(), CliError> {
 
 /// Contain the separate relay process, then run the Model-A copy-relay behind the wall (Linux +
 /// `sandbox` only). The containment is LAYERED, set up in a fixed order in the pre-serve window:
-/// (1) enter a FRESH, EMPTY (loopback-only) network namespace — the PRIMARY egress wall (MED-1), using
-/// the CAP_SYS_ADMIN the relay inherits from the root; (2) drop ALL capabilities (empty the bounding
-/// set incl. CAP_NET_RAW — INFO); (3) install the relay's OWN least-authority seccomp/Landlock profile
+/// (1) enter a FRESH, EMPTY (loopback-only) network namespace — the PRIMARY IP-egress wall (MED-1),
+/// using the CAP_SYS_ADMIN the relay inherits from the root; (2) `pivot_root` into a minimal mount-ns
+/// root holding ONLY the own binary + the one vsock-UDS dir, so no host PATHNAME `AF_UNIX` socket path
+/// resolves — closing the local-pivot surface the netns cannot (pathname UDS are not netns-scoped, and
+/// Landlock does not mediate UDS `connect(2)`) (INFO-1); (3) drop ALL capabilities (empty the bounding
+/// set incl. CAP_NET_RAW — INFO); (4) install the relay's OWN least-authority seccomp/Landlock profile
 /// fail-closed [`Enforced`] (F1 deny-all-TCP + no bind/listen/socketpair + exec/fork killed). Order is
-/// load-bearing: the netns + cap ops need pre-profile state (the profile hard-kills `unshare`/`setns`),
-/// and the netns needs the capability the cap-drop then removes. Any step failing returns `Err` ⇒ the
-/// caller fails the node closed (NEVER a relay with a full network / retained caps / no profile).
+/// load-bearing: the netns + mount-ns + cap ops need pre-profile state (the profile hard-kills
+/// `unshare`/`setns`/`mount`/`pivot_root`), and they need the capability the cap-drop then removes. Any
+/// step failing returns `Err` ⇒ the caller fails the node closed (NEVER a relay with a full network /
+/// reachable host UDSes / retained caps / no profile).
 /// Returns `Err` if the relay loop ever ends — the relay runs for the node's life.
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 fn run_vm_relay_confined(
@@ -1022,6 +1026,23 @@ fn run_vm_relay_confined(
     // drop caps → install the profile → accept()/dial from inside the empty netns.
     boatramp_server::sandbox::enter_empty_netns()
         .map_err(|e| format!("entering the relay's empty network namespace (MED-1): {e}"))?;
+
+    // INFO-1 — PATHNAME-AF_UNIX egress containment, layered OVER the empty netns. The empty netns
+    // closes all IP egress + abstract-namespace UDS, but a PATHNAME AF_UNIX socket is NOT netns-scoped,
+    // and Landlock's `AccessFs` does not mediate `connect(2)` to a UDS (its dir-grant governs the
+    // install's O_PATH opens, not the kernel's `unix_find_other` path walk) — so a compromised relay
+    // could still `connect()` a host UDS (`/run/docker.sock`, a dbus/systemd/postgres socket, …) for a
+    // local pivot. Enter a private mount namespace + `pivot_root` into a minimal root holding ONLY the
+    // own binary (execute-pin) + the one vsock-UDS dir, so no host UDS path resolves. Done HERE, in the
+    // pre-profile window (the profile hard-kills `unshare`/`mount`/`pivot_root`), using the CAP_SYS_ADMIN
+    // the relay still holds. Fail-closed: if the minimal root can't be built, REFUSE (never serve on the
+    // full host mount tree). The vsock dir is the uds's parent — the SAME dir the Landlock view grants.
+    let uds_dir = uds_norm
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| uds_norm.clone());
+    boatramp_server::sandbox::enter_minimal_mount_ns(&exe_norm, &uds_dir)
+        .map_err(|e| format!("building the relay's minimal mount-ns root (INFO-1): {e}"))?;
 
     // INFO — explicit capability floor, in two steps (AFTER the unshare, which needs CAP_SYS_ADMIN;
     // BEFORE the profile install, so `capset` is not yet seccomp-filtered). Fail-closed on each.
@@ -1057,9 +1078,9 @@ fn run_vm_relay_confined(
         ro = profile.policy.read_only_paths.len(),
         "[privsep] __vm-relay: least-authority profile installed + ENFORCED (no \
          bind/listen/socketpair, no key-lock, exec+fork hard-killed; FS view = own binary + the one \
-         vsock UDS) — layered OVER the empty-netns egress wall (MED-1) + the dropped capability floor \
-         (INFO): UDP/TCP/raw/abstract-UDS egress all closed, only the vsock UDS + the inherited \
-         listener remain"
+         vsock UDS) — layered OVER the empty-netns IP-egress wall (MED-1) + the minimal mount-ns root \
+         (INFO-1) + the dropped capability floor (INFO): UDP/TCP/raw/abstract-UDS egress all closed, \
+         no host pathname-UDS path resolves, only the vsock UDS + the inherited listener remain"
     );
 
     // Adopt the inherited pre-bound public TCP listener (the root bound it + dup2'd it onto this fd —

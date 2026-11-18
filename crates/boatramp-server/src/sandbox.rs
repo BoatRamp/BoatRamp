@@ -927,14 +927,21 @@ pub fn relay_supervisor_killlist() -> Vec<String> {
 /// granted path. The `landlock` crate cannot open a SOCKET inode on every target (on the shipped
 /// static-musl build the open returns `ENXIO` → the whole per-instance Landlock layer fails to apply →
 /// `install_derived` reports `Partial` → `enforce_privsep_status` REFUSES → the relay would never
-/// serve). Granting the uds's PARENT DIRECTORY (a regular directory, which opens everywhere) both
-/// avoids that and covers path resolution for the `connect(2)`. The relay boots its guest with the UDS
-/// in a DEDICATED per-VM directory ([`crate::privsep_vm`]'s `boot_firecracker`) that holds ONLY that
-/// socket, so the directory grant stays tight — the relay can read exactly its own vsock dir.
+/// serve). Granting the uds's PARENT DIRECTORY (a regular directory, which opens everywhere) avoids
+/// that AND lets the install's O_PATH open of the IN-view grant succeed, so the relay can read exactly
+/// its own vsock dir. The relay boots its guest with the UDS in a DEDICATED per-VM directory
+/// ([`crate::privsep_vm`]'s `boot_firecracker`) that holds ONLY that socket, so the grant stays tight.
 ///
-/// NOTE: Landlock's `AccessFs` vocabulary does not mediate `connect(2)` to an AF_UNIX socket, so the
-/// dir grant is NOT the load-bearing wall for reaching the guest (the hypervisor boundary + the seccomp
-/// socket-verb set are). The EXECUTE-pin is on the own binary ALONE: [`linux::build_ruleset`] STRIPS
+/// NOTE — the dir grant does NOT, by itself, block an OUT-of-view pathname-UDS `connect(2)`. Landlock's
+/// `AccessFs` vocabulary does not mediate `connect(2)` to an `AF_UNIX` socket at all: the dir grant
+/// governs the O_PATH opens the INSTALL makes, not the kernel's internal `unix_find_other()` path walk
+/// that a later `connect(2)` performs. So this view is NOT the wall that stops a compromised relay from
+/// pivoting to a host UDS (`/run/docker.sock`, …) — that is **settled empirically** by the
+/// `relay_mount_ns_contains_pathname_uds_pivot` live gate, whose no-mount-ns mutation arm connects an
+/// out-of-view host UDS SUCCESSFULLY under the netns + this dir-view alone. The pathname-UDS pivot is
+/// closed instead by the relay's minimal mount-ns `pivot_root` ([`enter_minimal_mount_ns`]), layered in
+/// `run_vm_relay_confined`; reaching the GUEST is governed by the hypervisor boundary + the seccomp
+/// socket-verb set. The EXECUTE-pin is on the own binary ALONE: [`linux::build_ruleset`] STRIPS
 /// `Execute` from the read grant and re-grants it only on `execute_paths`. `read_write_paths` is empty
 /// — the relay writes no file. `current_exe` + `vsock_uds` MUST already be absolute + normalized by the
 /// caller (WS-C contract #1: [`lexically_normalize`] / `fs::canonicalize`) so the fd-based install
@@ -1249,6 +1256,217 @@ pub fn clear_current_capabilities() -> std::io::Result<()> {
              undropped effective capabilities",
             std::io::Error::last_os_error()
         )));
+    }
+    Ok(())
+}
+
+/// Enter a fresh MOUNT namespace and `pivot_root` into a minimal, private tmpfs root that holds ONLY
+/// the relay's own binary (for the Landlock execute-pin's O_PATH open) and its one vsock-UDS directory
+/// (to dial the frontend-in-guest), each bind-mounted back at its REAL absolute path. Every OTHER
+/// filesystem path — in particular every host **pathname** `AF_UNIX` socket a compromised relay could
+/// pivot to (`/run/docker.sock`, `/run/dbus/system_bus_socket`, `/run/systemd/private`, a
+/// `/var/lib/<svc>/*.sock`, `/tmp/.X11-unix/X0`, …) — ceases to resolve, so a `connect(2)` to it fails
+/// `ENOENT`. The VM relay's PATHNAME-UDS egress containment (INFO-1); see below.
+///
+/// **Why this is needed on TOP of the empty netns + the Landlock dir-view.** The empty netns
+/// ([`enter_empty_netns`]) closes every IP egress and every ABSTRACT-namespace `AF_UNIX` socket, but a
+/// **pathname** `AF_UNIX` socket is NOT netns-scoped — `connect(2)` to a host UDS still resolves through
+/// the shared mount tree. And Landlock's `AccessFs` vocabulary does NOT mediate `connect(2)` to an
+/// `AF_UNIX` socket: the relay's directory grant governs the O_PATH opens the profile INSTALL makes, not
+/// the kernel's internal `unix_find_other()` path walk that `connect(2)` performs. That the narrow
+/// dir-view does NOT by itself block an out-of-view pathname-UDS `connect(2)` is settled EMPIRICALLY by
+/// the `relay_mount_ns_contains_pathname_uds_pivot` live gate (its no-mount-ns mutation arm connects an
+/// out-of-view host UDS successfully). A private mount namespace whose root contains nothing but the two
+/// paths the relay legitimately touches removes the host-UDS paths entirely — the robust wall, by a
+/// different mechanism than the netns (no LSM hook, no route), layered under both.
+///
+/// **Ordering / privilege (load-bearing).** `unshare(CLONE_NEWNS)` + `mount` + `pivot_root` all need
+/// `CAP_SYS_ADMIN`, which the production relay inherits from the privileged root; call this in the SAME
+/// pre-profile window as [`enter_empty_netns`], BEFORE [`drop_all_capabilities`] /
+/// [`clear_current_capabilities`] / the profile install (the relay's Enforced profile hard-KILLs
+/// `unshare`/`mount`/`pivot_root` — they are in [`KILL_SURFACE`]). The relay then drops ALL capabilities
+/// and installs its profile from INSIDE this minimal root (so the install's O_PATH opens of
+/// `own_binary` + `vsock_dir` resolve to the bind-mounts here). Fail-closed: ANY step failing returns
+/// `Err` and the relay REFUSES to serve — never a fallback to the full host mount tree.
+///
+/// `own_binary` + `vsock_dir` MUST be absolute + normalized by the caller (the SAME WS-C contract #1
+/// paths the relay's Landlock policy grants — [`relay_supervisor_policy`]'s own binary + the uds's
+/// parent dir), so the binds land at the exact paths the install opens and the dial resolves. Reuses the
+/// `boatramp-container` worker's mount-ns + `pivot_root` idiom (one namespace model, not a second).
+#[cfg(target_os = "linux")]
+pub fn enter_minimal_mount_ns(own_binary: &Path, vsock_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    fn cstr(p: &Path) -> std::io::Result<std::ffi::CString> {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::other("a relay mount path contains an interior NUL byte"))
+    }
+    // One thin wrapper over `mount(2)`; `src`/`data` may be empty C-strings where the call ignores them.
+    fn do_mount(
+        src: &std::ffi::CStr,
+        target: &std::ffi::CStr,
+        fstype: Option<&std::ffi::CStr>,
+        flags: libc::c_ulong,
+        data: Option<&std::ffi::CStr>,
+        what: &str,
+    ) -> std::io::Result<()> {
+        // SAFETY: all pointers are valid NUL-terminated C-strings (or NULL where unused); `mount(2)`
+        // reads them and returns a status — no pointer escapes.
+        let rc = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                target.as_ptr(),
+                fstype.map_or(std::ptr::null(), std::ffi::CStr::as_ptr),
+                flags,
+                data.map_or(std::ptr::null(), |d| d.as_ptr().cast()),
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::other(format!(
+                "mount({what}) building the relay's minimal root failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+    // Bind `src` (a file or a directory) into `newroot` at its SAME absolute path, creating the target.
+    fn bind_into_root(newroot: &Path, src: &Path, is_dir: bool) -> std::io::Result<()> {
+        let rel = src
+            .strip_prefix("/")
+            .map_err(|_| std::io::Error::other("a relay bind source is not absolute"))?;
+        let target = newroot.join(rel);
+        if is_dir {
+            std::fs::create_dir_all(&target).map_err(|e| {
+                std::io::Error::other(format!("creating a relay bind-dir target: {e}"))
+            })?;
+        } else {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    std::io::Error::other(format!(
+                        "creating a relay bind-file target's parent: {e}"
+                    ))
+                })?;
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&target)
+                .map_err(|e| {
+                    std::io::Error::other(format!("creating a relay bind-file target: {e}"))
+                })?;
+        }
+        let src_c = cstr(src)?;
+        let target_c = cstr(&target)?;
+        let flags = libc::MS_BIND | if is_dir { libc::MS_REC } else { 0 };
+        do_mount(&src_c, &target_c, None, flags, None, "bind")
+    }
+
+    // A relative/empty grant path would bind the WRONG inode — refuse fail-closed.
+    if !own_binary.is_absolute() || !vsock_dir.is_absolute() {
+        return Err(std::io::Error::other(
+            "the relay's own-binary + vsock-dir paths must be absolute to build its minimal mount-ns root",
+        ));
+    }
+
+    let empty = std::ffi::CString::new("").expect("no interior NUL in an empty string");
+    let slash = cstr(Path::new("/"))?;
+    let tmpfs = std::ffi::CString::new("tmpfs").expect("no interior NUL");
+
+    // (1) New mount namespace — the relay's mount tree becomes private to it.
+    // SAFETY: `unshare(2)` with a scalar flag takes no pointers.
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(std::io::Error::other(format!(
+            "unshare(CLONE_NEWNS) for the relay's minimal mount root failed: {} (needs CAP_SYS_ADMIN, \
+             held in the pre-cap-drop window)",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // (2) Make the whole tree recursively PRIVATE so our mounts don't propagate to the host (a
+    //     `pivot_root` precondition, and it keeps the overmount from leaking).
+    do_mount(
+        &empty,
+        &slash,
+        None,
+        libc::MS_REC | libc::MS_PRIVATE,
+        None,
+        "make-rprivate",
+    )?;
+
+    // (3) A fresh, PRIVATE tmpfs to be the new root: overmount it on the always-present `/tmp` mount
+    //     point. Because step (2) made the tree rprivate, this overmount does NOT propagate to the host,
+    //     and — crucially — nothing is written to the SHARED underlying fs (an mkdir of a named staging
+    //     dir WOULD be visible to the host and leak an empty dir per relay start). The relay touches
+    //     only `own_binary` + `vsock_dir`, neither under `/tmp`, so overmounting `/tmp` hides nothing it
+    //     needs. After `pivot_root` this tmpfs IS `/`; it and everything created on it vanish with the ns.
+    let newroot = std::path::Path::new("/tmp");
+    let newroot_c = cstr(newroot)?;
+    let tmpfs_opts =
+        std::ffi::CString::new("mode=0700,size=1m,nr_inodes=4k").expect("no interior NUL");
+    do_mount(
+        &tmpfs,
+        &newroot_c,
+        Some(&tmpfs),
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some(&tmpfs_opts),
+        "tmpfs-newroot",
+    )?;
+
+    // (4) Bind the ONLY two paths the relay needs, at their REAL absolute paths inside newroot: the own
+    //     binary (a file — the execute-pin O_PATH grant) and the vsock-UDS directory (a dir — the RO
+    //     grant plus the one socket it dials). Sources resolve on the current (private) tree where they
+    //     are NOT under `/tmp`; the bind-mounts land on the fresh tmpfs, consuming no shared-fs storage.
+    bind_into_root(newroot, own_binary, false)?;
+    bind_into_root(newroot, vsock_dir, true)?;
+
+    // (5) pivot_root: newroot becomes `/`, the old root moves to newroot/.put_old; then detach it so
+    //     the host tree (and every host UDS path) is unreachable from the relay.
+    let put_old = newroot.join(".put_old");
+    std::fs::create_dir_all(&put_old)
+        .map_err(|e| std::io::Error::other(format!("creating the relay pivot put_old dir: {e}")))?;
+    let put_old_c = cstr(&put_old)?;
+    // SAFETY: `pivot_root(2)` with two valid NUL-terminated absolute directory paths; newroot is a
+    // fresh tmpfs mount point and put_old lives beneath it (the syscall's preconditions).
+    if unsafe { libc::syscall(libc::SYS_pivot_root, newroot_c.as_ptr(), put_old_c.as_ptr()) } != 0 {
+        return Err(std::io::Error::other(format!(
+            "pivot_root into the relay's minimal root failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `chdir("/")` repoints cwd at the new root (an fd on the old cwd would otherwise pin it).
+    if unsafe { libc::chdir(slash.as_ptr()) } != 0 {
+        return Err(std::io::Error::other(format!(
+            "chdir(/) after the relay pivot_root failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // Detach the old root (now at `/.put_old`) lazily — fail-closed: the host tree must NOT remain
+    // reachable. `MNT_DETACH` succeeds even with the cwd/root fds just repointed.
+    let put_old_after = cstr(Path::new("/.put_old"))?;
+    // SAFETY: `umount2(2)` with `MNT_DETACH` on the old-root mount point.
+    if unsafe { libc::umount2(put_old_after.as_ptr(), libc::MNT_DETACH) } != 0 {
+        return Err(std::io::Error::other(format!(
+            "detaching the old root after the relay pivot_root failed: {} — refusing (the host mount \
+             tree, and every host UDS path on it, must not remain reachable)",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let _ = std::fs::remove_dir(Path::new("/.put_old"));
+
+    // VERIFY fail-closed: the two paths the relay legitimately needs must still resolve inside the
+    // minimal root (a bind that silently did not take would otherwise surface only as a later serve
+    // failure). The CONTAINMENT itself is structural (`pivot_root` + the detach of the old root).
+    if !own_binary.exists() {
+        return Err(std::io::Error::other(
+            "after the relay pivot_root its own-binary execute-pin path does not resolve in the \
+             minimal root — refusing fail-closed",
+        ));
+    }
+    if !vsock_dir.exists() {
+        return Err(std::io::Error::other(
+            "after the relay pivot_root its vsock-UDS directory does not resolve in the minimal root \
+             — refusing fail-closed (the guest dial would break)",
+        ));
     }
     Ok(())
 }
