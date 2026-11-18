@@ -243,3 +243,75 @@ async fn buffering_transport_body_tail_is_flushed_before_the_serial_driver_idles
     assert_eq!(body.len(), BODY, "the full body must reach the peer");
     assert!(body.iter().all(|&b| b == b'x'));
 }
+
+// --- regression: an error-path connection GOAWAY must also reach a buffering peer --------
+//
+// The connection-error teardown helper `goaway()` (`conn.rs`) writes a GOAWAY and then
+// tears the connection down. That GOAWAY goes out via `wire.write_all` just like a response,
+// so on a backpressured userspace-TLS writer its encrypted records sit queued in the
+// transport buffer — and without a flush/shutdown the peer sees only a bare FIN/RST and
+// never the diagnostic GOAWAY or its error code. The fix mirrors the invalid-preface and
+// peer-GOAWAY paths: `goaway()` shuts the write side down (which flushes) after writing.
+//
+// This drives the oversize-frame path (a connection FRAME_SIZE_ERROR: the size check fires
+// before any payload is read, so a single oversized frame header triggers it) through a
+// zero-budget `FlushGatedIo` — every server write is staged until a flush drains it, the
+// worst case for a buffering writer — and asserts the GOAWAY, with its error code, is
+// delivered. The driver's pre-idle `wire.flush()` still delivers the server SETTINGS at the
+// top of the loop, so only the error GOAWAY depends on the teardown flush under test; with
+// `goaway()`'s `wire.shutdown()` reverted this run ends after SETTINGS and the GOAWAY stays
+// stranded in the buffer.
+#[tokio::test]
+async fn error_goaway_is_flushed_through_a_buffering_transport() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let gated = FlushGatedIo {
+        inner: server_io,
+        budget: 0,
+        staged: Vec::new(),
+    };
+    tokio::spawn(async move {
+        let _ = serve_connection(gated, App).await;
+    });
+
+    // Preface, then one oversize frame header: declared length 65_536 > the 16_384 default
+    // max frame size. (type/flags/stream are irrelevant — the size check fires first.)
+    client_io.write_all(PREFACE).await.unwrap();
+    let oversize_header = [0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01];
+    client_io.write_all(&oversize_header).await.unwrap();
+
+    // Read until the server closes; with the fix the GOAWAY is flushed on teardown.
+    let mut got = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client_io.read_to_end(&mut got),
+    )
+    .await
+    .expect("server never closed the connection")
+    .unwrap();
+
+    // Walk the frames and require a GOAWAY carrying FRAME_SIZE_ERROR (0x6).
+    let mut i = 0;
+    let mut goaway_code = None;
+    while i + 9 <= got.len() {
+        let len = u32::from_be_bytes([0, got[i], got[i + 1], got[i + 2]]) as usize;
+        let kind = got[i + 3];
+        let payload_end = (i + 9 + len).min(got.len());
+        let payload = &got[i + 9..payload_end];
+        if kind == 0x7 && payload.len() >= 8 {
+            // GOAWAY payload: last-stream-id (4 bytes) then error code (4 bytes).
+            goaway_code = Some(u32::from_be_bytes([
+                payload[4], payload[5], payload[6], payload[7],
+            ]));
+        }
+        i += 9 + len;
+    }
+    assert_eq!(
+        goaway_code,
+        Some(0x6),
+        "error GOAWAY (FRAME_SIZE_ERROR) stranded in the transport buffer — teardown idled without flushing",
+    );
+}

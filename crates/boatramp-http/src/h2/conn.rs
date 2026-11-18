@@ -768,5 +768,14 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     wire.write_all(&frame::goaway(last, code, &[])).await?;
+    // Flush/shut the write side so the diagnostic GOAWAY actually reaches the peer. Like a
+    // completed response (see the pre-idle `wire.flush()` above), `write_all` only writes
+    // what the transport's `poll_write` accepts — a backpressured userspace-TLS writer
+    // queues the matching encrypted records and returns, so without this the peer would see
+    // a bare FIN/RST and never the GOAWAY/error code. `shutdown()` flushes + FINs a plain
+    // socket and sends close_notify + drains on TLS — the clean error teardown. Mirrors the
+    // invalid-preface and peer-GOAWAY paths, and like them swallows the shutdown error so it
+    // never masks the original connection error that got us here.
+    let _ = wire.shutdown().await;
     Ok(())
 }
