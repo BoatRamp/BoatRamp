@@ -425,9 +425,9 @@ fn run() -> Result<(), CliError> {
     // covers the later per-client worker threads), then runs the Model-A copy-relay behind that wall:
     // accept each client + splice opaque bytes to the frontend-in-guest over the vsock UDS. Matching
     // `argv[1]` EXACTLY (out of the clap enum). Cross-platform entry; the real relay is Linux+sandbox
-    // only (elsewhere it refuses to serve unprofiled). Not reached in production YET
-    // (`resolve_spawn_backend` still refuses `substrate: vm` — the supervise-dispatch flip + live gate
-    // are the next increment).
+    // only (elsewhere it refuses to serve unprofiled). REACHED when an operator selects `substrate: vm`
+    // for a scoped key-free static-parser frontend: `resolve_spawn_backend` now dispatches that shape
+    // (live-proven + Security-reviewed), and the root's supervise loop forks this relay per VM frontend.
     if std::env::args().nth(1).as_deref() == Some(privsep::VM_RELAY_SUBCOMMAND) {
         return privsep::run_vm_relay(&std::env::args().nth(2).unwrap_or_default());
     }

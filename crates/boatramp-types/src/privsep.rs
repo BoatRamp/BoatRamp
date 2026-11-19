@@ -771,10 +771,11 @@ impl TenantScope {
 /// supervises a SEPARATE least-authority `__vm-relay` process that splices the client's bytes to the
 /// frontend-in-guest over the vsock bridge (the root never crosses the vsock, carries no key bytes),
 /// gated to a key-free static-parser frontend (the lint's P3), and live-proven end-to-end on lighthouse
-/// (serve + kill-after-serve ⇒ FailNodeClosed). But it is NOT yet a wired backend (the SAFE SUBSET):
-/// `resolve_spawn_backend` refuses `substrate: vm` fail-closed pending ONLY the independent Security
-/// review; any other VM shape is additionally refused at `plan_root`
-/// (`check_vm_secret_blindness_closure`). See [`InstanceSubstrate::is_wired`],
+/// (serve + kill-after-serve ⇒ FailNodeClosed). It is NOW a WIRED backend for that scoped shape (the
+/// independent Security review returned SHIP): `resolve_spawn_backend` DISPATCHES `substrate: vm` for a
+/// key-free static-parser frontend and refuses any other VM shape fail-closed; any out-of-scope shape is
+/// additionally refused at `plan_root` (`check_vm_secret_blindness_closure`). See
+/// [`InstanceSubstrate::is_wired`],
 /// `crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md`, and
 /// `crates/boatramp/DESIGN-privsep-phase3-container.md`.
 #[derive(
@@ -806,17 +807,20 @@ impl InstanceSubstrate {
     /// `Container` is the Phase-3 namespace/cgroup-confined backend (the root unshares
     /// `CLONE_NEWNS|NEWIPC|NEWUTS|NEWCGROUP` in the child's `pre_exec` on the SIMPLE model — no
     /// `pivot_root`, no new net/pid/user namespace, the per-capability Landlock profile stays the FS
-    /// wall; see `crates/boatramp/DESIGN-privsep-phase3-container.md`). `Vm` stays NOT-wired in this cut
-    /// (the SAFE SUBSET): the owner-greenlit scoped VM supervise-dispatch (the root binds the listener,
+    /// wall; see `crates/boatramp/DESIGN-privsep-phase3-container.md`). `Vm` is NOW WIRED for the
+    /// owner-greenlit SCOPED first cut: the scoped VM supervise-dispatch (the root binds the listener,
     /// boots the microVM guest, and `fork`+`exec`s a SEPARATE least-authority `__vm-relay` process that
     /// splices the client's bytes to the frontend-in-guest over the vsock bridge, with a relay-side
-    /// positive readiness gate) is BUILT + wired and **live-proven end-to-end on lighthouse** (serves a
-    /// 200 over the separate relay on a `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` guest kernel; killing
-    /// either the relay or the firecracker child trips `FailNodeClosed`) — but it stays refused
-    /// fail-closed at `resolve_spawn_backend` pending ONLY the independent Security review. Flipping this
-    /// to include `Vm` is the final step. See `crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md` §S1.
+    /// positive readiness gate) is BUILT + wired and **live-proven end-to-end on lighthouse** (serves
+    /// over the separate relay on a `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` guest kernel; killing either
+    /// the relay or the firecracker child trips `FailNodeClosed`) and the independent Security review
+    /// returned SHIP. `is_wired` is capability-FREE, so for `Vm` it answers only "the VM spawn backend
+    /// exists"; the per-instance SCOPE gate (a key-free static-parser frontend only — any other VM shape
+    /// is refused) lives in `resolve_spawn_backend` (handled before this shortcut) + the `plan_root` S2
+    /// lint (`check_vm_secret_blindness_closure`). See
+    /// `crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md` §S1.
     pub const fn is_wired(self) -> bool {
-        matches!(self, Self::OsProcess | Self::Container)
+        matches!(self, Self::OsProcess | Self::Container | Self::Vm)
     }
 
     /// The compute-plane backend crate a NESTING substrate reuses — for the fail-closed follow-on
@@ -3318,12 +3322,13 @@ mod tests {
             cfg.instances["core"].substrate,
             InstanceSubstrate::OsProcess
         );
-        // `OsProcess` + `Container` (Phase-3 namespace/cgroup simple model) are WIRED backends; `Vm`
-        // stays NOT-wired in the SAFE SUBSET (the scoped supervise-dispatch is built + wired but the
-        // flip awaits a full live serve + kill→FailNodeClosed proof + Security).
+        // `OsProcess` + `Container` (Phase-3 namespace/cgroup simple model) are WIRED backends; `Vm` is
+        // NOW WIRED too for the owner-greenlit scoped first cut (live-proven serve + kill→FailNodeClosed,
+        // Security review SHIP). `is_wired` is capability-free — the per-instance VM SCOPE gate lives in
+        // `resolve_spawn_backend` + the `plan_root` S2 lint.
         assert!(InstanceSubstrate::OsProcess.is_wired());
         assert!(InstanceSubstrate::Container.is_wired());
-        assert!(!InstanceSubstrate::Vm.is_wired());
+        assert!(InstanceSubstrate::Vm.is_wired());
         assert!(
             InstanceSubstrate::OsProcess
                 .compute_plane_backend()

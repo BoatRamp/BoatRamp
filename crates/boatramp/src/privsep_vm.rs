@@ -108,6 +108,7 @@ mod imp {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
@@ -475,20 +476,36 @@ mod imp {
         let log2 = log
             .try_clone()
             .map_err(|e| io::Error::other(format!("cloning the console log handle: {e}")))?;
-        let child = Command::new(&assets.firecracker_bin)
+        let mut command = Command::new(&assets.firecracker_bin);
+        command
             .arg("--no-api")
             .arg("--config-file")
             .arg(&config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log2))
-            .spawn()
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "spawning firecracker ({}): {e}",
-                    assets.firecracker_bin.display()
-                ))
-            })?;
+            .stderr(Stdio::from(log2));
+        // INFO-4 (Security review, orphan-VM leak) — symmetric PR_SET_PDEATHSIG(SIGKILL), matching the
+        // __vm-relay's pre_exec (`privsep.rs` `spawn_vm_relay`). The root supervises both children and
+        // kills the firecracker guest on its OWN exit, but an UNCATCHABLE root SIGKILL skips that teardown
+        // — without this, the microVM would be orphaned (reparented to init) and keep running with the
+        // guest's listener live. The death-signal makes the guest's own kernel reap it when the root dies,
+        // closing the FailNodeClosed invariant even against SIGKILL. async-signal-safe (prctl only).
+        // SAFETY: `pre_exec` runs post-`fork`/pre-`exec`; `prctl` is async-signal-safe and touches only
+        // this child's death-signal disposition.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().map_err(|e| {
+            io::Error::other(format!(
+                "spawning firecracker ({}): {e}",
+                assets.firecracker_bin.display()
+            ))
+        })?;
         // The vsock UDS appears once firecracker's vsock DEVICE is up; a bounded wait, else firecracker
         // itself never came up. NOTE (acpi=off Security review, Finding 1): this is a DEVICE-UP
         // PRECONDITION so the relay has a socket to dial — NOT a guest-health gate. It returns as soon as
@@ -863,9 +880,11 @@ mod imp {
     /// the GUEST ever bound its listener and served — so a degraded-but-booted guest would have been
     /// relayed to silently. This asserts the guest actually SERVES: within `deadline`, dial the
     /// firecracker vsock UDS (retried — the guest may still be booting), do a trivial HTTP/1.1
-    /// request/response round-trip, and require a `200`. On success the relay is cleared to serve; if
-    /// the deadline passes with no served `200`, it returns `Err` — the relay process then exits and the
-    /// root's supervise loop trips `FailNodeClosed` (a bounded, POSITIVE gate, not an open-ended wait).
+    /// request/response round-trip, and require ANY valid HTTP response (a parseable status line — the
+    /// INFO-3 LIVENESS contract, not specifically a 200, so a frontend that answers `/` non-200 is not
+    /// false-closed). On success the relay is cleared to serve; if the deadline passes with no valid HTTP
+    /// response served, it returns `Err` — the relay process then exits and the root's supervise loop
+    /// trips `FailNodeClosed` (a bounded, POSITIVE gate, not an open-ended wait).
     ///
     /// It runs behind the relay's profile, so it uses ONLY allowed verbs (`socket`/`connect`/`read`/
     /// `write`/`shutdown` + the thread `clone`/`futex`) — the SAME socket surface the accept loop uses.
@@ -902,8 +921,9 @@ mod imp {
                             return;
                         }
                         Err(e) => {
-                            // Report progress + back off briefly and retry until we serve a 200 or the
-                            // relay dies. EVERY `Err` is retryable — the guest still booting (firecracker
+                            // Report progress + back off briefly and retry until the guest serves a valid
+                            // HTTP response (INFO-3 liveness) or the relay dies. EVERY `Err` is retryable —
+                            // the guest still booting (firecracker
                             // EOFs the CONNECT), a transient refusal, OR a `WouldBlock`/EAGAIN (defensive:
                             // the dials are forced blocking, but if one were ever non-blocking we retry
                             // rather than hard-fail on a spurious EAGAIN).
@@ -923,8 +943,8 @@ mod imp {
             let now = Instant::now();
             if now >= deadline {
                 return Err(format!(
-                    "the frontend-in-guest did not serve a 200 over vsock within the readiness \
-                     deadline ({attempts} attempts; last error: {last_err}) — FailNodeClosed \
+                    "the frontend-in-guest did not serve a valid HTTP response over vsock within the \
+                     readiness deadline ({attempts} attempts; last error: {last_err}) — FailNodeClosed \
                      (refusing to relay clients to a guest that never positively served; the UDS \
                      merely existing is NOT proof the guest is healthy)"
                 ));
@@ -933,9 +953,9 @@ mod imp {
                 Ok(Ok(attempt)) => {
                     tracing::info!(
                         attempts = attempt,
-                        "[privsep] __vm-relay: readiness handshake OK — the frontend-in-guest served \
-                         a 200 over vsock; clearing the relay to accept clients (Finding 1 positive \
-                         gate)"
+                        "[privsep] __vm-relay: readiness handshake OK — the frontend-in-guest returned \
+                         a valid HTTP response over vsock (liveness proven, any status); clearing the \
+                         relay to accept clients (Finding 1 positive gate)"
                     );
                     return Ok(());
                 }
@@ -945,8 +965,9 @@ mod imp {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(format!(
-                        "the frontend-in-guest did not serve a 200 over vsock within the readiness \
-                         deadline ({attempts} attempts; last error: {last_err}) — FailNodeClosed"
+                        "the frontend-in-guest did not serve a valid HTTP response over vsock within the \
+                         readiness deadline ({attempts} attempts; last error: {last_err}) — \
+                         FailNodeClosed"
                     ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -961,8 +982,11 @@ mod imp {
 
     /// One readiness attempt, BLOCKING (no `SO_RCVTIMEO` — see [`relay_readiness_probe`]): dial
     /// firecracker's host-side vsock bridge exactly as [`dial_guest`] does, then do a minimal HTTP/1.1
-    /// `GET /` and require a `200` status line. firecracker refuses the CONNECT (EOF on the reply read)
-    /// until the guest is listening, which surfaces as `Err` and is retried.
+    /// `GET /` and require ANY valid HTTP response — a parseable status line — as proof the guest is
+    /// SERVING (INFO-3 readiness LIVENESS contract; NOT specifically a 200, so a frontend that answers
+    /// `/` non-200 is not false-closed). firecracker refuses the CONNECT (EOF on the reply read) until
+    /// the guest is listening, and a non-serving guest returns no bytes — both surface as `Err` and are
+    /// retried until the watchdog deadline.
     fn probe_once_blocking(uds_path: &Path, guest_port: u32) -> Result<(), String> {
         let mut stream =
             UnixStream::connect(uds_path).map_err(|e| format!("connect vsock UDS: {e}"))?;
@@ -1016,16 +1040,50 @@ mod imp {
                 Err(e) => return Err(format!("read readiness response: {e}")),
             }
         }
+        // READINESS CONTRACT (INFO-3, Security review — a robust LIVENESS check, NOT "200 on GET /").
+        // The gate asserts the frontend-in-guest is SERVING, which it proves by returning ANY valid HTTP
+        // response — any parseable status line (`HTTP/<ver> <3-digit code> ...`), not specifically a 200.
+        // A frontend whose `/` legitimately answers non-200 (404, 401, a redirect, …) is a HEALTHY,
+        // serving guest and must pass; requiring 200-on-`/` would permanently FailNodeClose it. This does
+        // NOT weaken the fail-closed gate: a dead / non-serving / still-booting guest produces NO response
+        // (firecracker EOFs the CONNECT, or the read hits EOF with no bytes) → NO parseable status line →
+        // `Err` → retried until the 90s watchdog trips `FailNodeClosed`. Only a guest that actually speaks
+        // HTTP back passes. (The path/expected-status could be made operator-configurable later; the
+        // liveness default needs no config and is correct for the scoped static-parser frontend, whose
+        // `MinimalHandler` answers every request with a 200 — so this is behaviorally identical for the
+        // current cut and robust for any future frontend.)
         let head = String::from_utf8_lossy(&resp);
-        if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
-            Ok(())
-        } else {
-            Err(format!(
-                "readiness response was not a 200 (got {} bytes; first line: {:?})",
+        match parse_http_status(&head) {
+            Some(code) => {
+                tracing::debug!(
+                    status = code,
+                    "[privsep] __vm-relay readiness: frontend-in-guest returned a valid HTTP response \
+                     (liveness proven; any status counts — see the readiness contract)"
+                );
+                Ok(())
+            }
+            None => Err(format!(
+                "readiness response was not a valid HTTP response — no parseable status line (got {} \
+                 bytes; first line: {:?}); the guest is not serving yet",
                 resp.len(),
                 head.lines().next().unwrap_or("<none>")
-            ))
+            )),
         }
+    }
+
+    /// Parse the numeric status code out of an HTTP response head, returning `Some(code)` for a
+    /// well-formed status line (`HTTP/<ver> <3-digit code> [reason]`, code in 100..=599) and `None`
+    /// otherwise. This is the INFO-3 readiness LIVENESS predicate: ANY valid HTTP response proves the
+    /// frontend-in-guest is serving; a dead/non-serving guest returns no bytes, so no status line
+    /// parses and readiness correctly stays un-passed (fail-closed). Pure (unit-testable).
+    fn parse_http_status(head: &str) -> Option<u16> {
+        let first = head.lines().next()?;
+        let rest = first.strip_prefix("HTTP/")?;
+        // The version token (e.g. `1.1`, `1.0`, `2`) then whitespace then the status code.
+        let mut parts = rest.split_whitespace();
+        let _version = parts.next()?;
+        let code: u16 = parts.next()?.parse().ok()?;
+        (100..=599).contains(&code).then_some(code)
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1233,6 +1291,39 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::Cpio;
+
+        /// INFO-3 (Security review) — the readiness LIVENESS predicate accepts ANY valid HTTP response
+        /// (a parseable status line, any code) and rejects anything that is not a valid HTTP response, so
+        /// a serving-but-non-200 frontend is NOT false-closed while a dead/garbling guest still fails.
+        #[test]
+        fn readiness_parse_http_status_is_a_liveness_check_not_a_200_check() {
+            use super::parse_http_status;
+            // Any valid status line proves liveness — 200, but ALSO 404/401/301/500/… (the INFO-3 fix:
+            // a frontend answering `/` non-200 is healthy and must pass).
+            assert_eq!(parse_http_status("HTTP/1.1 200 OK\r\n\r\nbody"), Some(200));
+            assert_eq!(parse_http_status("HTTP/1.1 404 Not Found\r\n"), Some(404));
+            assert_eq!(
+                parse_http_status("HTTP/1.0 401 Unauthorized\r\n"),
+                Some(401)
+            );
+            assert_eq!(
+                parse_http_status("HTTP/1.1 301 Moved Permanently\r\n"),
+                Some(301)
+            );
+            assert_eq!(
+                parse_http_status("HTTP/1.1 500 Internal Server Error\r\n"),
+                Some(500)
+            );
+            assert_eq!(parse_http_status("HTTP/1.1 204\r\n"), Some(204)); // no reason phrase
+            assert_eq!(parse_http_status("HTTP/2 200\r\n"), Some(200)); // version token `2`
+            // A non-serving / garbling guest returns no valid status line ⇒ readiness stays un-passed
+            // (fail-closed): empty (EOF), non-HTTP noise, a code out of 100..=599, or a missing code.
+            assert_eq!(parse_http_status(""), None);
+            assert_eq!(parse_http_status("garbage not http\r\n"), None);
+            assert_eq!(parse_http_status("HTTP/1.1 999 Nope\r\n"), None);
+            assert_eq!(parse_http_status("HTTP/1.1 twelve\r\n"), None);
+            assert_eq!(parse_http_status("HTTP/1.1\r\n"), None); // no code token
+        }
 
         /// Finding 2 (acpi=off Security review) — a pure CI guard that the guest boot cmdline keeps the
         /// two LOAD-BEARING args. `acpi=off` + `X86_MPPARSE` off is what drops the firecracker-binary

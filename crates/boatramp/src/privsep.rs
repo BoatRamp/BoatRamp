@@ -199,9 +199,10 @@ pub struct InstanceSpawnSpec {
     /// backend"). The supervisor dispatches on it: `OsProcess` is the Phase-1 fork+exec backend,
     /// `Container` the Phase-3 one (the SAME fork+exec, the child additionally unsharing
     /// NS/IPC/UTS/CGROUP in its `pre_exec` — design-note Option C / §8). `Vm` (the scoped first cut —
-    /// the root boots the microVM guest + supervises a separate `__vm-relay`) has its supervise-dispatch
-    /// BUILT + wired but stays refused fail-closed by `resolve_spawn_backend` (the SAFE SUBSET) pending
-    /// a full live serve + kill→FailNodeClosed proof + Security.
+    /// the root boots the microVM guest + supervises a separate `__vm-relay`) is NOW WIRED: its
+    /// supervise-dispatch is live-proven (serve + kill→FailNodeClosed) and Security-reviewed (SHIP), so
+    /// `resolve_spawn_backend` DISPATCHES the scoped key-free static-parser frontend shape and refuses
+    /// any other VM shape fail-closed.
     pub substrate: InstanceSubstrate,
     /// The re-exec argv TAIL (after `argv[0]`): `["__instance", "<label>", "--config", "<path>"]`.
     pub argv: Vec<String>,
@@ -1018,10 +1019,10 @@ pub fn run_vm_guest() -> Result<(), CliError> {
 /// serve — a byte-relay of untrusted client data never runs unprofiled.
 ///
 /// It carries NO authority and NO key material (the secret-blindness invariant + the S2 lint forbid a
-/// key-material link crossing here), and scrubs its own environ first (inv10). It is not reached in
-/// production YET: [`resolve_spawn_backend`] still refuses `substrate: vm` before any relay is spawned
-/// (the supervise-dispatch flip + the Linux live gate are the next increment); this entry + the
-/// profile are the unit/socketpair-proven primitive they build on.
+/// key-material link crossing here), and scrubs its own environ first (inv10). It is REACHED when an
+/// operator selects `substrate: vm` for a scoped key-free static-parser frontend:
+/// [`resolve_spawn_backend`] now DISPATCHES that shape (live-proven + Security-reviewed), and the root's
+/// supervise loop forks this relay per VM frontend; any other VM shape stays refused fail-closed.
 /// The bounded deadline the `__vm-relay` readiness handshake (acpi=off Security review, Finding 1)
 /// waits for the frontend-in-guest to serve its first `200` over vsock before the relay accepts any
 /// client. Generous — a cold guest boots firecracker, unpacks a ~185 MB initramfs, self-relocates the
@@ -1210,18 +1211,21 @@ fn run_vm_relay_confined(
         .map_err(|e| format!("forcing the inherited public listener blocking: {e}"))?;
 
     // Finding 1 (acpi=off Security review) — POSITIVE readiness gate, BEHIND the profile + BEFORE the
-    // first client. Assert the frontend-in-guest actually SERVES a 200 over vsock within a bounded
-    // deadline (the UDS merely existing — `boot_firecracker`'s device-up wait — is NOT proof the guest
-    // is healthy). Done from the relay (NOT the root), which already holds the `connect`/`read`/`write`
-    // socket verbs this needs; the root never crosses the vsock. On timeout this returns `Err` ⇒ the
-    // relay exits ⇒ the root's supervise loop trips `FailNodeClosed` — a degraded-but-booted guest is
-    // never silently served. The probe connection is just another `Connection: close` client.
+    // first client. Assert the frontend-in-guest actually SERVES over vsock within a bounded deadline —
+    // a LIVENESS check: any valid HTTP response proves the guest is serving (INFO-3; NOT specifically a
+    // 200, so a frontend answering `/` non-200 is not false-closed). The UDS merely existing —
+    // `boot_firecracker`'s device-up wait — is NOT proof the guest is healthy. Done from the relay (NOT
+    // the root), which already holds the `connect`/`read`/`write` socket verbs this needs; the root never
+    // crosses the vsock. On timeout this returns `Err` ⇒ the relay exits ⇒ the root's supervise loop
+    // trips `FailNodeClosed` — a degraded/non-serving guest is never silently served. The probe
+    // connection is just another `Connection: close` client.
     let readiness_deadline = std::time::Instant::now() + VM_RELAY_READINESS_DEADLINE;
     crate::privsep_vm::relay_readiness_probe(&uds_norm, descriptor.guest_port, readiness_deadline)?;
     tracing::info!(
         instance = %label,
-        "[privsep] __vm-relay: readiness gate PASSED — the frontend-in-guest served a 200 over vsock; \
-         now accepting + relaying clients (PRIVSEP VM RELAY READY)"
+        "[privsep] __vm-relay: readiness gate PASSED — the frontend-in-guest returned a valid HTTP \
+         response over vsock (liveness proven, any status); now accepting + relaying clients (PRIVSEP \
+         VM RELAY READY)"
     );
 
     // Run the Model-A copy-relay behind the wall: accept each client, dial the frontend-in-guest over
@@ -1509,16 +1513,15 @@ where
 /// root, is the host-side vsock endpoint; the root carries no key bytes (a scoped frontend holds no
 /// key, enforced by the lint before spawn).
 ///
-/// **SAFE-SUBSET GATE (this cut).** That entire dispatch — [`supervise::run`]'s VM branch +
+/// **SCOPED-WIRED GATE (this cut).** That entire dispatch — [`supervise::run`]'s VM branch +
 /// [`per_tenant::spawn_vm_relay`] + the relay-side positive readiness gate ([`run_vm_relay_confined`] →
 /// [`crate::privsep_vm::relay_readiness_probe`]) — is BUILT + wired and **LIVE-PROVEN end-to-end on
-/// lighthouse**: on a `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` guest kernel the operator path serves a 200
-/// over the SEPARATE confined `__vm-relay` (the readiness gate passes), and killing EITHER the relay
-/// child OR the firecracker child trips `FailNodeClosed` (serve + kill-after-serve, the committed
-/// `tests/privsep_vm_operator_live.rs`). But `is_wired(Vm)` stays `false` and this arm REFUSES
-/// `substrate: vm` fail-closed, pending ONLY the independent Security review of the TCB-critical seam —
-/// flipping this arm + `is_wired(Vm)` is the final step. It refuses fail-closed for the scoped shape
-/// (gated) AND for:
+/// lighthouse**: on a `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` guest kernel the operator path serves over
+/// the SEPARATE confined `__vm-relay` (the readiness gate passes), and killing EITHER the relay child OR
+/// the firecracker child trips `FailNodeClosed` (serve + kill-after-serve, the committed
+/// `tests/privsep_vm_operator_live.rs`), and the independent Security review returned SHIP. So
+/// `is_wired(Vm)` is `true` and this arm DISPATCHES `substrate: vm` for the scoped shape (a key-free
+/// static-parser frontend). It still refuses fail-closed for:
 /// - Any OTHER VM shape — a co-located sealer bundle (P1, which needs the owner-GATED vsock key-relay,
 ///   design §3 / S2), a backend, an exec/control instance — outside the approved scope entirely. (The
 ///   `plan_root` scope lint already refuses these; this is the defence-in-depth spawn-gate companion.)
@@ -1532,28 +1535,25 @@ fn resolve_spawn_backend(
     // The VM substrate is handled FIRST — its acceptable SCOPE is capability-dependent, so it cannot
     // ride the capability-free `is_wired` shortcut. The operator supervise-dispatch (boot the microVM +
     // fork+supervise a separate least-authority `__vm-relay`, with the relay-side positive readiness
-    // gate) is BUILT + wired below, but `substrate: vm` stays REFUSED fail-closed here — the SAFE-SUBSET
-    // gate — pending a full live SERVE + kill→FailNodeClosed proof and the independent Security review
-    // (the dispatch's wiring + readiness + fail-closed-on-child-death are live-proven on lighthouse;
-    // the end-to-end 200 serve awaits the Phase-3c firecracker↔guest vsock transport being re-confirmed
-    // live — it regressed in the live environment). Flipping this + `is_wired(Vm)` is the final step.
+    // gate) is BUILT + wired + LIVE-PROVEN end-to-end on lighthouse (serve + kill→FailNodeClosed), and
+    // the independent Security review returned SHIP — so `substrate: vm` now DISPATCHES here for the
+    // owner-greenlit scoped shape (a key-free static-parser frontend). Any OTHER VM shape — a co-located
+    // sealer bundle / backend / exec/control instance — is outside the approved scope and STILL refused
+    // fail-closed (defence-in-depth behind `plan_root`'s `check_vm_secret_blindness_closure` scope lint).
     if matches!(substrate, InstanceSubstrate::Vm) {
-        let reason = if crate::privsep_vm::is_scoped_static_parser_frontend(capabilities) {
-            "it IS the owner-greenlit scoped shape (a key-free static-parser frontend), and the \
-             operator supervise-dispatch (boot the guest + fork+supervise a separate `__vm-relay` with \
-             the relay-side positive readiness gate) is BUILT + wired + LIVE-PROVEN end-to-end on \
-             lighthouse (serves a 200 over the separate relay, and killing EITHER the relay or the \
-             firecracker child trips FailNodeClosed) — but it stays refused fail-closed pending ONLY \
-             the independent Security review of the TCB-critical boot/fork/supervise seam"
-        } else {
-            "it is NOT a key-free static-parser frontend (a group-C `listen.*`-only slice), so it is \
-             outside the approved scope entirely — a co-located sealer bundle / backend / exec/control \
-             instance in a VM needs the owner-GATED vsock key-relay (design §3 / S2)"
-        };
+        if crate::privsep_vm::is_scoped_static_parser_frontend(capabilities) {
+            // The owner-greenlit scoped shape — DISPATCH (the supervise loop boots the guest + forks the
+            // separate `__vm-relay`; the relay's positive readiness gate + both-children supervision are
+            // live-proven and Security-reviewed).
+            return Ok(());
+        }
         return Err(PrivsepError::Supervise(format!(
-            "instance {label:?} selects the vm substrate: {reason}. Refusing fail-closed rather than \
-             silently downgrading to an OS process (which would discard the chosen isolation wall); \
-             use `substrate: OsProcess` or `substrate: Container`"
+            "instance {label:?} selects the vm substrate but is NOT a key-free static-parser frontend (a \
+             group-C `listen.*`-only slice) — it is outside the approved scope entirely: a co-located \
+             sealer bundle / backend / exec/control instance in a VM needs the owner-GATED vsock \
+             key-relay (design §3 / S2). Refusing fail-closed rather than silently downgrading to an OS \
+             process (which would discard the chosen isolation wall); use `substrate: OsProcess` or \
+             `substrate: Container`"
         )));
     }
     if substrate.is_wired() {
@@ -2692,11 +2692,12 @@ mod supervise {
 
         // Phase-3 spawn-backend dispatch (design §7 "substrate is a spawn backend"): resolve EACH
         // instance's isolation substrate BEFORE wiring/binding/spawning anything. OS-process + the
-        // Phase-3 namespace/cgroup Container backend are WIRED; `Vm` is refused fail-closed here (the
-        // scoped VM substrate MECHANISM is built + live-gated, but the operator-facing supervise wiring
-        // is gated on the S1 relay-placement decision — the host client-byte relay cannot run inside the
-        // secret-blind root's networkless self-profile; see `resolve_spawn_backend`). Container reuses
-        // the SAME fork+exec below — it only adds the child-side `unshare` in `spawn_wired_instance`'s
+        // Phase-3 namespace/cgroup Container backend are WIRED; `Vm` is NOW WIRED too for the scoped
+        // key-free static-parser frontend shape (live-proven + Security-reviewed SHIP) — the VM branch
+        // below boots the microVM guest + forks a separate `__vm-relay` (the host client-byte relay runs
+        // in that least-authority relay, NOT the secret-blind root's networkless self-profile; S1). Any
+        // OTHER VM shape is refused fail-closed here (see `resolve_spawn_backend`). Container reuses the
+        // SAME fork+exec below — it only adds the child-side `unshare` in `spawn_wired_instance`'s
         // `pre_exec` (design-note Option C / §8).
         for (label, inst) in &privsep.instances {
             super::resolve_spawn_backend(label, inst.substrate, &inst.capabilities)?;
@@ -2870,6 +2871,26 @@ mod supervise {
                             )));
                         }
                     };
+                    // LOW-1 (Security review, dup-site containment — STRUCTURAL at the source). A scoped
+                    // static-parser frontend has NO cross-kernel `local` socketpair links by construction
+                    // (its own guest kernel cannot cross a host socketpair — design §2a; the S2 scope lint
+                    // admits only a key-free listener-only slice, which holds no feature-links). So any
+                    // link fd in this wiring is a MIS-WIRE — refuse fail-closed rather than hand it to the
+                    // secret-blind relay. This makes "the relay inherits ONLY the listener" a property of
+                    // the SOURCE wiring, not something the downstream `close_inherited_fds_except` has to
+                    // scrub after the fact.
+                    if !wiring.fds.links.is_empty() {
+                        kill_all(&mut children);
+                        return Err(err(format!(
+                            "scoped VM frontend {:?} was wired {} cross-kernel link fd(s) ({:?}) — a \
+                             key-free static-parser frontend has NO socketpair links by construction, so \
+                             this is a mis-wire; refusing fail-closed rather than passing a link fd to \
+                             the secret-blind __vm-relay",
+                            spec.label,
+                            wiring.fds.links.len(),
+                            wiring.fds.links.keys().collect::<Vec<_>>(),
+                        )));
+                    }
                     let assets = match crate::privsep_vm::VmAssets::from_env() {
                         Ok(a) => a,
                         Err(e) => {
@@ -2919,13 +2940,25 @@ mod supervise {
                         std::env::vars(),
                         &declared_secret_env,
                     );
+                    // LOW-1 (Security review): hand the relay ONLY the listener dup — the single fd it
+                    // legitimately inherits (the pre-bound public TCP listener on `listener_target`). The
+                    // links-empty refusal above already proved `wiring.dups` holds no link entries for a
+                    // VM frontend, so this filter is belt-and-suspenders that makes the relay's inherited
+                    // set EXACTLY {listener} at the source, independent of any future wiring change — no
+                    // stray dup can reach the `__vm-relay`'s pre_exec `dup2` loop.
+                    let relay_dups: Vec<(RawFd, RawFd)> = wiring
+                        .dups
+                        .iter()
+                        .copied()
+                        .filter(|(_, tgt)| *tgt == listener_target)
+                        .collect();
                     // fork+exec the SEPARATE least-authority relay process. It INHERITS the root's
                     // capabilities (it drops them ITSELF after entering its netns/mount-ns), so
                     // `spawn_vm_relay` does NO pre_exec cap drop — unlike `spawn_wired_instance`.
                     let relay_child = match super::per_tenant::spawn_vm_relay(
                         &current_exe,
                         &relay_spec,
-                        wiring.dups.clone(),
+                        relay_dups,
                     ) {
                         Ok(c) => c,
                         Err(e) => {
@@ -5372,7 +5405,7 @@ mod tests {
     // ---- Phase-3: the operator-selectable substrate spawn-backend dispatch ----
 
     #[test]
-    fn resolve_spawn_backend_wires_os_process_and_container_and_refuses_vm_safe_subset() {
+    fn resolve_spawn_backend_wires_os_process_container_and_the_scoped_vm_frontend() {
         // OS-process is the Phase-1 wired backend; Container is the Phase-3 wired backend (the SIMPLE
         // model — the SAME fork+exec, with the child unsharing NS/IPC/UTS/CGROUP in its pre_exec).
         resolve_spawn_backend(
@@ -5389,36 +5422,24 @@ mod tests {
         .expect("container is a wired spawn backend (Phase-3 simple model)");
         assert!(InstanceSubstrate::OsProcess.is_wired());
         assert!(InstanceSubstrate::Container.is_wired());
-        // SAFE SUBSET: the operator supervise-dispatch is BUILT + wired, but `Vm` stays NOT-wired +
-        // refused fail-closed pending a full live SERVE + kill→FailNodeClosed proof + Security.
-        assert!(!InstanceSubstrate::Vm.is_wired());
+        // `Vm` is NOW WIRED for the owner-greenlit scoped first cut (live-proven serve +
+        // kill→FailNodeClosed, Security review SHIP). `is_wired` is capability-free; the per-instance VM
+        // SCOPE gate is enforced in `resolve_spawn_backend` itself (below) + the `plan_root` S2 lint.
+        assert!(InstanceSubstrate::Vm.is_wired());
 
-        // A VM that IS the owner-greenlit scoped shape — a key-free static-parser frontend — is refused
-        // at the spawn gate pending the serve proof + Security (the supervise-dispatch is built + wired;
-        // flipping this is the final step). Never a silent OS-process downgrade.
-        let scoped = resolve_spawn_backend(
+        // A VM that IS the owner-greenlit scoped shape — a key-free static-parser frontend (group-C
+        // `listen.*`-only) — now DISPATCHES (the supervise loop boots the guest + forks the separate
+        // `__vm-relay`). No silent OS-process downgrade: an in-scope VM is served as a VM.
+        resolve_spawn_backend(
             "edge-vm",
             InstanceSubstrate::Vm,
             &[HostAuthority::ListenHttpParse],
         )
-        .unwrap_err();
-        let PrivsepError::Supervise(s) = &scoped else {
-            panic!(
-                "the scoped vm must be refused as a Supervise error (safe subset), got {scoped:?}"
-            );
-        };
-        assert!(
-            s.contains("BUILT") && s.contains("Security") && s.contains("fail-closed"),
-            "the scoped-frontend VM refusal must say the dispatch is BUILT + gated pending Security: {s:?}"
-        );
-        assert!(
-            s.contains("OsProcess") && s.contains("Container"),
-            "the refusal must offer the wired OsProcess/Container fallbacks: {s:?}"
-        );
+        .expect("a scoped key-free static-parser VM frontend is now a wired spawn backend");
 
         // A VM that is NOT a key-free static-parser frontend (it holds a backend credential) is OUTSIDE
         // the approved scope entirely — it needs the owner-GATED vsock key-relay, refused fail-closed
-        // (defence-in-depth behind `plan_root`'s scope lint).
+        // (defence-in-depth behind `plan_root`'s scope lint). Never a silent OS-process downgrade.
         let oos =
             resolve_spawn_backend("bad-vm", InstanceSubstrate::Vm, &[HostAuthority::BackendKv])
                 .unwrap_err();
@@ -5432,6 +5453,17 @@ mod tests {
         assert!(
             o.contains("OsProcess") && o.contains("Container"),
             "the refusal must offer the wired OsProcess/Container fallbacks: {o:?}"
+        );
+        // A VM holding BOTH a listener AND a non-listener authority is NOT key-free — still out of scope.
+        let mixed = resolve_spawn_backend(
+            "mixed-vm",
+            InstanceSubstrate::Vm,
+            &[HostAuthority::ListenHttpParse, HostAuthority::BackendKv],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&mixed, PrivsepError::Supervise(m) if m.contains("outside the approved scope")),
+            "a VM mixing a listener with a backend credential must stay refused out-of-scope: {mixed:?}"
         );
     }
 
