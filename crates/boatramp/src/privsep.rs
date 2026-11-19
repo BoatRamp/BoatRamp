@@ -3245,6 +3245,7 @@ mod supervise {
 
 #[cfg(unix)]
 mod instance_serve {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::SocketAddr;
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use std::path::Path;
@@ -3953,7 +3954,10 @@ mod instance_serve {
 
     /// Serve one received client connection with the hand-rolled HTTP/1+2 stack (the same
     /// `boatramp_http::serve_connection` the monolith's `serve_router_conn` wraps) + a minimal
-    /// handler. The full authority-scoped app router is the authority-serve follow-on.
+    /// handler. The full authority-scoped app router is the self-host serve follow-on: the typed
+    /// [`NodeServeHandler`] seam (P5-1, design §Phase-5) is the drop-in that replaces
+    /// [`MinimalHandler`] here once P5-2 wires a real surface. Today — behind the unwired self-host
+    /// path ([`super::check_node_self_host_gate`] refuses `node-self-host`) — this stays the stub.
     async fn serve_client_fd(fd: OwnedFd) {
         let std_stream = std::net::TcpStream::from(fd);
         if let Err(e) = std_stream.set_nonblocking(true) {
@@ -3977,11 +3981,162 @@ mod instance_serve {
 
     /// The Phase-1 minimal backend handler: a fixed 200. It proves the end-to-end byte path
     /// (client → frontend listener fd → SCM_RIGHTS splice → backend → hand-rolled HTTP → response)
-    /// with the sandbox enforced in both instances. The authority-scoped app router is a follow-on.
+    /// with the sandbox enforced in both instances. The authority-scoped app router is a follow-on:
+    /// the [`NodeServeHandler`] seam (P5-1) is introduced below and swapped in here by P5-2 (it keeps
+    /// the identical stub body in the unwired cut, so wiring it changes the serve, not the byte path).
     struct MinimalHandler;
 
     impl boatramp_http::Handler for MinimalHandler {
         async fn handle(&self, _req: boatramp_http::Request) -> boatramp_http::Response {
+            boatramp_http::response(
+                200,
+                b"boatramp privsep backend instance (Phase 1 minimal serve)\n".to_vec(),
+            )
+        }
+    }
+
+    // =========================================================================
+    // P5-1: the authority-scoped node app-router SEAM (design §Phase-5 P5-1)
+    // =========================================================================
+    //
+    // This is the typed seam that REPLACES `MinimalHandler` when a `backend.*` / authority instance
+    // serves the node's OWN serve path (`node_serve = node-self-host`). It is introduced BEHIND the
+    // still-unwired self-host path: the root gate (`check_node_self_host_gate`) refuses `NodeSelfHost`
+    // fail-closed, `NodeServeMode::is_wired(NodeSelfHost)` is still false, and the live
+    // `serve_client_fd` above still serves the `MinimalHandler` stub. P5-1 proves the ROUTER SHAPE +
+    // the "construct-only-what-you-hold" discipline (design §4 item 5) host-side; P5-2 derives the
+    // reachability map from the live link topology, classifies each request into its serve surface,
+    // executes each route, and swaps this handler in. NOTHING here runs live.
+
+    /// The routing decision the node app-router makes for one serve surface, identified by the
+    /// [`HostAuthority`] that surface needs (design §Phase-5 P5-1, §4 item 5). It encodes the
+    /// materialization-by-construction discipline structurally: a surface whose authority this
+    /// instance HOLDS is served LOCALLY (the instance may construct that authority object —
+    /// [`MaterializationGate::ensure`] passes); every other surface is RELAYED over the instance's
+    /// root-wired link to the peer that holds the authority (a crown-jewel WS-E grammar for a group-A
+    /// authority, else a typed backend request); a surface whose authority is NEITHER held NOR
+    /// reachable over any wired link is REFUSED fail-closed (a composition-closure bug, never a
+    /// degraded serve — the node fails closed).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
+    pub(super) enum NodeRoute {
+        /// Serve LOCALLY: this instance HOLDS the authority, so it constructs and uses the authority
+        /// object in-process (materialization-by-construction — never a dropped authority).
+        Local(HostAuthority),
+        /// RELAY to a crown-jewel (group A) holder over the named WS-E authority-grammar link: a
+        /// bounded `AuthorityCall` with a re-validated end-principal context (results, never keys).
+        RelayCrownJewel {
+            authority: HostAuthority,
+            link: String,
+        },
+        /// RELAY to a data-holder / control peer over the named backend feature-link: a typed request
+        /// the peer serves against its OWN held credential (any non-crown-jewel holder — group B
+        /// `backend.*`, group D `exec.*`, group E `control.*`/`acme.*`).
+        RelayBackend {
+            authority: HostAuthority,
+            link: String,
+        },
+        /// REFUSE fail-closed: the surface's authority is neither HELD nor reachable over any wired
+        /// link. The node-self-host composition-closure clause (design §4 item 5) must preclude this,
+        /// so a serve-time refusal is a composition bug — it fails the node closed, never degrades.
+        Refuse(HostAuthority),
+    }
+
+    /// The authority-scoped node app-router (design §Phase-5 P5-1): the typed seam a `backend.*` /
+    /// authority instance constructs from its [`MaterializationGate`] to route the node's OWN serve
+    /// surfaces. It holds the instance's HELD authority set and the map of which non-held authority is
+    /// reachable over which named root-wired link, and makes the [`NodeRoute`] decision for each
+    /// surface — routing ONLY to held authorities and relaying everything else (design §4 item 5).
+    ///
+    /// P5-1 scope is the routing DECISION + the "construct-only-what-you-hold" discipline, host-tested
+    /// in isolation. Deriving the reachability map from the live link topology, classifying a real
+    /// request into its serve surface, and executing each route (local serve / crown-jewel relay /
+    /// backend relay) is P5-2 — this cut takes the map as a constructor input and serves the stub.
+    #[derive(Debug, Clone)]
+    #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
+    pub(super) struct NodeServeRouter {
+        /// The authorities this instance holds (from its [`MaterializationGate`]) — the ONLY surfaces
+        /// it may serve locally.
+        held: BTreeSet<HostAuthority>,
+        /// Non-held authority → the named root-wired link that reaches its holder. P5-1 takes this as
+        /// a constructor input so the routing decision is host-testable; P5-2 derives it live.
+        reachable: BTreeMap<HostAuthority, String>,
+    }
+
+    impl NodeServeRouter {
+        /// Build the router from an instance's [`MaterializationGate`] (its held authority set) and
+        /// the reachability map (non-held authority → the named root-wired link that reaches its
+        /// holder). Reversible P5-1 sub-decision (FLAGGED): the reachability map is a constructor
+        /// input here so the routing decision is host-testable in isolation; P5-2 derives it from the
+        /// live link topology (`fds.links` + the composition's `[privsep.links]` purposes).
+        #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
+        pub(super) fn new(
+            gate: &MaterializationGate,
+            reachable: BTreeMap<HostAuthority, String>,
+        ) -> Self {
+            Self {
+                held: gate.held().collect(),
+                reachable,
+            }
+        }
+
+        /// The P5-1 routing decision for a serve surface identified by the [`HostAuthority`] it needs.
+        /// HELD ⇒ [`NodeRoute::Local`] (construct-only-what-you-hold); else reachable over a wired
+        /// link ⇒ relay ([`NodeRoute::RelayCrownJewel`] for a group-A authority, else
+        /// [`NodeRoute::RelayBackend`]); else [`NodeRoute::Refuse`] fail-closed. A HELD authority is
+        /// NEVER relayed and a non-held one is NEVER served locally — the structural invariant this
+        /// seam exists to prove (design §4 item 5).
+        #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
+        pub(super) fn route(&self, surface: HostAuthority) -> NodeRoute {
+            if self.held.contains(&surface) {
+                return NodeRoute::Local(surface);
+            }
+            match self.reachable.get(&surface) {
+                Some(link) if surface.is_crown_jewel() => NodeRoute::RelayCrownJewel {
+                    authority: surface,
+                    link: link.clone(),
+                },
+                Some(link) => NodeRoute::RelayBackend {
+                    authority: surface,
+                    link: link.clone(),
+                },
+                None => NodeRoute::Refuse(surface),
+            }
+        }
+    }
+
+    /// The P5-1 node app-router HANDLER: the [`boatramp_http::Handler`] drop-in an authority instance
+    /// constructs from its [`MaterializationGate`] to replace [`MinimalHandler`] on the self-host
+    /// serve path. It holds a [`NodeServeRouter`] ready to route each request's serve surface, but in
+    /// THIS unwired cut it still answers the Phase-1 stub 200 — P5-2 adds the request→surface
+    /// classifier and executes each [`NodeRoute`] (local serve / relay) against a real surface. Kept
+    /// behaviorally identical to the stub so wiring it in P5-2 changes the serve, not the byte path.
+    #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
+    pub(super) struct NodeServeHandler {
+        router: NodeServeRouter,
+    }
+
+    impl NodeServeHandler {
+        /// Construct the handler around the instance's [`NodeServeRouter`].
+        #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
+        pub(super) fn new(router: NodeServeRouter) -> Self {
+            Self { router }
+        }
+
+        /// The router this handler routes each request's serve surface through (consumed by P5-2's
+        /// request→surface classifier). Exposed so P5-1 host tests can assert the handler carries the
+        /// gate-derived router.
+        #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
+        pub(super) fn router(&self) -> &NodeServeRouter {
+            &self.router
+        }
+    }
+
+    impl boatramp_http::Handler for NodeServeHandler {
+        async fn handle(&self, _req: boatramp_http::Request) -> boatramp_http::Response {
+            // P5-1 is BEHIND the unwired self-host path: no real serve surface is classified or served
+            // yet (that is P5-2), so this answers the SAME Phase-1 stub `MinimalHandler` does. The
+            // gate-derived router is held ready; nothing here serves the node's real app.
             boatramp_http::response(
                 200,
                 b"boatramp privsep backend instance (Phase 1 minimal serve)\n".to_vec(),
@@ -6107,5 +6262,190 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         );
 
         server.abort();
+    }
+
+    // ---- P5-1: the authority-scoped node app-router seam (design §Phase-5 P5-1) ----
+    //
+    // These are PURE / host-level tests (no fork, no sandbox, no Linux, no live serve path): they
+    // exercise the routing DECISION and the drop-in HANDLER shape in isolation on the host. The full
+    // self-host serve path stays REFUSED fail-closed at the root gate and on the `#[ignore]` live gate.
+
+    /// The P5-1 router routes ONLY to held authorities and relays everything else — the
+    /// "construct-only-what-you-hold" discipline (design §4 item 5), proven structurally:
+    /// - a HELD surface ⇒ `Local` (served in-process);
+    /// - a non-held CROWN-JEWEL (group A) reachable over a link ⇒ `RelayCrownJewel` (WS-E grammar);
+    /// - any other non-held authority reachable over a link ⇒ `RelayBackend` (typed backend request);
+    /// - a non-held, UNREACHABLE surface ⇒ `Refuse` fail-closed (a composition-closure bug).
+    #[cfg(unix)]
+    #[test]
+    fn p5_1_node_router_serves_held_relays_the_rest_refuses_unreachable() {
+        use super::instance_serve::{NodeRoute, NodeServeRouter};
+
+        // This instance HOLDS backend.kv only; it can REACH the signer (crown jewel, group A), the
+        // blob backend (group B) and the control plane (group E) over named root-wired links.
+        let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
+        let reachable = BTreeMap::from([
+            (HostAuthority::TokenSigner, "to-signer".to_string()),
+            (HostAuthority::BackendBlob, "to-blob".to_string()),
+            (HostAuthority::ControlAdminApi, "to-control".to_string()),
+        ]);
+        let router = NodeServeRouter::new(&gate, reachable);
+
+        // HELD ⇒ served locally; it is NEVER relayed.
+        assert_eq!(
+            router.route(HostAuthority::BackendKv),
+            NodeRoute::Local(HostAuthority::BackendKv),
+            "a HELD authority must be served locally (construct-only-what-you-hold)"
+        );
+
+        // Non-held crown jewel (group A) reachable over a link ⇒ the WS-E crown-jewel grammar relay.
+        assert_eq!(
+            router.route(HostAuthority::TokenSigner),
+            NodeRoute::RelayCrownJewel {
+                authority: HostAuthority::TokenSigner,
+                link: "to-signer".to_string(),
+            },
+            "a non-held crown jewel relays over the WS-E authority grammar, never served locally"
+        );
+
+        // Non-held data-holder (group B) reachable over a link ⇒ a typed backend request relay.
+        assert_eq!(
+            router.route(HostAuthority::BackendBlob),
+            NodeRoute::RelayBackend {
+                authority: HostAuthority::BackendBlob,
+                link: "to-blob".to_string(),
+            },
+            "a non-held backend relays a typed request over its feature-link"
+        );
+
+        // Non-held control-plane (group E) reachable over a link ⇒ a typed backend request relay too
+        // (control.admin-api is reached by a typed request, not the crown-jewel grammar).
+        assert_eq!(
+            router.route(HostAuthority::ControlAdminApi),
+            NodeRoute::RelayBackend {
+                authority: HostAuthority::ControlAdminApi,
+                link: "to-control".to_string(),
+            },
+            "a non-held, non-crown-jewel surface relays a typed request (group E included)"
+        );
+
+        // Non-held AND unreachable ⇒ REFUSE fail-closed (never a silent local serve or degraded path).
+        assert_eq!(
+            router.route(HostAuthority::BackendSql),
+            NodeRoute::Refuse(HostAuthority::BackendSql),
+            "a surface neither held nor reachable fails the node closed"
+        );
+    }
+
+    /// The router NEVER serves a non-held authority locally and NEVER relays a held one — the
+    /// structural invariant swept across EVERY `HostAuthority`, for an instance holding a mixed set.
+    #[cfg(unix)]
+    #[test]
+    fn p5_1_node_router_never_serves_a_dropped_authority_nor_relays_a_held_one() {
+        use super::instance_serve::{NodeRoute, NodeServeRouter};
+
+        // A mixed instance: holds a crown jewel + a backend; everything else is reachable over one
+        // shared link (so no surface is `Refuse` — isolating the hold-vs-relay invariant).
+        let held = [HostAuthority::SecretsSealer, HostAuthority::BackendKv];
+        let gate = MaterializationGate::new(&held);
+        let reachable: BTreeMap<HostAuthority, String> = HostAuthority::ALL
+            .iter()
+            .copied()
+            .filter(|a| !held.contains(a))
+            .map(|a| (a, "to-peer".to_string()))
+            .collect();
+        let router = NodeServeRouter::new(&gate, reachable);
+
+        for &a in HostAuthority::ALL {
+            let route = router.route(a);
+            if held.contains(&a) {
+                assert_eq!(
+                    route,
+                    NodeRoute::Local(a),
+                    "{}: a held authority must serve locally, never relay",
+                    a.tag()
+                );
+            } else {
+                assert!(
+                    !matches!(route, NodeRoute::Local(_)),
+                    "{}: a DROPPED authority must never be served locally (it is not constructed)",
+                    a.tag()
+                );
+                // Non-held ⇒ a relay whose kind follows the authority's group (crown jewel ⇒ WS-E
+                // grammar, else a backend request).
+                match route {
+                    NodeRoute::RelayCrownJewel { authority, .. } => {
+                        assert!(
+                            authority.is_crown_jewel(),
+                            "{}: WS-E relay only for group A",
+                            a.tag()
+                        );
+                    }
+                    NodeRoute::RelayBackend { authority, .. } => {
+                        assert!(
+                            !authority.is_crown_jewel(),
+                            "{}: a backend-request relay is never a crown jewel",
+                            a.tag()
+                        );
+                    }
+                    other => panic!(
+                        "{}: expected a relay for a reachable non-held authority, got {other:?}",
+                        a.tag()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The P5-1 [`NodeServeHandler`] is a valid `boatramp_http::Handler` drop-in: it serves one real
+    /// request end-to-end over an in-process `socketpair` (no listener fd, no SCM_RIGHTS splice, no
+    /// sandbox), returning the SAME Phase-1 stub `MinimalHandler` does. This proves the router shape at
+    /// the serve boundary while P5-1 stays behind the unwired path (no real surface served yet; P5-2
+    /// swaps in the request→surface classifier). Host-testable; the live splice path stays on the
+    /// `#[ignore]` Linux gate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn p5_1_node_serve_handler_drops_into_serve_connection_and_answers_the_stub() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use super::instance_serve::{NodeServeHandler, NodeServeRouter};
+
+        // Construct the handler the way an instance would: from its gate-derived router.
+        let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
+        let router = NodeServeRouter::new(&gate, BTreeMap::new());
+        let handler = NodeServeHandler::new(router);
+
+        // An in-process connected pair stands in for the spliced client fd — no fork / listener /
+        // SCM_RIGHTS / sandbox needed.
+        let (client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+
+        let serve = tokio::spawn(async move {
+            // The exact call `serve_client_fd` makes, minus the TcpStream adoption (generic over IO).
+            let _ = boatramp_http::serve_connection(server, handler).await;
+        });
+
+        let mut client = client;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: node.local\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write the request");
+
+        let mut resp = Vec::new();
+        client
+            .read_to_end(&mut resp)
+            .await
+            .expect("read the response");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "the NodeServeHandler drop-in answers the stub 200 (got: {:?})",
+            &text[..text.len().min(64)]
+        );
+        assert!(
+            text.contains("Phase 1 minimal serve"),
+            "P5-1 is still behind the unwired path — identical stub body to MinimalHandler"
+        );
+
+        serve.await.expect("serve task joins");
     }
 }
