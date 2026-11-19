@@ -37,10 +37,16 @@ and adds the transport proof (the vsock relay + guest serve + HTTP 200 end-to-en
   curl -fsSLo fc-base.config \
     https://raw.githubusercontent.com/firecracker-microvm/firecracker/v1.13.1/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config
   printf 'CONFIG_SECURITY=y\nCONFIG_SECURITYFS=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM="landlock,yama,bpf"\n' >> fc-base.config
-  # Phase-3c: the guest boots with `acpi=off` (see below), so virtio-mmio devices are discovered off the
-  # `virtio_mmio.device=` cmdline firecracker appends, NOT via ACPI. Enable that discovery path (the
-  # shipped `boatramp-vmlinux` already sets it for the embedded-VMM path, so this just matches it):
+  # Phase-3c (LOAD-BEARING): the guest boots with `acpi=off` (see below), so virtio-mmio devices are
+  # discovered off the `virtio_mmio.device=` cmdline firecracker appends, NOT via ACPI. Enable that
+  # discovery path — WITHOUT it the guest boots clean but binds AF_VSOCK on LOOPBACK only (no
+  # `virtio-mmio.0 … IRQ 5` probe), firecracker cannot forward a host CONNECT, and the serve gate
+  # FailNodeCloses with no 200. (The shipped `boatramp-vmlinux` already sets it for the embedded-VMM
+  # path, so this just matches it.)
   printf 'CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y\n' >> fc-base.config
+  # Enable IKCONFIG so the guest's Finding-2 kernel-config guard can ASSERT (via /proc/config.gz) the
+  # X86_MPPARSE-off + CMDLINE_DEVICES=y preconditions at boot instead of only warning:
+  printf 'CONFIG_IKCONFIG=y\nCONFIG_IKCONFIG_PROC=y\n' >> fc-base.config
   nix-build kernel.nix -o kernel-result        # -> kernel-result/vmlinux (the uncompressed ELF firecracker needs)
   ```
 
@@ -66,7 +72,28 @@ nix shell nixpkgs#rustup nixpkgs#cargo-zigbuild nixpkgs#zig nixpkgs#firecracker 
 ```
 
 The driver builds the musl static-PIE `boatramp` + the non-PIE shim, pins the guest-kernel hash (S3),
-and runs the serve gate, which greps `PRIVSEP VM SCOPED SERVE OK`.
+and runs the serve gate, which greps `PRIVSEP VM SCOPED SERVE OK` (the in-root-relay-thread mechanism).
+
+### Operator supervise-dispatch gate (`run-operator.sh`)
+
+`run-operator.sh` drives the REAL **operator** path (`boatramp __root`): bind the listener, boot the
+guest (NO in-root relay thread), `fork`+`exec` a SEPARATE confined `__vm-relay`, run its positive
+readiness handshake, and supervise BOTH children. Run it the same way (it runs under `sudo`):
+
+```sh
+nix shell nixpkgs#rustup nixpkgs#cargo-zigbuild nixpkgs#zig nixpkgs#firecracker \
+          nixpkgs#binutils nixpkgs#gcc nixpkgs#pkg-config nixpkgs#openssl --command \
+  env GUEST_KERNEL=$PWD/kbuild/kernel-result/vmlinux \
+  bash docs/privsep-vm-scoped-repro/run-operator.sh
+```
+
+It proves `PRIVSEP VM SUPERVISE SERVE OK` (a 200 over the separate relay) + `PRIVSEP VM RELAY-KILL
+FAILCLOSED OK` + `PRIVSEP VM FIRECRACKER-KILL FAILCLOSED OK` (kill either child ⇒ FailNodeClosed).
+**The `GUEST_KERNEL` MUST be the `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` kernel built above** — a kernel
+lacking it boots clean but the vsock device never probes (loopback-only), firecracker can't forward a
+host CONNECT, and the readiness gate FailNodeCloses with no serve. (This is a `substrate: vm` live
+prove; flip `is_wired(Vm)` + the `resolve_spawn_backend` Vm arm interim, then revert — the committed
+state is the safe subset.)
 
 ## Not a GitHub-CI gate
 

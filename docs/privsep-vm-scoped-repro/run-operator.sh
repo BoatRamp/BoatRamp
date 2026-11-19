@@ -12,6 +12,15 @@
 # LIGHTHOUSE-ONLY and runs the test under SUDO: the root must be privileged (/dev/kvm + the privileged
 # listener bind), and the `__vm-relay` child inherits CAP_SYS_ADMIN from it to enter its netns/mount-ns.
 #
+# GUEST_KERNEL REQUIREMENT (LOAD-BEARING): the kernel MUST be built with
+# `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` (AND Landlock V5, kernel >= 6.10, `X86_MPPARSE` off). With the
+# `acpi=off` boot-arg, ACPI enumeration is off, so the virtio-mmio VSOCK DEVICE is discovered ONLY off
+# the `virtio_mmio.device=` cmdline firecracker appends — which needs that flag. A kernel LACKING it
+# boots clean + binds AF_VSOCK on LOOPBACK only (no `virtio-mmio.0 … IRQ 5` probe), firecracker cannot
+# forward a host CONNECT, and the readiness gate correctly trips FailNodeClosed (no serve). Build it with
+# `kernel.nix` / the README recipe (both set the flag). ALSO enable `CONFIG_IKCONFIG_PROC=y` so the
+# guest's Finding-2 kernel-config guard ASSERTS the precondition at boot instead of only warning.
+#
 # Run (from the repo root, on lighthouse, inside the agent scratch clone):
 #   GUEST_KERNEL=/abs/path/to/vmlinux bash docs/privsep-vm-scoped-repro/run-operator.sh
 set -uo pipefail

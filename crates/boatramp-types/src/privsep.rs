@@ -770,10 +770,11 @@ impl TenantScope {
 /// own kernel, so the `local` socketpair cannot cross; the root instead boots the microVM guest and
 /// supervises a SEPARATE least-authority `__vm-relay` process that splices the client's bytes to the
 /// frontend-in-guest over the vsock bridge (the root never crosses the vsock, carries no key bytes),
-/// gated to a key-free static-parser frontend (the lint's P3). But it is NOT yet a wired backend (the
-/// SAFE SUBSET): `resolve_spawn_backend` refuses `substrate: vm` fail-closed pending a full live serve +
-/// kill→FailNodeClosed proof + the independent Security review; any other VM shape is additionally
-/// refused at `plan_root` (`check_vm_secret_blindness_closure`). See [`InstanceSubstrate::is_wired`],
+/// gated to a key-free static-parser frontend (the lint's P3), and live-proven end-to-end on lighthouse
+/// (serve + kill-after-serve ⇒ FailNodeClosed). But it is NOT yet a wired backend (the SAFE SUBSET):
+/// `resolve_spawn_backend` refuses `substrate: vm` fail-closed pending ONLY the independent Security
+/// review; any other VM shape is additionally refused at `plan_root`
+/// (`check_vm_secret_blindness_closure`). See [`InstanceSubstrate::is_wired`],
 /// `crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md`, and
 /// `crates/boatramp/DESIGN-privsep-phase3-container.md`.
 #[derive(
@@ -809,12 +810,11 @@ impl InstanceSubstrate {
     /// (the SAFE SUBSET): the owner-greenlit scoped VM supervise-dispatch (the root binds the listener,
     /// boots the microVM guest, and `fork`+`exec`s a SEPARATE least-authority `__vm-relay` process that
     /// splices the client's bytes to the frontend-in-guest over the vsock bridge, with a relay-side
-    /// positive readiness gate) is BUILT + wired and its boot/fork/supervise/readiness/fail-closed path
-    /// is live-proven on lighthouse — but it stays refused fail-closed at `resolve_spawn_backend`
-    /// pending (a) a full live SERVE + kill→FailNodeClosed proof (blocked only by the Phase-3c
-    /// firecracker↔guest vsock transport, which regressed in the live environment) and (b) the
-    /// independent Security review. Flipping this to include `Vm` is the final step. See
-    /// `crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md` §S1.
+    /// positive readiness gate) is BUILT + wired and **live-proven end-to-end on lighthouse** (serves a
+    /// 200 over the separate relay on a `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` guest kernel; killing
+    /// either the relay or the firecracker child trips `FailNodeClosed`) — but it stays refused
+    /// fail-closed at `resolve_spawn_backend` pending ONLY the independent Security review. Flipping this
+    /// to include `Vm` is the final step. See `crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md` §S1.
     pub const fn is_wired(self) -> bool {
         matches!(self, Self::OsProcess | Self::Container)
     }

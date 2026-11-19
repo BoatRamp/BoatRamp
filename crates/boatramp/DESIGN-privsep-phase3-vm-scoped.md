@@ -271,26 +271,39 @@ Enforced Landlock-V5 + seccomp profile installs (`status=Enforced`), `PRIVSEP VM
 host↔guest **byte relay serves a real `200`** through `boatramp_http` behind the hypervisor wall
 (`PRIVSEP VM SCOPED SERVE OK`, the frontend body marker asserted). The transport mechanism works.
 
-**Still open (NOT this increment):** the serve gate stays `#[ignore]`d + lighthouse-driven (hosted CI has
-no `/dev/kvm`); `resolve_spawn_backend` still refuses `substrate: vm` fail-closed — the operator-facing
-**supervise dispatch** (root binds the listener, boots the VM minus its in-root relay thread, `fork`+`exec`s
-the separate `__vm-relay`, supervises both → `FailNodeClosed` on either death) is the next increment, and
-the whole Phase-3c delta (this `acpi=off` transport fix + the dispatch) gates on the **Security review**.
+**Status:** the serve gate stays `#[ignore]`d + lighthouse-driven (hosted CI has no `/dev/kvm`). The
+operator-facing **supervise dispatch** (root binds the listener, boots the VM minus its in-root relay
+thread, `fork`+`exec`s the separate `__vm-relay`, supervises both → `FailNodeClosed` on either death)
+has since LANDED + been live-proven end-to-end — see the "Operator supervise-dispatch" section below.
+`resolve_spawn_backend` still refuses `substrate: vm` fail-closed (the safe subset); the whole Phase-3c
+delta (this `acpi=off` transport fix + the dispatch) gates on the **Security review** before the flip.
 
-## Operator supervise-dispatch — BUILT + wired (SAFE SUBSET; `substrate: Vm` still refused)
+## Operator supervise-dispatch — BUILT + wired + LIVE-PROVEN (SAFE SUBSET; `substrate: Vm` still refused)
 
-The operator-facing supervise dispatch is now BUILT + wired, taking the scoped VM frontend from
-fail-closed-refused to launched + supervised — but it lands as a **SAFE SUBSET**: `is_wired(Vm)` stays
-`false` and `resolve_spawn_backend` still REFUSES `substrate: vm` fail-closed, pending (a) a full live
-SERVE + kill→FailNodeClosed proof and (b) the independent Security review. The reason the flip is NOT
-taken in this cut: the end-to-end 200 serve could NOT be live-proven, because the **Phase-3c
-firecracker↔guest vsock transport regressed in the live environment** — the SAME failure stops the
-PRE-EXISTING in-root serve gate (`tests/privsep_vm_live.rs`), which served 3× consecutively ~hours
-earlier; it is NOT in this dispatch. The guest boots clean (`SHIM-ALIVE`, legacy-PIC `preallocated irqs:
-16`, `AF_VSOCK bound`, `PRIVSEP VM GUEST SERVING`), but firecracker never completes a host-initiated
-vsock CONNECT (no `OK`) — observed identically for the relay, the in-root thread, and a manual
-unconfined `socat`/python dial (25 attempts, 0 `OK`). Re-confirming that transport live is the
-precondition to flip. The dispatch, in `supervise::run` (`crates/boatramp/src/privsep.rs`):
+The operator-facing supervise dispatch is BUILT + wired AND **live-proven end-to-end on lighthouse**,
+taking the scoped VM frontend from fail-closed-refused to launched + supervised. It lands as a **SAFE
+SUBSET**: `is_wired(Vm)` stays `false` and `resolve_spawn_backend` still REFUSES `substrate: vm`
+fail-closed, pending ONLY the independent Security review — the serve + kill-after-serve proof is DONE.
+
+**Live proof (lighthouse, kernel 6.12.67 + Landlock V5 + `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y`,
+firecracker 1.13.1):** `tests/privsep_vm_operator_live.rs` via `docs/privsep-vm-scoped-repro/run-operator.sh`
+(interim `is_wired` flip, reverted after): the operator `boatramp __root` boots the scoped-VM frontend,
+the guest logs `virtio-mmio: Registering device virtio-mmio.0 at 0xc0001000-0xc0001fff, IRQ 5` (no `-22`)
++ `PRIVSEP VM GUEST SERVING`, the separate confined `__vm-relay`'s readiness probe serves a 200
+(`readiness gate PASSED … PRIVSEP VM RELAY READY`), a client `GET /` returns a real 200 over the relay
+(`PRIVSEP VM SUPERVISE SERVE OK`), then SIGKILL the relay child ⇒ `FailNodeClosed` (`PRIVSEP VM
+RELAY-KILL FAILCLOSED OK`) and, on a fresh node, SIGKILL the firecracker child ⇒ `FailNodeClosed`
+(`PRIVSEP VM FIRECRACKER-KILL FAILCLOSED OK`). `test result: ok. 1 passed`.
+
+**The `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` guest kernel is LOAD-BEARING** (don't boot without it): with
+`acpi=off`, ACPI enumeration is off, so the virtio-mmio vsock device is discovered ONLY via the
+`virtio_mmio.device=` cmdline firecracker appends — which requires that flag. A kernel lacking it boots
+clean + binds AF_VSOCK on LOOPBACK-only (no `virtio-mmio.0` probe), so firecracker cannot forward a host
+CONNECT and the relay's readiness gate correctly trips `FailNodeClosed` (verified: an earlier run on a
+non-CMDLINE kernel hung every dial — in-root, separate relay, and a manual unconfined `socat`/python
+sibling dial alike). This is exactly why the Finding-2 kernel-config guard exists; enable
+`CONFIG_IKCONFIG_PROC=y` in the shipped V5 kernel so that guard ASSERTS (not warns) at boot. The
+dispatch, in `supervise::run` (`crates/boatramp/src/privsep.rs`):
 
 1. The **root binds** the privileged public listener for the VM frontend (step 2, as for any `listen.*`
    holder) — the frontend's profile can then deny `bind`.

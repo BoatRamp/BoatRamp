@@ -259,7 +259,10 @@ fn try_http_get(port: u16) -> std::io::Result<String> {
     Ok(buf)
 }
 
-/// Parse `<key><digits>` out of the root log (tracing's `key=value` field format).
+/// Parse `<key><digits>` out of the root log (tracing's `key=value` field format). The log is
+/// ANSI-stripped first (see `read_log`), so `fc_pid=` / `relay_pid=` are contiguous — the tracing
+/// formatter otherwise wraps the `=` in SGR colour codes (`fc_pid\x1b[0m\x1b[2m=`), which would break a
+/// literal substring search.
 fn extract_pid(log: &str, key: &str) -> Option<u32> {
     let idx = log.find(key)? + key.len();
     let digits: String = log[idx..]
@@ -269,8 +272,34 @@ fn extract_pid(log: &str, key: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// Read the root log, STRIPPING ANSI/SGR escape sequences — the node's tracing emits colour codes even
+/// to a non-tty file sink, which would split `key=value` fields (e.g. `fc_pid=`) across escapes.
 fn read_log(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
+    strip_ansi(&std::fs::read_to_string(path).unwrap_or_default())
+}
+
+/// Remove ANSI CSI escape sequences (`\x1b[ … <final-byte>`), leaving plain text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC [ <params> <final>. The CSI introducer `[` (0x5B) is itself inside the final-byte
+            // range (0x40..=0x7E), so it must be SKIPPED first — otherwise the scan stops on `[` and
+            // leaves the params (e.g. `3m`) behind.
+            let mut first = true;
+            for c2 in chars.by_ref() {
+                if first {
+                    first = false; // the `[` introducer
+                } else if ('\u{40}'..='\u{7e}').contains(&c2) {
+                    break; // the final byte (e.g. `m`)
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Echo the guest serial console (SHIM-ALIVE / PRIVSEP VM GUEST SERVING / any fatal reason) on failure.

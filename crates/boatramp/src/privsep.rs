@@ -1511,13 +1511,14 @@ where
 ///
 /// **SAFE-SUBSET GATE (this cut).** That entire dispatch — [`supervise::run`]'s VM branch +
 /// [`per_tenant::spawn_vm_relay`] + the relay-side positive readiness gate ([`run_vm_relay_confined`] →
-/// [`crate::privsep_vm::relay_readiness_probe`]) — is BUILT + wired + its boot/fork/supervise/readiness/
-/// fail-closed-on-child-death path is live-proven on lighthouse. But `is_wired(Vm)` stays `false` and
-/// this arm REFUSES `substrate: vm` fail-closed, pending (a) a full live SERVE + kill→FailNodeClosed
-/// proof — blocked only by the Phase-3c firecracker↔guest vsock transport, which regressed in the live
-/// environment (it stops the pre-existing in-root serve gate too, NOT this dispatch) — and (b) the
-/// independent Security review of the TCB-critical seam. Flipping this arm + `is_wired(Vm)` is the final
-/// step. It refuses fail-closed for the scoped shape (gated) AND for:
+/// [`crate::privsep_vm::relay_readiness_probe`]) — is BUILT + wired and **LIVE-PROVEN end-to-end on
+/// lighthouse**: on a `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` guest kernel the operator path serves a 200
+/// over the SEPARATE confined `__vm-relay` (the readiness gate passes), and killing EITHER the relay
+/// child OR the firecracker child trips `FailNodeClosed` (serve + kill-after-serve, the committed
+/// `tests/privsep_vm_operator_live.rs`). But `is_wired(Vm)` stays `false` and this arm REFUSES
+/// `substrate: vm` fail-closed, pending ONLY the independent Security review of the TCB-critical seam —
+/// flipping this arm + `is_wired(Vm)` is the final step. It refuses fail-closed for the scoped shape
+/// (gated) AND for:
 /// - Any OTHER VM shape — a co-located sealer bundle (P1, which needs the owner-GATED vsock key-relay,
 ///   design §3 / S2), a backend, an exec/control instance — outside the approved scope entirely. (The
 ///   `plan_root` scope lint already refuses these; this is the defence-in-depth spawn-gate companion.)
@@ -1540,10 +1541,10 @@ fn resolve_spawn_backend(
         let reason = if crate::privsep_vm::is_scoped_static_parser_frontend(capabilities) {
             "it IS the owner-greenlit scoped shape (a key-free static-parser frontend), and the \
              operator supervise-dispatch (boot the guest + fork+supervise a separate `__vm-relay` with \
-             the relay-side positive readiness gate) is BUILT + wired — but it stays refused \
-             fail-closed pending a full live SERVE + kill→FailNodeClosed proof (the Phase-3c \
-             firecracker↔guest vsock transport must be re-confirmed live) AND the independent Security \
-             review of the TCB-critical boot/fork/supervise seam"
+             the relay-side positive readiness gate) is BUILT + wired + LIVE-PROVEN end-to-end on \
+             lighthouse (serves a 200 over the separate relay, and killing EITHER the relay or the \
+             firecracker child trips FailNodeClosed) — but it stays refused fail-closed pending ONLY \
+             the independent Security review of the TCB-critical boot/fork/supervise seam"
         } else {
             "it is NOT a key-free static-parser frontend (a group-C `listen.*`-only slice), so it is \
              outside the approved scope entirely — a co-located sealer bundle / backend / exec/control \
