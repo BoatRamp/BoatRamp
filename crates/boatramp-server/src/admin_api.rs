@@ -1217,6 +1217,50 @@ pub(super) async fn put_compute(
             }
         }
     }
+    // Likely-mistake advisory (PLAN-compute-dx #1): a `blob` binding resolves its namespace
+    // under the WORKLOAD name as the site-identity segment (`hblob/{project}/{workload}/…`),
+    // exactly as a `wasi:blobstore` handler uses its SITE name — so a workload shares a
+    // site's blob store ONLY when it is named after that site. A blob-bound workload whose
+    // name matches no known site almost certainly means the author expected to share a
+    // site's container but is silently writing to an invisible namespace of its own. Warn,
+    // never block; best-effort, so a site-list error just skips the advisory.
+    if request
+        .spec
+        .bindings
+        .iter()
+        .any(|b| b.kind == boatramp_core::compute::BindingKind::Blob)
+        && let Ok(sites) = deploy.all_sites(project.as_ref()).await
+        && boatramp_core::compute::blob_bind_names_unknown_site(
+            &name,
+            &request.spec.bindings,
+            &sites,
+        )
+    {
+        tracing::warn!(
+            project = %project.as_ref(), workload = %name,
+            "compute workload declares a `blob` binding but its name matches no site in the \
+             project; a blob bind resolves under the WORKLOAD name as the site segment \
+             (hblob/{{project}}/{{workload}}/…), so unless the workload is named after the \
+             site whose data it shares it reads/writes an empty namespace of its own — name \
+             it after that site (see `compute set --bind`)"
+        );
+    }
+    // Tenancy advisory (PLAN-compute-dx #3): opting into local-image reuse (a `pull_policy`
+    // other than `always`) with a MUTABLE `name:tag` is unsound on a node whose image store
+    // is shared across tenants — the tag could resolve to another tenant's (or a stale,
+    // poisoned) locally-cached image. A digest-pinned reference (`repo@sha256:…`) is sound
+    // and silent; `always` (the default) is always sound. Warn, never block.
+    if let boatramp_core::compute::RootSource::Image(reference) = &request.spec.root
+        && boatramp_core::compute::pull_reuse_is_unsound(request.spec.pull_policy, reference)
+    {
+        tracing::warn!(
+            workload = %name, image = %reference, pull_policy = ?request.spec.pull_policy,
+            "compute workload opts into local-image reuse (pull_policy != always) with a \
+             mutable image tag; the node's image store is shared across tenants, so this tag \
+             could resolve to another tenant's or a stale cached image — pin the image by \
+             digest (repo@sha256:…) for a sound reuse, or use pull_policy=always"
+        );
+    }
     let spec_hash = match deploy.put_compute_spec(&request.spec).await {
         Ok(hash) => hash,
         Err(err) => return deploy_error_response(err),

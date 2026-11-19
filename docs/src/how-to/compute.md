@@ -191,6 +191,43 @@ fails the pull **closed** — it is never silently downgraded to an anonymous pu
 anonymous pull happens only when no `--pull-secret` is set AND no operator host entry
 matches (a public image). A wrong/failed credential never echoes the token in an error.
 
+## Use a locally-loaded image (`--pull-policy`)
+
+By default boatramp **re-pulls** an `--image` from its registry on every launch. To run an
+image that lives only in the node's **local** image store — a `nix dockerTools` tarball you
+`docker load`'d, a `k3d image import`'d image, an air-gapped node — set a **pull policy** so
+the backend reuses the local image instead of reaching for a registry:
+
+```sh
+# Load a locally-built image, then deploy it without any registry round-trip:
+docker load < result            # nix dockerTools tarball -> acme/app:local
+boatramp compute set app --image acme/app:local --port 8080 \
+  --pull-policy if-not-present
+```
+
+| `--pull-policy` | Behavior | Equivalent |
+| --- | --- | --- |
+| `always` *(default)* | Re-pull from the registry every launch. | k8s `imagePullPolicy: Always` |
+| `if-not-present` | Reuse a locally-present image; pull only when absent. | `IfNotPresent` |
+| `never` | Require the image present locally; fail the launch if absent. | `Never` |
+
+The policy is honored on both the **docker** and **Kubernetes** backends (on k8s it maps
+straight to the pod's `imagePullPolicy`). A `--tar`/`--rootfs` source is staged from the
+content-addressed blob store and never pulled, so the policy is moot there.
+
+> **Tenancy caveat — prefer a digest.** A node's image store is **shared across every
+> tenant** on that node. Keyed by a *mutable* `name:tag`, a locally-cached image is ambient
+> state another tenant (or a stale earlier pull) can have populated with *different* bytes —
+> so `if-not-present`/`never` reuse is only **sound** for a **digest-pinned** reference
+> (`repo@sha256:…`, an immutable manifest). boatramp does not *refuse* a mutable-tag opt-in
+> (a locally-built image often has no registry digest), but it **logs a warning** at
+> `compute set` time. The default `always` is always safe. Pin by digest wherever you can:
+>
+> ```sh
+> boatramp compute set app --image acme/app@sha256:1a2b… --port 8080 \
+>   --pull-policy if-not-present      # sound reuse, no warning
+> ```
+
 ## Choose the isolation level
 
 `--isolation` decides which backend may run the workload:
@@ -374,6 +411,24 @@ Inspect a workload's desired state:
 boatramp compute get api
 ```
 
+## No-ingress workers (`--port 0`)
+
+`--port` is mandatory, but a workload that takes **no inbound traffic** — a pure bus
+consumer, a cron-style loop, a background worker that only *reaches out* (to a `--bind`ed
+store or the project bus) — has no port to serve. Pass **`--port 0`**: boatramp publishes
+no host port and the gateway never routes to it. (There is no separate `--worker` /
+`--no-ingress` flag; `0` is the no-ingress value.)
+
+```sh
+# A queue consumer with no HTTP surface:
+boatramp compute set mailroom --image acme/mail-consumer:1 --port 0 \
+  --bind messaging:deliver --bind blob
+```
+
+The docker health probe is **container-run-state**, not a port check, so a no-port
+consumer still reports healthy while its process is up — it does not need a listener to
+pass readiness.
+
 ## Docker workloads: read-only root, writable root, and volumes
 
 A docker (or native-container) workload runs **hardened** by default: a read-only
@@ -512,6 +567,16 @@ The `sql` endpoint above is the libsql / hrana shim. When the `sql` target is a
 `postgres://` / `mysql://` **DSN** (operator-templatable) — see [Use a managed
 Postgres/MySQL from a compute workload](#use-a-managed-postgresmysql-from-a-compute-workload-a-real-dsn)
 below.
+
+> **The workload name *is* the site segment.** A `kv`/`blob` binding resolves its
+> namespace under **this workload's name** as the site-identity segment —
+> `hblob/{project}/{workload}/…`, exactly as a `wasi:blobstore` handler uses its **site**
+> name. So a compute worker shares a site's data store **only when it is named after that
+> site**. A misnamed worker (say `mail-worker` binding `blob` while the site is `mailroom`)
+> silently reads and writes an *empty namespace of its own* — no error, just invisible data.
+> **Name the workload after the site** whose `kv`/`blob` data it shares. The server logs a
+> warning at `compute set` time when a `blob`-bound workload's name matches no known site in
+> the project. (There is no cross-name selector — the naming convention is the binding.)
 
 A bare `kv`/`blob` (no `:<name>`) is **site-wide** — the workload can read/write
 every bucket/container in the site's namespace; a bare `messaging` is

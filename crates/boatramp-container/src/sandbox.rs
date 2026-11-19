@@ -278,6 +278,7 @@ mod tests {
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
+            pull_policy: Default::default(),
         }
     }
 

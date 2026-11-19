@@ -477,6 +477,7 @@ mod tests {
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
+            pull_policy: Default::default(),
         };
         let hash = deploy.put_compute_spec(&spec).await.unwrap();
         deploy

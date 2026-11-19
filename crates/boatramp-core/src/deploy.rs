@@ -7592,6 +7592,7 @@ mod tests {
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
+            pull_policy: Default::default(),
         };
         // Content-addressed spec: storing returns the hash; re-reads match.
         let hash = s.put_compute_spec(&spec).await.unwrap();
@@ -8534,6 +8535,7 @@ mod tests {
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
+            pull_policy: Default::default(),
         };
         let hash = store.put_compute_spec(&spec).await.unwrap();
         store

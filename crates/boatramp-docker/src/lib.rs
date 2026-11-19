@@ -15,8 +15,8 @@
 use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
-    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource,
-    Scheme, VolumeInfo, VolumeRef, compute_instance_id, managed_db_alias,
+    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, PullPolicy, RestartPolicy,
+    RootSource, Scheme, VolumeInfo, VolumeRef, compute_instance_id, managed_db_alias,
 };
 use boatramp_core::registry_auth::RegistryAuth;
 use bollard::Docker;
@@ -575,6 +575,33 @@ fn image_pull_target(reference: &str) -> (String, String) {
     }
 }
 
+/// What `materialize` should do with an image under a given [`PullPolicy`], once it knows
+/// whether the image is already in the daemon's local store. Factored out of the daemon call
+/// path so the policy's semantics are unit-testable without a Docker daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullAction {
+    /// Reuse the locally-present image as-referenced (no registry round-trip).
+    UseLocal,
+    /// Pull the image from its registry.
+    Pull,
+    /// The image is absent and the policy forbids pulling — fail the materialize.
+    FailAbsent,
+}
+
+/// The pull decision for a `(PullPolicy, locally-present?)` pair:
+/// - [`PullPolicy::Always`] always pulls (never trusts the shared local store);
+/// - [`PullPolicy::IfNotPresent`] reuses a present image, else pulls;
+/// - [`PullPolicy::Never`] reuses a present image, else fails (no pull).
+fn pull_action(policy: PullPolicy, local_present: bool) -> PullAction {
+    match policy {
+        PullPolicy::Always => PullAction::Pull,
+        PullPolicy::IfNotPresent if local_present => PullAction::UseLocal,
+        PullPolicy::IfNotPresent => PullAction::Pull,
+        PullPolicy::Never if local_present => PullAction::UseLocal,
+        PullPolicy::Never => PullAction::FailAbsent,
+    }
+}
+
 /// Map a boatramp [`RestartPolicy`] to a Docker `HostConfig.restart_policy`.
 fn restart_policy(policy: RestartPolicy) -> DockerRestartPolicy {
     let name = match policy {
@@ -764,11 +791,35 @@ impl ComputeBackend for DockerBackend {
                 ));
             }
         };
-        // Authenticate the pull with the host-resolved registry credential (private
-        // image), or `None` for a public/anonymous pull. The credential is a sealed
-        // secret resolved fail-closed before launch — it never appears in config/argv.
-        let reference = self.pull_image(&reference, pull_auth).await?;
-        Ok(Artifact::Image { reference })
+        // Pull policy (PLAN-compute-dx #3 / `imagePullPolicy` parity). The DEFAULT
+        // (`Always`) re-pulls on every materialize — the safe posture, because the Docker
+        // daemon's image store is SHARED across every tenant on this node, so a mutable
+        // `name:tag` in it is ambient, poisonable state. `IfNotPresent`/`Never` reuse a
+        // locally-present image (a `docker load`'d tarball, a pre-pulled/pinned image) and
+        // are opt-in; reuse is sound only for a digest-pinned reference (surfaced by the
+        // set-time advisory in the server, not re-litigated here per launch). Only the
+        // non-`Always` policies consult the local store (via `inspect_image`) — `Always`
+        // never inspects, keeping the default path's behavior and cost identical to before.
+        let local_present = match spec.pull_policy {
+            PullPolicy::Always => false,
+            PullPolicy::IfNotPresent | PullPolicy::Never => self.image_present(&reference).await,
+        };
+        match pull_action(spec.pull_policy, local_present) {
+            // Authenticate the pull with the host-resolved registry credential (private
+            // image), or `None` for a public/anonymous pull. The credential is a sealed
+            // secret resolved fail-closed before launch — it never appears in config/argv.
+            PullAction::Pull => {
+                let reference = self.pull_image(&reference, pull_auth).await?;
+                Ok(Artifact::Image { reference })
+            }
+            // Reuse the locally-present image as-referenced — no registry round-trip.
+            PullAction::UseLocal => Ok(Artifact::Image { reference }),
+            PullAction::FailAbsent => Err(BackendError::Materialize(format!(
+                "image {reference} is not present in the local store and pull_policy=never \
+                 forbids pulling it; `docker load` / pull it first, or use \
+                 pull_policy=if-not-present (pull on absence) / always (always pull)"
+            ))),
+        }
     }
 
     async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
@@ -1919,6 +1970,17 @@ impl DockerBackend {
         })
     }
 
+    /// Whether `reference` is already present in the daemon's **local image store** — a
+    /// successful `inspect_image` (by name:tag or digest) means a launch can use it without
+    /// a registry pull. Any inspect error (a 404 "no such image", or a daemon hiccup) is
+    /// treated as "not present", so the caller falls back to a pull under `IfNotPresent` and
+    /// fails closed under `Never` — never a false "present". This is the `IfNotPresent` /
+    /// `Never` arm of [`materialize`](DockerBackend::materialize); see [`PullPolicy`] for the
+    /// shared-store tenancy caveat that keeps `Always` the default.
+    async fn image_present(&self, reference: &str) -> bool {
+        self.docker.inspect_image(reference).await.is_ok()
+    }
+
     /// The container's primary IPv4 address (the default bridge, or the first
     /// network it's attached to).
     async fn container_ip(&self, id: &str) -> Result<String, BackendError> {
@@ -2374,6 +2436,39 @@ mod tests {
         // A digest-pinned reference is passed whole, no tag.
         let d = "alpine@sha256:abc123";
         assert_eq!(image_pull_target(d), (d.into(), String::new()));
+    }
+
+    #[test]
+    fn pull_action_default_always_pulls_even_when_present() {
+        // The safe default re-pulls regardless of what the shared local store holds, so a
+        // locally-cached `name:tag` can never shadow the registry (the tenancy guarantee).
+        assert_eq!(pull_action(PullPolicy::Always, true), PullAction::Pull);
+        assert_eq!(pull_action(PullPolicy::Always, false), PullAction::Pull);
+    }
+
+    #[test]
+    fn pull_action_if_not_present_reuses_a_local_image() {
+        // The item-#3 capability: a locally-present image (a `docker load`'d tarball) is
+        // used WITHOUT a registry round-trip; an absent one still pulls.
+        assert_eq!(
+            pull_action(PullPolicy::IfNotPresent, true),
+            PullAction::UseLocal
+        );
+        assert_eq!(
+            pull_action(PullPolicy::IfNotPresent, false),
+            PullAction::Pull
+        );
+    }
+
+    #[test]
+    fn pull_action_never_requires_a_local_image() {
+        // `Never` reuses a present image and fails (never pulls) when absent — the
+        // air-gapped posture.
+        assert_eq!(pull_action(PullPolicy::Never, true), PullAction::UseLocal);
+        assert_eq!(
+            pull_action(PullPolicy::Never, false),
+            PullAction::FailAbsent
+        );
     }
 
     #[test]

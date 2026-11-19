@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use boatramp_core::compute::{ComputeSpec, RootSource, VolumeRef};
+use boatramp_core::compute::{ComputeSpec, PullPolicy, RootSource, VolumeRef};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
@@ -353,6 +353,7 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     let container = Container {
         name: "db".to_string(),
         image: Some(image.clone()),
+        image_pull_policy: image_pull_policy(spec.pull_policy),
         command: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
         env,
         ports: Some(vec![ContainerPort {
@@ -629,6 +630,24 @@ fn image_pull_secrets(ctx: &PlanContext) -> Option<Vec<LocalObjectReference>> {
     ctx.image_pull_secret
         .as_ref()
         .map(|name| vec![LocalObjectReference { name: name.clone() }])
+}
+
+/// The pod container's `imagePullPolicy` for a workload's [`PullPolicy`] — parity with the
+/// docker backend's local-reuse decision (PLAN-compute-dx #3). boatramp sets it explicitly
+/// on every launched container, rather than leaning on the apiserver's tag-dependent default
+/// (`:latest` becomes `Always`, any other tag becomes `IfNotPresent`), so the spec's policy
+/// is the single source of truth: the default [`PullPolicy::Always`] re-pulls on a k8s node's
+/// shared image store exactly as it does on docker, and the local-reuse opt-in is one field
+/// across both backends.
+fn image_pull_policy(policy: PullPolicy) -> Option<String> {
+    Some(
+        match policy {
+            PullPolicy::Always => "Always",
+            PullPolicy::IfNotPresent => "IfNotPresent",
+            PullPolicy::Never => "Never",
+        }
+        .to_string(),
+    )
 }
 
 /// The name of the per-workload env `Secret` (`<workload>-env`), passed through
@@ -949,6 +968,7 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
     let container = Container {
         name: "app".to_string(),
         image: Some(image),
+        image_pull_policy: image_pull_policy(spec.pull_policy),
         command: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
         env,
         ports: Some(vec![ContainerPort {
@@ -1680,6 +1700,33 @@ mod tests {
     }
 
     #[test]
+    fn image_pull_policy_defaults_to_always_and_honors_the_opt_in() {
+        // Parity with the docker backend (PLAN-compute-dx #3): the pod container's
+        // imagePullPolicy is set EXPLICITLY from the spec's `pull_policy`, default Always
+        // (never the apiserver's tag-dependent default), with the same local-reuse opt-in.
+        let app = |spec: &ComputeSpec| {
+            deployment_plan(&ctx("web-0"), spec)
+                .unwrap()
+                .deployment
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap()
+                .containers[0]
+                .image_pull_policy
+                .clone()
+        };
+        assert_eq!(app(&generic_spec()), Some("Always".to_string()));
+        let mut ifnp = generic_spec();
+        ifnp.pull_policy = PullPolicy::IfNotPresent;
+        assert_eq!(app(&ifnp), Some("IfNotPresent".to_string()));
+        let mut never = generic_spec();
+        never.pull_policy = PullPolicy::Never;
+        assert_eq!(app(&never), Some("Never".to_string()));
+    }
+
+    #[test]
     fn allowlisted_cap_add_rides_back_onto_the_hardened_container() {
         // The single-tenant posture `cap_add` escape hatch (the only posture that reaches
         // this shared-kernel backend) is honored: dropped-ALL, then the allowlisted caps
@@ -2239,6 +2286,7 @@ mod tests {
             pull_secret: None,
             bindings: Vec::new(),
             post_launch: Vec::new(),
+            pull_policy: Default::default(),
         }
     }
 
