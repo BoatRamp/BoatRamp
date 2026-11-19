@@ -1723,3 +1723,168 @@ fn relay_mount_ns_contains_pathname_uds_pivot() {
         "{PATHUDS_MARKER} (via sudo -n re-exec; see the child's probe detail above if captured)"
     );
 }
+
+// =============================================================================
+// PHASE-5 FAIL-CLOSED GATE — node SELF-HOSTING is refused end-to-end (not yet wired).
+// =============================================================================
+//
+// Phase-5 ("self-hosting") makes the node serve its OWN serve path — control-plane/admin API, the
+// gateway, the handler engine, the managed-DB/KV/blob backends — UNDER the privsep composition, not
+// only guest workloads. That serve path is NOT yet wired (today a `backend.*` instance serves only
+// the minimal stub; the authority-scoped node app router is the Phase-5 workstream, pending its own
+// Security review). The composition vocabulary exists (`[privsep].node_serve = node-self-host`,
+// `NodeServeMode`) and the root REFUSES it fail-closed in `plan_root` BEFORE any spawn, emitting the
+// greppable marker `PRIVSEP_NODE_SELF_HOST_UNWIRED` (`privsep::NODE_SELF_HOST_UNWIRED_MARKER`).
+//
+// This is the INVERTIBLE gate: today it asserts the node REFUSES to stand up and prints
+// `PRIVSEP NODE SELF-HOST REFUSED OK`. When the Phase-5 serve path + its Security review land, this
+// gate flips — like the `..._serves_end_to_end` gates above — to assert a real 200 from a
+// node-self-host instance and print a serve-OK marker instead (and `NodeServeMode::is_wired` flips
+// for `NodeSelfHost`). One mechanical inversion point; the composition fixture is otherwise identical
+// to the serving gates, so the diff is only the assertion + the marker.
+
+/// The marker literal the root emits + the CI greps (mirrors `privsep::NODE_SELF_HOST_UNWIRED_MARKER`;
+/// kept a literal here, like the other CI-grepped markers, so a drift in the const is caught).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+const NODE_SELF_HOST_UNWIRED_MARKER: &str = "PRIVSEP_NODE_SELF_HOST_UNWIRED";
+
+/// Live fail-closed gate for **Phase-5 node self-hosting**: an OTHERWISE-VALID privsep composition
+/// that additionally selects `node_serve: node-self-host` must be REFUSED by the root fail-closed,
+/// before any instance is spawned and before anything serves. Proves it end-to-end against the real
+/// binary: `boatramp __root` resolves the topology, runs its screens + lints, reaches the Phase-5
+/// self-host gate, and EXITS non-zero with the `PRIVSEP_NODE_SELF_HOST_UNWIRED` marker on stderr —
+/// never standing up a serving instance from the not-yet-wired self-host serve path (the "no silent
+/// downgrade to the stubbed serve" invariant).
+///
+/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]` like the other live gates;
+/// the CI `live gate (privsep)` job runs it via `--include-ignored` and greps the
+/// `PRIVSEP NODE SELF-HOST REFUSED OK` marker, so a silent skip / compile-out — or a regression that
+/// let self-hosting stand up unwired — fails the merge. INVERTIBLE: flip to a serve gate when Phase-5
+/// lands (see the section comment above).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live: forks boatramp __root for an otherwise-valid composition that selects \
+            `node_serve: node-self-host`; the root must refuse fail-closed (the Phase-5 self-host \
+            serve path is not wired) and exit with the PRIVSEP_NODE_SELF_HOST_UNWIRED marker, never \
+            serving; run via --include-ignored in the `live gate (privsep)` job"]
+fn privsep_node_self_host_refuses_fail_closed_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_boatramp");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("boatramp-privsep-selfhost-{}", std::process::id()));
+    let data_dir = tmp.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let port = free_port();
+    let cfg_path = tmp.join("boatramp.cfg");
+
+    // The SAME valid 4-instance composition the serving gate uses (edge/aux/ops/core: union == ALL,
+    // no forbidden co-residency, grants disjoint) — so the ONLY thing to refuse is `node_serve`.
+    // `node_serve: NodeSelfHost` asks the node to serve its own app router under privsep (Phase-5),
+    // which is NOT wired → the root must refuse before any spawn.
+    let cfg = format!(
+        r#"(
+    serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
+    privsep: (
+        instances: {{
+            "edge": (
+                capabilities: ["listen.public-tls", "listen.http-parse"],
+                sandbox: Derived,
+                links: ["to-core"],
+            ),
+            "aux": (
+                capabilities: [
+                    "listen.mail", "listen.overlay",
+                    "listen.s3ingress", "listen.inbound-tcp", "listen.gateway",
+                    "exec.wasmtime", "acme.dns-control",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "ops": (
+                capabilities: ["exec.compute", "control.admin-api"],
+                sandbox: Derived,
+                links: [],
+            ),
+            "core": (
+                capabilities: [
+                    "secrets.sealer", "token.signer", "image.signer", "overlay.dial-signer",
+                    "s3ingress.root", "cluster.join-signer",
+                    "backend.kv", "backend.sql", "backend.blob", "backend.messaging",
+                ],
+                sandbox: Derived,
+                links: ["to-core"],
+            ),
+        }},
+        links: {{ "to-core": (from: "edge", to: "core", transport: Local) }},
+        node_serve: NodeSelfHost,
+    ),
+)"#,
+        port = port,
+        data_dir = data_dir.display(),
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write the self-host privsep config");
+
+    let mut root = Command::new(bin)
+        .arg("__root")
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "boatramp=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn `boatramp __root`");
+
+    // The root must REFUSE at the Phase-5 gate and exit promptly — it never binds the listener, so a
+    // GET would never connect. Poll for the exit; if the node is still alive past the deadline it did
+    // NOT refuse (a regression that stood self-hosting up unwired) — kill it and fail LOUD (never a
+    // hang, never a silent serve).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Ok(Some(status)) = root.try_wait() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "`boatramp __root` did not refuse `node_serve: node-self-host` within 20s — the \
+                 Phase-5 self-host gate regressed (the node must fail closed, not stand up unwired)"
+            );
+        }
+        // Belt-and-suspenders: a self-host instance must NEVER serve while this gate is in force.
+        if try_http_get(&format!("127.0.0.1:{port}"))
+            .map(|r| r.contains("200"))
+            .unwrap_or(false)
+        {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "a `node_serve: node-self-host` composition served a 200 — self-hosting is NOT wired \
+                 and MUST be refused fail-closed, never served"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    let mut stderr = String::new();
+    if let Some(mut e) = root.stderr.take() {
+        let _ = e.read_to_string(&mut stderr);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert!(
+        !status.success(),
+        "the root must EXIT NON-ZERO refusing node self-hosting (it must not stand the node up), \
+         got a success exit.\n--- root stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains(NODE_SELF_HOST_UNWIRED_MARKER),
+        "the refusal must carry the invertible {NODE_SELF_HOST_UNWIRED_MARKER} marker (the Phase-5 \
+         self-host gate), got exit {:?}:\n--- root stderr ---\n{stderr}",
+        status.code(),
+    );
+
+    // The marker the CI gate greps — reached only after the root refused self-hosting fail-closed.
+    println!("PRIVSEP NODE SELF-HOST REFUSED OK");
+}

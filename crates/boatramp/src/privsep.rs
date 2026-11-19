@@ -56,8 +56,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use boatramp_core::privsep::{
-    CompositionReport, HostAuthority, InstanceSubstrate, LinkPurpose, PrivsepInstanceConfig,
-    check_composition_closure, check_sealed_signer_closure, check_vm_secret_blindness_closure,
+    CompositionReport, HostAuthority, InstanceSubstrate, LinkPurpose, PrivsepConfig,
+    PrivsepInstanceConfig, check_composition_closure, check_sealed_signer_closure,
+    check_vm_secret_blindness_closure,
 };
 use boatramp_node::privsep_resolve::{self, SecretBlindReport};
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,20 @@ pub enum PrivsepError {
     /// node down rather than serving degraded.
     #[error("privsep root supervisor: {0}")]
     Supervise(String),
+    /// The composition asked the node to SELF-HOST its own serve path under privsep
+    /// (`[privsep].node_serve = node-self-host`) — the node's OWN control-plane/admin API, gateway,
+    /// handler engine, and managed-DB/KV/blob backends served UNDER the composition, not only guest
+    /// workloads — but that serve path is **NOT YET WIRED** (design §Phase-5, pending its own
+    /// Security review). Refused fail-closed in the root BEFORE any spawn rather than silently
+    /// serving the node's REAL app from a stubbed / under-confined instance (the "no silent
+    /// downgrade" invariant). The marker [`NODE_SELF_HOST_UNWIRED_MARKER`] is greppable + invertible:
+    /// when the Phase-5 serve path lands it flips from this refusal to a live serve gate.
+    #[error(
+        "privsep node self-hosting refused: {0} — {marker}. Refusing fail-closed; use the default \
+         `node_serve = guest-workloads` composition until the Phase-5 self-host serve path is wired",
+        marker = NODE_SELF_HOST_UNWIRED_MARKER
+    )]
+    NodeSelfHostUnwired(String),
     /// A feature-instance runtime failure (sandbox derive/install, fd receive, or serve). The
     /// instance refuses to serve rather than degrade.
     #[error("privsep instance {label:?}: {reason}")]
@@ -257,6 +272,36 @@ impl RootPlan {
     }
 }
 
+/// The greppable, invertible marker the root emits when it refuses node self-hosting because the
+/// Phase-5 serve path is not wired (design §Phase-5). It is the counterpart of the live-serve
+/// markers the `live gate (privsep)` CI job greps (e.g. `PRIVSEP LIVE OK`): the `#[ignore]`d
+/// end-to-end gate asserts THIS marker today, and the SAME gate flips to assert a live serve marker
+/// once the self-host serve path + its Security review land — the single, mechanical inversion point.
+pub const NODE_SELF_HOST_UNWIRED_MARKER: &str = "PRIVSEP_NODE_SELF_HOST_UNWIRED";
+
+/// The root's fail-closed NODE SELF-HOSTING gate (design §Phase-5). Refuses a composition that asks
+/// the node to serve its OWN serve path (control-plane/admin API, gateway, handler engine, the
+/// managed-DB/KV/blob backends) UNDER the privsep composition — [`NodeServeMode::NodeSelfHost`] —
+/// because that serve path is **NOT YET WIRED** (today a `backend.*` instance serves only the minimal
+/// stub; the authority-scoped node app router is the Phase-5 workstream, pending its own Security
+/// review). A `None` / [`NodeServeMode::GuestWorkloads`] composition (every pre-Phase-5 node) is a
+/// NO-OP, so no running composition changes — this only refuses the not-yet-buildable self-host mode,
+/// loud and fail-closed, never a silent downgrade to the stubbed serve.
+///
+/// Mirrors [`resolve_spawn_backend`]'s substrate gate: keyed on a wired/not-wired vocabulary
+/// ([`NodeServeMode::is_wired`]), refusing BEFORE any allocation. Pure (host-testable). When the
+/// Phase-5 serve path lands, [`NodeServeMode::is_wired`] flips for `NodeSelfHost` and this gate
+/// admits it (and the `#[ignore]`d live gate inverts from the refusal marker to a live serve marker).
+fn check_node_self_host_gate(privsep: &PrivsepConfig) -> Result<(), PrivsepError> {
+    if privsep.node_serve.is_wired() {
+        return Ok(());
+    }
+    Err(PrivsepError::NodeSelfHostUnwired(format!(
+        "composition selects `node_serve = {}`, whose self-host serve path is not wired in this cut",
+        privsep.node_serve.tag()
+    )))
+}
+
 /// Build the root's authorized spawn plan — the PURE, fail-closed authorization gate
 /// (design §4.1, §5 inv4/inv6). Runs, in order and all before any spawn:
 /// 1. the secret-blind screen (F1/F11-A) over the resolved config;
@@ -316,6 +361,16 @@ where
     if has_per_tenant_template {
         privsep.per_tenant.validate()?;
     }
+
+    // 2d. NODE SELF-HOSTING gate (design §Phase-5): a composition that asks the node to serve its OWN
+    //     serve path (control-plane/admin API, gateway, handler engine, managed-DB/KV/blob backends)
+    //     UNDER the privsep composition (`node_serve = node-self-host`) is refused fail-closed — that
+    //     serve path is not yet wired (today a backend instance serves only the minimal stub; the
+    //     authority-scoped node app router is the Phase-5 workstream, pending its own Security
+    //     review). A `guest-workloads` (the default) composition is a no-op here, so no running
+    //     composition changes; this only refuses the not-yet-buildable self-host mode, loud and
+    //     fail-closed, before any spawn — never a silent downgrade to the stubbed serve.
+    check_node_self_host_gate(privsep)?;
 
     // 3. The per-instance re-exec spawn spec (F11-B minimal env). Reached ONLY after
     //    both gates pass — so a refused composition yields no spawn spec at all.
@@ -4615,8 +4670,8 @@ mod instance_serve {
 #[cfg(test)]
 mod tests {
     use boatramp_core::privsep::{
-        InstanceLifecycle, InstanceSubstrate, LinkPurpose, LinkTransport, PerTenantPolicy,
-        PrivsepConfig, PrivsepLink, SandboxPosture,
+        InstanceLifecycle, InstanceSubstrate, LinkPurpose, LinkTransport, NodeServeMode,
+        PerTenantPolicy, PrivsepConfig, PrivsepLink, SandboxPosture,
     };
 
     use super::*;
@@ -4769,6 +4824,7 @@ mod tests {
             links,
             supervisor: None,
             per_tenant: PerTenantPolicy::default(),
+            node_serve: NodeServeMode::default(),
         }
     }
 
@@ -4847,6 +4903,56 @@ mod tests {
         assert!(
             matches!(err, PrivsepError::Composition(_)),
             "a crown-jewel co-residency is a composition refusal, got {err:?}"
+        );
+    }
+
+    // ---- Phase-5: the node self-hosting gate (vocabulary + fail-closed refusal) ----
+
+    #[test]
+    fn node_self_host_mode_is_refused_fail_closed_before_any_spawn_spec() {
+        // The DEFAULT mode (guest-workloads) is the Phase-1..4 wired behavior — the gate is a no-op
+        // and a clean composition still authorizes (no running composition changes).
+        assert_eq!(NodeServeMode::default(), NodeServeMode::GuestWorkloads);
+        assert!(NodeServeMode::GuestWorkloads.is_wired());
+        assert!(!NodeServeMode::NodeSelfHost.is_wired());
+        assert!(NodeServeMode::NodeSelfHost.is_node_self_host());
+        let clean = clean_privsep();
+        assert_eq!(clean.node_serve, NodeServeMode::GuestWorkloads);
+        check_node_self_host_gate(&clean).expect("the default guest-workloads mode is wired");
+        plan_root(
+            &cfg_with(Some(clean)),
+            Path::new("boatramp.cfg"),
+            fake_env(),
+        )
+        .expect("a clean guest-workloads composition still authorizes");
+
+        // Selecting node self-hosting (the Phase-5 target) is REFUSED fail-closed — the serve path
+        // is not wired. The pure gate refuses with the greppable, invertible marker...
+        let mut privsep = clean_privsep();
+        privsep.node_serve = NodeServeMode::NodeSelfHost;
+        let gate_err = check_node_self_host_gate(&privsep)
+            .expect_err("node self-hosting must be refused until its serve path is wired");
+        assert!(
+            matches!(&gate_err, PrivsepError::NodeSelfHostUnwired(_)),
+            "node self-hosting is its own fail-closed refusal, got {gate_err:?}"
+        );
+        assert!(
+            gate_err.to_string().contains(NODE_SELF_HOST_UNWIRED_MARKER),
+            "the refusal must carry the invertible marker {NODE_SELF_HOST_UNWIRED_MARKER:?}, got: {gate_err}"
+        );
+
+        // ...and the gate is WIRED INTO `plan_root`, so the whole root authorization refuses
+        // end-to-end BEFORE any spawn spec is produced (a not-yet-buildable self-host composition
+        // never spawns — the same posture as the secret-blind / closure refusals above).
+        let err = plan_root(
+            &cfg_with(Some(privsep)),
+            Path::new("boatramp.cfg"),
+            fake_env(),
+        )
+        .expect_err("plan_root must refuse node self-hosting end-to-end before any spawn");
+        assert!(
+            matches!(err, PrivsepError::NodeSelfHostUnwired(_)),
+            "plan_root must surface the self-host refusal, got {err:?}"
         );
     }
 
@@ -5266,6 +5372,7 @@ mod tests {
             links,
             supervisor: None,
             per_tenant: PerTenantPolicy::default(),
+            node_serve: NodeServeMode::default(),
         };
         let out = compute_authority_serve_links(&cfg_with(Some(p)));
         // The crown-jewel SIGNER end is designated to serve WS-E on `to-sign`.
@@ -5311,6 +5418,7 @@ mod tests {
             links,
             supervisor: None,
             per_tenant: PerTenantPolicy::default(),
+            node_serve: NodeServeMode::default(),
         }));
         // ...IS designated (so the designation is not what stops it)...
         assert!(
@@ -5374,6 +5482,7 @@ mod tests {
             links,
             supervisor: None,
             per_tenant: PerTenantPolicy::default(),
+            node_serve: NodeServeMode::default(),
         }));
 
         // The marker designates the crown-jewel SIGNER to serve on the link EVEN THOUGH the peer is a
@@ -5702,6 +5811,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             links: link(LinkPurpose::Unspecified),
             supervisor: None,
             per_tenant: PerTenantPolicy::default(),
+            node_serve: NodeServeMode::default(),
         }));
         assert!(
             compute_authority_serve_links(&unspec)
@@ -5714,6 +5824,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             links: link(LinkPurpose::Relay),
             supervisor: None,
             per_tenant: PerTenantPolicy::default(),
+            node_serve: NodeServeMode::default(),
         }));
         assert!(
             compute_authority_serve_links(&relay).is_empty(),
@@ -5830,6 +5941,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             links,
             supervisor: None,
             per_tenant: PerTenantPolicy::default(),
+            node_serve: NodeServeMode::default(),
         }
     }
 
