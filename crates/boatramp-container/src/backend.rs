@@ -2168,7 +2168,7 @@ impl ContainerBackend {
             .map_err(|e| BackendError::Launch(format!("veth host setup: {e}")))?;
 
         let mut child = tokio::process::Command::new(&self.self_exe)
-            .arg("__sandbox")
+            .arg(crate::worker::SANDBOX_SUBCOMMAND)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2431,7 +2431,7 @@ impl ContainerBackend {
             .map_err(|e| BackendError::Launch(format!("veth host setup: {e}")))?;
 
         let mut child = tokio::process::Command::new(&self.self_exe)
-            .arg("__sandbox")
+            .arg(crate::worker::SANDBOX_SUBCOMMAND)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

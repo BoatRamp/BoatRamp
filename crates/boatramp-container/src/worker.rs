@@ -76,6 +76,70 @@ impl fmt::Display for WorkerError {
 
 impl std::error::Error for WorkerError {}
 
+/// The re-exec subcommand the native container launcher invokes for each
+/// workload: `<self_exe> __sandbox`. The host binary (and any embedder of
+/// [`ContainerBackend`](crate::backend::ContainerBackend)) routes this argv[1]
+/// to [`run_sandbox_worker`], which runs the self-jail worker in that process.
+///
+/// Mirrors the embedded VMM backend's `VMM_RUN_SUBCOMMAND`: the launcher and the
+/// dispatcher share this one constant instead of hardcoding the string in two
+/// places, so embedding the container backend's re-exec target is a one-liner.
+pub const SANDBOX_SUBCOMMAND: &str = "__sandbox";
+
+/// A failure in the [`run_sandbox_worker`] re-exec handshake (reading/parsing the
+/// plan, the `ready`/`go` exchange, or applying the plan). Distinct from
+/// [`WorkerError`] (which covers only the plan-application syscalls): this wraps
+/// the whole stdin-plan → `ready` → `go` → [`jail_and_run`] sequence the launcher
+/// drives, so an embedder's dispatcher can surface it verbatim. Each variant's
+/// `Display` + `source()` mirror the message the host binary emitted when this
+/// sequence lived in `main`, so the rendered error is unchanged.
+#[derive(Debug)]
+pub enum RunSandboxError {
+    /// Reading the `SandboxPlan` JSON line from stdin.
+    PlanRead(std::io::Error),
+    /// The stdin line did not parse as a `SandboxPlan`.
+    PlanParse(serde_json::Error),
+    /// Setting up the cgroup + namespaces ([`prepare`]) failed.
+    Prepare(WorkerError),
+    /// Writing the `ready` handshake line to stdout failed.
+    Ready(std::io::Error),
+    /// Reading the launcher's `go` handshake line failed.
+    Go(std::io::Error),
+    /// The launcher sent something other than `go`.
+    Handshake { got: String },
+    /// Forking/jailing the container init and exec'ing ([`jail_and_run`]) failed.
+    Worker(WorkerError),
+}
+
+impl fmt::Display for RunSandboxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RunSandboxError::PlanRead(e) => write!(f, "reading sandbox plan: {e}"),
+            RunSandboxError::PlanParse(e) => write!(f, "invalid sandbox plan: {e}"),
+            RunSandboxError::Prepare(e) => write!(f, "sandbox prepare: {e}"),
+            RunSandboxError::Ready(e) => write!(f, "sandbox ready signal: {e}"),
+            RunSandboxError::Go(e) => write!(f, "sandbox go signal: {e}"),
+            RunSandboxError::Handshake { got } => {
+                write!(f, "sandbox handshake aborted (expected 'go', got {got:?})")
+            }
+            RunSandboxError::Worker(e) => write!(f, "sandbox worker: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RunSandboxError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RunSandboxError::PlanRead(e) | RunSandboxError::Ready(e) | RunSandboxError::Go(e) => {
+                Some(e)
+            }
+            RunSandboxError::PlanParse(e) => Some(e),
+            RunSandboxError::Prepare(e) | RunSandboxError::Worker(e) => Some(e),
+            RunSandboxError::Handshake { .. } => None,
+        }
+    }
+}
+
 /// Set up the cgroup and `unshare` the namespaces, but do **not** fork yet.
 ///
 /// Split from [`jail_and_run`] so the caller (the `boatramp __sandbox`
@@ -152,6 +216,67 @@ pub fn jail_and_run(plan: &SandboxPlan) -> Result<i32, WorkerError> {
 pub fn run(plan: &SandboxPlan) -> Result<i32, WorkerError> {
     prepare(plan)?;
     jail_and_run(plan)
+}
+
+/// The container self-jail worker's re-exec entrypoint (the `__sandbox` /
+/// [`SANDBOX_SUBCOMMAND`] subcommand): read a [`SandboxPlan`](crate::sandbox::SandboxPlan)
+/// as JSON on stdin, run the launcher handshake, apply the plan, and `execve` the
+/// entrypoint. On success this **never returns** — the forked container init
+/// `execve`s and the parent [`process::exit`](std::process::exit)s with its code;
+/// it returns only on a handshake/setup failure.
+///
+/// The sequence (byte-for-byte what the launcher in
+/// [`backend`](crate::backend) drives from the host side):
+/// 1. read the `SandboxPlan` JSON (line 1 of stdin),
+/// 2. [`prepare`] the cgroup + namespaces (we are now in our own netns),
+/// 3. write `ready\n` to stdout — tells the launcher to move the veth peer into
+///    our netns + write the uid/gid maps,
+/// 4. block for the launcher's `go\n`,
+/// 5. [`jail_and_run`] — fork the init, build the jail, `execve` the entrypoint,
+///    then exit with the init's status.
+///
+/// The host binary dispatches `argv[1] == SANDBOX_SUBCOMMAND` straight here; an
+/// embedder of [`ContainerBackend`](crate::backend::ContainerBackend) does the
+/// same, so the backend's re-exec target needs no reimplementation. Mirrors the
+/// embedded VMM backend's `run_jailed_worker` counterpart (boatramp-firecracker).
+///
+/// Must be called while the process is still **single-threaded** (before any
+/// async runtime is built): step 5 `fork`s, which is unsafe once sibling threads
+/// exist. The host binary guards this by dispatching the subcommand before it
+/// builds its Tokio runtime.
+pub fn run_sandbox_worker() -> Result<(), RunSandboxError> {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut reader = std::io::BufReader::new(stdin.lock());
+
+    // Line 1: the SandboxPlan as JSON.
+    let mut plan_line = String::new();
+    reader
+        .read_line(&mut plan_line)
+        .map_err(RunSandboxError::PlanRead)?;
+    let plan: SandboxPlan =
+        serde_json::from_str(plan_line.trim()).map_err(RunSandboxError::PlanParse)?;
+
+    // Set up the cgroup + namespaces (we're now in our own netns).
+    prepare(&plan).map_err(RunSandboxError::Prepare)?;
+
+    // Network handshake: tell the launcher we've unshared (so it can move the
+    // veth peer into our netns + configure eth0), then block for its "go".
+    {
+        let mut out = std::io::stdout().lock();
+        out.write_all(b"ready\n")
+            .and_then(|()| out.flush())
+            .map_err(RunSandboxError::Ready)?;
+    }
+    let mut go = String::new();
+    reader.read_line(&mut go).map_err(RunSandboxError::Go)?;
+    if go.trim() != "go" {
+        return Err(RunSandboxError::Handshake { got: go });
+    }
+
+    // Fork the container init, jail it, and exec the entrypoint.
+    let code = jail_and_run(&plan).map_err(RunSandboxError::Worker)?;
+    std::process::exit(code);
 }
 
 /// The cgroup v2 root the worker creates per-instance cgroups under.
@@ -703,6 +828,53 @@ mod tests {
                 false
             )),
             128 + 9
+        );
+    }
+
+    #[test]
+    fn sandbox_subcommand_and_worker_are_exported() {
+        // The launcher (`backend`) and the host/embedder dispatcher share this exact
+        // string via the constant instead of hardcoding it in two places.
+        assert_eq!(SANDBOX_SUBCOMMAND, "__sandbox");
+        // The re-exec worker entrypoint is a public item an embedder can route its
+        // `__sandbox` subcommand straight to. Type-level only — never invoked here
+        // (it reads stdin, forks, and `execve`s).
+        let _worker: fn() -> Result<(), RunSandboxError> = run_sandbox_worker;
+    }
+
+    #[test]
+    fn run_sandbox_error_messages_match_the_lifted_originals() {
+        // These Display strings are the host binary's rendered errors from before the
+        // handshake was lifted out of `main`; keep them byte-identical so an embedder
+        // (and the shipped CLI) surface the same message.
+        let io = || std::io::Error::new(std::io::ErrorKind::BrokenPipe, "x");
+        assert_eq!(
+            RunSandboxError::PlanRead(io()).to_string(),
+            "reading sandbox plan: x"
+        );
+        assert_eq!(
+            RunSandboxError::Ready(io()).to_string(),
+            "sandbox ready signal: x"
+        );
+        assert_eq!(
+            RunSandboxError::Go(io()).to_string(),
+            "sandbox go signal: x"
+        );
+        assert_eq!(
+            RunSandboxError::Handshake {
+                got: "nope\n".into()
+            }
+            .to_string(),
+            "sandbox handshake aborted (expected 'go', got \"nope\\n\")"
+        );
+        // The wrapping variants' `source()` is the underlying error, so the host's
+        // `caused by:` chain is unchanged.
+        use std::error::Error as _;
+        assert!(RunSandboxError::PlanRead(io()).source().is_some());
+        assert!(
+            RunSandboxError::Handshake { got: String::new() }
+                .source()
+                .is_none()
         );
     }
 }

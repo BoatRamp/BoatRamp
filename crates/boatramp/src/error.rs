@@ -5,9 +5,11 @@
 //! aggregator that `#[from]`s each so the dispatch in `main` can propagate any of
 //! them with `?`. It carries no logic of its own: every command variant is
 //! `#[error(transparent)]` and delegates Display + `source()` to the module error
-//! it wraps. The exceptions are the handful of variants for the re-exec'd worker
-//! entrypoints (`__sandbox`, `__vmm-run`), whose failures originate in `main`
-//! itself rather than in a command module.
+//! it wraps — including the `__sandbox` worker, whose handshake now lives in
+//! `boatramp_container` (`RunSandboxError`) so an embedder of the container backend
+//! can reuse it. The exceptions are the variants for the re-exec'd VMM worker
+//! entrypoints (`__vmm-run`, `__vz-run`), whose `String`-typed failures originate
+//! at that process boundary rather than in a command module.
 
 /// Any failure surfaced by the `boatramp` CLI. `main` renders it (Display plus
 /// the `source()` chain) to stderr and exits non-zero.
@@ -175,36 +177,19 @@ pub enum CliError {
     Man(#[source] std::io::Error),
 
     // ---- re-exec'd worker entrypoints (Linux only) ----
-    // These run before/instead of the Tokio runtime and originate in `main`, so
-    // they carry their own typed variants rather than wrapping a command module.
-    /// `__sandbox`: reading the `SandboxPlan` JSON line from stdin.
+    // These run before/instead of the Tokio runtime, dispatched straight from
+    // `main`. `__sandbox` now delegates to `boatramp_container`'s `RunSandboxError`
+    // (so an embedder of the container backend reuses the same handshake); the VMM
+    // workers still carry their own typed variants for the `String` boundary.
+    /// `__sandbox`: the container self-jail worker's re-exec handshake (reading /
+    /// parsing the plan, the `ready`/`go` exchange, or applying the plan) failed.
+    /// The whole sequence lives in `boatramp_container` so an embedder of the
+    /// container backend can reuse it; its typed error carries Display + `source()`
+    /// here transparently, so the rendered message is unchanged from when the
+    /// handshake lived in `main`.
     #[cfg(target_os = "linux")]
-    #[error("reading sandbox plan: {0}")]
-    SandboxPlanRead(#[source] std::io::Error),
-    /// `__sandbox`: the stdin line did not parse as a `SandboxPlan`.
-    #[cfg(target_os = "linux")]
-    #[error("invalid sandbox plan: {0}")]
-    SandboxPlanParse(#[source] serde_json::Error),
-    /// `__sandbox`: setting up the cgroup + namespaces failed.
-    #[cfg(target_os = "linux")]
-    #[error("sandbox prepare: {0}")]
-    SandboxPrepare(#[source] boatramp_container::worker::WorkerError),
-    /// `__sandbox`: writing the `ready` handshake line to stdout failed.
-    #[cfg(target_os = "linux")]
-    #[error("sandbox ready signal: {0}")]
-    SandboxReady(#[source] std::io::Error),
-    /// `__sandbox`: reading the launcher's `go` handshake line failed.
-    #[cfg(target_os = "linux")]
-    #[error("sandbox go signal: {0}")]
-    SandboxGo(#[source] std::io::Error),
-    /// `__sandbox`: the launcher sent something other than `go`.
-    #[cfg(target_os = "linux")]
-    #[error("sandbox handshake aborted (expected 'go', got {got:?})")]
-    SandboxHandshake { got: String },
-    /// `__sandbox`: forking/jailing the container init and exec'ing failed.
-    #[cfg(target_os = "linux")]
-    #[error("sandbox worker: {0}")]
-    SandboxWorker(#[source] boatramp_container::worker::WorkerError),
+    #[error(transparent)]
+    Sandbox(#[from] boatramp_container::worker::RunSandboxError),
     /// `__vmm-run`: the config JSON argument was missing.
     #[cfg(target_os = "linux")]
     #[error("__vmm-run: missing config argument")]
