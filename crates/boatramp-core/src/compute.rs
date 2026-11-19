@@ -1839,6 +1839,12 @@ pub fn reconcile_plan_in(
             if matches!(activity, WorkloadActivity::Active)
                 && let Some(snapshot) = inst.snapshot.clone()
             {
+                // A wake restores the replica to Running (same node that holds its
+                // snapshot), so it reclaims the node's CPU/mem the pre-pass did NOT charge
+                // for a parked Zero replica. Debit the shared ledger here — exactly as a
+                // Launch does — so a later-ordered workload this pass sees the slot as taken
+                // and can't be placed on top of the waking replica (residual over-subscription).
+                capacity.reserve(inst.node, Reservation::of_spec(spec));
                 actions.push(Action::Restore {
                     snapshot,
                     node: inst.node,
@@ -6367,6 +6373,71 @@ mod tests {
                 .any(|e| e.contains("cannot resolve reservation")),
             "the unresolvable reservation is surfaced: {:?}",
             r.errors
+        );
+    }
+
+    /// Security F1: a scale-to-zero **wake** (`Action::Restore`) must debit the shared ledger
+    /// just like a Launch, or it re-opens over-subscription. A parked `Zero` replica holds no
+    /// CPU/mem (correctly skipped by the pre-pass), but if its workload goes `Active` the same
+    /// pass it restores to `Running` and reclaims the slot — so a later-ordered workload must
+    /// NOT be placed on top of it. Here `alpha` has a 5000-MiB `Zero` replica parked on an
+    /// 8192-MiB node and wakes this pass, while `beta` (sorts later, 5000 MiB) contends for the
+    /// same node: beta must stay unscheduled (10 GiB would not fit the 8 GiB node).
+    #[tokio::test]
+    async fn cumulative_binpack_a_scale_to_zero_wake_consumes_capacity() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        let alpha_hash = put_workload(&deploy, "alpha", 5000, 1).await;
+        put_workload(&deploy, "beta", 5000, 1).await;
+        // Park alpha's replica 0 as Zero (carrying its snapshot) on node 1 under the "fake"
+        // backend — the wake path the pre-pass deliberately doesn't charge until it restores.
+        let mut parked = zeroed("alpha", 0, 1);
+        parked.backend = "fake".into();
+        parked.active_spec = Some(alpha_hash);
+        deploy
+            .set_replica_state(crate::project::ProjectRef::DEFAULT, &parked)
+            .await
+            .unwrap();
+
+        let nodes = vec![fake_node()]; // 8192 MiB
+        let mut backends: BackendRegistry = BTreeMap::new();
+        // S2zBackend restores a parked replica (and launches beta's) under id "fake".
+        backends.insert("fake".into(), Arc::new(S2zBackend));
+        let policy = BackendPolicy::default();
+
+        // Active → alpha wakes (Restore, debiting 5000 MiB); beta contends for the rest.
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &FixedActivity(WorkloadActivity::Active),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(r.woke, 1, "alpha's Zero replica wakes: {:?}", r.errors);
+        assert_eq!(
+            r.launched, 0,
+            "beta must NOT launch on top of the waking replica: {:?}",
+            r.errors
+        );
+        let alpha = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "alpha")
+            .await
+            .unwrap();
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(alpha[0].phase, ReplicaPhase::Running, "alpha is awake");
+        let beta = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "beta")
+            .await
+            .unwrap();
+        assert_eq!(
+            beta.len(),
+            0,
+            "beta stays unscheduled — the wake was charged against the node"
         );
     }
 
