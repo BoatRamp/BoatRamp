@@ -1766,8 +1766,8 @@ jobs:
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
             --features sandbox --test privsep_live -- --include-ignored --nocapture 2>&1 | tee privsep-live.log
-          grep -qE 'test result: ok\. 7 passed' privsep-live.log \
-            || { echo "::error::privsep live gate did not run all seven tests (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 8 passed' privsep-live.log \
+            || { echo "::error::privsep live gate did not run all eight tests (silent skip or a failure)" >&2; exit 1; }
           grep -q 'PRIVSEP LIVE OK' privsep-live.log \
             || { echo "::error::privsep composition live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
           grep -q 'PRIVSEP SIGNER UNSEAL LIVE OK' privsep-live.log \
@@ -1782,6 +1782,8 @@ jobs:
             || { echo "::error::privsep VM-relay empty-netns egress gate never reached its marker (MED-1: the netless relay in its empty/loopback-only network namespace must DENY UDP egress — mutation: removing the netns reopens it — while still accept()ing the inherited listener + dialing the AF_UNIX vsock UDS; a regression that drops the netns wall, or a lost CAP_SYS_ADMIN/passwordless-sudo, fails here — see crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md §S1)" >&2; exit 1; }
           grep -q 'PRIVSEP VM RELAY PATHUDS OK' privsep-live.log \
             || { echo "::error::privsep VM-relay pathname-UDS pivot gate never reached its marker (INFO-1: the relay's minimal mount-ns pivot_root must DENY connect() to an out-of-view host pathname AF_UNIX socket — mutation: removing the mount-ns reopens it, empirically settling the pivot is open under the Landlock dir-view alone — while still dialing the in-view vsock UDS + accept()ing the inherited listener; a regression that drops the mount-ns wall, or a lost CAP_SYS_ADMIN/passwordless-sudo, fails here — see crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md §S1)" >&2; exit 1; }
+          grep -q 'PRIVSEP NODE SELF-HOST REFUSED OK' privsep-live.log \
+            || { echo "::error::privsep node-self-host refusal gate never reached its marker (Phase-5 scaffolding: node_serve=node-self-host MUST be refused fail-closed before any spawn until self-hosting is wired; a regression that lets it through — or a silent skip/compile-out of the test — fails here, and this grep inverts to a serve-gate when Phase-5 lands — see crates/boatramp/DESIGN-privsep-phase5-selfhost.md)" >&2; exit 1; }
   # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
   # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
   # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into
