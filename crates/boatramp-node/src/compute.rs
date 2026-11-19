@@ -546,6 +546,35 @@ pub async fn build_compute(
     // Native container backend (Linux only).
     #[cfg(target_os = "linux")]
     if bridge_ready {
+        // Per-port L2/L3 anti-spoof posture-gate: the container veths share the node bridge
+        // with the (anti-spoofed) VMM taps + every sibling (incl. managed Postgres), so each
+        // veth needs a per-port nftables filter or a malicious container can ARP/source-IP
+        // spoof a neighbor. Probe whether nft is usable ONCE here, then fail-closed on a
+        // multi-tenant host that can't install it (refuse launches) and warn-and-proceed on a
+        // single-tenant (operator-trusted) one. This is what makes retrofitting the filter
+        // onto the production backend safe on nft-less hosts.
+        let antispoof = match boatramp_container::probe_nft_bridge() {
+            Ok(()) => boatramp_container::AntiSpoof::Enforced,
+            Err(e) if strict => {
+                tracing::error!(
+                    reason = %e,
+                    "multi-tenant node: nftables bridge anti-spoof is UNAVAILABLE; the native \
+                     container backend will REFUSE every launch (a container veth cannot be \
+                     given per-port L2 isolation from its neighbors on the shared bridge). \
+                     Install nftables and grant this node CAP_NET_ADMIN, or run it single-tenant."
+                );
+                boatramp_container::AntiSpoof::RefuseMultiTenant
+            }
+            Err(e) => {
+                tracing::warn!(
+                    reason = %e,
+                    "single-tenant node: nftables bridge anti-spoof is unavailable; container \
+                     veths will have NO per-port L2/L3 anti-spoof (operator-trusted posture). \
+                     A MULTI-TENANT host REQUIRES nftables + CAP_NET_ADMIN for this backend."
+                );
+                boatramp_container::AntiSpoof::DisabledSingleTenant
+            }
+        };
         match worker_exe.map_or_else(std::env::current_exe, |p| Ok(p.to_path_buf())) {
             Ok(self_exe) => match boatramp_container::ContainerBackend::new(
                 storage.clone(),
@@ -555,6 +584,9 @@ pub async fn build_compute(
                 self_exe,
             ) {
                 Ok(c) => {
+                    // The per-veth anti-spoof posture decided above (fail-closed on a
+                    // multi-tenant nft-less host).
+                    let c = c.with_antispoof(antispoof);
                     // Single-tenant posture (`!strict`) may honor `cap_add`; multi-tenant
                     // keeps every capability dropped.
                     let c = c.with_cap_add_allowed(!strict);

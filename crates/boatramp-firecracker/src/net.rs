@@ -116,6 +116,158 @@ impl NodeNetwork {
     }
 }
 
+/// Build the per-port L2/L3 **anti-spoof** install commands for ANY bridge port — a VMM
+/// `tap-*` ([`TapNetwork`]) or a container `vth-*` (`boatramp-container`'s `VethNetwork`).
+/// `iface` is the host-side port name frames ingress on (matched as nft `iifname`),
+/// `table` is the dedicated `bridge`-family table that owns this port's rules (ONE table
+/// per port ⇒ teardown is a single atomic `delete table`, no rule-handle bookkeeping), and
+/// (`guest_ip`, `guest_mac`) is the single identity the port may source IP + ARP traffic as.
+///
+/// The chain is hooked at `prerouting` (priority `-300`) and **default-drops** any frame
+/// from this port whose source MAC isn't the pinned MAC, whose IPv4/ARP sender-IP isn't the
+/// pinned IP, whose ARP sender-**hardware** address isn't the pinned MAC, or whose ethertype
+/// is neither ARP nor IPv4 — so only correctly-sourced ARP + IPv4 from the pinned MAC leave
+/// the port. This is the shared primitive the VMM tap path and the container veth path BOTH
+/// call (the differing seam is just the iface/table/ip/mac), so the two backends can never
+/// drift to subtly different rulesets.
+///
+/// LOAD-BEARING INVARIANT: the nft-injection surface is closed ONLY because `iface` and
+/// `table` are slug-constrained by the caller. Both the VMM tap (`tap-<vm_id>`) and the
+/// container veth (`vth-<body>`) derive their names from either a
+/// `boatramp_core::validate_resource_name` id (`[A-Za-z0-9_-]`) or a base-36 digest
+/// (`[0-9a-z]`) — so the name interpolated into these `nft` tokens (and the `brl2-<port>`
+/// table name) can never carry a shell/nft metacharacter. If either caller ever loosens that
+/// naming, it MUST escape/validate the name itself before trusting it in a rule.
+pub fn antispoof_install_commands(
+    iface: &str,
+    table: &str,
+    guest_ip: &str,
+    guest_mac: &str,
+) -> Vec<HostCommand> {
+    // Interface names are quoted (they contain `-`); nft joins argv with spaces and
+    // re-lexes, so the literal quotes make `"tap-x"` / `"vth-x"` a single string token.
+    let iface = format!("\"{iface}\"");
+    vec![
+        HostCommand::new("nft", &["add", "table", "bridge", table]),
+        HostCommand::new(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "bridge",
+                table,
+                "antispoof",
+                "{ type filter hook prerouting priority -300 ; policy accept ; }",
+            ],
+        ),
+        // MAC anti-spoof: drop any frame not sourced from the pinned MAC.
+        HostCommand::new(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "bridge",
+                table,
+                "antispoof",
+                "iifname",
+                &iface,
+                "ether",
+                "saddr",
+                "!=",
+                guest_mac,
+                "drop",
+            ],
+        ),
+        // ARP anti-spoof: drop an ARP whose sender-protocol-address isn't the IP.
+        HostCommand::new(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "bridge",
+                table,
+                "antispoof",
+                "iifname",
+                &iface,
+                "arp",
+                "saddr",
+                "ip",
+                "!=",
+                guest_ip,
+                "drop",
+            ],
+        ),
+        // ARP sender-HARDWARE anti-spoof: drop an ARP whose sender MAC isn't the pinned MAC
+        // — blocks a gratuitous-ARP self-redirect that forges only the ARP-level hardware
+        // address (the frame's `ether saddr` could still be the pinned MAC, so the MAC rule
+        // above would not catch it).
+        HostCommand::new(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "bridge",
+                table,
+                "antispoof",
+                "iifname",
+                &iface,
+                "arp",
+                "saddr",
+                "ether",
+                "!=",
+                guest_mac,
+                "drop",
+            ],
+        ),
+        // IPv4 anti-spoof: drop an IP packet whose source address isn't the IP.
+        HostCommand::new(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "bridge",
+                table,
+                "antispoof",
+                "iifname",
+                &iface,
+                "ip",
+                "saddr",
+                "!=",
+                guest_ip,
+                "drop",
+            ],
+        ),
+        // Default-drop: anything that is neither ARP nor IPv4 from this port.
+        HostCommand::new(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "bridge",
+                table,
+                "antispoof",
+                "iifname",
+                &iface,
+                "ether",
+                "type",
+                "!=",
+                "{ arp, ip }",
+                "drop",
+            ],
+        ),
+    ]
+}
+
+/// The teardown for an [`antispoof_install_commands`] port: drop its dedicated `bridge`-family
+/// table in one atomic `delete table`. Best-effort at the call site (safe on a partial/absent
+/// install).
+pub fn antispoof_teardown_commands(table: &str) -> Vec<HostCommand> {
+    vec![HostCommand::new(
+        "nft",
+        &["delete", "table", "bridge", table],
+    )]
+}
+
 /// The per-tap L2/L3 **anti-spoof** binding (U16): the single guest IP + MAC a
 /// tap is permitted to source traffic as. Installed as a per-tap nftables `bridge`
 /// table so a guest cannot impersonate a neighbor at L2 (a forged source MAC — the
@@ -203,122 +355,17 @@ impl TapNetwork {
     /// that validation is ever loosened, this builder MUST escape/validate the name
     /// itself before trusting it in a rule.
     fn antispoof_commands(&self) -> Vec<HostCommand> {
-        let Some(f) = &self.filter else {
-            return Vec::new();
-        };
-        let table = self.filter_table();
-        // Interface names are quoted (they contain `-`); nft joins argv with spaces
-        // and re-lexes, so the literal quotes make `"tap-x"` a single string token.
-        let iface = format!("\"{}\"", self.tap_name);
-        vec![
-            HostCommand::new("nft", &["add", "table", "bridge", &table]),
-            HostCommand::new(
-                "nft",
-                &[
-                    "add",
-                    "chain",
-                    "bridge",
-                    &table,
-                    "antispoof",
-                    "{ type filter hook prerouting priority -300 ; policy accept ; }",
-                ],
+        match &self.filter {
+            // Delegate to the shared primitive both backends call (the container veth path
+            // installs the SAME ruleset on its `vth-*` host port), so they can never drift.
+            Some(f) => antispoof_install_commands(
+                &self.tap_name,
+                &self.filter_table(),
+                &f.guest_ip,
+                &f.guest_mac,
             ),
-            // MAC anti-spoof: drop any frame not sourced from the pinned MAC.
-            HostCommand::new(
-                "nft",
-                &[
-                    "add",
-                    "rule",
-                    "bridge",
-                    &table,
-                    "antispoof",
-                    "iifname",
-                    &iface,
-                    "ether",
-                    "saddr",
-                    "!=",
-                    &f.guest_mac,
-                    "drop",
-                ],
-            ),
-            // ARP anti-spoof: drop an ARP whose sender-protocol-address isn't the IP.
-            HostCommand::new(
-                "nft",
-                &[
-                    "add",
-                    "rule",
-                    "bridge",
-                    &table,
-                    "antispoof",
-                    "iifname",
-                    &iface,
-                    "arp",
-                    "saddr",
-                    "ip",
-                    "!=",
-                    &f.guest_ip,
-                    "drop",
-                ],
-            ),
-            // ARP sender-HARDWARE anti-spoof: drop an ARP whose sender MAC isn't the
-            // pinned MAC — blocks a gratuitous-ARP self-redirect that forges only the
-            // ARP-level hardware address (the frame's `ether saddr` could still be the
-            // pinned MAC, so the MAC rule above would not catch it).
-            HostCommand::new(
-                "nft",
-                &[
-                    "add",
-                    "rule",
-                    "bridge",
-                    &table,
-                    "antispoof",
-                    "iifname",
-                    &iface,
-                    "arp",
-                    "saddr",
-                    "ether",
-                    "!=",
-                    &f.guest_mac,
-                    "drop",
-                ],
-            ),
-            // IPv4 anti-spoof: drop an IP packet whose source address isn't the IP.
-            HostCommand::new(
-                "nft",
-                &[
-                    "add",
-                    "rule",
-                    "bridge",
-                    &table,
-                    "antispoof",
-                    "iifname",
-                    &iface,
-                    "ip",
-                    "saddr",
-                    "!=",
-                    &f.guest_ip,
-                    "drop",
-                ],
-            ),
-            // Default-drop: anything that is neither ARP nor IPv4 from this tap.
-            HostCommand::new(
-                "nft",
-                &[
-                    "add",
-                    "rule",
-                    "bridge",
-                    &table,
-                    "antispoof",
-                    "iifname",
-                    &iface,
-                    "ether",
-                    "type",
-                    "!=",
-                    "{ arp, ip }",
-                    "drop",
-                ],
-            ),
-        ]
+            None => Vec::new(),
+        }
     }
 
     /// Commands to create the tap, (optionally) install its anti-spoof filter, and
@@ -359,10 +406,7 @@ impl TapNetwork {
     pub fn teardown_commands(&self) -> Vec<HostCommand> {
         let mut cmds = Vec::new();
         if self.filter.is_some() {
-            cmds.push(HostCommand::new(
-                "nft",
-                &["delete", "table", "bridge", &self.filter_table()],
-            ));
+            cmds.extend(antispoof_teardown_commands(&self.filter_table()));
         }
         cmds.push(HostCommand::new("ip", &["link", "del", &self.tap_name]));
         cmds

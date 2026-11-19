@@ -69,9 +69,9 @@ pub mod seccomp;
 pub mod worker;
 
 #[cfg(target_os = "linux")]
-pub use backend::ContainerBackend;
-pub use net::VethNetwork;
+pub use backend::{AntiSpoof, ContainerBackend};
+pub use net::{VethFilter, VethNetwork};
 #[cfg(target_os = "linux")]
-pub use net::ensure_bridge;
+pub use net::{ensure_bridge, probe_nft_bridge};
 pub use sandbox::{CgroupLimits, Mount, Namespaces, SandboxPlan};
 pub use seccomp::default_allowlist;

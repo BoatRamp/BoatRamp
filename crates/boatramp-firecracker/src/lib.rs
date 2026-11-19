@@ -127,4 +127,6 @@ pub use embedded_backend::EmbeddedVmmBackend;
 
 pub use config::{FcMachine, MachineResources};
 pub use executor::{Executor, ExecutorConfig, Host, JailerConfig, LaunchPlan, Pid, RunningVm};
-pub use net::{HostCommand, NodeNetwork, TapNetwork};
+pub use net::{
+    HostCommand, NodeNetwork, TapNetwork, antispoof_install_commands, antispoof_teardown_commands,
+};

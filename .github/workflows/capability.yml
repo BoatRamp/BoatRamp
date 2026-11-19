@@ -132,6 +132,40 @@ jobs:
           grep -q 'ANTISPOOF-LIVE-OK:' antispoof.log \
             || { echo "::error::tap anti-spoof never reached the success marker (0 tests / silent skip / bypass?)" >&2; exit 1; }
 
+  # The native container backend's per-veth anti-spoof twin of `tap-antispoof`: proves the
+  # EXACT production filtered `VethNetwork::host_setup`/`teardown` path is accepted on a live
+  # kernel, and that a counter twin of the same ruleset drops every spoof shape (wrong MAC,
+  # spoofed source IP, spoofed ARP sender-IP, spoofed ARP sender-HW, non-ARP/non-IPv4
+  # ethertypes incl. 802.1Q VLAN + QinQ) injected FROM the container end of the veth, while
+  # EXACTLY the two legitimate frames are accepted. Needs root + nftables + CAP_NET_RAW
+  # (an AF_PACKET injector); no KVM, no secrets.
+  veth-antispoof:
+    name: container veth anti-spoof (nft L2 drops)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-veth-antispoof
+
+      - name: Host deps (nftables + iproute2 bridge tooling)
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2
+
+      - name: Install + drop-test the production veth anti-spoof ruleset (hard gate)
+        run: |
+          set -o pipefail
+          timeout -k 30 300 sudo -E env "PATH=$PATH" \
+            cargo test -p boatramp-container \
+            --test veth_antispoof_live \
+            veth_antispoof_accepts_production_rules_and_drops_spoofed_frames \
+            -- --ignored --nocapture 2>&1 | tee veth-antispoof.log
+          # Anti-silent-skip: the success marker prints ONLY after accept==2 + every spoof
+          # shape dropped + the production filtered host_setup/teardown accepted. 0 tests run
+          # (cfg'd out) or any silent skip never reaches it.
+          grep -q 'VETH-ANTISPOOF-LIVE-OK:' veth-antispoof.log \
+            || { echo "::error::container veth anti-spoof never reached the success marker (0 tests / silent skip / bypass?)" >&2; exit 1; }
+
   # Tier B — the native container backend: root + user namespaces + a veth bridge +
   # CRIU checkpoint/restore. Uses a busybox rootfs exported from the public busybox
   # image (a test-double, not a private artifact) plus a public pgvector image pulled
