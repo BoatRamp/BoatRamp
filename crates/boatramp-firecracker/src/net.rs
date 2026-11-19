@@ -190,9 +190,18 @@ impl TapNetwork {
 
     /// The anti-spoof install commands for `filter`: a dedicated `bridge`-family
     /// table hooked at `prerouting` that **default-drops** any frame from this tap
-    /// whose source MAC isn't the pinned MAC, whose IPv4/ARP source isn't the pinned
-    /// IP, or whose ethertype is neither ARP nor IPv4. Only correctly-sourced ARP +
-    /// IPv4 from the pinned MAC leave the port. Empty when there is no filter.
+    /// whose source MAC isn't the pinned MAC, whose IPv4/ARP sender-IP isn't the
+    /// pinned IP, whose ARP sender-**hardware** address isn't the pinned MAC, or
+    /// whose ethertype is neither ARP nor IPv4. Only correctly-sourced ARP + IPv4
+    /// from the pinned MAC leave the port. Empty when there is no filter.
+    ///
+    /// LOAD-BEARING INVARIANT: the nft-injection surface is closed ONLY because the
+    /// tap name is slug-constrained. `tap_name` is `tap-<vm_id>` where `vm_id` is
+    /// built from the project/workload, which `boatramp_core`'s `validate_resource_name`
+    /// restricts to `[A-Za-z0-9_-]` — so the name interpolated into these `nft` tokens
+    /// (and the `brl2-<tap>` table name) can never carry shell/nft metacharacters. If
+    /// that validation is ever loosened, this builder MUST escape/validate the name
+    /// itself before trusting it in a rule.
     fn antispoof_commands(&self) -> Vec<HostCommand> {
         let Some(f) = &self.filter else {
             return Vec::new();
@@ -248,6 +257,28 @@ impl TapNetwork {
                     "ip",
                     "!=",
                     &f.guest_ip,
+                    "drop",
+                ],
+            ),
+            // ARP sender-HARDWARE anti-spoof: drop an ARP whose sender MAC isn't the
+            // pinned MAC — blocks a gratuitous-ARP self-redirect that forges only the
+            // ARP-level hardware address (the frame's `ether saddr` could still be the
+            // pinned MAC, so the MAC rule above would not catch it).
+            HostCommand::new(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "bridge",
+                    &table,
+                    "antispoof",
+                    "iifname",
+                    &iface,
+                    "arp",
+                    "saddr",
+                    "ether",
+                    "!=",
+                    &f.guest_mac,
                     "drop",
                 ],
             ),
@@ -493,6 +524,14 @@ mod tests {
         assert!(lines.iter().any(
             |l| l.contains("ip saddr != 10.0.0.5 drop") && l.contains("iifname \"tap-web-0\"")
         ));
+        // ARP sender-HARDWARE anti-spoof bound to the pinned MAC (gratuitous-ARP
+        // self-redirect that forges only the ARP-level HW address).
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("arp saddr ether != 02:00:0a:00:00:05 drop")
+                    && l.contains("iifname \"tap-web-0\""))
+        );
         // Default-drop any non-ARP/non-IPv4 ethertype.
         assert!(
             lines

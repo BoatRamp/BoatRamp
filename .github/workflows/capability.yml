@@ -98,6 +98,40 @@ jobs:
           grep -qE 'running [1-9][0-9]* tests?' serve.log \
             || { echo "::error::serve path ran 0 tests" >&2; exit 1; }
 
+  # Tier A2 — per-tap L2/L3 anti-spoof (U16): on a real kernel with real nftables, prove
+  # the EXACT production `TapNetwork` setup/teardown command sequences load, then (via a
+  # counter-instrumented twin of the same ruleset) that every crafted spoof shape is
+  # dropped — wrong MAC, spoofed source IP, spoofed ARP sender-IP, spoofed ARP sender-HW,
+  # and non-ARP/non-IPv4 ethertypes including 802.1Q VLAN + QinQ — while EXACTLY the two
+  # legitimate frames (pinned-IP IPv4 + pinned ARP) are accepted. Needs root + nftables +
+  # /dev/net/tun; no KVM, no secrets.
+  tap-antispoof:
+    name: tap anti-spoof (nft L2 drops)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-tap-antispoof
+
+      - name: Host deps (nftables + iproute2 bridge tooling)
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2
+
+      - name: Install + drop-test the production anti-spoof ruleset (hard gate)
+        run: |
+          set -o pipefail
+          timeout -k 30 300 sudo -E env "PATH=$PATH" \
+            cargo test -p boatramp-firecracker --features embedded,backend \
+            --test antispoof_live \
+            tap_antispoof_accepts_production_rules_and_drops_spoofed_frames \
+            -- --ignored --nocapture 2>&1 | tee antispoof.log
+          # Anti-silent-skip: the success marker prints ONLY after accept==2 + every
+          # spoof shape dropped + the production ruleset accepted. 0 tests run (the
+          # embedded cfg compiled out) or any silent skip never reaches it.
+          grep -q 'ANTISPOOF-LIVE-OK:' antispoof.log \
+            || { echo "::error::tap anti-spoof never reached the success marker (0 tests / silent skip / bypass?)" >&2; exit 1; }
+
   # Tier B — the native container backend: root + user namespaces + a veth bridge +
   # CRIU checkpoint/restore. Uses a busybox rootfs exported from the public busybox
   # image (a test-double, not a private artifact) plus a public pgvector image pulled

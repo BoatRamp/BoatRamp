@@ -20,9 +20,10 @@
 //! part; the boot itself is the KVM-host (`compute-live`) seam.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -323,6 +324,11 @@ impl EmbeddedVmmBackend {
     /// the container backend's startup cgroup sweep. The PDEATHSIG re-arm in
     /// `run_jailed_worker` handles the common case going forward; this is the backstop
     /// for workers that predate it or raced its arming.
+    ///
+    /// ASSUMES ONE boatramp node process per host: it SIGKILLs *any* `__vmm-run` worker
+    /// (other than itself) and deletes *any* `tap-*` device on the box. Running a second
+    /// boatramp node on the same host would have its workers/taps reaped here, so this
+    /// is only ever called at node boot, before this backend has launched anything.
     pub fn sweep_orphans(&self) {
         // 1) Kill prior-incarnation workers (identified by their `__vmm-run` argv).
         let self_pid = std::process::id();
@@ -1054,15 +1060,37 @@ impl ComputeBackend for EmbeddedVmmBackend {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| BackendError::Other(format!("create snapshots dir: {e}")))?;
+        // A snapshot is sensitive: `.cfg` carries the full WorkerConfig (per-binding
+        // bearer TOKENS in `env`) and `.snap` is raw guest RAM. Lock the directory to
+        // `0700` and each file to `0600` so no non-root host process can read the
+        // tokens / RAM (closes the same U18 token-leak class as the argv fix). The dir
+        // perms are set explicitly (not umask-subject); the files are created `0600`
+        // from the start (never world-readable, even transiently).
+        tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| BackendError::Other(format!("secure snapshots dir perms: {e}")))?;
         let stem = dir.join(&id).display().to_string();
         let snap_path = format!("{stem}.snap");
         let cfg_path = format!("{stem}.cfg");
         // Persist the worker config so a restore can respawn without in-memory state.
         let cfg_json =
             serde_json::to_vec(&running.cfg).map_err(|e| BackendError::Other(e.to_string()))?;
-        tokio::fs::write(&cfg_path, cfg_json)
+        let mut cfg_file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&cfg_path)
+            .await
+            .map_err(|e| BackendError::Other(format!("create {cfg_path}: {e}")))?;
+        cfg_file
+            .write_all(&cfg_json)
             .await
             .map_err(|e| BackendError::Other(format!("write {cfg_path}: {e}")))?;
+        cfg_file
+            .flush()
+            .await
+            .map_err(|e| BackendError::Other(format!("flush {cfg_path}: {e}")))?;
 
         let snap_target = snap_path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -1076,8 +1104,14 @@ impl ComputeBackend for EmbeddedVmmBackend {
             // Stream the worker's snapshot output into the file as it writes it
             // (must drain concurrently — the RAM far exceeds the pipe buffer).
             let mut out = running.child.stdout.take().ok_or("no worker stdout")?;
-            let mut file =
-                File::create(&snap_target).map_err(|e| format!("create {snap_target}: {e}"))?;
+            // `0600`: the snapshot is raw guest RAM (secrets) — never world-readable.
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&snap_target)
+                .map_err(|e| format!("create {snap_target}: {e}"))?;
             std::io::copy(&mut out, &mut file).map_err(|e| format!("capture snapshot: {e}"))?;
             file.sync_all().ok();
             let status = running
