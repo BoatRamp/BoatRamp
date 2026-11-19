@@ -214,6 +214,11 @@ clean:
 # Publish the docs to the live boatramp instance + purge the Cloudflare cache.
 # Content-only (no image rebuild). Needs `boatramp` on PATH and BOATRAMP_TOKEN in
 # the env; CF_ZONE_ID + CF_PURGE_TOKEN enable the purge (skipped if unset).
+#
+# NOTE: as of the `deploy-docs` job in `.github/workflows/release.yml`, the live
+# docs are published AUTOMATICALLY at the end of every `vX.Y.Z` release (and can be
+# re-run on demand via that workflow's `deploy_docs` dispatch). This recipe is now
+# just the LOCAL/manual escape hatch — the release pipeline is the source of truth.
 deploy-docs server="https://docs.boatramp.dev" site="docs":
     #!/usr/bin/env bash
     set -euo pipefail

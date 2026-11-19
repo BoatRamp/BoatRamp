@@ -29,6 +29,20 @@ on:
         description: "GHCR multi-arch dry run → ghcr.io/<owner>/boatramp:ci-multiarch-test (amd64+arm64, UNSIGNED). No real tags touched."
         type: boolean
         default: false
+      # Docs-only dispatch: build the mdBook + sync it to docs.boatramp.dev using an
+      # ALREADY-RELEASED CLI binary, skipping every build/preflight/publish job. This is
+      # how the owner deploys a docs backlog (e.g. the v0.64→v0.65 content) or re-deploys
+      # on demand, independent of cutting a release. On a real `vX.Y.Z` tag the docs are
+      # deployed automatically by the terminal `deploy-docs` job (no input needed).
+      deploy_docs:
+        description: "Docs-only: build mdBook + sync to docs.boatramp.dev using the already-released CLI binary. Skips all build/preflight/publish jobs."
+        type: boolean
+        default: false
+      ref:
+        description: "Ref (tag/branch/SHA) to publish docs CONTENT from. Empty = the ref this run was dispatched against. Only used with deploy_docs."
+        type: string
+        default: ""
+        required: false
 
 permissions:
   contents: write # create the release + upload assets
@@ -54,7 +68,7 @@ jobs:
   preflight:
     # Skipped on the GHCR multi-arch dry run (that path exercises only the container
     # jobs). Runs on every other trigger — tag push AND the plain dispatch dry-run.
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.multiarch_test) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.multiarch_test || inputs.deploy_docs)) }}
     uses: ./.github/workflows/preflight-matrix.yml
     secrets: inherit
 
@@ -67,7 +81,7 @@ jobs:
     name: console SPA (Nix)
     # Skipped on the GHCR multi-arch dry run (containers build their console via Nix,
     # not this artifact). Runs on tag push and the plain dispatch dry-run.
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.multiarch_test) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.multiarch_test || inputs.deploy_docs)) }}
     runs-on: ubuntu-latest
     # Hard cap: a Nix/cachix step that WEDGES (the v0.44.0 release hung ~3h40m in a stuck
     # cachix push) must fail fast, not burn the 6h default. Generous vs a cold no-cache build.
@@ -103,7 +117,7 @@ jobs:
     needs: console-dist
     # Skipped on the GHCR multi-arch dry run (a plain `if` keeps the implicit
     # needs-success gate, so a real release still requires console-dist green).
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.multiarch_test) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.multiarch_test || inputs.deploy_docs)) }}
     runs-on: ${{ matrix.os }}
     # Hard cap on the per-target build (Nix static build + cachix read/push) — fail a wedge
     # fast instead of the 6h default. Per-leg (matrix.timeout): the Linux/Windows legs keep a
@@ -727,3 +741,108 @@ jobs:
           # cargo reads the crates.io token from this env var, so no `cargo login`.
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: just publish
+
+  # ── Publish the docs (docs.boatramp.dev), as a RELEASE STEP ─────────────────
+  # The live docs used to be pushed by hand (`just deploy-docs` with a token from a
+  # local `.env`), which drifted for months. This terminal job folds that into the
+  # pipeline: on a real `vX.Y.Z` tag it fires automatically once the release is
+  # actually OUT — it `needs:` the three shipping jobs (`release` = GitHub Release,
+  # `container` = GHCR images, `crates-io` = crates.io) and runs only if ALL three
+  # succeeded. It can also be run on demand via `workflow_dispatch` with
+  # `deploy_docs: true` (optionally a `ref:` to publish older content, e.g. a docs
+  # backlog or a re-deploy) — that path skips every build/preflight/publish job.
+  #
+  # NON-BLOCKING to the release by construction: it is terminal (nothing `needs:` it)
+  # and runs strictly AFTER the shipping jobs, so a docs-deploy failure cannot fail
+  # or un-ship the release (the binaries, images, and crates are already published).
+  # Its own failure still surfaces (the run goes red); we deliberately do NOT mark it
+  # `continue-on-error`, which would hide a broken docs deploy.
+  #
+  # It reuses the release's ALREADY-BUILT static musl `boatramp` binary (downloaded
+  # from the GitHub Release assets) rather than rebuilding the workspace — only
+  # `mdbook build docs` runs here. The publisher token is a GitHub Actions secret,
+  # read by the CLI from the `BOATRAMP_TOKEN` env var on the sync step ONLY and never
+  # placed on a command line or logged (Actions masks the secret in logs regardless).
+  deploy-docs:
+    name: deploy docs (docs.boatramp.dev)
+    needs: [release, container, crates-io]
+    if: >-
+      ${{ !cancelled() &&
+          (
+            (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+              && needs.release.result == 'success'
+              && needs.container.result == 'success'
+              && needs.crates-io.result == 'success')
+            || (github.event_name == 'workflow_dispatch' && inputs.deploy_docs)
+          ) }}
+    runs-on: ubuntu-latest
+    # Least privilege: only read access (download the release's musl binary asset). No
+    # packages / id-token / attestations here, unlike the publishing jobs above.
+    permissions:
+      contents: read
+    # Serialize live docs deploys (shared with the push-on-docs-change `deploy-docs.yml`
+    # workflow) so two publishes never race; don't cancel an in-flight sync.
+    concurrency:
+      group: deploy-docs
+      cancel-in-progress: false
+    timeout-minutes: 20
+    steps:
+      # Docs CONTENT: the tag on a release; the dispatch `ref` (or the dispatched ref
+      # when that is empty) on a manual run. `inputs.ref` is empty on a tag push.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Reuse the release's prebuilt static musl `boatramp` CLI — no workspace rebuild.
+      # On a tag push, grab THIS release's asset; on a manual dispatch, the latest
+      # published release's (the CLI version is independent of the docs content ref).
+      - name: Fetch the released boatramp CLI (musl)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="boatramp-x86_64-unknown-linux-musl.tar.xz"
+          tag=""
+          if [ "${{ github.event_name }}" = "push" ]; then tag="${{ github.ref_name }}"; fi
+          mkdir -p "$RUNNER_TEMP/dl" "$RUNNER_TEMP/bin"
+          # No positional tag ⇒ gh downloads the latest release's asset.
+          gh release download ${tag:+"$tag"} \
+            --repo "${{ github.repository }}" \
+            --pattern "$asset" \
+            --dir "$RUNNER_TEMP/dl"
+          tar -xJf "$RUNNER_TEMP/dl/$asset" -C "$RUNNER_TEMP/dl"
+          install -Dm755 \
+            "$RUNNER_TEMP/dl/boatramp-x86_64-unknown-linux-musl/boatramp" \
+            "$RUNNER_TEMP/bin/boatramp"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/boatramp" --version
+
+      - name: Install mdBook
+        env:
+          MDBOOK_VERSION: "0.5.2"
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build the book
+        run: mdbook build docs
+
+      # The ONLY step that sees the token. The CLI reads it from BOATRAMP_TOKEN (env),
+      # so it never appears on the command line; Actions masks the secret in logs. Do
+      # NOT add `set -x` / any debug dump of the environment here.
+      - name: Publish to docs.boatramp.dev
+        env:
+          BOATRAMP_TOKEN: ${{ secrets.BOATRAMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOATRAMP_TOKEN:-}" ]; then
+            echo "::error::BOATRAMP_TOKEN secret is not set — add it with:"
+            echo "::error::  gh secret set BOATRAMP_TOKEN --repo ${{ github.repository }}"
+            exit 1
+          fi
+          msg="docs @ ${{ github.event_name == 'push' && github.ref_name || github.sha }}"
+          boatramp sync docs/book \
+            --server https://docs.boatramp.dev --site docs -m "$msg"

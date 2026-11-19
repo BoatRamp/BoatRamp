@@ -78,6 +78,17 @@ versions.
 
 ### Changed
 
+- **The live documentation site (`docs.boatramp.dev`) is now published automatically by the release
+  pipeline, no longer by hand.** A terminal `deploy-docs` job in `.github/workflows/release.yml`
+  runs at the end of every `vX.Y.Z` release — after the GitHub Release, the GHCR images, and the
+  crates.io publish have all succeeded — and builds the mdBook, then `boatramp sync`s it to the live
+  site. It reuses the release's already-built static musl `boatramp` binary (no workspace rebuild)
+  and is non-blocking: being a terminal job that runs strictly after the shipping jobs, a docs-deploy
+  failure cannot fail or un-ship a release. The same job is re-runnable on demand via the workflow's
+  `deploy_docs` dispatch input (with an optional `ref`) for a docs backlog or a re-deploy. The
+  publisher token is the `BOATRAMP_TOKEN` repository secret, read by the CLI from the environment on
+  the sync step only (never logged). `just deploy-docs` remains as the local/manual escape hatch.
+
 - **The Kubernetes compute backend now sets an explicit `imagePullPolicy` on every launched pod
   container (default `Always`), from the spec's `pull_policy`.** Previously no policy was set, so
   the kube-apiserver's tag-dependent default applied — `Always` for a `:latest` tag but
