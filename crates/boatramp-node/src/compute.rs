@@ -504,7 +504,13 @@ pub async fn build_compute(
     #[cfg(target_os = "linux")]
     let shared_ip_authority: Option<boatramp_core::ipam::IpAuthority> =
         match boatramp_core::ipam::IpAuthority::new(&cfg.subnet) {
-            Ok(a) => Some(a),
+            // Release quarantine (U17): hold a just-released guest IP out of the fresh
+            // allocation scan for a cooldown, so a reissued IP — and its deterministic
+            // MAC = f(IP) — can't instantly route a new tenant into a prior tenant's
+            // stale-peer traffic. The stable-relaunch path (a replica reclaiming its own
+            // free address) bypasses it, so a container's endpoint stays stable across a
+            // stop+relaunch. Shared by both co-located backends on this bridge/subnet.
+            Ok(a) => Some(a.with_release_cooldown(std::time::Duration::from_secs(30))),
             Err(e) => {
                 tracing::warn!(%e, subnet = %cfg.subnet, "bad compute subnet; container + embedded-VMM backends disabled");
                 None
@@ -628,6 +634,13 @@ pub async fn build_compute(
                             Some(a) => vmm.with_ip_authority(a.clone()),
                             None => vmm,
                         };
+                        // Boot sweep (U17): SIGKILL prior-incarnation `__vmm-run` workers
+                        // (orphaned microVMs still holding taps after a node crash) and
+                        // delete their stale `tap-*` devices + anti-spoof tables BEFORE
+                        // the reconcile loop allocates — the in-memory registry doesn't
+                        // survive a restart. Best-effort; mirrors the container backend's
+                        // startup cgroup sweep.
+                        vmm.sweep_orphans();
                         backends.insert("vmm-embedded".to_string(), std::sync::Arc::new(vmm));
                     }
                     Err(e) => tracing::warn!(%e, "embedded VMM backend unavailable"),

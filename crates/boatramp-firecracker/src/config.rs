@@ -124,6 +124,36 @@ pub(crate) fn env_cmdline_fragment(env: &std::collections::BTreeMap<String, Stri
     format!(" boatramp.env={hex}")
 }
 
+/// The maximum length (bytes) of the ` boatramp.env=<hex>` cmdline fragment (U18).
+/// The x86_64 kernel `COMMAND_LINE_SIZE` is 2048 bytes (incl. the NUL) and the base
+/// cmdline + virtio-MMIO `device=` fragments already consume several hundred; cap the
+/// env fragment well under that (1024) so a large env fails FAST at launch with a
+/// clear error instead of being appended into an over-long cmdline the guest kernel
+/// silently truncates — a cryptic boot failure. (The guest-secret env ultimately
+/// wants an off-cmdline channel — MMDS/vsock — so it isn't world-readable in the
+/// guest's `/proc/cmdline` at all; this bound guards the interim cmdline path.)
+pub(crate) const MAX_ENV_CMDLINE_LEN: usize = 1024;
+
+/// Build the ` boatramp.env=<hex>` fragment and **reject** it if it exceeds
+/// [`MAX_ENV_CMDLINE_LEN`]. The embedded VMM launch path uses this (rather than the
+/// raw [`env_cmdline_fragment`]) so an over-large env surfaces as a clean launch
+/// error, not a silent guest boot failure.
+pub(crate) fn env_cmdline_fragment_bounded(
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    let frag = env_cmdline_fragment(env);
+    if frag.len() > MAX_ENV_CMDLINE_LEN {
+        return Err(format!(
+            "workload env is too large for the kernel cmdline: the `boatramp.env=` \
+             fragment is {} bytes (max {MAX_ENV_CMDLINE_LEN}); reduce the workload env \
+             or the assembled cmdline would exceed COMMAND_LINE_SIZE and the guest \
+             would fail to boot",
+            frag.len()
+        ));
+    }
+    Ok(frag)
+}
+
 /// The conventional gateway for a `/24`: the `.1` of the guest's network.
 fn gateway_ip(guest_ip: &str) -> String {
     match guest_ip.rsplit_once('.') {
@@ -272,6 +302,21 @@ mod tests {
             FcMachine::from_spec(&s, &resources()).boot_source.boot_args,
             "base boatramp.env=4b3d7600"
         );
+    }
+
+    #[test]
+    fn env_cmdline_fragment_is_length_bounded() {
+        // A modest env is accepted and byte-identical to the raw fragment.
+        let small = BTreeMap::from([("K".to_string(), "v".to_string())]);
+        assert_eq!(
+            env_cmdline_fragment_bounded(&small).unwrap(),
+            env_cmdline_fragment(&small)
+        );
+        // An env whose hex fragment would blow past MAX_ENV_CMDLINE_LEN is REFUSED
+        // (fail fast) rather than silently overflowing COMMAND_LINE_SIZE at boot.
+        let big = BTreeMap::from([("BIG".to_string(), "x".repeat(MAX_ENV_CMDLINE_LEN))]);
+        assert!(env_cmdline_fragment(&big).len() > MAX_ENV_CMDLINE_LEN);
+        assert!(env_cmdline_fragment_bounded(&big).is_err());
     }
 
     #[test]
