@@ -1078,14 +1078,75 @@ pub(super) async fn list_compute(
     }
 }
 
-/// Get one workload's desired state.
+/// A compact view of the workload's ACTIVE spec, surfaced alongside `compute get` so an
+/// operator can see WHAT a replica pulls (the image reference / source) and WITH WHICH
+/// credential (the project `pull_secret` NAME — never a value) without a separate
+/// spec-by-hash fetch. Additive: it rides as an `active_spec` key next to the workload's own
+/// fields, so an existing reader that ignores unknown keys is unaffected.
+#[derive(Serialize)]
+struct ActiveSpecView {
+    /// The active spec's content hash (`computever/<hash>`).
+    hash: String,
+    /// The root-source kind: `image`, `tar`, or `rootfs`.
+    source: &'static str,
+    /// The source reference — the OCI image reference for an `image` source, else the blob
+    /// hash for a staged `tar`/`rootfs`.
+    reference: String,
+    /// The project `pull_secret` NAME that authenticates an image pull, if the spec names one
+    /// (an image source only; absent otherwise). Never a credential value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pull_secret: Option<String>,
+}
+
+impl ActiveSpecView {
+    fn of(hash: &str, spec: &boatramp_core::compute::ComputeSpec) -> Self {
+        use boatramp_core::compute::RootSource;
+        let (source, reference) = match &spec.root {
+            RootSource::Image(r) => ("image", r.clone()),
+            RootSource::Tar(r) => ("tar", r.clone()),
+            RootSource::Rootfs(r) => ("rootfs", r.clone()),
+        };
+        Self {
+            hash: hash.to_string(),
+            source,
+            reference,
+            // `pull_secret` only authenticates an image pull; omit it for a non-image source.
+            pull_secret: matches!(spec.root, RootSource::Image(_))
+                .then(|| spec.pull_secret.clone())
+                .flatten(),
+        }
+    }
+}
+
+/// Get one workload's desired state, augmented with a compact [`ActiveSpecView`] of its
+/// ACTIVE spec (image reference / source + pull-secret name) so an operator reading `compute
+/// get` sees what is pulled and with which credential — the spec that a bare workload record
+/// only pointed at by hash.
 pub(super) async fn get_compute(
     State(deploy): State<DeployStore>,
     Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
 ) -> Response {
     match deploy.get_compute_workload(project.as_ref(), &name).await {
-        Ok(Some(workload)) => Json(workload).into_response(),
+        Ok(Some(workload)) => {
+            // Serialize the workload's own fields, then ride an additive `active_spec` key
+            // next to them. A failed/absent spec lookup degrades gracefully — the workload
+            // still returns, just without the spec summary (never a 500 for a status read).
+            let mut body = match serde_json::to_value(&workload) {
+                Ok(v) => v,
+                Err(_) => return Json(workload).into_response(),
+            };
+            if let Ok(Some(spec)) = deploy.get_compute_spec(&workload.active).await
+                && let Some(obj) = body.as_object_mut()
+            {
+                obj.insert(
+                    "active_spec".to_string(),
+                    serde_json::to_value(ActiveSpecView::of(&workload.active, &spec))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Json(body).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "no such workload\n").into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -2566,6 +2627,9 @@ fn readiness_to_json(readiness: Option<&boatramp_core::compute::Readiness>) -> s
         None => serde_json::json!({ "state": "pending" }),
         Some(Readiness::ProvisionFailed { reason }) => {
             serde_json::json!({ "state": "provision_failed", "reason": reason })
+        }
+        Some(Readiness::LaunchFailed { reason }) => {
+            serde_json::json!({ "state": "launch_failed", "reason": reason })
         }
         Some(Readiness::Provisioned) => serde_json::json!({ "state": "provisioned" }),
         Some(Readiness::ServiceReady) => serde_json::json!({ "state": "service_ready" }),
@@ -4721,6 +4785,15 @@ struct ReplicaStatusView {
     healthy: bool,
     /// `running` or `zero` (scaled-to-zero).
     phase: String,
+    /// Service-level readiness as the reconcile last persisted it: `starting`,
+    /// `service_ready`, `provisioned`, `provision_failed`, or `launch_failed`. Distinct
+    /// from `healthy` (runner/TCP-level) — a `launch_failed` replica never started at all,
+    /// so this is the signal that turns a once-silent launch failure into a visible one.
+    readiness: String,
+    /// The short failure reason for a `provision_failed` / `launch_failed` replica (the
+    /// backend error for a launch failure); absent otherwise. Carries no credential material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at: Option<u64>,
     /// Seconds since launch (`now - started_at`); `None` for older/restored records.
@@ -4730,6 +4803,7 @@ struct ReplicaStatusView {
 
 impl ReplicaStatusView {
     fn of(o: &boatramp_core::compute::ObservedInstance, now: u64) -> Self {
+        let (readiness, reason) = readiness_label(&o.readiness);
         Self {
             project: o.handle.project.clone(),
             workload: o.handle.workload.clone(),
@@ -4747,9 +4821,28 @@ impl ReplicaStatusView {
                 boatramp_core::compute::ReplicaPhase::Zero => "zero",
             }
             .to_string(),
+            readiness,
+            reason,
             started_at: o.started_at,
             age_secs: o.started_at.map(|s| now.saturating_sub(s)),
         }
+    }
+}
+
+/// Map a replica's [`Readiness`](boatramp_core::compute::Readiness) to the `(state, reason)`
+/// pair `compute status` renders per replica. The `state` token matches the one
+/// [`readiness_to_json`] uses for `db status`, so the two surfaces speak the same vocabulary;
+/// `reason` is set only for the two failure states.
+fn readiness_label(r: &boatramp_core::compute::Readiness) -> (String, Option<String>) {
+    use boatramp_core::compute::Readiness;
+    match r {
+        Readiness::Starting => ("starting".to_string(), None),
+        Readiness::ServiceReady => ("service_ready".to_string(), None),
+        Readiness::Provisioned => ("provisioned".to_string(), None),
+        Readiness::ProvisionFailed { reason } => {
+            ("provision_failed".to_string(), Some(reason.clone()))
+        }
+        Readiness::LaunchFailed { reason } => ("launch_failed".to_string(), Some(reason.clone())),
     }
 }
 

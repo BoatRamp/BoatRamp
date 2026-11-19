@@ -710,7 +710,11 @@ async fn ensure_database(
                     waited: true,
                 });
             }
-            "provision_failed" => {
+            // A terminal failure — stop waiting and surface the reason now. `launch_failed`
+            // (the backend `launch` Err'd, e.g. an image-pull denial) is as terminal as a
+            // `provision_failed`: polling will not clear it without an operator fix, so fail
+            // fast instead of burning the whole `--wait` budget.
+            "provision_failed" | "launch_failed" => {
                 return Err(Error::EnsureFailed {
                     name: name.to_string(),
                     reason: reason.unwrap_or_else(|| "unknown".to_string()),

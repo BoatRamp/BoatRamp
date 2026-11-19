@@ -820,8 +820,8 @@ fn write_status(states: &[serde_json::Value], w: &mut dyn std::io::Write) -> std
     }
     writeln!(
         w,
-        "{:<28}  {:>3}  {:<7}  {:<21}  {:<7}  {:>6}  BACKEND",
-        "PROJECT/WORKLOAD", "REP", "HEALTHY", "ENDPOINT", "PHASE", "AGE"
+        "{:<28}  {:>3}  {:<7}  {:<21}  {:<7}  {:<16}  {:>6}  BACKEND",
+        "PROJECT/WORKLOAD", "REP", "HEALTHY", "ENDPOINT", "PHASE", "READINESS", "AGE"
     )?;
     for s in states {
         let owner = format!(
@@ -841,14 +841,23 @@ fn write_status(states: &[serde_json::Value], w: &mut dyn std::io::Write) -> std
             s["port"].as_u64().unwrap_or(0)
         );
         let phase = s["phase"].as_str().unwrap_or("?");
+        // Readiness is the serving/launch state (distinct from the TCP-level `HEALTHY`); a
+        // `launch_failed` / `provision_failed` here is the once-silent failure now made
+        // visible, so append its reason inline (the server omits it for the healthy states).
+        let readiness = s["readiness"].as_str().unwrap_or("-");
         let age = match s["age_secs"].as_u64() {
             Some(a) => format!("{a}s"),
             None => "-".to_string(),
         };
         let backend = s["backend"].as_str().unwrap_or("?");
+        let reason = match s["reason"].as_str() {
+            Some(r) if !r.is_empty() => format!("  ({r})"),
+            _ => String::new(),
+        };
         writeln!(
             w,
-            "{owner:<28}  {rep:>3}  {healthy:<7}  {endpoint:<21}  {phase:<7}  {age:>6}  {backend}"
+            "{owner:<28}  {rep:>3}  {healthy:<7}  {endpoint:<21}  {phase:<7}  {readiness:<16}  \
+             {age:>6}  {backend}{reason}"
         )?;
     }
     Ok(())
