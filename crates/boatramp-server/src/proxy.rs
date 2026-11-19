@@ -346,7 +346,9 @@ fn tls_client_config(tls_insecure: bool) -> Result<Arc<rustls::ClientConfig>, ()
 /// forwarded headers + the inbound body stream; `None`/idempotent requests are retryable on
 /// a stale pooled connection, bodied requests are not (the stream can't be replayed).
 enum BodyPlan {
-    /// No request body.
+    /// No request body is written. The head may still carry an explicit `Content-Length: 0`
+    /// (preserved when the client declared one — some upstreams require it); it never carries
+    /// a `Transfer-Encoding`, so the empty-body framing stays unambiguous.
     None,
     /// A fixed-length body (the forwarded `Content-Length`) — forward the stream raw.
     Fixed,
@@ -400,7 +402,23 @@ impl UpstreamClient {
         // length peeks the body — empty ⇒ no body (a GET), non-empty ⇒ chunked.
         let mut data: BodyData = Box::pin(body.into_data_stream());
         let plan = match declared_len {
-            Some(0) => BodyPlan::None,
+            // A client-declared *zero*-length body. Re-emit the explicit `Content-Length: 0`
+            // that was stripped above: a well-behaved upstream treats a missing length on a
+            // bodied method as zero, but some REQUIRE the header's presence even when it is
+            // zero and reject the request outright ("missing content-length header") if a proxy
+            // drops it — notably a container registry's blob-upload finalize `PUT
+            // …/blobs/…?digest=sha256:…` (empty body, `Content-Length: 0`), the Gitea-fronted
+            // `docker push` this path was 400-looping. We still send NO body and NO
+            // Transfer-Encoding, so the framing stays unambiguous: exactly one canonical
+            // `Content-Length: 0`, never a `Content-Length`×`Transfer-Encoding` pair. Kept as
+            // `BodyPlan::None` (not `Fixed`) so an idempotent empty request stays retryable on a
+            // stale pooled connection.
+            Some(0) => {
+                parts
+                    .headers
+                    .insert(header::CONTENT_LENGTH, HeaderValue::from(0u64));
+                BodyPlan::None
+            }
             Some(n) => {
                 parts
                     .headers
@@ -2194,5 +2212,279 @@ Connection: close\r\n\r\n";
         );
         assert!(cookies.iter().any(|c| c.starts_with("session=")));
         assert!(cookies.iter().any(|c| c.starts_with("_csrf=")));
+    }
+
+    // --- bodied upload forward path (docker registry blob PUT through the gateway) -------
+    //
+    // These exercise the fallback (non-splice) forwarder that every bodied request takes:
+    // the native upstream client `UpstreamClient::send` (driven identically by `proxy_upstream`
+    // and the absolute-URL `proxy`). A raw one-shot upstream reads the forwarded request off
+    // the wire — head *and* body, honoring the framing the client emitted — so the assertions
+    // are on the actual bytes gitea would receive, not on an assumption.
+
+    /// Decode a complete HTTP/1.1 `chunked` body buffer into its payload bytes.
+    fn decode_chunked_body(mut data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(nl) = data.windows(2).position(|w| w == b"\r\n") {
+            let size_hex = data[..nl].split(|&b| b == b';').next().unwrap_or(&[]);
+            let size =
+                usize::from_str_radix(std::str::from_utf8(size_hex).unwrap_or("0").trim(), 16)
+                    .unwrap_or(0);
+            data = &data[nl + 2..];
+            if size == 0 {
+                break; // terminal chunk
+            }
+            if data.len() < size {
+                break;
+            }
+            out.extend_from_slice(&data[..size]);
+            data = &data[(size + 2).min(data.len())..]; // skip chunk data + its trailing CRLF
+        }
+        out
+    }
+
+    /// A raw one-shot upstream: accept one connection, read the full request (head, then the
+    /// body per its declared framing — fixed `Content-Length` or `chunked`), reply with
+    /// `response`, and hand back the captured `(head_text, decoded_body)`. Faithful to a real
+    /// origin — the framing is read off the wire, never assumed.
+    async fn capture_upstream(
+        response: &'static [u8],
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<(String, Vec<u8>)>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = raw.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = raw.accept().await else {
+                return;
+            };
+            let _ = sock.set_nodelay(true);
+            let mut buf: Vec<u8> = Vec::new();
+            let head_end = loop {
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break p + 4;
+                }
+                let mut tmp = [0u8; 4096];
+                match sock.read(&mut tmp).await {
+                    Ok(0) => break buf.len(),
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => return,
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let lower = head.to_ascii_lowercase();
+            let mut raw_body: Vec<u8> = buf[head_end..].to_vec();
+            let body = if let Some(cl) = lower
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+            {
+                while raw_body.len() < cl {
+                    let mut tmp = [0u8; 4096];
+                    match sock.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => raw_body.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                raw_body.truncate(cl);
+                raw_body
+            } else if lower.contains("transfer-encoding:") && lower.contains("chunked") {
+                // Read until the terminal `0\r\n\r\n` the client emits (`chunked::encode_last`).
+                while !raw_body.ends_with(b"0\r\n\r\n") {
+                    let mut tmp = [0u8; 4096];
+                    match sock.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => raw_body.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                decode_chunked_body(&raw_body)
+            } else {
+                Vec::new()
+            };
+            let _ = sock.write_all(response).await;
+            let _ = sock.flush().await;
+            let _ = tx.send((head, body));
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, rx)
+    }
+
+    /// Reproduce-first (the reported incident): a `docker push` to a Gitea-fronted registry
+    /// 400-loops on the blob-upload finalize `PUT …/blobs/…?digest=sha256:…`. That PUT carries
+    /// an **empty body with an explicit `Content-Length: 0`**, and the registry REQUIRES the
+    /// header's presence — it answers `missing content-length header for request` if it is
+    /// absent. The forwarder stripped the inbound `Content-Length` and, on the zero-length arm,
+    /// never re-emitted it, so Gitea saw no length and rejected the push. This drives a
+    /// Gitea-shaped upstream that returns `400` unless the forwarded head carries a
+    /// `Content-Length`; the forwarded PUT must therefore arrive with `Content-Length: 0` and
+    /// the client must see the `201`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_preserves_zero_content_length_on_blob_put() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const OK: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const MISSING_CL: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 44\r\nConnection: close\r\n\r\nmissing content-length header for request: x";
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = raw.local_addr().unwrap();
+        let (head_tx, head_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = raw.accept().await else {
+                return;
+            };
+            let _ = sock.set_nodelay(true);
+            let mut buf = Vec::new();
+            let head_end = loop {
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break p + 4;
+                }
+                let mut tmp = [0u8; 2048];
+                match sock.read(&mut tmp).await {
+                    Ok(0) => break buf.len(),
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => return,
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            // Gitea's registry contract: the blob PUT must carry a Content-Length header.
+            let resp = if head.to_ascii_lowercase().contains("content-length:") {
+                OK
+            } else {
+                MISSING_CL
+            };
+            let _ = sock.write_all(resp).await;
+            let _ = sock.flush().await;
+            let _ = head_tx.send(head);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/abc?digest=sha256:deadbeef",
+            addr.port()
+        );
+        // The finalize PUT exactly as docker/containerd sends it: empty body, explicit CL: 0.
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .header(header::CONTENT_LENGTH, 0)
+            .body(Body::empty())
+            .unwrap();
+        let resp = client.send(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "the Gitea-shaped registry rejected the blob PUT — the forwarder dropped Content-Length: 0"
+        );
+
+        let head = head_rx.await.unwrap();
+        assert!(
+            head.to_ascii_lowercase().contains("content-length: 0"),
+            "the forwarded blob PUT must preserve the client's explicit Content-Length: 0; got head:\n{head}"
+        );
+        // Anti-smuggling invariant: exactly one framing header, and never a chunked body.
+        assert_eq!(
+            head.to_ascii_lowercase().matches("content-length:").count(),
+            1,
+            "exactly one Content-Length must be emitted; got head:\n{head}"
+        );
+        assert!(
+            !head.to_ascii_lowercase().contains("transfer-encoding"),
+            "a zero-length body must not be re-framed as chunked (no CL×TE); got head:\n{head}"
+        );
+    }
+
+    /// A non-empty `Content-Length` PUT body (a monolithic blob upload) forwards fixed-length:
+    /// the upstream receives the exact bytes under a single `Content-Length: N` framing, never
+    /// re-chunked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_forwards_content_length_put_body_intact() {
+        const OK: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, rx) = capture_upstream(OK).await;
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/u1",
+            addr.port()
+        );
+        let blob = vec![0xABu8; 9000];
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .header(header::CONTENT_LENGTH, blob.len())
+            .body(Body::from(blob.clone()))
+            .unwrap();
+        let resp = client.send(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // Drain the response so the exchange completes before we read the capture.
+        let _ = axum::body::to_bytes(Body::from_stream(resp.into_body()), 1 << 20)
+            .await
+            .unwrap();
+
+        let (head, body) = rx.await.unwrap();
+        let lower = head.to_ascii_lowercase();
+        assert_eq!(
+            body, blob,
+            "the upstream must receive the blob bytes intact"
+        );
+        assert!(
+            lower.contains(&format!("content-length: {}", blob.len())),
+            "a fixed-length body must forward its Content-Length; got head:\n{head}"
+        );
+        assert!(
+            !lower.contains("transfer-encoding"),
+            "a Content-Length body must not be re-chunked (no CL×TE); got head:\n{head}"
+        );
+    }
+
+    /// A chunked PUT body (a streamed layer upload with no declared length) forwards as
+    /// `Transfer-Encoding: chunked`: the upstream reassembles the exact bytes, and the head
+    /// carries chunked framing with no spurious `Content-Length` (no CL×TE ambiguity).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_forwards_chunked_put_body_intact() {
+        const OK: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, rx) = capture_upstream(OK).await;
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/u2",
+            addr.port()
+        );
+
+        // No Content-Length + a streamed body ⇒ the client frames it chunked.
+        let parts: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"layer-")),
+            Ok(Bytes::from_static(b"segment-")),
+            Ok(Bytes::from_static(b"payload")),
+        ];
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .body(Body::from_stream(futures::stream::iter(parts)))
+            .unwrap();
+        let resp = client.send(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let _ = axum::body::to_bytes(Body::from_stream(resp.into_body()), 1 << 20)
+            .await
+            .unwrap();
+
+        let (head, body) = rx.await.unwrap();
+        let lower = head.to_ascii_lowercase();
+        assert_eq!(
+            body, b"layer-segment-payload",
+            "the upstream must reassemble the chunked body intact"
+        );
+        assert!(
+            lower.contains("transfer-encoding: chunked"),
+            "a length-unknown streamed body must forward chunked; got head:\n{head}"
+        );
+        assert!(
+            !lower.contains("content-length"),
+            "a chunked body must not also carry a Content-Length (no CL×TE); got head:\n{head}"
+        );
     }
 }
