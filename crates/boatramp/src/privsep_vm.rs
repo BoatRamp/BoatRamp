@@ -534,6 +534,10 @@ mod imp {
     /// connection on that port. This is the ONLY path into the guest (S1).
     fn dial_guest(uds_path: &Path, guest_port: u32) -> io::Result<UnixStream> {
         let mut stream = UnixStream::connect(uds_path)?;
+        // The dialed firecracker vsock UDS MUST be BLOCKING for the splice (a non-blocking fd makes
+        // `io::copy` spin/EAGAIN) — force it, mirroring the readiness probe. The in-root relay thread's
+        // fd setup leaves it blocking; the SEPARATE confined relay's did not, so this is load-bearing.
+        stream.set_nonblocking(false)?;
         stream.write_all(format!("CONNECT {guest_port}\n").as_bytes())?;
         let mut line = Vec::new();
         let mut byte = [0u8; 1];
@@ -728,6 +732,11 @@ mod imp {
     /// Copy bytes both ways between the client TCP stream and the guest vsock stream until either side
     /// closes, then shut the other down. A transparent byte pipe — the parse happens in the guest.
     fn splice_bidirectional(client: std::net::TcpStream, guest: UnixStream) {
+        // Both ends MUST be BLOCKING — `io::copy` on a non-blocking fd busy-spins/errors on EAGAIN.
+        // The accepted client + the dialed guest are blocking on the in-root path; force them blocking
+        // here too, so the SEPARATE confined relay's byte-splice behaves identically (defensive).
+        let _ = client.set_nonblocking(false);
+        let _ = guest.set_nonblocking(false);
         let (Ok(mut c_r), Ok(mut g_w)) = (client.try_clone(), guest.try_clone()) else {
             return;
         };
@@ -893,8 +902,11 @@ mod imp {
                             return;
                         }
                         Err(e) => {
-                            // Report progress (the guest is likely still booting → firecracker EOFs the
-                            // CONNECT); back off briefly and retry until we serve a 200 or the relay dies.
+                            // Report progress + back off briefly and retry until we serve a 200 or the
+                            // relay dies. EVERY `Err` is retryable — the guest still booting (firecracker
+                            // EOFs the CONNECT), a transient refusal, OR a `WouldBlock`/EAGAIN (defensive:
+                            // the dials are forced blocking, but if one were ever non-blocking we retry
+                            // rather than hard-fail on a spurious EAGAIN).
                             if tx.send(Err(e)).is_err() {
                                 return; // the main thread gave up (deadline) — stop
                             }
@@ -954,6 +966,14 @@ mod imp {
     fn probe_once_blocking(uds_path: &Path, guest_port: u32) -> Result<(), String> {
         let mut stream =
             UnixStream::connect(uds_path).map_err(|e| format!("connect vsock UDS: {e}"))?;
+        // Defensive: the dialed firecracker vsock UDS MUST be BLOCKING so the byte-at-a-time read_exact
+        // actually WAITS for firecracker's `OK` (a non-blocking fd would return EAGAIN before `OK`
+        // arrives, which — if the loop reconnected — could never complete). A fresh `UnixStream::connect`
+        // is already blocking here (verified live: `fcntl(F_GETFL)` had no `O_NONBLOCK`), but force it so
+        // a future O_NONBLOCK source (a non-blocking inherited/dup'd fd, a reactor) cannot regress it.
+        stream
+            .set_nonblocking(false)
+            .map_err(|e| format!("force the readiness UDS blocking: {e}"))?;
         // Firecracker host-initiated vsock: CONNECT <port>\n → OK <port>\n once the guest is listening.
         stream
             .write_all(format!("CONNECT {guest_port}\n").as_bytes())

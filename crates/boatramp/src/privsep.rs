@@ -1201,6 +1201,13 @@ fn run_vm_relay_confined(
     // SAFETY: `listener_fd` is the fd the root dup'd into this child + named in the fd map; the relay
     // owns it exclusively.
     let listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
+    // Defensive: the relay serves clients with the BLOCKING std `run_relay` (accept + `io::copy`), NOT a
+    // tokio reactor, so the inherited public listener MUST be blocking — force it (verified live:
+    // `fcntl(F_GETFL)` had no `O_NONBLOCK`, so this is a guard against a future non-blocking source, not
+    // a fix for a present one).
+    listener
+        .set_nonblocking(false)
+        .map_err(|e| format!("forcing the inherited public listener blocking: {e}"))?;
 
     // Finding 1 (acpi=off Security review) — POSITIVE readiness gate, BEHIND the profile + BEFORE the
     // first client. Assert the frontend-in-guest actually SERVES a 200 over vsock within a bounded
