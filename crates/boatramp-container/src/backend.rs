@@ -2379,6 +2379,7 @@ impl ContainerBackend {
             pull_secret: None,
             bindings: Vec::new(),
             post_launch: Vec::new(),
+            pull_policy: Default::default(),
         };
         let mut plan = SandboxPlan::for_spec(&spec, rootfs, id, GUEST_UID, GUEST_GID);
         // Read-only rootfs: a one-shot client never writes its rootfs (dumps stream to
@@ -3910,6 +3911,7 @@ mod tests {
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
+            pull_policy: Default::default(),
         }
     }
 

@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use boatramp_core::compute::{
     BindingKind, ComputeBinding, ComputeSpec, IsolationRequirement, PlacementConstraints,
-    RestartPolicy, RootSource,
+    PullPolicy as SpecPullPolicy, RestartPolicy, RootSource,
 };
 use clap::Subcommand;
 use serde::Serialize;
@@ -108,7 +108,12 @@ enum ComputeCommand {
         /// Guest memory (MiB).
         #[arg(long, default_value_t = 256)]
         mem_mib: u32,
-        /// In-guest TCP port the app listens on.
+        /// In-guest TCP port the app listens on, which the gateway routes to. Use
+        /// **`--port 0`** for a workload with **no ingress** — a pure bus consumer / worker
+        /// that listens on no port: boatramp publishes no host port and the gateway never
+        /// routes to it. (There is no separate `--worker`/`--no-ingress` flag; `0` is the
+        /// no-ingress value.) The docker health probe is container-run-state, not a port
+        /// check, so a no-port consumer still reports healthy while its process is up.
         #[arg(long)]
         port: u16,
         /// Desired replica count.
@@ -164,11 +169,18 @@ enum ComputeCommand {
         /// endpoint URL + token are injected into the guest env (`BOATRAMP_SQL_URL` /
         /// `BOATRAMP_KV_URL` / `BOATRAMP_BLOB_URL` / `BOATRAMP_MESSAGING_URL`). NOTE: a bare
         /// `kv`/`blob` (no `:<name>`) is SITE-WIDE — the workload can read/write EVERY
-        /// bucket/container in its site's `hkv{,blob}/{site}/` space; use `kv:<name>` /
-        /// `blob:<name>` to confine it. Likewise a bare `messaging` is PROJECT-BUS-WIDE (any
-        /// topic under `{project}/bus/`, for both publish and claim); use `messaging:<topic>`
-        /// to confine it to one topic. `invoke` (compute→function) is declared only — no
-        /// shim resolver yet, so it parses but injects no env (Phase 3).
+        /// bucket/container in its site's `hkv/{site}/` (kv) / `hblob/{site}/` (blob) space;
+        /// use `kv:<name>` / `blob:<name>` to confine it. Likewise a bare `messaging` is
+        /// PROJECT-BUS-WIDE (any topic under `{project}/bus/`, for both publish and claim);
+        /// use `messaging:<topic>` to confine it to one topic. `invoke` (compute→function) is
+        /// declared only — no shim resolver yet, so it parses but injects no env (Phase 3).
+        /// FOOTGUN: a `kv`/`blob` binding resolves its namespace under THIS WORKLOAD'S NAME
+        /// as the site segment (`hblob/{project}/{workload}/…`), exactly as a `wasi:blobstore`
+        /// handler uses its SITE name. So a workload shares a site's store ONLY when it is
+        /// NAMED AFTER that site — a misnamed workload reads/writes an invisible, empty
+        /// namespace of its own with no error. Name the workload after the site whose data it
+        /// shares. (The server logs a warning at set time when a `blob`-bound workload's name
+        /// matches no known site in the project.)
         #[arg(long = "bind")]
         bind: Vec<String>,
         /// Name of a **sealed registry pull credential** in THIS project's secret store
@@ -180,6 +192,20 @@ enum ComputeCommand {
         /// registry host).
         #[arg(long = "pull-secret")]
         pull_secret: Option<String>,
+        /// How the backend obtains the `--image` before launch (the opaque-compute analogue
+        /// of Kubernetes' `imagePullPolicy`). `always` (the default) RE-PULLS from the
+        /// registry every launch — the safe posture, since a node's local image store is
+        /// SHARED across tenants, so a mutable `name:tag` there is ambient, poisonable state.
+        /// `if-not-present` reuses a locally-present image (a `docker load`'d / `k3d image
+        /// import`'d image, or a cached pull) and pulls only when it is absent; `never`
+        /// requires it present already (a fully air-gapped node) and fails if absent. Reuse
+        /// is SOUND only for a digest-pinned reference (`repo@sha256:…`, an immutable
+        /// manifest); with a mutable `name:tag`, `if-not-present`/`never` are accepted but
+        /// WARN, because the shared store could hold another tenant's (or a stale) image
+        /// under that tag — pin by digest. Ignored for a `--tar`/`--rootfs` source (staged
+        /// from the blob store, never pulled).
+        #[arg(long = "pull-policy", value_enum, default_value_t = PullPolicy::Always)]
+        pull_policy: PullPolicy,
     },
     /// Build an ext4 rootfs from an OCI image, upload it, and set the workload.
     /// Needs the `e2fsprogs` `mke2fs` tool on this host.
@@ -196,7 +222,9 @@ enum ComputeCommand {
         /// Size of the ext4 rootfs image (MiB).
         #[arg(long, default_value_t = 1024)]
         size_mib: u64,
-        /// In-guest TCP port the app listens on.
+        /// In-guest TCP port the app listens on, which the gateway routes to. Use
+        /// `--port 0` for a no-ingress worker (a pure bus consumer with no listener): no
+        /// host port is published and the gateway never routes to it.
         #[arg(long)]
         port: u16,
         /// Virtual CPUs.
@@ -515,6 +543,28 @@ impl From<Isolation> for IsolationRequirement {
         match i {
             Isolation::Trusted => Self::Trusted,
             Isolation::Untrusted => Self::Untrusted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum PullPolicy {
+    /// Re-pull the image from its registry every launch (the safe default; the node's
+    /// shared local image store is never trusted as a source of truth).
+    #[default]
+    Always,
+    /// Reuse a locally-present image; pull only when it is absent (Kubernetes' `IfNotPresent`).
+    IfNotPresent,
+    /// Require the image to be present locally already; fail the launch if it is absent.
+    Never,
+}
+
+impl From<PullPolicy> for SpecPullPolicy {
+    fn from(p: PullPolicy) -> Self {
+        match p {
+            PullPolicy::Always => Self::Always,
+            PullPolicy::IfNotPresent => Self::IfNotPresent,
+            PullPolicy::Never => Self::Never,
         }
     }
 }
@@ -1034,6 +1084,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             regions,
             bind,
             pull_secret,
+            pull_policy,
         } => {
             // Exactly one of `--image` (an OCI reference, verbatim), `--tar` (a rootfs
             // archive, uploaded), or `--rootfs` (a rootfs filesystem image, uploaded)
@@ -1082,6 +1133,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 isolation,
                 parse_bindings(&bind)?,
                 pull_secret,
+                pull_policy.into(),
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             ComputeOutput::Set { name, spec: hash }
@@ -1158,9 +1210,11 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 user,
                 isolation,
                 parse_bindings(&bind)?,
-                // A `compute build` workload is a locally-built rootfs, not a registry
-                // pull, so it carries no pull credential.
+                // A `compute build` workload is a locally-built rootfs micro-VM, not a
+                // registry pull, so it carries no pull credential and the pull policy is
+                // moot (the default `Always` is never consulted for a rootfs source).
                 None,
+                SpecPullPolicy::Always,
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             ComputeOutput::Build { name, spec: hash }
@@ -1761,6 +1815,7 @@ fn build_spec(
     isolation: Isolation,
     bindings: Vec<ComputeBinding>,
     pull_secret: Option<String>,
+    pull_policy: SpecPullPolicy,
 ) -> Result<ComputeSpec> {
     let mut env_map = BTreeMap::new();
     for pair in env {
@@ -1792,6 +1847,7 @@ fn build_spec(
         isolation: isolation.into(),
         prefer_backend: None,
         pull_secret,
+        pull_policy,
         bindings,
         post_launch: Vec::new(),
     })
@@ -1850,6 +1906,15 @@ async fn put_workload(
         .error_for_status()?
         .json()
         .await?;
+    // F2: surface any non-fatal set-time advisories the server returned (blob-bind
+    // site-mismatch, mutable-tag pull-reuse) on stderr — the `Project·Admin` running the CLI
+    // cannot read the node log where they are also recorded. Diagnostic → tracing (stderr),
+    // never stdout (which carries the typed result).
+    if let Some(warnings) = resp["warnings"].as_array() {
+        for w in warnings.iter().filter_map(|w| w.as_str()) {
+            tracing::warn!("{w}");
+        }
+    }
     Ok(resp["spec"].as_str().unwrap_or("").to_string())
 }
 
@@ -2062,6 +2127,7 @@ mod tests {
             Isolation::Trusted,
             vec![],
             None,
+            SpecPullPolicy::Always,
         )
         .unwrap();
         assert_eq!(with.startup_grace_secs, 45);
@@ -2082,6 +2148,7 @@ mod tests {
             Isolation::Trusted,
             vec![],
             None,
+            SpecPullPolicy::Always,
         )
         .unwrap();
         assert_eq!(dflt.startup_grace_secs, 30);

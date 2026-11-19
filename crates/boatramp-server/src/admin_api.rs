@@ -1160,6 +1160,11 @@ pub(super) async fn get_compute(
 struct PutComputeResponse {
     /// The content hash of the stored spec (`computever/<hash>`).
     spec: String,
+    /// Non-fatal set-time advisories (F2) a `Project·Admin` can't read from node logs —
+    /// the blob-bind-site-mismatch nudge and the mutable-tag pull-reuse nudge. Returned so
+    /// the CLI can surface them on stderr. Omitted (not `[]`) when empty, for back-compat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Create/update a workload: content-address its spec, then flip the desired
@@ -1217,6 +1222,56 @@ pub(super) async fn put_compute(
             }
         }
     }
+    // Non-fatal set-time advisories (F2): collected here AND logged, then returned in the
+    // response body so a `Project·Admin` — who cannot read node logs — sees them in the CLI.
+    let mut warnings: Vec<String> = Vec::new();
+    // Likely-mistake advisory (PLAN-compute-dx #1): a `blob` binding resolves its namespace
+    // under the WORKLOAD name as the site-identity segment (`hblob/{project}/{workload}/…`),
+    // exactly as a `wasi:blobstore` handler uses its SITE name — so a workload shares a
+    // site's blob store ONLY when it is named after that site. A blob-bound workload whose
+    // name matches no known site almost certainly means the author expected to share a
+    // site's container but is silently writing to an invisible namespace of its own. Warn,
+    // never block; best-effort, so a site-list error just skips the advisory.
+    if request
+        .spec
+        .bindings
+        .iter()
+        .any(|b| b.kind == boatramp_core::compute::BindingKind::Blob)
+        && let Ok(sites) = deploy.all_sites(project.as_ref()).await
+        && boatramp_core::compute::blob_bind_names_unknown_site(
+            &name,
+            &request.spec.bindings,
+            &sites,
+        )
+    {
+        let msg = format!(
+            "workload `{name}` declares a `blob` binding but its name matches no site in the \
+             project; a blob bind resolves under the WORKLOAD name as the site segment \
+             (hblob/<project>/{name}/…), so unless the workload is named after the site whose \
+             data it shares it reads/writes an empty namespace of its own — name it after that \
+             site (see `compute set --bind`)"
+        );
+        tracing::warn!(project = %project.as_ref(), workload = %name, "{msg}");
+        warnings.push(msg);
+    }
+    // Tenancy advisory (PLAN-compute-dx #3): opting into local-image reuse (a `pull_policy`
+    // other than `always`) with a MUTABLE `name:tag` is unsound even single-tenant — the tag
+    // could resolve to a stale/poisoned locally-cached image. A digest-pinned reference
+    // (`repo@sha256:…`) is sound and silent; `always` (the default) is always sound. (Under
+    // the multi-tenant posture a reuse policy is REFUSED outright at launch by the backend —
+    // F1; this nudge is the single-tenant "prefer a digest" reminder.) Warn, never block.
+    if let boatramp_core::compute::RootSource::Image(reference) = &request.spec.root
+        && boatramp_core::compute::pull_reuse_is_unsound(request.spec.pull_policy, reference)
+    {
+        let msg = format!(
+            "workload `{name}` opts into local-image reuse (pull_policy != always) with the \
+             mutable image tag `{reference}`; the node's image store is shared across tenants, \
+             so this tag could resolve to a stale or poisoned cached image — pin the image by \
+             digest (repo@sha256:…) for a sound reuse, or use pull_policy=always"
+        );
+        tracing::warn!(workload = %name, image = %reference, pull_policy = ?request.spec.pull_policy, "{msg}");
+        warnings.push(msg);
+    }
     let spec_hash = match deploy.put_compute_spec(&request.spec).await {
         Ok(hash) => hash,
         Err(err) => return deploy_error_response(err),
@@ -1234,7 +1289,10 @@ pub(super) async fn put_compute(
     {
         Ok(()) => (
             StatusCode::CREATED,
-            Json(PutComputeResponse { spec: spec_hash }),
+            Json(PutComputeResponse {
+                spec: spec_hash,
+                warnings,
+            }),
         )
             .into_response(),
         Err(err) => deploy_error_response(err),

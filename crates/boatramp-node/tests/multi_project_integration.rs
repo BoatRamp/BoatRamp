@@ -820,6 +820,7 @@ fn plain_web_spec() -> ComputeSpec {
         pull_secret: None,
         bindings: vec![],
         post_launch: vec![],
+        pull_policy: Default::default(),
     }
 }
 

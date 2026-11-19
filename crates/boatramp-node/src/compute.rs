@@ -462,15 +462,18 @@ pub async fn build_compute(
     if !use_k8s {
         match boatramp_docker::DockerBackend::connect() {
             Ok(docker) => {
-                // `writable_root` and `cap_add` are honored only under the single-tenant
-                // posture (`!strict`); the multi-tenant guard keeps the hardened read-only
-                // root and every capability dropped.
+                // `writable_root`, `cap_add`, and local-image reuse (`pull_policy`
+                // if-not-present/never) are honored only under the single-tenant posture
+                // (`!strict`); the multi-tenant guard keeps the hardened read-only root,
+                // every capability dropped, and refuses local-image reuse on the shared
+                // image store (F1).
                 let docker = docker
                     .with_endpoint(cfg.docker_endpoint)
                     .with_volume_mode(cfg.docker_volume_mode)
                     .with_data_dir(data_dir)
                     .with_writable_root_allowed(!strict)
                     .with_cap_add_allowed(!strict)
+                    .with_local_image_reuse_allowed(!strict)
                     // Node-global guest-log secret redaction (System·Admin opt-out; on by
                     // default). Never a tenant knob.
                     .with_guest_log_redaction(cfg.redact_guest_log_secrets)
@@ -2010,6 +2013,7 @@ mod tests {
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
+            pull_policy: Default::default(),
         }
     }
 

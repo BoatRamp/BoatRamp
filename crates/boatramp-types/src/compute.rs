@@ -107,6 +107,77 @@ impl RootSource {
     }
 }
 
+/// How a backend obtains a workload's OCI **image** before launch — the opaque-compute
+/// analogue of Kubernetes' `imagePullPolicy`. Applies only to a [`RootSource::Image`]
+/// workload (a tar/rootfs source is staged from the content-addressed blob store and is
+/// never pulled). The **default is [`Always`](PullPolicy::Always)**: boatramp re-pulls the
+/// reference from its registry on every materialize, so a workload can never silently pick
+/// up a *different* image that merely shares a `name:tag` in the node's **shared,
+/// cross-tenant** local image store. Reusing a locally-present image — an air-gapped node,
+/// a `docker load`'d / `k3d image import`'d image, or just saving a registry round-trip —
+/// is therefore **opt-in**.
+///
+/// ## Tenancy caveat (read before opting in)
+///
+/// A node's Docker/containerd image store is **shared across every tenant** on that node.
+/// Keyed by a **mutable** `name:tag`, a locally-cached image is ambient, poisonable state:
+/// another tenant (or a stale earlier pull) can have populated `name:tag` with *different*
+/// bytes, and [`IfNotPresent`](PullPolicy::IfNotPresent) / [`Never`](PullPolicy::Never) would
+/// then reuse those bytes rather than the registry's. Local reuse is only **sound** for a
+/// **digest-pinned** reference (`repo@sha256:…`), which names an immutable manifest the daemon
+/// verifies. boatramp does not *refuse* a mutable-tag opt-in (the primary use case — a
+/// `docker load`'d image built locally — carries no registry digest), but it **warns** at set
+/// time ([`pull_reuse_is_unsound`]); prefer a digest wherever one exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullPolicy {
+    /// **Default.** Re-pull the image reference from its registry on every materialize; the
+    /// node's shared local image store is never trusted as a source of truth. The safe
+    /// default for a multi-tenant node, and the pre-`pull_policy` behavior.
+    #[default]
+    Always,
+    /// Reuse a locally-present image and pull **only when it is absent** — the equivalent of
+    /// Kubernetes' `IfNotPresent`. Opt-in; sound only for a digest-pinned reference (see the
+    /// type docs' tenancy caveat).
+    IfNotPresent,
+    /// **Never** pull: require the image to be present in the node's local store already and
+    /// fail the launch if it is absent. For a fully air-gapped / pre-loaded node. Opt-in; same
+    /// tenancy caveat as [`IfNotPresent`](PullPolicy::IfNotPresent).
+    Never,
+}
+
+impl PullPolicy {
+    /// Whether this is the default ([`Always`](PullPolicy::Always)) — used to omit it from the
+    /// serialized spec so existing specs keep their content hash (and an older server that does
+    /// not know the field never sees it on the wire).
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Always)
+    }
+
+    /// Whether this policy lets a backend **reuse a locally-present image** instead of always
+    /// pulling (`IfNotPresent` or `Never`). `Always` never reuses.
+    pub fn allows_local_reuse(self) -> bool {
+        matches!(self, Self::IfNotPresent | Self::Never)
+    }
+}
+
+/// Whether an OCI image reference is **digest-pinned** (`…@sha256:…`) — an immutable manifest
+/// reference, as opposed to a mutable `name:tag`. Local-image reuse under a non-`Always`
+/// [`PullPolicy`] is only *sound* for a digest-pinned reference, because a mutable tag in the
+/// node's shared image store is ambient cross-tenant state (see the [`PullPolicy`] tenancy
+/// caveat). The check mirrors the docker backend's own digest-vs-tag split: a `@` marks a
+/// digest reference.
+pub fn image_is_digest_pinned(reference: &str) -> bool {
+    reference.contains('@')
+}
+
+/// Whether reusing a locally-present image under `policy` for `reference` is **tenancy-unsound**
+/// and should be warned about: the policy allows local reuse *and* the reference is a mutable
+/// `name:tag` rather than a digest. Pure, so the set-time advisory and a backend share one rule.
+pub fn pull_reuse_is_unsound(policy: PullPolicy, reference: &str) -> bool {
+    policy.allows_local_reuse() && !image_is_digest_pinned(reference)
+}
+
 /// A persistent volume attached to the guest (a host block image, snapshotted
 /// to blob storage for durability). Opt-in; the default rootfs is read-only with
 /// an ephemeral scratch drive.
@@ -233,6 +304,17 @@ pub struct ComputeSpec {
     /// would).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_secret: Option<String>,
+    /// How a backend obtains the OCI **image** of a [`RootSource::Image`] workload before
+    /// launch (see [`PullPolicy`]). The default [`PullPolicy::Always`] re-pulls from the
+    /// registry every materialize — the safe posture on a node whose local image store is
+    /// shared across tenants. Opting into [`PullPolicy::IfNotPresent`] /
+    /// [`PullPolicy::Never`] lets a backend reuse a locally-present image (an air-gapped /
+    /// `docker load`'d image) and is **sound only for a digest-pinned reference** — see the
+    /// [`PullPolicy`] tenancy caveat. Ignored for a tar/rootfs source (staged from the blob
+    /// store, never pulled). Omitted from the wire + the content hash when `Always`
+    /// (back-compat: existing specs keep their id and an older server never sees the field).
+    #[serde(default, skip_serializing_if = "PullPolicy::is_default")]
+    pub pull_policy: PullPolicy,
     /// Managed resources this workload depends on — the opaque-process analogue of a
     /// handler's `imports`. boatramp resolves each to a **tenant-scoped** endpoint +
     /// credential at launch and injects the address into the guest env, so a workload
@@ -796,6 +878,7 @@ mod tests {
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
+            pull_policy: Default::default(),
         }
     }
 
@@ -821,6 +904,27 @@ mod tests {
             b.id(),
             "a declared post-launch action changes the id"
         );
+    }
+
+    #[test]
+    fn default_pull_policy_is_omitted_and_does_not_change_the_spec_hash() {
+        // The default `Always` pull_policy serializes without the field, so a spec hashes
+        // identically to a pre-`pull_policy` spec (back-compat; an older server never sees
+        // the field). Mirrors the `isolation`/`pull_secret` omit-from-wire siblings.
+        let a = spec();
+        assert_eq!(a.pull_policy, PullPolicy::Always, "default is Always");
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("pull_policy"),
+            "the default pull_policy is omitted from the wire"
+        );
+
+        // A non-default policy IS recorded and changes the content hash (it is part of the
+        // workload's identity — it changes how the backend obtains the image).
+        let mut b = spec();
+        b.pull_policy = PullPolicy::IfNotPresent;
+        assert_ne!(a.id(), b.id(), "a non-default pull_policy changes the id");
+        assert!(serde_json::to_string(&b).unwrap().contains("pull_policy"));
     }
 
     #[test]

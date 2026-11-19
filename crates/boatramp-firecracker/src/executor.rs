@@ -520,6 +520,7 @@ mod tests {
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
+            pull_policy: Default::default(),
         };
         let resources = MachineResources {
             kernel_path: "/k/vmlinux".into(),
