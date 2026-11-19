@@ -70,6 +70,16 @@ in
         Relax the systemd sandbox so the Linux compute backends (microVM/container:
         `/dev/kvm`, namespaces, mounts) can run. Off by default — a hardened
         static/handler/TLS node needs none of it.
+
+        This is an opt-in operator posture change: it grants the (non-root) service
+        the **ambient** capabilities `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_SETUID`
+        and `CAP_SETGID`, and allows the `AF_NETLINK` address family — all required
+        for boatramp to create the `br-boatramp` compute bridge and per-guest
+        veths/taps over rtnetlink, unshare the container network namespace, mount +
+        pivot the guest rootfs, and write the user-namespace uid/gid map. (Ambient,
+        not merely bounding-set, because `NoNewPrivileges` + a non-root `User` make a
+        bounding-set-only capability ineffective.) `CAP_SYS_ADMIN` is broad; enable
+        this only on a node you intend to run compute workloads on.
       '';
     };
   };
@@ -116,7 +126,23 @@ in
         ReadWritePaths = [ cfg.dataDir ];
 
         # Bind :80/:443 without root — the only capability the default profile needs.
-        AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+        # Under `cfg.compute` the net/sys/setuid/setgid caps must be AMBIENT, not just
+        # in the bounding set: `User=` is non-root and `NoNewPrivileges=true`, so a
+        # bounding-set cap alone grants nothing — only an ambient cap is actually
+        # effective (and is inherited by the re-exec'd `__sandbox`/VMM workers). These
+        # mirror the `cfg.compute` bounding-set additions below: `CAP_NET_ADMIN` +
+        # `CAP_SYS_ADMIN` for the rtnetlink bridge/veth ops + the container netns
+        # unshare / rootfs mount / pivot_root, and `CAP_SETUID`/`CAP_SETGID` for the
+        # userns uid/gid map.
+        AmbientCapabilities = [
+          "CAP_NET_BIND_SERVICE"
+        ]
+        ++ lib.optionals cfg.compute [
+          "CAP_NET_ADMIN"
+          "CAP_SYS_ADMIN"
+          "CAP_SETUID"
+          "CAP_SETGID"
+        ];
         CapabilityBoundingSet = [
           "CAP_NET_BIND_SERVICE"
         ]
@@ -148,7 +174,11 @@ in
           "AF_INET"
           "AF_INET6"
           "AF_UNIX"
-        ];
+        ]
+        # The compute backends create the `br-boatramp` bridge + per-guest veths over
+        # rtnetlink (an `AF_NETLINK` socket); without this the socket fails EAFNOSUPPORT
+        # (`os error 97`) and all container/VMM backends are disabled at node init.
+        ++ lib.optionals cfg.compute [ "AF_NETLINK" ];
         SystemCallFilter = [
           "@system-service"
         ]
