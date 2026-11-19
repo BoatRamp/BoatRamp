@@ -412,12 +412,38 @@ mod imp {
         // Raw firecracker machine config: kernel + initrd + vsock, `drives: []`, no
         // `network-interfaces` (the production `FcMachine` has no initrd/vsock fields; the bench
         // `vsock.rs` proves this exact kernel+initramfs+vsock shape).
+        //
+        // `acpi=off` is LOAD-BEARING (Phase-3c). The firecracker *binary* backend presents its
+        // virtio-mmio devices' interrupt topology over ACPI (its config ships `X86_MPPARSE` off,
+        // `ACPI=y` — the embedded rust-vmm VMM uses the MPTABLE/cmdline path instead). On a guest
+        // kernel >= 6.10 — which the privsep in-guest Landlock-V5 wall REQUIRES
+        // (`MIN_LANDLOCK_ABI`, kernel >= 6.10) — ACPICA 20240827 (kernels >= 6.12) REJECTS
+        // firecracker 1.13.x's reduced-hardware DSDT during operation-region init
+        // (`ACPI Error: AE_BAD_PARAMETER, During Region initialization`), which makes the kernel
+        // DISABLE ACPI entirely. With ACPI disabled mid-boot the IOAPIC is known (from the MADT)
+        // but NO device-IRQ routing is set up (`preallocated irqs: 0`, no legacy i8259), so every
+        // device interrupt is dead: the 8250 serial's IRQ-driven TX returns EIO (userspace console
+        // writes fail — PID 1's own `println!` then panics the guest), and the virtio-vsock driver's
+        // `request_irq` for its MMIO IRQ returns -EINVAL (the guest-driver probe fails `-22`), so the
+        // vsock transport never comes up and the host byte-relay can never reach the frontend.
+        // `acpi=off` sidesteps the broken DSDT: with `X86_MPPARSE` off too, the guest falls back to
+        // the legacy PC model (`APIC: Keep in PIC mode(8259)`, `preallocated irqs: 16`) that
+        // firecracker's KVM in-kernel irqchip emulates and routes GSI 0-15 to — so the serial (IRQ 4)
+        // and the vsock device (IRQ 5) both get working IRQ lines. The guest needs
+        // `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` so the device is discovered off the
+        // `virtio_mmio.device=` cmdline firecracker appends (ACPI enumeration is now off); the shipped
+        // `boatramp-vmlinux` already enables it (for the embedded-VMM path), so this is a pure
+        // boot-arg change. Live-proven on lighthouse (kernel 6.12.67, Landlock V5): clean boot, vsock
+        // probe succeeds, host<->guest relay serves a 200 (Phase-3c serve gate). A privsep guest runs
+        // no ACPI-dependent devices (no PCI, no power-management, single vcpu), so dropping ACPI is
+        // safe. Must stay paired with `X86_MPPARSE` OFF: were it ON, `acpi=off` would make the kernel
+        // hunt for an MPTABLE the firecracker binary does not emit.
         let config = format!(
             r#"{{
   "boot-source": {{
     "kernel_image_path": {kernel},
     "initrd_path": {initrd},
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off ro rdinit=/init"
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off acpi=off ro rdinit=/init"
   }},
   "drives": [],
   "machine-config": {{ "vcpu_count": 1, "mem_size_mib": 1024 }},

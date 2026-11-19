@@ -6,7 +6,11 @@
 # (S3/S4). This builds 6.12.67 (same as lighthouse's host) from the firecracker CI 6.1 x86_64 config
 # with Landlock turned on (`make oldconfig` via linuxManualConfig expands the partial config).
 #
-# Prereq: `fc-base.config` in the same dir = the firecracker CI config + the Landlock lines (see README).
+# Prereq: `fc-base.config` in the same dir = the firecracker CI config + the Landlock lines +
+# `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` (see README). The guest boots `acpi=off` (Phase-3c — firecracker
+# 1.13.x's reduced-hardware DSDT fails region init on ACPICA >= 20240827, disabling ACPI and all device
+# IRQs), so the virtio-mmio devices are discovered off the `virtio_mmio.device=` cmdline, not via ACPI —
+# hence `CMDLINE_DEVICES=y`. The shipped `boatramp-vmlinux` already enables it for the embedded-VMM path.
 #
 #   nix-build kernel.nix -o kernel-result     # -> kernel-result/vmlinux (the uncompressed ELF)
 #

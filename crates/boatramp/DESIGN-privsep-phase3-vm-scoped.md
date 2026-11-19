@@ -224,3 +224,55 @@ delivery (key material stays in-guest / relayed by the key-holder sealer, never 
 subsequent O4 increments on this same separated-relay foundation. Note the relay's empty netns is for
 the netless scoped frontend; an O4 backend-in-VM path that needs guest egress will provision it
 explicitly (a veth/slirp into the relay netns), never by removing this wall.
+
+## Phase-3c — the vsock byte-relay transport: the `acpi=off` fix + the serve gate going GREEN
+
+The scoped serve gate (`tests/privsep_vm_live.rs`) had never actually reached a 200 — booting the
+Landlock-V5 (>= 6.10) guest the in-guest wall requires, the guest's **virtio-vsock probe failed `-22`
+(EINVAL)** and PID 1 died with no console output. Root-caused live on lighthouse (kernel 6.12.67,
+firecracker 1.13.1 binary) to a SINGLE cause, NOT a vsock device-config / CID / driver-mismatch issue:
+
+- The firecracker **binary** backend presents its virtio-mmio devices' interrupt topology over **ACPI**
+  (its guest config ships `X86_MPPARSE` off, `ACPI=y`; the embedded rust-vmm VMM uses the MPTABLE +
+  `virtio_mmio.device=` cmdline path instead — see `flake.nix` `vmlinux`). On a guest kernel >= 6.12,
+  **ACPICA 20240827 REJECTS firecracker 1.13.x's reduced-hardware DSDT during operation-region init**
+  (`ACPI Error: AE_BAD_PARAMETER, During Region initialization (…/tbxfload-52)` → `ACPI: Unable to load
+  the System Description Tables` → `ACPI: disabled`). (5.10/6.1's older ACPICA accepted it; those lack
+  Landlock V5, so they were never a real option — this is a genuine firecracker-1.13 ↔ ACPICA-20240827
+  incompatibility, and every kernel with Landlock V5 that nixpkgs still ships is >= 6.12.)
+- With ACPI disabled mid-boot the IOAPIC is known (from the MADT, parsed earlier) but **no device-IRQ
+  routing is set up** (`preallocated irqs: 0`, no legacy i8259, `/proc/interrupts` has no numbered
+  lines). So EVERY device interrupt is dead: the 8250 serial's IRQ-driven TX returns **EIO** — userspace
+  `/dev/console` writes fail, and PID 1's own `println!("PRIVSEP VM GUEST SERVING …")` then PANICS the
+  guest (exit 101 → "Attempted to kill init"), which is why the console was silent AND the guest died;
+  and the virtio-vsock driver's `request_irq` (its MMIO IRQ) returns **-EINVAL**, so `virtio_vsock_probe`
+  → `virtio_find_vqs` fails `-22` and the transport never comes up — the host byte-relay can never reach
+  the frontend. (The `-22` is thus the **guest-driver probe**, not a host `connect()/bind()`.)
+
+**Fix (two lines, kernel-version-INDEPENDENT, no code logic change):**
+
+1. **`acpi=off`** in the guest kernel cmdline (`boot_firecracker`). With `X86_MPPARSE` also off (as the
+   firecracker config ships it) the guest falls back to the legacy PC model — `APIC: Keep in PIC
+   mode(8259)`, `preallocated irqs: 16` — that **firecracker's KVM in-kernel irqchip emulates and routes
+   GSI 0-15 to**. The serial (IRQ 4) and the vsock device (IRQ 5) then get working IRQ lines. Safe: a
+   privsep guest runs no ACPI-dependent devices (no PCI, no power-mgmt, single vcpu). MUST stay paired
+   with `X86_MPPARSE` OFF (ON + `acpi=off` would make the kernel hunt for an MPTABLE the firecracker
+   binary does not emit).
+2. **`CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y`** in the guest kernel — since ACPI enumeration is now off,
+   the device is discovered off the `virtio_mmio.device=` cmdline firecracker appends. The shipped
+   `boatramp-vmlinux` **already enables this** (for the embedded-VMM path, `flake.nix`), so for the
+   production kernel the fix is the `acpi=off` boot-arg ALONE; only the repro's own `kernel.nix` /
+   `fc-base.config` needed the flag added.
+
+**Live-proven on lighthouse** (kernel 6.12.67 + Landlock V5, firecracker 1.13.1, static-musl static-PIE
+`boatramp` + the non-PIE shim, 3 consecutive runs): clean boot (`SHIM-ALIVE` on the serial console — PID1/
+console sane), `virtio-mmio.0 … IRQ 5` registers with **no `-22`**, `AF_VSOCK bound`, the in-guest
+Enforced Landlock-V5 + seccomp profile installs (`status=Enforced`), `PRIVSEP VM GUEST SERVING`, and the
+host↔guest **byte relay serves a real `200`** through `boatramp_http` behind the hypervisor wall
+(`PRIVSEP VM SCOPED SERVE OK`, the frontend body marker asserted). The transport mechanism works.
+
+**Still open (NOT this increment):** the serve gate stays `#[ignore]`d + lighthouse-driven (hosted CI has
+no `/dev/kvm`); `resolve_spawn_backend` still refuses `substrate: vm` fail-closed — the operator-facing
+**supervise dispatch** (root binds the listener, boots the VM minus its in-root relay thread, `fork`+`exec`s
+the separate `__vm-relay`, supervises both → `FailNodeClosed` on either death) is the next increment, and
+the whole Phase-3c delta (this `acpi=off` transport fix + the dispatch) gates on the **Security review**.

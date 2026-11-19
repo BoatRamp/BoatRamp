@@ -33,12 +33,27 @@ and adds the transport proof (the vsock relay + guest serve + HTTP 200 end-to-en
   against `pkgs.linux_6_12`):
 
   ```sh
-  # fetch the firecracker CI base config, enable Landlock, build:
+  # fetch the firecracker CI base config, enable Landlock + the cmdline virtio-mmio device path, build:
   curl -fsSLo fc-base.config \
     https://raw.githubusercontent.com/firecracker-microvm/firecracker/v1.13.1/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config
   printf 'CONFIG_SECURITY=y\nCONFIG_SECURITYFS=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM="landlock,yama,bpf"\n' >> fc-base.config
+  # Phase-3c: the guest boots with `acpi=off` (see below), so virtio-mmio devices are discovered off the
+  # `virtio_mmio.device=` cmdline firecracker appends, NOT via ACPI. Enable that discovery path (the
+  # shipped `boatramp-vmlinux` already sets it for the embedded-VMM path, so this just matches it):
+  printf 'CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y\n' >> fc-base.config
   nix-build kernel.nix -o kernel-result        # -> kernel-result/vmlinux (the uncompressed ELF firecracker needs)
   ```
+
+  **`acpi=off` (Phase-3c, load-bearing).** The guest boots with `acpi=off` in its kernel cmdline
+  (`boot_firecracker` in `crates/boatramp/src/privsep_vm.rs`). On a kernel >= 6.12 (ACPICA 20240827) the
+  firecracker 1.13.x binary's reduced-hardware DSDT fails operation-region init
+  (`ACPI Error: AE_BAD_PARAMETER, During Region initialization`), which makes the kernel DISABLE ACPI
+  mid-boot and leaves NO device-IRQ routing — the 8250 serial's IRQ-driven TX then `EIO`s (PID 1's own
+  `println!` panics the guest) and the virtio-vsock driver's `request_irq` returns `-EINVAL` (the
+  guest-driver probe fails `-22`). `acpi=off` (with `X86_MPPARSE` off, as the firecracker config ships
+  it) drops the guest to the legacy i8259 PIC model firecracker's KVM irqchip emulates, so the serial
+  (IRQ 4) and the vsock device (IRQ 5) get working IRQ lines. A privsep guest runs no ACPI-dependent
+  devices (no PCI, single vcpu), so this is safe. See the `boot_firecracker` comment for the full trace.
 
 ## Run
 
