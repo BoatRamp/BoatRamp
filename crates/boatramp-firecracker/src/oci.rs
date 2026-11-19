@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
 /// An OCI build error.
@@ -427,14 +427,22 @@ fn ipv4_is_disallowed(v4: Ipv4Addr) -> bool {
 
 /// Is `ip` a non-globally-routable address that must never be a pull target?
 /// Blocks loopback, private, link-local (v4 `169.254/16`, v6 `fe80::/10`),
-/// unique-local (`fc00::/7`), multicast (v4 `224/4` + v6), and the v4-mapped /
-/// deprecated-v4-compatible IPv6 forms of the above — closing SSRF to cloud
-/// metadata (`169.254.169.254`) and internal hosts. `to_canonical` collapses
-/// `::ffff:a.b.c.d` and `::a.b.c.d` back to IPv4 so they can't dodge the v4 block.
+/// unique-local (`fc00::/7`), multicast (v4 `224/4` + v6), and — so an IPv4 target
+/// can't hide inside an IPv6 transition form — the embedded IPv4 of v4-mapped,
+/// v4-compatible, 6to4 and Teredo addresses ([`embedded_ipv4`]).
+///
+/// Note `to_canonical` collapses ONLY the v4-mapped form (`::ffff:a.b.c.d`) back
+/// to IPv4; it does NOT touch v4-compatible (`::a.b.c.d`), 6to4 (`2002::/16`) or
+/// Teredo (`2001:0000::/32`), so those are decoded explicitly here (otherwise
+/// `::169.254.169.254` / `2002:a9fe:a9fe::` would dodge the screen). Closes SSRF to
+/// cloud metadata (`169.254.169.254` and its IPv6-wrapped forms) and internal hosts.
 fn ip_is_disallowed(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(v4) => ipv4_is_disallowed(v4),
         IpAddr::V6(v6) => {
+            if embedded_ipv4(v6).is_some_and(ipv4_is_disallowed) {
+                return true;
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -442,6 +450,37 @@ fn ip_is_disallowed(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
         }
     }
+}
+
+/// Extract the IPv4 address embedded in an IPv6 **transition form** that
+/// `Ipv6Addr::to_canonical` does NOT unwrap, so it can be run through the IPv4
+/// screen: v4-compatible (`::a.b.c.d`, high 96 bits zero — excluding `::`/`::1`),
+/// 6to4 (`2002:ABCD:EFGH::/16`, embedded v4 in bits 16..48), and Teredo
+/// (`2001:0000::/32`, client v4 in the last 32 bits, XOR-obfuscated). Returns
+/// `None` for an ordinary IPv6 address (incl. v4-mapped, which `to_canonical`
+/// already handled before this is reached).
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = v6.segments();
+    let o = v6.octets();
+    // v4-compatible `::a.b.c.d` (deprecated): first 96 bits zero. Exclude `::`/`::1`.
+    if s[..6] == [0, 0, 0, 0, 0, 0] && !(s[6] == 0 && (s[7] == 0 || s[7] == 1)) {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    // 6to4 `2002::/16`: the embedded IPv4 is bits 16..48.
+    if s[0] == 0x2002 {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    // Teredo `2001:0000::/32`: the client IPv4 is the last 32 bits, obfuscated by
+    // a bitwise-NOT (XOR `0xff` per octet).
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        return Some(Ipv4Addr::new(
+            o[12] ^ 0xff,
+            o[13] ^ 0xff,
+            o[14] ^ 0xff,
+            o[15] ^ 0xff,
+        ));
+    }
+    None
 }
 
 /// Split a URL authority (`host`, `host:port`, or `[v6]:port`) into host + port,
@@ -1816,6 +1855,27 @@ mod tests {
         assert!(ip_is_disallowed("224.0.0.1".parse().unwrap()));
         // And a plain public v4 is allowed.
         assert!(!ip_is_disallowed("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_transition_forms_embedding_private_v4_are_refused() {
+        let v6 = |a, b, c, d, e, f, g, h| IpAddr::V6(Ipv6Addr::new(a, b, c, d, e, f, g, h));
+        // v4-compatible `::169.254.169.254` (cloud metadata) — `to_canonical` does
+        // NOT unwrap this, so it must be decoded + screened explicitly.
+        assert!(ip_is_disallowed(v6(0, 0, 0, 0, 0, 0, 0xa9fe, 0xa9fe)));
+        // 6to4 `2002::/16` wrapping link-local 169.254.169.254.
+        assert!(ip_is_disallowed(v6(0x2002, 0xa9fe, 0xa9fe, 0, 0, 0, 0, 0)));
+        // 6to4 wrapping RFC-1918 10.0.0.1.
+        assert!(ip_is_disallowed(v6(0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0)));
+        // Teredo `2001:0000::/32` whose obfuscated client v4 is 127.0.0.1
+        // (127.0.0.1 XOR 255.255.255.255 = 128.255.255.254 = 80ff:fffe).
+        assert!(ip_is_disallowed(v6(0x2001, 0, 0, 0, 0, 0, 0x80ff, 0xfffe)));
+        // A genuine global IPv6 (Cloudflare DNS) is still allowed.
+        assert!(!ip_is_disallowed(v6(
+            0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111
+        )));
+        // A 6to4 wrapping a PUBLIC v4 (1.1.1.1) stays allowed (no over-block).
+        assert!(!ip_is_disallowed(v6(0x2002, 0x0101, 0x0101, 0, 0, 0, 0, 0)));
     }
 
     #[test]
