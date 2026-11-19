@@ -906,3 +906,70 @@ jobs:
             || { echo "::error::dual-attached run_ephemeral never reached its default-bridge success marker (silent skip or the v0.56.0 per-project-net-PRIMARY regression — default-bridge DB unreachable)" >&2; exit 1; }
           grep -q 'DOCKER LONG MANAGED-DB SD OK' docker-net.log \
             || { echo "::error::long managed-DB workload (> 63-octet name) never reached its short-alias resolution marker (silent skip or the Docker-29 RFC-1035 label-cap regression — SD record for the over-long alias not published)" >&2; exit 1; }
+
+  # Tier A' — the scoped privsep VM substrate's OPERATOR SUPERVISE-DISPATCH (S1 —
+  # crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md). The authoritative evidence is the
+  # LIGHTHOUSE live run (hosted CI has /dev/kvm but the full serve path also needs a musl
+  # static-PIE boatramp + the non-PIE shim + a Landlock-V5 >= 6.10 guest kernel); this job is the
+  # CI home that WIRES the hard success markers of the lighthouse-driven gate
+  # (docs/privsep-vm-scoped-repro/run-operator.sh), per the "ignore-gated tests != evidence" rule.
+  #
+  # workflow_dispatch ONLY (NOT on the nightly schedule): it needs a PUBLISHED Landlock-V5
+  # `boatramp-vmlinux` release (the in-guest Enforced profile's MIN_LANDLOCK_ABI = V5 floor); until
+  # that tag is published + signed, pass it via the `vmlinux_tag` input when dispatching. The pure
+  # refuse-path + scope-lint + kernel-config-guard + boot-arg gates run in the ci.yml MERGE gate
+  # (--all-features lib tests) — those are the CI-assertable parts; THIS is the serve+teardown proof.
+  privsep-vm-operator:
+    name: privsep scoped VM — operator supervise-dispatch (KVM)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Confirm KVM is available on the hosted runner
+        run: |
+          test -e /dev/kvm && ls -l /dev/kvm
+          sudo chmod 666 /dev/kvm || true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-privsep-vm-operator
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Download + verify the released Landlock-V5 guest kernel (verify-before-boot bar)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.vmlinux_tag || 'v0.2.3' }}"
+          gh release download "$tag" -R BoatRamp/boatramp-vmlinux \
+            -p 'boatramp-vmlinux-x86_64' \
+            -p 'boatramp-vmlinux-x86_64.sha256' \
+            -D rel --clobber
+          cd rel
+          printf '%s  boatramp-vmlinux-x86_64\n' "$(cat boatramp-vmlinux-x86_64.sha256)" | sha256sum -c -
+
+      - name: Operator supervise-dispatch — serve a 200 + kill EITHER child => FailNodeClosed (hard gate)
+        run: |
+          set -o pipefail
+          export GUEST_KERNEL="$(realpath rel/boatramp-vmlinux-x86_64)"
+          # Reuse the ONE lighthouse driver (consolidate, don't parallelize): it builds the musl
+          # static-PIE boatramp + the non-PIE shim, boots the microVM via `boatramp __root`, proves a
+          # 200 over the separate __vm-relay, then SIGKILLs the relay and (fresh node) firecracker,
+          # asserting FailNodeClosed each time. firecracker/zig/cargo-zigbuild come from nixpkgs.
+          timeout -k 30 1500 \
+            nix shell nixpkgs#cargo-zigbuild nixpkgs#zig nixpkgs#firecracker \
+                      nixpkgs#binutils nixpkgs#gcc nixpkgs#pkg-config nixpkgs#openssl \
+              --command bash docs/privsep-vm-scoped-repro/run-operator.sh 2>&1 | tee op.log
+          for m in \
+            "PRIVSEP VM SUPERVISE SERVE OK" \
+            "PRIVSEP VM RELAY-KILL FAILCLOSED OK" \
+            "PRIVSEP VM FIRECRACKER-KILL FAILCLOSED OK"; do
+            grep -qF "$m" op.log \
+              || { echo "::error::operator supervise-dispatch missing marker: $m (silent skip or a regression?)" >&2; exit 1; }
+          done

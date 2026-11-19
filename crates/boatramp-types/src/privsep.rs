@@ -764,11 +764,18 @@ impl TenantScope {
 ///
 /// **Phase-3 scope:** `OsProcess` (Phase-1) and `Container` (Phase-3 simple model — the SAME
 /// fork+exec, the child unsharing mount/ipc/uts/cgroup namespaces in its `pre_exec`, no
-/// `pivot_root`, no new net/pid/user namespace; the per-capability Landlock profile stays the FS wall) are
-/// WIRED spawn backends. `Vm` parses + lints as valid composition vocabulary but the supervisor
-/// REFUSES to spawn it fail-closed (naming its reuse backend) rather than silently downgrading — a VM
-/// has its own kernel, so the `local` socketpair cannot cross and the link transport needs a vsock
-/// re-plumb. See [`InstanceSubstrate::is_wired`] and `crates/boatramp/DESIGN-privsep-phase3-container.md`.
+/// `pivot_root`, no new net/pid/user namespace; the per-capability Landlock profile stays the FS wall)
+/// are WIRED spawn backends. `Vm` (the owner-greenlit SCOPED first cut — firecracker/Linux,
+/// static-parser-frontends-only) has its full operator supervise-dispatch BUILT + wired — a VM has its
+/// own kernel, so the `local` socketpair cannot cross; the root instead boots the microVM guest and
+/// supervises a SEPARATE least-authority `__vm-relay` process that splices the client's bytes to the
+/// frontend-in-guest over the vsock bridge (the root never crosses the vsock, carries no key bytes),
+/// gated to a key-free static-parser frontend (the lint's P3). But it is NOT yet a wired backend (the
+/// SAFE SUBSET): `resolve_spawn_backend` refuses `substrate: vm` fail-closed pending a full live serve +
+/// kill→FailNodeClosed proof + the independent Security review; any other VM shape is additionally
+/// refused at `plan_root` (`check_vm_secret_blindness_closure`). See [`InstanceSubstrate::is_wired`],
+/// `crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md`, and
+/// `crates/boatramp/DESIGN-privsep-phase3-container.md`.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -798,9 +805,16 @@ impl InstanceSubstrate {
     /// `Container` is the Phase-3 namespace/cgroup-confined backend (the root unshares
     /// `CLONE_NEWNS|NEWIPC|NEWUTS|NEWCGROUP` in the child's `pre_exec` on the SIMPLE model — no
     /// `pivot_root`, no new net/pid/user namespace, the per-capability Landlock profile stays the FS
-    /// wall; see `crates/boatramp/DESIGN-privsep-phase3-container.md`). `Vm` stays the reported follow-on
-    /// (its own kernel ⇒ the `local` socketpair cannot cross, so it needs a vsock re-plumb), refused
-    /// fail-closed by the supervisor.
+    /// wall; see `crates/boatramp/DESIGN-privsep-phase3-container.md`). `Vm` stays NOT-wired in this cut
+    /// (the SAFE SUBSET): the owner-greenlit scoped VM supervise-dispatch (the root binds the listener,
+    /// boots the microVM guest, and `fork`+`exec`s a SEPARATE least-authority `__vm-relay` process that
+    /// splices the client's bytes to the frontend-in-guest over the vsock bridge, with a relay-side
+    /// positive readiness gate) is BUILT + wired and its boot/fork/supervise/readiness/fail-closed path
+    /// is live-proven on lighthouse — but it stays refused fail-closed at `resolve_spawn_backend`
+    /// pending (a) a full live SERVE + kill→FailNodeClosed proof (blocked only by the Phase-3c
+    /// firecracker↔guest vsock transport, which regressed in the live environment) and (b) the
+    /// independent Security review. Flipping this to include `Vm` is the final step. See
+    /// `crates/boatramp/DESIGN-privsep-phase3-vm-scoped.md` §S1.
     pub const fn is_wired(self) -> bool {
         matches!(self, Self::OsProcess | Self::Container)
     }
@@ -3305,7 +3319,8 @@ mod tests {
             InstanceSubstrate::OsProcess
         );
         // `OsProcess` + `Container` (Phase-3 namespace/cgroup simple model) are WIRED backends; `Vm`
-        // stays the reported follow-on (its own kernel ⇒ the `local` socketpair cannot cross).
+        // stays NOT-wired in the SAFE SUBSET (the scoped supervise-dispatch is built + wired but the
+        // flip awaits a full live serve + kill→FailNodeClosed proof + Security).
         assert!(InstanceSubstrate::OsProcess.is_wired());
         assert!(InstanceSubstrate::Container.is_wired());
         assert!(!InstanceSubstrate::Vm.is_wired());

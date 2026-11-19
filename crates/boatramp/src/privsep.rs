@@ -196,10 +196,12 @@ pub struct InstanceSpawnSpec {
     /// The fine-grained authority set this instance materializes.
     pub capabilities: Vec<HostAuthority>,
     /// The ISOLATION SUBSTRATE this instance's spawn backend uses (design §7 "substrate is a spawn
-    /// backend"). The supervisor dispatches on it: `OsProcess` is the Phase-1 fork+exec backend and
+    /// backend"). The supervisor dispatches on it: `OsProcess` is the Phase-1 fork+exec backend,
     /// `Container` the Phase-3 one (the SAME fork+exec, the child additionally unsharing
-    /// NS/IPC/UTS/CGROUP in its `pre_exec` — design-note Option C / §8); `Vm` is refused
-    /// fail-closed by [`resolve_spawn_backend`] until its vsock-crossing wiring lands.
+    /// NS/IPC/UTS/CGROUP in its `pre_exec` — design-note Option C / §8). `Vm` (the scoped first cut —
+    /// the root boots the microVM guest + supervises a separate `__vm-relay`) has its supervise-dispatch
+    /// BUILT + wired but stays refused fail-closed by `resolve_spawn_backend` (the SAFE SUBSET) pending
+    /// a full live serve + kill→FailNodeClosed proof + Security.
     pub substrate: InstanceSubstrate,
     /// The re-exec argv TAIL (after `argv[0]`): `["__instance", "<label>", "--config", "<path>"]`.
     pub argv: Vec<String>,
@@ -838,6 +840,85 @@ fn install_privsep_instance_profile(
     Ok(())
 }
 
+/// Finding 2 (acpi=off Security review) — PURE assertion of the two guest-kernel-config PRECONDITIONS
+/// the `acpi=off` boot silently depends on. `X86_MPPARSE` MUST be OFF (with `acpi=off` ON the kernel
+/// hunts for an MPTABLE the firecracker *binary* backend does not emit, so device IRQs never route —
+/// the serial `EIO`s and the virtio-vsock probe fails `-22`), and `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES`
+/// MUST be `=y` (with ACPI disabled the virtio-mmio devices are discovered off the `virtio_mmio.device=`
+/// cmdline). A violation ⇒ `Err` so the caller refuses fail-closed. Split out (no `cfg`) so it is
+/// unit-tested without a running kernel. Linux-only (the guest runs on Linux; the parser is dead on a
+/// non-Linux build). See [`crate::privsep_vm`]'s `boot_firecracker` for the trace.
+#[cfg(target_os = "linux")]
+fn check_kernel_config_preconditions(config: &str) -> Result<(), String> {
+    if config.lines().any(|l| l.trim() == "CONFIG_X86_MPPARSE=y") {
+        return Err(
+            "the guest kernel has CONFIG_X86_MPPARSE=y — with `acpi=off` the kernel hunts for an \
+             MPTABLE the firecracker binary backend does not emit, so NO device IRQ is routed (the \
+             8250 serial TX `EIO`s and the virtio-vsock `request_irq` fails -22, killing the \
+             transport). It MUST be OFF. Refusing to serve fail-closed (config drift)"
+                .to_string(),
+        );
+    }
+    if !config
+        .lines()
+        .any(|l| l.trim() == "CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y")
+    {
+        return Err(
+            "the guest kernel is missing CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y — with ACPI disabled \
+             (`acpi=off`) the virtio-mmio devices (the vsock transport included) are discovered off \
+             the `virtio_mmio.device=` cmdline firecracker appends; without it the vsock device is \
+             never found. It MUST be =y. Refusing to serve fail-closed (config drift)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Read the RUNNING guest kernel's own config from `/proc/config.gz` (present iff
+/// `CONFIG_IKCONFIG_PROC=y`), gunzipped. `None` when absent/unreadable — the guard then cannot assert
+/// and WARNs rather than refusing (the positive readiness gate still fails loud on any real
+/// degradation). Uses `flate2` (a plain `boatramp` dependency, present in the `fs,sandbox` guest build).
+#[cfg(target_os = "linux")]
+fn read_proc_config_gz() -> Option<String> {
+    use std::io::Read;
+    let bytes = std::fs::read("/proc/config.gz").ok()?;
+    let mut gz = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut out = String::new();
+    gz.read_to_string(&mut out).ok()?;
+    Some(out)
+}
+
+/// Finding 2 (acpi=off Security review) — the guest's BOOT-TIME kernel-config guard. If the running
+/// kernel's config is READABLE (`/proc/config.gz`, i.e. `CONFIG_IKCONFIG_PROC=y`) and VIOLATES a
+/// precondition, refuse fail-closed (`Err` ⇒ the guest powers off ⇒ the host trips `FailNodeClosed`,
+/// LOUD — never a silent boot degradation). If it is ABSENT/unreadable, WARN prominently and proceed:
+/// the guard cannot assert, but the relay's POSITIVE readiness gate (Finding 1) still converts any
+/// resulting boot degradation (dead IRQs ⇒ no vsock ⇒ no 200) into a loud `FailNodeClosed`.
+#[cfg(target_os = "linux")]
+fn guest_kernel_config_guard(label: &str) -> Result<(), String> {
+    match read_proc_config_gz() {
+        Some(config) => {
+            check_kernel_config_preconditions(&config)?;
+            tracing::info!(
+                instance = %label,
+                "[privsep] VM guest: kernel-config preconditions OK (X86_MPPARSE off + \
+                 VIRTIO_MMIO_CMDLINE_DEVICES=y — the acpi=off boot's device-IRQ routing holds)"
+            );
+            Ok(())
+        }
+        None => {
+            tracing::warn!(
+                instance = %label,
+                "[privsep] VM guest: /proc/config.gz is absent (CONFIG_IKCONFIG_PROC off) — CANNOT \
+                 assert the X86_MPPARSE-off + VIRTIO_MMIO_CMDLINE_DEVICES=y preconditions at boot. \
+                 Relying on the relay's positive readiness gate to fail LOUD if the acpi=off IRQ \
+                 routing is broken. Enable CONFIG_IKCONFIG_PROC in the guest kernel to assert here."
+            );
+            Ok(())
+        }
+    }
+}
+
 /// The scoped privsep VM substrate's IN-GUEST frontend entry (`boatramp __vm-guest`): the static-PIE
 /// `boatramp` the non-PIE init shim `execve`d as the microVM guest's PID 1 (own-binary-as-init, O3b).
 /// It serves a **static-parser frontend** slice behind the hypervisor wall, carrying ZERO key material
@@ -888,6 +969,12 @@ pub fn run_vm_guest() -> Result<(), CliError> {
     }
     let _gate = MaterializationGate::new(&inst.capabilities);
 
+    // Finding 2 (acpi=off Security review): assert the guest-kernel-config preconditions the `acpi=off`
+    // boot silently depends on (X86_MPPARSE off + VIRTIO_MMIO_CMDLINE_DEVICES=y). Readable-and-wrong ⇒
+    // refuse fail-closed (guest powers off ⇒ FailNodeClosed); absent ⇒ WARN (the relay's positive
+    // readiness gate still fails loud). Done before binding/serving.
+    guest_kernel_config_guard(&label).map_err(fail)?;
+
     // (3) Bind the vsock listener BEFORE the profile (the profile denies `bind`).
     let listener = crate::privsep_vm::vsock_bind_listen(descriptor.vsock_port)
         .map_err(|e| fail(format!("binding the guest vsock listener: {e}")))?;
@@ -935,6 +1022,15 @@ pub fn run_vm_guest() -> Result<(), CliError> {
 /// production YET: [`resolve_spawn_backend`] still refuses `substrate: vm` before any relay is spawned
 /// (the supervise-dispatch flip + the Linux live gate are the next increment); this entry + the
 /// profile are the unit/socketpair-proven primitive they build on.
+/// The bounded deadline the `__vm-relay` readiness handshake (acpi=off Security review, Finding 1)
+/// waits for the frontend-in-guest to serve its first `200` over vsock before the relay accepts any
+/// client. Generous — a cold guest boots firecracker, unpacks a ~185 MB initramfs, self-relocates the
+/// static-PIE, installs its Enforced profile, and binds vsock before it serves — but FINITE: when it
+/// elapses the relay exits and the root trips `FailNodeClosed`, rather than relaying clients to (or
+/// waiting forever on) a guest that never positively served.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+const VM_RELAY_READINESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
 pub fn run_vm_relay(label: &str) -> Result<(), CliError> {
     crate::init_tracing();
     // The relay handles untrusted client bytes; scrub any inherited live credential first (inv10).
@@ -1106,6 +1202,21 @@ fn run_vm_relay_confined(
     // owns it exclusively.
     let listener = unsafe { std::net::TcpListener::from_raw_fd(listener_fd) };
 
+    // Finding 1 (acpi=off Security review) — POSITIVE readiness gate, BEHIND the profile + BEFORE the
+    // first client. Assert the frontend-in-guest actually SERVES a 200 over vsock within a bounded
+    // deadline (the UDS merely existing — `boot_firecracker`'s device-up wait — is NOT proof the guest
+    // is healthy). Done from the relay (NOT the root), which already holds the `connect`/`read`/`write`
+    // socket verbs this needs; the root never crosses the vsock. On timeout this returns `Err` ⇒ the
+    // relay exits ⇒ the root's supervise loop trips `FailNodeClosed` — a degraded-but-booted guest is
+    // never silently served. The probe connection is just another `Connection: close` client.
+    let readiness_deadline = std::time::Instant::now() + VM_RELAY_READINESS_DEADLINE;
+    crate::privsep_vm::relay_readiness_probe(&uds_norm, descriptor.guest_port, readiness_deadline)?;
+    tracing::info!(
+        instance = %label,
+        "[privsep] __vm-relay: readiness gate PASSED — the frontend-in-guest served a 200 over vsock; \
+         now accepting + relaying clients (PRIVSEP VM RELAY READY)"
+    );
+
     // Run the Model-A copy-relay behind the wall: accept each client, dial the frontend-in-guest over
     // the vsock UDS, and splice OPAQUE bytes both ways — NO parse, and NEVER key material (the scoped
     // frontend holds no key; the secret-blindness invariant + the S2 lint forbid a key-material link
@@ -1226,12 +1337,15 @@ fn instance_listener_addr(
 // shape before spawn), so the relay is itself secret-blind.
 //
 // This is the ROOT→relay BOUNDARY CONTRACT (the S1 analog of `InstanceSpawnSpec` for WS-B): the
-// fully-formed, host-tested command + environment the root hands the OS for the relay. The actual
-// `.spawn()`, the pre-bound-listener-fd pass, the relay's OWN least-authority seccomp/Landlock
-// profile install, and the supervise wiring are the NEXT (Security-reviewed, Linux-live-gated)
-// increment — this is the reviewable primitive they build on. Until then `substrate: Vm` stays
-// refused fail-closed at `resolve_spawn_backend` (no runtime path change; the secret-blind root,
-// the prod VM-refusal gates, and the lint are all untouched).
+// fully-formed, host-tested command + environment the root hands the OS for the relay. It is now
+// WIRED into the operator supervise dispatch (`supervise::run` → `per_tenant::spawn_vm_relay`): the
+// root binds the listener, boots the microVM guest, builds this spec, `fork`+`exec`s the relay, and
+// supervises both the firecracker child and the relay child (either's death ⇒ `FailNodeClosed`). The
+// relay installs its OWN least-authority seccomp/Landlock profile + enters its egress-contained
+// netns/mount-ns BEFORE touching a client byte (`run_vm_relay_confined`), and does a POSITIVE
+// readiness handshake to the guest before accepting clients (Finding 1). `substrate: Vm` dispatches
+// for the scoped shape ONLY (`resolve_spawn_backend`); any other VM shape is still refused fail-closed
+// by the `plan_root` scope lint + the spawn gate.
 
 /// The internal `argv[1]` token that engages the separate VM client-byte relay process. Mirrors the
 /// `__root`/`__instance`/`__vm-guest` precedent: an EXACT `argv[1]` match, kept OUT of the clap
@@ -1289,12 +1403,12 @@ impl VmRelayDescriptor {
 
 /// The root→`__vm-relay` re-exec spawn spec — the S1 boundary primitive (the analog of
 /// [`InstanceSpawnSpec`] for the separate relay process). It is the fully-formed, tested command +
-/// environment the root hands the OS; the `.spawn()` + listener-fd pass + the relay's own
-/// least-authority profile install + supervision are the next increment.
+/// environment the root hands the OS; the supervise dispatch (`supervise::run` →
+/// [`per_tenant::spawn_vm_relay`](self)) now builds + spawns it.
 ///
-/// `#[allow(dead_code)]` carries it (+ [`plan_vm_relay_spec`]) as the root-side S1 seam, exercised by
-/// the tests, until the supervise loop builds + spawns it — exactly as [`InstanceSpawnSpec`] carried
-/// its own `to_command` seam before WS-C wired the spawn.
+/// `#[allow(dead_code)]` is kept for the NON-unix build, where the `supervise`/`per_tenant` modules
+/// are `#[cfg(unix)]`-gated out and the only remaining reference is the (test-only) unit test — the
+/// spec is fully wired on the live unix/Linux path.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmRelaySpawnSpec {
@@ -1311,8 +1425,8 @@ pub struct VmRelaySpawnSpec {
 
 impl VmRelaySpawnSpec {
     /// Build the ready-to-spawn re-exec [`std::process::Command`]: `env_clear` + the minimal
-    /// scrubbed env + the `__vm-relay` argv tail. `#[allow(dead_code)]` carries it as the S1 seam
-    /// (exercised by the tests) until the supervise loop calls it.
+    /// scrubbed env + the `__vm-relay` argv tail. Called by [`per_tenant::spawn_vm_relay`](self) on the
+    /// unix supervise path; `#[allow(dead_code)]` is kept for the non-unix build (supervise cfg'd out).
     #[allow(dead_code)]
     pub fn to_command(&self, current_exe: &Path) -> std::process::Command {
         let mut cmd = std::process::Command::new(current_exe);
@@ -1332,7 +1446,8 @@ impl VmRelaySpawnSpec {
 /// [`PRIVSEP_VM_RELAY_ENV`] descriptor and the [`PRIVSEP_FDS_ENV`] map carrying the pre-bound
 /// public TCP listener on `listener_fd` (`links` empty — the relay has no feature-links). Pure
 /// (host-testable). `parent_env` is the root's environment; `declared_secret_env` the config-driven
-/// secret-env set from [`privsep_resolve::declared_secret_env_var_names`].
+/// secret-env set from [`privsep_resolve::declared_secret_env_var_names`]. Called by the unix
+/// supervise dispatch; `#[allow(dead_code)]` is kept for the non-unix build (supervise cfg'd out).
 #[allow(dead_code)]
 pub fn plan_vm_relay_spec<I>(
     label: &str,
@@ -1367,31 +1482,38 @@ where
 /// downgraded to an OS process (which would discard the operator's chosen isolation wall).
 ///
 /// **Phase-3 scope.** [`InstanceSubstrate::OsProcess`] is the Phase-1 WIRED backend (the root's
-/// `fork`+`exec` over the `local` socketpair, below). [`InstanceSubstrate::Container`] is NOW WIRED
-/// too, on the SIMPLE model (design-note Option C, owner-approved): the SAME `fork`+`exec`, with the
-/// child additionally unsharing the mount/ipc/uts/cgroup namespaces in its `pre_exec` (no
-/// `pivot_root`, no new net/pid/user namespace — the per-capability Landlock profile stays the FS
-/// wall, and a `backend.*` instance keeps host-net egress; pid-ns isolation is a deferred increment). [`InstanceSubstrate::Vm`] stays the reported
-/// follow-on: a VM has its OWN kernel, so the `local` socketpair cannot cross (unlike Container on one
-/// shared kernel — design-note §2a); it needs a vsock re-plumb of the whole link transport. Until then
-/// `Vm` stays refused fail-closed at the operator-facing spawn gate, with a message that names WHICH
-/// blocker applies:
-/// - A key-free **static-parser frontend** (a group-C `listen.*`-only slice — the lint's P3;
-///   [`crate::privsep_vm::is_scoped_static_parser_frontend`]) is exactly the owner-greenlit scoped
-///   first cut. Its substrate MECHANISM is BUILT + live-gated ([`crate::privsep_vm`], the shim, the
-///   `__vm-guest` serve, the lighthouse serve gate), but the operator-facing SUPERVISE wiring is still
-///   being built on the **S1 relay-placement** decision, now RESOLVED (owner, 2026-11-14): the host
-///   client-byte relay (design §1c Model A) needs `accept4`/`connect`/`read`/`write`, which the
-///   secret-blind root's networkless TCB-floor self-profile (`derive_root_profile` — `ROOT_NET_STRIP`)
-///   forbids, so it runs in a SEPARATE least-authority relay process (`__vm-relay`) — NOT a widening of
-///   the root (a relay bug, parsing untrusted client bytes, stays OUT of the root's TCB floor). The
-///   root→relay BOUNDARY CONTRACT is built ([`VmRelaySpawnSpec`] / [`plan_vm_relay_spec`] /
-///   [`VmRelayDescriptor`], the S1 analog of [`InstanceSpawnSpec`]); the relay's OWN least-authority
-///   seccomp/Landlock profile, the `.spawn()` + listener-fd pass, and the supervise dispatch are the
-///   next (Security-reviewed, Linux-live-gated) increment. Until that lands the frontend is not
-///   operator-launched (never silently downgraded to an OS process, which would discard the wall).
+/// `fork`+`exec` over the `local` socketpair, below). [`InstanceSubstrate::Container`] is WIRED too, on
+/// the SIMPLE model (design-note Option C, owner-approved): the SAME `fork`+`exec`, with the child
+/// additionally unsharing the mount/ipc/uts/cgroup namespaces in its `pre_exec` (no `pivot_root`, no
+/// new net/pid/user namespace — the per-capability Landlock profile stays the FS wall, and a
+/// `backend.*` instance keeps host-net egress; pid-ns isolation is a deferred increment).
+/// [`InstanceSubstrate::Vm`] is NOW WIRED for the owner-greenlit SCOPED first cut — a key-free
+/// **static-parser frontend** (a group-C `listen.*`-only slice — the lint's P3;
+/// [`crate::privsep_vm::is_scoped_static_parser_frontend`]). A VM has its OWN kernel, so the `local`
+/// socketpair cannot cross (unlike Container on one shared kernel — design-note §2a); instead the root
+/// binds the privileged listener, boots the microVM guest ([`crate::privsep_vm::boot_frontend_vm`],
+/// WITHOUT any in-root relay thread), then `fork`+`exec`s a SEPARATE least-authority relay process
+/// (`__vm-relay`) that splices the client's bytes to the frontend-in-guest over the vsock bridge
+/// (design §1c Model A), and supervises BOTH the firecracker child and the relay child (either's death
+/// ⇒ `FailNodeClosed`). The relay runs the byte-relay — NOT the secret-blind root — because the host
+/// client-byte relay needs `accept4`/`connect`/`read`/`write`, which the root's networkless TCB-floor
+/// self-profile (`derive_root_profile` — `ROOT_NET_STRIP`) forbids; a relay bug parsing untrusted
+/// client bytes stays OUT of the root's TCB floor (S1, owner-resolved 2026-11-14). The relay, not the
+/// root, is the host-side vsock endpoint; the root carries no key bytes (a scoped frontend holds no
+/// key, enforced by the lint before spawn).
+///
+/// **SAFE-SUBSET GATE (this cut).** That entire dispatch — [`supervise::run`]'s VM branch +
+/// [`per_tenant::spawn_vm_relay`] + the relay-side positive readiness gate ([`run_vm_relay_confined`] →
+/// [`crate::privsep_vm::relay_readiness_probe`]) — is BUILT + wired + its boot/fork/supervise/readiness/
+/// fail-closed-on-child-death path is live-proven on lighthouse. But `is_wired(Vm)` stays `false` and
+/// this arm REFUSES `substrate: vm` fail-closed, pending (a) a full live SERVE + kill→FailNodeClosed
+/// proof — blocked only by the Phase-3c firecracker↔guest vsock transport, which regressed in the live
+/// environment (it stops the pre-existing in-root serve gate too, NOT this dispatch) — and (b) the
+/// independent Security review of the TCB-critical seam. Flipping this arm + `is_wired(Vm)` is the final
+/// step. It refuses fail-closed for the scoped shape (gated) AND for:
 /// - Any OTHER VM shape — a co-located sealer bundle (P1, which needs the owner-GATED vsock key-relay,
-///   design §3 / S2), a backend, an exec/control instance — is outside the approved scope entirely.
+///   design §3 / S2), a backend, an exec/control instance — outside the approved scope entirely. (The
+///   `plan_root` scope lint already refuses these; this is the defence-in-depth spawn-gate companion.)
 ///
 /// Pure (host-testable).
 fn resolve_spawn_backend(
@@ -1399,16 +1521,22 @@ fn resolve_spawn_backend(
     substrate: InstanceSubstrate,
     capabilities: &[HostAuthority],
 ) -> Result<(), PrivsepError> {
-    if substrate.is_wired() {
-        return Ok(());
-    }
+    // The VM substrate is handled FIRST — its acceptable SCOPE is capability-dependent, so it cannot
+    // ride the capability-free `is_wired` shortcut. The operator supervise-dispatch (boot the microVM +
+    // fork+supervise a separate least-authority `__vm-relay`, with the relay-side positive readiness
+    // gate) is BUILT + wired below, but `substrate: vm` stays REFUSED fail-closed here — the SAFE-SUBSET
+    // gate — pending a full live SERVE + kill→FailNodeClosed proof and the independent Security review
+    // (the dispatch's wiring + readiness + fail-closed-on-child-death are live-proven on lighthouse;
+    // the end-to-end 200 serve awaits the Phase-3c firecracker↔guest vsock transport being re-confirmed
+    // live — it regressed in the live environment). Flipping this + `is_wired(Vm)` is the final step.
     if matches!(substrate, InstanceSubstrate::Vm) {
         let reason = if crate::privsep_vm::is_scoped_static_parser_frontend(capabilities) {
-            "it IS the owner-greenlit scoped shape (a key-free static-parser frontend), and the VM \
-             substrate MECHANISM is built + live-gated — the operator-facing supervise wiring is \
-             being built on the RESOLVED S1 decision (a separate least-authority `__vm-relay` \
-             process; the root→relay boundary spec is landed), pending the relay's own \
-             least-authority profile + the supervise dispatch (the next Security-reviewed increment)"
+            "it IS the owner-greenlit scoped shape (a key-free static-parser frontend), and the \
+             operator supervise-dispatch (boot the guest + fork+supervise a separate `__vm-relay` with \
+             the relay-side positive readiness gate) is BUILT + wired — but it stays refused \
+             fail-closed pending a full live SERVE + kill→FailNodeClosed proof (the Phase-3c \
+             firecracker↔guest vsock transport must be re-confirmed live) AND the independent Security \
+             review of the TCB-critical boot/fork/supervise seam"
         } else {
             "it is NOT a key-free static-parser frontend (a group-C `listen.*`-only slice), so it is \
              outside the approved scope entirely — a co-located sealer bundle / backend / exec/control \
@@ -1419,6 +1547,9 @@ fn resolve_spawn_backend(
              silently downgrading to an OS process (which would discard the chosen isolation wall); \
              use `substrate: OsProcess` or `substrate: Container`"
         )));
+    }
+    if substrate.is_wired() {
+        return Ok(());
     }
     let backend = substrate.compute_plane_backend().unwrap_or("(none)");
     Err(PrivsepError::Supervise(format!(
@@ -1904,6 +2035,62 @@ mod per_tenant {
                     // stay here — they are spawn-specific; the relay never holds key material.)
                     boatramp_server::sandbox::drop_all_capabilities()?;
                 }
+                Ok(())
+            });
+        }
+        cmd.spawn()
+    }
+
+    /// The root's fork+exec primitive for the SEPARATE least-authority VM client-byte relay process
+    /// (`__vm-relay`) — the S1 companion to [`spawn_wired_instance`], used ONLY by the boot
+    /// supervisor's scoped-VM dispatch. It re-execs the current binary with the relay spec's minimal
+    /// secret-scrubbed env (already shaped by [`super::plan_vm_relay_spec`] — `env_clear` + the
+    /// descriptor + the fd map), and in the child's `pre_exec` `dup2`s the pre-bound public listener
+    /// onto its fixed target fd + clears `CLOEXEC`, then `PR_SET_PDEATHSIG(SIGKILL)` so a dead root
+    /// takes the relay with it (no orphaned relay).
+    ///
+    /// Deliberately DIFFERENT from [`spawn_wired_instance`] in two load-bearing ways:
+    /// 1. **NO capability drop here.** The relay INHERITS the root's capabilities (incl.
+    ///    `CAP_SYS_ADMIN`) and drops them ITSELF, in [`super::run_vm_relay_confined`] — AFTER using
+    ///    `CAP_SYS_ADMIN` once to enter its empty netns + minimal mount-ns, and BEFORE installing its
+    ///    profile / touching a client byte (`sandbox::drop_all_capabilities` +
+    ///    `clear_current_capabilities`). Dropping caps in this `pre_exec` would break those unshares.
+    /// 2. **NO namespace unshare here.** Unlike the Container substrate, the relay sets up its OWN
+    ///    (net + mount) namespaces post-exec inside `run_vm_relay_confined`.
+    ///
+    /// The relay re-execs its own binary (the root's execve is Landlock-pinned to it), so this is the
+    /// SAME re-exec primitive, minus the instance-specific cap/namespace steps.
+    pub(super) fn spawn_vm_relay(
+        current_exe: &Path,
+        spec: &super::VmRelaySpawnSpec,
+        dups: Vec<(RawFd, RawFd)>,
+    ) -> std::io::Result<std::process::Child> {
+        let mut cmd = spec.to_command(current_exe);
+        // SAFETY: `pre_exec` runs post-`fork`/pre-`exec`; `dup2`/`fcntl`/`prctl` are async-signal-safe
+        // and touch only this child's fd table + death-signal. The caller assigns the listener target
+        // fd ABOVE every source fd, so the `dup2` cannot clobber a not-yet-processed source.
+        unsafe {
+            cmd.pre_exec(move || {
+                for (src, tgt) in &dups {
+                    if *src != *tgt && libc::dup2(*src, *tgt) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // Clear CLOEXEC on the target so the listener survives the exec into the relay.
+                    let flags = libc::fcntl(*tgt, libc::F_GETFD);
+                    if flags < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(*tgt, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                // FailNodeClosed robustness: a dead root takes the relay with it (Linux only).
+                #[cfg(target_os = "linux")]
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // NB: NO capability drop + NO namespace unshare here (see the fn doc) — the relay does
+                // both ITSELF, post-exec, in `run_vm_relay_confined`.
                 Ok(())
             });
         }
@@ -2625,11 +2812,153 @@ mod supervise {
         //    primitive (`spawn_wired_instance`, WS-C step 1 — the SAME primitive the per-tenant router
         //    reuses). The extra env carries the fd map, plus a sealer's unseal allowlist / a crown
         //    jewel's authority-serve links (names only), exactly as before.
+        // Scoped-VM dispatch state (S1). Computed up front; referenced only by the VM branch in the
+        // spawn loop (a composition with no `substrate: vm` instance never reads them at runtime —
+        // which is fine, the source reference keeps them "used" at compile time):
+        // - `declared_secret_env`: the config-declared secret-env set, so the relay's env scrub matches
+        //   every instance's (Finding-1 parity — a BYO credential never crosses to the relay);
+        // - `vm_work_root`: the per-VM work dir root (initramfs/firecracker.json/console) under the node
+        //   data dir — NOT in the relay's Landlock view (the relay dials only the vsock UDS);
+        // - `next_guest_cid`: a monotonic guest CID (0/1/2 are reserved; multi-VM topology is a follow-on).
+        #[cfg(target_os = "linux")]
+        let declared_secret_env =
+            boatramp_node::privsep_resolve::declared_secret_env_var_names(config);
+        #[cfg(target_os = "linux")]
+        let vm_work_root = {
+            let cwd = std::env::current_dir().map_err(|e| err(format!("cwd: {e}")))?;
+            super::normalized_data_dir(config, &cwd).join("privsep-vm")
+        };
+        #[cfg(target_os = "linux")]
+        let mut next_guest_cid: u32 = 3;
+
         let mut children: Vec<(String, std::process::Child)> = Vec::new();
         for spec in &plan.static_instances {
             let Some(wiring) = wirings.iter().find(|w| w.label == spec.label) else {
                 continue;
             };
+
+            // Scoped-VM substrate dispatch (S1): the VM frontend does NOT take the single-`__instance`
+            // fork+exec path below (its own kernel ⇒ the `local` socketpair cannot cross). Instead the
+            // root boots the microVM guest ([`boot_frontend_vm`], NO in-root relay thread) and
+            // `fork`+`exec`s a SEPARATE least-authority `__vm-relay` process that splices the client's
+            // bytes to the frontend-in-guest over the vsock bridge — the relay, NOT the secret-blind
+            // root, is the host-side vsock endpoint, and the root carries no key bytes. BOTH children
+            // (firecracker + relay) are supervised; either's death ⇒ `FailNodeClosed`.
+            if matches!(spec.substrate, super::InstanceSubstrate::Vm) {
+                #[cfg(target_os = "linux")]
+                {
+                    let guest_cid = next_guest_cid;
+                    next_guest_cid += 1;
+                    // The scoped frontend is a key-free LISTENER-ONLY slice, so it MUST have a
+                    // root-bound public listener (assigned a target fd in step 3).
+                    let listener_target = match wiring.fds.listener {
+                        Some(t) => t,
+                        None => {
+                            kill_all(&mut children);
+                            return Err(err(format!(
+                                "scoped VM frontend {:?} has no bound public listener fd — a key-free \
+                                 static-parser frontend must bind serve.addr",
+                                spec.label
+                            )));
+                        }
+                    };
+                    let assets = match crate::privsep_vm::VmAssets::from_env() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            kill_all(&mut children);
+                            return Err(err(format!(
+                                "the vm substrate for instance {:?} needs its operator-provisioned \
+                                 assets: {e}",
+                                spec.label
+                            )));
+                        }
+                    };
+                    let work_dir = vm_work_root.join(&spec.label);
+                    // Boot the microVM guest (NO in-root relay thread — S1). The firecracker child is
+                    // spawned here, in the pre-self-profile window (the root's self-profile Landlock-pins
+                    // execve to its OWN binary, so firecracker — a different binary — must exec now).
+                    let booted = match crate::privsep_vm::boot_frontend_vm(
+                        &current_exe,
+                        &spec.label,
+                        config_path,
+                        &assets,
+                        &work_dir,
+                        guest_cid,
+                        crate::privsep_vm::DEFAULT_GUEST_VSOCK_PORT,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            kill_all(&mut children);
+                            return Err(err(format!(
+                                "booting the scoped VM frontend {:?}: {e}",
+                                spec.label
+                            )));
+                        }
+                    };
+                    // The relay's NON-SECRET descriptor + its secret-blind spawn spec: the pre-bound
+                    // public TCP listener rides the ONE existing fd-pass (`PrivsepChildFds`) at
+                    // `listener_target`; the env is the minimal capability-less scrub (no credential
+                    // crosses) + only the two non-secret wiring vars.
+                    let descriptor = super::VmRelayDescriptor {
+                        label: spec.label.clone(),
+                        uds_path: booted.uds_path.clone(),
+                        guest_port: crate::privsep_vm::DEFAULT_GUEST_VSOCK_PORT,
+                    };
+                    let relay_spec = super::plan_vm_relay_spec(
+                        &spec.label,
+                        &descriptor,
+                        listener_target,
+                        std::env::vars(),
+                        &declared_secret_env,
+                    );
+                    // fork+exec the SEPARATE least-authority relay process. It INHERITS the root's
+                    // capabilities (it drops them ITSELF after entering its netns/mount-ns), so
+                    // `spawn_vm_relay` does NO pre_exec cap drop — unlike `spawn_wired_instance`.
+                    let relay_child = match super::per_tenant::spawn_vm_relay(
+                        &current_exe,
+                        &relay_spec,
+                        wiring.dups.clone(),
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // Tear down the firecracker child we just booted, then everything else.
+                            let mut fc = booted.child;
+                            let _ = fc.kill();
+                            let _ = fc.wait();
+                            kill_all(&mut children);
+                            return Err(err(format!(
+                                "spawning the __vm-relay for instance {:?}: {e}",
+                                spec.label
+                            )));
+                        }
+                    };
+                    tracing::info!(
+                        instance = %spec.label,
+                        fc_pid = booted.child.id(),
+                        relay_pid = relay_child.id(),
+                        guest_cid,
+                        console = %booted.console.display(),
+                        "[privsep] root: scoped VM frontend dispatched — firecracker guest + separate \
+                         __vm-relay process, BOTH supervised (either exit ⇒ FailNodeClosed); the relay \
+                         (NOT the secret-blind root) is the host-side vsock endpoint (S1)"
+                    );
+                    // Supervise BOTH: a guest death (firecracker exit) OR a relay death (incl. a failed
+                    // readiness handshake) tears the node down fail-closed.
+                    children.push((format!("{} (firecracker guest)", spec.label), booted.child));
+                    children.push((format!("{} (vm-relay)", spec.label), relay_child));
+                    continue;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    kill_all(&mut children);
+                    return Err(err(format!(
+                        "instance {:?} selects the vm substrate, which needs Linux + KVM; refusing \
+                         fail-closed on this build (never a silent OS-process downgrade)",
+                        spec.label
+                    )));
+                }
+            }
+
             let mut extra_env: std::collections::BTreeMap<String, String> =
                 std::collections::BTreeMap::new();
             extra_env.insert(
@@ -5035,7 +5364,7 @@ mod tests {
     // ---- Phase-3: the operator-selectable substrate spawn-backend dispatch ----
 
     #[test]
-    fn resolve_spawn_backend_wires_os_process_and_container_and_refuses_vm() {
+    fn resolve_spawn_backend_wires_os_process_and_container_and_refuses_vm_safe_subset() {
         // OS-process is the Phase-1 wired backend; Container is the Phase-3 wired backend (the SIMPLE
         // model — the SAME fork+exec, with the child unsharing NS/IPC/UTS/CGROUP in its pre_exec).
         resolve_spawn_backend(
@@ -5049,14 +5378,16 @@ mod tests {
             InstanceSubstrate::Container,
             &[HostAuthority::BackendKv],
         )
-        .expect("container is now a wired spawn backend (Phase-3 simple model)");
+        .expect("container is a wired spawn backend (Phase-3 simple model)");
         assert!(InstanceSubstrate::OsProcess.is_wired());
         assert!(InstanceSubstrate::Container.is_wired());
+        // SAFE SUBSET: the operator supervise-dispatch is BUILT + wired, but `Vm` stays NOT-wired +
+        // refused fail-closed pending a full live SERVE + kill→FailNodeClosed proof + Security.
         assert!(!InstanceSubstrate::Vm.is_wired());
 
         // A VM that IS the owner-greenlit scoped shape — a key-free static-parser frontend — is refused
-        // at the OPERATOR gate pending the S1 relay-placement decision (the mechanism is built +
-        // live-gated), fail-closed, offering the wired fallbacks. Never a silent OS-process downgrade.
+        // at the spawn gate pending the serve proof + Security (the supervise-dispatch is built + wired;
+        // flipping this is the final step). Never a silent OS-process downgrade.
         let scoped = resolve_spawn_backend(
             "edge-vm",
             InstanceSubstrate::Vm,
@@ -5064,11 +5395,13 @@ mod tests {
         )
         .unwrap_err();
         let PrivsepError::Supervise(s) = &scoped else {
-            panic!("vm must be refused as a Supervise error, got {scoped:?}");
+            panic!(
+                "the scoped vm must be refused as a Supervise error (safe subset), got {scoped:?}"
+            );
         };
         assert!(
-            s.contains("S1") && s.contains("fail-closed"),
-            "the scoped-frontend VM refusal must name the S1 relay-placement gate + stay fail-closed: {s:?}"
+            s.contains("BUILT") && s.contains("Security") && s.contains("fail-closed"),
+            "the scoped-frontend VM refusal must say the dispatch is BUILT + gated pending Security: {s:?}"
         );
         assert!(
             s.contains("OsProcess") && s.contains("Container"),
@@ -5076,16 +5409,72 @@ mod tests {
         );
 
         // A VM that is NOT a key-free static-parser frontend (it holds a backend credential) is OUTSIDE
-        // the approved scope entirely — it needs the owner-GATED vsock key-relay.
+        // the approved scope entirely — it needs the owner-GATED vsock key-relay, refused fail-closed
+        // (defence-in-depth behind `plan_root`'s scope lint).
         let oos =
             resolve_spawn_backend("bad-vm", InstanceSubstrate::Vm, &[HostAuthority::BackendKv])
                 .unwrap_err();
         let PrivsepError::Supervise(o) = &oos else {
-            panic!("vm must be refused as a Supervise error, got {oos:?}");
+            panic!("a non-scoped vm must be refused as a Supervise error, got {oos:?}");
         };
         assert!(
             o.contains("key-relay") && o.contains("fail-closed"),
             "the out-of-scope VM refusal must name the owner-gated key-relay + stay fail-closed: {o:?}"
+        );
+        assert!(
+            o.contains("OsProcess") && o.contains("Container"),
+            "the refusal must offer the wired OsProcess/Container fallbacks: {o:?}"
+        );
+    }
+
+    // ---- Finding 2 (acpi=off Security review): the guest-kernel-config boot-time guard parser ----
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_config_guard_passes_on_the_shipped_preconditions() {
+        // The shape the shipped Landlock-V5 `boatramp-vmlinux` config carries: X86_MPPARSE OFF (as a
+        // `# ... is not set` line) + VIRTIO_MMIO_CMDLINE_DEVICES=y.
+        let config = "\
+CONFIG_SECURITY_LANDLOCK=y
+# CONFIG_X86_MPPARSE is not set
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+CONFIG_VIRTIO=y
+";
+        check_kernel_config_preconditions(config)
+            .expect("the shipped X86_MPPARSE-off + CMDLINE_DEVICES=y config must PASS");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_config_guard_refuses_x86_mpparse_on() {
+        // Mutation: X86_MPPARSE back ON — with acpi=off the kernel hunts for an MPTABLE firecracker
+        // never emits, so device IRQs die (the -22 vsock-probe failure). MUST refuse fail-closed.
+        let config = "\
+CONFIG_X86_MPPARSE=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+";
+        let err =
+            check_kernel_config_preconditions(config).expect_err("X86_MPPARSE=y must be refused");
+        assert!(
+            err.contains("X86_MPPARSE") && err.contains("fail-closed"),
+            "the refusal must name X86_MPPARSE + stay fail-closed: {err:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_config_guard_refuses_missing_cmdline_devices() {
+        // Mutation: CMDLINE_DEVICES dropped — with ACPI off the virtio-mmio devices (vsock included)
+        // are never discovered. MUST refuse fail-closed.
+        let config = "\
+# CONFIG_X86_MPPARSE is not set
+# CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES is not set
+";
+        let err = check_kernel_config_preconditions(config)
+            .expect_err("a missing CMDLINE_DEVICES=y must be refused");
+        assert!(
+            err.contains("VIRTIO_MMIO_CMDLINE_DEVICES") && err.contains("fail-closed"),
+            "the refusal must name VIRTIO_MMIO_CMDLINE_DEVICES + stay fail-closed: {err:?}"
         );
     }
 

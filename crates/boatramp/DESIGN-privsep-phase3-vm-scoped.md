@@ -276,3 +276,70 @@ no `/dev/kvm`); `resolve_spawn_backend` still refuses `substrate: vm` fail-close
 **supervise dispatch** (root binds the listener, boots the VM minus its in-root relay thread, `fork`+`exec`s
 the separate `__vm-relay`, supervises both → `FailNodeClosed` on either death) is the next increment, and
 the whole Phase-3c delta (this `acpi=off` transport fix + the dispatch) gates on the **Security review**.
+
+## Operator supervise-dispatch — BUILT + wired (SAFE SUBSET; `substrate: Vm` still refused)
+
+The operator-facing supervise dispatch is now BUILT + wired, taking the scoped VM frontend from
+fail-closed-refused to launched + supervised — but it lands as a **SAFE SUBSET**: `is_wired(Vm)` stays
+`false` and `resolve_spawn_backend` still REFUSES `substrate: vm` fail-closed, pending (a) a full live
+SERVE + kill→FailNodeClosed proof and (b) the independent Security review. The reason the flip is NOT
+taken in this cut: the end-to-end 200 serve could NOT be live-proven, because the **Phase-3c
+firecracker↔guest vsock transport regressed in the live environment** — the SAME failure stops the
+PRE-EXISTING in-root serve gate (`tests/privsep_vm_live.rs`), which served 3× consecutively ~hours
+earlier; it is NOT in this dispatch. The guest boots clean (`SHIM-ALIVE`, legacy-PIC `preallocated irqs:
+16`, `AF_VSOCK bound`, `PRIVSEP VM GUEST SERVING`), but firecracker never completes a host-initiated
+vsock CONNECT (no `OK`) — observed identically for the relay, the in-root thread, and a manual
+unconfined `socat`/python dial (25 attempts, 0 `OK`). Re-confirming that transport live is the
+precondition to flip. The dispatch, in `supervise::run` (`crates/boatramp/src/privsep.rs`):
+
+1. The **root binds** the privileged public listener for the VM frontend (step 2, as for any `listen.*`
+   holder) — the frontend's profile can then deny `bind`.
+2. The root **boots the microVM** via `crate::privsep_vm::boot_frontend_vm` (NEW — assemble initramfs +
+   S3-verify + `boot_firecracker`, returning the firecracker child + the host-side vsock UDS, with NO
+   in-root byte-relay thread). The firecracker child is spawned in the pre-self-profile window (the root's
+   self-profile Landlock-pins `execve` to its OWN binary; firecracker is a different binary).
+3. The root `fork`+`exec`s a **SEPARATE `__vm-relay` process** via `per_tenant::spawn_vm_relay` (NEW — the
+   S1 companion to `spawn_wired_instance`, dup'ing the pre-bound listener onto the relay's fixed fd; NO
+   capability drop + NO namespace unshare in its `pre_exec`, because the relay INHERITS the root's
+   `CAP_SYS_ADMIN` and drops it ITSELF after entering its netns/mount-ns). The relay spec comes from the
+   already-landed `plan_vm_relay_spec` (secret-blind env + the one fd-pass).
+4. The root **supervises BOTH** the firecracker child and the relay child in its existing wait loop;
+   **either's death ⇒ `FailNodeClosed`** (the whole node tears down fail-closed).
+
+The **HARD TCB invariant holds**: the relay, not the root, is the host-side vsock endpoint; the root never
+crosses the vsock and carries no key bytes (a scoped frontend holds no key, enforced by the lint before
+spawn). The relay keeps its own least-authority Enforced profile + empty-netns + minimal-mount-ns egress
+containment (unchanged from the landed `run_vm_relay_confined`).
+
+### The three acpi=off Security-review findings, addressed
+
+1. **Positive readiness gate (Finding 1).** The relay, behind its profile and BEFORE accepting any client,
+   runs `relay_readiness_probe` (`crate::privsep_vm`): within a bounded 90 s deadline it dials the vsock
+   UDS (retried — the guest boots asynchronously), does a trivial HTTP/1.1 `GET /` round-trip, and requires
+   a `200`. On success it logs `PRIVSEP VM RELAY READY` and serves; on timeout it returns `Err` ⇒ the relay
+   exits ⇒ the root trips `FailNodeClosed`. This REPLACES the emergent-only health signal:
+   `boot_firecracker`'s host-side UDS wait is now explicitly a device-up PRECONDITION (it returns on the
+   vsock device coming up, independent of guest health), NOT the readiness gate.
+2. **Kernel-config guard (Finding 2).** Two halves. (a) BOOT-TIME, in-guest: `run_vm_guest` reads the
+   running kernel's `/proc/config.gz` (when `CONFIG_IKCONFIG_PROC=y`) and asserts `X86_MPPARSE` is NOT `=y`
+   AND `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` — a readable-and-wrong config refuses fail-closed (the guest
+   powers off ⇒ `FailNodeClosed`, loud), an absent config WARNs (the relay's positive readiness gate still
+   fails loud on any degradation). (b) CI-ASSERTABLE, pure unit tests (no KVM): the parser
+   (`check_kernel_config_preconditions`) is driven by good/mutated configs, and `GUEST_BOOT_ARGS` is
+   asserted to keep `acpi=off` + `pci=off` — both run in the `ci.yml` merge gate. The production
+   Landlock-V5 guest kernel SHOULD enable `CONFIG_IKCONFIG_PROC` for the boot-time half to assert (else it
+   is warn-only); the repro kernel config notes this.
+3. **capability.yml live-gate marker (Finding 3).** The lighthouse-driven operator serve gate
+   (`tests/privsep_vm_operator_live.rs`, driven by `docs/privsep-vm-scoped-repro/run-operator.sh`) greps
+   three HARD markers — `PRIVSEP VM SUPERVISE SERVE OK`, `PRIVSEP VM RELAY-KILL FAILCLOSED OK`,
+   `PRIVSEP VM FIRECRACKER-KILL FAILCLOSED OK`. A `privsep-vm-operator` job in `.github/workflows/capability.yml`
+   wires those markers as a hard gate on the hosted KVM runner (workflow_dispatch-only — it needs a
+   published Landlock-V5 `boatramp-vmlinux` release; the pure refuse/scope/config gates run in the merge
+   gate). Per the "ignore-gated tests ≠ evidence" rule, the serve gate is thus marker-gated, with the
+   lighthouse run as the authoritative evidence.
+
+**Security re-review surface for the full pass:** the two new `fork`+`exec`/boot sites in the UNCONFINED
+root pre-self-profile window (`boot_frontend_vm` spawning firecracker, `spawn_vm_relay` spawning the relay
+WITHOUT a cap drop — deliberately, so the relay keeps `CAP_SYS_ADMIN` for its own netns/mount-ns); the
+relay-side readiness probe consuming one guest connection pre-serve; the supervise loop now watching 2
+children per VM; and the dispatch reusing the already-reviewed `run_vm_relay_confined` wall unchanged.

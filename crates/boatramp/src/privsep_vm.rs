@@ -383,6 +383,15 @@ mod imp {
         Ok(base)
     }
 
+    /// The guest kernel cmdline (Finding 2 — acpi=off Security review). `acpi=off` + `pci=off` are
+    /// LOAD-BEARING: on the firecracker *binary* backend (kernel >= 6.12) ACPICA rejects the
+    /// reduced-hardware DSDT and disables ACPI mid-boot, leaving NO device-IRQ routing unless the guest
+    /// falls back to the legacy PIC — which `acpi=off` forces (paired with `X86_MPPARSE` OFF + a KVM
+    /// in-kernel irqchip). Pulled into a named const so a pure CI unit test can assert the two args are
+    /// present (a future edit that drops `acpi=off` would silently break device IRQs ⇒ no vsock); the
+    /// guest-side companion is the kernel-config guard in `crate::privsep::run_vm_guest`.
+    const GUEST_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off acpi=off ro rdinit=/init";
+
     fn boot_firecracker(
         assets: &VmAssets,
         work_dir: &Path,
@@ -443,7 +452,7 @@ mod imp {
   "boot-source": {{
     "kernel_image_path": {kernel},
     "initrd_path": {initrd},
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off acpi=off ro rdinit=/init"
+    "boot_args": "{boot_args}"
   }},
   "drives": [],
   "machine-config": {{ "vcpu_count": 1, "mem_size_mib": 1024 }},
@@ -451,6 +460,7 @@ mod imp {
 }}"#,
             kernel = json_str(&assets.guest_kernel.to_string_lossy()),
             initrd = json_str(&initramfs.to_string_lossy()),
+            boot_args = GUEST_BOOT_ARGS,
             cid = guest_cid,
             uds = json_str(&uds_path.to_string_lossy()),
         );
@@ -479,7 +489,13 @@ mod imp {
                     assets.firecracker_bin.display()
                 ))
             })?;
-        // The vsock UDS appears once the device is up; a bounded wait, else the guest never came up.
+        // The vsock UDS appears once firecracker's vsock DEVICE is up; a bounded wait, else firecracker
+        // itself never came up. NOTE (acpi=off Security review, Finding 1): this is a DEVICE-UP
+        // PRECONDITION so the relay has a socket to dial — NOT a guest-health gate. It returns as soon as
+        // the UDS file exists, which is independent of whether the GUEST bound its vsock listener and
+        // actually serves. The POSITIVE readiness assertion (the guest served a 200) is
+        // [`relay_readiness_probe`], run by the separate relay process behind its profile; a
+        // degraded-but-booted guest trips `FailNodeClosed` there, never here.
         let deadline = Instant::now() + Duration::from_secs(15);
         while !uds_path.exists() {
             if Instant::now() > deadline {
@@ -487,7 +503,8 @@ mod imp {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(io::Error::other(
-                    "firecracker's vsock UDS never appeared within 15s (guest did not boot)",
+                    "firecracker's vsock device UDS never appeared within 15s (firecracker did not \
+                     bring up the vsock device — the guest could not have booted)",
                 ));
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -732,20 +749,33 @@ mod imp {
         pub _relay: std::thread::JoinHandle<()>,
     }
 
-    /// Launch ONE scoped static-parser-frontend VM: assemble the initramfs (shim + real binary + real
-    /// config + descriptor), S3-verify + boot the microVM, and spawn the host client-byte relay over
-    /// the ALREADY-bound TCP `listener`. The caller supervises `VmLaunch.child`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_frontend_vm(
+    /// What [`boot_frontend_vm`] hands the OPERATOR supervise dispatch: the firecracker child (a guest
+    /// death ⇒ `FailNodeClosed`), the host-side vsock UDS the SEPARATE `__vm-relay` process dials, and
+    /// the guest serial console path (for the `FailNodeClosed` diagnostic). NO in-root relay thread —
+    /// the operator path runs the byte-relay in a dedicated least-authority process
+    /// ([`crate::privsep::run_vm_relay`]), NEVER inside the secret-blind root (S1).
+    pub struct BootedFrontendVm {
+        pub child: Child,
+        pub uds_path: PathBuf,
+        pub console: PathBuf,
+    }
+
+    /// Boot ONE scoped static-parser-frontend VM for the OPERATOR supervise dispatch: assemble the
+    /// initramfs (shim + the real static-PIE binary + the real config + the non-secret descriptor),
+    /// S3-verify + boot the microVM — and STOP. It does NOT bind/accept/relay: the operator path binds
+    /// the listener in the root, boots here, then `fork`+`exec`s a SEPARATE least-authority `__vm-relay`
+    /// process to do the host↔guest byte-relay (S1 — the relay, NOT the secret-blind root, is the
+    /// host-side vsock endpoint). The caller supervises `BootedFrontendVm.child` (the firecracker child)
+    /// AND the relay child; either's death ⇒ `FailNodeClosed`.
+    pub fn boot_frontend_vm(
         current_exe: &Path,
         label: &str,
         config_path: &Path,
-        listener: std::net::TcpListener,
         assets: &VmAssets,
         work_dir: &Path,
         guest_cid: u32,
         guest_port: u32,
-    ) -> Result<VmLaunch, String> {
+    ) -> Result<BootedFrontendVm, String> {
         std::fs::create_dir_all(work_dir)
             .map_err(|e| format!("creating the VM work dir {}: {e}", work_dir.display()))?;
         let server_config = std::fs::read(config_path)
@@ -770,8 +800,41 @@ mod imp {
             guest_cid,
             guest_port,
             "[privsep] root: frontend microVM booted (own-binary-as-init via the non-PIE shim; vsock \
-             only, no net, no drives — the hypervisor wall is the PRIMARY containment)"
+             only, no net, no drives — the hypervisor wall is the PRIMARY containment). The host-side \
+             vsock endpoint is the SEPARATE __vm-relay process, not the root (S1)"
         );
+        Ok(BootedFrontendVm {
+            child: booted.child,
+            uds_path: booted.uds_path,
+            console: work_dir.join("console.log"),
+        })
+    }
+
+    /// Launch ONE scoped static-parser-frontend VM with the in-root relay THREAD (the live-gate path
+    /// `tests/privsep_vm_live.rs` exercises): boot via [`boot_frontend_vm`], then spawn the host
+    /// client-byte relay over the ALREADY-bound TCP `listener` on a thread. The OPERATOR dispatch does
+    /// NOT use this (it runs the relay in a separate least-authority PROCESS — S1); this stays for the
+    /// mechanism's own serve gate, which proves the vsock transport + guest serve end-to-end.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_frontend_vm(
+        current_exe: &Path,
+        label: &str,
+        config_path: &Path,
+        listener: std::net::TcpListener,
+        assets: &VmAssets,
+        work_dir: &Path,
+        guest_cid: u32,
+        guest_port: u32,
+    ) -> Result<VmLaunch, String> {
+        let booted = boot_frontend_vm(
+            current_exe,
+            label,
+            config_path,
+            assets,
+            work_dir,
+            guest_cid,
+            guest_port,
+        )?;
         let uds = booted.uds_path.clone();
         let relay_label = label.to_string();
         let relay = std::thread::Builder::new()
@@ -782,6 +845,167 @@ mod imp {
             child: booted.child,
             _relay: relay,
         })
+    }
+
+    /// The POSITIVE readiness handshake the separate `__vm-relay` process performs AFTER installing its
+    /// Enforced least-authority profile and BEFORE entering its accept loop (acpi=off Security review,
+    /// Finding 1). It replaces the EMERGENT-only "guest healthy?" signal: [`boot_firecracker`]'s
+    /// host-side UDS wait returns as soon as firecracker's vsock DEVICE is up — independent of whether
+    /// the GUEST ever bound its listener and served — so a degraded-but-booted guest would have been
+    /// relayed to silently. This asserts the guest actually SERVES: within `deadline`, dial the
+    /// firecracker vsock UDS (retried — the guest may still be booting), do a trivial HTTP/1.1
+    /// request/response round-trip, and require a `200`. On success the relay is cleared to serve; if
+    /// the deadline passes with no served `200`, it returns `Err` — the relay process then exits and the
+    /// root's supervise loop trips `FailNodeClosed` (a bounded, POSITIVE gate, not an open-ended wait).
+    ///
+    /// It runs behind the relay's profile, so it uses ONLY allowed verbs (`socket`/`connect`/`read`/
+    /// `write`/`shutdown` + the thread `clone`/`futex`) — the SAME socket surface the accept loop uses.
+    /// The probe connection is just another client from the guest's view (`Connection: close`, so the
+    /// guest closes after responding and the probe reads to EOF).
+    ///
+    /// **Blocking dial + watchdog deadline (NOT per-attempt `SO_RCVTIMEO`).** It reuses the EXACT
+    /// blocking handshake shape the proven in-root relay's [`dial_guest`] runs — a plain blocking
+    /// read of firecracker's `OK` reply — because firecracker's host-vsock CONNECT handshake does NOT
+    /// tolerate a short `SO_RCVTIMEO` across reconnects: a read-timeout that fires mid-handshake leaves
+    /// firecracker's host-side muxer wedged, so every subsequent reconnect then times out too (observed
+    /// live: a 3s `SO_RCVTIMEO` made EVERY attempt time out even with the guest serving, while the
+    /// timeout-free `dial_guest` on the same socket gets `OK` immediately). A dedicated worker thread
+    /// retries the blocking dial (firecracker refuses — EOF — until the guest binds its vsock listener),
+    /// while THIS thread bounds the whole wait with `deadline` via `recv_timeout`; a wedged blocking
+    /// dial is torn down when the relay exits (`FailNodeClosed`). Bounded + POSITIVE.
+    pub(crate) fn relay_readiness_probe(
+        uds_path: &Path,
+        guest_port: u32,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<Result<u32, String>>();
+        let uds = uds_path.to_path_buf();
+        std::thread::Builder::new()
+            .name("vm-relay-readiness".to_string())
+            .spawn(move || {
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    match probe_once_blocking(&uds, guest_port) {
+                        Ok(()) => {
+                            let _ = tx.send(Ok(attempt));
+                            return;
+                        }
+                        Err(e) => {
+                            // Report progress (the guest is likely still booting → firecracker EOFs the
+                            // CONNECT); back off briefly and retry until we serve a 200 or the relay dies.
+                            if tx.send(Err(e)).is_err() {
+                                return; // the main thread gave up (deadline) — stop
+                            }
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("spawning the readiness-probe thread: {e}"))?;
+
+        let mut last_err = String::from("no attempt completed");
+        let mut attempts: u32 = 0;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "the frontend-in-guest did not serve a 200 over vsock within the readiness \
+                     deadline ({attempts} attempts; last error: {last_err}) — FailNodeClosed \
+                     (refusing to relay clients to a guest that never positively served; the UDS \
+                     merely existing is NOT proof the guest is healthy)"
+                ));
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(Ok(attempt)) => {
+                    tracing::info!(
+                        attempts = attempt,
+                        "[privsep] __vm-relay: readiness handshake OK — the frontend-in-guest served \
+                         a 200 over vsock; clearing the relay to accept clients (Finding 1 positive \
+                         gate)"
+                    );
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    attempts += 1;
+                    last_err = e;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "the frontend-in-guest did not serve a 200 over vsock within the readiness \
+                         deadline ({attempts} attempts; last error: {last_err}) — FailNodeClosed"
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(
+                        "the readiness-probe thread ended unexpectedly — FailNodeClosed"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// One readiness attempt, BLOCKING (no `SO_RCVTIMEO` — see [`relay_readiness_probe`]): dial
+    /// firecracker's host-side vsock bridge exactly as [`dial_guest`] does, then do a minimal HTTP/1.1
+    /// `GET /` and require a `200` status line. firecracker refuses the CONNECT (EOF on the reply read)
+    /// until the guest is listening, which surfaces as `Err` and is retried.
+    fn probe_once_blocking(uds_path: &Path, guest_port: u32) -> Result<(), String> {
+        let mut stream =
+            UnixStream::connect(uds_path).map_err(|e| format!("connect vsock UDS: {e}"))?;
+        // Firecracker host-initiated vsock: CONNECT <port>\n → OK <port>\n once the guest is listening.
+        stream
+            .write_all(format!("CONNECT {guest_port}\n").as_bytes())
+            .map_err(|e| format!("write CONNECT: {e}"))?;
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream
+                .read_exact(&mut byte)
+                .map_err(|e| format!("read CONNECT reply: {e}"))?;
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+            if line.len() > 256 {
+                return Err("vsock CONNECT reply line too long".to_string());
+            }
+        }
+        if !line.starts_with(b"OK") {
+            return Err(format!(
+                "firecracker vsock CONNECT refused (guest not listening yet?): {}",
+                String::from_utf8_lossy(&line)
+            ));
+        }
+        // The guest's vsock listener is up; now prove it SERVES (not just listens).
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: readiness\r\nConnection: close\r\n\r\n")
+            .map_err(|e| format!("write readiness GET: {e}"))?;
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break, // the guest closed (Connection: close)
+                Ok(n) => {
+                    resp.extend_from_slice(&buf[..n]);
+                    if resp.len() >= 4096 {
+                        break;
+                    }
+                }
+                Err(e) => return Err(format!("read readiness response: {e}")),
+            }
+        }
+        let head = String::from_utf8_lossy(&resp);
+        if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
+            Ok(())
+        } else {
+            Err(format!(
+                "readiness response was not a 200 (got {} bytes; first line: {:?})",
+                resp.len(),
+                head.lines().next().unwrap_or("<none>")
+            ))
+        }
     }
 
     // ------------------------------------------------------------------------------------------
@@ -989,6 +1213,30 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::Cpio;
+
+        /// Finding 2 (acpi=off Security review) — a pure CI guard that the guest boot cmdline keeps the
+        /// two LOAD-BEARING args. `acpi=off` + `X86_MPPARSE` off is what drops the firecracker-binary
+        /// guest to the legacy PIC so device IRQs route (the serial + vsock come up); a future edit that
+        /// silently dropped `acpi=off` would reintroduce the `-22` vsock-probe failure. This asserts the
+        /// boot-arg half of the precondition in CI (no KVM); the config half is the guest-side
+        /// kernel-config guard, and the live boot is the lighthouse serve gate.
+        #[test]
+        fn guest_boot_args_keep_the_loadbearing_acpi_off_and_pci_off() {
+            let args = super::GUEST_BOOT_ARGS;
+            assert!(
+                args.split_whitespace().any(|a| a == "acpi=off"),
+                "the guest boot cmdline MUST keep `acpi=off` (the firecracker-binary DSDT fails on \
+                 ACPICA >= 20240827, so ACPI must be off for device IRQs to route): {args:?}"
+            );
+            assert!(
+                args.split_whitespace().any(|a| a == "pci=off"),
+                "the guest boot cmdline MUST keep `pci=off` (a privsep guest has no PCI): {args:?}"
+            );
+            assert!(
+                args.contains("rdinit=/init"),
+                "the guest boot cmdline MUST rdinit the non-PIE shim at /init: {args:?}"
+            );
+        }
 
         /// Socketpair/loopback proof of the relay's BYTE TRANSPARENCY (the Model-A copy-relay the
         /// separate `__vm-relay` process runs behind its profile): a loopback TCP pair stands in for
@@ -1212,9 +1460,11 @@ mod imp {
 
 // ---- host-facing re-exports (Linux) ----
 #[cfg(target_os = "linux")]
-pub use imp::{VmLaunch, launch_frontend_vm};
+pub use imp::{BootedFrontendVm, VmLaunch, boot_frontend_vm, launch_frontend_vm};
 #[cfg(target_os = "linux")]
-pub(crate) use imp::{guest_accept_serve_loop, run_relay, vsock_bind_listen};
+pub(crate) use imp::{
+    guest_accept_serve_loop, relay_readiness_probe, run_relay, vsock_bind_listen,
+};
 
 // ============================================================================================
 // Cross-platform surface. The VM substrate needs AF_VSOCK + firecracker + KVM (Linux only — the `imp`

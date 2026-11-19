@@ -533,6 +533,11 @@ schemars = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The privsep VM OPERATOR live gate (`privsep_vm_operator_live.rs`) SIGKILLs a specific supervised
+# child (the `__vm-relay` or firecracker pid) to prove the root FailNodeCloses on either death. `libc`
+# is already a regular dep of this crate (cargo unifies — no new compile cost), surfaced to the
+# integration-test harness here.
+libc = "0.2"
 # Generate a self-signed cert/key in the cluster-TLS bridge tests (avoids
 # embedding a base64 fixture). Already in the tree via boatramp-acme `acme`.
 rcgen = "0.13"
