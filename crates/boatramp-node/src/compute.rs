@@ -148,6 +148,198 @@ fn sysctl_string(name: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Node memory-capacity detection (compute inventory `free_mem_mib`)
+// ---------------------------------------------------------------------------
+//
+// The scheduler's fit-check is `node.free_mem_mib >= spec.mem_mib` (see
+// `boatramp_core::compute::place_replicas`). That figure is set ONCE here at boot and
+// advertised to placement. Historically `[compute].mem_mib == 0` (the default)
+// advertised a HARDCODED 1 GiB — so on a 64 GiB box a 2 GiB workload could never place
+// on ANY node, while vCPUs were (correctly) host-detected. These helpers advertise the
+// node's REAL memory instead: the detected host/cgroup total minus an OS/boatramp
+// reserve, still overridable by an explicit `[compute].mem_mib` pin.
+
+/// Advertised schedulable memory (MiB) from the `[compute]` config + a detected total.
+/// `cfg_mem_mib > 0` is an explicit pin, used verbatim. Otherwise advertise
+/// `detected_total − reserve`, where `reserve` is `cfg_reserve_mib` when non-zero, else
+/// the [`default_mem_reserve_mib`] policy. A `None` detected total (detection failed —
+/// non-Linux, or `/proc` + cgroup both unreadable) falls back to the conservative
+/// legacy 1 GiB, so an UNDETECTABLE host never over-advertises into OOM.
+fn advertised_mem_mib(
+    cfg_mem_mib: u32,
+    cfg_reserve_mib: u32,
+    detected_total_mib: Option<u32>,
+) -> u32 {
+    if cfg_mem_mib > 0 {
+        return cfg_mem_mib;
+    }
+    let Some(total) = detected_total_mib else {
+        return 1024;
+    };
+    let reserve = if cfg_reserve_mib > 0 {
+        cfg_reserve_mib
+    } else {
+        default_mem_reserve_mib(total)
+    };
+    total.saturating_sub(reserve)
+}
+
+/// OS + boatramp memory headroom (MiB) for an auto-detected `total`: the larger of
+/// 1 GiB or 1/16 (6.25%) of the total. The 1 GiB floor keeps a small node usable; the
+/// fraction scales headroom on a large one (e.g. 4 GiB held back on a 64 GiB host) so
+/// the node does not advertise RAM into host OOM.
+fn default_mem_reserve_mib(total_mib: u32) -> u32 {
+    (total_mib / 16).max(1024)
+}
+
+/// The host/cgroup memory total in MiB, cgroup-aware, or `None` when undetectable
+/// (e.g. a non-Linux host where `/proc/meminfo` is absent). Takes the SMALLER of the
+/// host `/proc/meminfo` `MemTotal` and the process's effective cgroup memory limit, so a
+/// containerized node advertises its cgroup ceiling, never the whole host.
+fn detect_total_mem_mib() -> Option<u32> {
+    let host = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| parse_meminfo_memtotal_bytes(&s));
+    let cgroup = detect_cgroup_mem_limit_bytes();
+    let bytes = match (host, cgroup) {
+        (Some(h), Some(c)) => h.min(c),
+        (Some(h), None) => h,
+        (None, Some(c)) => c,
+        (None, None) => return None,
+    };
+    Some(bytes_to_mib(bytes))
+}
+
+/// The process's effective cgroup memory limit in bytes: cgroup v2 `memory.max` (the
+/// unified hierarchy) else cgroup v1 `memory/memory.limit_in_bytes`. In BOTH tiers the
+/// process's OWN cgroup is resolved from `/proc/self/cgroup` first, then the mount root
+/// is used as a fallback — so a containerized node reads its real per-container ceiling,
+/// not the host root cgroup. `None` when neither is present or the limit is "unlimited"
+/// (`max` on v2, the near-`u64::MAX` sentinel on v1).
+fn detect_cgroup_mem_limit_bytes() -> Option<u64> {
+    let proc_self = std::fs::read_to_string("/proc/self/cgroup").ok();
+    cgroup_mem_limit_from(proc_self.as_deref(), |p| std::fs::read_to_string(p).ok())
+}
+
+/// The cgroup-tier decision logic, factored out of the `/proc` + `/sys` reads so it is
+/// unit-testable without a real cgroupfs: `proc_self_cgroup` is the `/proc/self/cgroup`
+/// contents (if readable) and `read` reads a `/sys/fs/cgroup/...` file (`None` on miss).
+///
+/// v2 is the unified hierarchy; v1 the legacy `memory` controller. Each tier reads the
+/// process's OWN cgroup (resolved from `/proc/self/cgroup`) first, falling back to the
+/// mount root only when that misses or parses to `None`. With a private cgroup namespace
+/// (the Docker/containerd default) the process path is `/`, so the resolved read and the
+/// mount-root read coincide — but with `--cgroupns=host` (Docker's default on a v1 host)
+/// the mount root is the HOST ROOT cgroup = the unlimited sentinel, and reading only the
+/// mount root would miss the container's real limit and over-advertise the host RAM.
+fn cgroup_mem_limit_from(
+    proc_self_cgroup: Option<&str>,
+    read: impl Fn(&str) -> Option<String>,
+) -> Option<u64> {
+    // cgroup v2 (unified): the process's own `memory.max`, then the mount root.
+    if let Some(path) = proc_self_cgroup.and_then(cgroup_v2_rel_path_from)
+        && let Some(s) = read(&format!("/sys/fs/cgroup{path}/memory.max"))
+        && let Some(b) = parse_cgroup_mem_max_v2(&s)
+    {
+        return Some(b);
+    }
+    if let Some(s) = read("/sys/fs/cgroup/memory.max")
+        && let Some(b) = parse_cgroup_mem_max_v2(&s)
+    {
+        return Some(b);
+    }
+    // cgroup v1 (legacy `memory` controller): the process's own
+    // `memory.limit_in_bytes`, then the mount root. The resolved read is the fix for
+    // host-cgroupns over-advertise (see the doc comment above).
+    if let Some(path) = proc_self_cgroup.and_then(cgroup_v1_mem_rel_path_from)
+        && let Some(s) = read(&format!(
+            "/sys/fs/cgroup/memory{path}/memory.limit_in_bytes"
+        ))
+        && let Some(b) = parse_cgroup_mem_limit_v1(&s)
+    {
+        return Some(b);
+    }
+    read("/sys/fs/cgroup/memory/memory.limit_in_bytes").and_then(|s| parse_cgroup_mem_limit_v1(&s))
+}
+
+/// A process's cgroup v2 relative path from the `/proc/self/cgroup` `0::<path>` line,
+/// WITHOUT a trailing slash so the caller can build `/sys/fs/cgroup<path>/memory.max`.
+/// `/` (the root) maps to the empty string. `None` when there is no v2 (`0::`) line.
+fn cgroup_v2_rel_path_from(s: &str) -> Option<String> {
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("0::") {
+            let p = rest.trim();
+            return Some(if p == "/" {
+                String::new()
+            } else {
+                p.to_string()
+            });
+        }
+    }
+    None
+}
+
+/// A process's cgroup v1 `memory`-controller relative path from `/proc/self/cgroup`,
+/// WITHOUT a trailing slash so the caller can build
+/// `/sys/fs/cgroup/memory<path>/memory.limit_in_bytes`. Each v1 line is
+/// `hierarchy-ID:controller-list:/cgroup-path`, where `controller-list` is a comma-joined
+/// set that may bundle `memory` with others (e.g. `4:cpu,cpuacct,memory:/docker/abc`), so
+/// the list is split on `,` and matched against `memory` exactly. `/` (the root) maps to
+/// the empty string. `None` when no line carries the `memory` controller.
+fn cgroup_v1_mem_rel_path_from(s: &str) -> Option<String> {
+    for line in s.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (Some(_id), Some(controllers), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if controllers.split(',').any(|c| c == "memory") {
+            let p = path.trim();
+            return Some(if p == "/" {
+                String::new()
+            } else {
+                p.to_string()
+            });
+        }
+    }
+    None
+}
+
+/// Parse `/proc/meminfo` for the `MemTotal:` line (kB) → bytes.
+fn parse_meminfo_memtotal_bytes(s: &str) -> Option<u64> {
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// Parse a cgroup v2 `memory.max` value: a byte count, or the literal `max`
+/// (unlimited ⇒ `None`).
+fn parse_cgroup_mem_max_v2(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t == "max" {
+        return None;
+    }
+    t.parse::<u64>().ok()
+}
+
+/// Parse a cgroup v1 `memory.limit_in_bytes` value. The v1 "unlimited" sentinel is a
+/// near-`u64::MAX` number (`PAGE_COUNTER_MAX`, page-rounded), so anything at or above
+/// 2^60 bytes (1 EiB) is treated as unlimited (`None`).
+fn parse_cgroup_mem_limit_v1(s: &str) -> Option<u64> {
+    let v: u64 = s.trim().parse().ok()?;
+    if v >= (1u64 << 60) { None } else { Some(v) }
+}
+
+/// Bytes → MiB, saturating into `u32`.
+fn bytes_to_mib(bytes: u64) -> u32 {
+    u32::try_from(bytes / (1024 * 1024)).unwrap_or(u32::MAX)
+}
+
 /// Build this node's compute [`BackendRegistry`] + scheduler [`Node`] inventory
 /// from the optional `[compute]` config. Backends
 /// are **capability-detected**: a reachable Docker daemon ⇒ `docker`; Linux ⇒ the
@@ -505,7 +697,22 @@ pub async fn build_compute(
             .map(|n| n.get() as u32)
             .unwrap_or(1)
     };
-    let free_mem_mib = if cfg.mem_mib > 0 { cfg.mem_mib } else { 1024 };
+    // Advertise the node's REAL schedulable memory: `cfg.mem_mib == 0` (the default)
+    // auto-detects the host/cgroup total minus a reserve (see `advertised_mem_mib`); a
+    // non-zero value is an explicit pin. Before this, `0` advertised a hardcoded 1 GiB
+    // regardless of host RAM, so any workload needing > 1 GiB failed the scheduler's
+    // `free_mem >= need_mem` fit-check on EVERY node — even a 64 GiB box.
+    let detected_total_mib = detect_total_mem_mib();
+    let free_mem_mib = advertised_mem_mib(cfg.mem_mib, cfg.mem_reserve_mib, detected_total_mib);
+    if free_mem_mib == 0 {
+        tracing::warn!(
+            ?detected_total_mib,
+            reserve_mib = cfg.mem_reserve_mib,
+            "advertised schedulable compute memory is 0 MiB — the detected host/cgroup \
+             total minus the reserve headroom leaves nothing; pin [compute].mem_mib or \
+             lower [compute].mem_reserve_mib"
+        );
+    }
     let advertised: Vec<BackendKind> = backends
         .iter()
         .map(|(id, b)| {
@@ -1464,6 +1671,208 @@ mod tests {
     use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+
+    // --- node memory-capacity detection ------------------------------------
+
+    #[test]
+    fn meminfo_memtotal_parses_to_bytes() {
+        // A real `/proc/meminfo` head (lighthouse: ~64 GiB).
+        let s = "MemTotal:       65621340 kB\nMemFree:        1234 kB\n";
+        assert_eq!(parse_meminfo_memtotal_bytes(s), Some(65_621_340u64 * 1024));
+        assert_eq!(parse_meminfo_memtotal_bytes("Bogus: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn cgroup_v2_memory_max_parses_number_and_unlimited() {
+        assert_eq!(parse_cgroup_mem_max_v2("2147483648\n"), Some(2_147_483_648));
+        assert_eq!(parse_cgroup_mem_max_v2("max\n"), None); // unlimited
+        assert_eq!(parse_cgroup_mem_max_v2("not-a-number"), None);
+    }
+
+    #[test]
+    fn cgroup_v1_limit_treats_the_huge_sentinel_as_unlimited() {
+        assert_eq!(parse_cgroup_mem_limit_v1("536870912\n"), Some(536_870_912));
+        // v1 "unlimited" sentinel (near u64::MAX) ⇒ None, so we fall back to the host.
+        assert_eq!(parse_cgroup_mem_limit_v1("9223372036854771712"), None);
+    }
+
+    #[test]
+    fn cgroup_v2_rel_path_parses_the_unified_line() {
+        assert_eq!(
+            cgroup_v2_rel_path_from("0::/docker/abc\n").as_deref(),
+            Some("/docker/abc")
+        );
+        // The root maps to the empty string (the resolved read is then the mount root).
+        assert_eq!(cgroup_v2_rel_path_from("0::/\n").as_deref(), Some(""));
+        // A pure-v1 proc file has no `0::` line.
+        assert_eq!(cgroup_v2_rel_path_from("4:memory:/x\n"), None);
+    }
+
+    #[test]
+    fn cgroup_v1_mem_rel_path_picks_the_memory_controller() {
+        // The `memory` controller bundled in a comma-joined list with others.
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from("4:cpu,cpuacct,memory:/docker/abc\n").as_deref(),
+            Some("/docker/abc")
+        );
+        // The specific case called out in the finding.
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from("4:cpu,memory:/x\n").as_deref(),
+            Some("/x")
+        );
+        // `memory` at the root ⇒ empty string (resolved read == the mount root).
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from("3:memory:/\n").as_deref(),
+            Some("")
+        );
+        // Exact match only — a controller merely CONTAINING "memory" must NOT match.
+        assert_eq!(cgroup_v1_mem_rel_path_from("2:memoryfoo:/y\n"), None);
+        // No `memory` controller anywhere (incl. the empty-controller v2 line).
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from("1:cpu,cpuacct:/z\n0::/u\n"),
+            None
+        );
+        // A realistic multi-line proc file: the `memory` line is picked among the rest.
+        let proc = "6:cpuset:/a\n5:cpu,cpuacct:/a\n4:memory:/docker/deadbeef\n3:devices:/a\n0::/\n";
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from(proc).as_deref(),
+            Some("/docker/deadbeef")
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_resolves_the_process_subpath() {
+        // The refactor must preserve v2: resolve the process's own cgroup, read its
+        // `memory.max`.
+        let proc = "0::/docker/abc\n";
+        let read = |p: &str| -> Option<String> {
+            match p {
+                "/sys/fs/cgroup/docker/abc/memory.max" => Some("2147483648\n".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(cgroup_mem_limit_from(Some(proc), read), Some(2_147_483_648));
+    }
+
+    #[test]
+    fn cgroup_v1_resolves_the_process_subpath_not_the_host_root() {
+        // THE FINDING: a v1 host with Docker's default `--cgroupns=host`. The mount-root
+        // `memory.limit_in_bytes` is the HOST ROOT cgroup = the near-u64::MAX unlimited
+        // sentinel, but THIS process's own `memory` sub-cgroup carries the real 2 GiB
+        // container cap. Detection must return the sub-cgroup limit, NOT fall through to
+        // the mount root (which would parse to None → whole host RAM → OOM over-advertise).
+        let proc = "5:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n3:cpuset:/docker/abc\n";
+        let read = |p: &str| -> Option<String> {
+            match p {
+                // No unified (v2) hierarchy on a pure-v1 host.
+                "/sys/fs/cgroup/memory.max" => None,
+                // The process's own memory sub-cgroup: the real 2 GiB cap.
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes" => {
+                    Some("2147483648\n".into())
+                }
+                // The mount root == the host root cgroup == unlimited sentinel.
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes" => {
+                    Some("9223372036854771712\n".into())
+                }
+                _ => None,
+            }
+        };
+        assert_eq!(cgroup_mem_limit_from(Some(proc), read), Some(2_147_483_648));
+    }
+
+    #[test]
+    fn cgroup_v1_unlimited_subpath_still_falls_through_to_the_mount_root() {
+        // A sub-cgroup that is ITSELF unlimited (sentinel) must not short-circuit to
+        // None — it falls back to the mount-root read, preserving the sentinel handling.
+        let proc = "4:memory:/docker/abc\n";
+        let read = |p: &str| -> Option<String> {
+            match p {
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes" => {
+                    Some("9223372036854771712\n".into())
+                }
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes" => Some("1073741824\n".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(cgroup_mem_limit_from(Some(proc), read), Some(1_073_741_824));
+    }
+
+    #[test]
+    fn cgroup_limit_is_none_when_everything_is_unlimited_or_absent() {
+        // No proc file and nothing readable ⇒ None (detection then falls to /proc/meminfo).
+        assert_eq!(cgroup_mem_limit_from(None, |_| None), None);
+        // v1 sub-path + mount root both unlimited (no v2 `memory.max`) ⇒ None.
+        let proc = "4:memory:/docker/abc\n";
+        let read = |p: &str| -> Option<String> {
+            // Only the v1 `memory.limit_in_bytes` files exist, and both are the sentinel.
+            if p.ends_with("memory.limit_in_bytes") {
+                Some("9223372036854771712\n".into())
+            } else {
+                None
+            }
+        };
+        assert_eq!(cgroup_mem_limit_from(Some(proc), read), None);
+    }
+
+    #[test]
+    fn reserve_policy_floors_at_1gib_and_scales_above() {
+        assert_eq!(default_mem_reserve_mib(2048), 1024); // 1 GiB floor on a small node
+        assert_eq!(default_mem_reserve_mib(4096), 1024); // still the floor (4096/16=256)
+        assert_eq!(default_mem_reserve_mib(65536), 4096); // 6.25% on a 64 GiB host
+    }
+
+    #[test]
+    fn advertised_mem_pins_an_explicit_value() {
+        // A non-zero `[compute].mem_mib` is used verbatim — no detection, no reserve.
+        assert_eq!(advertised_mem_mib(8192, 0, Some(65536)), 8192);
+        assert_eq!(advertised_mem_mib(8192, 0, None), 8192);
+    }
+
+    #[test]
+    fn advertised_mem_autodetects_total_minus_reserve() {
+        // 64 GiB host, default reserve (4 GiB) ⇒ advertise ~60 GiB.
+        assert_eq!(advertised_mem_mib(0, 0, Some(65536)), 65536 - 4096);
+        // An explicit reserve override is honored.
+        assert_eq!(advertised_mem_mib(0, 2048, Some(65536)), 65536 - 2048);
+    }
+
+    #[test]
+    fn advertised_mem_falls_back_to_1gib_when_undetectable() {
+        // Detection failed (non-Linux / unreadable) ⇒ the conservative legacy 1 GiB,
+        // so an undetectable host never over-advertises into OOM.
+        assert_eq!(advertised_mem_mib(0, 0, None), 1024);
+    }
+
+    #[test]
+    fn a_2gib_workload_now_fits_a_64gib_node() {
+        // THE BUG: the old code advertised a hardcoded 1024 MiB on any auto-detect node,
+        // and the scheduler's fit-check is `node.free_mem_mib >= spec.mem_mib`
+        // (`boatramp_core::compute::place_replicas`). 2048 > 1024 ⇒ a 2 GiB docker
+        // workload could never place on a 64 GiB box. With real detection it fits.
+        let advertised = advertised_mem_mib(0, 0, Some(65536));
+        assert!(advertised > 1024, "must exceed the old 1 GiB hardcode");
+        assert!(
+            advertised >= 2048,
+            "a 2 GiB (mem_mib=2048) workload must now fit"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn live_detection_exceeds_the_legacy_1gib_default() {
+        // On a real Linux host (CI) detection must read a total well above the old
+        // 1 GiB hardcode, and the advertised figure must fit a 2 GiB workload. This gate
+        // would FAIL against the pre-fix code, which never consulted the host at all.
+        let total = detect_total_mem_mib().expect("Linux host/cgroup memory detectable");
+        assert!(
+            total > 1024,
+            "detected total {total} MiB should exceed 1 GiB"
+        );
+        assert!(
+            advertised_mem_mib(0, 0, Some(total)) >= 2048,
+            "advertised memory must fit a 2 GiB workload on a real host",
+        );
+    }
 
     /// A `Storage` the `DeployStore` never actually reads on the volume paths (the
     /// spec/workload records live in the KV) — every method is a stub.

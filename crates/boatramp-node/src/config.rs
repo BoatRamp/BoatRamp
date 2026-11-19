@@ -821,6 +821,7 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_SUBNET",
     "BOATRAMP_COMPUTE_VCPUS",
     "BOATRAMP_COMPUTE_MEM_MIB",
+    "BOATRAMP_COMPUTE_MEM_RESERVE_MIB",
     "BOATRAMP_COMPUTE_REGION",
     "BOATRAMP_COMPUTE_SQL_SHIM_URL",
     "BOATRAMP_COMPUTE_BLOB_SHIM_URL",
@@ -1265,10 +1266,25 @@ pub struct ComputeConfig {
     pub bridge: String,
     /// Guest IP subnet (default `10.0.0.0/24`).
     pub subnet: String,
-    /// vCPUs this node advertises as schedulable (`0` ⇒ detect from the host).
+    /// vCPUs this node advertises as schedulable (`0` ⇒ detect from the host via
+    /// `available_parallelism`, which honors a cgroup cpuset / CPU affinity).
     pub vcpus: u32,
-    /// Memory (MiB) this node advertises as schedulable (`0` ⇒ a 1 GiB default).
+    /// Memory (MiB) this node advertises as schedulable. `0` (the default) ⇒
+    /// **auto-detect the host/cgroup memory total** and subtract
+    /// [`mem_reserve_mib`](Self::mem_reserve_mib) of OS + boatramp headroom. Detection
+    /// takes the SMALLER of `/proc/meminfo` `MemTotal` and the process's effective
+    /// cgroup memory limit (cgroup v2 `memory.max`, else cgroup v1
+    /// `memory.limit_in_bytes`), so a containerized node advertises its cgroup ceiling,
+    /// never the whole host. A non-zero value **pins** the advertised capacity verbatim
+    /// (no detection, no reserve). (Before v0.64, `0` advertised a hardcoded 1 GiB
+    /// regardless of host RAM — so any workload over 1 GiB failed to place on ANY node.)
     pub mem_mib: u32,
+    /// Memory (MiB) held back from the auto-detected total for the OS + boatramp itself,
+    /// consulted ONLY while [`mem_mib`](Self::mem_mib) is `0` (auto-detect). `0` (the
+    /// default) ⇒ the built-in policy: the larger of 1 GiB or 1/16 (6.25%) of the
+    /// detected total. A non-zero value reserves exactly that many MiB. Keeps a node
+    /// from advertising RAM into host OOM. Env: `BOATRAMP_COMPUTE_MEM_RESERVE_MIB`.
+    pub mem_reserve_mib: u32,
     /// **Static** kernel-signing public keys (`"<alg>:<hex>"`) — the trust anchor
     /// for the posture-scaled kernel bar. Under `multi-tenant`, a dynamically-
     /// selected default kernel must carry a signature verifying against one of
@@ -1569,6 +1585,7 @@ impl Default for ComputeConfig {
             subnet: "10.0.0.0/24".to_string(),
             vcpus: 0,
             mem_mib: 0,
+            mem_reserve_mib: 0,
             kernel_signing_pubkeys: vec![BOATRAMP_KERNEL_SIGNING_PUBKEY.to_string()],
             kernel_allowed_hashes: default_allowed_kernel_hashes(),
             region: None,
