@@ -7,6 +7,24 @@ versions.
 
 ## [Unreleased]
 
+### Added
+
+- **Silent compute placement/launch failures are now surfaced on the status plane.**
+  A replica that could not be scheduled (a capacity/eligibility shortfall) or whose launch
+  returned an error previously vanished from `compute status` with zero diagnostics — the blind
+  spot behind a multi-hour live incident. Reconcile now reports the unplaced tail per-ordinal
+  (with a resource-need reason) instead of silently truncating it: each unplaced ordinal is logged
+  as a structured warn and recorded in `report.errors`, firing the aggregated "compute reconcile:
+  partial" warning. A launch that errors now persists a durable `Readiness::LaunchFailed { reason }`
+  replica record carrying the backend error; `compute status` shows the ordinal + reason (new
+  READINESS column) and `db status` reports `launch_failed` + reason instead of "no
+  replicas"/pending, while reconcile keeps retrying each tick (a success overwrites the marker) and
+  `db ensure --wait` treats `launch_failed` as terminal. `compute get` gains an additive
+  `active_spec` summary (image ref/source + pull-secret name) so an operator sees what is pulled and
+  with which credential, and an image that resolves to an anonymous pull now warns — scoped to the
+  actionable cases (a named `pull_secret` that still resolved to anonymous, or a non-default/private
+  registry host) so a routine public `docker.io` pull stays quiet.
+
 ### Security
 
 - **`boatramp-cwt` / control-plane tokens: closed a chain-prefix _truncation_ escalation and
