@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 
 /// An OCI build error.
@@ -63,24 +64,64 @@ fn safe_relative(path: &Path) -> Result<PathBuf, OciError> {
     Ok(out)
 }
 
+/// Join `rel` (already sanitized to `Normal`-only components by [`safe_relative`])
+/// onto `root`, **refusing to resolve through a symlink**. Every ancestor
+/// component is `lstat`'d and rejected if it is a symlink, so a destination can
+/// never be computed *through* a symlink an earlier entry/layer planted (e.g.
+/// `work/evil -> /etc`, then `work/evil/passwd`). This is the cross-platform
+/// containment the whole unpack relies on — the host `std::fs` calls that follow
+/// (`create_dir_all`, `unpack`, `remove_*`, `hard_link`/`copy`) then operate on a
+/// path whose parents are verified real directories under `root`, so none of them
+/// can be redirected onto the host filesystem.
+///
+/// With `check_leaf` the final component is screened the same way — used where the
+/// resolved path is itself traversed/read (an opaque-whiteout directory to clear,
+/// a hard-link *target* to read): those must be real, not a symlink to follow.
+/// Otherwise the leaf is returned un-dereferenced and the caller must not follow
+/// it (it unlinks-then-creates it with the verified-real parent pinned).
+///
+/// Non-existent components are allowed (nothing to follow yet); only an existing
+/// symlink component is refused. `rel`'s components are all `Normal`; any other
+/// kind (defensive — `safe_relative` already rejected them) is refused.
+fn contained_path(root: &Path, rel: &Path, check_leaf: bool) -> Result<PathBuf, OciError> {
+    let mut cur = root.to_path_buf();
+    let comps: Vec<Component> = rel.components().collect();
+    let n = comps.len();
+    for (i, comp) in comps.into_iter().enumerate() {
+        let Component::Normal(name) = comp else {
+            return Err(OciError::UnsafePath(rel.display().to_string()));
+        };
+        cur.push(name);
+        let is_leaf = i + 1 == n;
+        if (check_leaf || !is_leaf) && fs::symlink_metadata(&cur).is_ok_and(|m| m.is_symlink()) {
+            return Err(OciError::UnsafePath(rel.display().to_string()));
+        }
+    }
+    Ok(cur)
+}
+
 /// Resolve a tar **hard-link** target into a host path under `root`. A hard link's
 /// `linkname` references another member of the *same archive* (the same namespace
 /// as member names), so it is always relative to the extraction root — never the
 /// process CWD. An absolute target is normalized to root-relative (its leading `/`
 /// is stripped, as `tar` does without `--absolute-names`); a `..` that would
-/// escape the root is refused. (Symlinks are different: their target is stored +
-/// created verbatim and resolved inside the guest, so they go through `unpack`.)
+/// escape the root is refused. The resolved target is then screened through
+/// [`contained_path`] with `check_leaf` — a hard link is `hard_link`'d/`copy`'d
+/// (and `copy` *follows* symlinks), so a target that traverses OR lands on a
+/// planted symlink (`-> /etc/shadow`) must be refused or it pulls a host file into
+/// the image (read/exfil). (A *symlink* entry is different: its target is stored +
+/// created verbatim and resolved inside the guest, so it goes through `unpack`.)
 fn link_target_under_root(root: &Path, link: &Path) -> Result<PathBuf, OciError> {
-    let mut out = root.to_path_buf();
+    let mut rel = PathBuf::new();
     for comp in link.components() {
         match comp {
-            Component::Normal(c) => out.push(c),
+            Component::Normal(c) => rel.push(c),
             // A leading `/` (or `./`) just means "from the archive root".
             Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
             Component::ParentDir => return Err(OciError::UnsafePath(link.display().to_string())),
         }
     }
-    Ok(out)
+    contained_path(root, &rel, true)
 }
 
 /// Recursively remove a path (file, dir, or symlink) if it exists.
@@ -135,20 +176,34 @@ pub fn apply_layer_tar(root: &Path, reader: impl Read) -> Result<(), OciError> {
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
 
         if file_name == ".wh..wh..opq" {
-            clear_dir(&root.join(parent))?;
+            // Clear the REAL directory; refuse if any component (the dir itself
+            // included) is a symlink, so an opaque whiteout can't be redirected to
+            // wipe a host directory via a planted symlink.
+            let dir = contained_path(root, parent, true)?;
+            clear_dir(&dir)?;
             continue;
         }
         if let Some(target_name) = file_name.strip_prefix(".wh.") {
-            remove_path(&root.join(parent).join(target_name))?;
+            // Pin the parent chain to real directories, then remove the named leaf
+            // WITHOUT following it (a symlinked whiteout parent must not let the
+            // delete reach outside the rootfs).
+            let victim = contained_path(root, &parent.join(target_name), false)?;
+            remove_path(&victim)?;
             continue;
         }
 
-        let dest = root.join(&rel);
-        // A replacing entry over an existing dir/symlink: clear it first so
-        // `unpack` writes cleanly (e.g. a file replacing a directory).
+        // Resolve the destination with its parent chain pinned to real
+        // directories — never resolve a write THROUGH an attacker-planted symlink.
+        let dest = contained_path(root, &rel, false)?;
+        // Clear any existing leaf unless BOTH the old and new entries are
+        // directories (a dir entry merges onto a lower-layer dir). This lets a
+        // later layer replace an entry AND — critically — ensures we never write
+        // a file THROUGH a leaf symlink planted by an earlier layer: we unlink the
+        // symlink itself (never follow it) before `unpack`.
         if let Ok(meta) = fs::symlink_metadata(&dest) {
             let entry_is_dir = entry.header().entry_type().is_dir();
-            if meta.is_dir() && !entry_is_dir {
+            let existing_is_dir = meta.file_type().is_dir();
+            if !(existing_is_dir && entry_is_dir) {
                 remove_path(&dest)?;
             }
         }
@@ -158,16 +213,16 @@ pub fn apply_layer_tar(root: &Path, reader: impl Read) -> Result<(), OciError> {
 
         // Hard links (e.g. busybox's applets → `/bin/busybox`) reference another
         // member of this archive, so the target resolves **relative to the rootfs
-        // root** ([`link_target_under_root`]); the tar crate's per-entry `unpack`
-        // would resolve it relative to the process CWD and fail. Link here (copy
-        // as a fallback if linking can't); everything else (files, dirs, symlinks)
-        // goes through `unpack`, which writes a symlink's target verbatim.
+        // root** ([`link_target_under_root`], which refuses a symlinked target);
+        // the tar crate's per-entry `unpack` would resolve it relative to the
+        // process CWD and fail. Link here (copy as a fallback if linking can't);
+        // everything else (files, dirs, symlinks) goes through `unpack`, which
+        // writes a symlink's target verbatim. The leaf was cleared above.
         if entry.header().entry_type() == tar::EntryType::Link {
             let link = entry
                 .link_name()?
                 .ok_or_else(|| OciError::Io(std::io::Error::other("hard link without target")))?;
             let target = link_target_under_root(root, &link)?;
-            let _ = fs::remove_file(&dest);
             if fs::hard_link(&target, &dest).is_err() {
                 fs::copy(&target, &dest)?;
             }
@@ -251,6 +306,165 @@ const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
     application/vnd.docker.distribution.manifest.v2+json, \
     application/vnd.docker.distribution.manifest.list.v2+json";
 
+/// Is `v4` a non-globally-routable IPv4 address (loopback, RFC-1918 private,
+/// link-local incl. the `169.254.169.254` cloud-metadata endpoint, CGNAT, …)?
+/// Such an address is refused as a pull target — the SSRF guard.
+fn ipv4_is_disallowed(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_unspecified()
+        || o[0] == 0 // "this network" 0.0.0.0/8
+        || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000) // 100.64.0.0/10 CGNAT
+        || o[0] >= 240 // 240.0.0.0/4 reserved
+}
+
+/// Is `ip` a non-globally-routable address that must never be a pull target?
+/// Blocks loopback, private, link-local (v4 `169.254/16`, v6 `fe80::/10`),
+/// unique-local (`fc00::/7`), multicast, and v4-mapped forms of the above —
+/// closing SSRF to cloud metadata (`169.254.169.254`) and internal hosts.
+fn ip_is_disallowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_disallowed(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return ipv4_is_disallowed(mapped);
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
+/// Split a URL authority (`host`, `host:port`, or `[v6]:port`) into host + port,
+/// defaulting to 443. No DNS; purely lexical.
+fn split_host_port(authority: &str) -> Result<(String, u16), OciError> {
+    if authority.is_empty() {
+        return Err(OciError::Registry("empty host in pull target".into()));
+    }
+    let bad_port = |a: &str| OciError::Registry(format!("bad port in pull target {a}"));
+    if let Some(rest) = authority.strip_prefix('[') {
+        // `[ipv6]` or `[ipv6]:port`.
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| OciError::Registry(format!("malformed IPv6 authority {authority}")))?;
+        let port = if after.is_empty() {
+            443
+        } else if let Some(p) = after.strip_prefix(':') {
+            p.parse::<u16>().map_err(|_| bad_port(authority))?
+        } else {
+            return Err(OciError::Registry(format!(
+                "malformed IPv6 authority {authority}"
+            )));
+        };
+        return Ok((host.to_string(), port));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) => Ok((
+            h.to_string(),
+            p.parse::<u16>().map_err(|_| bad_port(authority))?,
+        )),
+        None => Ok((authority.to_string(), 443)),
+    }
+}
+
+/// Validate a `WWW-Authenticate` realm URL as a safe pull target: it MUST be
+/// `https://` (no `http://`, no other scheme — a tenant image's 401 realm is
+/// attacker-controlled), returning its (host, port) for IP screening. Lexical
+/// only; the IP screen is [`screen_pull_host`].
+fn parse_realm(realm: &str) -> Result<(String, u16), OciError> {
+    let rest = realm
+        .strip_prefix("https://")
+        .ok_or_else(|| OciError::Registry(format!("auth realm must be https, refusing {realm}")))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip any `userinfo@`.
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    split_host_port(authority)
+}
+
+/// Screen a pull target host: resolve it and refuse if it is (or resolves to)
+/// any non-globally-routable address — the SSRF block for the registry host and
+/// the token realm. For a DNS name the screened socket addrs are returned to PIN
+/// into the client (so a re-resolve at connect time can't rebind to a private
+/// address — DNS-rebinding defense); a literal IP is screened in place and needs
+/// no pin. Blocking DNS (one shot, cold build path).
+fn screen_pull_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, OciError> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip_is_disallowed(ip) {
+            return Err(OciError::Registry(format!(
+                "refusing to pull from non-global address {host}"
+            )));
+        }
+        return Ok(Vec::new());
+    }
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| OciError::Registry(format!("resolving pull host {host}: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(OciError::Registry(format!(
+            "pull host {host} did not resolve"
+        )));
+    }
+    for sa in &addrs {
+        if ip_is_disallowed(sa.ip()) {
+            return Err(OciError::Registry(format!(
+                "refusing to pull from {host}: resolves to non-global address {}",
+                sa.ip()
+            )));
+        }
+    }
+    Ok(addrs)
+}
+
+/// Build an HTTP client for `host:port`, screened against SSRF: the host is
+/// resolved + IP-screened ([`screen_pull_host`]) and its vetted addrs pinned so
+/// the initial connect can't rebind. Redirects are **followed but re-screened at
+/// every hop** (bounded): a registry blob GET legitimately `307`s to a CDN, so a
+/// blanket no-redirect would break real pulls — but each hop must still be
+/// `https` to a globally-routable host, so an SSRF redirect to cloud metadata /
+/// an internal host is refused rather than chased.
+fn build_screened_client(host: &str, port: u16) -> Result<reqwest::Client, OciError> {
+    let pinned = screen_pull_host(host, port)?;
+    let redirect = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 8 {
+            return attempt.error(std::io::Error::other("too many redirects"));
+        }
+        // Copy what we need as owned values before consuming `attempt`.
+        let scheme = attempt.url().scheme().to_owned();
+        let host = attempt.url().host_str().map(str::to_owned);
+        let port = attempt.url().port_or_known_default().unwrap_or(443);
+        let shown = attempt.url().to_string();
+        if scheme != "https" {
+            return attempt.error(std::io::Error::other(format!(
+                "refusing non-https redirect to {shown}"
+            )));
+        }
+        let Some(h) = host else {
+            return attempt.error(std::io::Error::other("redirect without host"));
+        };
+        match screen_pull_host(&h, port) {
+            Ok(_) => attempt.follow(),
+            Err(e) => attempt.error(std::io::Error::other(e.to_string())),
+        }
+    });
+    let mut builder = reqwest::Client::builder()
+        .user_agent("boatramp-compute")
+        .redirect(redirect);
+    if !pinned.is_empty() {
+        builder = builder.resolve_to_addrs(host, &pinned);
+    }
+    builder
+        .build()
+        .map_err(|e| OciError::Registry(e.to_string()))
+}
+
 /// GET `url` with the manifest Accept header, performing a one-shot
 /// `WWW-Authenticate: Bearer` token exchange on `401` (anonymous pull).
 async fn get_authed(
@@ -279,7 +493,7 @@ async fn get_authed(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let new_token = fetch_token(client, &challenge).await?;
+    let new_token = fetch_token(&challenge).await?;
     *token = Some(new_token);
     send(token)
         .await
@@ -287,7 +501,14 @@ async fn get_authed(
 }
 
 /// Resolve a `Bearer realm="…",service="…",scope="…"` challenge into a token.
-async fn fetch_token(client: &reqwest::Client, challenge: &str) -> Result<String, OciError> {
+///
+/// The realm comes from the (tenant-controlled) registry's `401`, so it is
+/// screened before it is fetched: it MUST be `https://` and its host must not be
+/// (or resolve to) a non-global address ([`parse_realm`] + [`build_screened_client`]).
+/// A dedicated DNS-pinned, redirect-re-screening client is used, so a malicious
+/// `realm="http://169.254.169.254/…"` (SSRF to cloud metadata / internal hosts,
+/// plus a credential-exfil tail) is refused rather than fetched.
+async fn fetch_token(challenge: &str) -> Result<String, OciError> {
     let params = challenge.trim_start_matches("Bearer ");
     let mut realm = None;
     let mut query: Vec<(String, String)> = Vec::new();
@@ -303,6 +524,8 @@ async fn fetch_token(client: &reqwest::Client, challenge: &str) -> Result<String
         }
     }
     let realm = realm.ok_or_else(|| OciError::Registry("no realm in auth challenge".into()))?;
+    let (host, port) = parse_realm(&realm)?;
+    let client = build_screened_client(&host, port)?;
     let resp = client
         .get(&realm)
         .query(&query)
@@ -361,28 +584,27 @@ fn oci_arch() -> &'static str {
 /// [`oci_arch`] (the host/guest arch).
 async fn resolve_manifest(image: &str) -> Result<ResolvedManifest, OciError> {
     let (registry, repo, reference) = parse_reference(image);
-    let client = reqwest::Client::builder()
-        .user_agent("boatramp-compute")
-        .build()
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    // Screen the registry host for SSRF (scheme is fixed `https` below; the host
+    // must resolve to a global address) and pin + disable redirects.
+    let (reg_host, reg_port) = split_host_port(&registry)?;
+    let client = build_screened_client(&reg_host, reg_port)?;
     let base = format!("https://{registry}/v2/{repo}");
     let mut token = None;
 
+    // When the ref is a `@sha256:` digest pin, the manifest body itself must hash
+    // to it — otherwise a MITM / malicious registry can serve a *different*
+    // self-consistent manifest (its layer digests all check out against ITS own
+    // manifest). Verify the manifest bytes before trusting their layer list.
     let manifest_url = format!("{base}/manifests/{reference}");
-    let resp = get_authed(&client, &manifest_url, MANIFEST_ACCEPT, &mut token).await?;
-    if !resp.status().is_success() {
-        return Err(OciError::Registry(format!(
-            "manifest GET {}",
-            resp.status()
-        )));
-    }
-    let manifest: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    let want = reference
+        .starts_with("sha256:")
+        .then_some(reference.as_str());
+    let manifest = fetch_manifest(&client, &manifest_url, &mut token, want).await?;
 
     let manifest = if manifest.get("manifests").is_some() {
-        // An index/list — pick linux/<guest-arch>.
+        // An index/list — pick linux/<guest-arch>. The chosen child manifest is
+        // ALWAYS verified against the index-provided digest (the index itself was
+        // digest-verified above when the ref was a pin).
         let arch = oci_arch();
         let digest = manifest["manifests"]
             .as_array()
@@ -396,10 +618,7 @@ async fn resolve_manifest(image: &str) -> Result<ResolvedManifest, OciError> {
             .ok_or_else(|| OciError::Registry(format!("no linux/{arch} in image index")))?
             .to_string();
         let url = format!("{base}/manifests/{digest}");
-        let resp = get_authed(&client, &url, MANIFEST_ACCEPT, &mut token).await?;
-        resp.json()
-            .await
-            .map_err(|e| OciError::Registry(e.to_string()))?
+        fetch_manifest(&client, &url, &mut token, Some(&digest)).await?
     } else {
         manifest
     };
@@ -409,6 +628,48 @@ async fn resolve_manifest(image: &str) -> Result<ResolvedManifest, OciError> {
         manifest,
         token,
     })
+}
+
+/// Verify `bytes` hash to `digest` when it is a `sha256:` pin (a tag reference is
+/// not hash-verifiable and passes — its config/layer digests are checked
+/// downstream against the now-trusted manifest).
+fn verify_digest(bytes: &[u8], digest: &str) -> Result<(), OciError> {
+    use sha2::{Digest, Sha256};
+    if let Some(hex_want) = digest.strip_prefix("sha256:") {
+        let got = hex::encode(Sha256::digest(bytes));
+        if got != hex_want {
+            return Err(OciError::Registry(format!(
+                "manifest digest mismatch for {digest}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// GET a manifest from `url`, verifying its raw bytes against `expect` (a
+/// `sha256:` digest) BEFORE parsing — so a digest-pinned pull trusts only a
+/// manifest whose body actually hashes to the pin.
+async fn fetch_manifest(
+    client: &reqwest::Client,
+    url: &str,
+    token: &mut Option<String>,
+    expect: Option<&str>,
+) -> Result<serde_json::Value, OciError> {
+    let resp = get_authed(client, url, MANIFEST_ACCEPT, token).await?;
+    if !resp.status().is_success() {
+        return Err(OciError::Registry(format!(
+            "manifest GET {}",
+            resp.status()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| OciError::Registry(e.to_string()))?;
+    if let Some(d) = expect {
+        verify_digest(&bytes, d)?;
+    }
+    serde_json::from_slice(&bytes).map_err(|e| OciError::Registry(e.to_string()))
 }
 
 /// Fetch + verify a blob by `digest` from `base`.
@@ -684,12 +945,34 @@ fn write_init(
     if !mounts_spec.is_empty() {
         fs::write(cfgdir.join("mounts"), nul_join(&mounts_spec))?;
     }
-    // A default resolver so the workload can do DNS (egress NAT is the node's job).
+    // A default resolver so the workload can do DNS (egress NAT is the node's
+    // job). Overridable per deployment — the container backend rewrites
+    // resolv.conf post-stage to point at the internal resolver; the VMM bakes it
+    // at build, so expose the same knob here.
     let etc = root.join("etc");
     if !etc.join("resolv.conf").exists() {
-        fs::write(etc.join("resolv.conf"), "nameserver 1.1.1.1\n")?;
+        fs::write(etc.join("resolv.conf"), default_resolv_conf())?;
     }
     Ok(())
+}
+
+/// The default guest `resolv.conf` body. The nameserver defaults to `1.1.1.1` but
+/// is overridable via the `BOATRAMP_VM_NAMESERVER` env var (operator-set, not
+/// tenant-controlled); only a value that parses as an IP address is honored, so a
+/// malformed/newline-bearing override can't inject extra resolv.conf directives.
+fn default_resolv_conf() -> String {
+    resolv_conf_body(std::env::var("BOATRAMP_VM_NAMESERVER").ok().as_deref())
+}
+
+/// Render the guest `resolv.conf` body from an optional nameserver override. Only
+/// a value that parses as an IP address is honored (so a malformed or
+/// newline-bearing override falls back to `1.1.1.1` rather than injecting a
+/// second `nameserver`/other directive). Pure — the testable core.
+fn resolv_conf_body(ns_override: Option<&str>) -> String {
+    let ns = ns_override
+        .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        .map_or_else(|| "1.1.1.1".to_string(), |ip| ip.to_string());
+    format!("nameserver {ns}\n")
 }
 
 /// Materialize an OCI `image` into an unpacked rootfs **directory** at `out`
@@ -1032,5 +1315,290 @@ mod tests {
         // An unfound bare command is left bare (fails visibly in the guest init).
         assert_eq!(resolve_argv0(&root, "nope", &env), "nope");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- U15 part 1: symlink-traversal containment ----
+
+    /// Build a tar containing a symlink entry `path -> target` (verbatim target).
+    fn tar_symlink_then(entries: &[(&str, &str, &[u8])]) -> Vec<u8> {
+        // Each entry is (kind, path, data): kind "L" = symlink (data is the
+        // target as bytes), "F" = regular file, "W" = whiteout/other file.
+        let mut builder = tar::Builder::new(Vec::new());
+        for (kind, path, data) in entries {
+            let mut h = tar::Header::new_gnu();
+            if *kind == "L" {
+                h.set_entry_type(tar::EntryType::Symlink);
+                h.set_mode(0o777);
+                h.set_size(0);
+                let target = std::str::from_utf8(data).unwrap();
+                builder.append_link(&mut h, path, target).unwrap();
+            } else {
+                h.set_mode(0o644);
+                h.set_size(data.len() as u64);
+                builder.append_data(&mut h, path, *data).unwrap();
+            }
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn planted_symlink_unpack_refuses_write_escape() {
+        // An earlier entry plants `evil -> <sentinel outside root>`; a later entry
+        // `evil/pwned` must NOT be written through it (host-write escape).
+        let root = tmpdir("sym-write");
+        let sentinel = tmpdir("sym-write-escape");
+        fs::create_dir_all(&sentinel).unwrap();
+        let tar = tar_symlink_then(&[
+            ("L", "evil", sentinel.to_str().unwrap().as_bytes()),
+            ("F", "evil/pwned", b"PWNED"),
+        ]);
+        let err = apply_layer_tar(&root, &tar[..]).unwrap_err();
+        assert!(matches!(err, OciError::UnsafePath(_)), "got {err:?}");
+        assert!(
+            !sentinel.join("pwned").exists(),
+            "the write must NOT have escaped through the planted symlink"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&sentinel);
+    }
+
+    #[test]
+    fn whiteout_through_symlink_refuses_delete() {
+        // `evil -> <sentinel>`; a whiteout `evil/.wh.victim` must NOT delete the
+        // sentinel's file (host-delete escape).
+        let root = tmpdir("sym-wh");
+        let sentinel = tmpdir("sym-wh-escape");
+        fs::create_dir_all(&sentinel).unwrap();
+        fs::write(sentinel.join("victim"), b"keep").unwrap();
+        let tar = tar_symlink_then(&[
+            ("L", "evil", sentinel.to_str().unwrap().as_bytes()),
+            ("W", "evil/.wh.victim", b""),
+        ]);
+        let err = apply_layer_tar(&root, &tar[..]).unwrap_err();
+        assert!(matches!(err, OciError::UnsafePath(_)), "got {err:?}");
+        assert!(
+            sentinel.join("victim").exists(),
+            "the whiteout must NOT have deleted through the planted symlink"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&sentinel);
+    }
+
+    #[test]
+    fn opaque_whiteout_through_symlink_refuses_clear() {
+        // An opaque whiteout whose directory is a planted symlink must refuse,
+        // not `read_dir` + wipe the symlink target.
+        let root = tmpdir("sym-opq");
+        let sentinel = tmpdir("sym-opq-escape");
+        fs::create_dir_all(&sentinel).unwrap();
+        fs::write(sentinel.join("keep"), b"x").unwrap();
+        let tar = tar_symlink_then(&[
+            ("L", "evil", sentinel.to_str().unwrap().as_bytes()),
+            ("W", "evil/.wh..wh..opq", b""),
+        ]);
+        let err = apply_layer_tar(&root, &tar[..]).unwrap_err();
+        assert!(matches!(err, OciError::UnsafePath(_)), "got {err:?}");
+        assert!(
+            sentinel.join("keep").exists(),
+            "the opaque whiteout must NOT have cleared through the planted symlink"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&sentinel);
+    }
+
+    #[test]
+    fn hard_link_through_symlink_refuses_exfil() {
+        // `evil -> <sentinel/secret>` (a symlink to a host file); a hard-link
+        // entry `loot` pointing at `evil` must be refused, not copied — otherwise
+        // a host file is exfiltrated into the image.
+        let root = tmpdir("sym-link");
+        let sentinel = tmpdir("sym-link-escape");
+        fs::create_dir_all(&sentinel).unwrap();
+        let secret = sentinel.join("secret");
+        fs::write(&secret, b"topsecret").unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        // Plant the symlink `evil -> <abs path to secret>`.
+        let mut lh = tar::Header::new_gnu();
+        lh.set_entry_type(tar::EntryType::Symlink);
+        lh.set_mode(0o777);
+        lh.set_size(0);
+        builder
+            .append_link(&mut lh, "evil", secret.to_str().unwrap())
+            .unwrap();
+        // A hard link `loot` whose target is the planted symlink.
+        let mut hh = tar::Header::new_gnu();
+        hh.set_entry_type(tar::EntryType::Link);
+        hh.set_mode(0o644);
+        hh.set_size(0);
+        builder.append_link(&mut hh, "loot", "evil").unwrap();
+        let tar = builder.into_inner().unwrap();
+
+        let err = apply_layer_tar(&root, &tar[..]).unwrap_err();
+        assert!(matches!(err, OciError::UnsafePath(_)), "got {err:?}");
+        assert!(
+            !root.join("loot").exists(),
+            "the host file must NOT have been exfiltrated into the image"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&sentinel);
+    }
+
+    #[test]
+    fn legit_symlink_entry_is_stored_verbatim_not_followed() {
+        // A normal symlink entry is created as-is (resolved inside the guest, not
+        // the host) — the hardening must not break ordinary images.
+        let root = tmpdir("sym-ok");
+        let tar = tar_symlink_then(&[("F", "real", b"R"), ("L", "ln", b"real")]);
+        apply_layer_tar(&root, &tar[..]).unwrap();
+        let meta = fs::symlink_metadata(root.join("ln")).unwrap();
+        assert!(meta.file_type().is_symlink(), "symlink stored verbatim");
+        assert_eq!(fs::read_link(root.join("ln")).unwrap(), Path::new("real"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn contained_path_allows_real_dirs_refuses_symlinked_parent() {
+        let root = tmpdir("contained");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/f"), b"x").unwrap();
+        // A real parent chain resolves.
+        assert_eq!(
+            contained_path(&root, Path::new("a/b/f"), false).unwrap(),
+            root.join("a/b/f")
+        );
+        // A symlinked parent component is refused.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/tmp", root.join("a/link")).unwrap();
+            assert!(matches!(
+                contained_path(&root, Path::new("a/link/x"), false),
+                Err(OciError::UnsafePath(_))
+            ));
+            // With check_leaf, a symlink LEAF is also refused.
+            assert!(matches!(
+                contained_path(&root, Path::new("a/link"), true),
+                Err(OciError::UnsafePath(_))
+            ));
+            // Without check_leaf, a symlink leaf is returned (caller unlinks it).
+            assert_eq!(
+                contained_path(&root, Path::new("a/link"), false).unwrap(),
+                root.join("a/link")
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- U15 part 2: registry/realm SSRF guard ----
+
+    #[test]
+    fn malicious_realm_ssrf_is_refused() {
+        // A non-https realm (http, or any other scheme) is refused outright.
+        assert!(matches!(
+            parse_realm("http://169.254.169.254/token"),
+            Err(OciError::Registry(_))
+        ));
+        assert!(matches!(
+            parse_realm("gopher://internal/x"),
+            Err(OciError::Registry(_))
+        ));
+
+        // https realms whose host is a non-global literal IP are refused by the
+        // screen (no DNS needed — hermetic).
+        for ip in [
+            "169.254.169.254",
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+        ] {
+            let (host, port) = parse_realm(&format!("https://{ip}/token")).unwrap();
+            assert_eq!(port, 443);
+            assert!(
+                matches!(screen_pull_host(&host, port), Err(OciError::Registry(_))),
+                "{ip} (link-local/private/loopback) must be refused"
+            );
+        }
+        for ip in ["::1", "fe80::1", "fc00::1"] {
+            let (host, port) = parse_realm(&format!("https://[{ip}]:443/token")).unwrap();
+            assert!(
+                matches!(screen_pull_host(&host, port), Err(OciError::Registry(_))),
+                "{ip} (v6 loopback/link-local/unique-local) must be refused"
+            );
+        }
+
+        // A public literal IP passes the screen (and needs no DNS pin).
+        let (host, port) = parse_realm("https://1.1.1.1/token").unwrap();
+        assert_eq!((host.as_str(), port), ("1.1.1.1", 443));
+        assert!(screen_pull_host("1.1.1.1", 443).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ipv4_mapped_v6_metadata_is_refused() {
+        // `::ffff:169.254.169.254` must be screened via its mapped v4 form.
+        let mapped: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(ip_is_disallowed(mapped));
+        // And a plain public v4 is allowed.
+        assert!(!ip_is_disallowed("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn split_host_port_parses_authorities() {
+        assert_eq!(
+            split_host_port("ghcr.io").unwrap(),
+            ("ghcr.io".to_string(), 443)
+        );
+        assert_eq!(
+            split_host_port("reg.example.com:5000").unwrap(),
+            ("reg.example.com".to_string(), 5000)
+        );
+        assert_eq!(
+            split_host_port("[::1]:8443").unwrap(),
+            ("::1".to_string(), 8443)
+        );
+        assert_eq!(
+            split_host_port("[fe80::1]").unwrap(),
+            ("fe80::1".to_string(), 443)
+        );
+        assert!(split_host_port("host:notaport").is_err());
+    }
+
+    // ---- A1: manifest digest-pin integrity ----
+
+    #[test]
+    fn manifest_digest_mismatch_is_refused() {
+        use sha2::{Digest, Sha256};
+        let body = br#"{"schemaVersion":2,"layers":[]}"#;
+        let real = hex::encode(Sha256::digest(body));
+        // The correct pin verifies.
+        verify_digest(body, &format!("sha256:{real}")).unwrap();
+        // A wrong digest pin is refused (a MITM/malicious registry serving a
+        // different self-consistent manifest for a pinned ref).
+        assert!(matches!(
+            verify_digest(
+                body,
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Err(OciError::Registry(_))
+        ));
+        // A tag reference (not a sha256 pin) is not hash-checkable here → passes
+        // (its config/layer digests are verified downstream).
+        verify_digest(body, "latest").unwrap();
+    }
+
+    // ---- minor: overridable VMM nameserver ----
+
+    #[test]
+    fn resolv_conf_nameserver_default_override_and_sanitize() {
+        // Default when unset.
+        assert_eq!(resolv_conf_body(None), "nameserver 1.1.1.1\n");
+        // A valid IP override is honored.
+        assert_eq!(resolv_conf_body(Some("10.0.0.1")), "nameserver 10.0.0.1\n");
+        assert_eq!(resolv_conf_body(Some(" 8.8.8.8 ")), "nameserver 8.8.8.8\n");
+        // A malformed / injection attempt falls back to the default (not an IP).
+        assert_eq!(
+            resolv_conf_body(Some("6.6.6.6\nnameserver 7.7.7.7")),
+            "nameserver 1.1.1.1\n"
+        );
     }
 }
