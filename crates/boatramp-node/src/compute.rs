@@ -212,40 +212,90 @@ fn detect_total_mem_mib() -> Option<u32> {
 }
 
 /// The process's effective cgroup memory limit in bytes: cgroup v2 `memory.max` (the
-/// unified hierarchy — resolved for this process's own cgroup, then the mount root),
-/// else cgroup v1 `memory/memory.limit_in_bytes`. `None` when neither is present or the
-/// limit is "unlimited" (`max` on v2, the near-`u64::MAX` sentinel on v1).
+/// unified hierarchy) else cgroup v1 `memory/memory.limit_in_bytes`. In BOTH tiers the
+/// process's OWN cgroup is resolved from `/proc/self/cgroup` first, then the mount root
+/// is used as a fallback — so a containerized node reads its real per-container ceiling,
+/// not the host root cgroup. `None` when neither is present or the limit is "unlimited"
+/// (`max` on v2, the near-`u64::MAX` sentinel on v1).
 fn detect_cgroup_mem_limit_bytes() -> Option<u64> {
-    // cgroup v2: resolve the process's own cgroup path (`0::<path>` in /proc/self/cgroup)
-    // and read its `memory.max`. With a private cgroup namespace (the Docker/containerd
-    // default) the path is `/` and the mount root already IS the container's own cgroup,
-    // so the mount-root read below also works — try the resolved path first.
-    if let Some(path) = cgroup_v2_rel_path()
-        && let Ok(s) = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max"))
-        && let Some(b) = parse_cgroup_mem_max_v2(&s)
-    {
-        return Some(b);
-    }
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-        && let Some(b) = parse_cgroup_mem_max_v2(&s)
-    {
-        return Some(b);
-    }
-    // cgroup v1 fallback.
-    std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        .ok()
-        .and_then(|s| parse_cgroup_mem_limit_v1(&s))
+    let proc_self = std::fs::read_to_string("/proc/self/cgroup").ok();
+    cgroup_mem_limit_from(proc_self.as_deref(), |p| std::fs::read_to_string(p).ok())
 }
 
-/// This process's cgroup v2 relative path from `/proc/self/cgroup` (the `0::<path>`
-/// line), WITHOUT a trailing slash so the caller can build
-/// `/sys/fs/cgroup<path>/memory.max`. `/` (the root) maps to the empty string. `None`
-/// when there is no v2 (`0::`) line.
-fn cgroup_v2_rel_path() -> Option<String> {
-    let s = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+/// The cgroup-tier decision logic, factored out of the `/proc` + `/sys` reads so it is
+/// unit-testable without a real cgroupfs: `proc_self_cgroup` is the `/proc/self/cgroup`
+/// contents (if readable) and `read` reads a `/sys/fs/cgroup/...` file (`None` on miss).
+///
+/// v2 is the unified hierarchy; v1 the legacy `memory` controller. Each tier reads the
+/// process's OWN cgroup (resolved from `/proc/self/cgroup`) first, falling back to the
+/// mount root only when that misses or parses to `None`. With a private cgroup namespace
+/// (the Docker/containerd default) the process path is `/`, so the resolved read and the
+/// mount-root read coincide — but with `--cgroupns=host` (Docker's default on a v1 host)
+/// the mount root is the HOST ROOT cgroup = the unlimited sentinel, and reading only the
+/// mount root would miss the container's real limit and over-advertise the host RAM.
+fn cgroup_mem_limit_from(
+    proc_self_cgroup: Option<&str>,
+    read: impl Fn(&str) -> Option<String>,
+) -> Option<u64> {
+    // cgroup v2 (unified): the process's own `memory.max`, then the mount root.
+    if let Some(path) = proc_self_cgroup.and_then(cgroup_v2_rel_path_from)
+        && let Some(s) = read(&format!("/sys/fs/cgroup{path}/memory.max"))
+        && let Some(b) = parse_cgroup_mem_max_v2(&s)
+    {
+        return Some(b);
+    }
+    if let Some(s) = read("/sys/fs/cgroup/memory.max")
+        && let Some(b) = parse_cgroup_mem_max_v2(&s)
+    {
+        return Some(b);
+    }
+    // cgroup v1 (legacy `memory` controller): the process's own
+    // `memory.limit_in_bytes`, then the mount root. The resolved read is the fix for
+    // host-cgroupns over-advertise (see the doc comment above).
+    if let Some(path) = proc_self_cgroup.and_then(cgroup_v1_mem_rel_path_from)
+        && let Some(s) = read(&format!(
+            "/sys/fs/cgroup/memory{path}/memory.limit_in_bytes"
+        ))
+        && let Some(b) = parse_cgroup_mem_limit_v1(&s)
+    {
+        return Some(b);
+    }
+    read("/sys/fs/cgroup/memory/memory.limit_in_bytes").and_then(|s| parse_cgroup_mem_limit_v1(&s))
+}
+
+/// A process's cgroup v2 relative path from the `/proc/self/cgroup` `0::<path>` line,
+/// WITHOUT a trailing slash so the caller can build `/sys/fs/cgroup<path>/memory.max`.
+/// `/` (the root) maps to the empty string. `None` when there is no v2 (`0::`) line.
+fn cgroup_v2_rel_path_from(s: &str) -> Option<String> {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("0::") {
             let p = rest.trim();
+            return Some(if p == "/" {
+                String::new()
+            } else {
+                p.to_string()
+            });
+        }
+    }
+    None
+}
+
+/// A process's cgroup v1 `memory`-controller relative path from `/proc/self/cgroup`,
+/// WITHOUT a trailing slash so the caller can build
+/// `/sys/fs/cgroup/memory<path>/memory.limit_in_bytes`. Each v1 line is
+/// `hierarchy-ID:controller-list:/cgroup-path`, where `controller-list` is a comma-joined
+/// set that may bundle `memory` with others (e.g. `4:cpu,cpuacct,memory:/docker/abc`), so
+/// the list is split on `,` and matched against `memory` exactly. `/` (the root) maps to
+/// the empty string. `None` when no line carries the `memory` controller.
+fn cgroup_v1_mem_rel_path_from(s: &str) -> Option<String> {
+    for line in s.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (Some(_id), Some(controllers), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if controllers.split(',').any(|c| c == "memory") {
+            let p = path.trim();
             return Some(if p == "/" {
                 String::new()
             } else {
@@ -1644,6 +1694,124 @@ mod tests {
         assert_eq!(parse_cgroup_mem_limit_v1("536870912\n"), Some(536_870_912));
         // v1 "unlimited" sentinel (near u64::MAX) ⇒ None, so we fall back to the host.
         assert_eq!(parse_cgroup_mem_limit_v1("9223372036854771712"), None);
+    }
+
+    #[test]
+    fn cgroup_v2_rel_path_parses_the_unified_line() {
+        assert_eq!(
+            cgroup_v2_rel_path_from("0::/docker/abc\n").as_deref(),
+            Some("/docker/abc")
+        );
+        // The root maps to the empty string (the resolved read is then the mount root).
+        assert_eq!(cgroup_v2_rel_path_from("0::/\n").as_deref(), Some(""));
+        // A pure-v1 proc file has no `0::` line.
+        assert_eq!(cgroup_v2_rel_path_from("4:memory:/x\n"), None);
+    }
+
+    #[test]
+    fn cgroup_v1_mem_rel_path_picks_the_memory_controller() {
+        // The `memory` controller bundled in a comma-joined list with others.
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from("4:cpu,cpuacct,memory:/docker/abc\n").as_deref(),
+            Some("/docker/abc")
+        );
+        // The specific case called out in the finding.
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from("4:cpu,memory:/x\n").as_deref(),
+            Some("/x")
+        );
+        // `memory` at the root ⇒ empty string (resolved read == the mount root).
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from("3:memory:/\n").as_deref(),
+            Some("")
+        );
+        // Exact match only — a controller merely CONTAINING "memory" must NOT match.
+        assert_eq!(cgroup_v1_mem_rel_path_from("2:memoryfoo:/y\n"), None);
+        // No `memory` controller anywhere (incl. the empty-controller v2 line).
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from("1:cpu,cpuacct:/z\n0::/u\n"),
+            None
+        );
+        // A realistic multi-line proc file: the `memory` line is picked among the rest.
+        let proc = "6:cpuset:/a\n5:cpu,cpuacct:/a\n4:memory:/docker/deadbeef\n3:devices:/a\n0::/\n";
+        assert_eq!(
+            cgroup_v1_mem_rel_path_from(proc).as_deref(),
+            Some("/docker/deadbeef")
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_resolves_the_process_subpath() {
+        // The refactor must preserve v2: resolve the process's own cgroup, read its
+        // `memory.max`.
+        let proc = "0::/docker/abc\n";
+        let read = |p: &str| -> Option<String> {
+            match p {
+                "/sys/fs/cgroup/docker/abc/memory.max" => Some("2147483648\n".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(cgroup_mem_limit_from(Some(proc), read), Some(2_147_483_648));
+    }
+
+    #[test]
+    fn cgroup_v1_resolves_the_process_subpath_not_the_host_root() {
+        // THE FINDING: a v1 host with Docker's default `--cgroupns=host`. The mount-root
+        // `memory.limit_in_bytes` is the HOST ROOT cgroup = the near-u64::MAX unlimited
+        // sentinel, but THIS process's own `memory` sub-cgroup carries the real 2 GiB
+        // container cap. Detection must return the sub-cgroup limit, NOT fall through to
+        // the mount root (which would parse to None → whole host RAM → OOM over-advertise).
+        let proc = "5:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n3:cpuset:/docker/abc\n";
+        let read = |p: &str| -> Option<String> {
+            match p {
+                // No unified (v2) hierarchy on a pure-v1 host.
+                "/sys/fs/cgroup/memory.max" => None,
+                // The process's own memory sub-cgroup: the real 2 GiB cap.
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes" => {
+                    Some("2147483648\n".into())
+                }
+                // The mount root == the host root cgroup == unlimited sentinel.
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes" => {
+                    Some("9223372036854771712\n".into())
+                }
+                _ => None,
+            }
+        };
+        assert_eq!(cgroup_mem_limit_from(Some(proc), read), Some(2_147_483_648));
+    }
+
+    #[test]
+    fn cgroup_v1_unlimited_subpath_still_falls_through_to_the_mount_root() {
+        // A sub-cgroup that is ITSELF unlimited (sentinel) must not short-circuit to
+        // None — it falls back to the mount-root read, preserving the sentinel handling.
+        let proc = "4:memory:/docker/abc\n";
+        let read = |p: &str| -> Option<String> {
+            match p {
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes" => {
+                    Some("9223372036854771712\n".into())
+                }
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes" => Some("1073741824\n".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(cgroup_mem_limit_from(Some(proc), read), Some(1_073_741_824));
+    }
+
+    #[test]
+    fn cgroup_limit_is_none_when_everything_is_unlimited_or_absent() {
+        // No proc file and nothing readable ⇒ None (detection then falls to /proc/meminfo).
+        assert_eq!(cgroup_mem_limit_from(None, |_| None), None);
+        // v1 sub-path + mount root both unlimited (no v2 `memory.max`) ⇒ None.
+        let proc = "4:memory:/docker/abc\n";
+        let read = |p: &str| -> Option<String> {
+            // Only the v1 `memory.limit_in_bytes` files exist, and both are the sentinel.
+            if p.ends_with("memory.limit_in_bytes") {
+                Some("9223372036854771712\n".into())
+            } else {
+                None
+            }
+        };
+        assert_eq!(cgroup_mem_limit_from(Some(proc), read), None);
     }
 
     #[test]
