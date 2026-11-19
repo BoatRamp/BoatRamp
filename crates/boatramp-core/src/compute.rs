@@ -2773,9 +2773,22 @@ pub async fn reconcile_once(
             // replica whose OWN launched spec can't be resolved.
             let workload_spec = deploy.get_compute_spec(&workload.active).await?;
             for state in deploy.list_replica_states(project, &workload.name).await? {
-                // Only a RUNNING replica occupies vCPU/memory; a Zero (parked) or terminal
-                // one holds none (its reserved IP is tracked separately via `parked_keys`).
-                if state.phase != ReplicaPhase::Running {
+                // Only a RUNNING replica with a LIVE instance occupies vCPU/memory. Skip:
+                //  - a Zero (parked) or terminal replica (phase != Running) — it holds none
+                //    (its reserved IP is tracked separately via `parked_keys`); and
+                //  - a durable `LaunchFailed` MARKER — it is recorded `Running` as a diagnostic
+                //    (see the launch-error arm below / PLAN launch-observability) but its
+                //    `launch` never produced an instance, so it consumes no real capacity.
+                //    Charging it would phantom-occupy the node AND double-count the ordinal,
+                //    since `reconcile_plan_in` relaunches the failed ordinal THIS SAME pass
+                //    (debiting the ledger again) — which on a tight node would wrongly leave the
+                //    retry `unscheduled` and mask the real launch-failure reason. Skipping it is
+                //    what makes cumulative bin-packing and launch-observability compose: the same
+                //    "a LaunchFailed marker has no live instance" rule the observe loop, binding
+                //    resolution, and the planner's classification already apply.
+                if state.phase != ReplicaPhase::Running
+                    || matches!(state.readiness, Readiness::LaunchFailed { .. })
+                {
                     continue;
                 }
                 let res = running_replica_reservation(
@@ -6174,6 +6187,13 @@ mod tests {
     /// every workload against the node's FULL advertised capacity afresh, so both launched
     /// and over-packed the node. With the shared pre-debited ledger, the first (by the
     /// deterministic (project, name) order) places and the second is left UNSCHEDULED.
+    ///
+    /// COMPOSITION with the launch/placement observability fix (v0.64.2): the ledger decides
+    /// beta is *not placeable*, and that rejection is SURFACED through
+    /// [`ReconcilePlan::unscheduled`] as a "not scheduled: no eligible backend with capacity"
+    /// entry in `report.errors` (not silently dropped). The two are complementary — the ledger
+    /// says *not placeable*, the observability says *why* — so this asserts beta is both
+    /// unscheduled AND reported with the capacity reason.
     #[tokio::test]
     async fn cumulative_binpack_second_workload_is_not_over_subscribed() {
         let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
@@ -6204,7 +6224,21 @@ mod tests {
             "only the first workload fits; {:?}",
             r.errors
         );
-        assert!(r.errors.is_empty(), "no spurious errors: {:?}", r.errors);
+        // COMPOSITION (b): the ledger's rejection of beta is SURFACED — not silently dropped —
+        // as a single "not scheduled: no eligible backend with capacity" entry naming the
+        // over-subscribed replica and its resource need. Exactly one such entry (beta/0), and
+        // nothing else.
+        assert_eq!(
+            r.errors.len(),
+            1,
+            "the only error is beta's surfaced capacity shortfall: {:?}",
+            r.errors
+        );
+        assert!(
+            r.errors[0].starts_with("beta/0: not scheduled: no eligible backend with capacity"),
+            "the ledger rejection is surfaced with the capacity reason: {:?}",
+            r.errors
+        );
         let alpha = deploy
             .list_replica_states(crate::project::ProjectRef::DEFAULT, "alpha")
             .await
@@ -6438,6 +6472,93 @@ mod tests {
             beta.len(),
             0,
             "beta stays unscheduled — the wake was charged against the node"
+        );
+    }
+
+    /// COMPOSITION (cumulative bin-packing × launch-observability): a durable `LaunchFailed`
+    /// marker is recorded `Running` (so `compute status` shows its reason) but represents a
+    /// launch that NEVER produced a live instance — it holds NO real node capacity. The
+    /// bin-packing pre-pass must therefore NOT charge it. If it did, the marker would both
+    /// phantom-occupy the node AND be double-counted, because `reconcile_plan_in` relaunches
+    /// the failed ordinal the SAME pass (debiting the ledger again); on a tight node the retry
+    /// would then be left `unscheduled` — masking the real launch-failure reason behind a
+    /// spurious "no capacity". Here `w`'s only replica is a 5000-MiB `LaunchFailed` marker on an
+    /// 8192-MiB node: were the marker charged (5000 ⇒ 3192 free), the 5000-MiB retry would not
+    /// fit and land unscheduled; skipping it leaves the full 8192 free so the retry is placed and
+    /// (with a succeeding backend) relaunches, clearing the marker. Removing the pre-pass skip
+    /// turns this RED (launched: 0, a "not scheduled" error).
+    #[tokio::test]
+    async fn launch_failed_marker_is_not_charged_in_the_binpack_prepass() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        let hash = deploy.put_compute_spec(&spec(1, 5000)).await.unwrap();
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash.clone(),
+                    replicas: 1,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        // Pre-seed replica 0 as a durable LaunchFailed marker: phase `Running` (a diagnostic
+        // phase), unhealthy, no live instance — exactly what the launch-error arm persists.
+        let mut marker = observed("w", 0, 1, false);
+        marker.backend = "fake".into();
+        marker.active_spec = Some(hash);
+        marker.readiness = Readiness::LaunchFailed {
+            reason: "image pull denied for ghcr.io/acme/app:1".into(),
+        };
+        deploy
+            .set_replica_state(crate::project::ProjectRef::DEFAULT, &marker)
+            .await
+            .unwrap();
+
+        let nodes = vec![fake_node()]; // 8 vCPU / 8192 MiB
+        let mut backends: BackendRegistry = BTreeMap::new();
+        // A succeeding backend: the retry relaunches cleanly, so the marker is cleared — crisp
+        // proof the pre-pass left the node's full capacity for the failed ordinal's retry.
+        backends.insert("fake".into(), Arc::new(FakeBackend));
+        let policy = BackendPolicy::default();
+
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &FixedActivity(WorkloadActivity::Active),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The failed ordinal was RE-launched (not phantom-blocked): exactly one launch, and
+        // crucially NOT reported as a capacity shortfall.
+        assert_eq!(
+            r.launched, 1,
+            "the LaunchFailed ordinal retries on the freed (never-charged) capacity: {:?}",
+            r.errors
+        );
+        assert!(
+            !r.errors.iter().any(|e| e.contains("not scheduled")),
+            "a LaunchFailed marker must not phantom-occupy the node and block its own retry: {:?}",
+            r.errors
+        );
+        // The marker is cleared by the successful relaunch — one fresh (non-failed) record.
+        let states = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        assert_eq!(states.len(), 1, "still exactly one record for the ordinal");
+        assert!(
+            !matches!(states[0].readiness, Readiness::LaunchFailed { .. }),
+            "the successful retry overwrote the LaunchFailed marker: {:?}",
+            states[0].readiness
         );
     }
 
