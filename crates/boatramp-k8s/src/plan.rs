@@ -161,6 +161,32 @@ pub enum PlanError {
          charset [A-Za-z0-9/._-], no `..`)"
     )]
     InvalidMountPath(String),
+    /// F1 (Security review): a `pull_policy` of `if-not-present`/`never` (local-image **reuse**)
+    /// was requested under the multi-tenant (`strict`) posture. Local reuse on a k8s node's
+    /// SHARED image store is a cross-tenant relaxation — a cached image a co-tenant pulled under
+    /// this `name:tag`/digest would run with NO `imagePullSecret`/registry-auth check (the
+    /// classic `IfNotPresent` cross-tenant leak, which digest-pinning does not close) and
+    /// exposes mutable-tag poisoning. Refused under `strict`; honored only single-tenant.
+    #[error(
+        "pull_policy=if-not-present/never (local-image reuse) is refused under the multi-tenant \
+         posture: a k8s node's image store is shared across tenants, so reusing a cached image \
+         would bypass this tenant's imagePullSecret check and expose tag poisoning — use \
+         pull_policy=always, or run under the single-tenant posture"
+    )]
+    MultiTenantLocalReuse,
+}
+
+/// F1 (Security review): the posture gate for a workload's [`PullPolicy`], mirroring the docker
+/// backend's `local_reuse_refused`. Local-image reuse (`IfNotPresent`/`Never`) is honored only
+/// under the single-tenant posture; under the multi-tenant guard (`strict`) it is REFUSED (never
+/// silently downgraded). Called at the top of each plan so the whole plan fails closed before any
+/// container is built. See [`PlanError::MultiTenantLocalReuse`] for the tenancy rationale.
+fn check_pull_policy_posture(policy: PullPolicy, strict: bool) -> Result<(), PlanError> {
+    if strict && policy.allows_local_reuse() {
+        Err(PlanError::MultiTenantLocalReuse)
+    } else {
+        Ok(())
+    }
 }
 
 /// The inputs the planner needs beyond the immutable [`ComputeSpec`]: the replica
@@ -287,6 +313,9 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     if !is_dns1123_label(&ctx.workload) {
         return Err(PlanError::InvalidName(ctx.workload.clone()));
     }
+    // F1: refuse local-image reuse under the multi-tenant posture (fail closed before any
+    // container is built), mirroring the docker backend's `local_reuse_refused` gate.
+    check_pull_policy_posture(spec.pull_policy, ctx.strict)?;
     let image = match &spec.root {
         RootSource::Image(reference) => reference.clone(),
         RootSource::Tar(_) => return Err(PlanError::NonImageRoot("tar rootfs")),
@@ -395,7 +424,11 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
     // ROOT carries PRE-fix (<= v0.55.0) data that the defect-A subPath move would otherwise
     // silently re-`initdb` and strand. Order matters — it must inspect the root before the
     // chown/server mounts (bound to the `pgdata` subPath) make the kubelet create that subdir.
-    let mut init = vec![pgdata_preflight_init_container(&image, volume)];
+    let mut init = vec![pgdata_preflight_init_container(
+        spec.pull_policy,
+        &image,
+        volume,
+    )];
     init.extend(chown_init_container(spec, &image, volume));
     let init_containers = Some(init);
 
@@ -806,10 +839,16 @@ fn is_safe_mount_path(p: &str) -> bool {
 /// ALL capabilities dropped and no privilege escalation; the script interpolates only
 /// compile-time constants (no spec-derived value), so the `sh -c` form carries no injection
 /// surface (the chown init's F5 exec-form concern does not apply here).
-fn pgdata_preflight_init_container(image: &str, volume: &VolumeRef) -> Container {
+fn pgdata_preflight_init_container(
+    policy: PullPolicy,
+    image: &str,
+    volume: &VolumeRef,
+) -> Container {
     Container {
         name: "pgdata-preflight".to_string(),
         image: Some(image.to_string()),
+        // F3: explicit on EVERY launched container, matching the main containers.
+        image_pull_policy: image_pull_policy(policy),
         // `sh -c` over a FIXED, constants-only script (see [`PGDATA_PREFLIGHT_SCRIPT`] / the
         // [`PGDATA_PVC_ROOT_MOUNT`] doc) — no caller input reaches the shell.
         command: Some(vec![
@@ -855,6 +894,8 @@ fn chown_init_container(spec: &ComputeSpec, image: &str, volume: &VolumeRef) -> 
     Some(Container {
         name: "chown-data".to_string(),
         image: Some(image.to_string()),
+        // F3: explicit on EVERY launched container, matching the main containers.
+        image_pull_policy: image_pull_policy(spec.pull_policy),
         // Exec form — NO shell (F5): the mount path is a plain argv element, so it can carry
         // no shell metacharacter even if it were crafted. `chown` resolves on PATH; the init
         // container reuses the operand image (a stock DB image ships coreutils). The mount is
@@ -944,6 +985,9 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
     if !is_dns1123_label(&ctx.workload) {
         return Err(PlanError::InvalidName(ctx.workload.clone()));
     }
+    // F1: refuse local-image reuse under the multi-tenant posture (fail closed before any
+    // container is built), mirroring the docker backend's `local_reuse_refused` gate.
+    check_pull_policy_posture(spec.pull_policy, ctx.strict)?;
     match &spec.root {
         RootSource::Image(_) => {}
         RootSource::Tar(_) => return Err(PlanError::NonImageRoot("tar rootfs")),
@@ -1724,6 +1768,61 @@ mod tests {
         let mut never = generic_spec();
         never.pull_policy = PullPolicy::Never;
         assert_eq!(app(&never), Some("Never".to_string()));
+    }
+
+    #[test]
+    fn local_image_reuse_is_refused_under_the_multi_tenant_posture() {
+        // F1 (Security review): `if-not-present`/`never` (local-image reuse) is refused under
+        // the multi-tenant (`strict`) posture — the node image store is shared across tenants —
+        // and honored only single-tenant, mirroring the docker backend's `local_reuse_refused`.
+        for policy in [PullPolicy::IfNotPresent, PullPolicy::Never] {
+            let mut app = generic_spec();
+            app.pull_policy = policy;
+            assert!(
+                matches!(
+                    deployment_plan(&strict_ctx("web-0"), &app),
+                    Err(PlanError::MultiTenantLocalReuse)
+                ),
+                "deployment_plan must refuse {policy:?} under strict"
+            );
+            // Single-tenant (non-strict) honors it.
+            assert!(deployment_plan(&ctx("web-0"), &app).is_ok());
+
+            let mut db = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+            db.pull_policy = policy;
+            assert!(
+                matches!(
+                    managed_db_plan(&strict_ctx("pg"), &db),
+                    Err(PlanError::MultiTenantLocalReuse)
+                ),
+                "managed_db_plan must refuse {policy:?} under strict"
+            );
+        }
+        // `Always` is never a reuse — allowed under strict.
+        assert!(deployment_plan(&strict_ctx("web-0"), &generic_spec()).is_ok());
+    }
+
+    #[test]
+    fn init_containers_set_image_pull_policy_explicitly() {
+        // F3: EVERY launched container — the pre-flight guard + the chown init, not just the
+        // main `db` container — carries an explicit imagePullPolicy from the spec's policy.
+        let mut spec = managed_db_spec(ManagedDbEngine::Postgres, None, 1024, false);
+        spec.user = Some("999:999".to_string()); // so the chown-data init exists
+        spec.pull_policy = PullPolicy::IfNotPresent; // single-tenant (ctx is non-strict)
+        let plan = managed_db_plan(&ctx("pg"), &spec).unwrap();
+        let pod = plan.stateful_set.spec.unwrap().template.spec.unwrap();
+        let inits = pod.init_containers.unwrap();
+        for name in ["pgdata-preflight", "chown-data"] {
+            let c = inits
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing init container {name}"));
+            assert_eq!(
+                c.image_pull_policy.as_deref(),
+                Some("IfNotPresent"),
+                "init container {name} must carry an explicit imagePullPolicy"
+            );
+        }
     }
 
     #[test]

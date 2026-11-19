@@ -198,6 +198,16 @@ pub struct DockerBackend {
     /// (single-tenant only); off under the multi-tenant guard, so a cap-add spec is
     /// forced back to the dropped-`ALL` default.
     cap_add_allowed: bool,
+    /// Whether a spec's `pull_policy` of `IfNotPresent`/`Never` (local-image **reuse**) is
+    /// honored here. Set from the isolation posture (single-tenant only); off under the
+    /// multi-tenant guard, where it is **refused** (never silently re-pulled). Local reuse
+    /// on the daemon's **shared** image store is a cross-tenant relaxation: reusing an image
+    /// a co-tenant cached under the same `name:tag`/digest would run that image with NO
+    /// per-tenant registry-auth check (bypassing this workload's `--pull-secret` fail-closed
+    /// — the classic k8s `IfNotPresent` cross-tenant leak, which digest-pinning does not
+    /// close) and exposes mutable-tag poisoning. So it rides the single-tenant posture
+    /// exactly like [`writable_root_allowed`] / [`cap_add_allowed`].
+    local_image_reuse_allowed: bool,
     /// Wall-clock backstop for a single [`run_ephemeral`](ComputeBackend::run_ephemeral)
     /// invocation (export/import client run). Generous by default
     /// ([`EPHEMERAL_RUN_TIMEOUT`]); the operator raises it for a very large migration so
@@ -228,6 +238,7 @@ impl DockerBackend {
             data_dir: PathBuf::from("."),
             writable_root_allowed: false,
             cap_add_allowed: false,
+            local_image_reuse_allowed: false,
             ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
             redact_guest_log_secrets: true,
         })
@@ -242,6 +253,7 @@ impl DockerBackend {
             data_dir: PathBuf::from("."),
             writable_root_allowed: false,
             cap_add_allowed: false,
+            local_image_reuse_allowed: false,
             ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
             redact_guest_log_secrets: true,
         }
@@ -284,6 +296,15 @@ impl DockerBackend {
     /// keeps every capability dropped.
     pub fn with_cap_add_allowed(mut self, allowed: bool) -> Self {
         self.cap_add_allowed = allowed;
+        self
+    }
+
+    /// Allow a spec's `pull_policy` of `IfNotPresent`/`Never` (local-image reuse) to be
+    /// honored here (single-tenant posture). Off by default, so the multi-tenant guard
+    /// REFUSES a reuse policy rather than trust the shared image store (see
+    /// [`local_image_reuse_allowed`](Self::local_image_reuse_allowed)).
+    pub fn with_local_image_reuse_allowed(mut self, allowed: bool) -> Self {
+        self.local_image_reuse_allowed = allowed;
         self
     }
 
@@ -602,6 +623,16 @@ fn pull_action(policy: PullPolicy, local_present: bool) -> PullAction {
     }
 }
 
+/// F1 (Security review): whether `policy` must be **refused** given the backend posture.
+/// Local-image reuse (`IfNotPresent`/`Never`) is a cross-tenant relaxation on the daemon's
+/// SHARED image store — honored only under the single-tenant posture (`reuse_allowed`). Under
+/// the multi-tenant guard a reuse policy is refused outright (never silently downgraded to a
+/// pull), mirroring how `writable_root`/`cap_add` are gated. Pure, so the gate is unit-testable
+/// without a daemon.
+fn local_reuse_refused(policy: PullPolicy, reuse_allowed: bool) -> bool {
+    policy.allows_local_reuse() && !reuse_allowed
+}
+
 /// Map a boatramp [`RestartPolicy`] to a Docker `HostConfig.restart_policy`.
 fn restart_policy(policy: RestartPolicy) -> DockerRestartPolicy {
     let name = match policy {
@@ -791,15 +822,37 @@ impl ComputeBackend for DockerBackend {
                 ));
             }
         };
+        // F1 (Security review): local-image reuse (`IfNotPresent`/`Never`) is a cross-tenant
+        // relaxation on the daemon's SHARED image store — reusing an image a co-tenant cached
+        // under this `name:tag`/digest would run it with NO per-tenant registry-auth check
+        // (bypassing `--pull-secret` fail-closed — the classic k8s `IfNotPresent` leak, which
+        // digest-pinning does not close) and exposes mutable-tag poisoning. Honor it ONLY under
+        // the single-tenant posture; under the multi-tenant guard REFUSE outright (never a
+        // silent re-pull), mirroring how `writable_root`/`cap_add` are stripped.
+        if local_reuse_refused(spec.pull_policy, self.local_image_reuse_allowed) {
+            return Err(BackendError::Materialize(format!(
+                "pull_policy={} (local-image reuse) is refused under the multi-tenant posture: \
+                 the Docker daemon's image store is shared across tenants, so reusing a \
+                 locally-cached image would bypass this tenant's registry-auth check and expose \
+                 tag poisoning. Use pull_policy=always (re-pull every launch), or run under the \
+                 single-tenant posture where `docker load`'d local images are safe.",
+                match spec.pull_policy {
+                    PullPolicy::IfNotPresent => "if-not-present",
+                    PullPolicy::Never => "never",
+                    PullPolicy::Always => "always",
+                }
+            )));
+        }
         // Pull policy (PLAN-compute-dx #3 / `imagePullPolicy` parity). The DEFAULT
         // (`Always`) re-pulls on every materialize — the safe posture, because the Docker
         // daemon's image store is SHARED across every tenant on this node, so a mutable
         // `name:tag` in it is ambient, poisonable state. `IfNotPresent`/`Never` reuse a
         // locally-present image (a `docker load`'d tarball, a pre-pulled/pinned image) and
-        // are opt-in; reuse is sound only for a digest-pinned reference (surfaced by the
-        // set-time advisory in the server, not re-litigated here per launch). Only the
-        // non-`Always` policies consult the local store (via `inspect_image`) — `Always`
-        // never inspects, keeping the default path's behavior and cost identical to before.
+        // are opt-in (single-tenant only, gated above); reuse is sound only for a
+        // digest-pinned reference (surfaced by the set-time advisory in the server, not
+        // re-litigated here per launch). Only the non-`Always` policies consult the local
+        // store (via `inspect_image`) — `Always` never inspects, keeping the default path's
+        // behavior and cost identical to before.
         let local_present = match spec.pull_policy {
             PullPolicy::Always => false,
             PullPolicy::IfNotPresent | PullPolicy::Never => self.image_present(&reference).await,
@@ -2468,6 +2521,74 @@ mod tests {
         assert_eq!(
             pull_action(PullPolicy::Never, false),
             PullAction::FailAbsent
+        );
+    }
+
+    #[test]
+    fn local_reuse_refused_only_under_multi_tenant() {
+        // F1: a reuse policy is refused when reuse is not allowed (multi-tenant guard) and
+        // honored (not refused) when allowed (single-tenant). `Always` is never a reuse, so
+        // it is never refused under either posture.
+        assert!(local_reuse_refused(PullPolicy::IfNotPresent, false));
+        assert!(local_reuse_refused(PullPolicy::Never, false));
+        assert!(!local_reuse_refused(PullPolicy::IfNotPresent, true));
+        assert!(!local_reuse_refused(PullPolicy::Never, true));
+        assert!(!local_reuse_refused(PullPolicy::Always, false));
+        assert!(!local_reuse_refused(PullPolicy::Always, true));
+    }
+
+    #[tokio::test]
+    async fn materialize_refuses_local_reuse_under_multi_tenant_and_admits_it_single_tenant() {
+        let docker = Docker::connect_with_defaults().unwrap();
+        let spec = |policy: PullPolicy| ComputeSpec {
+            version: 1,
+            root: RootSource::Image("acme/app:local".into()),
+            kernel: String::new(),
+            kernel_cmdline: None,
+            vcpus: 1,
+            mem_mib: 128,
+            entrypoint: vec![],
+            env: Default::default(),
+            port: 0,
+            restart: RestartPolicy::Always,
+            startup_grace_secs: 30,
+            scale_to_zero: false,
+            volumes: vec![],
+            writable_root: false,
+            cap_add: vec![],
+            user: None,
+            isolation: Default::default(),
+            prefer_backend: None,
+            pull_secret: None,
+            pull_policy: policy,
+            bindings: vec![],
+            post_launch: vec![],
+        };
+
+        // Multi-tenant (reuse NOT allowed, the default): `if-not-present` is REFUSED with the
+        // posture error, before any daemon round-trip.
+        let mt = DockerBackend::with_client(docker.clone());
+        let err = mt
+            .materialize("p", "w", &spec(PullPolicy::IfNotPresent), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, BackendError::Materialize(m) if m.contains("multi-tenant posture")),
+            "expected a multi-tenant posture refusal, got {err:?}"
+        );
+
+        // Single-tenant (reuse allowed): the posture gate PASSES — `never` then reaches the
+        // local-store decision and (no daemon/image here) fails with the distinct
+        // "not present / pull_policy=never" error, proving reuse was admitted, not refused.
+        let st = DockerBackend::with_client(docker).with_local_image_reuse_allowed(true);
+        let err = st
+            .materialize("p", "w", &spec(PullPolicy::Never), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, BackendError::Materialize(m)
+                if m.contains("not present") && !m.contains("multi-tenant posture")),
+            "expected the admitted `never`-absent error, got {err:?}"
         );
     }
 

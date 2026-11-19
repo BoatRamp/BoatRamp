@@ -907,6 +907,27 @@ mod tests {
     }
 
     #[test]
+    fn default_pull_policy_is_omitted_and_does_not_change_the_spec_hash() {
+        // The default `Always` pull_policy serializes without the field, so a spec hashes
+        // identically to a pre-`pull_policy` spec (back-compat; an older server never sees
+        // the field). Mirrors the `isolation`/`pull_secret` omit-from-wire siblings.
+        let a = spec();
+        assert_eq!(a.pull_policy, PullPolicy::Always, "default is Always");
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("pull_policy"),
+            "the default pull_policy is omitted from the wire"
+        );
+
+        // A non-default policy IS recorded and changes the content hash (it is part of the
+        // workload's identity — it changes how the backend obtains the image).
+        let mut b = spec();
+        b.pull_policy = PullPolicy::IfNotPresent;
+        assert_ne!(a.id(), b.id(), "a non-default pull_policy changes the id");
+        assert!(serde_json::to_string(&b).unwrap().contains("pull_policy"));
+    }
+
+    #[test]
     fn empty_bindings_do_not_change_the_spec_hash() {
         // A spec that declares no bindings serializes without the field, so it hashes
         // identically to a pre-bindings spec (back-compat).

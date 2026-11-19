@@ -9,6 +9,28 @@ versions.
 
 ### Added
 
+- **Compute workloads can reuse a locally-loaded image via `compute set --pull-policy`
+  (`always` | `if-not-present` | `never`).** The default `always` re-pulls from the registry
+  every launch (unchanged behavior). `if-not-present` reuses an image already in the node's
+  local store — a `docker load`'d `nix dockerTools` tarball, a `k3d image import`'d image, or a
+  cached pull — and pulls only on absence; `never` requires it present already (air-gapped) and
+  fails otherwise. Honored on both the docker and Kubernetes backends (on k8s it maps to the
+  pod `imagePullPolicy`). **Local-image reuse is a single-tenant-only relaxation**: on a node
+  whose image store is shared across tenants, reusing a co-tenant-cached `name:tag`/digest would
+  bypass this tenant's registry-auth check and expose tag poisoning, so under the multi-tenant
+  posture a non-`always` policy is **refused**. Even single-tenant, reuse is sound only for a
+  digest-pinned reference (`repo@sha256:…`); a mutable-tag opt-in is accepted but warns.
+- **`compute set --port 0` declares a no-ingress worker.** A pure bus consumer / background
+  worker that listens on no port now has a first-class value: `--port 0` publishes no host port
+  and the gateway never routes to it (the docker health probe is container-run-state, so such a
+  worker still reports healthy). Documented on the flag and in the compute how-to.
+- **A `compute set` with a `blob`/`kv` binding now warns when the workload's name matches no
+  site in the project.** Such a binding resolves its namespace under the WORKLOAD name as the
+  site segment (`hblob/<project>/<workload>/…`), so a worker shares a site's store only when
+  named after that site — a misnamed worker silently uses an empty namespace of its own. The
+  advisory (and the mutable-tag pull-reuse nudge) is returned in the `PUT /api/compute/:name`
+  response and printed by the CLI, not only logged node-side.
+
 - **Silent compute placement/launch failures are now surfaced on the status plane.**
   A replica that could not be scheduled (a capacity/eligibility shortfall) or whose launch
   returned an error previously vanished from `compute status` with zero diagnostics — the blind
@@ -40,6 +62,15 @@ versions.
   control-plane role gate.
 
 ### Changed
+
+- **The Kubernetes compute backend now sets an explicit `imagePullPolicy` on every launched pod
+  container (default `Always`), from the spec's `pull_policy`.** Previously no policy was set, so
+  the kube-apiserver's tag-dependent default applied — `Always` for a `:latest` tag but
+  `IfNotPresent` for any other tag. A non-`:latest` workload that relied on that implicit
+  `IfNotPresent` (e.g. an air-gapped cluster running a pre-`image import`'d tagged image) must now
+  pass `compute set --pull-policy if-not-present` explicitly. This is the safe direction (it closes
+  the same shared-node-store cross-tenant reuse hazard the docker backend has) and brings the two
+  backends to one pull-policy model; local-image reuse is refused under the multi-tenant posture.
 
 - **A holder-bound (`cnf`) or attenuated control-plane token presented WITHOUT a proof-of-possession
   is now rejected (401) at the "any valid token" gates — protected previews and `whoami` — where it

@@ -1906,6 +1906,15 @@ async fn put_workload(
         .error_for_status()?
         .json()
         .await?;
+    // F2: surface any non-fatal set-time advisories the server returned (blob-bind
+    // site-mismatch, mutable-tag pull-reuse) on stderr — the `Project·Admin` running the CLI
+    // cannot read the node log where they are also recorded. Diagnostic → tracing (stderr),
+    // never stdout (which carries the typed result).
+    if let Some(warnings) = resp["warnings"].as_array() {
+        for w in warnings.iter().filter_map(|w| w.as_str()) {
+            tracing::warn!("{w}");
+        }
+    }
     Ok(resp["spec"].as_str().unwrap_or("").to_string())
 }
 
