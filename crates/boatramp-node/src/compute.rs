@@ -991,7 +991,7 @@ impl boatramp_core::compute::ComputeExec for NodeComputeExec {
         argv: &[String],
         stdin: Option<&[u8]>,
     ) -> Result<boatramp_core::compute::ExecOutput, boatramp_core::compute::ExecError> {
-        use boatramp_core::compute::{BackendError, ExecError, ReplicaPhase};
+        use boatramp_core::compute::{BackendError, ExecError, Readiness, ReplicaPhase};
         use boatramp_core::project::ProjectRef;
         let states = self
             .deploy
@@ -999,11 +999,20 @@ impl boatramp_core::compute::ComputeExec for NodeComputeExec {
             .await
             .map_err(|e| ExecError::Other(e.to_string()))?;
         // A running replica — prefer a healthy one, else any running (a just-launched
-        // DB may not be health-marked yet but can still accept an exec).
+        // DB may not be health-marked yet but can still accept an exec). A `LaunchFailed`
+        // marker is `phase=Running` but has NO live container (empty `backend_ref`), so it
+        // must be excluded from the fallback too — otherwise an exec against a workload whose
+        // only replica is a launch-failure marker would try to exec into a nonexistent
+        // container instead of returning the clean `NoReplica`. (Mirrors how the DNS/endpoint
+        // selectors already gate it out via `readiness`.)
+        let running = |s: &&boatramp_core::compute::ObservedInstance| {
+            s.phase == ReplicaPhase::Running
+                && !matches!(s.readiness, Readiness::LaunchFailed { .. })
+        };
         let target = states
             .iter()
-            .find(|s| s.phase == ReplicaPhase::Running && s.healthy)
-            .or_else(|| states.iter().find(|s| s.phase == ReplicaPhase::Running))
+            .find(|s| running(s) && s.healthy)
+            .or_else(|| states.iter().find(running))
             .ok_or_else(|| ExecError::NoReplica(workload.to_string()))?;
         let backend = self
             .backends
@@ -2228,6 +2237,62 @@ mod tests {
             "another backend's replica IP must not be adopted by the container backend"
         );
         assert_eq!(got.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exec_on_a_launch_failed_only_workload_returns_no_replica() {
+        use boatramp_core::compute::{
+            ComputeExec, Endpoint, ExecError, ObservedInstance, Readiness, ReplicaPhase, Scheme,
+        };
+        let store = DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        );
+        // The workload's ONLY replica is a durable launch-FAILURE marker: `phase=Running`
+        // (so the status plane surfaces it) but NO live container (empty `backend_ref`).
+        // `exec` must treat it as "nothing runnable" and return the clean `NoReplica`, NOT
+        // select it and try to exec into a nonexistent container. Regression guard: before
+        // the `LaunchFailed` exclusion, the `.or_else(find Running)` fallback picked this
+        // marker.
+        let marker = ObservedInstance {
+            handle: InstanceHandle {
+                project: "default".into(),
+                workload: "pg".into(),
+                replica: 0,
+                backend_ref: String::new(),
+            },
+            node: 1,
+            backend: "docker".into(),
+            endpoint: Endpoint {
+                scheme: Scheme::Http,
+                host: String::new(),
+                port: 0,
+            },
+            region: None,
+            healthy: false,
+            started_at: None,
+            phase: ReplicaPhase::Running,
+            readiness: Readiness::LaunchFailed {
+                reason: "launch: image pull denied".into(),
+            },
+            data_dir: None,
+            snapshot: None,
+            active_spec: None,
+        };
+        store
+            .set_replica_state(ProjectRef::new("default"), &marker)
+            .await
+            .expect("persist replica state");
+
+        let exec = NodeComputeExec::new(BTreeMap::new(), store);
+        let err = exec
+            .exec("default", "pg", &["true".to_string()], None)
+            .await
+            .expect_err("a LaunchFailed-only workload has no runnable replica");
+        assert!(
+            matches!(err, ExecError::NoReplica(ref wl) if wl == "pg"),
+            "expected NoReplica, got {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

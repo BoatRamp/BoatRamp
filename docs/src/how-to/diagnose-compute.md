@@ -26,8 +26,8 @@ boatramp compute status --output-format json
 ```
 
 ```
-PROJECT/WORKLOAD               REP  HEALTHY  ENDPOINT               PHASE       AGE  BACKEND
-acme/pg                          0  NO       10.0.0.2:5432          running     47s  container
+PROJECT/WORKLOAD               REP  HEALTHY  ENDPOINT               PHASE    READINESS         AGE  BACKEND
+acme/pg                          0  NO       10.0.0.2:5432          running  starting          47s  container
 ```
 
 `HEALTHY=NO` on a `running` replica that *has* an endpoint is the signature of
@@ -48,6 +48,32 @@ REP  ENDPOINT               REACHABLE  HEALTHY  PHASE    BACKEND
 `REACHABLE=yes` + `HEALTHY=NO` means the data plane is fine and the *control*
 plane's health record is stale — force-serve it (below). `REACHABLE=NO` points
 at a real network or launch fault; keep digging with the IP and DNS views.
+
+## Read the `READINESS` column
+
+`READINESS` is the serving/launch state, distinct from the runner-level `HEALTHY`:
+`starting` → `service_ready` → `provisioned` (usable), plus two failure states that
+carry a short reason printed in parentheses on the row:
+
+- `provision_failed` — the replica launched and answers, but a post-launch action
+  (a managed DB's provisioning DDL, or a declared `post_launch` exec) failed.
+- `launch_failed` — the backend `launch` itself errored, so **no instance ever
+  started** (an image-pull denial, no eligible node, a backend fault). Before this
+  existed, such a replica left *no* record at all — `compute status` showed "no
+  replicas" and `db status` a bare `pending`, with the real reason only in a log
+  line. Now the ordinal is shown with its reason, and the reconcile retries the
+  launch every tick until it succeeds (a success replaces the record with a fresh
+  `starting` one):
+
+```
+PROJECT/WORKLOAD               REP  HEALTHY  ENDPOINT               PHASE    READINESS         AGE  BACKEND
+acme/api                         0  NO       :0                     running  launch_failed       -  docker  (launch: image pull denied for ghcr.io/acme/api:1)
+```
+
+A placement shortfall is the sibling case: when no eligible node has capacity for a
+replica, the reconcile logs a `compute reconcile: partial` warning naming the
+unscheduled ordinal and its resource need (`not scheduled: no eligible backend with
+capacity (needs 2vcpu/512MiB)`) instead of silently dropping it.
 
 ## Find an IP collision
 

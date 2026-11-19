@@ -1227,6 +1227,13 @@ pub enum ReplicaPhase {
 /// - [`ProvisionFailed`](Readiness::ProvisionFailed) → a post-launch action failed;
 ///   surfaced (e.g. `db status`), retried on the next reconcile tick, and blocks the
 ///   gated surfaces.
+/// - [`LaunchFailed`](Readiness::LaunchFailed) → the backend `launch` itself ERRORED
+///   (image-pull denied, no node capacity accepted it, a backend fault) so no instance
+///   ever started; carries the backend error. Persisted by the reconcile as a durable
+///   marker — *without* it a failed launch left no replica state at all, so `compute
+///   status` showed "no replicas" and `db status` a bare `pending`, with the real
+///   reason living only in a transient log line (the multi-hour blind spot this closes).
+///   Retried every tick like a broken launch; always blocks the gated surfaces.
 ///
 /// *Which* surfaces require which level is configurable (the readiness-gate policy),
 /// defaulting to [`Provisioned`](Readiness::Provisioned) for all of them.
@@ -1241,6 +1248,19 @@ pub enum Readiness {
     /// A post-launch action failed; carries the reason. Retried next tick; gated.
     ProvisionFailed {
         /// Human-readable failure reason (no credential material).
+        reason: String,
+    },
+    /// The backend `launch` ERRORED — no instance ever started (e.g. an image pull was
+    /// denied, no eligible node accepted the placement, or a backend fault). Carries the
+    /// backend error message so `compute status` / `db status` surface *why* a replica is
+    /// missing instead of silently showing nothing. The reconcile persists this as a
+    /// durable marker (phase stays [`Running`](ReplicaPhase::Running) with `healthy:
+    /// false`) and retries the launch on the next tick; a successful relaunch overwrites
+    /// it with a fresh [`Starting`](Readiness::Starting) record. Always gated (never
+    /// routed): it has no live endpoint.
+    LaunchFailed {
+        /// Human-readable backend launch error (carries no credential material — the
+        /// registry-auth layer's errors name only secret refs, never values).
         reason: String,
     },
 }
@@ -1277,11 +1297,16 @@ fn readiness_provisioned_backcompat() -> Readiness {
 /// readiness signal (PLAN-managed-dependency-readiness WS4) — the shared primitive behind
 /// every readiness-polling surface (`db status`'s `database_status`, `OperatorSql::readiness`)
 /// so they report the identical, once-tested semantics instead of each re-deriving it.
-/// Most-informative-wins: a [`ProvisionFailed`](Readiness::ProvisionFailed) (with its reason)
-/// surfaces over a sibling that is merely [`Starting`](Readiness::Starting);
+/// Most-informative-wins: a FAILURE with its reason — a
+/// [`LaunchFailed`](Readiness::LaunchFailed) (the launch never started) or a
+/// [`ProvisionFailed`](Readiness::ProvisionFailed) (a post-launch action failed) — surfaces
+/// over a sibling that is merely [`Starting`](Readiness::Starting);
 /// [`Provisioned`](Readiness::Provisioned) means at least one replica is usable. `None` ⇒ no
 /// RUNNING replica recorded (not launched yet, scaled to zero, or registered under a scope the
 /// caller doesn't track) — "pending", distinct from `Starting` (launched but not yet probed).
+/// A [`LaunchFailed`](Readiness::LaunchFailed) replica IS recorded `Running` (a durable failure
+/// marker), so a launch that never started surfaces its reason here instead of looking like
+/// "pending" / "no replicas".
 pub fn reduce_readiness(states: &[ObservedInstance]) -> Option<Readiness> {
     let running: Vec<&Readiness> = states
         .iter()
@@ -1291,11 +1316,20 @@ pub fn reduce_readiness(states: &[ObservedInstance]) -> Option<Readiness> {
     if running.is_empty() {
         return None;
     }
-    if let Some(reason) = running.iter().find_map(|r| match r {
-        Readiness::ProvisionFailed { reason } => Some(reason.clone()),
-        _ => None,
-    }) {
-        return Some(Readiness::ProvisionFailed { reason });
+    // A failure (with its reason) is the most actionable signal — surface it over a
+    // merely-starting or provisioned sibling. `LaunchFailed` (the launch Err'd) takes
+    // precedence over `ProvisionFailed` (it started but post-launch failed): a workload
+    // that never came up at all is the more fundamental fault to report first.
+    if let Some(failed) = running
+        .iter()
+        .find(|r| matches!(r, Readiness::LaunchFailed { .. }))
+        .or_else(|| {
+            running
+                .iter()
+                .find(|r| matches!(r, Readiness::ProvisionFailed { .. }))
+        })
+    {
+        return Some((*failed).clone());
     }
     if running.iter().any(|r| r.is_provisioned()) {
         return Some(Readiness::Provisioned);
@@ -1505,6 +1539,35 @@ pub enum WorkloadActivity {
     Idle,
 }
 
+/// One replica the planner needed to (re)launch but could **not place** this pass — a
+/// capacity / eligibility shortfall. Surfaced by [`reconcile_plan`] (in
+/// [`ReconcilePlan::unscheduled`]) so the driver records + logs it instead of silently
+/// truncating the unplaced tail (the bug that hid a stuck workload from `compute status`
+/// with zero diagnostics for hours).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unscheduled {
+    /// Workload name.
+    pub workload: String,
+    /// The replica ordinal that got no placement.
+    pub replica: u32,
+    /// Human-readable reason (no eligible backend had capacity for the spec's needs).
+    pub reason: String,
+}
+
+/// The output of [`reconcile_plan`]: the actions the driver executes **plus** the replicas
+/// it could not place. Making the shortfall an explicit field (rather than letting the
+/// zipped-and-truncated tail vanish) is what lets the driver turn a silent placement
+/// failure into a logged, reported one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReconcilePlan {
+    /// The actions to execute against the backends, in order.
+    pub actions: Vec<Action>,
+    /// Replicas that needed a (re)launch but got no placement this pass. Empty on the
+    /// happy path; non-empty names exactly which ordinals a capacity/eligibility shortfall
+    /// left unscheduled, each with a reason.
+    pub unscheduled: Vec<Unscheduled>,
+}
+
 /// Compute the actions to converge `workload` (running `spec`) from `observed`
 /// to its desired replica count, honoring placement, the isolation requirement,
 /// and the backend `policy`. Pure: no IO, fully unit-tested.
@@ -1520,7 +1583,17 @@ pub enum WorkloadActivity {
 /// database's first `initdb`) is not killed mid-init into a crash loop. A replica with
 /// `started_at == None` (older records / restored) is treated as past-grace, preserving
 /// the prior immediate stop + relaunch. Free ordinals are placed onto eligible nodes;
-/// if capacity runs out, fewer launches are emitted.
+/// if capacity runs out, the unplaced ordinals are returned in
+/// [`ReconcilePlan::unscheduled`] (NOT silently dropped) so the driver surfaces the
+/// shortfall.
+///
+/// A replica persisted in [`Readiness::LaunchFailed`] (a durable marker for a launch that
+/// `Err`'d — see [`reconcile_once`]) is, while in range, treated as a free ordinal to
+/// **relaunch** regardless of restart policy: it never started, so it is neither "healthy"
+/// to keep nor a completed run-to-completion job to leave terminal, and nothing is Stopped
+/// for it (there is no live instance) — exactly the retry a failed launch got before it was
+/// recorded. Out of range (scaled down) it is Stopped like any replica, cleaning up the
+/// stale marker.
 ///
 /// `now` is the current wall-clock unix seconds, compared against each replica's
 /// `started_at` for the startup-grace check.
@@ -1541,7 +1614,7 @@ pub fn reconcile_plan(
     caps: &BTreeMap<String, Capabilities>,
     now: u64,
     force_recreate: &BTreeSet<u32>,
-) -> Vec<Action> {
+) -> ReconcilePlan {
     let desired = workload.replicas;
     let mut actions = Vec::new();
 
@@ -1560,6 +1633,16 @@ pub fn reconcile_plan(
         .filter(|i| i.handle.workload == workload.name)
     {
         let ord = inst.handle.replica;
+        // A durable LAUNCH-FAILURE marker (`launch` Err'd; no instance ever started — see
+        // `reconcile_once`). While in range, skip it here so it is added to NO keep/terminal
+        // set and NO Stop is emitted (there is nothing running to stop): its ordinal then
+        // lands in `need` below and is relaunched — the exact retry a failed launch had
+        // before it was recorded, and independent of restart policy (a run-to-completion job
+        // that never STARTED is not a completed one). Out of range (scaled down / deleted) it
+        // falls through to the normal out-of-range `Stop` so the stale marker is cleaned up.
+        if ord < desired && matches!(inst.readiness, Readiness::LaunchFailed { .. }) {
+            continue;
+        }
         // A REDEPLOY check: this replica was launched from a spec pointer that no
         // longer matches the workload's current `active` (an operator flipped it to a
         // new spec). It must be RECREATED (stopped here → relaunched below from the new
@@ -1647,12 +1730,19 @@ pub fn reconcile_plan(
         })
         .collect();
     if need.is_empty() {
-        return actions;
+        return ReconcilePlan {
+            actions,
+            unscheduled: Vec::new(),
+        };
     }
 
-    // Place the needed count; zip ordinals with placements (a capacity shortfall
-    // simply leaves the tail unplaced — the caller logs it).
+    // Place the needed count and zip ordinals with placements. A capacity/eligibility
+    // shortfall means `place_replicas` returns FEWER placements than `need`; the leading
+    // ordinals get their `Launch`, and — crucially — the unplaced tail is NOT silently
+    // dropped (the bug that hid a stuck workload for hours) but returned in `unscheduled`
+    // so the driver logs + reports it.
     let placements = place_replicas(need.len() as u32, &workload.placement, spec, nodes, policy);
+    let placed = placements.len();
     for (ord, place) in need.iter().zip(placements) {
         actions.push(Action::Launch {
             workload: workload.name.clone(),
@@ -1661,7 +1751,25 @@ pub fn reconcile_plan(
             backend: place.backend,
         });
     }
-    actions
+    // The ordinals past the placed count had no eligible backend with capacity. Name the
+    // resource need so the operator sees what to add (the same `need_cpu`/`need_mem` floor
+    // `place_replicas` uses).
+    let unscheduled: Vec<Unscheduled> = need[placed..]
+        .iter()
+        .map(|ord| Unscheduled {
+            workload: workload.name.clone(),
+            replica: *ord,
+            reason: format!(
+                "no eligible backend with capacity (needs {}vcpu/{}MiB)",
+                spec.vcpus.max(1),
+                spec.mem_mib.max(1)
+            ),
+        })
+        .collect();
+    ReconcilePlan {
+        actions,
+        unscheduled,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2482,6 +2590,16 @@ pub async fn reconcile_once(
                 ));
                 continue;
             }
+            // A durable launch-FAILURE marker has no live backend instance to probe:
+            // skip the health / endpoint / readiness / data-dir refresh entirely so its
+            // reason is NOT clobbered to `Starting` by `advance_readiness` (which reads
+            // `!healthy` and falls back to `Starting`). The record stays untouched — the
+            // operator sees the persisted reason on `compute status` / `db status` — and the
+            // planner below relaunches its ordinal to retry; a successful relaunch overwrites
+            // this record with a fresh `Starting` one.
+            if matches!(state.readiness, Readiness::LaunchFailed { .. }) {
+                continue;
+            }
             if let Some(backend) = backends.get(&state.backend) {
                 let mut changed = false;
                 // Auto-heal probe: a backend may report that this running replica's live
@@ -2598,7 +2716,11 @@ pub async fn reconcile_once(
             && !spec.bindings.is_empty()
         {
             for state in &observed {
-                if state.phase == ReplicaPhase::Running {
+                // A launch-failure marker is `Running` (a durable diagnostic phase) but has
+                // no live guest to bind — skip it; a successful relaunch resolves bindings.
+                if state.phase == ReplicaPhase::Running
+                    && !matches!(state.readiness, Readiness::LaunchFailed { .. })
+                {
                     resolver
                         .resolve(
                             &project_name,
@@ -2612,7 +2734,7 @@ pub async fn reconcile_once(
         }
 
         let workload_activity = activity.activity(&workload.name).await;
-        for action in reconcile_plan(
+        let plan = reconcile_plan(
             &workload,
             &spec,
             nodes,
@@ -2622,7 +2744,25 @@ pub async fn reconcile_once(
             &caps,
             crate::time::now_unix(),
             &force_recreate,
-        ) {
+        );
+        // Surface every replica the planner could NOT place (capacity/eligibility
+        // shortfall) — a structured per-ordinal `warn!` at the site AND an entry in
+        // `report.errors`, so the aggregated "compute reconcile: partial" WARN fires instead
+        // of a stuck workload silently vanishing from `compute status` with no reason.
+        for u in &plan.unscheduled {
+            tracing::warn!(
+                project = %project_name,
+                workload = %u.workload,
+                replica = u.replica,
+                reason = %u.reason,
+                "compute: replica not scheduled",
+            );
+            report.errors.push(format!(
+                "{}/{}: not scheduled: {}",
+                u.workload, u.replica, u.reason
+            ));
+        }
+        for action in plan.actions {
             match action {
                 Action::Launch {
                     workload: wl,
@@ -2692,7 +2832,53 @@ pub async fn reconcile_once(
                                 .resolve(&project_name, reference, spec.pull_secret.as_deref())
                                 .await
                             {
-                                Ok(auth) => auth,
+                                // Resolved a credential → authenticated pull.
+                                Ok(Some(auth)) => Some(auth),
+                                // No credential resolved → an ANONYMOUS pull. SCOPE the warning
+                                // to the ACTIONABLE cases so it doesn't drown in noise (a public
+                                // `docker.io/library/*` image legitimately pulls anonymously, and
+                                // a crash-looping public workload relaunches every tick):
+                                //   (a) a `pull_secret` was NAMED yet nothing resolved — an
+                                //       anomaly worth flagging (the production sealed resolver
+                                //       fails CLOSED on a named-but-missing secret via the `Err`
+                                //       arm below, so this catches a resolver that returned
+                                //       anonymous despite a named secret); OR
+                                //   (b) the image host is a NON-DEFAULT (typically private)
+                                //       registry, where an anonymous pull is far more likely a
+                                //       misconfiguration than an intentional public pull.
+                                // A bare default-registry (`docker.io`) image with no
+                                // `pull_secret` is the expected public case → `debug!`, not a
+                                // warning.
+                                Ok(None) => {
+                                    let host = crate::registry_auth::registry_host_of(reference);
+                                    let named_but_unresolved =
+                                        spec.pull_secret.as_deref().is_some_and(|s| !s.is_empty());
+                                    let non_default_host =
+                                        host != crate::registry_auth::DEFAULT_REGISTRY_HOST;
+                                    if named_but_unresolved || non_default_host {
+                                        tracing::warn!(
+                                            project = %project_name,
+                                            workload = %wl,
+                                            replica,
+                                            host = %host,
+                                            image = %reference,
+                                            pull_secret_named = named_but_unresolved,
+                                            "no registry credential resolved for image; \
+                                             attempting anonymous pull",
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            project = %project_name,
+                                            workload = %wl,
+                                            replica,
+                                            host = %host,
+                                            image = %reference,
+                                            "anonymous pull of a public default-registry image \
+                                             (no pull_secret configured)",
+                                        );
+                                    }
+                                    None
+                                }
                                 Err(e) => {
                                     report
                                         .errors
@@ -2738,7 +2924,65 @@ pub async fn reconcile_once(
                             Ok(()) => report.launched += 1,
                             Err(e) => report.errors.push(format!("{wl}/{replica}: persist: {e}")),
                         },
-                        Err(e) => report.errors.push(format!("{wl}/{replica}: launch: {e}")),
+                        Err(e) => {
+                            // The backend `launch` ERRORED — no instance started (image-pull
+                            // denied, no node accepted the placement, a backend fault). Two
+                            // things make this visible instead of a silent gap:
+                            //
+                            //  1) a structured per-failure `warn!` AT the site (project /
+                            //     workload / replica / backend / image ref / error), not just
+                            //     the aggregated "partial" line; and
+                            //  2) a DURABLE `LaunchFailed` replica record carrying the reason,
+                            //     so `compute status` shows the ordinal with its failure and
+                            //     `db status` reports `launch_failed` + reason (instead of "no
+                            //     replicas" / a bare `pending`). The planner relaunches it next
+                            //     tick (the same retry a failed launch always got); a success
+                            //     overwrites this record with a fresh `Starting` one.
+                            //
+                            // The reason is the backend error verbatim — the registry-auth layer
+                            // already sanitizes its errors to name only secret REFS (never a
+                            // credential value), and image refs / registry messages are not
+                            // secret.
+                            let reason = e.to_string();
+                            tracing::warn!(
+                                project = %project_name,
+                                workload = %wl,
+                                replica,
+                                backend = %backend,
+                                image = %spec.root.as_str(),
+                                error = %reason,
+                                "compute: replica launch failed",
+                            );
+                            let failed = ObservedInstance {
+                                handle: InstanceHandle {
+                                    project: project_name.clone(),
+                                    workload: wl.clone(),
+                                    replica,
+                                    backend_ref: String::new(),
+                                },
+                                node,
+                                backend: backend.clone(),
+                                endpoint: Endpoint {
+                                    scheme: Scheme::Http,
+                                    host: String::new(),
+                                    port: 0,
+                                },
+                                region: None,
+                                healthy: false,
+                                started_at: None,
+                                phase: ReplicaPhase::Running,
+                                readiness: Readiness::LaunchFailed { reason },
+                                data_dir: None,
+                                snapshot: None,
+                                active_spec: Some(workload.active.clone()),
+                            };
+                            report.errors.push(format!("{wl}/{replica}: launch: {e}"));
+                            if let Err(pe) = deploy.set_replica_state(project, &failed).await {
+                                report
+                                    .errors
+                                    .push(format!("{wl}/{replica}: persist launch failure: {pe}"));
+                            }
+                        }
                     }
                 }
                 Action::Stop { handle } => {
@@ -3976,6 +4220,7 @@ mod tests {
             u64::MAX,
             &BTreeSet::new(),
         )
+        .actions
     }
 
     /// A capability map advertising scale-to-zero for the `vmm` backend (the id
@@ -4016,7 +4261,8 @@ mod tests {
             &s2z_caps(),
             u64::MAX,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], Action::Snapshot { handle } if handle.replica == 0));
     }
@@ -4036,7 +4282,8 @@ mod tests {
             &BTreeMap::new(),
             u64::MAX,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert!(no_cap.is_empty(), "no capable backend: {no_cap:?}");
         // Capable backend, but the spec didn't opt in → no snapshot.
         let no_opt = reconcile_plan(
@@ -4049,7 +4296,8 @@ mod tests {
             &s2z_caps(),
             u64::MAX,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert!(no_opt.is_empty(), "not opted in: {no_opt:?}");
     }
 
@@ -4067,7 +4315,8 @@ mod tests {
             &s2z_caps(),
             u64::MAX,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert_eq!(actions.len(), 1);
         assert!(
             matches!(&actions[0], Action::Restore { snapshot, node, .. } if snapshot.replica == 0 && *node == 1)
@@ -4088,7 +4337,8 @@ mod tests {
             &s2z_caps(),
             u64::MAX,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         // Idle → no restore, and crucially no Launch (the parked ordinal is not
         // treated as a missing replica).
         assert!(
@@ -4111,7 +4361,8 @@ mod tests {
             &s2z_caps(),
             u64::MAX,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert!(
             actions
                 .iter()
@@ -4121,6 +4372,85 @@ mod tests {
             !actions.iter().any(|a| matches!(a, Action::Restore { .. })),
             "out-of-range parked replica is stopped, not restored"
         );
+    }
+
+    #[test]
+    fn unplaceable_workload_is_reported_unscheduled_not_silently_dropped() {
+        // The PRIMARY bug: with no node able to place the replica, the planner used to zip
+        // `need` against an empty placement list and silently drop the tail — the workload
+        // then vanished from `compute status` with zero diagnostics. The fix surfaces the
+        // unplaced ordinal in `ReconcilePlan::unscheduled` (so the driver logs + reports it).
+        // Mutating the fix to drop the `unscheduled` tail turns this RED.
+        let nodes: Vec<Node> = vec![];
+        let plan = reconcile_plan(
+            &workload(1, Default::default()),
+            &spec(2, 512),
+            &nodes,
+            &BackendPolicy::default(),
+            &[],
+            WorkloadActivity::Active,
+            &BTreeMap::new(),
+            u64::MAX,
+            &BTreeSet::new(),
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Launch { .. })),
+            "no capacity ⇒ no Launch emitted: {:?}",
+            plan.actions
+        );
+        assert_eq!(
+            plan.unscheduled.len(),
+            1,
+            "the unplaced ordinal must be surfaced, not silently dropped: {:?}",
+            plan.unscheduled
+        );
+        let u = &plan.unscheduled[0];
+        assert_eq!(u.replica, 0);
+        assert!(
+            u.reason.contains("no eligible backend with capacity"),
+            "names the shortfall: {}",
+            u.reason
+        );
+        assert!(
+            u.reason.contains("2vcpu/512MiB"),
+            "names the resource need so the operator sees what to add: {}",
+            u.reason
+        );
+    }
+
+    #[test]
+    fn partial_placement_launches_what_fits_and_reports_the_rest() {
+        // One node with room for exactly ONE replica of a 2-vcpu spec; the workload wants 2.
+        // The head still launches; the unplaced tail is REPORTED (not dropped) so a partial
+        // scale-up is visible rather than a quietly-short replica set.
+        let nodes = vec![vmm(1, "eu", 2, 4096)];
+        let plan = reconcile_plan(
+            &workload(2, Default::default()),
+            &spec(2, 512),
+            &nodes,
+            &BackendPolicy::default(),
+            &[],
+            WorkloadActivity::Active,
+            &BTreeMap::new(),
+            u64::MAX,
+            &BTreeSet::new(),
+        );
+        let launches = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Launch { .. }))
+            .count();
+        assert_eq!(launches, 1, "exactly one replica fits: {:?}", plan.actions);
+        assert_eq!(
+            plan.unscheduled.len(),
+            1,
+            "the second replica is reported unscheduled: {:?}",
+            plan.unscheduled
+        );
+        assert_eq!(plan.unscheduled[0].replica, 1);
     }
 
     #[test]
@@ -4282,7 +4612,8 @@ mod tests {
             &BTreeMap::new(),
             u64::MAX,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert!(none.is_empty(), "no force flag → no-op: {none:?}");
         // Ordinal 0 flagged → recreate (Stop + relaunch).
         let forced = reconcile_plan(
@@ -4295,7 +4626,8 @@ mod tests {
             &BTreeMap::new(),
             u64::MAX,
             &BTreeSet::from([0u32]),
-        );
+        )
+        .actions;
         assert!(
             forced
                 .iter()
@@ -4385,7 +4717,8 @@ mod tests {
             &BTreeMap::new(),
             now,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         // Mid-init: neither stopped nor relaunched (it counts toward `desired`).
         assert!(
             actions.is_empty(),
@@ -4411,7 +4744,8 @@ mod tests {
             &BTreeMap::new(),
             now,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert!(
             actions
                 .iter()
@@ -4444,7 +4778,8 @@ mod tests {
             &BTreeMap::new(),
             1_000_000,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert!(
             actions
                 .iter()
@@ -4476,7 +4811,8 @@ mod tests {
             &BTreeMap::new(),
             now,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Launch { .. })),
             "a starting replica fills its ordinal — no duplicate Launch: {actions:?}"
@@ -4860,7 +5196,8 @@ mod tests {
             &caps,
             past_grace,
             &BTreeSet::new(),
-        );
+        )
+        .actions;
         assert!(
             actions
                 .iter()
@@ -5117,6 +5454,151 @@ mod tests {
         assert_eq!(woken[0].phase, ReplicaPhase::Running);
         assert!(woken[0].snapshot.is_none());
         assert!(woken[0].healthy);
+    }
+
+    /// A backend that PLACES fine but whose `launch` always ERRORS (an image-pull denial),
+    /// so no instance ever starts — the shape behind the live incident's silent gap.
+    struct FailingLaunchBackend;
+
+    #[async_trait]
+    impl ComputeBackend for FailingLaunchBackend {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: false,
+                persistent_volumes: false,
+                max_vcpus: None,
+                max_mem_mib: None,
+            }
+        }
+        async fn materialize(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _spec: &ComputeSpec,
+            _pull_auth: Option<&RegistryAuth>,
+        ) -> Result<Artifact, BackendError> {
+            Ok(Artifact::Image {
+                reference: "img:latest".into(),
+            })
+        }
+        async fn launch(&self, _req: &LaunchRequest) -> Result<Instance, BackendError> {
+            Err(BackendError::Launch(
+                "image pull denied for ghcr.io/acme/app:1".into(),
+            ))
+        }
+        async fn stop(&self, _handle: &InstanceHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn health(&self, _handle: &InstanceHandle) -> Result<Health, BackendError> {
+            Ok(Health::Unhealthy)
+        }
+    }
+
+    /// Item 2: a launch that `Err`s must persist a DURABLE `LaunchFailed` replica carrying the
+    /// reason — so `compute status` shows the ordinal with its failure and `db status`'s
+    /// `reduce_readiness` reports `launch_failed` (instead of "no replicas" / a bare
+    /// `pending`), and the failure is retried every tick without duplicating or vanishing.
+    #[tokio::test]
+    async fn failed_launch_persists_a_durable_launch_failed_record_and_retries() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        let hash = deploy.put_compute_spec(&spec(1, 128)).await.unwrap();
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash,
+                    replicas: 1,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(FailingLaunchBackend));
+        let nodes = vec![fake_node()];
+        let policy = BackendPolicy::default();
+
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &FixedActivity(WorkloadActivity::Active),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.launched, 0, "launch Err'd, nothing launched");
+        assert!(
+            r.errors.iter().any(|e| e.contains("launch:")),
+            "the launch error is reported: {:?}",
+            r.errors
+        );
+
+        // A durable record exists for the ordinal — NOT a silent gap.
+        let states = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        assert_eq!(
+            states.len(),
+            1,
+            "the failed ordinal is persisted, not dropped"
+        );
+        assert_eq!(states[0].phase, ReplicaPhase::Running);
+        assert!(!states[0].healthy);
+        match &states[0].readiness {
+            Readiness::LaunchFailed { reason } => {
+                assert!(
+                    reason.contains("image pull denied"),
+                    "carries the backend reason: {reason}"
+                );
+            }
+            other => panic!("expected LaunchFailed, got {other:?}"),
+        }
+        // `db status` / `OperatorSql::readiness` read through `reduce_readiness`: it must
+        // surface the failure (with its reason) rather than look "pending"/"starting".
+        match reduce_readiness(&states) {
+            Some(Readiness::LaunchFailed { reason }) => {
+                assert!(reason.contains("image pull denied"), "{reason}");
+            }
+            other => panic!("reduce_readiness should surface LaunchFailed, got {other:?}"),
+        }
+
+        // Next tick: the backend still fails. The marker is retried (relaunch attempted) and
+        // re-persisted — still exactly ONE record, still LaunchFailed (no duplication, no
+        // clobber to `Starting` by the observe-loop's readiness refresh).
+        let r2 = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &FixedActivity(WorkloadActivity::Active),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r2.launched, 0);
+        let states = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        assert_eq!(states.len(), 1, "retry does not duplicate the record");
+        assert!(
+            matches!(states[0].readiness, Readiness::LaunchFailed { .. }),
+            "the durable reason survives the observe-loop refresh: {:?}",
+            states[0].readiness
+        );
     }
 
     /// A backend whose running replica's live endpoint DRIFTS out from under the stored
