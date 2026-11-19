@@ -1146,12 +1146,111 @@ pub struct Placement {
     pub backend: String,
 }
 
-/// Place `count` replicas of `spec` (subject to `placement` + `policy`) across
-/// `nodes`. Eligibility = satisfies the placement constraints, currently fits
-/// the spec's CPU/mem, **and** offers a policy-allowed backend whose isolation
-/// satisfies the spec. Worst-fit (most-free node first) spreads load; capacity is
-/// decremented per placement. Returns fewer than `count` when capacity/eligible
-/// backends run out (the caller surfaces "insufficient capacity").
+/// A `(vCPU, memory-MiB)` resource amount — either a node's **remaining** schedulable
+/// capacity or the reservation a replica holds against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reservation {
+    /// vCPUs.
+    pub vcpus: u32,
+    /// Memory in MiB.
+    pub mem_mib: u32,
+}
+
+impl Reservation {
+    /// The reservation `spec` holds — its declared vCPU/memory, floored at 1 each so an
+    /// unspecified (`0`) dimension still occupies a slot, matching the placement fit check.
+    fn of_spec(spec: &ComputeSpec) -> Self {
+        Self {
+            vcpus: spec.vcpus.max(1),
+            mem_mib: spec.mem_mib.max(1),
+        }
+    }
+}
+
+/// Conservative reservation charged against a node for a **running** replica whose
+/// reservation cannot be resolved — neither its own launched spec (`active_spec`) nor its
+/// workload's current active spec is retrievable. Counting such a replica as **zero** would
+/// overstate the node's free capacity and re-open the very over-subscription cumulative
+/// bin-packing prevents, so the pre-pass charges this non-trivial floor (1 vCPU + 1 GiB —
+/// one typical small workload, matching the node inventory's default memory floor) and
+/// surfaces the replica in the reconcile report. It is a last resort: a legacy record's
+/// `active_spec` is backfilled to the workload's active spec on observation, and a live
+/// workload's active spec resolves — so it bites only a genuinely orphaned replica whose
+/// spec blob is gone. Tunable should an operator's unresolved replicas run materially larger.
+const UNRESOLVED_RESERVATION: Reservation = Reservation {
+    vcpus: 1,
+    mem_mib: 1024,
+};
+
+/// Per-node **remaining** schedulable capacity for a single reconcile pass, threaded
+/// (mutable) across the pass's per-workload placement loop so that cumulative placements of
+/// **different** workloads can no longer over-subscribe one node — true cumulative
+/// bin-packing. Seeded from each node's advertised free vCPUs/memory
+/// ([`advertised`](Self::advertised)), then debited by the reservations of every already-
+/// running replica (the reconcile pre-pass) and by each new placement
+/// ([`place_replicas_in`]).
+///
+/// The previous scheduler read each node's *advertised* figure fresh for every workload and
+/// decremented only a throwaway copy, so N workloads that each fit a node alone could
+/// collectively exceed it (each saw the full node). This type is the shared ledger that
+/// closes that gap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeCapacities {
+    remaining: BTreeMap<u64, Reservation>,
+}
+
+impl NodeCapacities {
+    /// Seed remaining capacity from each node's **advertised** free vCPUs/memory. No replica
+    /// reservations are debited yet — the reconcile pre-pass does that via [`reserve`](Self::reserve).
+    pub fn advertised(nodes: &[Node]) -> Self {
+        Self {
+            remaining: nodes
+                .iter()
+                .map(|n| {
+                    (
+                        n.id,
+                        Reservation {
+                            vcpus: n.free_vcpus,
+                            mem_mib: n.free_mem_mib,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Remaining capacity on `node` (zero for an unknown node — never a placement target).
+    fn get(&self, node: u64) -> Reservation {
+        self.remaining.get(&node).copied().unwrap_or_default()
+    }
+
+    /// Whether `node` currently has room for `res`.
+    fn fits(&self, node: u64, res: Reservation) -> bool {
+        let have = self.get(node);
+        have.vcpus >= res.vcpus && have.mem_mib >= res.mem_mib
+    }
+
+    /// Debit `res` from `node`'s remaining capacity (**saturating** at zero, so a node that a
+    /// prior over-subscription already over-committed never underflows into a huge free
+    /// figure). A node absent from the ledger is ignored — it is not a placement target.
+    pub fn reserve(&mut self, node: u64, res: Reservation) {
+        if let Some(r) = self.remaining.get_mut(&node) {
+            r.vcpus = r.vcpus.saturating_sub(res.vcpus);
+            r.mem_mib = r.mem_mib.saturating_sub(res.mem_mib);
+        }
+    }
+}
+
+/// Place `count` replicas of `spec` (subject to `placement` + `policy`) across `nodes`.
+/// Eligibility = satisfies the placement constraints, currently fits the spec's CPU/mem,
+/// **and** offers a policy-allowed backend whose isolation satisfies the spec. Worst-fit
+/// (most-free node first) spreads load; capacity is decremented per placement. Returns fewer
+/// than `count` when capacity/eligible backends run out (the caller surfaces the shortfall).
+///
+/// This is the single-call convenience wrapper: it starts from each node's advertised free
+/// capacity afresh, so it does **not** account for replicas already running or for other
+/// workloads placed this pass. The reconcile loop instead uses [`place_replicas_in`] with a
+/// shared, pre-debited [`NodeCapacities`] to get true cumulative bin-packing.
 pub fn place_replicas(
     count: u32,
     placement: &PlacementConstraints,
@@ -1159,37 +1258,63 @@ pub fn place_replicas(
     nodes: &[Node],
     policy: &BackendPolicy,
 ) -> Vec<Placement> {
-    let need_cpu = spec.vcpus.max(1);
-    let need_mem = spec.mem_mib.max(1);
+    let mut capacity = NodeCapacities::advertised(nodes);
+    place_replicas_in(count, placement, spec, nodes, policy, &mut capacity)
+}
 
-    // Working copy: (id, free_cpu, free_mem, the node) for placement-eligible nodes.
-    let mut free: Vec<(u64, u32, u32, &Node)> = nodes
+/// Place `count` replicas of `spec` against the **shared** remaining-capacity ledger
+/// `capacity`, debiting each placement from it so later placements (of this or any later
+/// workload in the same reconcile pass) see the reduced capacity — the core of cumulative
+/// bin-packing. Eligibility and worst-fit spread are as [`place_replicas`]; the only
+/// difference is that remaining capacity is read from, and written back to, `capacity`
+/// rather than a throwaway copy of each node's advertised figure.
+///
+/// Worst-fit picks the node with the most remaining vCPUs (then memory); ties are broken by
+/// **lowest node id**, so placement is deterministic and independent of the membership
+/// slice's order — a workload that can't fit everywhere lands on the same node across
+/// reconciles and doesn't flap.
+pub fn place_replicas_in(
+    count: u32,
+    placement: &PlacementConstraints,
+    spec: &ComputeSpec,
+    nodes: &[Node],
+    policy: &BackendPolicy,
+    capacity: &mut NodeCapacities,
+) -> Vec<Placement> {
+    let need = Reservation::of_spec(spec);
+
+    // Placement-eligible nodes (region/label constraints), kept in membership order; the
+    // per-node remaining capacity is read from (and debited to) the shared `capacity`.
+    let eligible: Vec<&Node> = nodes
         .iter()
         .filter(|n| placement.allows(n.region.as_deref(), &n.labels))
-        .map(|n| (n.id, n.free_vcpus, n.free_mem_mib, n))
         .collect();
 
     let mut placements = Vec::new();
     for _ in 0..count {
-        // Worst-fit among nodes that fit AND have an eligible backend.
-        let pick = free
-            .iter_mut()
-            .filter(|(_, c, m, n)| {
-                *c >= need_cpu && *m >= need_mem && n.pick_backend(spec, policy).is_some()
-            })
-            .max_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+        // Worst-fit among nodes that currently fit `need` AND offer an eligible backend:
+        // most-remaining-vCPU first, then memory, then lowest id (deterministic tie-break).
+        let pick = eligible
+            .iter()
+            .filter(|n| capacity.fits(n.id, need) && n.pick_backend(spec, policy).is_some())
+            .max_by(|a, b| {
+                let (ra, rb) = (capacity.get(a.id), capacity.get(b.id));
+                ra.vcpus
+                    .cmp(&rb.vcpus)
+                    .then(ra.mem_mib.cmp(&rb.mem_mib))
+                    // Lower id wins the tie: make it compare as the greater element.
+                    .then(b.id.cmp(&a.id))
+            });
         match pick {
-            Some(slot) => {
-                let backend = slot
-                    .3
+            Some(node) => {
+                let backend = node
                     .pick_backend(spec, policy)
                     .expect("filtered to nodes with an eligible backend");
                 placements.push(Placement {
-                    node: slot.0,
+                    node: node.id,
                     backend,
                 });
-                slot.1 -= need_cpu;
-                slot.2 -= need_mem;
+                capacity.reserve(node.id, need);
             }
             None => break, // no node can fit another eligible replica
         }
@@ -1603,6 +1728,12 @@ pub struct ReconcilePlan {
 /// [`needs_redeploy`](ComputeBackend::needs_redeploy) auto-heal signal (e.g. a docker
 /// container stuck on the wrong PRIMARY network). Such a replica is stopped and relaunched
 /// exactly like a spec-changed one. Empty ⇒ the recreate trigger is the spec pointer alone.
+///
+/// This convenience form sizes placement from each node's **advertised** free capacity
+/// afresh (so it sees neither already-running replicas nor other workloads reconciled this
+/// pass). The reconcile loop instead calls [`reconcile_plan_in`] with a shared, pre-debited
+/// [`NodeCapacities`] ledger so cumulative placement across workloads can't over-subscribe a
+/// node.
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile_plan(
     workload: &ComputeWorkload,
@@ -1614,6 +1745,42 @@ pub fn reconcile_plan(
     caps: &BTreeMap<String, Capabilities>,
     now: u64,
     force_recreate: &BTreeSet<u32>,
+) -> ReconcilePlan {
+    let mut capacity = NodeCapacities::advertised(nodes);
+    reconcile_plan_in(
+        workload,
+        spec,
+        nodes,
+        policy,
+        observed,
+        activity,
+        caps,
+        now,
+        force_recreate,
+        &mut capacity,
+    )
+}
+
+/// [`reconcile_plan`], but placing new replicas against the **shared** remaining-capacity
+/// ledger `capacity` (debiting each launch from it) instead of each node's advertised figure.
+/// The reconcile loop seeds one ledger per pass — advertised capacity minus every running
+/// replica's reservation — and threads it through this call for every workload, so a
+/// workload placed earlier in the pass reduces the capacity a later workload sees. Every
+/// classification/redeploy/scale-to-zero rule is identical to [`reconcile_plan`] (including the
+/// [`ReconcilePlan::unscheduled`] surfacing of a capacity/eligibility shortfall); only the
+/// placement capacity source differs.
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_plan_in(
+    workload: &ComputeWorkload,
+    spec: &ComputeSpec,
+    nodes: &[Node],
+    policy: &BackendPolicy,
+    observed: &[ObservedInstance],
+    activity: WorkloadActivity,
+    caps: &BTreeMap<String, Capabilities>,
+    now: u64,
+    force_recreate: &BTreeSet<u32>,
+    capacity: &mut NodeCapacities,
 ) -> ReconcilePlan {
     let desired = workload.replicas;
     let mut actions = Vec::new();
@@ -1736,12 +1903,21 @@ pub fn reconcile_plan(
         };
     }
 
-    // Place the needed count and zip ordinals with placements. A capacity/eligibility
-    // shortfall means `place_replicas` returns FEWER placements than `need`; the leading
-    // ordinals get their `Launch`, and — crucially — the unplaced tail is NOT silently
-    // dropped (the bug that hid a stuck workload for hours) but returned in `unscheduled`
-    // so the driver logs + reports it.
-    let placements = place_replicas(need.len() as u32, &workload.placement, spec, nodes, policy);
+    // Place the needed count against the SHARED remaining-capacity ledger, then zip ordinals
+    // with placements. The two features compose here: `place_replicas_in` consults (and debits)
+    // the cumulative ledger, so when the ledger can't fit a replica — a genuine over-subscription
+    // / capacity shortfall across workloads — it returns FEWER placements than `need`. The
+    // leading ordinals get their `Launch` (each debiting `capacity` so a later workload this pass
+    // sees the reduced node), and the unplaced tail is NOT silently dropped (the bug that hid a
+    // stuck workload for hours) but returned in `unscheduled` so the driver logs + reports it.
+    let placements = place_replicas_in(
+        need.len() as u32,
+        &workload.placement,
+        spec,
+        nodes,
+        policy,
+        capacity,
+    );
     let placed = placements.len();
     for (ord, place) in need.iter().zip(placements) {
         actions.push(Action::Launch {
@@ -2562,9 +2738,55 @@ pub async fn reconcile_once(
     // its IP reserved for the wake, so the post-loop pool-vs-reality GC (A2) must never
     // reclaim it — it feeds this set to each backend's `gc_ip_pool`.
     let mut parked_keys: Vec<(String, String, u32)> = Vec::new();
-    // Fan out over every project's workloads (compute is project-scoped in 0.2.0).
+
+    // Every project's workloads (compute is project-scoped in 0.2.0), fetched once.
+    let mut workloads = deploy.list_compute_workloads_all().await?;
+    // DETERMINISTIC placement order. With one shared capacity ledger (below) the order in
+    // which workloads consume contended capacity is observable, so sort by (project,
+    // workload name) — a total order that is stable across reconciles and independent of the
+    // store's iteration order. A workload that doesn't fit when capacity is tight stays
+    // unplaced on the same stable basis each tick (it doesn't flap), and freed capacity is
+    // handed to the earliest such workload in this order.
+    workloads.sort_by(|(pa, wa), (pb, wb)| pa.cmp(pb).then_with(|| wa.name.cmp(&wb.name)));
+
+    // BIN-PACKING PRE-PASS. Seed one shared remaining-capacity ledger for the whole pass:
+    // each node's advertised free capacity MINUS the reservation of every currently-running
+    // replica (across all projects/workloads). Threaded (mutable) through every workload's
+    // `reconcile_plan_in` below, so cumulative placement can no longer over-subscribe a node
+    // — the bug where each workload saw the node's full advertised capacity, so N workloads
+    // that each fit alone could collectively exceed it. The reservations are resolved by spec
+    // hash (cached) with a fail-safe floor for an unresolvable one (`running_replica_reservation`).
+    let mut capacity = NodeCapacities::advertised(nodes);
+    {
+        // Resolved reservation per spec content-hash (or confirmed-missing), cached across the
+        // pre-pass so a workload's many replicas (same `active_spec`) don't each re-fetch.
+        let mut spec_res_cache: BTreeMap<String, Option<Reservation>> = BTreeMap::new();
+        for (project_name, workload) in &workloads {
+            let project = ProjectRef::new(project_name);
+            // The workload's current active spec — the fallback reservation for a running
+            // replica whose OWN launched spec can't be resolved.
+            let workload_spec = deploy.get_compute_spec(&workload.active).await?;
+            for state in deploy.list_replica_states(project, &workload.name).await? {
+                // Only a RUNNING replica occupies vCPU/memory; a Zero (parked) or terminal
+                // one holds none (its reserved IP is tracked separately via `parked_keys`).
+                if state.phase != ReplicaPhase::Running {
+                    continue;
+                }
+                let res = running_replica_reservation(
+                    deploy,
+                    &mut spec_res_cache,
+                    &state,
+                    workload_spec.as_ref(),
+                    &mut report,
+                )
+                .await?;
+                capacity.reserve(state.node, res);
+            }
+        }
+    }
+
     // The owning project threads through every replica-state read/write below.
-    for (project_name, workload) in deploy.list_compute_workloads_all().await? {
+    for (project_name, workload) in workloads {
         let project = ProjectRef::new(&project_name);
         let Some(spec) = deploy.get_compute_spec(&workload.active).await? else {
             report
@@ -2734,7 +2956,7 @@ pub async fn reconcile_once(
         }
 
         let workload_activity = activity.activity(&workload.name).await;
-        let plan = reconcile_plan(
+        let plan = reconcile_plan_in(
             &workload,
             &spec,
             nodes,
@@ -2744,11 +2966,13 @@ pub async fn reconcile_once(
             &caps,
             crate::time::now_unix(),
             &force_recreate,
+            &mut capacity,
         );
         // Surface every replica the planner could NOT place (capacity/eligibility
-        // shortfall) — a structured per-ordinal `warn!` at the site AND an entry in
-        // `report.errors`, so the aggregated "compute reconcile: partial" WARN fires instead
-        // of a stuck workload silently vanishing from `compute status` with no reason.
+        // shortfall — including a cumulative-ledger over-subscription rejection) — a structured
+        // per-ordinal `warn!` at the site AND an entry in `report.errors`, so the aggregated
+        // "compute reconcile: partial" WARN fires instead of a stuck workload silently
+        // vanishing from `compute status` with no reason.
         for u in &plan.unscheduled {
             tracing::warn!(
                 project = %project_name,
@@ -3160,6 +3384,62 @@ pub async fn reconcile_once(
     }
 
     Ok(report)
+}
+
+/// The resource reservation to charge a **running** replica against its node in the
+/// cumulative bin-packing pre-pass ([`reconcile_once`]). Resolution order:
+///
+/// 1. the replica's OWN launched spec, keyed by its `active_spec` content hash and cached
+///    (resolved or confirmed-missing) so a workload's many replicas don't each re-fetch;
+/// 2. the workload's current active spec — a same-workload proxy, and for a stale replica
+///    about to be recreated, exactly the sizing it will take on;
+/// 3. the conservative [`UNRESOLVED_RESERVATION`] floor, with the replica surfaced in the
+///    report.
+///
+/// **Fail-safe:** an unresolvable replica is never charged ZERO — that would overstate the
+/// node's free capacity and re-open the over-subscription this pass exists to prevent. A
+/// legacy record's `active_spec` is backfilled to the workload's active spec on observation
+/// and a live workload's active spec resolves, so the floor bites only a genuinely orphaned
+/// replica whose spec blob is gone.
+async fn running_replica_reservation(
+    deploy: &DeployStore,
+    cache: &mut BTreeMap<String, Option<Reservation>>,
+    state: &ObservedInstance,
+    workload_spec: Option<&ComputeSpec>,
+    report: &mut ReconcileReport,
+) -> Result<Reservation, crate::error::DeployError> {
+    // 1) The replica's own launched spec, by content hash (cached: resolved or missing).
+    if let Some(hash) = state.active_spec.as_deref() {
+        let resolved = match cache.get(hash) {
+            Some(cached) => *cached,
+            None => {
+                let r = deploy
+                    .get_compute_spec(hash)
+                    .await?
+                    .map(|s| Reservation::of_spec(&s));
+                cache.insert(hash.to_string(), r);
+                r
+            }
+        };
+        if let Some(r) = resolved {
+            return Ok(r);
+        }
+    }
+    // 2) Fall back to the workload's current active spec (best same-workload proxy).
+    if let Some(spec) = workload_spec {
+        return Ok(Reservation::of_spec(spec));
+    }
+    // 3) FAIL-SAFE: neither resolves — charge a conservative floor, never zero, and surface it.
+    report.errors.push(format!(
+        "{}/{}: bin-packing: cannot resolve reservation (launched spec {} and workload active \
+         spec both missing); charging conservative {}MiB/{}vCPU floor to avoid over-subscription",
+        state.handle.workload,
+        state.handle.replica,
+        state.active_spec.as_deref().unwrap_or("<none>"),
+        UNRESOLVED_RESERVATION.mem_mib,
+        UNRESOLVED_RESERVATION.vcpus,
+    ));
+    Ok(UNRESOLVED_RESERVATION)
 }
 
 /// Whether the reconcile should run the **read-only** data-dir-ownership diagnosis for a
@@ -5859,6 +6139,234 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Place a workload (desired `replicas` of a `mem_mib`-sized spec) in `deploy`, returning
+    /// its stored spec hash. 1 vCPU each so memory is the binding constraint.
+    async fn put_workload(deploy: &DeployStore, name: &str, mem_mib: u32, replicas: u32) -> String {
+        let hash = deploy.put_compute_spec(&spec(1, mem_mib)).await.unwrap();
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: name.into(),
+                    active: hash.clone(),
+                    replicas,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        hash
+    }
+
+    /// Cumulative bin-packing: two workloads that EACH fit the node alone but NOT together
+    /// must not over-subscribe it. The node advertises 8192 MiB; each workload's single
+    /// replica wants 5000 MiB (fits alone; 10000 together does not). The old scheduler sized
+    /// every workload against the node's FULL advertised capacity afresh, so both launched
+    /// and over-packed the node. With the shared pre-debited ledger, the first (by the
+    /// deterministic (project, name) order) places and the second is left UNSCHEDULED.
+    #[tokio::test]
+    async fn cumulative_binpack_second_workload_is_not_over_subscribed() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        // Names chosen so "alpha" sorts before "beta" — alpha is the one that should place.
+        put_workload(&deploy, "alpha", 5000, 1).await;
+        put_workload(&deploy, "beta", 5000, 1).await;
+        let nodes = vec![fake_node()]; // 8 vCPU / 8192 MiB
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(FakeBackend));
+        let policy = BackendPolicy::default();
+
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Exactly ONE replica launched — not two (that would be the over-subscription bug).
+        assert_eq!(
+            r.launched, 1,
+            "only the first workload fits; {:?}",
+            r.errors
+        );
+        assert!(r.errors.is_empty(), "no spurious errors: {:?}", r.errors);
+        let alpha = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "alpha")
+            .await
+            .unwrap();
+        let beta = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "beta")
+            .await
+            .unwrap();
+        assert_eq!(alpha.len(), 1, "alpha (sorted first) places");
+        assert_eq!(
+            beta.len(),
+            0,
+            "beta is unscheduled, not over-packed onto a full node"
+        );
+    }
+
+    /// Freed capacity lets a previously-unschedulable workload place. After alpha is scaled
+    /// to zero its reservation is still charged for the pass that STOPS it (the conservative,
+    /// never-over-subscribe pre-pass counts every currently-running replica), so beta places
+    /// the tick AFTER alpha's replica is actually gone — the safe one-tick lag.
+    #[tokio::test]
+    async fn cumulative_binpack_frees_capacity_for_a_pending_workload() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        let alpha_hash = put_workload(&deploy, "alpha", 5000, 1).await;
+        put_workload(&deploy, "beta", 5000, 1).await;
+        let nodes = vec![fake_node()];
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(FakeBackend));
+        let policy = BackendPolicy::default();
+        let run = async || {
+            reconcile_once(
+                &deploy,
+                &backends,
+                &nodes,
+                &policy,
+                &AlwaysActive,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        };
+        let beta_count = async || {
+            deploy
+                .list_replica_states(crate::project::ProjectRef::DEFAULT, "beta")
+                .await
+                .unwrap()
+                .len()
+        };
+
+        // Pass 1: alpha places, beta can't (node full).
+        let r1 = run().await;
+        assert_eq!(r1.launched, 1);
+        assert_eq!(
+            beta_count().await,
+            0,
+            "beta blocked while alpha holds the node"
+        );
+
+        // Scale alpha to zero → free its capacity.
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "alpha".into(),
+                    active: alpha_hash,
+                    replicas: 0,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Pass 2: alpha's replica is STOPPED; its reservation is still charged this pass, so
+        // beta is still blocked (the conservative, never-over-subscribe lag).
+        let r2 = run().await;
+        assert_eq!(r2.stopped, 1, "alpha's replica is stopped: {:?}", r2.errors);
+        assert_eq!(r2.launched, 0);
+        assert_eq!(
+            beta_count().await,
+            0,
+            "beta still waits the tick alpha frees capacity"
+        );
+
+        // Pass 3: alpha is gone from the node → beta places on the freed capacity.
+        let r3 = run().await;
+        assert_eq!(
+            r3.launched, 1,
+            "beta places once alpha's capacity is free: {:?}",
+            r3.errors
+        );
+        assert_eq!(beta_count().await, 1);
+    }
+
+    /// Fail-safe: a RUNNING replica whose spec cannot be resolved — its `active_spec` points at
+    /// a missing blob AND its workload has no active spec either — must NOT be charged ZERO,
+    /// which would overstate free capacity and re-open over-subscription. The pre-pass charges
+    /// the conservative [`UNRESOLVED_RESERVATION`] floor (1024 MiB) and surfaces the replica.
+    /// A pending 7500-MiB workload then does NOT fit (8192 − 1024 = 7168 free), whereas a zero
+    /// charge (8192 free) would have wrongly admitted it — so this asserts the floor is applied.
+    #[tokio::test]
+    async fn cumulative_binpack_unresolvable_replica_charges_conservative_floor() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        // A workload with NO stored active spec (dangling pointer) + a running replica whose
+        // own active_spec also dangles → neither resolves → the conservative floor applies.
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "ghost".into(),
+                    active: "missing-spec-hash".into(),
+                    replicas: 1,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut running = observed("ghost", 0, 1, true);
+        running.backend = "fake".into();
+        running.active_spec = Some("also-missing".into());
+        deploy
+            .set_replica_state(crate::project::ProjectRef::DEFAULT, &running)
+            .await
+            .unwrap();
+        // A pending workload wanting 7500 MiB — placeable ONLY if the ghost replica were
+        // (wrongly) charged zero (8192 free). With the 1024 floor only 7168 is free, so it
+        // must stay unscheduled. ("aaa_pending" sorts before "ghost".)
+        put_workload(&deploy, "aaa_pending", 7500, 1).await;
+
+        let nodes = vec![fake_node()]; // 8192 MiB; floor charges 1024 → 7168 free.
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(FakeBackend));
+        let policy = BackendPolicy::default();
+
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The floor denied the pending workload the capacity a zero charge would have freed.
+        let pending = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "aaa_pending")
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            0,
+            "pending workload stays unscheduled — the unresolvable replica was not charged zero"
+        );
+        assert_eq!(r.launched, 0);
+        // The unresolvable replica is surfaced (not silently floored).
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("cannot resolve reservation")),
+            "the unresolvable reservation is surfaced: {:?}",
+            r.errors
         );
     }
 
