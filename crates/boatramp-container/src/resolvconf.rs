@@ -51,10 +51,34 @@ pub fn render(gateway: Ipv4Addr, project: &str, domain: &str) -> String {
 /// one pointing at a public resolver — we replace it so the guest uses boatramp's
 /// resolver, exactly as the VMM path replaces it).
 ///
+/// `rootfs` is the tenant-controlled staged tree (an image layer can plant `etc`
+/// as a symlink), and this runs pre-`pivot_root` in the node process, so the write
+/// goes through [`boatramp_firecracker::oci::contained_write`], NOT raw `std::fs`:
+/// it resolves `RESOLVE_IN_ROOT` and unlinks a planted leaf symlink before writing,
+/// so `etc -> /etc` (host) can never redirect the write onto the host.
+///
 /// Called by the container backend's launch path, which knows the container's
 /// project + the bridge gateway. Best-effort at the call site: a failure to write
 /// the resolver config should not abort an otherwise-healthy launch (the guest just
 /// falls back to whatever the image shipped), so the caller logs rather than fails.
+///
+/// The container backend (and this writer's production use) is Linux-only, where
+/// the write goes through the shared symlink-containment resolver. The non-Linux
+/// arm is only for this module's host-testable unit tests (the `boatramp-firecracker`
+/// dep is Linux-gated) and never runs a real container.
+#[cfg(target_os = "linux")]
+pub fn write(rootfs: &Path, gateway: Ipv4Addr, project: &str, domain: &str) -> io::Result<()> {
+    let body = render(gateway, project, domain);
+    boatramp_firecracker::oci::contained_write(
+        rootfs,
+        Path::new("etc/resolv.conf"),
+        body.as_bytes(),
+    )
+    .map(|_| ())
+    .map_err(|e| io::Error::other(e.to_string()))
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn write(rootfs: &Path, gateway: Ipv4Addr, project: &str, domain: &str) -> io::Result<()> {
     let etc = rootfs.join("etc");
     std::fs::create_dir_all(&etc)?;
@@ -110,6 +134,26 @@ mod tests {
             "the staged public resolver must be replaced by the gateway"
         );
         assert!(!got.contains("8.8.8.8"), "the old resolver must be gone");
+    }
+
+    /// A hostile image layer plants `etc` as an absolute symlink to a host dir;
+    /// the pre-`pivot_root` resolv.conf write must stay INSIDE `rootfs`, never
+    /// landing on the host (the containment the firecracker `contained_write`
+    /// provides). Linux-only: that is the platform wired to the shared containment
+    /// resolver (and where the container backend runs). Mutation witness: revert
+    /// `write` to raw `std::fs` and the host sentinel receives `resolv.conf`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn write_contains_a_planted_etc_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sentinel = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(sentinel.path(), root.join("etc")).unwrap();
+        write(root, Ipv4Addr::new(10, 0, 0, 1), "p", "boatramp.internal").unwrap();
+        assert!(
+            !sentinel.path().join("resolv.conf").exists(),
+            "resolv.conf must NOT escape onto the host through the planted etc symlink"
+        );
     }
 
     #[test]

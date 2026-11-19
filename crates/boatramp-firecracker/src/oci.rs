@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
 /// An OCI build error.
@@ -64,52 +64,153 @@ fn safe_relative(path: &Path) -> Result<PathBuf, OciError> {
     Ok(out)
 }
 
-/// Join `rel` (already sanitized to `Normal`-only components by [`safe_relative`])
-/// onto `root`, **refusing to resolve through a symlink**. Every ancestor
-/// component is `lstat`'d and rejected if it is a symlink, so a destination can
-/// never be computed *through* a symlink an earlier entry/layer planted (e.g.
-/// `work/evil -> /etc`, then `work/evil/passwd`). This is the cross-platform
-/// containment the whole unpack relies on — the host `std::fs` calls that follow
-/// (`create_dir_all`, `unpack`, `remove_*`, `hard_link`/`copy`) then operate on a
-/// path whose parents are verified real directories under `root`, so none of them
-/// can be redirected onto the host filesystem.
+/// Bound on symlink expansions while resolving one path — a loop / long-chain
+/// guard (mirrors `openat2`'s `SYMLOOP_MAX`-style cap).
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// One owned element of a path being resolved. Owned (not a borrowing
+/// [`Component`]) so a followed symlink's target elements can be spliced in.
+enum PathTok {
+    Name(std::ffi::OsString),
+    Parent,
+    Root,
+}
+
+fn path_toks(p: &Path) -> Vec<PathTok> {
+    p.components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(PathTok::Name(n.to_os_string())),
+            Component::ParentDir => Some(PathTok::Parent),
+            Component::RootDir | Component::Prefix(_) => Some(PathTok::Root),
+            Component::CurDir => None,
+        })
+        .collect()
+}
+
+/// Resolve `rel` under `root` with **`RESOLVE_IN_ROOT` (chroot-style) semantics**,
+/// cross-platform and without `openat2` (the macOS VZ path needs it too):
+/// symlink components ARE followed, but `root` is treated as the filesystem root,
+/// so the result is ALWAYS inside `root`. An **absolute** symlink target is
+/// reinterpreted root-relative (`sbin -> /etc/cron.d` resolves to `<root>/etc/cron.d`,
+/// never the host's `/etc`); a **relative** target resolves from the symlink's own
+/// directory; `..` is clamped at `root` (it never escapes); and symlink chains are
+/// bounded by [`MAX_SYMLINK_HOPS`]. This both CONTAINS a hostile layer's planted
+/// symlink (the escape is neutralized) AND stays compatible with legitimate
+/// in-root symlinks that real images ship (usrmerge `/lib -> usr/lib`,
+/// `/sbin -> usr/sbin`, …) — which a strict refuse-all-symlinks guard would wrongly
+/// reject.
 ///
-/// With `check_leaf` the final component is screened the same way — used where the
-/// resolved path is itself traversed/read (an opaque-whiteout directory to clear,
-/// a hard-link *target* to read): those must be real, not a symlink to follow.
-/// Otherwise the leaf is returned un-dereferenced and the caller must not follow
-/// it (it unlinks-then-creates it with the verified-real parent pinned).
-///
-/// Non-existent components are allowed (nothing to follow yet); only an existing
-/// symlink component is refused. `rel`'s components are all `Normal`; any other
-/// kind (defensive — `safe_relative` already rejected them) is refused.
-fn contained_path(root: &Path, rel: &Path, check_leaf: bool) -> Result<PathBuf, OciError> {
-    let mut cur = root.to_path_buf();
-    let comps: Vec<Component> = rel.components().collect();
-    let n = comps.len();
-    for (i, comp) in comps.into_iter().enumerate() {
-        let Component::Normal(name) = comp else {
-            return Err(OciError::UnsafePath(rel.display().to_string()));
-        };
-        cur.push(name);
-        let is_leaf = i + 1 == n;
-        if (check_leaf || !is_leaf) && fs::symlink_metadata(&cur).is_ok_and(|m| m.is_symlink()) {
-            return Err(OciError::UnsafePath(rel.display().to_string()));
+/// `follow_leaf` controls the final component: `true` follows it (used where the
+/// resolved path is itself read/traversed — a hard-link target, an opaque-whiteout
+/// dir, an existence check); `false` leaves the leaf un-dereferenced so the caller
+/// can unlink-then-create it (never following a planted leaf symlink). The parents
+/// of the returned path are always real, symlink-free directories (or
+/// not-yet-existing) inside `root`.
+fn resolve_in_root_impl(root: &Path, rel: &Path, follow_leaf: bool) -> Result<PathBuf, OciError> {
+    // `stack`: resolved, symlink-free components relative to `root`.
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    // `queue`: tokens still to process, popped from the END (= front of the path).
+    // A followed symlink splices its target's tokens onto the end so they resolve
+    // next, from the directory that contained the link.
+    let mut queue: Vec<PathTok> = path_toks(rel);
+    queue.reverse();
+    let mut hops = 0usize;
+
+    while let Some(tok) = queue.pop() {
+        match tok {
+            PathTok::Root => stack.clear(), // absolute symlink target → back to root
+            PathTok::Parent => {
+                stack.pop(); // clamp at root (no-op when already at root)
+            }
+            PathTok::Name(name) => {
+                let is_last = queue.is_empty();
+                let mut candidate = root.to_path_buf();
+                for s in &stack {
+                    candidate.push(s);
+                }
+                candidate.push(&name);
+                let followable = follow_leaf || !is_last;
+                if followable && fs::symlink_metadata(&candidate).is_ok_and(|m| m.is_symlink()) {
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return Err(OciError::UnsafePath(format!(
+                            "too many symlink hops resolving {} under root",
+                            rel.display()
+                        )));
+                    }
+                    let target = fs::read_link(&candidate)?;
+                    let mut toks = path_toks(&target);
+                    toks.reverse();
+                    queue.extend(toks);
+                } else {
+                    stack.push(name);
+                }
+            }
         }
     }
-    Ok(cur)
+    let mut out = root.to_path_buf();
+    for s in &stack {
+        out.push(s);
+    }
+    Ok(out)
+}
+
+/// [`resolve_in_root_impl`] following the final component (for a path that is
+/// itself read/traversed).
+fn resolve_in_root(root: &Path, rel: &Path) -> Result<PathBuf, OciError> {
+    resolve_in_root_impl(root, rel, true)
+}
+
+/// [`resolve_in_root_impl`] stopping before the final component: the parent chain
+/// is resolved in-root and the leaf is returned un-dereferenced (the caller
+/// unlinks a planted leaf symlink before writing, never following it).
+fn resolve_parent_in_root(root: &Path, rel: &Path) -> Result<PathBuf, OciError> {
+    resolve_in_root_impl(root, rel, false)
+}
+
+/// Create (and parents) a real directory for the in-`root` path `rel`, resolving
+/// symlink components `RESOLVE_IN_ROOT` so a planted symlink can never redirect
+/// the `mkdir` onto the host. A planted leaf symlink is not followed. Returns the
+/// resolved real path. The crate's post-unpack writers (`write_init`) and the
+/// container backend's resolv.conf writer go through this so EVERY write into the
+/// tenant-controlled tree is contained, not just the layer unpack.
+pub fn contained_create_dir_all(root: &Path, rel: &Path) -> Result<PathBuf, OciError> {
+    let sane = safe_relative(rel)?;
+    let dest = resolve_in_root(root, &sane)?;
+    fs::create_dir_all(&dest)?;
+    Ok(dest)
+}
+
+/// Write `data` to the in-`root` path `rel`, resolving the parent chain
+/// `RESOLVE_IN_ROOT`, creating it, and — critically — **unlinking any existing
+/// leaf symlink before writing** (never following it), so a hostile layer that
+/// planted the destination as a symlink cannot redirect the write onto the host.
+/// Returns the resolved real path (its parents are real in-root dirs), so a
+/// caller can safely `chmod` it. The companion to [`contained_create_dir_all`].
+pub fn contained_write(root: &Path, rel: &Path, data: &[u8]) -> Result<PathBuf, OciError> {
+    let sane = safe_relative(rel)?;
+    let dest = resolve_parent_in_root(root, &sane)?;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Never write THROUGH a planted leaf symlink: unlink it first.
+    if fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink()) {
+        fs::remove_file(&dest)?;
+    }
+    fs::write(&dest, data)?;
+    Ok(dest)
 }
 
 /// Resolve a tar **hard-link** target into a host path under `root`. A hard link's
 /// `linkname` references another member of the *same archive* (the same namespace
 /// as member names), so it is always relative to the extraction root — never the
 /// process CWD. An absolute target is normalized to root-relative (its leading `/`
-/// is stripped, as `tar` does without `--absolute-names`); a `..` that would
-/// escape the root is refused. The resolved target is then screened through
-/// [`contained_path`] with `check_leaf` — a hard link is `hard_link`'d/`copy`'d
-/// (and `copy` *follows* symlinks), so a target that traverses OR lands on a
-/// planted symlink (`-> /etc/shadow`) must be refused or it pulls a host file into
-/// the image (read/exfil). (A *symlink* entry is different: its target is stored +
+/// is stripped, as `tar` does without `--absolute-names`); a `..` in the linkname
+/// itself is refused. The result is then resolved [`RESOLVE_IN_ROOT`](resolve_in_root)
+/// (following the leaf): a hard link is `hard_link`'d/`copy`'d (and `copy` FOLLOWS
+/// symlinks), so a planted symlink target (`-> /etc/shadow`) is reinterpreted
+/// root-relative and can only ever reach the image's OWN files, never a host file
+/// (read/exfil closed). (A *symlink* entry is different: its target is stored +
 /// created verbatim and resolved inside the guest, so it goes through `unpack`.)
 fn link_target_under_root(root: &Path, link: &Path) -> Result<PathBuf, OciError> {
     let mut rel = PathBuf::new();
@@ -121,7 +222,7 @@ fn link_target_under_root(root: &Path, link: &Path) -> Result<PathBuf, OciError>
             Component::ParentDir => return Err(OciError::UnsafePath(link.display().to_string())),
         }
     }
-    contained_path(root, &rel, true)
+    resolve_in_root(root, &rel)
 }
 
 /// Recursively remove a path (file, dir, or symlink) if it exists.
@@ -176,25 +277,26 @@ pub fn apply_layer_tar(root: &Path, reader: impl Read) -> Result<(), OciError> {
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
 
         if file_name == ".wh..wh..opq" {
-            // Clear the REAL directory; refuse if any component (the dir itself
-            // included) is a symlink, so an opaque whiteout can't be redirected to
-            // wipe a host directory via a planted symlink.
-            let dir = contained_path(root, parent, true)?;
+            // Clear the directory the marker sits in, resolved RESOLVE_IN_ROOT so a
+            // planted symlink can only ever redirect the clear onto an in-root
+            // directory, never a host one.
+            let dir = resolve_in_root(root, parent)?;
             clear_dir(&dir)?;
             continue;
         }
         if let Some(target_name) = file_name.strip_prefix(".wh.") {
-            // Pin the parent chain to real directories, then remove the named leaf
-            // WITHOUT following it (a symlinked whiteout parent must not let the
-            // delete reach outside the rootfs).
-            let victim = contained_path(root, &parent.join(target_name), false)?;
+            // Resolve the parent RESOLVE_IN_ROOT, then remove the named leaf WITHOUT
+            // following it (a symlinked whiteout parent is contained in-root; a
+            // symlinked victim leaf is unlinked itself, not its target).
+            let victim = resolve_parent_in_root(root, &parent.join(target_name))?;
             remove_path(&victim)?;
             continue;
         }
 
-        // Resolve the destination with its parent chain pinned to real
-        // directories — never resolve a write THROUGH an attacker-planted symlink.
-        let dest = contained_path(root, &rel, false)?;
+        // Resolve the destination's parent chain RESOLVE_IN_ROOT — a planted
+        // symlink parent is followed only within `root`, so the write can never
+        // land on the host; the leaf is returned un-dereferenced.
+        let dest = resolve_parent_in_root(root, &rel)?;
         // Clear any existing leaf unless BOTH the old and new entries are
         // directories (a dir entry merges onto a lower-layer dir). This lets a
         // later layer replace an entry AND — critically — ensures we never write
@@ -317,6 +419,7 @@ fn ipv4_is_disallowed(v4: Ipv4Addr) -> bool {
         || v4.is_broadcast()
         || v4.is_documentation()
         || v4.is_unspecified()
+        || v4.is_multicast() // 224.0.0.0/4
         || o[0] == 0 // "this network" 0.0.0.0/8
         || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000) // 100.64.0.0/10 CGNAT
         || o[0] >= 240 // 240.0.0.0/4 reserved
@@ -324,15 +427,14 @@ fn ipv4_is_disallowed(v4: Ipv4Addr) -> bool {
 
 /// Is `ip` a non-globally-routable address that must never be a pull target?
 /// Blocks loopback, private, link-local (v4 `169.254/16`, v6 `fe80::/10`),
-/// unique-local (`fc00::/7`), multicast, and v4-mapped forms of the above —
-/// closing SSRF to cloud metadata (`169.254.169.254`) and internal hosts.
+/// unique-local (`fc00::/7`), multicast (v4 `224/4` + v6), and the v4-mapped /
+/// deprecated-v4-compatible IPv6 forms of the above — closing SSRF to cloud
+/// metadata (`169.254.169.254`) and internal hosts. `to_canonical` collapses
+/// `::ffff:a.b.c.d` and `::a.b.c.d` back to IPv4 so they can't dodge the v4 block.
 fn ip_is_disallowed(ip: IpAddr) -> bool {
-    match ip {
+    match ip.to_canonical() {
         IpAddr::V4(v4) => ipv4_is_disallowed(v4),
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return ipv4_is_disallowed(mapped);
-            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -376,8 +478,8 @@ fn split_host_port(authority: &str) -> Result<(String, u16), OciError> {
 
 /// Validate a `WWW-Authenticate` realm URL as a safe pull target: it MUST be
 /// `https://` (no `http://`, no other scheme — a tenant image's 401 realm is
-/// attacker-controlled), returning its (host, port) for IP screening. Lexical
-/// only; the IP screen is [`screen_pull_host`].
+/// attacker-controlled), returning its (host, port). Lexical only; the IP screen
+/// is [`screen_literal_host`] (literal-IP realm) + [`ScreeningResolver`] (hostname).
 fn parse_realm(realm: &str) -> Result<(String, u16), OciError> {
     let rest = realm
         .strip_prefix("https://")
@@ -388,79 +490,94 @@ fn parse_realm(realm: &str) -> Result<(String, u16), OciError> {
     split_host_port(authority)
 }
 
-/// Screen a pull target host: resolve it and refuse if it is (or resolves to)
-/// any non-globally-routable address — the SSRF block for the registry host and
-/// the token realm. For a DNS name the screened socket addrs are returned to PIN
-/// into the client (so a re-resolve at connect time can't rebind to a private
-/// address — DNS-rebinding defense); a literal IP is screened in place and needs
-/// no pin. Blocking DNS (one shot, cold build path).
-fn screen_pull_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, OciError> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if ip_is_disallowed(ip) {
-            return Err(OciError::Registry(format!(
-                "refusing to pull from non-global address {host}"
-            )));
-        }
-        return Ok(Vec::new());
-    }
-    let addrs: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| OciError::Registry(format!("resolving pull host {host}: {e}")))?
-        .collect();
-    if addrs.is_empty() {
+/// Eagerly refuse a pull host that is a literal non-global IP. The DNS-screening
+/// [`ScreeningResolver`] only sees *hostnames* (reqwest never calls a resolver for
+/// a literal-IP URL), so a literal-IP registry/realm URL would otherwise skip the
+/// screen entirely. A hostname passes here and is screened at resolution time.
+fn screen_literal_host(host: &str) -> Result<(), OciError> {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = h.parse::<IpAddr>()
+        && ip_is_disallowed(ip)
+    {
         return Err(OciError::Registry(format!(
-            "pull host {host} did not resolve"
+            "refusing to pull from non-global address {host}"
         )));
     }
-    for sa in &addrs {
-        if ip_is_disallowed(sa.ip()) {
-            return Err(OciError::Registry(format!(
-                "refusing to pull from {host}: resolves to non-global address {}",
-                sa.ip()
-            )));
-        }
-    }
-    Ok(addrs)
+    Ok(())
 }
 
-/// Build an HTTP client for `host:port`, screened against SSRF: the host is
-/// resolved + IP-screened ([`screen_pull_host`]) and its vetted addrs pinned so
-/// the initial connect can't rebind. Redirects are **followed but re-screened at
-/// every hop** (bounded): a registry blob GET legitimately `307`s to a CDN, so a
-/// blanket no-redirect would break real pulls — but each hop must still be
-/// `https` to a globally-routable host, so an SSRF redirect to cloud metadata /
-/// an internal host is refused rather than chased.
-fn build_screened_client(host: &str, port: u16) -> Result<reqwest::Client, OciError> {
-    let pinned = screen_pull_host(host, port)?;
+/// A reqwest DNS resolver that screens EVERY resolved address against
+/// [`ip_is_disallowed`] — the SSRF block applied at resolution, for the initial
+/// request AND for every redirect hop, so the screen and the actual connect share
+/// ONE lookup (closing the DNS-rebinding window). getaddrinfo runs on the
+/// runtime's blocking pool (`tokio::net::lookup_host`), so it never stalls the
+/// async reactor.
+#[derive(Debug, Clone, Copy)]
+struct ScreeningResolver;
+
+impl reqwest::dns::Resolve for ScreeningResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            // Port is irrelevant to IP screening; reqwest overrides it on connect.
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("no address resolved for {host}").into());
+            }
+            for sa in &addrs {
+                if ip_is_disallowed(sa.ip()) {
+                    return Err(format!(
+                        "refusing to connect to {host}: resolves to non-global address {}",
+                        sa.ip()
+                    )
+                    .into());
+                }
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Build the SSRF-screened pull client, shared across registry + blob + token
+/// fetches: a [`ScreeningResolver`] screens every hostname lookup (initial +
+/// redirects), and the redirect policy (bounded) requires each hop to be `https`
+/// and rejects a hop to a literal non-global IP (which the resolver never sees).
+/// Redirects are FOLLOWED — a registry blob GET legitimately `307`s to a CDN — but
+/// an SSRF redirect to cloud metadata / an internal host is refused, not chased.
+fn screening_client() -> Result<reqwest::Client, OciError> {
     let redirect = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= 8 {
             return attempt.error(std::io::Error::other("too many redirects"));
         }
         // Copy what we need as owned values before consuming `attempt`.
-        let scheme = attempt.url().scheme().to_owned();
-        let host = attempt.url().host_str().map(str::to_owned);
-        let port = attempt.url().port_or_known_default().unwrap_or(443);
+        let is_https = attempt.url().scheme() == "https";
+        // A redirect to a literal-IP host bypasses the DNS resolver → screen here.
+        let literal_bad = attempt.url().host_str().is_some_and(|h| {
+            h.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .is_ok_and(ip_is_disallowed)
+        });
         let shown = attempt.url().to_string();
-        if scheme != "https" {
-            return attempt.error(std::io::Error::other(format!(
+        if !is_https {
+            attempt.error(std::io::Error::other(format!(
                 "refusing non-https redirect to {shown}"
-            )));
-        }
-        let Some(h) = host else {
-            return attempt.error(std::io::Error::other("redirect without host"));
-        };
-        match screen_pull_host(&h, port) {
-            Ok(_) => attempt.follow(),
-            Err(e) => attempt.error(std::io::Error::other(e.to_string())),
+            )))
+        } else if literal_bad {
+            attempt.error(std::io::Error::other(format!(
+                "refusing redirect to non-global host {shown}"
+            )))
+        } else {
+            attempt.follow()
         }
     });
-    let mut builder = reqwest::Client::builder()
+    reqwest::Client::builder()
         .user_agent("boatramp-compute")
-        .redirect(redirect);
-    if !pinned.is_empty() {
-        builder = builder.resolve_to_addrs(host, &pinned);
-    }
-    builder
+        .dns_resolver(std::sync::Arc::new(ScreeningResolver))
+        .redirect(redirect)
         .build()
         .map_err(|e| OciError::Registry(e.to_string()))
 }
@@ -493,7 +610,7 @@ async fn get_authed(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let new_token = fetch_token(&challenge).await?;
+    let new_token = fetch_token(client, &challenge).await?;
     *token = Some(new_token);
     send(token)
         .await
@@ -503,12 +620,14 @@ async fn get_authed(
 /// Resolve a `Bearer realm="…",service="…",scope="…"` challenge into a token.
 ///
 /// The realm comes from the (tenant-controlled) registry's `401`, so it is
-/// screened before it is fetched: it MUST be `https://` and its host must not be
-/// (or resolve to) a non-global address ([`parse_realm`] + [`build_screened_client`]).
-/// A dedicated DNS-pinned, redirect-re-screening client is used, so a malicious
-/// `realm="http://169.254.169.254/…"` (SSRF to cloud metadata / internal hosts,
-/// plus a credential-exfil tail) is refused rather than fetched.
-async fn fetch_token(challenge: &str) -> Result<String, OciError> {
+/// screened before it is fetched: it MUST be `https://` ([`parse_realm`]) and its
+/// host must not be (or resolve to) a non-global address — a literal-IP realm via
+/// [`screen_literal_host`], a hostname via the shared client's [`ScreeningResolver`].
+/// So a malicious `realm="http://169.254.169.254/…"` (SSRF to cloud metadata /
+/// internal hosts, plus a credential-exfil tail) is refused rather than fetched.
+/// The same screened `client` serves the realm GET (its resolver screens the realm
+/// host too).
+async fn fetch_token(client: &reqwest::Client, challenge: &str) -> Result<String, OciError> {
     let params = challenge.trim_start_matches("Bearer ");
     let mut realm = None;
     let mut query: Vec<(String, String)> = Vec::new();
@@ -524,8 +643,8 @@ async fn fetch_token(challenge: &str) -> Result<String, OciError> {
         }
     }
     let realm = realm.ok_or_else(|| OciError::Registry("no realm in auth challenge".into()))?;
-    let (host, port) = parse_realm(&realm)?;
-    let client = build_screened_client(&host, port)?;
+    let (host, _port) = parse_realm(&realm)?;
+    screen_literal_host(&host)?;
     let resp = client
         .get(&realm)
         .query(&query)
@@ -584,21 +703,21 @@ fn oci_arch() -> &'static str {
 /// [`oci_arch`] (the host/guest arch).
 async fn resolve_manifest(image: &str) -> Result<ResolvedManifest, OciError> {
     let (registry, repo, reference) = parse_reference(image);
-    // Screen the registry host for SSRF (scheme is fixed `https` below; the host
-    // must resolve to a global address) and pin + disable redirects.
-    let (reg_host, reg_port) = split_host_port(&registry)?;
-    let client = build_screened_client(&reg_host, reg_port)?;
+    // Screen the registry host for SSRF (scheme is fixed `https` below; a
+    // literal-IP host is screened eagerly, a hostname by the client's resolver).
+    let (reg_host, _reg_port) = split_host_port(&registry)?;
+    screen_literal_host(&reg_host)?;
+    let client = screening_client()?;
     let base = format!("https://{registry}/v2/{repo}");
     let mut token = None;
 
-    // When the ref is a `@sha256:` digest pin, the manifest body itself must hash
-    // to it — otherwise a MITM / malicious registry can serve a *different*
+    // When the ref is an `@<algo>:<hex>` digest pin, the manifest body itself must
+    // hash to it — otherwise a MITM / malicious registry can serve a *different*
     // self-consistent manifest (its layer digests all check out against ITS own
-    // manifest). Verify the manifest bytes before trusting their layer list.
+    // manifest). Verify the manifest bytes before trusting their layer list. A
+    // reference with a `:` is a digest (a tag never contains one).
     let manifest_url = format!("{base}/manifests/{reference}");
-    let want = reference
-        .starts_with("sha256:")
-        .then_some(reference.as_str());
+    let want = reference.contains(':').then_some(reference.as_str());
     let manifest = fetch_manifest(&client, &manifest_url, &mut token, want).await?;
 
     let manifest = if manifest.get("manifests").is_some() {
@@ -630,25 +749,34 @@ async fn resolve_manifest(image: &str) -> Result<ResolvedManifest, OciError> {
     })
 }
 
-/// Verify `bytes` hash to `digest` when it is a `sha256:` pin (a tag reference is
-/// not hash-verifiable and passes — its config/layer digests are checked
-/// downstream against the now-trusted manifest).
+/// Verify `bytes` hash to `digest` (an `<algo>:<hex>` content digest). Supports
+/// `sha256` and `sha512`; an **unknown algorithm FAILS CLOSED** (rejected) rather
+/// than passing unverified — a caller that believes it pinned `@sha512:…` (or any
+/// future algo) must never silently trust registry-supplied bytes. A malformed
+/// digest (no `algo:`) is also rejected.
 fn verify_digest(bytes: &[u8], digest: &str) -> Result<(), OciError> {
-    use sha2::{Digest, Sha256};
-    if let Some(hex_want) = digest.strip_prefix("sha256:") {
-        let got = hex::encode(Sha256::digest(bytes));
-        if got != hex_want {
+    use sha2::{Digest, Sha256, Sha512};
+    let (algo, hex_want) = digest
+        .split_once(':')
+        .ok_or_else(|| OciError::Registry(format!("malformed content digest {digest}")))?;
+    let got = match algo {
+        "sha256" => hex::encode(Sha256::digest(bytes)),
+        "sha512" => hex::encode(Sha512::digest(bytes)),
+        other => {
             return Err(OciError::Registry(format!(
-                "manifest digest mismatch for {digest}"
+                "unsupported digest algorithm {other:?}: refusing to trust unverifiable content"
             )));
         }
+    };
+    if !got.eq_ignore_ascii_case(hex_want) {
+        return Err(OciError::Registry(format!("digest mismatch for {digest}")));
     }
     Ok(())
 }
 
-/// GET a manifest from `url`, verifying its raw bytes against `expect` (a
-/// `sha256:` digest) BEFORE parsing — so a digest-pinned pull trusts only a
-/// manifest whose body actually hashes to the pin.
+/// GET a manifest from `url`, verifying its raw bytes against `expect` (a content
+/// digest) BEFORE parsing — so a digest-pinned pull trusts only a manifest whose
+/// body actually hashes to the pin.
 async fn fetch_manifest(
     client: &reqwest::Client,
     url: &str,
@@ -672,14 +800,15 @@ async fn fetch_manifest(
     serde_json::from_slice(&bytes).map_err(|e| OciError::Registry(e.to_string()))
 }
 
-/// Fetch + verify a blob by `digest` from `base`.
+/// Fetch + verify a blob by `digest` from `base`. The blob bytes are verified
+/// against `digest` via [`verify_digest`], which fails closed on an unknown
+/// algorithm (so a `sha512:` config/layer digest is verified, not waved through).
 async fn fetch_blob(
     client: &reqwest::Client,
     base: &str,
     digest: &str,
     token: &mut Option<String>,
 ) -> Result<Vec<u8>, OciError> {
-    use sha2::{Digest, Sha256};
     let url = format!("{base}/blobs/{digest}");
     let resp = get_authed(client, &url, "*/*", token).await?;
     if !resp.status().is_success() {
@@ -689,14 +818,7 @@ async fn fetch_blob(
         .bytes()
         .await
         .map_err(|e| OciError::Registry(e.to_string()))?;
-    if let Some(hex_want) = digest.strip_prefix("sha256:") {
-        let got = hex::encode(Sha256::digest(&bytes));
-        if got != hex_want {
-            return Err(OciError::Registry(format!(
-                "blob digest mismatch for {digest}"
-            )));
-        }
-    }
+    verify_digest(&bytes, digest)?;
     Ok(bytes.to_vec())
 }
 
@@ -854,6 +976,43 @@ fn resolve_argv0(root: &Path, argv0: &str, env: &[String]) -> String {
     argv0.to_string()
 }
 
+/// Create a fresh, exclusively-owned staging directory for a rootfs build.
+/// Defense-in-depth against a predictable `/tmp` path: the name carries entropy
+/// (pid + high-resolution clock + a process-unique counter), creation is
+/// **exclusive** (`create_dir` fails `EEXIST` if the name — or a symlink of that
+/// name — is pre-planted, so it can't be hijacked), and on unix it is chmod'd
+/// `0700` so no other local user can inject symlinks into the work tree mid-unpack
+/// (which would otherwise race the containment resolver).
+fn make_staging_dir(tag: &str) -> Result<PathBuf, OciError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::temp_dir();
+    let pid = u64::from(std::process::id());
+    for _ in 0..128 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(format!("br-rootfs-{pid:x}-{nanos:x}-{seq:x}-{tag}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+                }
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(OciError::Io(std::io::Error::other(
+        "could not create a unique rootfs staging directory",
+    )))
+}
+
 /// Build an ext4 rootfs at `out` from an OCI `image`: pull the image (config +
 /// layers) → overlay the layers → inject a `/sbin/init` that execs the workload
 /// (the `entrypoint` override, else the image's `Entrypoint`+`Cmd`; with `env`
@@ -869,13 +1028,8 @@ pub async fn build_rootfs(
 ) -> Result<(), OciError> {
     let (config, layers) = pull_image(image).await?;
     let argv = effective_argv(&config, entrypoint)?;
-    let work = std::env::temp_dir().join(format!(
-        "br-rootfs-{}-{}",
-        std::process::id(),
-        out.file_name().and_then(|n| n.to_str()).unwrap_or("vm")
-    ));
-    let _ = fs::remove_dir_all(&work);
-    fs::create_dir_all(&work)?;
+    let tag = out.file_name().and_then(|n| n.to_str()).unwrap_or("vm");
+    let work = make_staging_dir(tag)?;
     let result = (|| {
         for layer in &layers {
             apply_layer_gz(&work, &layer[..])?;
@@ -892,6 +1046,14 @@ pub async fn build_rootfs(
 /// (`/etc/boatramp/{argv,env,cwd}` — NUL-separated argv/env, the cwd one line),
 /// the pseudo-filesystem mount-point dirs (the root boots read-only, so they must
 /// pre-exist), and a default `/etc/resolv.conf`.
+///
+/// Every destination is written through [`contained_write`] /
+/// [`contained_create_dir_all`], NOT raw `std::fs` — the rootfs tree is
+/// tenant-controlled (a layer can plant `sbin`/`etc`/a mount point as a symlink),
+/// and this runs in the privileged node process, so a raw `create_dir_all` +
+/// `write` would follow a planted `sbin -> /etc/cron.hourly` and drop a 0755 ELF
+/// onto the HOST. The contained writers resolve `RESOLVE_IN_ROOT` and unlink a
+/// planted leaf symlink before writing, so every write stays inside `root`.
 fn write_init(
     root: &Path,
     argv: &[String],
@@ -899,10 +1061,7 @@ fn write_init(
     env_override: &[(String, String)],
     volume_mounts: &[String],
 ) -> Result<(), OciError> {
-    let sbin = root.join("sbin");
-    fs::create_dir_all(&sbin)?;
-    let init = sbin.join("init");
-    fs::write(&init, VMINIT)?;
+    let init = contained_write(root, Path::new("sbin/init"), VMINIT)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -916,20 +1075,18 @@ fn write_init(
     if let Some(first) = argv.first_mut() {
         *first = resolve_argv0(root, first, &env);
     }
-    let cfgdir = root.join("etc").join("boatramp");
-    fs::create_dir_all(&cfgdir)?;
-    fs::write(cfgdir.join("argv"), nul_join(&argv))?;
-    fs::write(cfgdir.join("env"), nul_join(&env))?;
+    contained_write(root, Path::new("etc/boatramp/argv"), &nul_join(&argv))?;
+    contained_write(root, Path::new("etc/boatramp/env"), &nul_join(&env))?;
     let cwd = if cfg.workdir.is_empty() {
         "/"
     } else {
         &cfg.workdir
     };
-    fs::write(cfgdir.join("cwd"), cwd)?;
+    contained_write(root, Path::new("etc/boatramp/cwd"), cwd.as_bytes())?;
 
     // The init mounts onto these; a read-only root means they must already exist.
     for dir in ["proc", "sys", "dev", "tmp", "run"] {
-        fs::create_dir_all(root.join(dir))?;
+        contained_create_dir_all(root, Path::new(dir))?;
     }
 
     // Persistent-volume mount points: each volume attaches as a writable
@@ -938,20 +1095,28 @@ fn write_init(
     // `source␞target` map the init mounts. Best-effort at runtime.
     let mut mounts_spec: Vec<String> = Vec::with_capacity(volume_mounts.len() * 2);
     for (i, mount) in volume_mounts.iter().enumerate() {
-        fs::create_dir_all(root.join(mount.trim_start_matches('/')))?;
+        contained_create_dir_all(root, Path::new(mount.trim_start_matches('/')))?;
         mounts_spec.push(format!("/dev/vd{}", (b'b' + i as u8) as char));
         mounts_spec.push(mount.clone());
     }
     if !mounts_spec.is_empty() {
-        fs::write(cfgdir.join("mounts"), nul_join(&mounts_spec))?;
+        contained_write(
+            root,
+            Path::new("etc/boatramp/mounts"),
+            &nul_join(&mounts_spec),
+        )?;
     }
     // A default resolver so the workload can do DNS (egress NAT is the node's
     // job). Overridable per deployment — the container backend rewrites
     // resolv.conf post-stage to point at the internal resolver; the VMM bakes it
-    // at build, so expose the same knob here.
-    let etc = root.join("etc");
-    if !etc.join("resolv.conf").exists() {
-        fs::write(etc.join("resolv.conf"), default_resolv_conf())?;
+    // at build, so expose the same knob here. Only written if the image shipped
+    // none (resolved RESOLVE_IN_ROOT so a shipped symlink is honored, not escaped).
+    if !resolve_in_root(root, Path::new("etc/resolv.conf"))?.exists() {
+        contained_write(
+            root,
+            Path::new("etc/resolv.conf"),
+            default_resolv_conf().as_bytes(),
+        )?;
     }
     Ok(())
 }
@@ -1342,9 +1507,10 @@ mod tests {
     }
 
     #[test]
-    fn planted_symlink_unpack_refuses_write_escape() {
-        // An earlier entry plants `evil -> <sentinel outside root>`; a later entry
-        // `evil/pwned` must NOT be written through it (host-write escape).
+    fn planted_symlink_unpack_is_contained_in_root() {
+        // A layer plants `evil -> <absolute path outside root>`, then writes
+        // `evil/pwned`. RESOLVE_IN_ROOT reinterprets the absolute symlink target
+        // root-relative, so the write lands INSIDE root — never on the host.
         let root = tmpdir("sym-write");
         let sentinel = tmpdir("sym-write-escape");
         fs::create_dir_all(&sentinel).unwrap();
@@ -1352,20 +1518,23 @@ mod tests {
             ("L", "evil", sentinel.to_str().unwrap().as_bytes()),
             ("F", "evil/pwned", b"PWNED"),
         ]);
-        let err = apply_layer_tar(&root, &tar[..]).unwrap_err();
-        assert!(matches!(err, OciError::UnsafePath(_)), "got {err:?}");
+        apply_layer_tar(&root, &tar[..]).unwrap();
         assert!(
             !sentinel.join("pwned").exists(),
-            "the write must NOT have escaped through the planted symlink"
+            "the write must NOT have escaped to the host sentinel"
         );
+        // It materialized in-root at the chroot-reinterpreted location.
+        let landed = resolve_in_root(&root, Path::new("evil/pwned")).unwrap();
+        assert!(landed.starts_with(&root), "{landed:?} must be under root");
+        assert_eq!(fs::read(&landed).unwrap(), b"PWNED");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&sentinel);
     }
 
     #[test]
-    fn whiteout_through_symlink_refuses_delete() {
-        // `evil -> <sentinel>`; a whiteout `evil/.wh.victim` must NOT delete the
-        // sentinel's file (host-delete escape).
+    fn whiteout_through_symlink_is_contained_in_root() {
+        // `evil -> <absolute sentinel>`; a whiteout `evil/.wh.victim` stays in-root
+        // (the sentinel's HOST file is never deleted).
         let root = tmpdir("sym-wh");
         let sentinel = tmpdir("sym-wh-escape");
         fs::create_dir_all(&sentinel).unwrap();
@@ -1374,20 +1543,19 @@ mod tests {
             ("L", "evil", sentinel.to_str().unwrap().as_bytes()),
             ("W", "evil/.wh.victim", b""),
         ]);
-        let err = apply_layer_tar(&root, &tar[..]).unwrap_err();
-        assert!(matches!(err, OciError::UnsafePath(_)), "got {err:?}");
+        apply_layer_tar(&root, &tar[..]).unwrap();
         assert!(
             sentinel.join("victim").exists(),
-            "the whiteout must NOT have deleted through the planted symlink"
+            "the host sentinel's file must NOT have been deleted through the symlink"
         );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&sentinel);
     }
 
     #[test]
-    fn opaque_whiteout_through_symlink_refuses_clear() {
-        // An opaque whiteout whose directory is a planted symlink must refuse,
-        // not `read_dir` + wipe the symlink target.
+    fn opaque_whiteout_through_symlink_is_contained_in_root() {
+        // An opaque whiteout whose dir is a planted absolute symlink is resolved
+        // in-root — it never `read_dir`s + wipes the HOST symlink target.
         let root = tmpdir("sym-opq");
         let sentinel = tmpdir("sym-opq-escape");
         fs::create_dir_all(&sentinel).unwrap();
@@ -1396,21 +1564,20 @@ mod tests {
             ("L", "evil", sentinel.to_str().unwrap().as_bytes()),
             ("W", "evil/.wh..wh..opq", b""),
         ]);
-        let err = apply_layer_tar(&root, &tar[..]).unwrap_err();
-        assert!(matches!(err, OciError::UnsafePath(_)), "got {err:?}");
+        apply_layer_tar(&root, &tar[..]).unwrap();
         assert!(
             sentinel.join("keep").exists(),
-            "the opaque whiteout must NOT have cleared through the planted symlink"
+            "the host sentinel dir must NOT have been cleared through the symlink"
         );
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&sentinel);
     }
 
     #[test]
-    fn hard_link_through_symlink_refuses_exfil() {
-        // `evil -> <sentinel/secret>` (a symlink to a host file); a hard-link
-        // entry `loot` pointing at `evil` must be refused, not copied — otherwise
-        // a host file is exfiltrated into the image.
+    fn hard_link_through_symlink_does_not_exfil_host_file() {
+        // `evil -> <absolute host file>`; a hard link `loot -> evil`. RESOLVE_IN_ROOT
+        // reinterprets the symlink target root-relative, so the link/copy can only
+        // ever reach an in-root path (absent here) — the host file is never pulled in.
         let root = tmpdir("sym-link");
         let sentinel = tmpdir("sym-link-escape");
         fs::create_dir_all(&sentinel).unwrap();
@@ -1418,7 +1585,7 @@ mod tests {
         fs::write(&secret, b"topsecret").unwrap();
 
         let mut builder = tar::Builder::new(Vec::new());
-        // Plant the symlink `evil -> <abs path to secret>`.
+        // Plant `evil -> <abs path to a host secret>`.
         let mut lh = tar::Header::new_gnu();
         lh.set_entry_type(tar::EntryType::Symlink);
         lh.set_mode(0o777);
@@ -1434,10 +1601,12 @@ mod tests {
         builder.append_link(&mut hh, "loot", "evil").unwrap();
         let tar = builder.into_inner().unwrap();
 
-        let err = apply_layer_tar(&root, &tar[..]).unwrap_err();
-        assert!(matches!(err, OciError::UnsafePath(_)), "got {err:?}");
+        // The in-root reinterpreted target does not exist → the link/copy fails; the
+        // load-bearing property is that the host secret is never exfiltrated.
+        let _ = apply_layer_tar(&root, &tar[..]);
+        let leaked = fs::read(root.join("loot")).ok();
         assert!(
-            !root.join("loot").exists(),
+            leaked.as_deref() != Some(b"topsecret".as_slice()),
             "the host file must NOT have been exfiltrated into the image"
         );
         let _ = fs::remove_dir_all(&root);
@@ -1458,35 +1627,137 @@ mod tests {
     }
 
     #[test]
-    fn contained_path_allows_real_dirs_refuses_symlinked_parent() {
-        let root = tmpdir("contained");
-        fs::create_dir_all(root.join("a/b")).unwrap();
-        fs::write(root.join("a/b/f"), b"x").unwrap();
-        // A real parent chain resolves.
+    #[cfg(unix)]
+    fn resolve_in_root_follows_in_root_symlinks_and_contains_escapes() {
+        use std::os::unix::fs::symlink;
+        let root = tmpdir("riroot");
+        fs::create_dir_all(root.join("usr/sbin")).unwrap();
+        // usrmerge: `sbin -> usr/sbin` (relative, in-root) is FOLLOWED (compat).
+        symlink("usr/sbin", root.join("sbin")).unwrap();
         assert_eq!(
-            contained_path(&root, Path::new("a/b/f"), false).unwrap(),
-            root.join("a/b/f")
+            resolve_in_root(&root, Path::new("sbin/tool")).unwrap(),
+            root.join("usr/sbin/tool"),
+            "a legitimate in-root symlink dir must be followed (usrmerge compat)"
         );
-        // A symlinked parent component is refused.
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink("/tmp", root.join("a/link")).unwrap();
-            assert!(matches!(
-                contained_path(&root, Path::new("a/link/x"), false),
-                Err(OciError::UnsafePath(_))
-            ));
-            // With check_leaf, a symlink LEAF is also refused.
-            assert!(matches!(
-                contained_path(&root, Path::new("a/link"), true),
-                Err(OciError::UnsafePath(_))
-            ));
-            // Without check_leaf, a symlink leaf is returned (caller unlinks it).
-            assert_eq!(
-                contained_path(&root, Path::new("a/link"), false).unwrap(),
-                root.join("a/link")
-            );
-        }
+        // An absolute-target symlink is reinterpreted root-relative (contained).
+        symlink("/etc/cron.d", root.join("escape")).unwrap();
+        assert_eq!(
+            resolve_in_root(&root, Path::new("escape/x")).unwrap(),
+            root.join("etc/cron.d/x"),
+            "an absolute symlink target must be chrooted into root"
+        );
+        // `..` cannot climb above root.
+        assert_eq!(
+            resolve_in_root(&root, Path::new("usr/../../../../etc")).unwrap(),
+            root.join("etc"),
+            ".. must be clamped at root"
+        );
+        // A leaf symlink is returned un-dereferenced for the caller to unlink.
+        symlink("/elsewhere", root.join("leaf")).unwrap();
+        assert_eq!(
+            resolve_parent_in_root(&root, Path::new("leaf")).unwrap(),
+            root.join("leaf"),
+            "resolve_parent leaves the leaf raw"
+        );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn contained_write_unlinks_a_planted_leaf_symlink() {
+        use std::os::unix::fs::symlink;
+        // A planted leaf symlink at the destination must be UNLINKED (not followed)
+        // before writing, so the write can't be redirected onto the symlink target.
+        let root = tmpdir("cw-leaf");
+        let outside = tmpdir("cw-leaf-out");
+        fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim");
+        fs::write(&victim, b"original").unwrap();
+        fs::create_dir_all(root.join("etc")).unwrap();
+        symlink(&victim, root.join("etc/resolv.conf")).unwrap();
+        let dest = contained_write(
+            &root,
+            Path::new("etc/resolv.conf"),
+            b"nameserver 10.0.0.1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"original",
+            "the host file behind the planted symlink must be untouched"
+        );
+        assert!(
+            !fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(root.join("etc/resolv.conf")).unwrap(),
+            b"nameserver 10.0.0.1\n"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_init_contains_planted_sbin_and_etc_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        // The CRITICAL regression: a hostile layer plants `sbin` + `etc` as
+        // absolute symlinks to host dirs. `write_init`'s writes (the 0755 init ELF,
+        // the exec spec, resolv.conf) must stay INSIDE root, never landing on the
+        // host via the planted symlink.
+        let root = tmpdir("wi-sym");
+        let sbin_sent = tmpdir("wi-sym-sbin");
+        let etc_sent = tmpdir("wi-sym-etc");
+        fs::create_dir_all(&sbin_sent).unwrap();
+        fs::create_dir_all(&etc_sent).unwrap();
+        let tar = tar_symlink_then(&[
+            ("L", "sbin", sbin_sent.to_str().unwrap().as_bytes()),
+            ("L", "etc", etc_sent.to_str().unwrap().as_bytes()),
+        ]);
+        apply_layer_tar(&root, &tar[..]).unwrap();
+
+        let cfg = ImageConfig {
+            entrypoint: vec!["/bin/true".into()],
+            ..Default::default()
+        };
+        write_init(
+            &root,
+            &["/bin/true".to_string()],
+            &cfg,
+            &[],
+            &["/data".to_string()],
+        )
+        .unwrap();
+
+        // Nothing escaped onto the HOST sentinels.
+        assert!(
+            !sbin_sent.join("init").exists(),
+            "the init ELF escaped onto the host via the sbin symlink"
+        );
+        assert!(
+            !etc_sent.join("boatramp").exists(),
+            "the exec spec escaped onto the host via the etc symlink"
+        );
+        assert!(
+            !etc_sent.join("resolv.conf").exists(),
+            "resolv.conf escaped onto the host via the etc symlink"
+        );
+        // The init materialized INSIDE root (chroot-reinterpreted), mode 0755.
+        let init = resolve_in_root(&root, Path::new("sbin/init")).unwrap();
+        assert!(
+            init.starts_with(&root) && init.exists(),
+            "init must exist inside root: {init:?}"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&init).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&sbin_sent);
+        let _ = fs::remove_dir_all(&etc_sent);
     }
 
     // ---- U15 part 2: registry/realm SSRF guard ----
@@ -1504,7 +1775,8 @@ mod tests {
         ));
 
         // https realms whose host is a non-global literal IP are refused by the
-        // screen (no DNS needed — hermetic).
+        // eager literal screen (a literal-IP URL never reaches the DNS resolver).
+        // Hermetic — no DNS.
         for ip in [
             "169.254.169.254",
             "127.0.0.1",
@@ -1512,32 +1784,36 @@ mod tests {
             "192.168.1.1",
             "172.16.0.1",
         ] {
-            let (host, port) = parse_realm(&format!("https://{ip}/token")).unwrap();
-            assert_eq!(port, 443);
+            let (host, _port) = parse_realm(&format!("https://{ip}/token")).unwrap();
             assert!(
-                matches!(screen_pull_host(&host, port), Err(OciError::Registry(_))),
+                matches!(screen_literal_host(&host), Err(OciError::Registry(_))),
                 "{ip} (link-local/private/loopback) must be refused"
             );
         }
         for ip in ["::1", "fe80::1", "fc00::1"] {
-            let (host, port) = parse_realm(&format!("https://[{ip}]:443/token")).unwrap();
+            let (host, _port) = parse_realm(&format!("https://[{ip}]:443/token")).unwrap();
             assert!(
-                matches!(screen_pull_host(&host, port), Err(OciError::Registry(_))),
+                matches!(screen_literal_host(&host), Err(OciError::Registry(_))),
                 "{ip} (v6 loopback/link-local/unique-local) must be refused"
             );
         }
 
-        // A public literal IP passes the screen (and needs no DNS pin).
+        // A public literal IP passes the eager screen; a hostname passes it too
+        // (it is screened later, at DNS resolution, by `ScreeningResolver`).
         let (host, port) = parse_realm("https://1.1.1.1/token").unwrap();
         assert_eq!((host.as_str(), port), ("1.1.1.1", 443));
-        assert!(screen_pull_host("1.1.1.1", 443).unwrap().is_empty());
+        screen_literal_host("1.1.1.1").unwrap();
+        screen_literal_host("registry.example.com").unwrap();
     }
 
     #[test]
     fn ipv4_mapped_v6_metadata_is_refused() {
-        // `::ffff:169.254.169.254` must be screened via its mapped v4 form.
+        // `::ffff:169.254.169.254` must be screened via its mapped v4 form
+        // (`to_canonical` collapses it back to IPv4).
         let mapped: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
         assert!(ip_is_disallowed(mapped));
+        // v4 multicast (224/4) is also blocked.
+        assert!(ip_is_disallowed("224.0.0.1".parse().unwrap()));
         // And a plain public v4 is allowed.
         assert!(!ip_is_disallowed("1.1.1.1".parse().unwrap()));
     }
@@ -1566,12 +1842,20 @@ mod tests {
     // ---- A1: manifest digest-pin integrity ----
 
     #[test]
-    fn manifest_digest_mismatch_is_refused() {
-        use sha2::{Digest, Sha256};
+    fn manifest_digest_verify_sha256_sha512_and_fail_closed() {
+        use sha2::{Digest, Sha256, Sha512};
         let body = br#"{"schemaVersion":2,"layers":[]}"#;
-        let real = hex::encode(Sha256::digest(body));
-        // The correct pin verifies.
-        verify_digest(body, &format!("sha256:{real}")).unwrap();
+        // Correct sha256 AND sha512 pins verify.
+        verify_digest(
+            body,
+            &format!("sha256:{}", hex::encode(Sha256::digest(body))),
+        )
+        .unwrap();
+        verify_digest(
+            body,
+            &format!("sha512:{}", hex::encode(Sha512::digest(body))),
+        )
+        .unwrap();
         // A wrong digest pin is refused (a MITM/malicious registry serving a
         // different self-consistent manifest for a pinned ref).
         assert!(matches!(
@@ -1581,9 +1865,22 @@ mod tests {
             ),
             Err(OciError::Registry(_))
         ));
-        // A tag reference (not a sha256 pin) is not hash-checkable here → passes
-        // (its config/layer digests are verified downstream).
-        verify_digest(body, "latest").unwrap();
+        // FAIL CLOSED: an unknown / unsupported algorithm is REJECTED, not waved
+        // through as "verified" (an OCI-legal `@sha512:`/future-algo pin the caller
+        // believes is enforced must never be trusted-from-registry unverified).
+        assert!(matches!(
+            verify_digest(body, "sha999:deadbeef"),
+            Err(OciError::Registry(_))
+        ));
+        assert!(matches!(
+            verify_digest(body, "md5:abc"),
+            Err(OciError::Registry(_))
+        ));
+        // A malformed digest (no `algo:` prefix) is rejected too.
+        assert!(matches!(
+            verify_digest(body, "latest"),
+            Err(OciError::Registry(_))
+        ));
     }
 
     // ---- minor: overridable VMM nameserver ----
