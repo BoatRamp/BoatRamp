@@ -341,14 +341,24 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Conn<IO> {
         self.io.flush().await
     }
 
-    /// Read and parse the response head, leaving any body bytes already read in the buffer.
-    /// A malformed head or an EOF before a complete head is an error (the connection is
-    /// dropped, never reused).
+    /// Read and parse the **final** response head, leaving any body bytes already read in the
+    /// buffer. An interim `1xx` response (`100 Continue`, `103 Early Hints`, …) is consumed and
+    /// skipped — it carries no body and is never the final response, so returning it here would
+    /// relay an interim status as the response and strand the real response framed on the
+    /// connection (a cross-request desync). This client never issues an `Upgrade`, so a `101`
+    /// is a protocol violation and is skipped the same way (mirrors the splice forwarder's
+    /// `read_final_response_head`). A malformed head or an EOF before a complete head is an
+    /// error (the connection is dropped, never reused).
     pub async fn read_response_head(&mut self) -> std::io::Result<ResponseHead> {
         loop {
             match parse_response_head(&self.buf) {
                 RespParse::Complete { head, consumed } => {
                     let _ = self.buf.split_to(consumed);
+                    // Skip an interim 1xx head (no body) and read the next one — the final
+                    // response is the first head with status >= 200.
+                    if (100..200).contains(&head.status.as_u16()) {
+                        continue;
+                    }
                     return Ok(head);
                 }
                 RespParse::Reject => {

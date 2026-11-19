@@ -391,6 +391,17 @@ impl UpstreamClient {
             .and_then(|s| s.trim().parse::<u64>().ok());
         parts.headers.remove(header::CONTENT_LENGTH);
         parts.headers.remove(header::TRANSFER_ENCODING);
+        // Drop `Expect` before forwarding. The gateway terminates the client's
+        // `Expect: 100-continue` handshake on the inbound leg itself (the serve loop already
+        // wrote the downstream `100 Continue` before invoking the handler), so re-forwarding
+        // `Expect` double-negotiates — and makes a spec-compliant upstream (Go/nginx/Gitea)
+        // emit its OWN interim `100 Continue`, which this single-shot client would otherwise
+        // read as the final response head (a cross-request response desync). We own the
+        // upstream-leg framing end to end, so the upstream must never be asked to interim-ack.
+        // This is the single chokepoint for both the gateway (`proxy_upstream`) and the
+        // absolute-URL (`proxy`) forward paths. (`read_response_head` also skips any interim
+        // 1xx as defense-in-depth, e.g. an unsolicited `103 Early Hints`.)
+        parts.headers.remove(header::EXPECT);
         if !parts.headers.contains_key(header::HOST)
             && let Some(auth) = parts.uri.authority()
             && let Ok(v) = HeaderValue::from_str(auth.as_str())
@@ -2485,6 +2496,141 @@ Connection: close\r\n\r\n";
         assert!(
             !lower.contains("content-length"),
             "a chunked body must not also carry a Content-Length (no CL×TE); got head:\n{head}"
+        );
+    }
+
+    // --- interim 1xx / Expect double-negotiation (response-desync class) -------------------
+
+    /// PRIMARY fix: the gateway terminates the downstream `Expect: 100-continue` handshake
+    /// itself, so the forwarded upstream request must NOT carry `Expect` — otherwise a
+    /// spec-compliant upstream emits its own interim `100 Continue` that the single-shot
+    /// native client would read as the final response. The forwarded head must have no
+    /// `Expect` (and must still preserve the explicit `Content-Length: 0`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_strips_expect_before_forwarding() {
+        const OK: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, rx) = capture_upstream(OK).await;
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/u3",
+            addr.port()
+        );
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .header(header::EXPECT, "100-continue")
+            .header(header::CONTENT_LENGTH, 0)
+            .body(Body::empty())
+            .unwrap();
+        let resp = client.send(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let (head, _body) = rx.await.unwrap();
+        let lower = head.to_ascii_lowercase();
+        assert!(
+            !lower.contains("expect"),
+            "the forwarded request must not carry Expect (the gateway owns the 100-continue handshake); got head:\n{head}"
+        );
+        assert!(
+            lower.contains("content-length: 0"),
+            "the zero-length PUT must still preserve Content-Length: 0; got head:\n{head}"
+        );
+    }
+
+    /// Reproduce-first (response-desync, defense-in-depth): an upstream that emits an interim
+    /// `100 Continue` before the real response (Go/nginx/Gitea do, and `103 Early Hints` is
+    /// unsolicited) must not corrupt the native client. `read_response_head` must SKIP the
+    /// interim and return the real response, keeping the pooled connection byte-aligned so the
+    /// NEXT request reused on that SAME keep-alive connection gets ITS own response — not a
+    /// desynced one. The stub accepts exactly ONE connection and serves both requests on it,
+    /// so request #2 succeeding proves the connection was reused clean (no fresh dial, no
+    /// desync). Without the 1xx-skip the client returns the `100` as request #1's response and
+    /// this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_skips_interim_1xx_and_reuses_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = raw.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Exactly ONE connection is ever accepted: request #2 must reuse it.
+            let Ok((mut sock, _)) = raw.accept().await else {
+                return;
+            };
+            let _ = sock.set_nodelay(true);
+            // Read one request head (CRLFCRLF), discarding it.
+            async fn read_head(sock: &mut tokio::net::TcpStream) -> bool {
+                let mut buf: Vec<u8> = Vec::new();
+                loop {
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        return true;
+                    }
+                    let mut tmp = [0u8; 1024];
+                    match sock.read(&mut tmp).await {
+                        Ok(0) => return false,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => return false,
+                    }
+                }
+            }
+            // Request #1: an interim 100, THEN the real keep-alive 201 (so the connection pools).
+            if !read_head(&mut sock).await {
+                return;
+            }
+            let _ = sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\n\r\nfirst")
+                .await;
+            let _ = sock.flush().await;
+            // Request #2 on the SAME connection: a distinct response (then close).
+            if !read_head(&mut sock).await {
+                return;
+            }
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecond",
+                )
+                .await;
+            let _ = sock.flush().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        // Request #1 — the interim 100 must be skipped; the real 201/"first" is the response.
+        let req1 = Request::builder()
+            .method(Method::GET)
+            .uri(format!("{base}/one"))
+            .body(Body::empty())
+            .unwrap();
+        let resp1 = client.send(req1).await.unwrap();
+        assert_eq!(
+            resp1.status(),
+            StatusCode::CREATED,
+            "the interim 100 Continue leaked out as the response instead of the real 201"
+        );
+        let body1 = axum::body::to_bytes(Body::from_stream(resp1.into_body()), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(body1.as_ref(), b"first");
+
+        // Request #2 — reuses the (clean) pooled connection; must get ITS own response.
+        let req2 = Request::builder()
+            .method(Method::GET)
+            .uri(format!("{base}/two"))
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = client.send(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = axum::body::to_bytes(Body::from_stream(resp2.into_body()), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            body2.as_ref(),
+            b"second",
+            "request #2 got a desynced response — the pooled connection was left misaligned by the interim 1xx"
         );
     }
 }
