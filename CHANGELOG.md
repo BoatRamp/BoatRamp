@@ -9,6 +9,21 @@ versions.
 
 ### Added
 
+- **Cumulative bin-packing across workloads in the compute reconcile scheduler.** The scheduler
+  previously sized each workload's placement against every node's _full advertised_ free capacity
+  afresh, so N workloads that each fit a node alone could collectively over-subscribe it. Each
+  reconcile pass now seeds one shared remaining-capacity ledger (`NodeCapacities`) — advertised
+  capacity minus the reservation of every currently-running replica (a pre-pass, resolving each
+  replica's spec by content hash with a conservative never-charge-zero floor for an unresolvable
+  one) — and threads it (mutable) through every workload's placement in a deterministic
+  `(project, workload)` order, debiting each launch and each scale-to-zero wake. A workload the
+  ledger cannot fit is left unscheduled on a stable basis (it does not flap) rather than packed
+  onto a full node, and that rejection composes with the placement-observability surfacing above:
+  the ledger decides _not placeable_ and the unplaced ordinal is reported through
+  `ReconcilePlan::unscheduled` as a "not scheduled: no eligible backend with capacity" entry (never
+  silently dropped). A durable `LaunchFailed` marker — recorded `Running` but holding no live
+  instance — is excluded from the pre-pass so it neither phantom-occupies its node nor blocks its
+  own relaunch.
 - **Silent compute placement/launch failures are now surfaced on the status plane.**
   A replica that could not be scheduled (a capacity/eligibility shortfall) or whose launch
   returned an error previously vanished from `compute status` with zero diagnostics — the blind
