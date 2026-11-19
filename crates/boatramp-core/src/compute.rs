@@ -2834,21 +2834,49 @@ pub async fn reconcile_once(
                             {
                                 // Resolved a credential → authenticated pull.
                                 Ok(Some(auth)) => Some(auth),
-                                // No credential referenced AND no operator host-map match →
-                                // an ANONYMOUS pull. Warn so a genuine no-cred pull is
-                                // self-diagnosing (today it surfaces only as the backend's
-                                // 403 after the fact), naming the registry host the pull will
-                                // hit unauthenticated.
+                                // No credential resolved → an ANONYMOUS pull. SCOPE the warning
+                                // to the ACTIONABLE cases so it doesn't drown in noise (a public
+                                // `docker.io/library/*` image legitimately pulls anonymously, and
+                                // a crash-looping public workload relaunches every tick):
+                                //   (a) a `pull_secret` was NAMED yet nothing resolved — an
+                                //       anomaly worth flagging (the production sealed resolver
+                                //       fails CLOSED on a named-but-missing secret via the `Err`
+                                //       arm below, so this catches a resolver that returned
+                                //       anonymous despite a named secret); OR
+                                //   (b) the image host is a NON-DEFAULT (typically private)
+                                //       registry, where an anonymous pull is far more likely a
+                                //       misconfiguration than an intentional public pull.
+                                // A bare default-registry (`docker.io`) image with no
+                                // `pull_secret` is the expected public case → `debug!`, not a
+                                // warning.
                                 Ok(None) => {
-                                    tracing::warn!(
-                                        project = %project_name,
-                                        workload = %wl,
-                                        replica,
-                                        host = %crate::registry_auth::registry_host_of(reference),
-                                        image = %reference,
-                                        "no registry credential resolved for image; attempting \
-                                         anonymous pull",
-                                    );
+                                    let host = crate::registry_auth::registry_host_of(reference);
+                                    let named_but_unresolved =
+                                        spec.pull_secret.as_deref().is_some_and(|s| !s.is_empty());
+                                    let non_default_host =
+                                        host != crate::registry_auth::DEFAULT_REGISTRY_HOST;
+                                    if named_but_unresolved || non_default_host {
+                                        tracing::warn!(
+                                            project = %project_name,
+                                            workload = %wl,
+                                            replica,
+                                            host = %host,
+                                            image = %reference,
+                                            pull_secret_named = named_but_unresolved,
+                                            "no registry credential resolved for image; \
+                                             attempting anonymous pull",
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            project = %project_name,
+                                            workload = %wl,
+                                            replica,
+                                            host = %host,
+                                            image = %reference,
+                                            "anonymous pull of a public default-registry image \
+                                             (no pull_secret configured)",
+                                        );
+                                    }
                                     None
                                 }
                                 Err(e) => {
