@@ -267,7 +267,7 @@ fn extract_pid(log: &str, key: &str) -> Option<u32> {
     let idx = log.find(key)? + key.len();
     let digits: String = log[idx..]
         .chars()
-        .take_while(|c| c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .collect();
     digits.parse().ok()
 }
