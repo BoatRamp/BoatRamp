@@ -45,6 +45,12 @@ use crate::embedded::{
     build_zero_page, e820_entries, identity_page_tables, ram_regions,
 };
 
+/// The x86_64 kernel `COMMAND_LINE_SIZE` (`arch/x86/include/asm/setup.h`): the
+/// maximum kernel-cmdline length in bytes, **including** the terminating NUL. A
+/// longer cmdline is silently truncated by the kernel, so the VMM refuses to write
+/// one (U18) rather than boot a guest with a half-dropped `boatramp.env=`.
+const COMMAND_LINE_SIZE: usize = 2048;
+
 /// Why bringing up the embedded VMM failed.
 #[derive(Debug)]
 pub enum VmmError {
@@ -289,6 +295,20 @@ impl EmbeddedVmm {
     pub fn write_boot_params(&self, cmdline: &str) -> Result<(), VmmError> {
         let mut cl = cmdline.as_bytes().to_vec();
         cl.push(0); // the kernel expects a NUL-terminated cmdline
+        // Hard bound (U18 defense-in-depth): the x86_64 kernel truncates the cmdline
+        // at COMMAND_LINE_SIZE (2048 bytes incl. the NUL), which silently drops the
+        // tail — including a `boatramp.env=` fragment — and yields a cryptic boot
+        // failure. Refuse to write an over-long cmdline with a clear error instead.
+        // The launch path also bounds the env fragment up front (see
+        // `config::env_cmdline_fragment_bounded`); this catches the assembled total.
+        if cl.len() > COMMAND_LINE_SIZE {
+            return Err(VmmError::Memory(format!(
+                "kernel cmdline is {} bytes, over the {COMMAND_LINE_SIZE}-byte \
+                 COMMAND_LINE_SIZE limit (incl. NUL); reduce the workload env or \
+                 kernel_cmdline",
+                cl.len()
+            )));
+        }
         self.guest_mem
             .write_slice(&cl, GuestAddress(CMDLINE_START))
             .map_err(|e| VmmError::Memory(format!("write cmdline: {e}")))?;

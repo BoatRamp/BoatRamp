@@ -20,9 +20,10 @@
 //! part; the boot itself is the KVM-host (`compute-live`) seam.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -311,9 +312,120 @@ impl EmbeddedVmmBackend {
             .map_err(|e| BackendError::Materialize(format!("rename {hash}: {e}")))?;
         Ok(dest.display().to_string())
     }
+
+    /// **Boot sweep** (U17): reclaim the leftovers of a prior node incarnation before
+    /// the reconcile loop allocates. The in-memory registry doesn't survive a restart,
+    /// so after a node crash/restart its `__vmm-run` workers keep running — orphaned
+    /// microVMs still holding taps on the shared bridge — and their taps linger. This
+    /// SIGKILLs every `__vmm-run` worker (there are none of ours yet — the backend was
+    /// just built) and deletes every `tap-*` device + its per-tap anti-spoof table not
+    /// in the (currently empty) registry, so a reissued IP/MAC can't collide with a
+    /// stale peer. Best-effort + idempotent; called once from `build_compute`, mirroring
+    /// the container backend's startup cgroup sweep. The PDEATHSIG re-arm in
+    /// `run_jailed_worker` handles the common case going forward; this is the backstop
+    /// for workers that predate it or raced its arming.
+    ///
+    /// ASSUMES ONE boatramp node process per host: it SIGKILLs *any* `__vmm-run` worker
+    /// (other than itself) and deletes *any* `tap-*` device on the box. Running a second
+    /// boatramp node on the same host would have its workers/taps reaped here, so this
+    /// is only ever called at node boot, before this backend has launched anything.
+    pub fn sweep_orphans(&self) {
+        // 1) Kill prior-incarnation workers (identified by their `__vmm-run` argv).
+        let self_pid = std::process::id();
+        let entries = read_proc_cmdlines();
+        let orphans = crate::net::orphan_vmm_worker_pids(&entries, VMM_RUN_SUBCOMMAND, self_pid);
+        for pid in &orphans {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        // 2) Reclaim stale taps + their per-tap anti-spoof tables. The registry is empty
+        //    at this point, but take its tap names anyway so this is correct if ever
+        //    re-run after launches exist.
+        let live: std::collections::BTreeSet<String> = self
+            .running
+            .lock()
+            .expect("running mutex")
+            .values()
+            .map(|r| r.tap.tap_name.clone())
+            .collect();
+        let ifaces = list_net_ifaces();
+        let stale = crate::net::stale_vmm_taps(&ifaces, &live);
+        for tap in &stale {
+            // Delete the per-tap anti-spoof table (U16) first, then the device. Both are
+            // best-effort — a tap with no filter table just no-ops the first command.
+            let _ = run_host_command(&HostCommand::new(
+                "nft",
+                &["delete", "table", "bridge", &format!("brl2-{tap}")],
+            ));
+            let _ = run_host_command(&HostCommand::new("ip", &["link", "del", tap]));
+        }
+        if !orphans.is_empty() || !stale.is_empty() {
+            // This crate has no `tracing` dep; the node logs via its own subscriber, so a
+            // plain stderr line is the seam here (as elsewhere in this module).
+            eprintln!(
+                "vmm-embedded: swept {} orphaned worker(s) + {} stale tap(s) at startup",
+                orphans.len(),
+                stale.len()
+            );
+        }
+    }
 }
 
-/// Set up the tap + spawn the jailed `__vmm-run` child for `cfg`. stdin is the
+/// Read every readable `/proc/<pid>/cmdline` as `(pid, argv)` — the host seam the boot
+/// sweep's pure [`orphan_vmm_worker_pids`](crate::net::orphan_vmm_worker_pids)
+/// selection consumes. A `cmdline` is NUL-separated argv; unreadable/again-gone entries
+/// are skipped. Kept thin (no selection logic) so the selection stays host-testable.
+#[cfg(target_os = "linux")]
+fn read_proc_cmdlines() -> Vec<(u32, Vec<String>)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue; // non-numeric /proc entry (not a pid)
+        };
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue; // the process exited, or we can't read it
+        };
+        let argv: Vec<String> = raw
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if !argv.is_empty() {
+            out.push((pid, argv));
+        }
+    }
+    out
+}
+
+/// The host's network-interface names (`/sys/class/net/*`) — the host seam the boot
+/// sweep's pure [`stale_vmm_taps`](crate::net::stale_vmm_taps) selection consumes.
+#[cfg(target_os = "linux")]
+fn list_net_ifaces() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect()
+}
+
+/// Set up the tap + spawn the jailed `__vmm-run` child for `cfg`.
+///
+/// The [`WorkerConfig`] — which carries the workload's per-binding identity bearer
+/// **tokens** in its `env` — is delivered to the child as the **first line on its
+/// stdin**, NOT as an argv element (U18): an argv element leaks into the host's
+/// `/proc/<pid>/cmdline`, readable by any process on a multi-tenant node (mirrors
+/// the container backend's stdin plan delivery). After line 1, stdin stays the
 /// control channel (snapshot requests) and stdout the snapshot-out channel, both
 /// piped. For a **restore**, `restore_file` is dup2'd onto [`RESTORE_FD`] in the
 /// child (via `pre_exec`) so it can read the snapshot stream there. Blocking —
@@ -328,11 +440,12 @@ fn spawn_worker(
     for cmd in tap.setup_commands() {
         run_host_command(&cmd)?;
     }
+    // Compact (single-line) JSON — `serde_json::to_string` never embeds a literal
+    // newline (newlines inside strings are escaped), so it is exactly line 1.
     let json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
     let mut command = Command::new(self_exe);
     command
         .arg(VMM_RUN_SUBCOMMAND)
-        .arg(json)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     if let Some(file) = restore_file {
@@ -347,9 +460,21 @@ fn spawn_worker(
             });
         }
     }
-    command
+    let mut child = command
         .spawn()
-        .map_err(|e| format!("spawn {}: {e}", self_exe.display()))
+        .map_err(|e| format!("spawn {}: {e}", self_exe.display()))?;
+    // Hand the config over stdin (line 1) before returning the child; the caller
+    // keeps the same stdin pipe as the subsequent snapshot-control channel.
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "worker stdin not piped".to_string())?;
+    stdin
+        .write_all(json.as_bytes())
+        .and_then(|()| stdin.write_all(b"\n"))
+        .and_then(|()| stdin.flush())
+        .map_err(|e| format!("send worker config over stdin: {e}"))?;
+    Ok(child)
 }
 
 /// Run a host command best-effort, mapping a non-zero exit to an error string.
@@ -528,6 +653,27 @@ fn drop_all_caps() -> Result<(), String> {
     Ok(())
 }
 
+/// Read the [`WorkerConfig`] the backend handed the jailed child as the **first
+/// line on stdin** (U18 — off argv, so the per-binding bearer tokens in `env` never
+/// land in the host's `/proc/<pid>/cmdline`). The `__vmm-run` dispatch calls this,
+/// then [`run_jailed_worker`]; the control thread that watches stdin for the later
+/// `snapshot` line reads from the SAME process-global stdin, so its buffered
+/// read-ahead continues seamlessly after this line. Mirrors the container worker's
+/// stdin plan read.
+#[cfg(target_os = "linux")]
+pub fn read_worker_config_from_stdin() -> Result<WorkerConfig, String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("read worker config from stdin: {e}"))?;
+    if line.is_empty() {
+        return Err("worker config: stdin closed before the config line arrived".into());
+    }
+    serde_json::from_str(line.trim_end()).map_err(|e| format!("invalid worker config: {e}"))
+}
+
 /// Run one VM **in this process**, to be invoked from the re-exec'd `__vmm-run`
 /// child (or the test's `vmm-worker` bin): attach the tap, assemble the virtio
 /// bus (block rootfs + net), build + boot the guest, then **jail this process** —
@@ -537,6 +683,9 @@ fn drop_all_caps() -> Result<(), String> {
 /// the untrusted-multi-tenant isolation boundary. Linux + `/dev/kvm`.
 #[cfg(target_os = "linux")]
 pub fn run_jailed_worker(cfg: WorkerConfig) -> Result<(), String> {
+    // Record the node (parent) pid up front so we can detect, after arming the
+    // parent-death signal below, that the parent already exited (U17).
+    let parent_pid = nix::unistd::getppid();
     // Attach our fds to the (parent-created) tap: TX for the device, RX poller.
     let tap = Tap::open(&cfg.tap_name).map_err(|e| e.to_string())?;
     let tx_tap = tap.try_clone().map_err(|e| e.to_string())?;
@@ -619,6 +768,20 @@ pub fn run_jailed_worker(cfg: WorkerConfig) -> Result<(), String> {
     // confine to the run-loop syscalls (the RX poller + the snapshot-control
     // thread spawned below inherit it).
     drop_all_caps()?;
+    // Re-arm the parent-death signal AFTER the cap-drop (U17): a `pre_exec`
+    // `PR_SET_PDEATHSIG` both races the fork and is CLEARED by the credential change
+    // in `drop_all_caps`, so without this a node (parent) crash would orphan this
+    // microVM with a live tap. `drop_all_caps` only drops capabilities (no uid/seccomp
+    // change), so arming here, before the seccomp filter, needs no `prctl` on the
+    // allow-list and survives the filter install (which changes no credentials).
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|e| format!("arm PR_SET_PDEATHSIG: {e}"))?;
+    // Close the residual race: if the node already exited between our fork and the
+    // arm above, the death signal will never fire — so if we've been reparented, bail
+    // now rather than linger as an orphaned VM holding a tap + guest IP.
+    if nix::unistd::getppid() != parent_pid {
+        return Err("node (parent) exited before PDEATHSIG was armed; aborting worker".into());
+    }
     crate::embedded_seccomp::install().map_err(|e| e.to_string())?;
 
     // Run until the guest exits, a snapshot is requested, or the process is killed
@@ -688,6 +851,18 @@ impl ComputeBackend for EmbeddedVmmBackend {
         }
     }
 
+    /// Adopt the IPs of already-running embedded-VMM replicas into this backend's
+    /// (shared) IP pool at boot (U17): the in-memory registry does NOT survive a node
+    /// restart, so without this a fresh pool would re-hand a prior incarnation's live
+    /// `10.0.0.x` — and, since the MAC is `f(IP)`, its MAC too — to a DIFFERENT
+    /// workload. `IpAuthority::reserve_in_use` skips the gateway + out-of-subnet
+    /// addresses, so passing the full fleet is safe + idempotent (it also shares the
+    /// pool with the co-located container backend, so each reserves the other's IPs).
+    async fn reserve_in_use(&self, replicas: &[(String, String, u32, std::net::Ipv4Addr)]) {
+        let ips: Vec<std::net::Ipv4Addr> = replicas.iter().map(|(_, _, _, ip)| *ip).collect();
+        self.ipam.reserve_in_use(&ips);
+    }
+
     async fn materialize(
         &self,
         _project: &str,
@@ -743,7 +918,12 @@ impl ComputeBackend for EmbeddedVmmBackend {
             .ipam
             .allocate()
             .map_err(|e| BackendError::Launch(e.to_string()))?;
-        let tap = TapNetwork::for_vm(&id, &self.bridge);
+        // Bind the tap to exactly this guest's IP + (deterministic) MAC with a per-tap
+        // anti-spoof filter (U16), installed fail-closed before the tap joins the bridge
+        // so a guest can't impersonate a neighbor at L2 (the predictable `02:00:<ip>` MAC)
+        // or L3 (a forged source/ARP IP).
+        let tap =
+            TapNetwork::for_vm_filtered(&id, &self.bridge, &ip.to_string(), &IpPool::mac_for(ip));
         let port = req.spec.port;
 
         // Materialize persistent volumes: validate + create/reuse each
@@ -763,7 +943,8 @@ impl ComputeBackend for EmbeddedVmmBackend {
             rootfs_path,
             kernel_path,
             cmdline_override: req.spec.kernel_cmdline.clone(),
-            env_cmdline: crate::config::env_cmdline_fragment(&req.spec.env),
+            env_cmdline: crate::config::env_cmdline_fragment_bounded(&req.spec.env)
+                .map_err(BackendError::Launch)?,
             tap_name: tap.tap_name.clone(),
             guest_ip: ip.to_string(),
             gateway: self.gateway.clone(),
@@ -879,15 +1060,37 @@ impl ComputeBackend for EmbeddedVmmBackend {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| BackendError::Other(format!("create snapshots dir: {e}")))?;
+        // A snapshot is sensitive: `.cfg` carries the full WorkerConfig (per-binding
+        // bearer TOKENS in `env`) and `.snap` is raw guest RAM. Lock the directory to
+        // `0700` and each file to `0600` so no non-root host process can read the
+        // tokens / RAM (closes the same U18 token-leak class as the argv fix). The dir
+        // perms are set explicitly (not umask-subject); the files are created `0600`
+        // from the start (never world-readable, even transiently).
+        tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| BackendError::Other(format!("secure snapshots dir perms: {e}")))?;
         let stem = dir.join(&id).display().to_string();
         let snap_path = format!("{stem}.snap");
         let cfg_path = format!("{stem}.cfg");
         // Persist the worker config so a restore can respawn without in-memory state.
         let cfg_json =
             serde_json::to_vec(&running.cfg).map_err(|e| BackendError::Other(e.to_string()))?;
-        tokio::fs::write(&cfg_path, cfg_json)
+        let mut cfg_file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&cfg_path)
+            .await
+            .map_err(|e| BackendError::Other(format!("create {cfg_path}: {e}")))?;
+        cfg_file
+            .write_all(&cfg_json)
             .await
             .map_err(|e| BackendError::Other(format!("write {cfg_path}: {e}")))?;
+        cfg_file
+            .flush()
+            .await
+            .map_err(|e| BackendError::Other(format!("flush {cfg_path}: {e}")))?;
 
         let snap_target = snap_path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -901,8 +1104,14 @@ impl ComputeBackend for EmbeddedVmmBackend {
             // Stream the worker's snapshot output into the file as it writes it
             // (must drain concurrently — the RAM far exceeds the pipe buffer).
             let mut out = running.child.stdout.take().ok_or("no worker stdout")?;
-            let mut file =
-                File::create(&snap_target).map_err(|e| format!("create {snap_target}: {e}"))?;
+            // `0600`: the snapshot is raw guest RAM (secrets) — never world-readable.
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&snap_target)
+                .map_err(|e| format!("create {snap_target}: {e}"))?;
             std::io::copy(&mut out, &mut file).map_err(|e| format!("capture snapshot: {e}"))?;
             file.sync_all().ok();
             let status = running
@@ -954,7 +1163,9 @@ impl ComputeBackend for EmbeddedVmmBackend {
 
         // Re-reserve the guest IP so the pool won't reissue it while restoring.
         self.ipam.reserve(addr);
-        let tap = TapNetwork::for_vm(&id, &self.bridge);
+        // Same per-tap anti-spoof binding as launch (U16) — the restored guest keeps its
+        // IP, so it keeps the same pinned (IP, MAC).
+        let tap = TapNetwork::for_vm_filtered(&id, &self.bridge, &ip, &IpPool::mac_for(addr));
 
         let (self_exe, tap_for_spawn, cfg_for_spawn) =
             (self.self_exe.clone(), tap.clone(), cfg.clone());

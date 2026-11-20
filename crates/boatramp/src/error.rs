@@ -205,14 +205,13 @@ pub enum CliError {
     #[cfg(target_os = "linux")]
     #[error("sandbox worker: {0}")]
     SandboxWorker(#[source] boatramp_container::worker::WorkerError),
-    /// `__vmm-run`: the config JSON argument was missing.
-    #[cfg(target_os = "linux")]
-    #[error("__vmm-run: missing config argument")]
-    VmmMissingConfig,
-    /// `__vmm-run`: the config argument did not parse as a `WorkerConfig`.
+    /// `__vmm-run`: reading the `WorkerConfig` line from stdin failed, or it did not
+    /// parse as a `WorkerConfig` (U18 — the config is delivered over stdin, off argv).
+    /// The worker reports this as a `String` at the process boundary (read + parse are
+    /// one step), carried verbatim.
     #[cfg(target_os = "linux")]
     #[error("__vmm-run: invalid config: {0}")]
-    VmmConfigParse(#[source] serde_json::Error),
+    VmmConfigParse(String),
     /// `__vmm-run`: building/booting/jailing the microVM failed. The embedded VMM
     /// worker reports failures as a `String` at this process boundary; carried
     /// verbatim (this is not a stringly-typed catch-all — it is the one foreign

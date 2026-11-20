@@ -369,7 +369,7 @@ fn run() -> Result<(), CliError> {
     if std::env::args().nth(1).as_deref()
         == Some(boatramp_firecracker::embedded_backend::VMM_RUN_SUBCOMMAND)
     {
-        return run_vmm_worker(std::env::args().nth(2));
+        return run_vmm_worker();
     }
     // A re-exec'd `boatramp __vz-run <json>` is the macOS-native VMM backend's
     // per-VM worker: it builds + runs one Linux microVM via Virtualization.framework
@@ -426,16 +426,19 @@ fn run_sandbox() -> Result<(), CliError> {
     std::process::exit(code);
 }
 
-/// The embedded VMM backend's jailed per-VM worker (`boatramp __vmm-run <json>`):
-/// build + run one microVM in this process (separate address space), then drop
-/// caps + install seccomp. Runs until the guest exits or the process is killed
-/// (the backend's `stop` SIGKILLs it). `json` is the [`WorkerConfig`]. x86_64-only
-/// (the embedded VMM is KVM-x86-specific).
+/// The embedded VMM backend's jailed per-VM worker (`boatramp __vmm-run`): build +
+/// run one microVM in this process (separate address space), then drop caps +
+/// install seccomp. Runs until the guest exits or the process is killed (the
+/// backend's `stop` SIGKILLs it). The [`WorkerConfig`] is read as the first line on
+/// **stdin** (U18 — off argv, so the per-binding bearer tokens in its `env` never
+/// land in the host's `/proc/<pid>/cmdline`). x86_64-only (the embedded VMM is
+/// KVM-x86-specific).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn run_vmm_worker(json: Option<String>) -> Result<(), CliError> {
-    use boatramp_firecracker::embedded_backend::{WorkerConfig, run_jailed_worker};
-    let json = json.ok_or(CliError::VmmMissingConfig)?;
-    let cfg: WorkerConfig = serde_json::from_str(&json).map_err(CliError::VmmConfigParse)?;
+fn run_vmm_worker() -> Result<(), CliError> {
+    use boatramp_firecracker::embedded_backend::{
+        read_worker_config_from_stdin, run_jailed_worker,
+    };
+    let cfg = read_worker_config_from_stdin().map_err(CliError::VmmConfigParse)?;
     run_jailed_worker(cfg).map_err(CliError::VmmWorker)?;
     Ok(())
 }

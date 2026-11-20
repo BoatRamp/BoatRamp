@@ -434,6 +434,30 @@ impl IpLifecycle {
 
 /// The native container backend: rootfs staging + per-node IPAM + veth wiring,
 /// re-execing this binary as the self-jail worker.
+/// How the native container backend binds each veth's per-port L2/L3 anti-spoof filter,
+/// decided ONCE at node start (`build_compute`) from nft usability × isolation posture.
+///
+/// The veths share the node bridge with every sibling (incl. managed-Postgres workloads),
+/// so without a per-port filter a malicious container can ARP/source-IP-spoof a neighbor.
+/// The filter closes that, but needs usable nftables; this posture is how retrofitting the
+/// filter onto the heavily-used production backend stays safe on nft-less hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiSpoof {
+    /// nftables is usable (`probe_nft_bridge` passed): install the per-veth anti-spoof
+    /// filter on **every** launch/restore/ephemeral, and FAIL the launch if it can't be
+    /// installed (fail-closed, before the veth joins the bridge). The posture under BOTH
+    /// single- and multi-tenant whenever nft works — the happy path.
+    Enforced,
+    /// nftables is **not** usable but the node is **single-tenant** (operator-trusted): skip
+    /// the filter and launch as before. A startup WARN already told the operator that veths
+    /// have no per-port L2 isolation. (Multi-tenant hosts must not land here.)
+    DisabledSingleTenant,
+    /// nftables is **not** usable AND the node is **multi-tenant**: refuse every container
+    /// launch with a clear operator error, so a multi-tenant host never silently runs a
+    /// container without L2 isolation from its neighbors (fail-closed).
+    RefuseMultiTenant,
+}
+
 pub struct ContainerBackend {
     storage: Arc<dyn Storage>,
     /// Root for staged rootfs dirs (`<data_dir>/compute/rootfs/<hash>`).
@@ -517,6 +541,12 @@ pub struct ContainerBackend {
     /// (carried in [`LaunchRequest::redaction`]); this flag only decides whether to apply
     /// it.
     redact_guest_log_secrets: bool,
+    /// The per-veth L2/L3 anti-spoof posture, decided at node start from nft usability ×
+    /// isolation posture (see [`AntiSpoof`]). Default [`AntiSpoof::DisabledSingleTenant`] —
+    /// the legacy, pre-anti-spoof launch path — so a bare [`new`](Self::new) (tests,
+    /// embedders) is unchanged; the node ALWAYS sets the real posture via
+    /// [`with_antispoof`](Self::with_antispoof).
+    antispoof: AntiSpoof,
 }
 
 impl ContainerBackend {
@@ -557,7 +587,50 @@ impl ContainerBackend {
             // Secret redaction of the guest-log stream is ON by default; a node operator
             // opts out via `with_guest_log_redaction(false)`.
             redact_guest_log_secrets: true,
+            // Legacy no-filter behavior by default (tests/embedders); the node sets the real
+            // posture from `probe_nft_bridge` × `strict` via `with_antispoof`.
+            antispoof: AntiSpoof::DisabledSingleTenant,
         })
+    }
+
+    /// Set the per-veth anti-spoof posture (see [`AntiSpoof`]). The node calls this at
+    /// `build_compute` with [`AntiSpoof::Enforced`] when `probe_nft_bridge` passes, else
+    /// [`AntiSpoof::RefuseMultiTenant`] under the multi-tenant posture or
+    /// [`AntiSpoof::DisabledSingleTenant`] otherwise.
+    #[must_use]
+    pub fn with_antispoof(mut self, antispoof: AntiSpoof) -> Self {
+        self.antispoof = antispoof;
+        self
+    }
+
+    /// Build the veth wiring for a launch of `id` at `ip`: under [`AntiSpoof::Enforced`] a
+    /// **filtered** veth (per-port nft anti-spoof bound to `ip` + its deterministic
+    /// `IpPool::mac_for(ip)` MAC — the SAME MAC pinned on the container's `eth0`); otherwise
+    /// an unfiltered veth (legacy path — reached only under [`AntiSpoof::DisabledSingleTenant`],
+    /// as [`AntiSpoof::RefuseMultiTenant`] refuses the launch before this).
+    fn veth_for(&self, id: &str, ip: Ipv4Addr) -> VethNetwork {
+        if self.antispoof == AntiSpoof::Enforced {
+            VethNetwork::for_vm_filtered(id, &self.bridge, &ip.to_string(), &IpPool::mac_for(ip))
+        } else {
+            VethNetwork::for_vm(id, &self.bridge)
+        }
+    }
+
+    /// Fail-closed gate for a multi-tenant node without usable nftables: refuse the launch
+    /// (rather than silently run a container with no L2 isolation from its neighbors). A
+    /// no-op under [`AntiSpoof::Enforced`] / [`AntiSpoof::DisabledSingleTenant`].
+    fn ensure_antispoof_allows_launch(&self) -> Result<(), BackendError> {
+        if self.antispoof == AntiSpoof::RefuseMultiTenant {
+            return Err(BackendError::Launch(
+                "multi-tenant node: nftables bridge anti-spoof is unavailable, so a container \
+                 veth cannot be given per-port L2/L3 isolation from its neighbors on the shared \
+                 node bridge (including co-located managed Postgres). Refusing to launch (fail \
+                 closed). Install nftables and grant this node CAP_NET_ADMIN, or run it \
+                 single-tenant."
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Authorize exactly ONE `(project, workload)` to adopt the legacy shared `data` volume
@@ -1201,6 +1274,8 @@ impl ComputeBackend for ContainerBackend {
             .parse()
             .map_err(|e| BackendError::Other(format!("bad snapshot ip {ip}: {e}")))?;
         let id = container_id(&snapshot.project, &snapshot.workload, snapshot.replica);
+        // Fail-closed on a multi-tenant node without usable nftables (no L2 isolation).
+        self.ensure_antispoof_allows_launch()?;
 
         // Re-reserve the IP (recording ownership for this replica) and recreate the
         // host veth (the peer lands in the restored netns via the action-script below).
@@ -1210,7 +1285,9 @@ impl ComputeBackend for ContainerBackend {
             snapshot.replica,
             addr,
         );
-        let veth = VethNetwork::for_vm(&id, &self.bridge);
+        // Filtered under the enforced posture — the restore re-installs the SAME per-port
+        // anti-spoof as the launch path (CRIU left the netns empty; the host veth is fresh).
+        let veth = self.veth_for(&id, addr);
         if let Err(e) = veth.host_setup().await {
             self.ipam.lock().expect("ipam mutex").stop(
                 &snapshot.project,
@@ -1248,7 +1325,14 @@ impl ComputeBackend for ContainerBackend {
             veth.move_peer_into_netns(pid)
                 .await
                 .map_err(|e| format!("move veth peer: {e}"))?;
-            configure_in_netns(pid, &veth.peer_veth, addr, self.prefix, self.gateway)
+            configure_in_netns(
+                pid,
+                &veth.peer_veth,
+                addr,
+                self.prefix,
+                self.gateway,
+                &IpPool::mac_for(addr),
+            )
         };
         if let Err(e) = restore_net.await {
             // Best-effort: kill the restored container + release the IP so a retry
@@ -2113,6 +2197,8 @@ impl ContainerBackend {
         rootfs: &str,
         ip: Ipv4Addr,
     ) -> Result<Instance, BackendError> {
+        // Fail-closed on a multi-tenant node without usable nftables (no L2 isolation).
+        self.ensure_antispoof_allows_launch()?;
         // Launch the init process (the stock entrypoint) as the uid it should RUN as. For a
         // managed DB with no operator-set `user` that is the image's DETECTED runtime uid (e.g.
         // postgres 999) — so the entrypoint takes its non-root path and inits/serves directly
@@ -2162,7 +2248,9 @@ impl ContainerBackend {
         if self.cap_add_allowed {
             plan.cap_add = req.spec.cap_add.clone();
         }
-        let veth = VethNetwork::for_vm(id, &self.bridge);
+        // Filtered (per-port anti-spoof) under the enforced posture; unfiltered legacy wiring
+        // otherwise. host_setup installs the filter BEFORE the veth joins the bridge.
+        let veth = self.veth_for(id, ip);
         veth.host_setup()
             .await
             .map_err(|e| BackendError::Launch(format!("veth host setup: {e}")))?;
@@ -2231,12 +2319,21 @@ impl ContainerBackend {
                 .map_err(|e| BackendError::Launch(format!("write userns maps: {e}")))?;
         }
 
-        // Move the veth peer into the worker's netns + configure eth0/lo there.
+        // Move the veth peer into the worker's netns + configure eth0/lo there, pinning the
+        // deterministic `IpPool::mac_for(ip)` MAC so the guest's actual source MAC matches
+        // the anti-spoof filter's pinned MAC (the filter default-drops any other `ether saddr`).
         veth.move_peer_into_netns(pid)
             .await
             .map_err(|e| BackendError::Launch(format!("move veth peer: {e}")))?;
-        configure_in_netns(pid, &veth.peer_veth, ip, self.prefix, self.gateway)
-            .map_err(|e| BackendError::Launch(format!("netns config: {e}")))?;
+        configure_in_netns(
+            pid,
+            &veth.peer_veth,
+            ip,
+            self.prefix,
+            self.gateway,
+            &IpPool::mac_for(ip),
+        )
+        .map_err(|e| BackendError::Launch(format!("netns config: {e}")))?;
 
         // One-shot network-state dump (diagnostics): reveal the exact L2/L3 state and the
         // host→container reachability result right after the netns is configured, so a
@@ -2349,6 +2446,10 @@ impl ContainerBackend {
         use std::os::unix::process::ExitStatusExt;
         use tokio::io::AsyncReadExt as TokioReadExt;
 
+        // Fail-closed on a multi-tenant node without usable nftables (no L2 isolation) —
+        // an ephemeral client shares the same bridge as every workload.
+        self.ensure_antispoof_allows_launch()?;
+
         // --- The hardened one-shot sandbox plan. ---
         // A minimal synthetic spec feeds `SandboxPlan::for_spec`, so the one-shot inherits
         // the SAME hardened baseline as a launched workload: the pivoted (shared, never
@@ -2425,7 +2526,7 @@ impl ContainerBackend {
         }
 
         // --- Host veth + worker spawn + netns handshake (mirrors `launch_inner`). ---
-        let veth = VethNetwork::for_vm(id, &self.bridge);
+        let veth = self.veth_for(id, ip);
         veth.host_setup()
             .await
             .map_err(|e| BackendError::Launch(format!("veth host setup: {e}")))?;
@@ -2492,8 +2593,15 @@ impl ContainerBackend {
         veth.move_peer_into_netns(pid)
             .await
             .map_err(|e| BackendError::Launch(format!("move veth peer: {e}")))?;
-        configure_in_netns(pid, &veth.peer_veth, ip, self.prefix, self.gateway)
-            .map_err(|e| BackendError::Launch(format!("netns config: {e}")))?;
+        configure_in_netns(
+            pid,
+            &veth.peer_veth,
+            ip,
+            self.prefix,
+            self.gateway,
+            &IpPool::mac_for(ip),
+        )
+        .map_err(|e| BackendError::Launch(format!("netns config: {e}")))?;
 
         // Networking ready — release the worker to jail + exec the client.
         cstdin
@@ -3286,8 +3394,10 @@ fn configure_in_netns(
     ip: Ipv4Addr,
     prefix: u8,
     gateway: Ipv4Addr,
+    mac: &str,
 ) -> Result<(), String> {
     let peer = peer.to_string();
+    let mac = mac.to_string();
     std::thread::scope(|scope| {
         scope
             .spawn(move || -> Result<(), String> {
@@ -3303,7 +3413,7 @@ fn configure_in_netns(
                     let (conn, handle, _) =
                         rtnetlink::new_connection().map_err(|e| format!("netlink: {e}"))?;
                     tokio::spawn(conn);
-                    rename_up_addr_route(&handle, &peer, ip, prefix, gateway).await
+                    rename_up_addr_route(&handle, &peer, ip, prefix, gateway, &mac).await
                 })
             })
             .join()
@@ -3311,13 +3421,14 @@ fn configure_in_netns(
     })
 }
 
-/// The in-netns netlink sequence (rename peer→eth0, addr, up, default route, lo up).
+/// The in-netns netlink sequence (rename peer→eth0, pin MAC, addr, up, default route, lo up).
 async fn rename_up_addr_route(
     handle: &rtnetlink::Handle,
     peer: &str,
     ip: Ipv4Addr,
     prefix: u8,
     gateway: Ipv4Addr,
+    mac: &str,
 ) -> Result<(), String> {
     use futures::TryStreamExt;
     let index = |name: String| async move {
@@ -3336,6 +3447,19 @@ async fn rename_up_addr_route(
         .execute()
         .await
         .map_err(|e| format!("rename eth0: {e}"))?;
+    // Pin eth0's hardware address to the deterministic `IpPool::mac_for(ip)` MAC while the
+    // link is still DOWN (a MAC change requires the link down). This is what the host-side
+    // veth's anti-spoof filter expects as `ether saddr`; a kernel-random MAC would be
+    // default-dropped. Set on EVERY container path (launch/restore/CRIU/ephemeral) so the
+    // filter's pinned MAC always matches the guest's actual source MAC.
+    let mac_bytes = crate::net::mac_bytes(mac)?;
+    handle
+        .link()
+        .set(peer_idx)
+        .address(mac_bytes.to_vec())
+        .execute()
+        .await
+        .map_err(|e| format!("set eth0 mac: {e}"))?;
     handle
         .address()
         .add(peer_idx, std::net::IpAddr::V4(ip), prefix)
@@ -4366,6 +4490,68 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    /// The anti-spoof posture drives BOTH the veth shape (filtered vs legacy) and the
+    /// fail-closed launch gate: enforced ⇒ a filtered veth + launches allowed; single-tenant
+    /// nft-less ⇒ unfiltered + still allowed (warn-only); multi-tenant nft-less ⇒ launches
+    /// refused. The default (bare `new`) is the legacy no-filter behavior.
+    #[test]
+    fn antispoof_posture_selects_veth_shape_and_gates_launch() {
+        let data_dir = unique_dir("antispoof-posture");
+        let mk = |mode: AntiSpoof| {
+            ContainerBackend::new(
+                Arc::new(OneBlob(Vec::new())),
+                data_dir.clone(),
+                "br-boatramp".into(),
+                "10.0.0.0/24",
+                PathBuf::from("/proc/self/exe"),
+            )
+            .expect("backend")
+            .with_antispoof(mode)
+        };
+        let ip = Ipv4Addr::new(10, 0, 0, 5);
+
+        // Enforced: a FILTERED veth pinned to the IP + its deterministic MAC; launches allowed.
+        let enf = mk(AntiSpoof::Enforced);
+        let v = enf.veth_for("web-0", ip);
+        assert_eq!(v.host_veth, "vth-web-0");
+        assert_eq!(v.filter_table(), "brl2-vth-web-0");
+        let f = v
+            .filter
+            .as_ref()
+            .expect("enforced posture pins an anti-spoof filter");
+        assert_eq!(f.guest_ip, "10.0.0.5");
+        assert_eq!(f.guest_mac, IpPool::mac_for(ip), "pins IpPool::mac_for(ip)");
+        assert!(enf.ensure_antispoof_allows_launch().is_ok());
+
+        // Single-tenant, nft unusable: UNfiltered (legacy) veth, launches still allowed.
+        let st = mk(AntiSpoof::DisabledSingleTenant);
+        assert!(
+            st.veth_for("web-0", ip).filter.is_none(),
+            "single-tenant nft-less posture installs no filter"
+        );
+        assert!(st.ensure_antispoof_allows_launch().is_ok());
+
+        // Multi-tenant, nft unusable: REFUSE launches (fail closed).
+        let mt = mk(AntiSpoof::RefuseMultiTenant);
+        assert!(
+            mt.ensure_antispoof_allows_launch().is_err(),
+            "multi-tenant nft-less posture must refuse launches"
+        );
+
+        // Default (bare `new`, no `with_antispoof`) = the legacy no-filter behavior.
+        let def = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            data_dir.clone(),
+            "br-boatramp".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/proc/self/exe"),
+        )
+        .expect("backend");
+        assert_eq!(def.antispoof, AntiSpoof::DisabledSingleTenant);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]

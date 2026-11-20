@@ -6,9 +6,10 @@
 //! and derive a stable locally-administered MAC from the IP. The allocation set
 //! is the authority the control plane persists; this is the pure logic over it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ipnet::Ipv4Net;
 
@@ -38,6 +39,19 @@ pub struct IpPool {
     net: Ipv4Net,
     gateway: Ipv4Addr,
     allocated: BTreeSet<u32>,
+    /// **Release quarantine** (U17): how long a just-released address is skipped by
+    /// the fresh-[`allocate`](Self::allocate) scan before it may be re-handed, so a
+    /// reissued IP (and its deterministic MAC = f(IP)) can't instantly route a new
+    /// tenant into a prior tenant's stale-peer traffic. `ZERO` (the default) disables
+    /// it — every existing caller/test is byte-identical; the compute node opts in.
+    /// The stable-reuse path ([`allocate_stable`](Self::allocate_stable) with a free
+    /// `preferred`) BYPASSES the quarantine, so a replica reclaiming its own address
+    /// across a stop+relaunch stays stable.
+    release_cooldown: Duration,
+    /// Addresses released within the cooldown window: `ip → released-at`. Consulted by
+    /// [`allocate`](Self::allocate); an entry is dropped once its cooldown elapses or
+    /// the address is handed out again. Empty whenever `release_cooldown` is `ZERO`.
+    quarantine: BTreeMap<u32, Instant>,
 }
 
 impl IpPool {
@@ -52,7 +66,24 @@ impl IpPool {
             net,
             gateway,
             allocated: BTreeSet::new(),
+            release_cooldown: Duration::ZERO,
+            quarantine: BTreeMap::new(),
         })
+    }
+
+    /// Set the [release quarantine](Self::release_cooldown) window (U17). Consuming
+    /// builder for a freshly-built pool; see also
+    /// [`IpAuthority::with_release_cooldown`].
+    #[must_use]
+    pub fn with_release_cooldown(mut self, cooldown: Duration) -> Self {
+        self.release_cooldown = cooldown;
+        self
+    }
+
+    /// Set the release-quarantine window in place (for a pool already wrapped in an
+    /// [`IpAuthority`]).
+    pub fn set_release_cooldown(&mut self, cooldown: Duration) {
+        self.release_cooldown = cooldown;
     }
 
     /// The reserved gateway address (`.1`).
@@ -111,30 +142,80 @@ impl IpPool {
         if let Some(ip) = preferred
             && self.is_free(ip)
         {
-            self.allocated.insert(ip.into());
+            let key = u32::from(ip);
+            // Reclaiming a specific free address (stable relaunch) bypasses the release
+            // quarantine — this replica is re-taking *its own* endpoint, not a fresh one.
+            self.quarantine.remove(&key);
+            self.allocated.insert(key);
             return Ok(ip);
         }
         self.allocate()
     }
 
-    /// Allocate the next free guest IP.
+    /// Allocate the next free guest IP. Skips the gateway, allocated addresses, and —
+    /// when a [release quarantine](Self::release_cooldown) is configured — addresses
+    /// still cooling down after a recent release (U17), falling back to a cooling
+    /// address only if nothing else is free (so the quarantine never causes a false
+    /// exhaustion).
     pub fn allocate(&mut self) -> Result<Ipv4Addr, IpamError> {
+        self.allocate_at(Instant::now())
+    }
+
+    /// [`allocate`](Self::allocate) with the clock injected (host-testable quarantine).
+    fn allocate_at(&mut self, now: Instant) -> Result<Ipv4Addr, IpamError> {
+        // First pass: a fully-free address that is not still cooling down.
         for ip in self.net.hosts() {
             if ip == self.gateway {
                 continue;
             }
             let key = u32::from(ip);
-            if !self.allocated.contains(&key) {
-                self.allocated.insert(key);
-                return Ok(ip);
+            if self.allocated.contains(&key) || self.is_cooling(key, now) {
+                continue;
             }
+            self.quarantine.remove(&key);
+            self.allocated.insert(key);
+            return Ok(ip);
+        }
+        // Second pass (pressure fallback): every free address is still cooling — reuse
+        // one rather than report a false exhaustion (lowest-first, as before).
+        for ip in self.net.hosts() {
+            if ip == self.gateway {
+                continue;
+            }
+            let key = u32::from(ip);
+            if self.allocated.contains(&key) {
+                continue;
+            }
+            self.quarantine.remove(&key);
+            self.allocated.insert(key);
+            return Ok(ip);
         }
         Err(IpamError::Exhausted)
     }
 
-    /// Return `ip` to the pool.
+    /// Whether `key` was released within the quarantine window and may not yet be
+    /// re-handed by the fresh-allocation scan.
+    fn is_cooling(&self, key: u32, now: Instant) -> bool {
+        match self.quarantine.get(&key) {
+            Some(released) => now.duration_since(*released) < self.release_cooldown,
+            None => false,
+        }
+    }
+
+    /// Return `ip` to the pool. When a [release quarantine](Self::release_cooldown) is
+    /// configured, the address is held out of the fresh-allocation scan for the cooldown
+    /// window (U17).
     pub fn release(&mut self, ip: Ipv4Addr) {
-        self.allocated.remove(&u32::from(ip));
+        self.release_at(ip, Instant::now());
+    }
+
+    /// [`release`](Self::release) with the clock injected (host-testable quarantine).
+    fn release_at(&mut self, ip: Ipv4Addr, now: Instant) {
+        let key = u32::from(ip);
+        self.allocated.remove(&key);
+        if !self.release_cooldown.is_zero() {
+            self.quarantine.insert(key, now);
+        }
     }
 
     /// How many addresses are currently allocated.
@@ -224,6 +305,20 @@ impl IpAuthority {
             high_water: Self::DEFAULT_HIGH_WATER,
             warned_high: Arc::new(Mutex::new(false)),
         }
+    }
+
+    /// Set the shared pool's [release quarantine](IpPool::release_cooldown) window
+    /// (U17), so a released guest IP is held out of the fresh-allocation scan for the
+    /// cooldown before it (and its deterministic MAC) can be re-handed to a different
+    /// tenant. Applies to every co-located backend drawing from this authority; the
+    /// stable-relaunch path (a replica reclaiming its own free address) bypasses it.
+    #[must_use]
+    pub fn with_release_cooldown(self, cooldown: Duration) -> Self {
+        self.pool
+            .lock()
+            .expect("ipam authority")
+            .set_release_cooldown(cooldown);
+        self
     }
 
     /// The reserved gateway address (`.1`) of the shared subnet.
@@ -687,6 +782,73 @@ mod tests {
             IpPool::new("not-a-cidr"),
             Err(IpamError::BadCidr(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // U17: IP release quarantine. A just-released address is held out of the fresh
+    // allocation scan for a cooldown window, so a reissued IP (and its deterministic
+    // MAC = f(IP)) can't instantly route a new tenant into stale-peer traffic.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_pool_has_no_quarantine() {
+        // cooldown ZERO (the default) ⇒ a released address is immediately reusable,
+        // exactly as before — every existing caller/test is unaffected.
+        let mut pool = IpPool::new("10.0.0.0/24").unwrap();
+        let a = pool.allocate().unwrap();
+        pool.release(a);
+        assert_eq!(pool.allocate().unwrap(), a);
+    }
+
+    #[test]
+    fn quarantine_skips_a_recently_released_ip_until_the_cooldown_elapses() {
+        let t0 = Instant::now();
+        let mut pool = IpPool::new("10.0.0.0/24")
+            .unwrap()
+            .with_release_cooldown(Duration::from_secs(30));
+        let a = pool.allocate_at(t0).unwrap(); // .2
+        let b = pool.allocate_at(t0).unwrap(); // .3
+        pool.release_at(a, t0); // .2 released → quarantined at t0
+
+        // Within the window, the freed .2 is skipped; the next free (.4) is handed out.
+        let c = pool.allocate_at(t0 + Duration::from_secs(5)).unwrap();
+        assert_ne!(c, a, "a cooling address must not be re-handed");
+        assert_ne!(c, b);
+
+        // After the window elapses, .2 is reusable again.
+        pool.release_at(c, t0 + Duration::from_secs(5));
+        // Far in the future: both .2 and the just-freed c have cooled; the lowest free wins.
+        let later = pool.allocate_at(t0 + Duration::from_secs(60)).unwrap();
+        assert_eq!(later, a, ".2 is reissued once its cooldown has elapsed");
+    }
+
+    #[test]
+    fn quarantine_falls_back_under_pressure_rather_than_false_exhaustion() {
+        // A /30 has exactly one allocatable host (.2). Releasing it quarantines it, but a
+        // subsequent allocation must still succeed (reuse the cooling address) rather than
+        // falsely report the pool exhausted.
+        let t0 = Instant::now();
+        let mut pool = IpPool::new("10.0.0.0/30")
+            .unwrap()
+            .with_release_cooldown(Duration::from_secs(30));
+        let only = pool.allocate_at(t0).unwrap();
+        pool.release_at(only, t0);
+        // Still within the cooldown, but it's the only address — fall back to it.
+        assert_eq!(pool.allocate_at(t0 + Duration::from_secs(1)).unwrap(), only);
+    }
+
+    #[test]
+    fn quarantine_bypassed_by_stable_reclaim_of_own_address() {
+        // A replica reclaiming its OWN endpoint across a stop+relaunch (stable IP) must
+        // NOT be blocked by the quarantine — only a FRESH allocation is held back.
+        let t0 = Instant::now();
+        let mut pool = IpPool::new("10.0.0.0/24")
+            .unwrap()
+            .with_release_cooldown(Duration::from_secs(30));
+        let a = pool.allocate_at(t0).unwrap();
+        pool.release_at(a, t0);
+        // The stable path reuses the freed preferred address immediately.
+        assert_eq!(pool.allocate_stable(Some(a)).unwrap(), a);
     }
 
     #[test]
