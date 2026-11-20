@@ -7,6 +7,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.68.0] — 2026-11-20
+
 ### Added
 
 - **Turnkey, firewall-coherent compute networking (docker + native container).** `--bind
