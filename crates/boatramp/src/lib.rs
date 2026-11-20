@@ -356,7 +356,7 @@ fn run() -> Result<(), CliError> {
     // in the child while possibly holding locks). At this point we're still
     // single-threaded.
     #[cfg(target_os = "linux")]
-    if std::env::args().nth(1).as_deref() == Some("__sandbox") {
+    if std::env::args().nth(1).as_deref() == Some(boatramp_container::worker::SANDBOX_SUBCOMMAND) {
         return run_sandbox();
     }
     // A re-exec'd `boatramp __vmm-run <json>` is the embedded VMM backend's jailed
@@ -390,40 +390,16 @@ fn run() -> Result<(), CliError> {
 /// as JSON on stdin, apply it (namespaces/mounts/`pivot_root`/cgroups/seccomp/
 /// drop-privileges), and `execve` the entrypoint. Never returns on success in
 /// the forked child; the parent exits with the child's status.
+///
+/// The whole handshake lives in `boatramp_container` ([`run_sandbox_worker`]) so an
+/// embedder of the container backend can route its own `__sandbox` re-exec to the
+/// same sequence; this is the host binary's thin dispatch into it, carrying the
+/// backend's typed error through transparently.
+///
+/// [`run_sandbox_worker`]: boatramp_container::worker::run_sandbox_worker
 #[cfg(target_os = "linux")]
 fn run_sandbox() -> Result<(), CliError> {
-    use std::io::{BufRead, Write};
-    let stdin = std::io::stdin();
-    let mut reader = std::io::BufReader::new(stdin.lock());
-
-    // Line 1: the SandboxPlan as JSON.
-    let mut plan_line = String::new();
-    reader
-        .read_line(&mut plan_line)
-        .map_err(CliError::SandboxPlanRead)?;
-    let plan: boatramp_container::SandboxPlan =
-        serde_json::from_str(plan_line.trim()).map_err(CliError::SandboxPlanParse)?;
-
-    // Set up the cgroup + namespaces (we're now in our own netns).
-    boatramp_container::worker::prepare(&plan).map_err(CliError::SandboxPrepare)?;
-
-    // Network handshake: tell the launcher we've unshared (so it can move the
-    // veth peer into our netns + configure eth0), then block for its "go".
-    {
-        let mut out = std::io::stdout().lock();
-        out.write_all(b"ready\n")
-            .and_then(|()| out.flush())
-            .map_err(CliError::SandboxReady)?;
-    }
-    let mut go = String::new();
-    reader.read_line(&mut go).map_err(CliError::SandboxGo)?;
-    if go.trim() != "go" {
-        return Err(CliError::SandboxHandshake { got: go });
-    }
-
-    // Fork the container init, jail it, and exec the entrypoint.
-    let code = boatramp_container::worker::jail_and_run(&plan).map_err(CliError::SandboxWorker)?;
-    std::process::exit(code);
+    boatramp_container::worker::run_sandbox_worker().map_err(CliError::Sandbox)
 }
 
 /// The embedded VMM backend's jailed per-VM worker (`boatramp __vmm-run`): build +
