@@ -3502,15 +3502,37 @@ pub async fn reconcile_once(
         // PER-PROJECT operator policy — operator-first, narrowing-only (intersect allows /
         // union forbids / per-project `prefer` wins). The composed policy is what the
         // scheduler selects on, so a tenant `require`/`prefer` can only ever pick WITHIN the
-        // operator bound. A missing/empty per-project record composes to exactly `policy`
-        // (back-compat). A store read error is non-fatal: fall back to the node bound alone
-        // (never fail-OPEN past it — composition only narrows).
-        let project_policy = deploy
-            .get_project_backend_policy(project)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        // operator bound.
+        //
+        // FAIL CLOSED on a store ERROR (distinct from `Ok(None)`): the per-project
+        // `forbid`/`allow` is a security control — the ONLY per-project isolation-hardening
+        // mechanism (there is deliberately no per-project posture field), and the write path
+        // (`set_project_backend_policy` → `put_durable_checkpointed`) treats a lost write as
+        // never-silently-revert-to-more-permissive. So an `Err` must NOT collapse to the empty
+        // policy (which would drop the forbid/allow and place under the node bound alone —
+        // fail-OPEN). Instead HOLD new placements for this workload: skip BEFORE
+        // `reconcile_plan_in`, so no plan is computed ⇒ no new `Launch` AND no `Stop`/
+        // scale-down — existing replicas keep running; only new placement is held during the
+        // blip, which self-heals on the next tick. Mirrors the `get_compute_spec` skip
+        // precedent in this loop. `Ok(None)` (no record) correctly composes to the node bound
+        // (back-compat).
+        let project_policy = match deploy.get_project_backend_policy(project).await {
+            Ok(p) => p.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(
+                    project = %project_name,
+                    workload = %workload.name,
+                    error = %e,
+                    "compute: backend policy unavailable — holding new placement (existing replicas untouched)",
+                );
+                // Surface via the same `not scheduled:` path the planner's shortfalls use.
+                report.errors.push(format!(
+                    "{}: not scheduled: backend policy unavailable — placement held",
+                    workload.name
+                ));
+                continue;
+            }
+        };
         let effective_policy = policy.compose_project(&project_policy);
         // Persist the per-workload placement-explain (legibility that survives the stuck-at-0
         // case: a no-placement workload has zero replica rows but still gets this). Best-effort
@@ -7042,6 +7064,120 @@ mod tests {
                 .unwrap()
                 .eligibility,
             BackendEligibility::ForbiddenByProjectPolicy,
+        );
+    }
+
+    /// A [`KvStore`](crate::kv::KvStore) wrapper that returns a store `Err` from `get` for any
+    /// key containing a substring, delegating everything else to an inner store — to exercise
+    /// a TRANSIENT per-project-policy read fault in the reconcile loop.
+    struct FailGetOnKey {
+        inner: Arc<dyn crate::kv::KvStore>,
+        needle: String,
+    }
+
+    #[async_trait]
+    impl crate::kv::KvStore for FailGetOnKey {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, crate::error::KvError> {
+            if key.contains(&self.needle) {
+                return Err(crate::error::KvError::backend(
+                    "injected transient read fault",
+                ));
+            }
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), crate::error::KvError> {
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), crate::error::KvError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, crate::error::KvError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    /// MUST-FIX (v0.67.0 Security review): a per-project-policy read ERROR must FAIL CLOSED —
+    /// HOLD new placement for the workload, NOT silently drop the project `forbid`/`allow` and
+    /// place under the node bound alone (fail-open). The operator has forbidden "fake" (the
+    /// only backend the node offers); a transient read fault must not let the workload land on
+    /// it, and must not Stop any existing replica.
+    ///
+    /// Mutation reasoning: reverting the fix to `get_project_backend_policy(..).await.ok()
+    /// .flatten().unwrap_or_default()` collapses the `Err` into the empty policy ⇒ the node
+    /// bound (which permits "fake") applies ⇒ the free ordinal is LAUNCHED on the forbidden
+    /// backend ⇒ `r.launched == 0` flips to `1` and the "placement held" reason disappears, so
+    /// this test fails.
+    #[tokio::test]
+    async fn per_project_policy_read_error_holds_placement_fail_closed() {
+        let inner: Arc<dyn crate::kv::KvStore> = Arc::new(crate::kv::MemoryKv::new());
+        let kv: Arc<dyn crate::kv::KvStore> = Arc::new(FailGetOnKey {
+            inner: inner.clone(),
+            needle: "backend_policy".into(),
+        });
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv);
+        // The operator HAS forbidden "fake" (stored fine — the fault is on GET only). Two
+        // replicas desired; ordinal 0 is already running, ordinal 1 is a free placement.
+        deploy
+            .set_project_backend_policy(
+                crate::project::ProjectRef::DEFAULT,
+                &ProjectBackendPolicy {
+                    allow: None,
+                    forbid: vec!["fake".into()],
+                    prefer: None,
+                },
+            )
+            .await
+            .unwrap();
+        let hash = put_workload(&deploy, "w", 256, 2).await;
+        let mut running = observed("w", 0, 1, true);
+        running.backend = "fake".into();
+        running.active_spec = Some(hash);
+        deploy
+            .set_replica_state(crate::project::ProjectRef::DEFAULT, &running)
+            .await
+            .unwrap();
+
+        let nodes = vec![fake_node()];
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(FakeBackend));
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &BackendPolicy::default(), // node bound permits "fake" — the exclusion is per-project
+            &AlwaysActive,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // HELD: no new placement (the free ordinal is NOT launched on the forbidden backend)…
+        assert_eq!(
+            r.launched, 0,
+            "a policy read error must HOLD, never place on the node-allowed-but-project-forbidden backend: {:?}",
+            r.errors
+        );
+        // …and no existing replica is stopped/scaled down (plan not computed at all).
+        assert_eq!(
+            r.stopped, 0,
+            "existing replicas must keep running during the read blip"
+        );
+        // Legible held reason surfaced via the same `not scheduled:` path.
+        assert!(
+            r.errors.iter().any(|e| e.contains("placement held")),
+            "the held reason must be legible: {:?}",
+            r.errors
+        );
+        // The existing replica's state is untouched.
+        assert!(
+            !deploy
+                .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the existing replica record survives the held pass"
         );
     }
 
