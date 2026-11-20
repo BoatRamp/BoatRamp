@@ -918,6 +918,79 @@
           # can't run it).
           checks = {
             clippy = workspaceClippy;
+
+            # NixOS module eval gate (Gap B). Pure eval — no VM — so it runs on the
+            # macOS builder too: evaluate `services.boatramp` with `compute` on/off and
+            # assert the firewall admits the compute-shim traffic on the boatramp
+            # compute bridges (the static `br-boatramp` + the per-project docker
+            # `boatramp-` prefix), scoped to those bridges and NOT the broad `br-+`,
+            # present under `compute` and absent without it, across BOTH firewall
+            # backends (iptables + nftables). Forced at `nix flake check` eval time via
+            # the `assert`, so `--no-build` still catches a regression.
+            compute-firewall-eval =
+              let
+                firewallOf =
+                  {
+                    compute,
+                    shimPorts ? [ ],
+                    nftables ? false,
+                  }:
+                  (inputs.nixpkgs.lib.nixosSystem {
+                    system = "x86_64-linux";
+                    modules = [
+                      inputs.self.nixosModules.default
+                      {
+                        nixpkgs.hostPlatform = "x86_64-linux";
+                        networking.nftables.enable = nftables;
+                        services.boatramp = {
+                          enable = true;
+                          inherit compute;
+                          computeShimPorts = shimPorts;
+                          configFile = pkgs.writeText "boatramp.cfg" ''(serve: (addr: "127.0.0.1:8080"))'';
+                        };
+                      }
+                    ];
+                  }).config.networking.firewall;
+
+                onIpt = firewallOf { compute = true; };
+                offIpt = firewallOf { compute = false; };
+                scopedIpt = firewallOf {
+                  compute = true;
+                  shimPorts = [
+                    8083
+                    8084
+                  ];
+                };
+                onNft = firewallOf {
+                  compute = true;
+                  nftables = true;
+                };
+
+                has = hay: needle: lib.hasInfix needle hay;
+                a = lib.asserts.assertMsg;
+                assertions = [
+                  # Present under `compute` (iptables backend): the static native/firecracker
+                  # bridge AND the per-project docker bridge name-prefix wildcard.
+                  (a (has onIpt.extraCommands "-i br-boatramp ") "compute: iptables rule must match br-boatramp")
+                  (a (has onIpt.extraCommands "-i boatramp-+ ") "compute: iptables rule must match the docker boatramp- prefix")
+                  # Scoped to boatramp bridges — never the broad `br-+`/`br+` (would trust every
+                  # docker bridge, i.e. other tenants' / unrelated networks).
+                  (a (!has onIpt.extraCommands "-i br-+ ") "compute: must NOT trust all br-+")
+                  (a (!has onIpt.extraCommands "-i br+ ") "compute: must NOT trust all br+")
+                  # Absent without `compute`.
+                  (a (!has offIpt.extraCommands "boatramp") "no-compute: firewall must not touch the compute bridges")
+                  # `computeShimPorts` narrows to the specific TCP dports (least privilege).
+                  (a (has scopedIpt.extraCommands "--dports 8083,8084") "computeShimPorts must narrow the rule to those ports")
+                  # nftables backend: fixed name for br-boatramp, glob prefix for the docker bridges.
+                  (a (has onNft.extraInputRules ''iifname "br-boatramp"'') "compute(nft): rule must match br-boatramp")
+                  (a (has onNft.extraInputRules ''iifname "boatramp-*"'') "compute(nft): rule must match the docker boatramp-* glob")
+                  (a (!has onNft.extraInputRules ''iifname "br-*"'') "compute(nft): must NOT trust all br-*")
+                ];
+              in
+              assert lib.all (x: x) assertions;
+              pkgs.runCommand "boatramp-compute-firewall-eval" { } ''
+                echo "services.boatramp compute-firewall module assertions passed" > $out
+              '';
           }
           // lib.optionalAttrs pkgs.stdenv.isLinux {
             # Compile-lint the whole feature matrix for the shipped musl target — the

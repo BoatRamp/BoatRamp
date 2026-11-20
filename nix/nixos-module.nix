@@ -68,8 +68,9 @@ in
       default = false;
       description = ''
         Relax the systemd sandbox so the Linux compute backends (microVM/container:
-        `/dev/kvm`, namespaces, mounts) can run. Off by default — a hardened
-        static/handler/TLS node needs none of it.
+        `/dev/kvm`, namespaces, mounts) can run, AND admit the compute-shim traffic
+        on the boatramp compute bridges in the firewall (see below). Off by default —
+        a hardened static/handler/TLS node needs none of it.
 
         This is an opt-in operator posture change: it grants the (non-root) service
         the **ambient** capabilities `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_SETUID`
@@ -80,6 +81,35 @@ in
         not merely bounding-set, because `NoNewPrivileges` + a non-root `User` make a
         bounding-set-only capability ineffective.) `CAP_SYS_ADMIN` is broad; enable
         this only on a node you intend to run compute workloads on.
+
+        It ALSO opens the firewall for the token-gated compute-shim data plane on the
+        boatramp compute bridges ONLY — `br-boatramp` (native-container/firecracker)
+        and the per-project docker bridges (the `boatramp-` interface-name prefix
+        boatramp pins via the bridge driver-opt). A compute workload runs on a bridge
+        whose gateway is the host, and the shims are bound host-side; on a
+        default-firewall host the INPUT chain would otherwise DROP the
+        container→host:shim-port packet even though the caps to create the bridge were
+        granted. The rule is scoped to the boatramp bridges, so it never admits the
+        LAN/public interface or an unrelated docker bridge (`br-<hash>`); see
+        `computeShimPorts` to narrow it further to specific ports.
+      '';
+    };
+
+    computeShimPorts = lib.mkOption {
+      type = lib.types.listOf lib.types.port;
+      default = [ ];
+      example = [
+        8083
+        8084
+      ];
+      description = ''
+        TCP ports to narrow the `compute` firewall rule to — the compute-shim ports
+        this node serves (the `:<port>` of each `compute.<kind>_shim_url` in the RON
+        config). Least-privilege hardening: when set, the firewall admits ONLY these
+        ports on the boatramp compute bridges, instead of trusting all traffic on
+        them. Empty (the default) trusts the boatramp bridge interfaces wholesale —
+        still scoped to those interfaces, so the off-node boundary is unchanged, but
+        not narrowed to the shim ports. Has no effect unless `compute` is enabled.
       '';
     };
   };
@@ -95,12 +125,69 @@ in
     };
     users.groups = lib.mkIf (cfg.group == "boatramp") { boatramp = { }; };
 
-    networking.firewall = lib.mkIf cfg.openFirewall {
-      allowedTCPPorts = [
-        80
-        443
-      ];
-    };
+    networking.firewall = lib.mkMerge [
+      (lib.mkIf cfg.openFirewall {
+        allowedTCPPorts = [
+          80
+          443
+        ];
+      })
+      # Gap B — firewall coherence. `compute` grants the caps to CREATE the compute
+      # bridges, but a default-firewall host still DROPs the container→host:shim-port
+      # packet at INPUT. Admit the compute-shim data plane on the boatramp compute
+      # bridges ONLY: the static `br-boatramp` (native-container/firecracker) and the
+      # per-project docker bridges, whose Linux interface names boatramp pins to the
+      # `boatramp-` prefix (boatramp-docker's `project_bridge_name` /
+      # `PROJECT_BRIDGE_PREFIX`). Matching that scoped prefix — never the broad `br-+`
+      # — is the crux of the off-node invariant: the rule accepts traffic ARRIVING on
+      # a boatramp bridge (the project's own containers → the host), and admits
+      # nothing on the LAN/public interface or on an unrelated docker bridge.
+      #
+      # Two firewall backends, two syntaxes for the per-project docker bridges'
+      # name-prefix match (the hash suffix is per-project, so an exact name is
+      # impossible): nftables uses an `iifname "boatramp-*"` glob; iptables uses the
+      # `boatramp-+` interface wildcard. `br-boatramp` is a fixed name in both.
+      # `computeShimPorts` narrows the match to specific TCP dports when set; empty
+      # trusts the boatramp bridge interfaces wholesale (still interface-scoped).
+      (lib.mkIf cfg.compute (
+        let
+          useNft = config.networking.nftables.enable;
+          ports = cfg.computeShimPorts;
+          scoped = ports != [ ];
+          # nftables: `tcp dport { 8083, 8084 }` when scoped, else bare `tcp`.
+          nftMatch = if scoped then "tcp dport { ${lib.concatMapStringsSep ", " toString ports} }" else "tcp";
+          nftRule = ifaceSel: "${ifaceSel} ${nftMatch} accept";
+          # iptables: `-p tcp -m multiport --dports 8083,8084` when scoped, else `-p tcp`.
+          iptMatch =
+            if scoped then
+              "-p tcp -m multiport --dports ${lib.concatMapStringsSep "," toString ports}"
+            else
+              "-p tcp";
+          iptRule = iface: "iptables -A nixos-fw -i ${iface} ${iptMatch} -j nixos-fw-accept";
+          iptDel =
+            iface: "iptables -D nixos-fw -i ${iface} ${iptMatch} -j nixos-fw-accept 2>/dev/null || true";
+        in
+        if useNft then
+          {
+            extraInputRules = ''
+              ${nftRule "iifname \"br-boatramp\""}
+              ${nftRule "iifname \"boatramp-*\""}
+            '';
+          }
+        else
+          {
+            extraCommands = ''
+              ${iptRule "br-boatramp"}
+              ${iptRule "boatramp-+"}
+            '';
+            # Remove our rules on firewall stop/reload so they don't accumulate.
+            extraStopCommands = ''
+              ${iptDel "br-boatramp"}
+              ${iptDel "boatramp-+"}
+            '';
+          }
+      ))
+    ];
 
     # ProtectSystem=strict makes the FS read-only; the data dir is the one writable
     # path, created + owned before start.
