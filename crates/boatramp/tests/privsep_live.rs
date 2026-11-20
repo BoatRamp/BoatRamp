@@ -140,6 +140,15 @@ fn privsep_two_instance_composition_serves_end_to_end() {
         }
     };
 
+    // HIGH-1 (final privsep Security re-review) — while the node is STILL serving, probe the
+    // cross-instance `/proc/<pid>/mem` wall against the REAL crown-jewel `core` instance: a capless
+    // same-uid sibling must be DENIED reading its memory (`PR_SET_DUMPABLE(0)` ⇒ root-owned +
+    // `ptrace_may_access`-gated). Capture the verdict NOW (node alive) but assert AFTER teardown so a
+    // failure doesn't leak the node. Linux+`sandbox` only — the probe uses `libc::fork` + the sandbox
+    // capability primitives, so it is cfg-gated (this test otherwise compiles on every platform).
+    #[cfg(all(target_os = "linux", feature = "sandbox"))]
+    let proc_mem_verdict = probe_cross_instance_proc_mem_wall(&cfg_path);
+
     let _ = root.kill();
     let _ = root.wait();
     let _ = std::fs::remove_dir_all(&tmp);
@@ -153,6 +162,12 @@ fn privsep_two_instance_composition_serves_end_to_end() {
         "expected the backend instance's body marker (proving the SCM_RIGHTS splice reached a \
          sandboxed serving backend), got:\n{response}"
     );
+
+    // HIGH-1 cross-instance `/proc/<pid>/mem` wall: assert the capless sibling was DENIED and emit the
+    // `PRIVSEP PROC-MEM WALL OK` marker (mutation-verified — see `assert_proc_mem_wall`). A hard gate:
+    // a wall-down verdict, or a probe that could not run (target gone / capdrop failed), FAILS here.
+    #[cfg(all(target_os = "linux", feature = "sandbox"))]
+    assert_proc_mem_wall(proc_mem_verdict);
 
     // The marker the CI gate greps — only reached after a real 200 came back over the full path.
     println!("PRIVSEP LIVE OK");
@@ -1887,4 +1902,279 @@ fn privsep_node_self_host_refuses_fail_closed_end_to_end() {
 
     // The marker the CI gate greps — reached only after the root refused self-hosting fail-closed.
     println!("PRIVSEP NODE SELF-HOST REFUSED OK");
+}
+
+// =============================================================================
+// HIGH-1 LIVE GATE — the cross-instance `/proc/<pid>/mem` key-disclosure WALL.
+// =============================================================================
+//
+// The final privsep Security re-review found (HIGH-1) that on the same-kernel instance substrates
+// (OsProcess default + the Container "simple model") the VFS path to a sibling's `/proc/<pid>/mem` was
+// left open: all instances run as the same node uid in the SHARED host pid namespace, `/proc` is
+// read-granted in every derived Landlock profile, and `openat`/`pread64` are allowed — so a compromised
+// frontend instance could `openat("/proc/<signer-pid>/mem")` + `pread64` a crown-jewel key straight out
+// of a holder's mlocked address space, bypassing the ptrace/process_vm_readv seccomp KILL (that VFS read
+// issues NO ptrace syscall). The fix: every served instance calls `sandbox::set_process_undumpable()`
+// (`prctl(PR_SET_DUMPABLE, 0)`) post-exec, which reparents its `/proc/<pid>/*` to root:root and gates
+// them behind `ptrace_may_access` — so a capless same-uid sibling gets `EPERM`/`EACCES`.
+//
+// This assertion (invoked from `privsep_two_instance_composition_serves_end_to_end`, while that real
+// `__root` composition is serving) PROVES the wall against the REAL crown-jewel `core` instance, and is
+// MUTATION-verifiable: with the fix present the capless same-uid sibling is DENIED (`PRIVSEP PROC-MEM
+// WALL OK`); revert `set_process_undumpable()` and the SAME read SUCCEEDS (the reader reports DISCLOSED
+// and the assertion fails), proving the gate has teeth. The CI `live gate (privsep)` job greps the
+// marker, so a silent skip / compile-out fails the merge (the "ignore-gated tests != evidence" rule).
+
+/// The success marker the CI `live gate (privsep)` job greps for the HIGH-1 wall.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+const PROC_MEM_WALL_MARKER: &str = "PRIVSEP PROC-MEM WALL OK";
+
+/// The `/proc/sys/kernel/yama/ptrace_scope` sysctl (absent on a kernel built without
+/// `CONFIG_SECURITY_YAMA`).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+const PTRACE_SCOPE_PATH: &str = "/proc/sys/kernel/yama/ptrace_scope";
+
+/// Reader-child verdicts (reported via `_exit`, like the netns/pathuds fork-probes above).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+mod proc_mem_probe_codes {
+    pub const WALL_OK: i32 = 60; // the read was DENIED (EPERM/EACCES) — the PR_SET_DUMPABLE(0) wall held
+    pub const DISCLOSED: i32 = 61; // the read was ADMITTED (open+read) — the wall is DOWN (mutation signal)
+    pub const CAPDROP_FAILED: i32 = 62; // the reader could not shed CAP_SYS_PTRACE (would be a false pass)
+    pub const TARGET_GONE: i32 = 63; // `/proc/<pid>/mem` open ENOENT/ESRCH — the core PID vanished (race)
+    pub const SETUP_FAILED: i32 = 64; // an unexpected open/read errno (not a verdict)
+}
+
+/// The decoded verdict of the cross-instance `/proc/<pid>/mem` probe, captured WHILE the node is still
+/// serving but asserted AFTER teardown (so a failure does not leak the node).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+struct ProcMemVerdict {
+    code: i32,
+    detail: String,
+}
+
+/// Find the PID of the privsep instance whose re-exec cmdline carries the unique
+/// `__instance <label> --config <cfg_path>` token (the SAME token shape `read_container_core_caps`
+/// matches). `cmdline` is `0444`/world-readable even for a non-dumpable target, so the harness (same
+/// uid as the instance) can scan it without any capability. Pure-Rust `/proc` walk (no `sudo`).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn find_instance_pid(cfg_path: &std::path::Path, label: &str) -> Option<i32> {
+    let token = format!("__instance {label} --config {}", cfg_path.display());
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // `cmdline` args are NUL-separated; translate NUL→space to match the token shape above.
+        if let Ok(raw) = std::fs::read(entry.path().join("cmdline")) {
+            let joined = String::from_utf8_lossy(&raw).replace('\0', " ");
+            if joined.contains(&token) {
+                return name.parse::<i32>().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort lower `kernel.yama.ptrace_scope` to 0 for the probe window, returning the prior value to
+/// restore (`None` ⇒ Yama absent, already 0, or we could not lower it — nothing to restore).
+///
+/// WHY: with `ptrace_scope >= 1`, Yama INDEPENDENTLY blocks a non-ancestor same-uid reader EVEN when the
+/// target is dumpable — which would MASK a revert of the dumpable fix (the gate would stay green with the
+/// hole reopened: no teeth). The dumpable fix itself denies REGARDLESS of `ptrace_scope`, so lowering it
+/// NEVER changes the fix-present (WALL_OK) result — it only lets the MUTATION demonstrate the disclosure,
+/// giving the gate real teeth. Writes the sysctl directly when root, else via passwordless `sudo -n`
+/// (CI runners + lighthouse have it). A box without either keeps its current scope: the gate still
+/// passes with the fix, but its teeth then hold only where `ptrace_scope` is already 0 or Yama is absent
+/// (documented in the mutation-proof recipe).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn lower_ptrace_scope_best_effort() -> Option<String> {
+    let prior = std::fs::read_to_string(PTRACE_SCOPE_PATH).ok()?; // None ⇒ Yama absent ⇒ nothing to do
+    let prior = prior.trim().to_string();
+    if prior == "0" {
+        return None; // already permissive — no change, nothing to restore
+    }
+    if write_ptrace_scope("0") {
+        Some(prior)
+    } else {
+        None
+    }
+}
+
+/// Restore a `ptrace_scope` value previously lowered by [`lower_ptrace_scope_best_effort`] (best-effort).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn restore_ptrace_scope_best_effort(prior: Option<String>) {
+    if let Some(prior) = prior {
+        let _ = write_ptrace_scope(&prior);
+    }
+}
+
+/// Write `value` to the `ptrace_scope` sysctl — directly if root, else via passwordless `sudo -n`.
+/// Returns whether the write succeeded.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn write_ptrace_scope(value: &str) -> bool {
+    if std::fs::write(PTRACE_SCOPE_PATH, value).is_ok() {
+        return true;
+    }
+    Command::new("sudo")
+        .arg("-n")
+        .arg("sh")
+        .arg("-c")
+        .arg(format!("echo {value} > {PTRACE_SCOPE_PATH}"))
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Fork ONE child that stands in for a COMPROMISED same-uid sibling instance: shed ALL capabilities
+/// (so it holds no `CAP_SYS_PTRACE` — the crux, else a full-cap root reader would bypass the dumpable
+/// gate and false-pass), then `open("/proc/<target>/mem")` + `pread` and `_exit` a
+/// [`proc_mem_probe_codes`] verdict. Returns the child's exit code.
+///
+/// The child performs NO heap allocation after the fork (the `/proc/<pid>/mem` path is built as a
+/// `CString` in the PARENT, and the body is `prctl`/`capset`/`open`/`pread`/`close` syscalls only) — the
+/// async-signal-safe discipline the sibling fork-probes rely on, which makes the raw `fork` safe even
+/// though this probe (unlike the netns/pathuds ones) runs inline in the possibly-multi-threaded harness.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn fork_proc_mem_reader(target_pid: i32) -> i32 {
+    use proc_mem_probe_codes as code;
+
+    // Built BEFORE the fork — no post-fork allocation in the child.
+    let mem_path =
+        std::ffi::CString::new(format!("/proc/{target_pid}/mem")).expect("no NUL in path");
+    let is_root = process_is_root();
+
+    // SAFETY: a single selected live test ⇒ no concurrent harness thread allocating at the fork instant,
+    // and the child below only ever calls async-signal-safe syscalls (no malloc) — the SAME assumption
+    // the netns/pathuds fork-probes above document.
+    let pid = unsafe { libc::fork() };
+    assert!(
+        pid >= 0,
+        "fork() failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if pid == 0 {
+        // ---- the reader child: become capless, then attempt the cross-instance read ----
+        // Shed capabilities so this reader holds NO CAP_SYS_PTRACE. THE CRUX: a full-cap root reader
+        // holds CAP_SYS_PTRACE and would bypass the dumpable gate (the read would succeed even WITH the
+        // fix ⇒ a false pass). Mirror a served instance/relay as closely as practical:
+        // `drop_all_capabilities()` (SECBIT_NOROOT + empty bounding set) THEN
+        // `clear_current_capabilities()` (the in-process effective/permitted clear — this reader never
+        // execs, exactly like the relay). `drop_all`'s `PR_SET_SECUREBITS` needs `CAP_SETPCAP`; when the
+        // harness is already NON-root it holds none, so tolerate `drop_all`'s failure THERE (the reader
+        // is already capless) but ALWAYS require the effective-set clear (which needs no privilege and is
+        // the step that actually strips `CAP_SYS_PTRACE` from THIS reader). As root, `drop_all` MUST
+        // succeed (CAP_SETPCAP is held), else the reader could retain ptrace authority ⇒ a false pass.
+        let drop_all_ok = boatramp_server::sandbox::drop_all_capabilities().is_ok();
+        if boatramp_server::sandbox::clear_current_capabilities().is_err() {
+            unsafe { libc::_exit(code::CAPDROP_FAILED) };
+        }
+        if is_root && !drop_all_ok {
+            unsafe { libc::_exit(code::CAPDROP_FAILED) };
+        }
+
+        // Open the target's `/proc/<pid>/mem`. With the fix (target non-dumpable) the file is
+        // root-owned + `ptrace_may_access`-gated, so a capless same-uid sibling is DENIED here with
+        // EPERM (ptrace gate) or EACCES (DAC, when the reparented root:root file is unreadable to a
+        // non-root reader) — both are the wall.
+        let fd = unsafe { libc::open(mem_path.as_ptr(), libc::O_RDONLY) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if e == libc::EPERM || e == libc::EACCES {
+                unsafe { libc::_exit(code::WALL_OK) };
+            }
+            if e == libc::ENOENT || e == libc::ESRCH {
+                unsafe { libc::_exit(code::TARGET_GONE) };
+            }
+            unsafe { libc::_exit(code::SETUP_FAILED) };
+        }
+        // `open` SUCCEEDED ⇒ `ptrace_may_access` ADMITTED this reader at open time. Attempt a read: a
+        // read that is denied (EPERM/EACCES) is still the wall; a read that returns bytes — OR fails only
+        // for a benign reason such as EIO at an unmapped offset 0 — means the reader has a live handle to
+        // the target's address space (it could walk `/proc/<pid>/maps` and pread a mapped key) ⇒ the wall
+        // is DOWN (disclosure).
+        let mut buf = [0u8; 1];
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, 1, 0) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            unsafe { libc::close(fd) };
+            if e == libc::EPERM || e == libc::EACCES {
+                unsafe { libc::_exit(code::WALL_OK) };
+            }
+            unsafe { libc::_exit(code::DISCLOSED) };
+        }
+        unsafe { libc::close(fd) };
+        unsafe { libc::_exit(code::DISCLOSED) };
+    }
+    // ---- the parent: reap the child + decode its exit code ----
+    let mut status: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, 0) };
+    assert_eq!(
+        r,
+        pid,
+        "waitpid() failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    }
+}
+
+/// Probe the cross-instance `/proc/<pid>/mem` wall against the live crown-jewel `core` instance (HIGH-1).
+/// Locates `core`'s PID, neutralizes Yama so the mutation keeps its teeth (see
+/// [`lower_ptrace_scope_best_effort`]), forks the capless same-uid reader, restores Yama, and returns the
+/// verdict. Call WHILE the node is still serving.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn probe_cross_instance_proc_mem_wall(cfg_path: &std::path::Path) -> ProcMemVerdict {
+    use proc_mem_probe_codes as code;
+
+    let core_pid = match find_instance_pid(cfg_path, "core") {
+        Some(p) => p,
+        None => {
+            return ProcMemVerdict {
+                code: code::TARGET_GONE,
+                detail: "could not locate the serving `core` instance by its \
+                         `__instance core --config <cfg>` cmdline token in /proc"
+                    .to_string(),
+            };
+        }
+    };
+
+    let prior_scope = lower_ptrace_scope_best_effort();
+    let exit_code = fork_proc_mem_reader(core_pid);
+    restore_ptrace_scope_best_effort(prior_scope);
+
+    ProcMemVerdict {
+        code: exit_code,
+        detail: format!("core pid={core_pid}"),
+    }
+}
+
+/// Assert the HIGH-1 wall held (the capless sibling was DENIED) and emit the CI marker. A hard gate: any
+/// non-`WALL_OK` verdict — including a probe that could not run — FAILS rather than silently skip.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn assert_proc_mem_wall(verdict: ProcMemVerdict) {
+    use proc_mem_probe_codes as code;
+    let ProcMemVerdict { code: got, detail } = verdict;
+    assert_eq!(
+        got,
+        code::WALL_OK,
+        "HIGH-1 cross-instance /proc/<pid>/mem wall ({detail}): a CAPLESS same-uid sibling MUST be \
+         DENIED (EPERM/EACCES) reading the crown-jewel `core` instance's memory — the \
+         PR_SET_DUMPABLE(0) wall. Verdict codes: {disclosed}=DISCLOSED (the wall is DOWN — the open+read \
+         was ADMITTED: either the `set_process_undumpable` flip regressed, OR on a reverted-mutation run \
+         this is the EXPECTED failure that proves the gate's teeth), {capdrop}=CAPDROP_FAILED (the \
+         reader could not shed CAP_SYS_PTRACE ⇒ refused as a would-be false pass), {gone}=TARGET_GONE \
+         (the `core` PID was not found ⇒ the probe could not run, so it FAILS rather than silently \
+         skip), {setup}=SETUP_FAILED (an unexpected open/read errno).",
+        disclosed = code::DISCLOSED,
+        capdrop = code::CAPDROP_FAILED,
+        gone = code::TARGET_GONE,
+        setup = code::SETUP_FAILED,
+    );
+    // The marker the CI gate greps — reached only after the capless sibling was walled off.
+    println!("{PROC_MEM_WALL_MARKER}");
 }

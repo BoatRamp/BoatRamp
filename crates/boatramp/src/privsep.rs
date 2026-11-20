@@ -743,30 +743,36 @@ fn verify_container_namespaces_unshared(label: &str) -> Result<(), String> {
 /// then stop at the WS-C serving seam. Refuses a non-privsep node / an unknown label
 /// (design F10, §2).
 pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
-    crate::init_tracing();
-    // Scrub any inherited live credential from this instance's own environ (inv10). The
-    // root already spawns children with an explicitly-minimal scrubbed env, so for a
-    // root-spawned child this is a no-op; it backstops the explicit `boatramp __instance`
-    // entry, which inherits the full parent environ.
-    scrub_own_environ();
-
     // Privsep's load-bearing wall is the per-instance Enforced sandbox; on any non-Linux /
     // non-`sandbox` build an instance cannot install it, so refuse to serve rather than run
     // unsandboxed — including the dev-only `Off` posture. The root already refuses off-Linux at
     // spawn; this backstops a manual `boatramp __instance` invocation for consistency (Security
     // re-review INFO), so no privsep instance ever serves unsandboxed on a non-Linux Unix host.
+    // Checked FIRST (before `init_tracing` / `scrub_own_environ`) so the HIGH-1 dumpable flip below
+    // can be the very first thing a Linux instance does.
     if !cfg!(all(target_os = "linux", feature = "sandbox")) {
         return Err(PrivsepError::UnsupportedPlatform.into());
     }
 
-    // HIGH-1 (final privsep Security re-review) — mark THIS served instance NON-dumpable as early as
-    // possible, so a compromised SAME-UID sibling in the shared host pid namespace cannot
+    // HIGH-1 (final privsep Security re-review) — mark THIS served instance NON-dumpable as the VERY
+    // FIRST step (right after the platform gate, BEFORE `init_tracing` + `scrub_own_environ`), so a
+    // compromised SAME-UID sibling in the shared host pid namespace cannot
     // `openat("/proc/<our-pid>/mem")` + `pread64` a crown-jewel key out of our mlocked memory, bypassing
     // the ptrace/process_vm_readv seccomp KILL (that VFS read issues no ptrace syscall). With dumpable=0
     // the kernel reparents our `/proc/<pid>/*` to root:root and gates it behind `ptrace_may_access`,
-    // which the capless sibling fails (`EPERM`) REGARDLESS of `kernel.yama.ptrace_scope`. This MUST live
-    // here in the re-exec'd instance — POST-execve — NOT in `spawn_wired_instance`'s pre_exec: a
-    // non-setuid execve RESETS dumpable to 1, so a pre_exec value would be clobbered (see
+    // which the capless sibling fails (`EPERM`) REGARDLESS of `kernel.yama.ptrace_scope`.
+    //
+    // Ordered BEFORE `init_tracing` / `scrub_own_environ` on purpose (re-review INFO hardening): on the
+    // MANUAL `boatramp __instance` backstop entry (NOT the production root-spawn, which hands over an
+    // already-scrubbed minimal env, so it is immune) an inherited env credential sits in a
+    // still-dumpable `/proc/<pid>/environ` until `scrub_own_environ` clears it — a sub-ms window a
+    // sibling could read. Flipping dumpable=0 FIRST closes that window too (dumpable=0 also walls off
+    // `/proc/<pid>/environ`). The flip is `prctl`-only with NO dependencies (needs no tracing, no
+    // config), so it is safe to run before everything else; it is still well before any key
+    // materialization (keys load later, in `instance_serve::run`), so nothing sensitive precedes it.
+    //
+    // This MUST live here in the re-exec'd instance — POST-execve — NOT in `spawn_wired_instance`'s
+    // pre_exec: a non-setuid execve RESETS dumpable to 1, so a pre_exec value would be clobbered (see
     // `set_process_undumpable`). Load-bearing for HIGH-1 ⇒ fail-closed (refuse to serve if it fails). Own
     // `/proc/self/*` access is unaffected, so the container `/proc/self/ns` self-check + `/proc/self/fd`
     // magic symlinks below keep working. Covers OsProcess + Container instances (and every per-tenant
@@ -779,6 +785,14 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
             "marking the instance non-dumpable (HIGH-1 cross-instance /proc/<pid>/mem disclosure): {e}"
         ),
     })?;
+
+    crate::init_tracing();
+    // Scrub any inherited live credential from this instance's own environ (inv10). The
+    // root already spawns children with an explicitly-minimal scrubbed env, so for a
+    // root-spawned child this is a no-op; it backstops the explicit `boatramp __instance`
+    // entry, which inherits the full parent environ. (The dumpable flip above already walled
+    // `/proc/<pid>/environ` off from a sibling before this runs.)
+    scrub_own_environ();
 
     let config = ServerConfig::load(config_path, None).map_err(PrivsepError::from)?;
 

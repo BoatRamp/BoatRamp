@@ -3280,8 +3280,12 @@ mod privsep_derivation_tests {
     /// mechanism the HIGH-1 fix relies on: a non-dumpable target's `/proc/<pid>/mem` becomes
     /// root-owned + `ptrace_may_access`-gated, so a capless same-uid sibling gets `EPERM`). Reads it
     /// back via `prctl(PR_GET_DUMPABLE)` and RESTORES the prior value so sibling tests in this process
-    /// are unaffected. (The full cross-instance read→`EPERM` attack is proven by the privsep live gate,
-    /// which forks real instances; this unit test guards the primitive against an args regression.)
+    /// are unaffected. This unit test only guards the PRIMITIVE against an args regression — the full
+    /// cross-instance read→`EPERM`/`EACCES` attack is proven LIVE by the `PRIVSEP PROC-MEM WALL OK`
+    /// assertion in `crates/boatramp/tests/privsep_live.rs`: while a real `__root` composition is
+    /// serving, it forks a capless same-uid sibling that is DENIED reading the crown-jewel `core`
+    /// instance's `/proc/<pid>/mem`, and is mutation-verified (revert `set_process_undumpable` ⇒ the
+    /// same read SUCCEEDS and the assertion fails).
     #[cfg(target_os = "linux")]
     #[test]
     fn set_process_undumpable_clears_the_dumpable_flag() {

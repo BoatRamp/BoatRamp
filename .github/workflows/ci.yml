@@ -1770,6 +1770,8 @@ jobs:
             || { echo "::error::privsep live gate did not run all eight tests (silent skip or a failure)" >&2; exit 1; }
           grep -q 'PRIVSEP LIVE OK' privsep-live.log \
             || { echo "::error::privsep composition live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
+          grep -q 'PRIVSEP PROC-MEM WALL OK' privsep-live.log \
+            || { echo "::error::privsep cross-instance /proc/<pid>/mem wall gate (HIGH-1) never reached its marker — while the 2-instance node was serving, a CAPLESS same-uid sibling must be DENIED (EPERM/EACCES) reading the crown-jewel core instance's /proc/<pid>/mem, proving the set_process_undumpable (PR_SET_DUMPABLE(0)) wall; a revert of that flip (the read then SUCCEEDS), a capability-drop regression, or a silent skip/compile-out fails here — see crates/boatramp/tests/privsep_live.rs" >&2; exit 1; }
           grep -q 'PRIVSEP SIGNER UNSEAL LIVE OK' privsep-live.log \
             || { echo "::error::privsep signer-key-unlock live gate never reached its marker (a sealer→signer unseal / allowlist / resolver regression)" >&2; exit 1; }
           grep -q 'PRIVSEP FRONTEND INVERSION LIVE OK' privsep-live.log \
