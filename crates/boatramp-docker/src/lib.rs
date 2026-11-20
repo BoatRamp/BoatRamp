@@ -14,10 +14,10 @@
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
-    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, PullPolicy, RestartPolicy,
-    RootSource, RootSourceKind, Scheme, SourceSupport, VolumeInfo, VolumeRef, compute_instance_id,
-    managed_db_alias,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeBinding, ComputeSpec, Endpoint,
+    ExecOutput, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, PullPolicy,
+    RestartPolicy, RootSource, RootSourceKind, Scheme, SourceSupport, VolumeInfo, VolumeRef,
+    compute_instance_id, managed_db_alias,
 };
 use boatramp_core::registry_auth::RegistryAuth;
 use bollard::Docker;
@@ -421,6 +421,18 @@ impl DockerBackend {
             driver: "bridge".to_string(),
             check_duplicate: true,
             labels,
+            // Pin the Linux bridge interface name to a boatramp-SCOPED, bounded, deterministic
+            // name (`project_bridge_name`) via the bridge driver-opt, instead of docker's unscoped
+            // `br-<hash>`. This lets the NixOS compute-firewall admit the shim-port traffic on a
+            // `boatramp-`-prefixed interface (see PROJECT_BRIDGE_PREFIX) rather than trusting the
+            // broad `br-+`. The opt applies only at CREATE: an interface cannot be renamed on a
+            // live network, so a network that already exists (the 409-is-success path below) keeps
+            // whatever bridge name it was born with until it is GC'd (last workload stops) and a
+            // later launch re-creates it with the scoped name.
+            options: HashMap::from([(
+                "com.docker.network.bridge.name".to_string(),
+                project_bridge_name(name),
+            )]),
             ..Default::default()
         };
         match self.docker.create_network(options).await {
@@ -507,6 +519,175 @@ pub fn project_network_name(project: &str) -> String {
 /// out so a holder of the name alone can recover the project (strip the prefix) — used by the
 /// export/import one-shot to label a create-if-absent network identically to the launch path.
 pub const PROJECT_NETWORK_PREFIX: &str = "boatramp-net-";
+
+/// The fixed prefix every per-project **Linux bridge interface** name carries (see
+/// [`project_bridge_name`]). Factored out as the single source of truth the NixOS module's
+/// compute-firewall rule matches on (`nix/nixos-module.nix`): the firewall admits the shim-port
+/// traffic on an interface whose name begins with this prefix (plus the static `br-boatramp` the
+/// native-container/firecracker backends use), so a boatramp-scoped match — NOT the broad docker
+/// `br-+` — can trust every per-project bridge without trusting an unrelated docker network or the
+/// LAN. If this prefix ever changes, the module's matcher MUST change with it.
+pub const PROJECT_BRIDGE_PREFIX: &str = "boatramp-";
+
+/// The Linux `IFNAMSIZ` budget for an interface name: 16 bytes including the trailing NUL, so a
+/// name is at most **15 bytes**. A docker driver-opt bridge name over this is silently truncated
+/// (or rejected), so [`project_bridge_name`] is bounded to fit.
+const MAX_IFNAME_LEN: usize = 15;
+
+/// The deterministic, SCOPED Linux bridge interface name for the per-project network `network`
+/// (the `boatramp-net-<project>` name [`project_network_name`] returns). Set as the
+/// `com.docker.network.bridge.name` driver-opt at network-create (see [`DockerBackend::create_bridge_network`])
+/// so the kernel bridge is e.g. `boatramp-1a2b3c` instead of docker's unscoped `br-<hash>`.
+///
+/// Scheme — `boatramp-<6 hex>`, exactly 15 bytes (the [`MAX_IFNAME_LEN`] ceiling):
+/// - `boatramp-` (9 bytes) is the [`PROJECT_BRIDGE_PREFIX`] the firewall trusts.
+/// - `<6 hex>` is the low 24 bits of a stable [FNV-1a] hash of the FULL network name. A raw project
+///   name cannot be used verbatim — a slug is up to 63 bytes, far over the 15-byte `IFNAMSIZ`
+///   ceiling — so it is hashed to a fixed, bounded, name-safe (`[0-9a-f]`) token.
+///
+/// The hash is **deterministic** (a fixed algorithm, not the std hasher — whose seed is unspecified
+/// and release-unstable): the same project always derives the same bridge name, so the
+/// create-if-absent launch path and the export/import one-shot converge on ONE bridge per project
+/// across restarts. Docker keys the network by its NAME (unique per project), so the bridge name is
+/// only a host-side label; a 24-bit space collides (birthday) near ~4.8 k concurrent projects on
+/// ONE node, far past any realistic per-node project count, and a collision fails the *second*
+/// network's create loudly (the Linux ifname is already in use) rather than merging two projects —
+/// never a tenancy leak.
+///
+/// [FNV-1a]: https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
+pub fn project_bridge_name(network: &str) -> String {
+    // 64-bit FNV-1a — a tiny, dependency-free, deterministic hash (std's `DefaultHasher` seed is
+    // unspecified and may shift between releases, which would rename every bridge on upgrade).
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in network.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    // Low 24 bits → 6 lowercase-hex chars. `boatramp-` (9) + 6 = 15 = MAX_IFNAME_LEN.
+    let name = format!("{PROJECT_BRIDGE_PREFIX}{:06x}", hash & 0x00ff_ffff);
+    debug_assert!(name.len() <= MAX_IFNAME_LEN, "bridge name exceeds IFNAMSIZ");
+    name
+}
+
+/// The container-side hostname boatramp injects into a docker workload's `/etc/hosts` (via
+/// [`HOST_GATEWAY_EXTRA_HOST`]) and rewrites a bind-local shim URL's host to (see
+/// [`rewrite_shim_host_for_docker`]). `host.docker.internal` is docker's conventional name for
+/// "the host", and `host-gateway` resolves it — from ANY bridge, including a per-project
+/// user-defined one — to the daemon's host-gateway IP (default `172.17.0.1`). That one stable name
+/// reaches the host from every per-project network, so a bridged workload reaches its compute shims
+/// without the operator pinning a per-bridge gateway IP into each guest.
+const GUEST_HOST_ALIAS: &str = "host.docker.internal";
+
+/// The `ExtraHosts` entry that makes [`GUEST_HOST_ALIAS`] resolve to the host from inside a
+/// container on ANY docker network. `host-gateway` is docker's daemon-wide alias for the host's
+/// bridge-reachable address; on Linux it is NOT added automatically, so boatramp adds it to every
+/// launched workload.
+const HOST_GATEWAY_EXTRA_HOST: &str = "host.docker.internal:host-gateway";
+
+/// Rewrite a compute-shim base URL so a bridged docker container can reach it, returning the
+/// rewritten URL when a rewrite applies and `None` when the URL is already guest-reachable (left
+/// untouched).
+///
+/// A rewrite applies ONLY when the URL's host is an address a bridged container cannot route to the
+/// host with: a **loopback** (`127.0.0.0/8`, `::1`, or the literal `localhost`) — which inside a
+/// container is the container's OWN loopback, never the host's — or an **unspecified** bind address
+/// (`0.0.0.0`, `::`) — which names no destination at all. In both cases the host portion is
+/// replaced with [`GUEST_HOST_ALIAS`] (`host.docker.internal`), preserving the scheme, port, path,
+/// and query verbatim; paired with [`HOST_GATEWAY_EXTRA_HOST`] the guest then reaches the host's
+/// gateway IP from any per-project bridge.
+///
+/// A host that already names a routable destination — an explicit IP such as the host-gateway
+/// `172.17.0.1`, or a DNS name such as a sibling's [`managed_db_alias`] (a managed-DB DSN reached
+/// over the per-project net's embedded DNS) or an external FQDN — is returned as `None` (NOT
+/// rewritten): the operator pointed it at a real address and the container can already reach it.
+/// This is what keeps the rewrite from clobbering a managed-database DSN or an external endpoint.
+fn rewrite_shim_host_for_docker(url: &str) -> Option<String> {
+    // Split `scheme://authority/rest` without a URL crate (the remote client stays dependency-lean,
+    // mirroring the server's hand-rolled `shim_bind_addr`). Require an explicit scheme so a bare
+    // `host:port` (ambiguous with `scheme:path`) is left alone.
+    let (scheme, after_scheme) = url.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    {
+        return None;
+    }
+    // The authority ends at the first `/`, `?`, or `#`; the remainder (path/query/fragment) is kept
+    // byte-for-byte.
+    let auth_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (authority, rest) = after_scheme.split_at(auth_end);
+    // An authority may carry `user[:pass]@` before the host — preserve it untouched.
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((u, hp)) => (Some(u), hp),
+        None => (None, authority),
+    };
+    // Separate host from `:port`. An IPv6 literal is bracketed (`[::1]:8080`); otherwise the LAST
+    // `:` (if any) starts the port (a bare IPv6 without brackets has no port form here).
+    let (host, port) = if let Some(end) = hostport.strip_prefix('[') {
+        let (h, tail) = end.split_once(']')?;
+        (h, tail.strip_prefix(':').map(|p| (":", p)))
+    } else if let Some((h, p)) = hostport.rsplit_once(':') {
+        (h, Some((":", p)))
+    } else {
+        (hostport, None)
+    };
+    if !host_is_bind_local(host) {
+        return None;
+    }
+    let port = port.map(|(sep, p)| format!("{sep}{p}")).unwrap_or_default();
+    let userinfo = userinfo.map(|u| format!("{u}@")).unwrap_or_default();
+    Some(format!(
+        "{scheme}://{userinfo}{GUEST_HOST_ALIAS}{port}{rest}"
+    ))
+}
+
+/// Whether `host` is a bind-side address that names no destination a bridged container can route to
+/// the host with: loopback (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0`, `::`), or the literal
+/// `localhost`. See [`rewrite_shim_host_for_docker`].
+fn host_is_bind_local(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_unspecified(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unspecified(),
+        // A DNS name (a managed-DB alias, an external FQDN) — a real destination, never rewritten.
+        Err(_) => false,
+    }
+}
+
+/// Make a docker workload's declared compute-binding shims reachable from its per-project bridge:
+/// rewrite each binding URL whose host is bind-local to `host.docker.internal` (see
+/// [`rewrite_shim_host_for_docker`]) IN PLACE in `env`, and return the `ExtraHosts` entries the
+/// container needs for that name to resolve. A pure function over the (env, bindings) pair so the
+/// rewrite + the `/etc/hosts` injection are unit-testable without a daemon.
+///
+/// `ExtraHosts` is returned unconditionally (not only when a rewrite happened): the
+/// `host.docker.internal` mapping is docker-idiomatic and harmless when unused, and it keeps a
+/// workload that reaches the host by that name working regardless of how its shim URL was spelled.
+fn docker_binding_reachability(
+    env: &mut std::collections::BTreeMap<String, String>,
+    bindings: &[ComputeBinding],
+) -> Vec<String> {
+    for binding in bindings {
+        // A binding injects its endpoint URL at `url_env()` (and, for a managed-DB migration DSN,
+        // at `migration_url_env()`); the credential at `<url_env>_AUTH_TOKEN` is never a URL and is
+        // not touched.
+        for key in [binding.url_env(), binding.migration_url_env()] {
+            if let Some(value) = env.get(&key)
+                && let Some(rewritten) = rewrite_shim_host_for_docker(value)
+            {
+                env.insert(key, rewritten);
+            }
+        }
+    }
+    vec![HOST_GATEWAY_EXTRA_HOST.to_string()]
+}
 
 /// Build the [`NetworkingConfig`] attaching a container to `network` with the given DNS `aliases`
 /// (the workload's [`managed_db_alias`] for a server a sibling resolves by name; empty for a
@@ -897,12 +1078,20 @@ impl ComputeBackend for DockerBackend {
             }
         };
         let name = container_name(&req.project, &req.workload, req.replica);
-        let env: Vec<String> = req
-            .spec
-            .env
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
+        // Make the workload's compute-binding shims reachable from its per-project bridge. A
+        // container cannot reach a shim the operator bound on the host loopback (`127.0.0.1` — the
+        // container's OWN loopback) or on `0.0.0.0` (no routable destination); and with MULTIPLE
+        // per-project bridges there is no single gateway IP to pin into every guest. So rewrite any
+        // bind-local shim URL's host to `host.docker.internal` and add the matching `host-gateway`
+        // ExtraHost (`docker_binding_reachability`): that one stable name resolves to the host from
+        // every per-project network. A shim bound on a routable host-gateway IP (e.g.
+        // `172.17.0.1`), a managed-DB DSN (a sibling's DNS alias), or an external endpoint already
+        // names a reachable destination and is left untouched. The off-node security boundary is
+        // NOT weakened here — it is the shim's own bind scope plus the node firewall (which admits
+        // the shim port only on the boatramp compute bridges); see the crate/module docs.
+        let mut env_map = req.spec.env.clone();
+        let extra_hosts = docker_binding_reachability(&mut env_map, &req.spec.bindings);
+        let env: Vec<String> = env_map.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let port = req.spec.port;
         let port_key = format!("{port}/tcp");
         // Honor `writable_root` only where the posture allows it (single-tenant);
@@ -922,6 +1111,9 @@ impl ComputeBackend for DockerBackend {
             writable_root,
             cap_add,
         );
+        // `host.docker.internal:host-gateway` (see `docker_binding_reachability`) — so a bridged
+        // workload resolves the host from any per-project network to reach its compute shims.
+        host_config.extra_hosts = Some(extra_hosts);
         // Attach the spec's persistent volumes (validated; bind dirs created).
         let mounts = self.stage_volumes(&req.spec).await?;
         if !mounts.is_empty() {
@@ -2910,6 +3102,145 @@ mod tests {
             project_network_name("acme"),
             project_network_name("default")
         );
+    }
+
+    #[test]
+    fn project_bridge_name_is_scoped_bounded_and_deterministic() {
+        let acme = project_bridge_name(&project_network_name("acme"));
+        // Scoped to the boatramp prefix the firewall trusts — NOT docker's `br-<hash>`.
+        assert!(
+            acme.starts_with(PROJECT_BRIDGE_PREFIX),
+            "{acme} must carry the boatramp bridge prefix"
+        );
+        assert!(
+            !acme.starts_with("br-"),
+            "{acme} must not look like a docker default bridge"
+        );
+        // Within the Linux IFNAMSIZ budget (15 bytes), for EVERY project — including a max-length
+        // 63-byte slug, which cannot go into an ifname verbatim.
+        let long = "a".repeat(63);
+        for net in [
+            project_network_name("acme"),
+            project_network_name("default"),
+            project_network_name(&long),
+        ] {
+            let bridge = project_bridge_name(&net);
+            assert!(
+                bridge.len() <= MAX_IFNAME_LEN,
+                "{bridge} ({} bytes) exceeds IFNAMSIZ {MAX_IFNAME_LEN}",
+                bridge.len()
+            );
+            // Name-safe for a Linux interface: ASCII, no `/` or whitespace.
+            assert!(
+                bridge
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+                "{bridge} must be interface-name-safe"
+            );
+        }
+        // Deterministic: the same project always derives the same bridge (create-if-absent + the
+        // export/import one-shot must converge on ONE bridge across restarts).
+        assert_eq!(acme, project_bridge_name(&project_network_name("acme")));
+        // Distinct projects get distinct bridges (no accidental sharing under the hash).
+        assert_ne!(acme, project_bridge_name(&project_network_name("beta")));
+        assert_ne!(
+            project_bridge_name(&project_network_name("default")),
+            project_bridge_name(&project_network_name("acme"))
+        );
+        // The docker bridge prefix is DISJOINT from the native-container/firecracker `br-boatramp`
+        // bridge, so the firewall can match the two with separate, non-overlapping patterns and a
+        // boatramp-scoped match never degrades to the broad `br-+`.
+        assert!(!"br-boatramp".starts_with(PROJECT_BRIDGE_PREFIX));
+    }
+
+    #[test]
+    fn rewrite_shim_host_rewrites_only_bind_local_hosts() {
+        // Bind-local hosts a bridged container can't reach the host at → rewritten, port/path kept.
+        assert_eq!(
+            rewrite_shim_host_for_docker("http://127.0.0.1:8083/claim").as_deref(),
+            Some("http://host.docker.internal:8083/claim")
+        );
+        assert_eq!(
+            rewrite_shim_host_for_docker("http://0.0.0.0:8084").as_deref(),
+            Some("http://host.docker.internal:8084")
+        );
+        assert_eq!(
+            rewrite_shim_host_for_docker("http://localhost:8085/b/x/y?z=1").as_deref(),
+            Some("http://host.docker.internal:8085/b/x/y?z=1")
+        );
+        assert_eq!(
+            rewrite_shim_host_for_docker("http://[::1]:8086/").as_deref(),
+            Some("http://host.docker.internal:8086/")
+        );
+        // 127.0.0.0/8 (not just .0.1).
+        assert_eq!(
+            rewrite_shim_host_for_docker("http://127.9.9.9:9/p").as_deref(),
+            Some("http://host.docker.internal:9/p")
+        );
+        // Already-routable hosts are LEFT ALONE: an explicit host-gateway IP, a managed-DB DNS
+        // alias (reached over the per-project net), an external FQDN. This is what protects a
+        // managed-database DSN and an external endpoint from being clobbered.
+        assert_eq!(
+            rewrite_shim_host_for_docker("http://172.17.0.1:8083/claim"),
+            None
+        );
+        assert_eq!(
+            rewrite_shim_host_for_docker("postgres://cmp-pg-ab12:5432/app"),
+            None
+        );
+        assert_eq!(
+            rewrite_shim_host_for_docker("https://db.example.com:5432/app"),
+            None
+        );
+        // No explicit scheme → ambiguous, left alone.
+        assert_eq!(rewrite_shim_host_for_docker("127.0.0.1:8083"), None);
+    }
+
+    #[test]
+    fn docker_binding_reachability_rewrites_shim_urls_and_spares_managed_dsns() {
+        use boatramp_core::compute::BindingKind;
+        let bind = |kind, url_env: Option<&str>, migration: Option<&str>| ComputeBinding {
+            kind,
+            name: String::new(),
+            url_env: url_env.map(str::to_string),
+            migration_url_env: migration.map(str::to_string),
+        };
+        let mut env = std::collections::BTreeMap::from([
+            // A kv/blob/messaging shim bound on loopback — always a shim, always rewritten.
+            (
+                "BOATRAMP_KV_URL".to_string(),
+                "http://127.0.0.1:8084".to_string(),
+            ),
+            // A sql shim (libsql) bound on loopback — rewritten.
+            (
+                "BOATRAMP_SQL_URL".to_string(),
+                "http://127.0.0.1:8083".to_string(),
+            ),
+            // A managed-DB DSN (sql binding, co-located pg reached by DNS alias) — NOT a shim,
+            // host is a DNS name, MUST survive untouched.
+            (
+                "MANAGED_DB".to_string(),
+                "postgres://cmp-pg-ab12:5432/app".to_string(),
+            ),
+            // An operator literal that happens to hold a localhost URL but is NOT a binding target
+            // — must NOT be rewritten (only declared binding env keys are touched).
+            (
+                "SOME_LOCAL".to_string(),
+                "http://127.0.0.1:9000".to_string(),
+            ),
+        ]);
+        let bindings = [
+            bind(BindingKind::Kv, None, None),
+            bind(BindingKind::Sql, None, None),
+            bind(BindingKind::Sql, Some("MANAGED_DB"), None),
+        ];
+        let extra = docker_binding_reachability(&mut env, &bindings);
+        assert_eq!(env["BOATRAMP_KV_URL"], "http://host.docker.internal:8084");
+        assert_eq!(env["BOATRAMP_SQL_URL"], "http://host.docker.internal:8083");
+        assert_eq!(env["MANAGED_DB"], "postgres://cmp-pg-ab12:5432/app");
+        assert_eq!(env["SOME_LOCAL"], "http://127.0.0.1:9000");
+        // Always injects the host-gateway ExtraHost so `host.docker.internal` resolves.
+        assert_eq!(extra, vec![HOST_GATEWAY_EXTRA_HOST.to_string()]);
     }
 
     #[test]

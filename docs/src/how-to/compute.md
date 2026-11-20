@@ -634,6 +634,67 @@ shim. See [`kv_shim_url`/`blob_shim_url`/`messaging_shim_url`/`sql_shim_url` and
 their `*_max_*_bytes` size caps](../reference/boatramp-cfg.md#compute) in the
 config reference.
 
+### Shim reachability from a docker workload
+
+The `docker` backend runs every workload on a **per-project** bridge
+(`boatramp-net-<project>`), so a container's `127.0.0.1` is its *own* loopback — not
+the host — and with several projects there is no single bridge gateway to pin into
+every guest. boatramp handles this automatically: at launch it adds
+`host.docker.internal:host-gateway` to the container and rewrites any shim URL bound
+on a host-local address (`127.0.0.1`, `localhost`, `0.0.0.0`, `::1`) to
+`http://host.docker.internal:<port>`. `host.docker.internal` resolves — from *any*
+per-project bridge — to the host's gateway IP, so the workload reaches the shims
+wherever the operator bound them. A shim URL that already names a routable address
+(the docker host-gateway IP `172.17.0.1`, a managed-DB DNS alias, or an external
+endpoint) is left untouched.
+
+The operator's only job is to bind the shims where that gateway lands — point each
+`[compute].<kind>_shim_url` at the **docker host-gateway IP** (`http://172.17.0.1:<port>`,
+the recommended least-exposure bind) or at `0.0.0.0`. The Linux bridge interface is
+named with a boatramp-scoped prefix (`boatramp-<hash>`) so the host firewall can admit
+the shim traffic on the boatramp bridges precisely — see [NixOS: open the compute
+firewall](#nixos-open-the-compute-firewall) below. The `native container` and
+`firecracker` backends share one bridge (`br-boatramp`, gateway `10.0.0.1`); point the
+shim URLs there and the same firewall rule admits them.
+
+### NixOS: open the compute firewall
+
+On a default-firewall NixOS host the INPUT chain DROPs the container→host:shim-port
+packet even though `services.boatramp.compute = true` granted the caps to create the
+bridges. Enabling `compute` now ALSO opens the firewall for the shim data plane on the
+boatramp compute bridges **only** — the static `br-boatramp` and the per-project docker
+`boatramp-*` bridges — never the LAN/public interface and never an unrelated docker
+`br-<hash>`. Set the shim URLs via `computeShimUrls`: the module feeds them to the
+server AND opens **only** their ports on the boatramp bridges (least privilege by
+default — no separate port list to maintain):
+
+```nix
+services.boatramp = {
+  enable = true;
+  compute = true; # caps + firewall for the compute bridges
+  computeShimUrls = {
+    # Bind on the docker host-gateway IP; the backend rewrites the guest's view
+    # to host.docker.internal automatically.
+    sql = "http://172.17.0.1:8083";
+    kv  = "http://172.17.0.1:8084";
+  };
+  # computeShimPorts = [ … ];   # add ports only for a shim URL set outside the module
+  # computeTrustBridges = true; # opt out of port-scoping (trust all TCP on the boatramp bridges)
+};
+```
+
+With no `computeShimUrls`/`computeShimPorts`/`computeTrustBridges`, the firewall opens
+nothing (no bindings to admit). The shims stay unreachable off-node: they are bound on a
+host-internal address (the bridge gateway / loopback, not a public interface), and the
+firewall admits their port only on traffic arriving on the boatramp bridges — so a LAN
+or internet peer is blocked at both layers.
+
+> **Upgrade note.** The scoped docker bridge name applies only when a per-project network
+> is CREATED. After upgrading, a pre-existing `boatramp-net-<project>` keeps docker's old
+> `br-<hash>` bridge, which the firewall rule does not match — that workload's shim traffic
+> is DROPped (fail-closed) until the network is recreated. Redeploy/cycle docker compute
+> workloads after upgrading so their networks recreate with the scoped bridge name.
+
 ## Use a managed Postgres/MySQL from a compute workload (a real DSN)
 
 The `sql` binding above hands a **libsql / hrana** endpoint — the right shape for
