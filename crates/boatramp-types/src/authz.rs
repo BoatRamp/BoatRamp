@@ -666,6 +666,41 @@ impl Right {
                 Some(default_project.clone()),
                 if get { Action::Read } else { Action::Admin },
             ),
+            // The project's internal SEALED secret store — the LEGACY default-project form of
+            // `/api/projects/<proj>/secrets{,/{name}}` (`secrets set/ls/rm` with no `--project`,
+            // the CLI `secrets` command's path). `project_scope` does NOT rewrite this bare path,
+            // so the `set_secret`/`list_secrets`/`delete_secret` handlers read the DEFAULT project
+            // from the injected `ProjectContext` and operate ONLY on the default project's sealed
+            // store — never node-globally or across projects (verified). So — exactly like the
+            // project-scoped `secrets` arm above — it gets the dedicated `Resource::Secrets` scoped
+            // to the DEFAULT project: list with `Read`, mutate (set/delete) with `Write` (both
+            // satisfied by a `Secrets·Admin` grant). This is a LOOSENING off the deny-safe
+            // `_`→`System·Admin` default below (mailroom #33: that default demanded a node-global
+            // admin, refusing a least-privilege `project_admin:default` holding `Secrets·Admin` on
+            // the default project). No cross-project widening: the target is host-forced to
+            // `default`, so a `project_admin` on ANOTHER project — and a `publisher`/`deployer` —
+            // still cannot reach it (secrets stays admin-gated).
+            p if p == "/api/secrets" || p.starts_with("/api/secrets/") => Self::new(
+                Resource::Secrets,
+                Some(default_project.clone()),
+                if get { Action::Read } else { Action::Write },
+            ),
+            // The project's SMTP email profiles — the LEGACY default-project form of
+            // `/api/projects/<proj>/email/profiles{,/{name}}` (`email set/ls/rm` with no
+            // `--project`). Credential config (a sealed password + relay config), default-project
+            // -scoped exactly like the bare secrets store above: `project_scope` does NOT rewrite
+            // this bare path, so the `set_email_profile`/`list_email_profiles`/`show_email_profile`/
+            // `delete_email_profile` handlers read the DEFAULT project from `ProjectContext` and
+            // operate ONLY on the default project's store (verified). Same `Resource::Secrets`
+            // mapping as the project-scoped `email` arm above: list/show with `Read`, set/delete
+            // with `Write` (both satisfied by a `Secrets·Admin` grant). The same LOOSENING off the
+            // deny-safe `_`→`System·Admin` default, with no cross-project widening (target
+            // host-forced to `default`).
+            p if p == "/api/email" || p.starts_with("/api/email/") => Self::new(
+                Resource::Secrets,
+                Some(default_project.clone()),
+                if get { Action::Read } else { Action::Write },
+            ),
             // Operator S3 upload-credential minting (`POST /api/blob-mint-upload`, PLAN-blob-s3-ingress
             // §6 / M3): mint a short-lived, scoped S3 upload credential for a project+site's blob
             // container. Gated with the DEDICATED `Resource::BlobUpload` scoped to the DEFAULT project
@@ -2496,6 +2531,65 @@ mod tests {
         );
         let admin = AuthzPolicy::default_policy().rights_for(&[GrantedRole::global("admin")]);
         assert!(admin.allows(&required), "a node admin may read node health");
+    }
+
+    #[test]
+    fn bare_default_project_secrets_and_email_are_secrets_scoped_not_system_admin() {
+        // mailroom #33: the LEGACY default-project forms `/api/secrets{,/<name>}` and
+        // `/api/email/profiles{,/<name>}` (the CLI `secrets`/`email` commands with no `--project`)
+        // are handler-scoped to the DEFAULT project (`ProjectContext` defaults to `default`; the
+        // bare path is never rewritten by `project_scope`), so they resolve to the dedicated
+        // `Resource::Secrets` on the DEFAULT project — list/show with `Read`, set/delete with
+        // `Write` — NOT the deny-safe `_`→`System·Admin` default that demanded a node-global admin.
+        let policy = AuthzPolicy::default_policy();
+
+        // Every bare verb resolves to Secrets(default): Read for GET, Write for the mutating verbs.
+        let cases: &[(&str, &str, Action)] = &[
+            ("GET", "/api/secrets", Action::Read),
+            ("POST", "/api/secrets", Action::Write),
+            ("DELETE", "/api/secrets/db-password", Action::Write),
+            ("GET", "/api/email/profiles", Action::Read),
+            ("PUT", "/api/email/profiles/default", Action::Write),
+            ("DELETE", "/api/email/profiles/default", Action::Write),
+        ];
+        let proj_admin_default =
+            policy.rights_for(&[GrantedRole::scoped("project_admin", "default")]);
+        let proj_admin_acme = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        let admin = policy.rights_for(&[GrantedRole::global("admin")]);
+        for (method, path, action) in cases {
+            let required = Right::required(method, path).expect("route is gated");
+            assert_eq!(
+                required,
+                Right::new(Resource::Secrets, Some("default".into()), *action),
+                "required({method}, {path}) must be Secrets(default)·{action:?}, not System·Admin"
+            );
+            // (a) a least-privilege `project_admin:default` (holds `Secrets·Admin` on `default`) is
+            // authorized for BOTH the Read and the Write verbs.
+            assert!(
+                proj_admin_default.allows(&required),
+                "project_admin:default must be allowed on {method} {path}"
+            );
+            // (b) a `project_admin` on a DIFFERENT project must NOT — the tenant boundary, so the
+            // loosening is not a cross-project widening.
+            assert!(
+                !proj_admin_acme.allows(&required),
+                "project_admin:acme must be refused on the default project's {method} {path}"
+            );
+            // (c) a global `admin` still covers it (`Secrets` ∈ `Resource::ALL`).
+            assert!(
+                admin.allows(&required),
+                "global admin must be allowed on {method} {path}"
+            );
+            // (d) a site `publisher`/`deployer` holds no `Secrets` right, so secrets stay
+            // admin-gated even on the default project.
+            for role in ["publisher", "deployer"] {
+                let site_role = policy.rights_for(&[GrantedRole::scoped(role, "default/blog")]);
+                assert!(
+                    !site_role.allows(&required),
+                    "{role}:default/blog must be refused on {method} {path} (secrets stay admin-gated)"
+                );
+            }
+        }
     }
 
     #[test]
