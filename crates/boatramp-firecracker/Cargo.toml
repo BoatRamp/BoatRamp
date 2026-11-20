@@ -19,7 +19,10 @@ description = "Firecracker microVM executor for boatramp tier-3 compute: API con
 # flate2 + an async HTTP client; off by default so the executor's pure config/
 # IPAM/placement layer stays dependency-light. The layer-overlay logic is
 # unit-tested; the registry pull (network) + `mke2fs` (e2fsprogs) are host seams.
-build = ["dep:tar", "dep:flate2", "dep:reqwest", "dep:hex", "dep:sha2"]
+# `dep:tokio` is for the SSRF-screening DNS resolver (`tokio::net::lookup_host`
+# on reqwest's blocking pool); reqwest already drags tokio in, so this only makes
+# it a direct dep for the resolver.
+build = ["dep:tar", "dep:flate2", "dep:reqwest", "dep:hex", "dep:sha2", "dep:tokio"]
 # The VMM `ComputeBackend` impl: wraps the
 # `Executor` behind `boatramp_core::compute::ComputeBackend`, staging blobs from
 # `Storage` and driving the (blocking) executor off the async runtime. Pulls
@@ -74,8 +77,10 @@ sha2 = { workspace = true, optional = true }
 # `backend` feature (the VMM `ComputeBackend`).
 boatramp-core = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
-# `+ time` for the health-probe connect timeout (workspace tokio omits it).
-tokio = { workspace = true, optional = true, features = ["time"] }
+# `+ time` for the health-probe connect timeout (workspace tokio omits it);
+# `+ net`/`rt` for the `build` feature's SSRF-screening DNS resolver
+# (`tokio::net::lookup_host`, which resolves on the runtime's blocking pool).
+tokio = { workspace = true, optional = true, features = ["time", "net", "rt"] }
 futures = { workspace = true, optional = true }
 
 # `embedded` feature (the in-process rust-vmm VMM) — Linux/KVM only.
