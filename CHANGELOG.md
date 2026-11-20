@@ -7,11 +7,13 @@ versions.
 
 ## [Unreleased]
 
-## [0.66.0] — 2026-11-20
+## [0.66.1] — 2026-11-20
 
 A compute-backend security-hardening release (plus two live-service fixes and a NixOS-module
 fix). Every item below was independently security-reviewed; the per-tenant L2 anti-spoof and the
-OCI-unpack containment are live-proven on a real kernel.
+OCI-unpack containment are live-proven on a real kernel. (0.66.0 was tagged but never published —
+its release preflight failed on a TOML-formatting check; 0.66.1 is the first published cut of this
+slate, adding only that formatting fix.)
 
 ### Security
 
