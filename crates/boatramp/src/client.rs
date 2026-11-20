@@ -75,6 +75,172 @@ pub struct MismatchFlags {
     pub only_blobs: Vec<String>,
 }
 
+/// Give up resuming an interrupted clone only after this many CONSECUTIVE interruptions that made
+/// **no forward progress** (the per-SHA diff showed the same number of blobs still to transfer). A
+/// transfer that keeps progressing through periodic connection drops is resumed indefinitely; only a
+/// genuinely stuck connection is abandoned, with the advice to re-run (which resumes).
+const CLONE_RESUME_MAX_STALLED_ATTEMPTS: u32 = 6;
+
+/// Backoff before re-issuing an interrupted clone: `1,2,4,8,16,30s` by consecutive-stall count
+/// (capped at 30s), long enough to outlast a transient edge/proxy blip without hammering.
+fn clone_resume_backoff(stalled: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((1u64 << stalled.min(5)).min(30))
+}
+
+/// The outcome of ONE `/clone/from` apply/verify attempt (one long-held streaming request).
+///
+/// The apply/verify transfer rides a SINGLE tens-of-minutes-long, near-idle HTTP response (only a
+/// ~5s progress heartbeat flows on this connection — the bulk bytes move on the target's SEPARATE
+/// pull from the source). An edge/proxy idle-cut or a transient reset severs the response body
+/// mid-wait, which `reqwest` surfaces as `error decoding response body`. The clone is IDEMPOTENT and
+/// RESUMABLE — the target restores each blob into its LIVE content-addressed store as it streams, and
+/// the per-SHA presence diff skips already-restored blobs on a re-issue — so a transport interruption
+/// is a [`Interrupted`](Self::Interrupted) that the caller RECOVERS by re-issuing, not a fatal error.
+#[derive(Debug)]
+enum CloneAttemptOutcome {
+    /// The stream delivered a plan and a terminal report — the clone converged. Boxed so this
+    /// (much larger) variant does not bloat every `Interrupted`/`Fatal` on the resume loop's hot path.
+    Applied {
+        plan: Box<boatramp_core::project_export::ClonePlan>,
+        report: Box<boatramp_core::project_export::ImportReport>,
+    },
+    /// The response was severed before the terminal report (a transport reset/truncation, or a
+    /// transient `502/503/504`): RESUMABLE. `remaining` is the blobs-still-to-transfer the attempt
+    /// observed in its plan (`None` if cut before the plan arrived), used to detect forward progress
+    /// across attempts.
+    Interrupted {
+        reason: String,
+        remaining: Option<usize>,
+    },
+    /// A REAL failure — a terminal `Error` event from the target, a malformed progress line, or a
+    /// non-transient refusal status — that re-issuing cannot fix. Surface it, do not retry.
+    Fatal(String),
+}
+
+/// Advance the resume stall/progress accounting after one [`CloneAttemptOutcome::Interrupted`]. Pure
+/// (no I/O) so the give-up policy is unit-tested without a live transfer. `remaining` is the
+/// blobs-still-to-transfer the interrupted attempt observed. Returns the updated
+/// `(stall, best_remaining)` and whether to GIVE UP (too many consecutive no-progress attempts).
+fn clone_resume_step(
+    stall: u32,
+    best_remaining: Option<usize>,
+    remaining: Option<usize>,
+) -> (u32, Option<usize>, bool) {
+    // Forward progress = fewer blobs still to transfer than the best we have ever seen. The first
+    // measurement (no prior best) counts as progress so a transfer that is moving is never abandoned.
+    let progressed = match (remaining, best_remaining) {
+        (Some(r), Some(b)) => r < b,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let best_remaining = match remaining {
+        Some(r) => Some(best_remaining.map_or(r, |b| b.min(r))),
+        None => best_remaining,
+    };
+    let stall = if progressed { 0 } else { stall + 1 };
+    let give_up = stall >= CLONE_RESUME_MAX_STALLED_ATTEMPTS;
+    (stall, best_remaining, give_up)
+}
+
+/// Drive ONE clone attempt's NDJSON progress stream to a [`CloneAttemptOutcome`]: parse each line,
+/// surface the plan + transfer heartbeats on `tracing` (stderr) so the operator is never left in
+/// silence, and collect the terminal report. A transport error from the body stream (the
+/// `error decoding response body` the bug reported), or a clean end BEFORE the terminal report, is a
+/// resumable [`Interrupted`](CloneAttemptOutcome::Interrupted); a terminal `Error` event or a
+/// malformed line is [`Fatal`](CloneAttemptOutcome::Fatal). Generic over the chunk/error types so it
+/// is driven by `reqwest`'s `bytes_stream()` in production and an in-memory stream in tests.
+async fn drive_clone_ndjson<S, B, E>(stream: S, target: &str) -> CloneAttemptOutcome
+where
+    S: futures::Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    use boatramp_core::project_export::CloneEvent;
+    use futures::StreamExt as _;
+    futures::pin_mut!(stream);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut plan: Option<boatramp_core::project_export::ClonePlan> = None;
+    let mut report: Option<boatramp_core::project_export::ImportReport> = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            // A transport-level body error mid-stream: the long-held response was severed (this is
+            // the `error decoding response body` the bug surfaced). RESUMABLE — the target skips the
+            // blobs already restored to its live store on a re-issue.
+            Err(e) => {
+                return CloneAttemptOutcome::Interrupted {
+                    reason: e.to_string(),
+                    remaining: plan.as_ref().map(|p| p.blobs_to_transfer),
+                };
+            }
+        };
+        buf.extend_from_slice(chunk.as_ref());
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            let line = &line[..line.len() - 1];
+            if line.is_empty() {
+                continue;
+            }
+            let ev: CloneEvent = match serde_json::from_slice(line) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    return CloneAttemptOutcome::Fatal(format!(
+                        "clone progress line was not valid JSON: {e}"
+                    ));
+                }
+            };
+            match ev {
+                CloneEvent::Plan(p) => {
+                    tracing::info!(
+                        target = %target,
+                        source = %p.source_project,
+                        blobs_total = p.blobs_total,
+                        blobs_present = p.blobs_present,
+                        blobs_to_transfer = p.blobs_to_transfer,
+                        bytes_to_transfer = p.bytes_to_transfer,
+                        bytes_exact = p.bytes_exact,
+                        "clone plan: transferring {} of {} blobs (~{} bytes){}",
+                        p.blobs_to_transfer,
+                        p.blobs_total,
+                        p.bytes_to_transfer,
+                        if p.bytes_exact { "" } else { "+" },
+                    );
+                    plan = Some(p);
+                }
+                CloneEvent::Progress {
+                    bytes_transferred,
+                    elapsed_secs,
+                } => tracing::info!(
+                    bytes_transferred,
+                    elapsed_secs,
+                    "clone progress: {bytes_transferred} bytes transferred in {elapsed_secs}s"
+                ),
+                CloneEvent::Report(r) => report = Some(r),
+                CloneEvent::Error { message } => {
+                    // A restore failure the target reported AFTER the stream opened — a REAL failure,
+                    // not a transport drop. Re-issuing will not fix it; surface it.
+                    return CloneAttemptOutcome::Fatal(format!(
+                        "clone failed after the stream opened: {message}"
+                    ));
+                }
+            }
+        }
+    }
+    match (plan, report) {
+        (Some(plan), Some(report)) => CloneAttemptOutcome::Applied {
+            plan: Box::new(plan),
+            report: Box::new(report),
+        },
+        // The stream ended cleanly WITHOUT both a plan and a terminal report — the connection was
+        // closed before the terminal event arrived (a proxy closing the near-idle long-held
+        // connection), or a malformed plan-less stream. RESUMABLE either way.
+        (plan, _) => CloneAttemptOutcome::Interrupted {
+            reason: "stream ended without a terminal report (truncated response)".into(),
+            remaining: plan.as_ref().map(|p| p.blobs_to_transfer),
+        },
+    }
+}
+
 /// Resolve the API token from `BOATRAMP_TOKEN` or `publish.token`.
 pub fn token(config: &ProjectConfig) -> Option<String> {
     std::env::var("BOATRAMP_TOKEN")
@@ -1175,7 +1341,7 @@ impl ControlPlane {
         drop_soft_deleted: bool,
         mismatch: MismatchFlags,
     ) -> Result<CloneOutcome> {
-        use boatramp_core::project_export::{CloneEvent, ClonePlan};
+        use boatramp_core::project_export::ClonePlan;
         let Self {
             http: client,
             base: server,
@@ -1211,23 +1377,25 @@ impl ControlPlane {
         if let Some(c) = &mismatch.continue_on_error {
             body["continue_on_error"] = serde_json::Value::String(c.clone());
         }
-        let resp = client
-            .post(format!("{server}/api/projects/{target}/clone/from"))
-            .header("x-boatramp-source-token", token)
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Refused(format!(
-                "project clone refused ({status}): {}",
-                text.trim_end()
-            )));
-        }
+        let url = format!("{server}/api/projects/{target}/clone/from");
 
-        // The DEFAULT dry-run answers with a single cheap ClonePlan JSON (no stream).
+        // The DEFAULT dry-run answers with a single cheap ClonePlan JSON — one short request, no
+        // long-held connection, so it is NOT part of the resumable transfer loop below.
         if !apply && !verify {
+            let resp = client
+                .post(url.as_str())
+                .header("x-boatramp-source-token", token)
+                .json(&body)
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(ClientError::Refused(format!(
+                    "project clone refused ({status}): {}",
+                    text.trim_end()
+                )));
+            }
             let bytes = resp.bytes().await?;
             let plan: ClonePlan = serde_json::from_slice(&bytes).map_err(|e| {
                 ClientError::Refused(format!("clone plan response was not valid JSON: {e}"))
@@ -1235,66 +1403,104 @@ impl ControlPlane {
             return Ok(CloneOutcome::Planned(plan));
         }
 
-        // apply / verify: read the NDJSON progress stream line-by-line as it arrives, surfacing the
-        // plan + transfer heartbeats on `tracing` (stderr) so the operator is never left in silence,
-        // and collecting the terminal report. A line-buffer stitches chunk boundaries.
-        use futures::StreamExt;
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut plan: Option<ClonePlan> = None;
-        let mut report: Option<boatramp_core::project_export::ImportReport> = None;
-        while let Some(chunk) = stream.next().await {
-            buf.extend_from_slice(&chunk?);
-            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=nl).collect();
-                let line = &line[..line.len() - 1];
-                if line.is_empty() {
-                    continue;
+        // apply / verify: the transfer rides a SINGLE tens-of-minutes-long, near-idle streaming
+        // response (only the ~5s progress heartbeat flows on this connection; the bulk bytes move on
+        // the target's SEPARATE pull from the source). An edge/proxy idle-cut or a transient reset
+        // severs the response body mid-wait — `reqwest`'s `error decoding response body`, the reported
+        // failure. The clone is IDEMPOTENT + RESUMABLE (the target restores each blob into its LIVE
+        // store as it streams, and its per-SHA diff skips already-restored blobs on a re-issue), so we
+        // RECOVER a transport interruption by re-issuing and converging rather than failing the whole
+        // transfer. We only give up after `CLONE_RESUME_MAX_STALLED_ATTEMPTS` consecutive interruptions
+        // that made NO forward progress. (`verify` persists nothing, so a resume re-validates — bounded
+        // by the same stall budget.)
+        let mut stall: u32 = 0;
+        let mut best_remaining: Option<usize> = None;
+        loop {
+            match self.clone_apply_attempt(&url, token, &body, target).await {
+                CloneAttemptOutcome::Applied { plan, report } => {
+                    return Ok(CloneOutcome::Applied {
+                        plan: *plan,
+                        report: *report,
+                    });
                 }
-                let ev: CloneEvent = serde_json::from_slice(line).map_err(|e| {
-                    ClientError::Refused(format!("clone progress line was not valid JSON: {e}"))
-                })?;
-                match ev {
-                    CloneEvent::Plan(p) => {
-                        tracing::info!(
-                            target = %target,
-                            source = %p.source_project,
-                            blobs_total = p.blobs_total,
-                            blobs_present = p.blobs_present,
-                            blobs_to_transfer = p.blobs_to_transfer,
-                            bytes_to_transfer = p.bytes_to_transfer,
-                            bytes_exact = p.bytes_exact,
-                            "clone plan: transferring {} of {} blobs (~{} bytes){}",
-                            p.blobs_to_transfer,
-                            p.blobs_total,
-                            p.bytes_to_transfer,
-                            if p.bytes_exact { "" } else { "+" },
-                        );
-                        plan = Some(p);
-                    }
-                    CloneEvent::Progress {
-                        bytes_transferred,
-                        elapsed_secs,
-                    } => tracing::info!(
-                        bytes_transferred,
-                        elapsed_secs,
-                        "clone progress: {bytes_transferred} bytes transferred in {elapsed_secs}s"
-                    ),
-                    CloneEvent::Report(r) => report = Some(r),
-                    CloneEvent::Error { message } => {
+                CloneAttemptOutcome::Fatal(msg) => return Err(ClientError::Refused(msg)),
+                CloneAttemptOutcome::Interrupted { reason, remaining } => {
+                    let (new_stall, new_best, give_up) =
+                        clone_resume_step(stall, best_remaining, remaining);
+                    stall = new_stall;
+                    best_remaining = new_best;
+                    if give_up {
                         return Err(ClientError::Refused(format!(
-                            "clone failed after the stream opened: {message}"
+                            "clone data transfer to {target} keeps dropping mid-transfer without \
+                             making progress (last: {reason}); the connection is too unstable to \
+                             complete in one run — re-run the command to resume (already-transferred \
+                             blobs are skipped)"
                         )));
                     }
+                    let backoff = clone_resume_backoff(stall.saturating_sub(1));
+                    tracing::warn!(
+                        target = %target,
+                        reason = %reason,
+                        stall,
+                        backoff_secs = backoff.as_secs(),
+                        "clone transfer interrupted mid-stream; resuming (the target skips \
+                         already-transferred blobs)"
+                    );
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
-        match (plan, report) {
-            (Some(plan), Some(report)) => Ok(CloneOutcome::Applied { plan, report }),
-            _ => Err(ClientError::Refused(
-                "clone stream ended without a terminal report (truncated response)".into(),
-            )),
+    }
+
+    /// Issue ONE `/clone/from` apply/verify request and drive its NDJSON stream to a
+    /// [`CloneAttemptOutcome`]. A send failure (the response never reached its headers) and a
+    /// transient `502/503/504` are both resumable [`Interrupted`](CloneAttemptOutcome::Interrupted);
+    /// a non-transient refusal status is [`Fatal`](CloneAttemptOutcome::Fatal). The streaming body is
+    /// classified by [`drive_clone_ndjson`]. Factored out so [`project_clone_from`]'s resume loop re-
+    /// issues an identical request (the request body is idempotent — the target's per-SHA diff makes a
+    /// re-issue transfer only what is still missing).
+    async fn clone_apply_attempt(
+        &self,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+        target: &str,
+    ) -> CloneAttemptOutcome {
+        let resp = match self
+            .http
+            .post(url)
+            .header("x-boatramp-source-token", token)
+            .json(body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            // The request did not reach its response headers (connect error / reset before `200`):
+            // transport-level, and nothing could have been applied yet. RESUMABLE.
+            Err(e) => {
+                return CloneAttemptOutcome::Interrupted {
+                    reason: format!("request did not reach the target: {e}"),
+                    remaining: None,
+                };
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            // A gateway/proxy transient (the edge briefly could not reach the backend) is RESUMABLE;
+            // any other non-success is a real refusal that re-issuing cannot fix.
+            if matches!(status.as_u16(), 502..=504) {
+                return CloneAttemptOutcome::Interrupted {
+                    reason: format!("target returned a transient {status}"),
+                    remaining: None,
+                };
+            }
+            let text = resp.text().await.unwrap_or_default();
+            return CloneAttemptOutcome::Fatal(format!(
+                "project clone refused ({status}): {}",
+                text.trim_end()
+            ));
         }
+        drive_clone_ndjson(resp.bytes_stream(), target).await
     }
 
     /// RESUMABLE export (`POST /api/project-export?resumable=<dir_name>`, `Project·Admin` on the target):
@@ -3407,6 +3613,250 @@ mod tests {
             dryrun_hits.load(Ordering::SeqCst),
             1,
             "no_wait makes exactly one attempt"
+        );
+    }
+
+    // ---- clone/from long-transfer resilience (the v0.65 `error decoding response body` fix) ----
+
+    /// The stream-driver classifies each terminal shape correctly. The LOAD-BEARING case is the
+    /// severed mid-stream body — the reported `error decoding response body` — which must be a
+    /// RESUMABLE `Interrupted` (carrying the blobs-still-to-transfer the plan observed), NOT a fatal
+    /// error. Pre-fix, the same `chunk?` turned this into `ClientError::Http(..)` and failed the
+    /// whole clone.
+    #[tokio::test]
+    async fn drive_clone_ndjson_classifies_a_severed_stream_as_resumable() {
+        use boatramp_core::project_export::{CloneEvent, ClonePlan, ImportReport};
+
+        let plan = ClonePlan {
+            source_project: "src".into(),
+            target_project: "dst".into(),
+            blobs_total: 10,
+            blobs_present: 0,
+            blobs_to_transfer: 10,
+            ..Default::default()
+        };
+        let plan_line = format!(
+            "{}\n",
+            serde_json::to_string(&CloneEvent::Plan(plan)).unwrap()
+        );
+        let report_line = format!(
+            "{}\n",
+            serde_json::to_string(&CloneEvent::Report(ImportReport {
+                blobs: 10,
+                ..Default::default()
+            }))
+            .unwrap()
+        );
+
+        // A complete stream (plan + terminal report) converges to Applied.
+        let full = futures::stream::iter(vec![
+            Ok::<Vec<u8>, std::io::Error>(plan_line.clone().into_bytes()),
+            Ok(report_line.into_bytes()),
+        ]);
+        match drive_clone_ndjson(full, "dst").await {
+            CloneAttemptOutcome::Applied { report, .. } => assert_eq!(report.blobs, 10),
+            other => panic!("a complete stream must be Applied, got {other:?}"),
+        }
+
+        // A transport error mid-stream (`error decoding response body`) is a RESUMABLE Interrupted
+        // carrying the blobs still to transfer — the exact bug shape.
+        let severed = futures::stream::iter(vec![
+            Ok::<Vec<u8>, std::io::Error>(plan_line.clone().into_bytes()),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "error decoding response body",
+            )),
+        ]);
+        match drive_clone_ndjson(severed, "dst").await {
+            CloneAttemptOutcome::Interrupted { remaining, .. } => assert_eq!(remaining, Some(10)),
+            other => panic!("a severed stream must be a resumable Interrupted, got {other:?}"),
+        }
+
+        // A clean end BEFORE the terminal report is ALSO a resumable Interrupted (truncated).
+        let truncated = futures::stream::iter(vec![Ok::<Vec<u8>, std::io::Error>(
+            plan_line.clone().into_bytes(),
+        )]);
+        match drive_clone_ndjson(truncated, "dst").await {
+            CloneAttemptOutcome::Interrupted { remaining, .. } => assert_eq!(remaining, Some(10)),
+            other => panic!("a truncated stream must be a resumable Interrupted, got {other:?}"),
+        }
+
+        // A terminal Error event is a REAL failure (Fatal) — never retried.
+        let errored = futures::stream::iter(vec![
+            Ok::<Vec<u8>, std::io::Error>(plan_line.into_bytes()),
+            Ok(format!(
+                "{}\n",
+                serde_json::to_string(&CloneEvent::Error {
+                    message: "restore blew up".into()
+                })
+                .unwrap()
+            )
+            .into_bytes()),
+        ]);
+        match drive_clone_ndjson(errored, "dst").await {
+            CloneAttemptOutcome::Fatal(m) => assert!(m.contains("restore blew up"), "{m}"),
+            other => panic!("a terminal Error event must be Fatal, got {other:?}"),
+        }
+    }
+
+    /// The give-up policy abandons a transfer ONLY after the stall budget of consecutive
+    /// NO-progress interruptions — a transfer that keeps shrinking its remaining-to-transfer is
+    /// resumed indefinitely.
+    #[test]
+    fn clone_resume_step_gives_up_only_without_progress() {
+        // No forward progress (same `remaining` every attempt) → stall climbs to the cap → give up.
+        let mut stall = 0u32;
+        let mut best = Some(100usize);
+        let mut gave_up = false;
+        for _ in 0..CLONE_RESUME_MAX_STALLED_ATTEMPTS {
+            let (s, b, g) = clone_resume_step(stall, best, Some(100));
+            stall = s;
+            best = b;
+            gave_up = g;
+        }
+        assert!(
+            gave_up,
+            "a stuck transfer must give up after {CLONE_RESUME_MAX_STALLED_ATTEMPTS} no-progress tries"
+        );
+
+        // Forward progress (shrinking `remaining`) resets the stall every time → never gives up,
+        // even across far more interruptions than the cap.
+        let mut stall = 0u32;
+        let mut best = None;
+        let mut remaining = 1000usize;
+        for _ in 0..(CLONE_RESUME_MAX_STALLED_ATTEMPTS * 3) {
+            remaining = remaining.saturating_sub(10);
+            let (s, b, g) = clone_resume_step(stall, best, Some(remaining));
+            stall = s;
+            best = b;
+            assert!(
+                !g,
+                "a progressing transfer must never give up (remaining={remaining}, stall={stall})"
+            );
+        }
+        assert_eq!(stall, 0, "forward progress keeps the stall counter at zero");
+    }
+
+    /// END-TO-END through the REAL `project_clone_from` + `reqwest`: a mock `/clone/from` node whose
+    /// FIRST response is severed mid-stream (the bug's `error decoding response body`) and whose
+    /// second completes. The client must RE-ISSUE and converge to `Applied` — pre-fix it failed the
+    /// whole clone on the first severed body.
+    #[tokio::test]
+    async fn project_clone_from_resumes_after_a_severed_stream() {
+        use axum::response::IntoResponse;
+        use boatramp_core::project_export::{CloneEvent, ClonePlan, ImportReport, ManagedRestore};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let count = Arc::new(AtomicUsize::new(0));
+
+        async fn handler(
+            axum::extract::State(count): axum::extract::State<Arc<AtomicUsize>>,
+            _req: axum::extract::Request,
+        ) -> axum::response::Response {
+            let n = count.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Attempt 1: plan + a heartbeat, then SEVER the body mid-stream (no terminal report).
+                let plan = ClonePlan {
+                    source_project: "src".into(),
+                    target_project: "dst".into(),
+                    blobs_total: 10,
+                    blobs_present: 0,
+                    blobs_to_transfer: 10,
+                    ..Default::default()
+                };
+                let lines = vec![
+                    Ok::<Vec<u8>, std::io::Error>(
+                        format!(
+                            "{}\n",
+                            serde_json::to_string(&CloneEvent::Plan(plan)).unwrap()
+                        )
+                        .into_bytes(),
+                    ),
+                    Ok(format!(
+                        "{}\n",
+                        serde_json::to_string(&CloneEvent::Progress {
+                            bytes_transferred: 1,
+                            elapsed_secs: 0,
+                        })
+                        .unwrap()
+                    )
+                    .into_bytes()),
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "severed mid-transfer",
+                    )),
+                ];
+                let mut resp =
+                    axum::body::Body::from_stream(futures::stream::iter(lines)).into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/x-ndjson"),
+                );
+                resp
+            } else {
+                // Resume attempt: the diff shows forward progress (7 present) and the stream completes.
+                let plan = ClonePlan {
+                    source_project: "src".into(),
+                    target_project: "dst".into(),
+                    blobs_total: 10,
+                    blobs_present: 7,
+                    blobs_to_transfer: 3,
+                    ..Default::default()
+                };
+                let report = ImportReport {
+                    blobs: 3,
+                    ..Default::default()
+                };
+                format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(&CloneEvent::Plan(plan)).unwrap(),
+                    serde_json::to_string(&CloneEvent::Report(report)).unwrap(),
+                )
+                .into_response()
+            }
+        }
+
+        let app = axum::Router::new()
+            .route(
+                "/api/projects/{target}/clone/from",
+                axum::routing::post(handler),
+            )
+            .with_state(count.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        let cp = ControlPlane::new(base.clone(), http_client(None), "dst".into());
+        let outcome = cp
+            .project_clone_from(
+                "dst",
+                &base,
+                Some("src"),
+                b"srctok",
+                true,  // apply
+                false, // verify
+                true,  // overwrite
+                false, // force
+                true,  // data_only
+                Some(ManagedRestore::ShadowSwap),
+                false, // skip_control_plane_kv
+                false, // drop_soft_deleted
+                MismatchFlags::default(),
+            )
+            .await
+            .expect("the clone must RESUME past the severed first attempt and converge to Applied");
+        match outcome {
+            CloneOutcome::Applied { report, .. } => assert_eq!(report.blobs, 3),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "the client must re-issue the clone after the severed first attempt"
         );
     }
 }
