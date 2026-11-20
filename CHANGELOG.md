@@ -7,6 +7,28 @@ versions.
 
 ## [Unreleased]
 
+## [0.66.2] — 2026-11-20
+
+### Fixed
+
+- **Compute scheduler no longer selects a backend that can't run the workload** (hotfix for a
+  v0.66.1 regression). v0.66.1 made the native `container` compute backend available on nodes where
+  it previously was not (the NixOS compute-caps fix), and the scheduler's backend eligibility checked
+  isolation / volumes / scale-to-zero but NOT the workload's source kind or its registry credential —
+  so with the native `container` backend sorting first, an `image()` workload carrying a `pull_secret`
+  (a private-registry image) was handed to the native container backend, which cannot apply a registry
+  credential, and crash-looped (`launched=0`, "cannot apply a registry credential"). Backend
+  eligibility is now **source- and credential-aware**: each backend advertises which `RootSource` kinds
+  it can run (`ComputeBackend::source_support()`) and whether it can apply a private-registry
+  credential; a workload places only on a backend that accepts its source kind, and a private
+  (`pull_secret`) image places only on a credential-capable backend (docker / cloudflare), never the
+  native container or firecracker backends. A default source-affinity tie-break keeps an `image()`
+  routing to an image-native backend over the native container backend when both are eligible — so a
+  dual-backend node preserves the documented `image()`→docker behavior while a container-only node
+  (e.g. a daemonless fly.io guest running a co-located managed database from a public image) still
+  places. Fail-closed throughout: a workload with no capable backend is left unscheduled (a legible
+  no-placement) rather than crash-looped onto an incapable one.
+
 ## [0.66.1] — 2026-11-20
 
 A compute-backend security-hardening release (plus two live-service fixes and a NixOS-module
