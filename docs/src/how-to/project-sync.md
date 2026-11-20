@@ -140,6 +140,14 @@ target's name; override it with `--from-project`. A cross-node **`--apply`** nee
 **source node's** `Project·Admin` token — via `--clone-source-token-file <path>` or
 `BOATRAMP_CLONE_SOURCE_TOKEN` (sent in a header over TLS, never on argv).
 
+A cross-node `--apply` rides the same long-held, near-idle clone transport, so it inherits its
+**automatic resume**: if the transfer is severed mid-stream (an edge reset, a transient
+`502`/`503`/`504`), the client re-issues the idempotent request and converges rather than failing
+the whole run — see [How it resumes](./clone-project.md#how-it-resumes-without-staging-a-bundle).
+An auto-resume may briefly overlap the server's still-finishing first import (safe, converges); for
+a managed-DB member a populated `<live>__old_<suffix>` aside may linger until the next sync
+self-heal (below) or a manual `boatramp db drop database <name> --orphan -y`.
+
 Worked example — clone production app data into a fresh/absent A/B environment on a separate
 machine, keeping the target's own front door and identity:
 

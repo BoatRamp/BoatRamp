@@ -75,6 +75,35 @@ replica, the reconcile logs a `compute reconcile: partial` warning naming the
 unscheduled ordinal and its resource need (`not scheduled: no eligible backend with
 capacity (needs 2vcpu/512MiB)`) instead of silently dropping it.
 
+## Launches refused: nftables anti-spoof unavailable
+
+On a **multi-tenant** node, every bridge-based launch (native `container` or microVM)
+first installs a per-port nftables anti-spoof filter on `br-boatramp`. If the host has no
+usable `nft`, the node **refuses the launch fail-closed** rather than run a workload with no
+L2 isolation from its neighbors — the replica surfaces as `launch_failed` with a reason
+like:
+
+```
+launch_failed  (multi-tenant node: nftables bridge anti-spoof is unavailable … Install
+nftables and grant this node CAP_NET_ADMIN, or run it single-tenant.)
+```
+
+Fix it by installing the `nft` binary and granting the node `CAP_NET_ADMIN` (on NixOS, set
+[`services.boatramp.compute = true`](./install.md#nix--nixos)); a `single-tenant` node logs
+a startup WARN and proceeds instead. See
+[Node networking: nftables anti-spoof](./compute.md#node-networking-nftables-anti-spoof-required-for-multi-tenant).
+
+## Image pull refused: private registry on an internal address
+
+A pull from a registry (or an auth realm / redirect) that resolves to a loopback, private
+(RFC-1918), link-local, CGNAT, or ULA address — or that is plain `http` — is **refused by
+the SSRF guard**, so an image hosted on a localhost/internal-only registry fails to pull.
+Host the registry on an externally-resolvable `https` address, or preload the image into the
+node's local store and launch with
+[`--pull-policy if-not-present`/`never`](./compute.md#use-a-locally-loaded-image---pull-policy).
+An operator allowlist for a trusted internal registry is a planned follow-up. See
+[Pull from a private registry](./compute.md#pull-from-a-private-registry).
+
 ## Find an IP collision
 
 If two replicas were handed the same address, the gateway and internal DNS will

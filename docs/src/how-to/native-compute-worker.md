@@ -243,6 +243,20 @@ boatramp compute set worker --image ghcr.io/acme/worker:1 --port 8080 \
   --pull-secret ghcr-pull --bind blob:assets
 ```
 
+The registry host, its auth realm, and every redirect hop are **SSRF-screened and must be
+https** — a private registry reachable only on a loopback/internal (RFC-1918, link-local,
+CGNAT, ULA, …) address is currently **refused**. Use an externally-resolvable public
+registry, or preload the image and launch with `--pull-policy if-not-present`. A
+digest-pinned reference (`…@sha256:`/`@sha512:`) is verified against its digest on pull. See
+[Pull from a private registry](./compute.md#pull-from-a-private-registry).
+
+> **Operator note — the native container backend needs nftables under multi-tenant.** Each
+> worker's veth gets a per-port nftables anti-spoof filter on the shared `br-boatramp` bridge.
+> Under the `multi-tenant` posture a node with no usable `nft` **refuses every launch**
+> (fail-closed); a single-tenant node warns and proceeds. Install `nft` and grant the node
+> `CAP_NET_ADMIN` (on NixOS, [`services.boatramp.compute = true`](./install.md#nix--nixos)).
+> See [Node networking: nftables anti-spoof](./compute.md#node-networking-nftables-anti-spoof-required-for-multi-tenant).
+
 See [Run a container or microVM](./compute.md) for the full `compute set` surface (volumes,
 scale-to-zero, regions, resource limits) and
 [Diagnose & work around compute issues](./diagnose-compute.md) for operating the reconcile

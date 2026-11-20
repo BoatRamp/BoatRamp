@@ -156,11 +156,31 @@ The target first fetches a cheap **manifest** from the source (`clone/manifest`)
 source project's blob objects plus the non-blob member paths (managed-DB dumps, the KV slice), never
 a body read, so it stays cheap even at tens of GB. It diffs that list against its **own
 content-addressed store**, then asks the source (`clone/stream`) to stream **only the members it is
-missing**. Blobs flow **bucket → bucket**. An interrupted clone is **resumable**: a re-run re-diffs
+missing**. Blobs flow **bucket → bucket**. An interrupted clone is **resumable**: a re-issue re-diffs
 and transfers only what is still missing, not the whole project again. Each member is restored
 through the same **atomic shadow-restore** path a bundle import uses (a managed dedicated DB restores
 into a shadow and swaps in only after it verifies), so a failed clone leaves the live target
 untouched.
+
+**A severed long transfer now resumes automatically.** A multi-GB clone rides one long-held,
+near-idle HTTP response (the bulk bytes move on a separate dest→source pull, so only a periodic
+progress heartbeat flows on the operator's connection), which an edge or a transient reset can
+sever mid-wait. The client no longer treats a mid-stream body error, a clean truncation before the
+terminal report, or a transient `502`/`503`/`504` as fatal: it **re-issues the identical idempotent
+request and converges**, backing off `1s → 30s`, and gives up only after **6 consecutive**
+interruptions that made no forward progress (a transfer that keeps progressing resumes
+indefinitely). A terminal server error, a malformed stream, or a non-transient refusal is still
+surfaced at once. So a long clone that previously died with `error decoding response body` now rides
+through a dropped connection without operator intervention; you no longer need to re-run it by hand.
+
+> **Deliberate concurrent-import overlap.** The server's apply import is a detached task that keeps
+> running after the client disconnects, so an auto-resume may **briefly overlap** the still-finishing
+> first import. This is safe and converges — blob puts are idempotent. For a **managed-DB** member it
+> is a narrow shadow-swap overlap: a populated `<live>__old_<suffix>` database may be left **aside**
+> after the swap. It is harmless and reclaimed by the next
+> [`project sync`](./project-sync.md#self-heal-a-prior-failed-managed-db-sync) self-heal; to clear it
+> by hand, use `boatramp db drop database <name> --orphan -y` (see
+> [Declare a managed database](./managed-databases.md)).
 
 ### Authorization and tenancy
 

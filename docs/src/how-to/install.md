@@ -95,6 +95,23 @@ nixpkgs.overlays = [ inputs.boatramp.overlays.default ];
 services.boatramp.enable = true;
 ```
 
+To run **compute workloads** (containers / microVMs) on a NixOS node, also set
+`services.boatramp.compute = true`. The default systemd sandbox is too tight to build the
+compute bridge — a non-root service under `NoNewPrivileges=true` needs the capabilities as
+**ambient** (a bounding-set-only grant is inert), and `AF_NETLINK` must be permitted for the
+rtnetlink socket. Setting `compute = true` grants the service the ambient `CAP_NET_ADMIN`,
+`CAP_SYS_ADMIN`, `CAP_SETUID`, and `CAP_SETGID` capabilities and allows `AF_NETLINK`, which
+is what boatramp needs to create the `br-boatramp` bridge and per-guest veths; without it the
+bridge fails to come up (`EAFNOSUPPORT`) and the compute backends stay disabled:
+
+```nix
+services.boatramp.enable = true;
+services.boatramp.compute = true;   # grants the ambient caps + AF_NETLINK for the compute bridge
+```
+
+`CAP_SYS_ADMIN` is broad — it is the documented opt-in, so enable `compute` only on a node you
+intend to run compute workloads on.
+
 ## Prebuilt archive
 
 Download the release archive for your platform from the

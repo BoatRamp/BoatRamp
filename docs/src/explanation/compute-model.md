@@ -61,6 +61,14 @@ disabled, so a workload marked `--isolation untrusted` — or any workload under
 that posture — runs in a microVM. A `single-tenant` operator who owns every
 image can allow containers for their lower overhead.
 
+The container and microVM backends share one node bridge, so each guest's port
+also gets a per-port nftables anti-spoof filter (pinned to a deterministic per-IP
+MAC) to stop a guest spoofing a neighbor at layer 2. That filter needs a usable
+`nft`: under `multi-tenant` a node without it refuses compute launches
+fail-closed, so **nftables is effectively required for multi-tenant compute**; a
+`single-tenant` node warns and proceeds. See
+[Node networking: nftables anti-spoof](../how-to/compute.md#node-networking-nftables-anti-spoof-required-for-multi-tenant).
+
 ## Scale to zero
 
 A microVM workload can snapshot its running state and stop when idle, then

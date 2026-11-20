@@ -90,6 +90,13 @@ All of these are **project-scoped** via the global `--project` flag (default
 a publisher can *reference* `boatramp:stripe-key` but only an admin provisions
 it.
 
+> **Least-privilege for the default project.** Managing the **default** project's
+> secrets (and [email profiles](./send-email.md)) with the bare `boatramp secrets`
+> / `boatramp email` commands authorizes on the `Secrets` right for the `default`
+> project — so a scoped `project_admin:default` token is sufficient and a
+> node-global `admin` token is **no longer required**. The authority is the same
+> `Secrets·Admin` a project admin holds on any other project.
+
 > **Requires a `[secrets]` envelope.** The store seals every value, so the
 > secret commands (and any `boatramp:` reference) need a `[secrets]` envelope
 > configured — see [Encrypt secrets at rest](./secrets-at-rest.md). Without one

@@ -191,6 +191,24 @@ fails the pull **closed** — it is never silently downgraded to an anonymous pu
 anonymous pull happens only when no `--pull-secret` is set AND no operator host entry
 matches (a public image). A wrong/failed credential never echoes the token in an error.
 
+> **Registry pulls are SSRF-screened — an internal/localhost registry is refused.** The
+> image pull runs in the node process (root, on a tenant-controlled reference), so boatramp
+> screens the registry host, the `WWW-Authenticate` auth realm, **and every redirect hop**
+> against an SSRF block-list and requires **https**. Any name that resolves to a
+> loopback, private (RFC-1918), link-local, CGNAT, ULA, or v4-mapped / 6to4 / Teredo /
+> v4-compat IPv6, or multicast address is refused (the vetted address is pinned against
+> DNS-rebinding; a legitimate blob→CDN redirect is re-screened and allowed). A consequence
+> today is that a **private registry reachable only on an internal/localhost address is
+> refused** — host it on an externally-resolvable public address, or preload the image into
+> the node's local store and launch it with [`--pull-policy if-not-present`/`never`](#use-a-locally-loaded-image---pull-policy).
+> **Known limitation:** an operator allowlist to exempt a trusted internal registry is a
+> planned follow-up; it is not configurable yet.
+>
+> **Digest-pinned pulls are verified.** A `repo@sha256:…` or `@sha512:…` reference has its
+> manifest and layer bytes hashed and checked against the pinned digest before boatramp
+> trusts them (an unknown/malformed digest algorithm is rejected, not waved through), so a
+> malicious or MITM registry cannot serve different bytes under a pinned reference.
+
 ## Use a locally-loaded image (`--pull-policy`)
 
 By default boatramp **re-pulls** an `--image` from its registry on every launch. To run an
@@ -245,6 +263,33 @@ boatramp compute build tenant-app --image ghcr.io/acme/app:1.4 \
 Under the strict `multi-tenant` security posture, shared-kernel (container)
 compute is disabled, so every workload runs in a microVM regardless of
 `--isolation`. See [Choose a security posture](./security-posture.md).
+
+## Node networking: nftables anti-spoof (required for multi-tenant)
+
+Every bridge-based compute backend — the microVM VMM taps and the native
+`container` veths — shares one node bridge (`br-boatramp`), so a workload could
+otherwise ARP- or source-IP-spoof a neighbor (including a co-located managed
+Postgres) at layer 2. boatramp closes that by installing a **per-port nftables
+anti-spoof filter** on each tap/veth, pinned to a deterministic per-IP guest MAC,
+**before** the port joins the bridge (fail-closed — a port whose filter cannot be
+installed never carries traffic).
+
+The filter needs a usable `nft` (nftables) on the host. The node probes it once at
+startup and gates on the [security posture](./security-posture.md):
+
+| nftables | Posture | Behavior |
+| --- | --- | --- |
+| usable | any | Filter installed on every launch/restore (fail-closed if an install fails). |
+| unusable | `multi-tenant` | **Every compute launch is refused** (fail-closed) — the node will not run a container/microVM without L2 isolation from its neighbors. |
+| unusable | `single-tenant` / `dev` | A startup **WARN** is logged and launches proceed (operator-trusted). |
+
+So **nftables is effectively required for multi-tenant compute**: install the `nft`
+binary and grant the node `CAP_NET_ADMIN` (on NixOS, set
+[`services.boatramp.compute = true`](./install.md#nix--nixos)), or run the node
+single-tenant. A refused multi-tenant launch reports it plainly (see
+[Diagnose compute issues](./diagnose-compute.md#launches-refused-nftables-anti-spoof-unavailable)).
+The Kubernetes backend does not use this bridge — it isolates workloads with
+[NetworkPolicies](#network-isolation-networkpolicy--cni) instead.
 
 ## The Kubernetes backend (boatramp on k8s)
 

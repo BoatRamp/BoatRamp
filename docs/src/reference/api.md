@@ -604,8 +604,11 @@ scopes to another project.
 The control-plane surface is uniform whether or not execution is available on the
 node. Only the **microVM** backend needs `/dev/kvm`; the native **container** backend
 instead needs the `br-boatramp` bridge and `CAP_NET_ADMIN` (both compute backends are
-Linux-only). On macOS / Windows compute runs through the remote-docker backend. See
-[Run compute workloads](../how-to/compute.md).
+Linux-only). Both bridge backends also need a usable `nft` (nftables) to install the
+per-port anti-spoof filter: under the `multi-tenant` posture a node without it **refuses
+compute launches** (fail-closed), while a `single-tenant` node warns and proceeds. On
+macOS / Windows compute runs through the remote-docker backend. See
+[Run compute workloads](../how-to/compute.md#node-networking-nftables-anti-spoof-required-for-multi-tenant).
 
 ### Compute operations (node-global)
 
@@ -763,6 +766,13 @@ when a `[secrets]` key envelope is configured (else a clear `501`). Secrets sinc
 | `PUT` | `/api/projects/:project/email/profiles/:name` | Set / partial-update an SMTP profile (sealed password); returns the redacted profile. |
 | `GET` | `/api/projects/:project/email/profiles[/:name]` | List / show email profiles (redacted). |
 | `DELETE` | `/api/projects/:project/email/profiles/:name` | Delete an email profile. |
+
+The CLI's default-project convenience forms — the bare `/api/secrets[/<name>]` and
+`/api/email/profiles[/<name>]` (what `boatramp secrets` / `boatramp email` call with no
+`--project`) — operate on the **default** project's sealed store and authorize on the same
+`secrets` right scoped to the `default` project (`read` for `GET`, `write` for set/delete).
+A least-privilege `project_admin:default` token can therefore manage default-project secrets
+and email profiles; a node-global `System·Admin` is **not** required.
 
 See [Store secrets](../how-to/secrets.md) and [Send email](../how-to/send-email.md).
 
