@@ -1188,7 +1188,7 @@ impl BackendPolicy {
     /// backend nor relax the isolation posture. This is the authority split enforced
     /// structurally.
     #[must_use]
-    pub fn compose_project(&self, project: &ProjectBackendPolicy) -> BackendPolicy {
+    pub fn compose_project(&self, project: &ProjectBackendPolicy) -> Self {
         let allow = match (&self.allow, &project.allow) {
             (None, None) => None,
             (Some(n), None) => Some(n.clone()),
@@ -1201,7 +1201,7 @@ impl BackendPolicy {
                 forbid.push(f.clone());
             }
         }
-        BackendPolicy {
+        Self {
             allow,
             forbid,
             prefer: project.prefer.clone().or_else(|| self.prefer.clone()),
@@ -1243,10 +1243,10 @@ impl ProjectBackendPolicy {
     }
 }
 
-/// Why a backend is — or is NOT — a placement candidate for a spec under the operator policy
-/// + isolation posture + capability floor. The **single** verdict the scheduler selects on
-/// ([`Node::pick_backend`]) and the placement-explain surfaces (`compute get`, and the
-/// no-placement `not scheduled: …` reason) report, so selection and legibility can never
+/// Why a backend is — or is NOT — a placement candidate for a spec under the operator policy,
+/// the isolation posture, and the capability floor. The **single** verdict the scheduler
+/// selects on ([`Node::pick_backend`]) and the placement-explain surfaces (`compute get`, and
+/// the no-placement `not scheduled: …` reason) report, so selection and legibility can never
 /// drift. `Eligible` ⇒ a valid candidate; any other variant is the FIRST hard gate the
 /// backend failed, evaluated operator-first (policy → posture → capability floor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1278,7 +1278,7 @@ impl BackendEligibility {
     /// Whether this verdict is a valid placement candidate.
     #[must_use]
     pub fn is_eligible(self) -> bool {
-        matches!(self, BackendEligibility::Eligible)
+        matches!(self, Self::Eligible)
     }
 
     /// A short, operator-facing phrase for the no-placement reason (`compute status` /
@@ -1286,14 +1286,14 @@ impl BackendEligibility {
     #[must_use]
     pub fn describe(self) -> &'static str {
         match self {
-            BackendEligibility::Eligible => "eligible",
-            BackendEligibility::ForbiddenByNodePolicy => "forbidden by node policy",
-            BackendEligibility::ForbiddenByProjectPolicy => "forbidden by project policy",
-            BackendEligibility::IsolationInsufficient => "isolation insufficient",
-            BackendEligibility::CannotRunSource => "cannot run this source kind",
-            BackendEligibility::NoCredential => "no credential for a private image",
-            BackendEligibility::NoPersistentVolume => "no persistent-volume support",
-            BackendEligibility::NoScaleToZero => "no scale-to-zero support",
+            Self::Eligible => "eligible",
+            Self::ForbiddenByNodePolicy => "forbidden by node policy",
+            Self::ForbiddenByProjectPolicy => "forbidden by project policy",
+            Self::IsolationInsufficient => "isolation insufficient",
+            Self::CannotRunSource => "cannot run this source kind",
+            Self::NoCredential => "no credential for a private image",
+            Self::NoPersistentVolume => "no persistent-volume support",
+            Self::NoScaleToZero => "no scale-to-zero support",
         }
     }
 }
@@ -5087,7 +5087,7 @@ mod tests {
             1,
             &PlacementConstraints::default(),
             &s,
-            &[n.clone()],
+            std::slice::from_ref(&n),
             &policy,
         );
         assert_eq!(
