@@ -21,7 +21,8 @@ use boatramp_core::Storage;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, DataDirOwnership, Endpoint,
     ExecOutput, ForeignOwnedEntry, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
-    RootSource, Scheme, Snapshot, VolumeInfo, compute_instance_id, compute_volume_scope,
+    RootSource, RootSourceKind, Scheme, Snapshot, SourceSupport, VolumeInfo, compute_instance_id,
+    compute_volume_scope,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
 use boatramp_core::registry_auth::RegistryAuth;
@@ -993,6 +994,26 @@ impl ComputeBackend for ContainerBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+        }
+    }
+
+    fn source_support(&self) -> SourceSupport {
+        // The native container backend runs a **tar** rootfs archive (`RootSource::Tar`,
+        // staged + unpacked) AND a PUBLIC **image** (`stage_image` → `oci::build_rootfs_dir`
+        // — a daemonless OCI pull+overlay; `stage_rootfs_source` rejects only `Rootfs`). It
+        // CANNOT apply a registry credential: `materialize` fails closed on a PRIVATE image
+        // (`pull_auth.is_some()`) — "the native container backend cannot apply a registry
+        // credential; run this private-image workload on the `docker` backend". So it
+        // ACCEPTS Image + Tar (a container-only node — fly.io: daemonless + kvmless, the
+        // sole backend, where co-located managed DBs are PUBLIC images — must place them
+        // here, not strand them), is NOT private-registry-credential-capable (the scheduler
+        // steers a PRIVATE image to docker, or fails closed if none), and is Tar-PRIMARY
+        // (so a public image prefers the image-native docker/cloudflare backend when one is
+        // also present — a tie-break, not an exclusion).
+        SourceSupport {
+            accepted_sources: vec![RootSourceKind::Image, RootSourceKind::Tar],
+            private_registry_credential: false,
+            primary_source: Some(RootSourceKind::Tar),
         }
     }
 
@@ -4633,6 +4654,49 @@ mod tests {
         )
         .expect("backend")
         .with_legacy_data_claimant(claimant.map(|(p, w)| (p.to_string(), w.to_string())))
+    }
+
+    /// Drift-guard (Security review, v0.66.1 prod-down): the SCHEDULER advertises this
+    /// backend via [`ComputeBackend::source_support`], and that advertised capability MUST
+    /// match what `materialize` / [`ContainerBackend::stage_rootfs_source`] ACTUALLY runs —
+    /// a PUBLIC `Image` (`stage_image` → `oci::build_rootfs_dir`) **and** a `Tar`, never a
+    /// `Rootfs`, and it CANNOT apply a per-project registry credential (`materialize` fails
+    /// closed on a private image). The regression hid precisely because nothing asserted the
+    /// REAL value: a narrowed `accepted_sources` that dropped `Image` would strand a
+    /// container-only node's public-image workloads (fly.io managed DBs) with no placement.
+    /// Assert the real return directly so any future narrowing fails HERE.
+    #[test]
+    fn source_support_matches_the_real_materialize_contract() {
+        let data_dir = unique_dir("srcsupport");
+        let ss = migration_backend(&data_dir, None).source_support();
+        assert!(
+            ss.accepted_sources.contains(&RootSourceKind::Image),
+            "native container runs a PUBLIC OCI image (stage_image → oci::build_rootfs_dir); \
+             source_support MUST accept Image or a container-only node strands public-image \
+             workloads — the v0.66.1 prod-down regression"
+        );
+        assert!(
+            ss.accepted_sources.contains(&RootSourceKind::Tar),
+            "native container's primary substrate is a tar rootfs archive"
+        );
+        assert!(
+            !ss.accepted_sources.contains(&RootSourceKind::Rootfs),
+            "native container does NOT run a rootfs block image (that is the micro-VM \
+             substrate; stage_rootfs_source rejects Rootfs)"
+        );
+        assert!(
+            !ss.private_registry_credential,
+            "native container cannot apply a per-project registry credential (materialize \
+             fails closed on a private image), so the scheduler must steer a private image \
+             to the docker backend"
+        );
+        assert_eq!(
+            ss.primary_source,
+            Some(RootSourceKind::Tar),
+            "native container is Tar-primary: a public image prefers an image-native backend \
+             (docker/cloudflare) when one is also present"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// A single-volume spec whose volume is named `vol`. `managed` makes it a managed-DB spec

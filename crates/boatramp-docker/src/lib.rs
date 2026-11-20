@@ -16,7 +16,8 @@ use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
     Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, PullPolicy, RestartPolicy,
-    RootSource, Scheme, VolumeInfo, VolumeRef, compute_instance_id, managed_db_alias,
+    RootSource, RootSourceKind, Scheme, SourceSupport, VolumeInfo, VolumeRef, compute_instance_id,
+    managed_db_alias,
 };
 use boatramp_core::registry_auth::RegistryAuth;
 use bollard::Docker;
@@ -802,6 +803,17 @@ impl ComputeBackend for DockerBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+        }
+    }
+
+    fn source_support(&self) -> SourceSupport {
+        // The docker backend pulls an OCI **image** reference (`materialize` rejects a
+        // tar/rootfs source) and authenticates the pull with the host-resolved registry
+        // credential (`pull_image(…, pull_auth)`): image-only, private-registry-capable.
+        SourceSupport {
+            accepted_sources: vec![RootSourceKind::Image],
+            private_registry_credential: true,
+            primary_source: Some(RootSourceKind::Image),
         }
     }
 

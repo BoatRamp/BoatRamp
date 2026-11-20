@@ -105,6 +105,38 @@ impl RootSource {
             Self::Image(s) | Self::Tar(s) | Self::Rootfs(s) => s,
         }
     }
+
+    /// This source's [`RootSourceKind`] — the artifact kind without the payload. The
+    /// scheduler matches a backend's accepted kinds against a spec's source kind to
+    /// avoid placing a workload on a backend whose `materialize` would reject its
+    /// source (a guaranteed crash).
+    pub fn kind(&self) -> RootSourceKind {
+        match self {
+            Self::Image(_) => RootSourceKind::Image,
+            Self::Tar(_) => RootSourceKind::Tar,
+            Self::Rootfs(_) => RootSourceKind::Rootfs,
+        }
+    }
+}
+
+/// The discriminant of a [`RootSource`] — its concrete artifact *kind* without the
+/// payload. Each backend accepts a fixed set of these (an image runtime pulls an
+/// [`Image`](RootSourceKind::Image); the native container runtime stages a
+/// [`Tar`](RootSourceKind::Tar); a micro-VM boots a [`Rootfs`](RootSourceKind::Rootfs)),
+/// the same 1:1 mapping the CLI's source→substrate derivation applies. The scheduler
+/// gates placement on it so a workload only lands on a backend that can run its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootSourceKind {
+    /// [`RootSource::Image`] — an OCI image reference a runtime pulls (docker,
+    /// cloudflare, kubernetes).
+    Image,
+    /// [`RootSource::Tar`] — a tar rootfs archive the native `container` runtime stages
+    /// and unpacks.
+    Tar,
+    /// [`RootSource::Rootfs`] — a rootfs filesystem image the `firecracker`/VMM micro-VM
+    /// boots as its root block device.
+    Rootfs,
 }
 
 /// How a backend obtains a workload's OCI **image** before launch — the opaque-compute

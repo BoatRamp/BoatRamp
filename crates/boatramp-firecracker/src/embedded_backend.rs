@@ -35,8 +35,8 @@ use async_trait::async_trait;
 use boatramp_core::Storage;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot, VolumeRef,
-    compute_instance_id,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource, RootSourceKind, Scheme, Snapshot,
+    SourceSupport, VolumeRef, compute_instance_id,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
 use boatramp_core::registry_auth::RegistryAuth;
@@ -848,6 +848,17 @@ impl ComputeBackend for EmbeddedVmmBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+        }
+    }
+
+    fn source_support(&self) -> SourceSupport {
+        // A micro-VM boots a prebuilt **rootfs** block image (`RootSource::Rootfs`);
+        // `materialize` rejects an image/tar source, and it never pulls from a registry,
+        // so no pull credential applies. Rootfs-only, not credential-capable.
+        SourceSupport {
+            accepted_sources: vec![RootSourceKind::Rootfs],
+            private_registry_credential: false,
+            primary_source: Some(RootSourceKind::Rootfs),
         }
     }
 

@@ -459,6 +459,18 @@ fn nodes() -> Vec<Node> {
             isolation: IsolationClass::Namespace,
             persistent_volumes: true,
             scale_to_zero: true,
+            // Mirror the REAL native container backend's capability (the fake stands in for
+            // id "container" on a daemonless/kvmless node): accepts a PUBLIC image + a tar,
+            // is NOT private-registry-credential-capable, and is Tar-primary. The managed
+            // DBs here are public `RootSource::Image` (pull_secret: None), so they place on
+            // this sole container backend via the tie-break's sorted-order fallback — the
+            // exact container-only placement path the Security review flagged.
+            accepted_sources: vec![
+                boatramp_core::compute::RootSourceKind::Image,
+                boatramp_core::compute::RootSourceKind::Tar,
+            ],
+            private_registry_credential: false,
+            primary_source: Some(boatramp_core::compute::RootSourceKind::Tar),
         }],
     }]
 }

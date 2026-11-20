@@ -17,7 +17,8 @@ use boatramp_core::compute::ComputeSpec;
 use boatramp_core::compute::RootSource;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, Endpoint, ExecOutput, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, Scheme, VolumeInfo,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSourceKind, Scheme, SourceSupport,
+    VolumeInfo,
 };
 use boatramp_core::registry_auth::RegistryAuth;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
@@ -307,6 +308,21 @@ impl ComputeBackend for KubernetesBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+        }
+    }
+
+    fn source_support(&self) -> SourceSupport {
+        // The kubelet pulls the operand **image** (`materialize` rejects a tar/rootfs
+        // source). A per-project sealed `pull_secret` is REFUSED at `materialize` — the
+        // backend's least-privilege Role grants no `secrets` verb to mint a pull Secret —
+        // so it is NOT per-project-credential-capable: the supported private-registry path
+        // is the operator-configured `[compute].k8s_image_pull_secret`, not a project
+        // `pull_secret`. Hence image-only, and (for the scheduler's `spec.pull_secret`
+        // gate) not credential-capable.
+        SourceSupport {
+            accepted_sources: vec![RootSourceKind::Image],
+            private_registry_credential: false,
+            primary_source: Some(RootSourceKind::Image),
         }
     }
 

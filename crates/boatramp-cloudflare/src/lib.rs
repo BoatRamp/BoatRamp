@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RootSource,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource, RootSourceKind, SourceSupport,
 };
 use boatramp_core::registry_auth::RegistryAuth;
 
@@ -216,6 +216,19 @@ impl ComputeBackend for CloudflareBackend {
             persistent_volumes: false,
             max_vcpus: None,
             max_mem_mib: Some(InstanceType::Standard.mem_mib()),
+        }
+    }
+
+    fn source_support(&self) -> SourceSupport {
+        // Cloudflare Containers run an OCI **image** (`materialize` rejects a tar/rootfs
+        // source). A private image's credential is configured CF-side by the wrangler
+        // emitter from `spec.pull_secret` (carried on `CfContainer::pull_secret`) — the CF
+        // backend performs no in-process pull, so it ignores the resolved `pull_auth` but
+        // IS able to run a private image. Image-only, credential-capable.
+        SourceSupport {
+            accepted_sources: vec![RootSourceKind::Image],
+            private_registry_credential: true,
+            primary_source: Some(RootSourceKind::Image),
         }
     }
 

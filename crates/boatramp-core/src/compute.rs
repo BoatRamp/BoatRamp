@@ -69,6 +69,59 @@ pub struct Capabilities {
     pub max_mem_mib: Option<u32>,
 }
 
+/// Which [`RootSource`] kinds a backend can actually run, plus whether it can apply a
+/// per-project registry pull credential ([`ComputeSpec::pull_secret`]) to a private-image
+/// pull. The scheduler gates placement on this (see [`Node::pick_backend`]) so a workload
+/// is never placed on a backend whose `materialize` would reject its source — or, for a
+/// private image, on a backend that cannot apply the credential and would crash-loop.
+/// Sourced from the backend itself ([`ComputeBackend::source_support`]) so the scheduler's
+/// view cannot drift from the backend's real `materialize` contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSupport {
+    /// The [`RootSource`] kinds this backend's `materialize` accepts. A spec whose
+    /// `root` kind is absent here is rejected at `materialize` (a guaranteed crash), so
+    /// the scheduler treats the backend as ineligible for it.
+    pub accepted_sources: Vec<RootSourceKind>,
+    /// Whether this backend can apply a per-project registry pull credential
+    /// ([`ComputeSpec::pull_secret`]) to a private-image pull. `false` ⇒ an `Image` +
+    /// `pull_secret` workload must not be placed here (the native container + kubernetes
+    /// backends refuse a per-project credential at `materialize` and would fail closed).
+    pub private_registry_credential: bool,
+    /// This backend's PRIMARY (native) source kind — the one the CLI's source→substrate
+    /// derivation maps to it (`Image`→docker/cloudflare/kubernetes, `Tar`→native
+    /// container, `Rootfs`→firecracker/VMM). A pure placement **tie-break**, NOT an
+    /// eligibility exclusion: when several backends are eligible for a spec's source, the
+    /// scheduler prefers the one whose primary source matches — so a public `Image` lands
+    /// on an image-native backend rather than the native container backend (which can
+    /// also run a public image) when both are present, preserving the documented
+    /// `image()`→docker behavior on a dual node. `None` ⇒ no affinity (the permissive
+    /// default; the backend falls to sorted order). A backend that accepts a source it is
+    /// not primary for stays eligible for it, so a container-only node still places an
+    /// image.
+    pub primary_source: Option<RootSourceKind>,
+}
+
+impl SourceSupport {
+    /// The permissive support used as the [`ComputeBackend::source_support`] default:
+    /// every source kind, credential-capable, no primary-source affinity — i.e. the exact
+    /// behavior before the source/credential placement gate existed. Every PRODUCTION
+    /// backend overrides `source_support` with its true contract; this default serves only
+    /// the in-crate test-double backends (whose value the scheduler never reads — those
+    /// tests build their [`BackendKind`]s directly), so they keep behaving exactly as
+    /// before.
+    pub fn any() -> Self {
+        Self {
+            accepted_sources: vec![
+                RootSourceKind::Image,
+                RootSourceKind::Tar,
+                RootSourceKind::Rootfs,
+            ],
+            private_registry_credential: true,
+            primary_source: None,
+        }
+    }
+}
+
 /// A backend-specific, materialized artifact for a spec (what the backend boots).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Artifact {
@@ -673,6 +726,17 @@ pub trait ComputeBackend: Send + Sync {
     /// What this backend can do here (used by the scheduler + policy gate).
     fn capabilities(&self) -> Capabilities;
 
+    /// Which [`RootSource`] kinds this backend can run, and whether it can apply a
+    /// per-project registry pull credential ([`ComputeSpec::pull_secret`]) — the
+    /// scheduler's source + credential placement gate (see [`SourceSupport`] and
+    /// [`Node::pick_backend`]). The default is [`SourceSupport::any`] (the permissive,
+    /// pre-gate behavior, used only by test doubles); every production backend overrides
+    /// it with its true `materialize` contract so the scheduler can never place a
+    /// workload on a backend that would reject its source or its pull credential.
+    fn source_support(&self) -> SourceSupport {
+        SourceSupport::any()
+    }
+
     /// Stage `spec`'s artifact into whatever this backend boots from, for the replica
     /// identified by `(project, workload)`. Idempotent + content-addressed (cache/dedup by
     /// spec id). The identity is threaded in so a backend that backs persistent volumes on
@@ -1087,6 +1151,23 @@ pub struct BackendKind {
     /// a `false` backend would run always-on (a silently missed cost optimization),
     /// so the scheduler treats it as ineligible rather than surprise the operator.
     pub scale_to_zero: bool,
+    /// The [`RootSource`] kinds this backend can run on this node. A spec whose `root`
+    /// kind is not accepted would be rejected at `materialize` (a guaranteed crash), so
+    /// the scheduler treats such a backend as ineligible for that spec. Populated from
+    /// the backend's [`SourceSupport`] at node advertisement ([`ComputeBackend::source_support`]).
+    pub accepted_sources: Vec<RootSourceKind>,
+    /// Whether this backend can apply a per-project registry pull credential
+    /// ([`ComputeSpec::pull_secret`]) to a private-image pull. A private-image workload
+    /// placed on a `false` backend would fail closed at `materialize` (the native
+    /// container + kubernetes backends refuse a per-project credential), so the scheduler
+    /// treats it as ineligible for such a workload. Populated from [`SourceSupport`].
+    pub private_registry_credential: bool,
+    /// This backend's PRIMARY (native) source kind — the scheduler's placement tie-break
+    /// (see [`SourceSupport::primary_source`] and [`Node::pick_backend`]). Prefers an
+    /// image-native backend over the native container backend for an image when both are
+    /// eligible, without excluding the container backend (so container-only nodes still
+    /// place images). Populated from [`SourceSupport`].
+    pub primary_source: Option<RootSourceKind>,
 }
 
 /// A node's advertised capacity, attributes, and the backends it offers
@@ -1124,9 +1205,45 @@ impl Node {
                 // A scale-to-zero spec needs a scale-to-zero-capable backend — else it
                 // silently runs always-on. Fail loud (no placement) instead.
                 && (!spec.scale_to_zero || b.scale_to_zero)
+                // The backend must ACCEPT this spec's root source kind. A docker /
+                // kubernetes / cloudflare *image* backend cannot run a tar/rootfs source,
+                // the native `container` backend runs a tar OR a public image (but not a
+                // rootfs), and firecracker/VMM only a rootfs — see each backend's
+                // `materialize`. Placing a workload on a backend whose `materialize` would
+                // reject its source is a guaranteed crash, so fail closed (no placement).
+                && b.accepted_sources.contains(&spec.root.kind())
+                // A PRIVATE image — an `Image` source naming a `pull_secret` — needs a
+                // credential-capable backend. The native `container` + `kubernetes`
+                // backends REFUSE a per-project pull credential at `materialize` (they
+                // would crash-loop); only `docker` + `cloudflare` apply it. `pull_secret`
+                // is resolved (into `pull_auth`) only for an `Image` source and ignored
+                // for tar/rootfs (see the reconcile's pull_auth resolution), so the
+                // credential gate bites exactly where a credential is actually applied —
+                // never spuriously rejecting a tar/rootfs spec that merely carries one.
+                && (spec.pull_secret.is_none()
+                    || !matches!(spec.root, RootSource::Image(_))
+                    || b.private_registry_credential)
         };
         if let Some(pref) = &spec.prefer_backend
             && let Some(b) = self.backends.iter().find(|b| &b.id == pref && eligible(b))
+        {
+            return Some(b.id.clone());
+        }
+        // Default source-affinity TIE-BREAK (ordering only, never an eligibility
+        // exclusion): among the eligible backends, prefer the one whose PRIMARY source
+        // matches the spec's source kind. So a public `Image` prefers an image-native
+        // backend (docker/cloudflare/kubernetes) over the native `container` backend —
+        // which can also run a public image — when both are eligible, preserving the
+        // documented `image()`→docker behavior on a dual node. The container backend
+        // stays ELIGIBLE for an image, so a container-only node (fly.io: daemonless +
+        // kvmless, where the native container backend is the sole backend and managed DBs
+        // are public images) still places it via the sorted-order fallback below. Being a
+        // pure tie-break, it composes with a future operator placement policy.
+        let kind = spec.root.kind();
+        if let Some(b) = self
+            .backends
+            .iter()
+            .find(|b| eligible(b) && b.primary_source == Some(kind))
         {
             return Some(b.id.clone());
         }
@@ -4181,12 +4298,21 @@ mod tests {
                 .map(|(id, iso)| BackendKind {
                     id: (*id).to_string(),
                     isolation: *iso,
-                    // Fully-capable fixture: the volume / scale-to-zero gates only
-                    // *refuse* on absent capability, so a capable fixture leaves every
-                    // existing placement test unaffected; negative cases build their
-                    // own incapable `BackendKind`.
+                    // Fully-capable fixture: the volume / scale-to-zero / source /
+                    // credential gates only *refuse* on absent capability, so a capable
+                    // fixture leaves every existing placement test unaffected; negative
+                    // cases build their own restricted `BackendKind`.
                     persistent_volumes: true,
                     scale_to_zero: true,
+                    accepted_sources: vec![
+                        RootSourceKind::Image,
+                        RootSourceKind::Tar,
+                        RootSourceKind::Rootfs,
+                    ],
+                    private_registry_credential: true,
+                    // Neutral: no source affinity, so the tie-break is a no-op for the
+                    // generic fixtures and existing placement tests keep their behavior.
+                    primary_source: None,
                 })
                 .collect(),
         }
@@ -4336,6 +4462,16 @@ mod tests {
                 isolation: iso,
                 persistent_volumes: volumes,
                 scale_to_zero: s2z,
+                // Fully source/credential-capable: these negative fixtures exercise the
+                // volume / scale-to-zero gates, so leave the source + credential gates
+                // open (the source-aware tests build their own restricted `BackendKind`s).
+                accepted_sources: vec![
+                    RootSourceKind::Image,
+                    RootSourceKind::Tar,
+                    RootSourceKind::Rootfs,
+                ],
+                private_registry_credential: true,
+                primary_source: None,
             }],
         }
     }
@@ -4506,6 +4642,155 @@ mod tests {
         assert_eq!(
             placed[0].backend, "vmm",
             "policy force beats the spec preference"
+        );
+    }
+
+    /// A realistic native `container` backend (as `build_compute` advertises it): accepts
+    /// a public `Image` (its `stage_image`/`oci::build_rootfs_dir` path) AND a `Tar`, is
+    /// NOT private-registry-credential-capable (its `materialize` fails closed on a
+    /// private image + credential), and is Tar-primary. Sorts FIRST — the real
+    /// `"container" < "docker"` BTreeMap order that surfaced the v0.66.1 bug.
+    fn container_backendkind() -> BackendKind {
+        BackendKind {
+            id: "container".into(),
+            isolation: IsolationClass::Namespace,
+            persistent_volumes: true,
+            scale_to_zero: true,
+            accepted_sources: vec![RootSourceKind::Image, RootSourceKind::Tar],
+            private_registry_credential: false,
+            primary_source: Some(RootSourceKind::Tar),
+        }
+    }
+
+    /// A realistic `docker` backend: image-only, credential-capable, image-primary.
+    fn docker_backendkind() -> BackendKind {
+        BackendKind {
+            id: "docker".into(),
+            isolation: IsolationClass::Container,
+            persistent_volumes: true,
+            scale_to_zero: false,
+            accepted_sources: vec![RootSourceKind::Image],
+            private_registry_credential: true,
+            primary_source: Some(RootSourceKind::Image),
+        }
+    }
+
+    fn node_with_backends(backends: Vec<BackendKind>) -> Node {
+        Node {
+            id: 1,
+            region: Some("eu".into()),
+            labels: BTreeMap::new(),
+            free_vcpus: 8,
+            free_mem_mib: 8192,
+            backends,
+        }
+    }
+
+    /// Regression (v0.66.1 prod-down): an `image()` + `pull_secret` workload must NEVER
+    /// land on the native `container` backend, which cannot apply a registry credential
+    /// (`boatramp-container` backend.rs: "the native container backend cannot apply a
+    /// registry credential; run this private-image workload on the `docker` backend") and
+    /// crash-loops. v0.66.1 made the native `container` backend available, and backends
+    /// iterate in sorted-id order (`container` < `docker`) — so a prior `pick_backend`
+    /// that gated only on isolation/volumes/scale-to-zero picked `container` (first) for a
+    /// trusted image+secret workload. The credential gate steers a PRIVATE image to the
+    /// credential-capable backend (or fails closed when none is present), and the
+    /// source-affinity tie-break steers a PUBLIC image to the image-native backend on a
+    /// dual node — WITHOUT excluding `container`, so a container-only node still places a
+    /// public image (the Security-review stranding fix: on fly.io the native container
+    /// backend is the sole backend and managed DBs are public images).
+    ///
+    /// Mutation reasoning: drop the `private_registry_credential` clause and the
+    /// CONTAINER-ONLY private-image assertion flips from `None` to `Some("container")` —
+    /// exactly the crash-loop shape — so the test fails (the credential clause has teeth,
+    /// and the tie-break does NOT mask it: a container-only node has no credential-capable
+    /// alternative to prefer). Drop the `accepted_sources` clause and the `Rootfs`
+    /// fail-closed assertion flips from `None` to `Some("container")` (an unsupported
+    /// source would be placed), so the test fails. Both clauses are load-bearing.
+    #[test]
+    fn image_workload_never_picks_credential_incapable_native_container() {
+        // Dual node: native `container` (sorts first) + `docker`.
+        let dual = node_with_backends(vec![container_backendkind(), docker_backendkind()]);
+
+        // (1) A PRIVATE image (names a `pull_secret`), trusted, no explicit preference —
+        // the crash-looping shape. Despite `container` sorting first and satisfying the
+        // trusted isolation requirement, it MUST land on the credential-capable `docker`.
+        let mut private_image = spec(1, 128);
+        private_image.root = RootSource::Image("registry.example.com/acme/private:1".into());
+        private_image.pull_secret = Some("acme-pull".into());
+        assert_eq!(private_image.isolation, IsolationRequirement::Trusted);
+        assert_eq!(private_image.prefer_backend, None);
+        assert_eq!(
+            dual.pick_backend(&private_image, &BackendPolicy::default())
+                .as_deref(),
+            Some("docker"),
+            "a private image+pull_secret workload must go to the credential-capable \
+             docker backend, NEVER the native container backend (which crash-loops)"
+        );
+
+        // (2) A PUBLIC image (no pull_secret) on the dual node picks `docker` via the
+        // source-affinity TIE-BREAK (docker is image-primary), not the first-sorted
+        // `container` — which IS eligible (it accepts a public image) but is Tar-primary.
+        // This is an ordering preference, not an exclusion (see assertion 4).
+        let mut public_image = spec(1, 128);
+        public_image.root = RootSource::Image("docker.io/library/nginx:1".into());
+        assert_eq!(public_image.pull_secret, None);
+        assert_eq!(
+            dual.pick_backend(&public_image, &BackendPolicy::default())
+                .as_deref(),
+            Some("docker"),
+            "a public image prefers the image-native docker backend on a dual node"
+        );
+
+        // (3) A tar source still picks the native container backend (the only tar-capable
+        // backend here) — the normal `--tar` derivation is not regressed.
+        let mut tar = spec(1, 128);
+        tar.root = RootSource::Tar("t".repeat(64));
+        assert_eq!(
+            dual.pick_backend(&tar, &BackendPolicy::default())
+                .as_deref(),
+            Some("container"),
+            "a tar source still picks the native container backend"
+        );
+
+        // (4) Container-ONLY node (fly.io: daemonless + kvmless). A PUBLIC image MUST
+        // still place on `container` — the stranding fix. The tie-break finds no
+        // image-primary backend eligible, so it falls back to the (only) eligible
+        // `container`; the source clause keeps `container` eligible for an image.
+        let container_only = node_with_backends(vec![container_backendkind()]);
+        assert_eq!(
+            container_only
+                .pick_backend(&public_image, &BackendPolicy::default())
+                .as_deref(),
+            Some("container"),
+            "a public image on a container-only node must place on container \
+             (co-located managed DBs on fly.io are public images) — never stranded"
+        );
+
+        // (5) Container-ONLY node + a PRIVATE image: no credential-capable backend exists,
+        // so the credential clause fails closed (no placement) rather than crash-looping
+        // on `container`. THIS is where the credential clause has mutation teeth — drop it
+        // and this flips to `Some("container")`.
+        assert_eq!(
+            container_only
+                .pick_backend(&private_image, &BackendPolicy::default())
+                .as_deref(),
+            None,
+            "a private image on a credential-incapable-only node fails closed (no \
+             placement), never lands on the native container backend"
+        );
+
+        // (6) A `Rootfs` source on an image/tar-only node has no accepting backend →
+        // fail closed. This gives the `accepted_sources` clause mutation teeth (drop it
+        // and the tie-break fallback would place it on `container`).
+        let mut rootfs = spec(1, 128);
+        rootfs.root = RootSource::Rootfs("r".repeat(64));
+        assert_eq!(
+            dual.pick_backend(&rootfs, &BackendPolicy::default())
+                .as_deref(),
+            None,
+            "a rootfs source has no accepting backend on an image/tar-only node → no \
+             placement (never the native container backend)"
         );
     }
 
@@ -5623,6 +5908,13 @@ mod tests {
                 // fixture) still place; negative gate tests build their own node.
                 persistent_volumes: true,
                 scale_to_zero: true,
+                accepted_sources: vec![
+                    RootSourceKind::Image,
+                    RootSourceKind::Tar,
+                    RootSourceKind::Rootfs,
+                ],
+                private_registry_credential: true,
+                primary_source: None,
             }],
         }
     }

@@ -765,11 +765,19 @@ pub async fn build_compute(
         .iter()
         .map(|(id, b)| {
             let caps = b.capabilities();
+            // Source + credential support comes from the backend itself so the
+            // scheduler's placement gate can never drift from the backend's real
+            // `materialize` contract (which `RootSource` kinds it runs, whether it
+            // applies a per-project registry pull credential).
+            let support = b.source_support();
             BackendKind {
                 id: id.clone(),
                 isolation: caps.isolation,
                 persistent_volumes: caps.persistent_volumes,
                 scale_to_zero: caps.scale_to_zero,
+                accepted_sources: support.accepted_sources,
+                private_registry_credential: support.private_registry_credential,
+                primary_source: support.primary_source,
             }
         })
         .collect();
