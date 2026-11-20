@@ -77,9 +77,11 @@ on:
   # Fire on EVERY branch push — merges land both as PRs and as client-side pushes
   # straight to a branch / to main, so the gate can't assume the PR flow. A maintainer
   # sees Tier 1 before a client-side merge, and again when it lands on main. Release
-  # tags don't match `branches`, so they stay owned by release.yml.
+  # tags don't match `branches`, so they stay owned by release.yml. `stable` is excluded:
+  # release.yml moves it to an already-tagged, already-tested commit, so re-running the
+  # full gate on it is pure waste.
   push:
-    branches: ['**']
+    branches: ['**', '!stable']
   # Fork / contributor code (which can't push to the repo) is gated here instead.
   pull_request:
 

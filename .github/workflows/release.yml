@@ -846,3 +846,59 @@ jobs:
           msg="docs @ ${{ github.event_name == 'push' && github.ref_name || github.sha }}"
           boatramp sync docs/book \
             --server https://docs.boatramp.dev --site docs -m "$msg"
+
+  # ── Advance the `stable` branch to the released commit ──────────────────────
+  # `stable` is a convenience pointer that always names the latest FINAL release, so
+  # `git clone -b stable` (or a flake `ref=stable`) gets the newest shipped cut. It
+  # moves ONLY on a real `vX.Y.Z` tag with NO pre-release suffix — the owner does not
+  # want pre-releases on `stable` — and ONLY once the release is actually OUT: it
+  # `needs:` the three shipping jobs (`release` = GitHub Release, `container` = GHCR
+  # images, `crates-io` = crates.io) and runs only if ALL THREE succeeded.
+  #
+  # Terminal by construction (nothing `needs:` it) and strictly AFTER the shipping
+  # jobs, so moving the pointer can never fail or un-ship the release. `stable` is
+  # excluded from the CI workflow's push trigger (ci.yml `branches: ['**', '!stable']`)
+  # since it only ever points at an already-tagged, already-tested commit.
+  update-stable:
+    name: advance stable branch
+    needs: [release, container, crates-io]
+    if: >-
+      ${{ !cancelled()
+          && github.event_name == 'push'
+          && startsWith(github.ref, 'refs/tags/v')
+          && !contains(github.ref_name, '-')
+          && needs.release.result == 'success'
+          && needs.container.result == 'success'
+          && needs.crates-io.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # move refs/heads/stable to the released commit
+    steps:
+      - name: Point refs/heads/stable at the released commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha; // the commit the vX.Y.Z tag points at
+            const ref = 'heads/stable';
+            try {
+              await github.rest.git.updateRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref,
+                sha,
+                force: true, // stable is a managed release pointer — move it forward
+              });
+              core.info(`Advanced stable -> ${sha} (${context.ref})`);
+            } catch (e) {
+              if (e.status === 404 || e.status === 422) {
+                await github.rest.git.createRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `refs/${ref}`,
+                  sha,
+                });
+                core.info(`Created stable -> ${sha} (${context.ref})`);
+              } else {
+                throw e;
+              }
+            }
