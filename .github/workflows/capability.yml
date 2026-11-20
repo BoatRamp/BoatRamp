@@ -1223,7 +1223,7 @@ jobs:
       - name: Pre-pull the alpine test-double image
         run: docker pull alpine:3.20
 
-      - name: Per-project-net DNS + cross-project isolation + recreate/resolution + ephemeral default-bridge (hard gate)
+      - name: Per-project-net DNS + cross-project isolation + recreate/resolution + ephemeral default-bridge + stale-bridge upgrade (hard gate)
         run: |
           set -o pipefail
           # All ignored gates in one run: (1) two workloads in one project resolve by name over
@@ -1234,10 +1234,14 @@ jobs:
           # no reconcile churn loop); (3) a DUAL-ATTACHED run_ephemeral one-shot (per-project-net
           # hint set) still reaches a DB on the DEFAULT bridge (the v0.56.0 regression shape); (4) a
           # managed-DB workload whose RAW name exceeds the 63-octet DNS-label cap resolves by its
-          # SHORT alias (the Docker-29 RFC-1035 SD-registration fix); (5) the UPGRADE path — a
+          # SHORT alias (the Docker-29 RFC-1035 SD-registration fix); (5) the alias UPGRADE path — a
           # producer created with a STALE pre-fix long alias is flagged for recreate by
           # needs_redeploy, relaunched with the current SHORT alias, reached by a sibling over it,
-          # and reported idempotent (no churn). Each marker prints ONLY after every assertion holds.
+          # and reported idempotent (no churn); (6) the legacy-BRIDGE upgrade — an EMPTY per-project
+          # network on docker's unscoped br-<hash> is migrated to the scoped boatramp- bridge on
+          # relaunch (labels preserved, workload attached + reachable), while an OCCUPIED one with a
+          # live attached container is LEFT INTACT (never torn down). Each marker prints ONLY after
+          # every assertion holds.
           BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
             -- --ignored --nocapture 2>&1 | tee docker-net.log
           grep -qE 'test result: ok' docker-net.log \
@@ -1252,6 +1256,8 @@ jobs:
             || { echo "::error::long managed-DB workload (> 63-octet name) never reached its short-alias resolution marker (silent skip or the Docker-29 RFC-1035 label-cap regression — SD record for the over-long alias not published)" >&2; exit 1; }
           grep -q 'DOCKER MANAGED-DB ALIAS UPGRADE HEAL OK' docker-net.log \
             || { echo "::error::managed-DB alias UPGRADE auto-heal never reached its success marker (silent skip or a regression — a producer carrying a STALE pre-fix long alias was not flagged for recreate, not re-aliased to the current short label, or not idempotent afterwards)" >&2; exit 1; }
+          grep -q 'DOCKER STALE-BRIDGE UPGRADE OK' docker-net.log \
+            || { echo "::error::legacy-unscoped-bridge UPGRADE never reached its success marker (silent skip or a regression — an EMPTY legacy br-<hash> per-project network was not migrated to the scoped boatramp- bridge on relaunch, its isolation labels were dropped, OR an OCCUPIED legacy network with a live attached container was torn down instead of left intact)" >&2; exit 1; }
 
       - name: Guest-log forwarding to the shared sink (hard gate)
         run: |

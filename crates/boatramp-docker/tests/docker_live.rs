@@ -1020,6 +1020,377 @@ async fn docker_reconcile_heals_a_producer_carrying_a_stale_managed_db_alias_on_
     );
 }
 
+/// The **legacy-unscoped-bridge UPGRADE** live gate (the reap-race defect fixed on this branch —
+/// tokenfield's blocked prod managed-Postgres adopter).
+///
+/// A per-project docker network created BEFORE the scoped-bridge driver-opt existed carries docker's
+/// unscoped `br-<hash>` bridge. The NixOS compute-firewall admits only the scoped `boatramp-` bridge,
+/// so that network's shim traffic is dropped forever: the bridge name is fixed for a network's life,
+/// `create_bridge_network` treats the already-existing network as success (409) without changing it,
+/// and the best-effort `remove_network` in `stop()` raced the reconcile relaunch and could never
+/// win — so `compute restart` never migrated it. The fix makes `ensure_project_network` detect a
+/// stale bridge at launch and, when the network is EMPTY (the instant a plain `compute restart`
+/// produces between the old container's removal and the new one's attach), remove + recreate it on
+/// the scoped bridge, while NEVER tearing down a network that still has a live attached container.
+///
+/// This reproduces BOTH halves against a REAL daemon:
+///
+///   A. UPGRADE. A per-project network is pre-created DIRECTLY with NO bridge-name opt (docker's
+///      unscoped `br-<hash>`, the exact pre-fix on-wire state). A workload is then launched into
+///      that project; the FIRST launch finds the network empty, so `ensure_project_network` removes
+///      + recreates it on the scoped `project_bridge_name` bridge and attaches. We assert the
+///      network now reports the scoped bridge opt, still carries the per-project isolation labels
+///      (`boatramp.managed` + `boatramp.project` — the SAME isolated network, only the bridge name
+///      changed), the launched workload is attached, and a sibling reaches it over the upgraded net
+///      (the data plane works) — the migration a plain `compute restart` now performs automatically.
+///
+///   B. LIVE GUARD. A second per-project network is pre-created unscoped AND a live `nc` server is
+///      attached to it directly. A workload is then launched into that project; because the network
+///      has a live endpoint, `ensure_project_network` leaves it UNTOUCHED. We assert the network is
+///      STILL on the unscoped bridge (never rebuilt), the pre-existing live server is STILL running
+///      (its endpoint never severed), and the newly launched sibling still reaches it by name — a
+///      live per-project network is never torn down. (The emptiness guard is the first gate; docker
+///      refusing to remove a network with active endpoints is the backstop — both hold here.)
+///
+/// `#[ignore]` + env-gated (needs a daemon); the capability gate greps the final marker, printed
+/// ONLY after every assertion holds — it cannot be earned without the real end-to-end pass. The
+/// firewall-admission half (the scoped bridge is what the NixOS rule admits) is covered live by
+/// `scripts/compute-net-turnkey-gate.sh` on a real NixOS host.
+///
+/// Run it:
+/// ```sh
+/// BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+///   stale_unscoped_bridge -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs a reachable Docker daemon; set BOATRAMP_TEST_DOCKER=1 and run with --ignored"]
+async fn docker_stale_unscoped_bridge_is_upgraded_on_relaunch_and_a_live_network_is_never_torn_down()
+ {
+    use std::collections::HashMap;
+
+    use boatramp_docker::{project_bridge_name, project_network_name};
+    use bollard::Docker;
+    use bollard::container::{
+        Config as BollardConfig, CreateContainerOptions, NetworkingConfig, RemoveContainerOptions,
+    };
+    use bollard::image::CreateImageOptions;
+    use bollard::models::{EndpointSettings, HostConfig};
+    use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
+    use futures::StreamExt;
+
+    // The docker driver-opt key that pins (and reports) a user-defined bridge's interface name.
+    // Absent in a network's `Options` ⇒ docker auto-generated an unscoped `br-<hash>`.
+    const BRIDGE_NAME_OPT: &str = "com.docker.network.bridge.name";
+
+    if std::env::var("BOATRAMP_TEST_DOCKER").is_err() {
+        eprintln!("skipping: set BOATRAMP_TEST_DOCKER=1 (needs a reachable daemon)");
+        return;
+    }
+    let backend = DockerBackend::connect().expect("connect to docker");
+    let docker = Docker::connect_with_local_defaults().expect("raw docker client");
+
+    async fn launch(
+        backend: &DockerBackend,
+        project: &str,
+        workload: &str,
+        spec: &ComputeSpec,
+    ) -> boatramp_core::compute::Instance {
+        let artifact = backend
+            .materialize(project, workload, spec, None)
+            .await
+            .expect("materialize");
+        let req = LaunchRequest {
+            project: project.into(),
+            workload: workload.into(),
+            replica: 0,
+            spec: spec.clone(),
+            artifact,
+            redaction: Default::default(),
+        };
+        backend.launch(&req).await.expect("launch")
+    }
+
+    // The bridge the daemon actually reports for a network (the pinned opt), or None for a legacy
+    // auto-generated `br-<hash>`.
+    async fn bridge_opt(docker: &Docker, net: &str) -> Option<String> {
+        docker
+            .inspect_network(net, None::<InspectNetworkOptions<String>>)
+            .await
+            .expect("inspect network")
+            .options
+            .and_then(|o| o.get(BRIDGE_NAME_OPT).cloned())
+    }
+
+    // Pre-create a per-project network DIRECTLY on docker's UNSCOPED bridge (NO bridge-name opt) with
+    // the per-project isolation labels — the exact shape a pre-fix boatramp left behind.
+    async fn precreate_unscoped(docker: &Docker, project: &str) -> String {
+        let net = project_network_name(project);
+        let _ = docker.remove_network(&net).await;
+        docker
+            .create_network(CreateNetworkOptions {
+                name: net.clone(),
+                driver: "bridge".to_string(),
+                labels: HashMap::from([
+                    ("boatramp.managed".to_string(), "true".to_string()),
+                    ("boatramp.project".to_string(), project.to_string()),
+                ]),
+                // NO `options` ⇒ docker assigns an unscoped `br-<hash>` — the pre-fix state.
+                ..Default::default()
+            })
+            .await
+            .expect("pre-create unscoped per-project network");
+        net
+    }
+
+    // Pull the test-double once (the backend caches it too; belt-and-braces for the raw-created
+    // live server in part B).
+    let mut pull = docker.create_image(
+        Some(CreateImageOptions {
+            from_image: "alpine".to_string(),
+            tag: "3.20".to_string(),
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    while let Some(step) = pull.next().await {
+        step.expect("pull alpine:3.20");
+    }
+
+    // ===================================================================================
+    // PART A — the UPGRADE: an EMPTY legacy-unscoped network is migrated to the scoped bridge.
+    // ===================================================================================
+    let proj_a = "stalebridge";
+    let net_a = precreate_unscoped(&docker, proj_a).await;
+
+    // Precondition: the pre-created network is on docker's UNSCOPED bridge (no pinned opt) — i.e.
+    // the reap-race defect's exact starting state. If this were already scoped there would be
+    // nothing to upgrade and the gate would be vacuous.
+    let expected_a = project_bridge_name(&net_a);
+    assert_ne!(
+        bridge_opt(&docker, &net_a).await,
+        Some(expected_a.clone()),
+        "fixture precondition: {net_a} must start on an UNSCOPED bridge (not the scoped {expected_a})"
+    );
+
+    // Launch the FIRST workload into the project. The network is empty at this instant, so
+    // `ensure_project_network` removes + recreates it on the scoped bridge, then attaches.
+    let a_db = launch(&backend, proj_a, "db", &server_spec("UP")).await;
+
+    // (A1) The network is now on the SCOPED bridge — the migration happened automatically.
+    assert_eq!(
+        bridge_opt(&docker, &net_a).await,
+        Some(expected_a.clone()),
+        "after a relaunch the empty legacy network must be recreated on the scoped bridge {expected_a}"
+    );
+
+    // (A2) The per-project isolation labels survived the recreate — the SAME isolated network, only
+    // the bridge name changed (a different-tenancy or unlabeled network would be a leak).
+    let net_a_info = docker
+        .inspect_network(&net_a, None::<InspectNetworkOptions<String>>)
+        .await
+        .expect("inspect upgraded net");
+    let labels_a = net_a_info.labels.unwrap_or_default();
+    assert_eq!(
+        labels_a.get("boatramp.managed").map(String::as_str),
+        Some("true"),
+        "the upgraded network must keep boatramp.managed=true"
+    );
+    assert_eq!(
+        labels_a.get("boatramp.project").map(String::as_str),
+        Some(proj_a),
+        "the upgraded network must keep its owning-project label"
+    );
+
+    // (A3) The launched workload is attached to the upgraded (scoped) network.
+    let a_db_name = decode_name(&a_db.handle);
+    let attached = docker
+        .inspect_container(&a_db_name, None)
+        .await
+        .expect("inspect launched db")
+        .network_settings
+        .and_then(|ns| ns.networks)
+        .map(|nets| nets.contains_key(&net_a))
+        .unwrap_or(false);
+    assert!(
+        attached,
+        "the launched workload must be attached to the upgraded network {net_a}"
+    );
+
+    // (A4) The upgraded network carries data-plane traffic: a sibling launched into the project
+    // resolves + reaches the server by name over the scoped bridge (proves the migration did not
+    // break reachability — the whole point of the firewall-admitted scoped bridge).
+    let a_app = launch(&backend, proj_a, "app", &client_spec()).await;
+    let reach = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "for i in $(seq 1 30); do R=$(nc -w3 db 8080 </dev/null 2>/dev/null); \
+         if [ -n \"$R\" ]; then printf '%s' \"$R\"; exit 0; fi; sleep 1; done; exit 1"
+            .to_string(),
+    ];
+    let out = backend
+        .exec(&a_app.handle, &reach, None)
+        .await
+        .expect("exec reach db by name");
+    assert_eq!(
+        out.exit_code, 0,
+        "app must resolve + reach db over the upgraded scoped network {net_a}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "UP",
+        "the sibling must read the server's body over the upgraded network"
+    );
+
+    // ===================================================================================
+    // PART B — the LIVE GUARD: a legacy-unscoped network with a LIVE attached container is never
+    // torn down; it is left on its unscoped bridge until a workload cycle empties it.
+    // ===================================================================================
+    let proj_b = "stalebridgelive";
+    let net_b = precreate_unscoped(&docker, proj_b).await;
+    let expected_b = project_bridge_name(&net_b);
+
+    // A LIVE `nc` server attached DIRECTLY to the unscoped network (primary, alias `liveserver`),
+    // serving ALIVE — the pre-existing live endpoint the guard must protect.
+    let live_name = format!("boatramp-stalebridge-liveserver-{}", std::process::id());
+    let _ = docker
+        .remove_container(
+            &live_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: live_name.clone(),
+                platform: None,
+            }),
+            BollardConfig {
+                image: Some("alpine:3.20".to_string()),
+                cmd: Some(vec![
+                    "nc".into(),
+                    "-lk".into(),
+                    "-p".into(),
+                    "8080".into(),
+                    "-e".into(),
+                    "sh".into(),
+                    "-c".into(),
+                    "printf ALIVE".into(),
+                ]),
+                host_config: Some(HostConfig {
+                    network_mode: Some(net_b.clone()),
+                    ..Default::default()
+                }),
+                networking_config: Some(NetworkingConfig {
+                    endpoints_config: HashMap::from([(
+                        net_b.clone(),
+                        EndpointSettings {
+                            aliases: Some(vec!["liveserver".to_string()]),
+                            ..Default::default()
+                        },
+                    )]),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create the live server on the unscoped network");
+    docker
+        .start_container::<String>(&live_name, None)
+        .await
+        .expect("start the live server");
+
+    // Launch a workload into this project. The network has a live endpoint, so the upgrade must be
+    // SKIPPED and the network left intact.
+    let b_probe = launch(&backend, proj_b, "probe", &client_spec()).await;
+
+    // (B1) The network is STILL on the UNSCOPED bridge — it was NOT recreated (a live network must
+    // never be torn down). This is the guard: an occupied legacy network is left as-is.
+    assert_ne!(
+        bridge_opt(&docker, &net_b).await,
+        Some(expected_b.clone()),
+        "a legacy network with a LIVE attached container must be left on its unscoped bridge, \
+         never recreated on the scoped {expected_b} (that would sever the live endpoint)"
+    );
+
+    // (B2) The pre-existing live server is STILL running — its endpoint was never severed.
+    let live_running = docker
+        .inspect_container(&live_name, None)
+        .await
+        .expect("inspect live server")
+        .state
+        .and_then(|s| s.running)
+        .unwrap_or(false);
+    assert!(
+        live_running,
+        "the pre-existing live server must still be running — the guard must not have torn down \
+         its network"
+    );
+
+    // (B3) The newly launched sibling still reaches the live server by name over the intact
+    // (unscoped) network — it kept serving throughout.
+    let reach_live = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "for i in $(seq 1 30); do R=$(nc -w3 liveserver 8080 </dev/null 2>/dev/null); \
+         if [ -n \"$R\" ]; then printf '%s' \"$R\"; exit 0; fi; sleep 1; done; exit 1"
+            .to_string(),
+    ];
+    let out_live = backend
+        .exec(&b_probe.handle, &reach_live, None)
+        .await
+        .expect("exec reach live server by name");
+    assert_eq!(
+        out_live.exit_code, 0,
+        "the launched probe must reach the pre-existing live server over the intact network"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out_live.stdout).trim(),
+        "ALIVE",
+        "the live server must keep serving its body through the untouched network"
+    );
+
+    // Cleanup (best-effort): stop the launched workloads (which GCs each empty project net on the
+    // last stop), force-remove the raw live server, and drop any residual networks.
+    for h in [&a_app.handle, &a_db.handle, &b_probe.handle] {
+        let _ = backend.stop(h).await;
+    }
+    let _ = docker
+        .remove_container(
+            &live_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker.remove_network(&net_a).await;
+    let _ = docker.remove_network(&net_b).await;
+
+    // The single success marker the capability gate greps for — printed ONLY after BOTH the upgrade
+    // (an empty legacy network migrated to the scoped bridge, labels preserved, workload attached +
+    // reachable) AND the live guard (an occupied legacy network left untouched, its live endpoint
+    // intact and still serving) held end-to-end.
+    println!(
+        "DOCKER STALE-BRIDGE UPGRADE OK: empty legacy net {net_a} migrated to scoped bridge \
+         {expected_a} (labels kept, db reachable as UP); occupied legacy net {net_b} left on its \
+         unscoped bridge with its live server still serving ALIVE (never torn down)"
+    );
+}
+
+/// Decode an `InstanceHandle`'s backend-ref to the docker container name (`<name>@<ip>:<port>`), for
+/// the raw-API inspects the stale-bridge gate makes against the backend-launched containers.
+fn decode_name(handle: &boatramp_core::compute::InstanceHandle) -> String {
+    handle
+        .backend_ref
+        .split_once('@')
+        .map(|(n, _)| n.to_string())
+        .unwrap_or_else(|| handle.backend_ref.clone())
+}
+
 /// A `MakeWriter` over a shared buffer so the forwarder's `tracing` output can be
 /// asserted in the live gate (the forwarder runs on background runtime threads, so a
 /// GLOBAL subscriber is needed to capture across threads).

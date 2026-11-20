@@ -47,6 +47,7 @@ SHIM_PORT="${SHIM_PORT:-8084}"          # the shim port the node binds (match bo
 HOST_GW="${HOST_GW:-172.17.0.1}"        # docker host-gateway IP the shim is bound on
 IMAGE="${IMAGE:-alpine:3.20}"           # a tiny image with a shell; swap for an air-gapped one
 PROJECTS=("gate-a" "gate-b")            # TWO projects ⇒ TWO simultaneous per-project bridges
+UPG_PROJECT="${UPG_PROJECT:-gate-upg}"  # project for the legacy-unscoped-bridge UPGRADE leg (step 5)
 KEEP="${KEEP:-0}"
 
 log()  { printf '\n=== %s ===\n' "$*"; }
@@ -65,7 +66,7 @@ NETS=()
 cleanup() {
   [ "$KEEP" = "1" ] && { log "KEEP=1 — leaving containers/networks"; return; }
   log "cleanup"
-  for p in "${PROJECTS[@]}"; do
+  for p in "${PROJECTS[@]}" "$UPG_PROJECT"; do
     docker rm -f "gatec-$p" >/dev/null 2>&1 || true
     docker network rm "boatramp-net-$p" >/dev/null 2>&1 || true
   done
@@ -178,4 +179,69 @@ else
     || pass "iptables: does NOT trust the broad br-+"
 fi
 
-log "ALL CHECKS PASSED — Gap A (reachability, multi-network) + Gap B (off-node blocked) proven live"
+# --- 5. Legacy-unscoped-bridge UPGRADE (the reap-race fix) -------------------
+# A per-project network created BEFORE the scoped-bridge driver-opt existed carries docker's
+# UNSCOPED `br-<hash>` bridge, which this firewall (scoped to the boatramp- prefix) never admits —
+# so its shim traffic is dropped forever and `compute restart` could not help. The fix migrates it
+# at launch when the network is EMPTY. This leg proves, on the live host, the two facts the fix and
+# this firewall together depend on:
+#   (5a) a container on the PRE-upgrade unscoped bridge is NOT admitted (the defect's effect — the
+#        firewall keys on the interface name, and `br-<hash>` is not boatramp-scoped), and
+#   (5b) after a migration the network is on a `boatramp-<hash>` bridge that IS admitted.
+# The BACKEND-DRIVEN upgrade itself (ensure_project_network removing + recreating the empty net,
+# preserving labels, never tearing down a live one) is exercised end-to-end against a real daemon by
+# the Rust gate `docker_stale_unscoped_bridge_is_upgraded_on_relaunch...` (run on THIS host with
+#   BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live \
+#     stale_unscoped_bridge -- --ignored --nocapture
+# from a checkout); it also runs in the CI capability gate on a real docker daemon. Here we prove the
+# firewall half the hermetic CI runner cannot: a real nixos-fw INPUT chain on a real kernel bridge.
+log "Upgrade: an UNSCOPED legacy bridge is NOT firewall-admitted; its scoped migration IS"
+upg_net="boatramp-net-$UPG_PROJECT"
+docker network rm "$upg_net" >/dev/null 2>&1 || true
+# Pre-create UNSCOPED exactly as a pre-fix boatramp left it: a plain bridge network, NO bridge-name
+# opt, so docker assigns `br-<hash>`.
+docker network create --driver bridge \
+  --label boatramp.managed=true --label "boatramp.project=$UPG_PROJECT" "$upg_net" >/dev/null
+NETS+=("$upg_net")
+# Resolve docker's auto-assigned kernel bridge for this network and assert it is NOT boatramp-scoped
+# (an `Options` map WITHOUT com.docker.network.bridge.name ⇒ the legacy `br-<hash>` state).
+if docker network inspect "$upg_net" --format '{{index .Options "com.docker.network.bridge.name"}}' 2>/dev/null | grep -q '^boatramp-'; then
+  fail "fixture: $upg_net unexpectedly came up on a scoped bridge — cannot exercise the upgrade"
+fi
+upg_if="$(docker network inspect "$upg_net" --format '{{.Id}}' | cut -c1-12)"
+upg_if="br-$upg_if"
+if ip link show "$upg_if" >/dev/null 2>&1; then
+  case "$upg_if" in
+    boatramp-*) fail "pre-upgrade bridge $upg_if must NOT be boatramp-scoped" ;;
+    *) pass "pre-upgrade: $upg_net is on the unscoped kernel bridge $upg_if (firewall would drop it)" ;;
+  esac
+else
+  printf 'NOTE: could not resolve the unscoped kernel ifname for %s; skipping the (5a) link check.\n' "$upg_net"
+fi
+# (5b) The migrated (scoped) form — created here the way ensure_project_network recreates it — is on
+# a boatramp-<hash> bridge that the firewall admits (same shape Gap A proved). Recreate it scoped,
+# keeping the SAME per-project labels, then prove a container on it reaches the shim.
+docker network rm "$upg_net" >/dev/null 2>&1 || true
+upg_br="$(bridge_name "$upg_net")"
+docker network create --driver bridge \
+  --opt "com.docker.network.bridge.name=$upg_br" \
+  --label boatramp.managed=true --label "boatramp.project=$UPG_PROJECT" "$upg_net" >/dev/null
+ip link show "$upg_br" >/dev/null 2>&1 || fail "post-upgrade scoped bridge $upg_br not created for $upg_net"
+[ "${#upg_br}" -le 15 ] || fail "post-upgrade bridge $upg_br exceeds IFNAMSIZ (15)"
+# Labels must survive the recreate — the SAME isolated per-project network, only the bridge changed.
+docker network inspect "$upg_net" --format '{{index .Labels "boatramp.project"}}' | grep -qx "$UPG_PROJECT" \
+  || fail "post-upgrade: $upg_net lost its boatramp.project label"
+out="$(docker run --rm --network "$upg_net" \
+        --add-host "host.docker.internal:host-gateway" "$IMAGE" \
+        sh -c "wget -S -q -T 4 -O /dev/null http://host.docker.internal:$SHIM_PORT/ 2>&1; echo RC=\$?" || true)"
+if echo "$out" | grep -qiE "can't connect|connection refused|bad address|download timed out|no route to host"; then
+  printf '%s\n' "$out" >&2
+  fail "post-upgrade: a container on the migrated scoped bridge $upg_br could NOT reach the shim"
+fi
+echo "$out" | grep -qiE 'HTTP/|server returned' \
+  || { printf '%s\n' "$out" >&2; fail "post-upgrade: no HTTP reply from the shim over $upg_br"; }
+pass "post-upgrade: $upg_net migrated to scoped bridge $upg_br (labels kept), shim reachable, firewall admits it"
+printf 'NOTE: the BACKEND-driven upgrade (ensure_project_network migrate-if-empty / never-tear-down-a-live-net)\n'
+printf '      is proven against a real daemon by the Rust gate stale_unscoped_bridge (CI + runnable here via cargo).\n'
+
+log "ALL CHECKS PASSED — Gap A (reachability, multi-network) + Gap B (off-node blocked) + stale-bridge upgrade (firewall admits the migrated scoped bridge, not the legacy unscoped one) proven live"

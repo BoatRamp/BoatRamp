@@ -30,9 +30,10 @@ use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::models::{
     ContainerState, ContainerStateStatusEnum, EndpointSettings, HealthStatusEnum, HostConfig,
-    Mount, MountTypeEnum, PortBinding, RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum,
+    Mount, MountTypeEnum, Network, PortBinding, RestartPolicy as DockerRestartPolicy,
+    RestartPolicyNameEnum,
 };
-use bollard::network::{ConnectNetworkOptions, CreateNetworkOptions};
+use bollard::network::{ConnectNetworkOptions, CreateNetworkOptions, InspectNetworkOptions};
 use bollard::volume::{ListVolumesOptions, RemoveVolumeOptions};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -426,13 +427,11 @@ impl DockerBackend {
             // `br-<hash>`. This lets the NixOS compute-firewall admit the shim-port traffic on a
             // `boatramp-`-prefixed interface (see PROJECT_BRIDGE_PREFIX) rather than trusting the
             // broad `br-+`. The opt applies only at CREATE: an interface cannot be renamed on a
-            // live network, so a network that already exists (the 409-is-success path below) keeps
-            // whatever bridge name it was born with until it is GC'd (last workload stops) and a
-            // later launch re-creates it with the scoped name.
-            options: HashMap::from([(
-                "com.docker.network.bridge.name".to_string(),
-                project_bridge_name(name),
-            )]),
+            // live network, so a network that already exists keeps whatever bridge name it was born
+            // with. A network born BEFORE this driver-opt existed (a legacy unscoped `br-<hash>`)
+            // is migrated by `ensure_project_network`, which detects the stale bridge and — when
+            // the network is empty — removes + recreates it through THIS scoped path.
+            options: HashMap::from([(BRIDGE_NAME_OPT.to_string(), project_bridge_name(name))]),
             ..Default::default()
         };
         match self.docker.create_network(options).await {
@@ -449,17 +448,152 @@ impl DockerBackend {
     /// absent) and return its name. Every workload of `project` joins this ONE network with a DNS
     /// alias = its workload name, so siblings resolve each other by name over docker's embedded DNS
     /// while a different project (a different network) can neither resolve nor reach them.
+    ///
+    /// **Legacy-bridge upgrade (the stale-`br-<hash>` migration).** A per-project network created
+    /// BEFORE the scoped-bridge driver-opt existed carries docker's unscoped `br-<hash>` bridge,
+    /// which the NixOS compute-firewall (scoped to the `boatramp-` prefix) never admits — so the
+    /// shim traffic is dropped and `compute restart` cannot help, because the bridge name is fixed
+    /// for a network's life. This method makes the migration AUTOMATIC: on launch it inspects an
+    /// existing network and, if its bridge is not the scoped [`project_bridge_name`] AND the
+    /// network has NO attached containers (the instant between the old container's stop+remove and
+    /// the new one's attach — a plain `compute restart` of the project's last workload), it removes
+    /// and recreates the network through the scoped [`create_bridge_network`](Self::create_bridge_network)
+    /// path, preserving the per-project isolation labels. A network that still has a LIVE attached
+    /// container is NEVER torn down (that would sever a serving endpoint): it is left as-is with a
+    /// `warn!` that a workload cycle is needed to migrate it, and the same for a network whose
+    /// attachment set cannot be determined (fail safe). The remaining old GC path (the best-effort
+    /// `remove_network` in [`stop`](ComputeBackend::stop)) raced the reconcile relaunch and so could
+    /// never win; this upgrade-on-launch does not depend on that reap landing first.
+    ///
+    /// Concurrency + idempotency: two workloads of one project launching together are safe. A 409
+    /// on the recreate (a sibling created the scoped network first) is success. A `remove_network`
+    /// that fails because a sibling just attached a container is tolerated — docker refuses to
+    /// remove a network with active endpoints, which is the backstop under our emptiness check — and
+    /// the subsequent `create_bridge_network` 409s, so we fall through to using the existing network
+    /// either way. No live network is ever destroyed.
     async fn ensure_project_network(&self, project: &str) -> Result<String, BackendError> {
         let name = project_network_name(project);
-        self.create_bridge_network(
-            &name,
-            HashMap::from([
-                ("boatramp.managed".to_string(), "true".to_string()),
-                ("boatramp.project".to_string(), project.to_string()),
-            ]),
-        )
-        .await?;
+        let labels = project_network_labels(project);
+        match self
+            .docker
+            .inspect_network(&name, None::<InspectNetworkOptions<String>>)
+            .await
+        {
+            // Absent — create it scoped (the create-if-absent steady state).
+            Err(e) if is_not_found(&e) => {
+                self.create_bridge_network(&name, labels).await?;
+            }
+            // Inspect failed for some other reason — surface it rather than guess at the state and
+            // risk tearing down a network we could not read.
+            Err(e) => {
+                return Err(BackendError::Launch(format!(
+                    "inspect project network {name}: {e}"
+                )));
+            }
+            // Exists — keep it, or migrate a legacy unscoped bridge when it is safe.
+            Ok(net) => {
+                let expected = project_bridge_name(&name);
+                match classify_project_network(&net, &expected) {
+                    // Already on the scoped bridge — keep (the idempotent steady state).
+                    ProjectNetworkBridge::Scoped => {}
+                    // Unscoped AND empty at this instant — the safe upgrade: remove + recreate
+                    // scoped. If a sibling launch attached a container between our inspect and this
+                    // remove, docker REFUSES the remove (active endpoints); we ignore that and the
+                    // recreate 409s as success, leaving the existing (now occupied) network in
+                    // place. The scoped labels are reapplied so it stays the SAME per-project
+                    // isolated network — only the bridge name changes.
+                    ProjectNetworkBridge::UnscopedEmpty => {
+                        let _ = self.docker.remove_network(&name).await;
+                        self.create_bridge_network(&name, labels).await?;
+                    }
+                    // Unscoped but a LIVE container is attached — never rebuild a serving network.
+                    // A workload cycle (stop every replica, then relaunch) empties it and the next
+                    // launch migrates it through the UnscopedEmpty arm above.
+                    ProjectNetworkBridge::UnscopedOccupied => {
+                        tracing::warn!(
+                            project,
+                            network = %name,
+                            "per-project docker network is still on a legacy unscoped bridge while \
+                             a workload is attached; the NixOS compute-firewall admits only the \
+                             scoped boatramp- bridge, so cycle the project's workloads (stop all, \
+                             then relaunch) to migrate it"
+                        );
+                    }
+                    // Unscoped and we could not determine the attachment set — fail SAFE: leave it
+                    // untouched rather than risk removing a network that may be live.
+                    ProjectNetworkBridge::UnscopedUnknown => {
+                        tracing::warn!(
+                            project,
+                            network = %name,
+                            "per-project docker network is on a legacy unscoped bridge and its \
+                             attachment set could not be determined; leaving it untouched (fail \
+                             safe, no teardown)"
+                        );
+                    }
+                }
+            }
+        }
         Ok(name)
+    }
+}
+
+/// The docker network driver-opt that pins the Linux bridge interface name. Set at network create
+/// to the scoped [`project_bridge_name`] (see [`DockerBackend::create_bridge_network`]); read back
+/// from a network's `Options` to tell a scoped bridge from a legacy auto-generated `br-<hash>`
+/// (which docker does NOT report under this key).
+const BRIDGE_NAME_OPT: &str = "com.docker.network.bridge.name";
+
+/// The per-project isolation labels every per-project network carries (`boatramp.managed=true` +
+/// `boatramp.project=<project>`), so an operator can identify + reclaim it and so the legacy-bridge
+/// upgrade in [`ensure_project_network`](DockerBackend::ensure_project_network) reapplies the SAME
+/// labels when it recreates a network — keeping it the SAME per-project isolated network, only the
+/// bridge name changing. One source of truth shared by the create-if-absent and the recreate paths.
+fn project_network_labels(project: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("boatramp.managed".to_string(), "true".to_string()),
+        ("boatramp.project".to_string(), project.to_string()),
+    ])
+}
+
+/// How an EXISTING per-project network's Linux bridge compares to the scoped [`project_bridge_name`],
+/// deciding whether a launch may migrate a legacy unscoped `br-<hash>` bridge. See
+/// [`DockerBackend::ensure_project_network`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectNetworkBridge {
+    /// The bridge is already the scoped name — keep it (the idempotent steady state).
+    Scoped,
+    /// The bridge is NOT the scoped name (a legacy docker `br-<hash>` reported as an absent opt, or
+    /// any other value) AND the network has NO attached containers — safe to remove + recreate
+    /// scoped at this instant (the old workload is stopped+removed, the new one not yet attached).
+    UnscopedEmpty,
+    /// The bridge is NOT the scoped name but the network HAS ≥ 1 attached container — leave it
+    /// untouched: a live network cannot be rebuilt without severing its endpoint.
+    UnscopedOccupied,
+    /// The bridge is NOT the scoped name and the network's attachment set could not be determined
+    /// (`Containers` absent) — fail safe and leave it untouched.
+    UnscopedUnknown,
+}
+
+/// Classify an existing per-project `net` against the `expected` scoped bridge name
+/// ([`project_bridge_name`] of the network's own name). The bridge actually in effect is the
+/// [`BRIDGE_NAME_OPT`] driver-opt docker reports in `Options`; docker does NOT report an
+/// auto-generated `br-<hash>` there, so an ABSENT (or differing) opt is a legacy unscoped bridge.
+/// Guards strictly on emptiness via `Containers`: a non-empty map is occupied, an EMPTY map is
+/// safe to rebuild, and an ABSENT map is treated as indeterminate (never torn down). Pure (no I/O),
+/// so the detect/guard decision is unit-testable without a daemon.
+fn classify_project_network(net: &Network, expected: &str) -> ProjectNetworkBridge {
+    let is_scoped = net
+        .options
+        .as_ref()
+        .and_then(|o| o.get(BRIDGE_NAME_OPT))
+        .is_some_and(|bridge| bridge == expected);
+    if is_scoped {
+        return ProjectNetworkBridge::Scoped;
+    }
+    match net.containers.as_ref() {
+        None => ProjectNetworkBridge::UnscopedUnknown,
+        Some(containers) if containers.is_empty() => ProjectNetworkBridge::UnscopedEmpty,
+        Some(_) => ProjectNetworkBridge::UnscopedOccupied,
     }
 }
 
@@ -3151,6 +3285,114 @@ mod tests {
         // bridge, so the firewall can match the two with separate, non-overlapping patterns and a
         // boatramp-scoped match never degrades to the broad `br-+`.
         assert!(!"br-boatramp".starts_with(PROJECT_BRIDGE_PREFIX));
+    }
+
+    /// Build a `Network` inspect result with a given bridge driver-opt and attachment set, for the
+    /// `classify_project_network` detect/guard tests. `bridge: None` ⇒ no `com.docker.network.
+    /// bridge.name` opt (a legacy auto-generated `br-<hash>` — docker does not report it). `containers:
+    /// None` ⇒ the `Containers` field is absent (emptiness indeterminable); `Some(n)` ⇒ a map with
+    /// `n` attached entries.
+    fn net_with(bridge: Option<&str>, containers: Option<usize>) -> Network {
+        use bollard::models::NetworkContainer;
+        Network {
+            options: bridge.map(|b| HashMap::from([(BRIDGE_NAME_OPT.to_string(), b.to_string())])),
+            containers: containers.map(|n| {
+                (0..n)
+                    .map(|i| (format!("container{i}"), NetworkContainer::default()))
+                    .collect()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classify_project_network_detects_scoped_vs_unscoped_and_guards_on_emptiness() {
+        let net = project_network_name("acme");
+        let scoped = project_bridge_name(&net);
+
+        // SCOPED: the opt equals the expected scoped bridge → keep, regardless of attachment (a
+        // scoped network is never rebuilt).
+        for containers in [None, Some(0), Some(3)] {
+            assert_eq!(
+                classify_project_network(&net_with(Some(&scoped), containers), &scoped),
+                ProjectNetworkBridge::Scoped,
+                "a bridge equal to the scoped name is always kept"
+            );
+        }
+
+        // UNSCOPED + EMPTY → safe to recreate scoped. Covers BOTH shapes of "not scoped":
+        //   (a) no bridge opt at all — docker's legacy auto-generated `br-<hash>` (the reap-race
+        //       defect's exact on-wire state), and
+        //   (b) an opt present but set to some OTHER value.
+        assert_eq!(
+            classify_project_network(&net_with(None, Some(0)), &scoped),
+            ProjectNetworkBridge::UnscopedEmpty,
+            "a legacy br-<hash> (no opt) with no attached container is the safe-upgrade case"
+        );
+        assert_eq!(
+            classify_project_network(&net_with(Some("br-deadbeef"), Some(0)), &scoped),
+            ProjectNetworkBridge::UnscopedEmpty,
+            "a differing bridge value with no attached container is also upgradable"
+        );
+
+        // UNSCOPED + OCCUPIED → leave untouched (never sever a live endpoint).
+        assert_eq!(
+            classify_project_network(&net_with(None, Some(1)), &scoped),
+            ProjectNetworkBridge::UnscopedOccupied,
+            "a legacy bridge with a live attached container must be left intact"
+        );
+        assert_eq!(
+            classify_project_network(&net_with(None, Some(5)), &scoped),
+            ProjectNetworkBridge::UnscopedOccupied
+        );
+
+        // UNSCOPED + INDETERMINATE (Containers absent) → fail safe, leave untouched.
+        assert_eq!(
+            classify_project_network(&net_with(None, None), &scoped),
+            ProjectNetworkBridge::UnscopedUnknown,
+            "emptiness that cannot be determined must NOT be torn down (fail safe)"
+        );
+
+        // The scoped bridge is per-project: `acme`'s scoped name is NOT `beta`'s, so inspecting
+        // `beta`'s (empty, legacy) network against `acme`'s expected bridge classifies as a
+        // regular unscoped-empty — detection keys on the project's OWN expected bridge, never a
+        // cross-project one.
+        let beta = project_network_name("beta");
+        let beta_scoped = project_bridge_name(&beta);
+        assert_ne!(scoped, beta_scoped);
+        assert_eq!(
+            classify_project_network(&net_with(Some(&beta_scoped), Some(0)), &scoped),
+            ProjectNetworkBridge::UnscopedEmpty,
+            "another project's scoped bridge is not THIS project's scoped bridge"
+        );
+    }
+
+    #[test]
+    fn project_network_labels_are_the_per_project_isolation_labels() {
+        // The recreate path reapplies EXACTLY these labels, so an upgraded network stays the SAME
+        // per-project isolated network (managed + the owning project) — only the bridge changes.
+        let labels = project_network_labels("acme");
+        assert_eq!(
+            labels.get("boatramp.managed").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            labels.get("boatramp.project").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            labels.len(),
+            2,
+            "exactly the two isolation labels, nothing else"
+        );
+        // The reserved default project (and an empty id) still carry their own project label — a
+        // single-tenant install is its own isolated, labeled network, never an unlabeled shared one.
+        assert_eq!(
+            project_network_labels("default")
+                .get("boatramp.project")
+                .map(String::as_str),
+            Some("default")
+        );
     }
 
     #[test]
