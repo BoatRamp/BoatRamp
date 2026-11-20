@@ -664,19 +664,36 @@ packet even though `services.boatramp.compute = true` granted the caps to create
 bridges. Enabling `compute` now ALSO opens the firewall for the shim data plane on the
 boatramp compute bridges **only** — the static `br-boatramp` and the per-project docker
 `boatramp-*` bridges — never the LAN/public interface and never an unrelated docker
-`br-<hash>`. To narrow the opening to the exact shim ports (least privilege), list them:
+`br-<hash>`. Set the shim URLs via `computeShimUrls`: the module feeds them to the
+server AND opens **only** their ports on the boatramp bridges (least privilege by
+default — no separate port list to maintain):
 
 ```nix
 services.boatramp = {
   enable = true;
-  compute = true;               # caps + firewall for the compute bridges
-  computeShimPorts = [ 8083 8084 ]; # optional: scope to the shim ports you configured
+  compute = true; # caps + firewall for the compute bridges
+  computeShimUrls = {
+    # Bind on the docker host-gateway IP; the backend rewrites the guest's view
+    # to host.docker.internal automatically.
+    sql = "http://172.17.0.1:8083";
+    kv  = "http://172.17.0.1:8084";
+  };
+  # computeShimPorts = [ … ];   # add ports only for a shim URL set outside the module
+  # computeTrustBridges = true; # opt out of port-scoping (trust all TCP on the boatramp bridges)
 };
 ```
 
-The shims stay unreachable off-node: they are bound on a host-internal address (the
-bridge gateway / loopback, not a public interface), and the firewall admits their port
-only on the boatramp bridges — so a LAN or internet peer is blocked at both layers.
+With no `computeShimUrls`/`computeShimPorts`/`computeTrustBridges`, the firewall opens
+nothing (no bindings to admit). The shims stay unreachable off-node: they are bound on a
+host-internal address (the bridge gateway / loopback, not a public interface), and the
+firewall admits their port only on traffic arriving on the boatramp bridges — so a LAN
+or internet peer is blocked at both layers.
+
+> **Upgrade note.** The scoped docker bridge name applies only when a per-project network
+> is CREATED. After upgrading, a pre-existing `boatramp-net-<project>` keeps docker's old
+> `br-<hash>` bridge, which the firewall rule does not match — that workload's shim traffic
+> is DROPped (fail-closed) until the network is recreated. Redeploy/cycle docker compute
+> workloads after upgrading so their networks recreate with the scoped bridge name.
 
 ## Use a managed Postgres/MySQL from a compute workload (a real DSN)
 

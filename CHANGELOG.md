@@ -7,6 +7,41 @@ versions.
 
 ## [Unreleased]
 
+### Added
+
+- **Turnkey, firewall-coherent compute networking (docker + native container).** `--bind
+  blob/messaging/sql/kv` compute workloads are now reachable on a default-firewall NixOS host
+  without the operator hand-wiring per-bridge gateway IPs or `trustedInterfaces`:
+  - **Docker shim reachability.** The docker backend runs each workload on a per-project bridge, so a
+    shim bound on the host loopback is the container's OWN loopback and there is no single gateway to
+    pin into every guest. At launch the backend now adds `host.docker.internal:host-gateway` to the
+    container and rewrites any bind-local shim URL (loopback / `0.0.0.0` / `localhost`) to
+    `http://host.docker.internal:<port>` — one stable name that resolves to the host from ANY
+    per-project bridge. A URL that already names a routable host (the host-gateway IP, a managed-DB
+    DNS alias, an external endpoint) is left untouched.
+  - **Scoped docker bridge name.** Per-project docker networks now pin their Linux bridge interface to
+    a boatramp-scoped, deterministic `boatramp-<hash>` name (≤ 15 bytes) via the
+    `com.docker.network.bridge.name` driver-opt, so the firewall can trust a boatramp prefix instead
+    of the broad `br-+`.
+  - **NixOS firewall.** `services.boatramp.compute = true` now also opens the firewall for the
+    compute-shim data plane on the boatramp compute bridges ONLY (`br-boatramp` +
+    `boatramp-*`), across both the iptables and nftables backends. New
+    `services.boatramp.computeShimUrls` is the single source for the shim URLs — fed to the server as
+    `BOATRAMP_COMPUTE_*_SHIM_URL` AND parsed for the `:port` the firewall opens, so the least-privilege
+    (shim-ports-only) rule is the default and the operator needn't hand-list ports.
+    `computeShimPorts` adds extra ports; `computeTrustBridges` opts out to trusting the whole
+    (boatramp-scoped) interface. The shims stay unreachable off-node (bound host-internal; the
+    firewall admits only traffic arriving on a boatramp bridge).
+
+### Upgrade notes
+
+- **Cycle docker compute workloads after upgrading.** The scoped docker bridge name applies only at
+  network CREATE — a pre-existing `boatramp-net-<project>` keeps docker's old `br-<hash>` bridge, which
+  the new firewall rule does NOT match, so that workload's shim traffic is DROPped (fail-closed) until
+  its per-project network is recreated. After upgrading, redeploy/cycle docker compute workloads (stop
+  the last replica of each project so the network is GC'd, then relaunch) so their networks recreate
+  with the scoped bridge name. Native-container/firecracker (`br-boatramp`) is unaffected.
+
 ## [0.67.0] — 2026-11-20
 
 ### Added

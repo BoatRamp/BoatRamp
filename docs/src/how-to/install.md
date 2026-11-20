@@ -116,9 +116,11 @@ Enabling `compute` also opens the firewall for the token-gated compute-shim data
 boatramp compute bridges **only** — the static `br-boatramp` (native container / firecracker) and
 the per-project docker `boatramp-*` bridges — so a bridged workload can reach its `--bind`
 shims on a default-firewall host. The opening never touches the LAN/public interface or an
-unrelated docker bridge. To narrow it to the exact shim ports you serve (least privilege), set
-`services.boatramp.computeShimPorts = [ 8083 8084 ];`. See
-[Shim reachability + the compute firewall](./compute.md#nixos-open-the-compute-firewall).
+unrelated docker bridge. Set the shim URLs via `services.boatramp.computeShimUrls` and the module
+feeds them to the server AND opens only their ports (least privilege). See
+[Shim reachability + the compute firewall](./compute.md#nixos-open-the-compute-firewall), which also
+covers the one-time upgrade step (cycle docker compute workloads so their networks recreate with the
+scoped bridge name).
 
 ## Prebuilt archive
 

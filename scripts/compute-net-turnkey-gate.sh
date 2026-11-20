@@ -23,14 +23,20 @@
 #
 # RUN ON lighthouse (jwk@lighthouse.bytesoba.net — the owner's NixOS docker box):
 #
-#   # 1. Deploy a node from this branch with compute + a shim bound on the docker
-#   #    host-gateway IP. Minimal boatramp.cfg:
-#   #      (serve: (addr: "0.0.0.0:8080",
-#   #               compute: (kv_shim_url: "http://172.17.0.1:8084")))
-#   #    services.boatramp = { enable = true; compute = true;
-#   #                          computeShimPorts = [ 8084 ]; };
+#   # 1. Deploy a node from this branch with compute + the shim URL set via the
+#   #    module (which binds the shim AND opens only its port on the boatramp bridges):
+#   #      services.boatramp = {
+#   #        enable = true; compute = true;
+#   #        computeShimUrls.kv = "http://172.17.0.1:8084";  # host-gateway IP
+#   #      };
 #   # 2. Then, from a checkout of this branch on lighthouse:
 #   sudo SHIM_PORT=8084 scripts/compute-net-turnkey-gate.sh
+#
+# COVER BOTH FIREWALL BACKENDS: run it once on the default (iptables) host and once
+# with `networking.nftables.enable = true` — the nftables default rule is the one M1
+# fixed (a valid `meta l4proto tcp` / `tcp dport {…}` match, never a bare `tcp`), so
+# the live nft path must be exercised. The firewall check (step 4) asserts the live
+# rule uses a valid match, which would fail on the pre-M1 bare-`tcp` ruleset.
 #
 # Exit 0 = both halves proven. Non-zero = a real failure (printed). The script
 # SELF-SKIPS (exit 0 with a SKIP line) when not on a Linux+docker host, so it is a
@@ -146,13 +152,19 @@ else
   pass "shim is NOT reachable on the LAN IP $LAN_IP:$SHIM_PORT (blocked at bind+firewall)"
 fi
 
-# --- 4. The firewall rule is scoped to the boatramp bridges, not br-+ ---------
-log "firewall: admit rule present on the boatramp bridges, scoped (not all br-+)"
+# --- 4. The firewall rule is scoped to the boatramp bridges, not br-+, with a VALID match
+log "firewall: admit rule present on the boatramp bridges, scoped (not br-+), valid match"
 if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
   rs="$(nft list ruleset 2>/dev/null)"
+  # The live ruleset is already kernel-accepted, so a bare-`tcp` match could not be
+  # loaded; still assert the boatramp rule uses a valid header match (`dport`/`l4proto`)
+  # — a positive guard that the M1 fix (not a bare `tcp`) is what shipped.
   echo "$rs" | grep -qE 'iifname "(br-boatramp|boatramp-)' \
     && pass "nft: boatramp-scoped iifname accept present" \
     || fail "nft: no boatramp-scoped iifname accept rule found"
+  echo "$rs" | grep -E 'iifname "(br-boatramp|boatramp-)[^"]*"' | grep -qE '(tcp dport|meta l4proto tcp)' \
+    && pass "nft: the boatramp rule uses a valid match (dport / l4proto), not a bare tcp" \
+    || fail "nft: the boatramp rule is missing a valid tcp match (M1 bare-tcp regression?)"
   echo "$rs" | grep -qE 'iifname "br-\*"' \
     && fail "nft: rule trusts the broad br-* (must be boatramp-scoped only)" \
     || pass "nft: does NOT trust the broad br-*"

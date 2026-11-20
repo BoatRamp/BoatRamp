@@ -919,20 +919,27 @@
           checks = {
             clippy = workspaceClippy;
 
-            # NixOS module eval gate (Gap B). Pure eval — no VM — so it runs on the
-            # macOS builder too: evaluate `services.boatramp` with `compute` on/off and
-            # assert the firewall admits the compute-shim traffic on the boatramp
-            # compute bridges (the static `br-boatramp` + the per-project docker
-            # `boatramp-` prefix), scoped to those bridges and NOT the broad `br-+`,
-            # present under `compute` and absent without it, across BOTH firewall
-            # backends (iptables + nftables). Forced at `nix flake check` eval time via
+            # NixOS module eval gate (Gap B + S1). Pure eval — no VM — so it runs on the
+            # macOS builder too: evaluate `services.boatramp` in several compute shapes
+            # and assert the firewall admits the shim traffic on the boatramp compute
+            # bridges (static `br-boatramp` + per-project docker `boatramp-` prefix),
+            # scoped to those bridges and NOT the broad `br-+`; that the DEFAULT is
+            # port-scoped to the ports AUTO-DERIVED from `computeShimUrls` (least
+            # privilege — no hand-listing); that those URLs are ALSO fed to the server as
+            # env; that `computeTrustBridges` opts out to a bare-protocol accept using a
+            # VALID `meta l4proto tcp` match (NOT a bare `tcp`, the M1 regression); and
+            # that it opens nothing without compute / without shim config. The dedicated
+            # `compute-firewall-nft-ruleset` check (Linux-only, below) then REALIZES the
+            # nft ruleset through `nft --check`. Forced at `nix flake check` eval time via
             # the `assert`, so `--no-build` still catches a regression.
             compute-firewall-eval =
               let
-                firewallOf =
+                cfgOf =
                   {
                     compute,
+                    shimUrls ? { },
                     shimPorts ? [ ],
+                    trustBridges ? false,
                     nftables ? false,
                   }:
                   (inputs.nixpkgs.lib.nixosSystem {
@@ -945,46 +952,89 @@
                         services.boatramp = {
                           enable = true;
                           inherit compute;
+                          computeShimUrls = shimUrls;
                           computeShimPorts = shimPorts;
+                          computeTrustBridges = trustBridges;
+                          # Stub package so reading the generated unit (serviceConfig.Environment)
+                          # evaluates without the boatramp overlay — this is a pure eval, never built.
+                          package = pkgs.writeShellScriptBin "boatramp" "";
                           configFile = pkgs.writeText "boatramp.cfg" ''(serve: (addr: "127.0.0.1:8080"))'';
                         };
                       }
                     ];
-                  }).config.networking.firewall;
+                  }).config;
+                fwOf = args: (cfgOf args).networking.firewall;
+                envOf = args: (cfgOf args).systemd.services.boatramp.serviceConfig.Environment or [ ];
 
-                onIpt = firewallOf { compute = true; };
-                offIpt = firewallOf { compute = false; };
-                scopedIpt = firewallOf {
-                  compute = true;
-                  shimPorts = [
-                    8083
-                    8084
-                  ];
+                shims = {
+                  sql = "http://172.17.0.1:8083";
+                  kv = "http://0.0.0.0:8084";
                 };
-                onNft = firewallOf {
+                # DEFAULT: shim URLs set, no explicit ports/trust → port-scoped from the URLs.
+                defIpt = fwOf {
+                  compute = true;
+                  shimUrls = shims;
+                };
+                defNft = fwOf {
+                  compute = true;
+                  shimUrls = shims;
+                  nftables = true;
+                };
+                defEnv = envOf {
+                  compute = true;
+                  shimUrls = shims;
+                };
+                # TRUST opt-out (both backends) — the bare-protocol path (M1).
+                trustNft = fwOf {
+                  compute = true;
+                  trustBridges = true;
+                  nftables = true;
+                };
+                trustIpt = fwOf {
+                  compute = true;
+                  trustBridges = true;
+                };
+                # EMPTY: compute on, no shim config, no trust → open nothing.
+                emptyIpt = fwOf { compute = true; };
+                emptyNft = fwOf {
                   compute = true;
                   nftables = true;
                 };
+                # Compute OFF.
+                offIpt = fwOf { compute = false; };
 
                 has = hay: needle: lib.hasInfix needle hay;
                 a = lib.asserts.assertMsg;
                 assertions = [
-                  # Present under `compute` (iptables backend): the static native/firecracker
-                  # bridge AND the per-project docker bridge name-prefix wildcard.
-                  (a (has onIpt.extraCommands "-i br-boatramp ") "compute: iptables rule must match br-boatramp")
-                  (a (has onIpt.extraCommands "-i boatramp-+ ") "compute: iptables rule must match the docker boatramp- prefix")
-                  # Scoped to boatramp bridges — never the broad `br-+`/`br+` (would trust every
-                  # docker bridge, i.e. other tenants' / unrelated networks).
-                  (a (!has onIpt.extraCommands "-i br-+ ") "compute: must NOT trust all br-+")
-                  (a (!has onIpt.extraCommands "-i br+ ") "compute: must NOT trust all br+")
-                  # Absent without `compute`.
+                  # --- Default (auto-derived, port-scoped) iptables ---
+                  (a (has defIpt.extraCommands "-i br-boatramp ") "default: iptables rule must match br-boatramp")
+                  (a (has defIpt.extraCommands "-i boatramp-+ ") "default: iptables rule must match the docker boatramp- prefix")
+                  (a (!has defIpt.extraCommands "-i br-+ ") "default: must NOT trust all br-+")
+                  (a (!has defIpt.extraCommands "-i br+ ") "default: must NOT trust all br+")
+                  # Ports AUTO-DERIVED from the shim URLs (8083 from sql, 8084 from kv) WITHOUT
+                  # the operator hand-listing computeShimPorts.
+                  (a (has defIpt.extraCommands "--dports 8083,8084") "default: must auto-derive the shim ports from computeShimUrls")
+                  # --- The SAME URLs feed the server as env (single source) ---
+                  (a (lib.elem "BOATRAMP_COMPUTE_SQL_SHIM_URL=http://172.17.0.1:8083" defEnv) "default: must export the sql shim URL to the server env")
+                  (a (lib.elem "BOATRAMP_COMPUTE_KV_SHIM_URL=http://0.0.0.0:8084" defEnv) "default: must export the kv shim URL to the server env")
+                  # --- Default nftables: valid port-scoped match, boatramp-scoped ---
+                  (a (has defNft.extraInputRules ''iifname "br-boatramp" tcp dport { 8083, 8084 } accept'') "default(nft): must be a valid port-scoped match on br-boatramp")
+                  (a (has defNft.extraInputRules ''iifname "boatramp-*" tcp dport'') "default(nft): must match the docker boatramp-* glob")
+                  (a (!has defNft.extraInputRules ''iifname "br-*"'') "default(nft): must NOT trust all br-*")
+                  # --- Trust opt-out: VALID bare-protocol match (M1 regression guard) ---
+                  (a (has trustNft.extraInputRules ''iifname "boatramp-*" meta l4proto tcp accept'') "trust(nft): must use the valid `meta l4proto tcp` match")
+                  # The old bug — a bare `tcp` match — must NOT appear (this would have failed on the pre-fix code).
+                  (a (
+                    !has trustNft.extraInputRules ''boatramp-*" tcp accept''
+                  ) "trust(nft): must NOT emit a bare `tcp` match (invalid nft)")
+                  (a (
+                    !has trustNft.extraInputRules ''br-boatramp" tcp accept''
+                  ) "trust(nft): must NOT emit a bare `tcp` match (invalid nft)")
+                  (a (has trustIpt.extraCommands "-i boatramp-+ -p tcp -j nixos-fw-accept") "trust(ipt): must accept all TCP on the boatramp bridges")
+                  # --- Empty / off: open nothing ---
+                  (a (!has emptyIpt.extraCommands "boatramp") "empty: no shim config ⇒ no iptables compute rule")
+                  (a (!has emptyNft.extraInputRules "boatramp") "empty: no shim config ⇒ no nft compute rule")
                   (a (!has offIpt.extraCommands "boatramp") "no-compute: firewall must not touch the compute bridges")
-                  # `computeShimPorts` narrows to the specific TCP dports (least privilege).
-                  (a (has scopedIpt.extraCommands "--dports 8083,8084") "computeShimPorts must narrow the rule to those ports")
-                  # nftables backend: fixed name for br-boatramp, glob prefix for the docker bridges.
-                  (a (has onNft.extraInputRules ''iifname "br-boatramp"'') "compute(nft): rule must match br-boatramp")
-                  (a (has onNft.extraInputRules ''iifname "boatramp-*"'') "compute(nft): rule must match the docker boatramp-* glob")
-                  (a (!has onNft.extraInputRules ''iifname "br-*"'') "compute(nft): must NOT trust all br-*")
                 ];
               in
               assert lib.all (x: x) assertions;
@@ -996,6 +1046,91 @@
             # Compile-lint the whole feature matrix for the shipped musl target — the
             # backstop against a musl-only build break reaching a release tag.
             musl-clippy = boatrampMuslClippy;
+
+            # M1: REALIZE the compute firewall's nft ruleset and validate it with
+            # `nft --check` (not just a string assertion) — closing the gap that let an
+            # invalid bare-`tcp` match pass the string-only eval. Linux-only (needs the
+            # `nft` netfilter userspace + a throwaway netns, like NixOS's own
+            # `checkRuleset`). Validates BOTH the port-scoped default and the
+            # `computeTrustBridges` bare-protocol path, AND proves the check has teeth by
+            # requiring that a bare-`tcp` ruleset is REJECTED.
+            compute-firewall-nft-ruleset =
+              let
+                rulesOf =
+                  args:
+                  (inputs.nixpkgs.lib.nixosSystem {
+                    system = "x86_64-linux";
+                    modules = [
+                      inputs.self.nixosModules.default
+                      {
+                        nixpkgs.hostPlatform = "x86_64-linux";
+                        networking.nftables.enable = true;
+                        services.boatramp = {
+                          enable = true;
+                          compute = true;
+                          configFile = pkgs.writeText "boatramp.cfg" ''(serve: (addr: "127.0.0.1:8080"))'';
+                        }
+                        // args;
+                      }
+                    ];
+                  }).config.networking.firewall.extraInputRules;
+                # The module's real output for the two live paths.
+                scopedRules = rulesOf {
+                  computeShimUrls = {
+                    sql = "http://172.17.0.1:8083";
+                    kv = "http://0.0.0.0:8084";
+                  };
+                };
+                trustRules = rulesOf { computeTrustBridges = true; };
+                wrap = rules: ''
+                  table inet boatramp_test {
+                    chain input {
+                      type filter hook input priority 0; policy drop;
+                      ${rules}
+                    }
+                  }
+                '';
+                # The pre-fix bug: a bare `tcp` match (no header field) — must be REJECTED.
+                badRuleset = ''
+                  table inet boatramp_test {
+                    chain input {
+                      type filter hook input priority 0; policy drop;
+                      iifname "boatramp-*" tcp accept
+                    }
+                  }
+                '';
+              in
+              pkgs.runCommand "boatramp-compute-firewall-nft-ruleset"
+                {
+                  nativeBuildInputs = [
+                    pkgs.nftables
+                    pkgs.util-linux
+                  ];
+                  scoped = wrap scopedRules;
+                  trust = wrap trustRules;
+                  bad = badRuleset;
+                }
+                ''
+                  set -eu
+                  # Check in a throwaway user+net namespace, exactly as NixOS's checkRuleset does,
+                  # so `nft --check` can validate against a real (empty) kernel ruleset in the sandbox.
+                  check() { unshare --user --map-root-user --net ${pkgs.nftables}/bin/nft --check --file "$1"; }
+                  printf '%s' "$scoped" > scoped.nft
+                  printf '%s' "$trust" > trust.nft
+                  printf '%s' "$bad" > bad.nft
+                  echo "== realize + check the port-scoped default ruleset =="
+                  cat scoped.nft
+                  check scoped.nft
+                  echo "== realize + check the computeTrustBridges ruleset =="
+                  cat trust.nft
+                  check trust.nft
+                  echo "== a bare-\`tcp\` ruleset MUST be rejected (the check has teeth) =="
+                  if check bad.nft 2>/dev/null; then
+                    echo "FAIL: nft --check accepted a bare \`tcp\` match — the check cannot catch the M1 regression" >&2
+                    exit 1
+                  fi
+                  echo "compute firewall nft ruleset realized + validated" > $out
+                '';
 
             nixos-service = pkgs.testers.runNixOSTest {
               name = "boatramp-service";
