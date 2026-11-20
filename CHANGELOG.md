@@ -7,6 +7,69 @@ versions.
 
 ## [Unreleased]
 
+## [0.66.0] — 2026-11-20
+
+A compute-backend security-hardening release (plus two live-service fixes and a NixOS-module
+fix). Every item below was independently security-reviewed; the per-tenant L2 anti-spoof and the
+OCI-unpack containment are live-proven on a real kernel.
+
+### Security
+
+- **OCI image unpack hardened against a tenant-image host escape.** The OCI layer unpack (run in
+  the privileged node process, used by both the firecracker `compute build` and native-container
+  image staging) now resolves EVERY destination — layer unpack, whiteout delete, hard-link target,
+  and the post-unpack init/config/`resolv.conf` writes — through a cross-platform
+  `RESOLVE_IN_ROOT`-style containment that follows in-root symlinks (so usrmerge base images still
+  work) but contains any escape, closing an arbitrary root-owned host write/delete/read via a
+  symlink planted in a tenant image. The registry client now screens the `WWW-Authenticate`
+  auth-realm and every redirect hop against an SSRF block-list (loopback / RFC-1918 / link-local
+  incl. `169.254.169.254` / CGNAT / ULA / v4-mapped, 6to4, Teredo and v4-compatible IPv6 /
+  multicast), https-only, with DNS screened at resolution time so there is no rebind window; and a
+  digest-pinned pull now verifies the manifest body (sha256 + sha512, fail-closed on an unknown
+  algorithm), not just the layer blobs.
+- **Per-tenant L2 anti-spoofing on the shared compute bridge.** Both embedded-VMM taps and
+  native-container veths now install a per-port nftables filter (pinned MAC + source IP + ARP
+  sender IP/HW; non-ARP/IPv4 ethertypes dropped; installed fail-closed BEFORE the port joins the
+  bridge), closing cross-tenant ARP / source-IP spoofing. Gated by node security posture: under
+  multi-tenant, a node where the filter cannot be installed REFUSES compute launches (fail-closed);
+  single-tenant warns and proceeds. The guest MAC is now deterministic and unique per IP.
+- **Embedded-VMM lifecycle + secret-handling hardening.** VMM worker processes re-arm a
+  parent-death `SIGKILL` after the capability drop; a boot sweep reaps orphaned workers and stale
+  taps and reserves in-use IPs before allocating, with a release quarantine on reuse; and the worker
+  config (which carries per-binding identity tokens) is delivered over stdin instead of argv, with
+  snapshot artifacts written `0600` — so tokens no longer land in host `/proc/<pid>/cmdline` or
+  world-readable files.
+- **Least-privilege secrets management on the default project.** The bare `/api/secrets` and
+  `/api/email` endpoints (the default-project credential surfaces the CLI uses) are now authorized
+  by `Secrets` on the default project instead of falling through to node-global `System·Admin`, so a
+  `project_admin` can manage the default project's secrets without a node-global `admin` token.
+
+### Fixed
+
+- **Gateway: body-carrying uploads forward correctly.** A client `Content-Length: 0` on a bodied
+  request (a docker registry blob-upload finalize `PUT`) is now preserved when forwarding upstream,
+  fixing a persistent 502 on `docker push` through the gateway. The gateway also no longer forwards
+  `Expect: 100-continue` upstream (it terminates that handshake itself) and skips any interim `1xx`
+  on the upstream read, closing a pooled-connection response desync.
+- **`project sync` / `clone` survives a severed long transfer.** The long-held `/clone/from`
+  transfer now resumes on a transport interruption (e.g. an edge idle-timeout cutting the near-idle
+  heartbeat connection) instead of failing the whole multi-GB clone, converging via the existing
+  server-side per-blob resumability.
+- **NixOS: `services.boatramp.compute = true` can create the compute bridge.** The module now grants
+  the ambient `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`/`CAP_SETUID`/`CAP_SETGID` and the `AF_NETLINK` address
+  family the non-root, `NoNewPrivileges` service needs to create `br-boatramp` and plumb
+  container/VMM networking — previously those caps were only in the bounding set and `AF_NETLINK`
+  was absent, so bridge creation silently failed and the container/VMM backends were disabled.
+
+### Changed
+
+- **`boatramp-firecracker` rust-vmm dependencies pinned to exact versions** (`vm-memory`,
+  `linux-loader`, `virtio-queue`, `vm-superio`, `vmm-sys-util`, `kvm-bindings`, `kvm-ioctls`) for a
+  deterministic, co-embeddable dependency graph.
+- **`boatramp-container` exports its re-exec worker** (`SANDBOX_SUBCOMMAND` + `run_sandbox_worker`),
+  so an embedder can run the container backend's sandbox worker without copying the handshake —
+  matching `boatramp-firecracker`'s `VMM_RUN_SUBCOMMAND`.
+
 ### Added
 
 - **Cumulative bin-packing across workloads in the compute reconcile scheduler.** The scheduler
