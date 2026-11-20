@@ -566,6 +566,22 @@ const SANDBOX_INSTALL: &[&str] = &[
 /// The conservative system read roots every instance (and the monolith) needs so the process
 /// keeps working (shared-object loading, `/etc/resolv.conf` + CA bundle, `/proc`). Single
 /// source of truth for [`SandboxPolicy::for_server`] and [`SandboxDerivationInputs`].
+///
+/// **`/proc` is granted BROAD by design (HIGH-1 defense-in-depth decision).** The final privsep
+/// Security re-review flagged that this whole-`/proc` read grant leaves the VFS path to a sibling's
+/// `/proc/<pid>/mem` open. We deliberately keep the grant broad rather than narrow it to the instance's
+/// own `/proc/self` subtree, because the cross-instance memory-disclosure hole is closed COMPLETELY and
+/// more robustly at its source by `set_process_undumpable` (`prctl(PR_SET_DUMPABLE, 0)` in
+/// `run_instance` / `run_vm_relay_confined`): a non-dumpable target's `/proc/<pid>/{mem,maps,…}` are
+/// root-owned and `ptrace_may_access`-gated, so the broad VFS read grant can no longer reach a sibling's
+/// memory regardless of this allow-list. Narrowing to `/proc/self` was rejected as risky and incomplete:
+/// the runtime + its dependencies + glibc legitimately read numerous NON-pid `/proc` entries
+/// (`/proc/cpuinfo`, `/proc/meminfo`, `/proc/stat`, `/proc/sys/...`, `/proc/net/...`, `/proc/config.gz`,
+/// …) whose exact set is kernel- and configuration-dependent, and a Landlock ALLOW-list that missed one
+/// would deny it SILENTLY (`EACCES`) in a way the non-Linux dev build cannot catch — trading a
+/// fully-closed hole for a fragile startup regression. (`/proc/self/*` own-access is unaffected by
+/// either choice — the kernel short-circuits same-thread-group access — so the Container
+/// `/proc/self/ns` self-check and `/proc/self/fd/N` magic symlinks work under both.)
 pub const SYSTEM_READ_ROOTS: &[&str] = &[
     "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/dev", "/run", "/var/run",
 ];
@@ -1324,6 +1340,54 @@ pub fn clear_current_capabilities() -> std::io::Result<()> {
              undropped effective capabilities",
             std::io::Error::last_os_error()
         )));
+    }
+    Ok(())
+}
+
+/// Mark the calling process NON-dumpable (`prctl(PR_SET_DUMPABLE, 0)`) — the HIGH-1 (final privsep
+/// Security re-review) cross-instance memory-disclosure wall for the SAME-KERNEL instance substrates
+/// (`OsProcess` + the Container "simple model"). All instances run as the same node uid at euid 0
+/// (capability-reduced only) in the SHARED host pid namespace, so a compromised frontend instance
+/// (`listen.http-parse`) could otherwise `openat("/proc/<signer-pid>/mem")` + `pread64` a crown-jewel
+/// `secrets.sealer` / `token.signer` key straight out of a holder's mlocked address space. That read is
+/// a pure VFS access — it issues NO `ptrace`/`process_vm_readv` syscall, so the seccomp KILL on those
+/// verbs never fires, and the `/proc` read grant + `openat`/`pread64` are allowed. Setting the TARGET
+/// non-dumpable makes the kernel reparent its `/proc/<pid>/{mem,maps,environ,pagemap,…}` to root:root
+/// and gates access behind `ptrace_may_access`, which — for a non-dumpable target — demands
+/// `CAP_SYS_PTRACE` in the target's user namespace. A capless sibling has none, so it gets `EPERM`
+/// REGARDLESS of `kernel.yama.ptrace_scope` (this does not rely on Yama being present/configured).
+///
+/// **MUST be called POST-`execve`, in the served process itself — NOT from a `pre_exec` closure.** A
+/// non-privilege-elevating `execve` RESETS the dumpable flag to `SUID_DUMP_USER` (1): the kernel's
+/// `begin_new_exec` runs `set_dumpable(mm, SUID_DUMP_USER)` on any non-`secureexec` (non-setuid /
+/// no-gained-file-caps) exec, so a value set before the re-exec would be silently clobbered by the exec
+/// that follows. Our instance / relay re-exec is non-setuid with no file capabilities (confirmed by the
+/// reviewer), so once set HERE — after the exec, in `run_instance` / `run_vm_relay_confined` — it
+/// persists for the process's life (the serving path performs no further `execve`). This is WHY the
+/// dumpable step is deliberately NOT consolidated into `spawn_wired_instance`'s `pre_exec` next to the
+/// Finding-2 capability drop (whose `SECBIT_NOROOT` is the OPPOSITE case — it MUST precede the execve to
+/// take effect at it): the two hardening steps have opposite exec-ordering requirements.
+///
+/// `prctl(PR_SET_DUMPABLE, …)` needs NO capability, so this works for a capless per-tenant child exactly
+/// as for a full-cap boot child. Own-process access is UNAFFECTED: the kernel short-circuits
+/// `ptrace_may_access` for a same-thread-group caller, so this process keeps full access to its OWN
+/// `/proc/self/*` — the Container `/proc/self/ns` self-check and every `/proc/self/fd/N` magic symlink
+/// still resolve. Load-bearing for HIGH-1, so callers treat a failure as fail-closed (refuse to serve).
+#[cfg(target_os = "linux")]
+pub fn set_process_undumpable() -> std::io::Result<()> {
+    // SAFETY: `prctl(PR_SET_DUMPABLE, 0, …)` — scalar args only, no pointers; async-signal-safe. Sets
+    // this process's mm dumpable flag to SUID_DUMP_DISABLE (0).
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_DUMPABLE,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -3208,6 +3272,30 @@ mod privsep_derivation_tests {
         assert_eq!(fd_close_ranges(&[3]), vec![(4, u32::MAX)]);
         // A negative-only keep set behaves like an empty one (the optional fd was absent).
         assert_eq!(fd_close_ranges(&[-1]), vec![(3, u32::MAX)]);
+    }
+
+    // ---- HIGH-1: PR_SET_DUMPABLE(0) (cross-instance /proc/<pid>/mem wall) ----
+
+    /// [`set_process_undumpable`] actually flips the calling process's dumpable flag to 0 (the
+    /// mechanism the HIGH-1 fix relies on: a non-dumpable target's `/proc/<pid>/mem` becomes
+    /// root-owned + `ptrace_may_access`-gated, so a capless same-uid sibling gets `EPERM`). Reads it
+    /// back via `prctl(PR_GET_DUMPABLE)` and RESTORES the prior value so sibling tests in this process
+    /// are unaffected. (The full cross-instance read→`EPERM` attack is proven by the privsep live gate,
+    /// which forks real instances; this unit test guards the primitive against an args regression.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn set_process_undumpable_clears_the_dumpable_flag() {
+        // SAFETY: `prctl(PR_GET_DUMPABLE)` takes no pointers; it returns the current flag (0/1/2).
+        let prior = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+        assert!(prior >= 0, "PR_GET_DUMPABLE should not fail: {prior}");
+        set_process_undumpable()
+            .expect("set_process_undumpable must succeed (needs no capability)");
+        // SAFETY: as above.
+        let after = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+        assert_eq!(after, 0, "the process must be NON-dumpable after the call");
+        // Restore the prior dumpable so core-dump/ptrace behavior of other tests is unchanged.
+        // SAFETY: scalar args only.
+        let _ = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, prior as libc::c_ulong) };
     }
 
     // ---- Seccomp allow/kill derivation ----

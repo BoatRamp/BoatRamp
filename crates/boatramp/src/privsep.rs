@@ -525,6 +525,23 @@ pub fn run_root_with_config(config: ServerConfig, config_path: &Path) -> Result<
     if !cfg!(all(target_os = "linux", feature = "sandbox")) {
         return Err(PrivsepError::UnsupportedPlatform.into());
     }
+
+    // HIGH-1 (final privsep Security re-review) defense-in-depth #3 — DEFERRED as a `// TODO`, by
+    // design. The reviewer suggested asserting `kernel.yama.ptrace_scope >= 1` at root boot as a
+    // belt-and-suspenders check against cross-instance `/proc/<pid>/mem` reads. It is intentionally NOT
+    // implemented here because: (a) the hole is already closed COMPLETELY and more robustly by the
+    // PRIMARY fix — every instance + the relay call `sandbox::set_process_undumpable()`
+    // (`PR_SET_DUMPABLE(0)`) post-exec, which makes a target's `/proc/<pid>/mem` root-owned and
+    // `ptrace_may_access`-gated INDEPENDENTLY of Yama; and (b) a naive fail-CLOSED assertion would be
+    // WRONG — a hardened kernel may ship WITHOUT `CONFIG_SECURITY_YAMA` (the `ptrace_scope` sysctl then
+    // does not exist) yet still be fully protected by (a), so refusing to boot on a missing/zero
+    // `ptrace_scope` would reject a safe node. A correct version would read
+    // `/proc/sys/kernel/yama/ptrace_scope` best-effort and only WARN (never refuse) when Yama is present
+    // and 0, and would be gated on a decision about the privsep V5 kernel's Yama config — more than a
+    // few lines of careful plumbing for a purely-redundant signal. Tracked as a follow-up, not folded
+    // into this HIGH-1 fix.
+    // TODO(privsep-high1): best-effort WARN if `/proc/sys/kernel/yama/ptrace_scope` exists and reads 0.
+
     supervise::run(&config, &plan, config_path).map_err(Into::into)
 }
 
@@ -741,6 +758,27 @@ pub fn run_instance(label: &str, config_path: &Path) -> Result<(), CliError> {
     if !cfg!(all(target_os = "linux", feature = "sandbox")) {
         return Err(PrivsepError::UnsupportedPlatform.into());
     }
+
+    // HIGH-1 (final privsep Security re-review) — mark THIS served instance NON-dumpable as early as
+    // possible, so a compromised SAME-UID sibling in the shared host pid namespace cannot
+    // `openat("/proc/<our-pid>/mem")` + `pread64` a crown-jewel key out of our mlocked memory, bypassing
+    // the ptrace/process_vm_readv seccomp KILL (that VFS read issues no ptrace syscall). With dumpable=0
+    // the kernel reparents our `/proc/<pid>/*` to root:root and gates it behind `ptrace_may_access`,
+    // which the capless sibling fails (`EPERM`) REGARDLESS of `kernel.yama.ptrace_scope`. This MUST live
+    // here in the re-exec'd instance — POST-execve — NOT in `spawn_wired_instance`'s pre_exec: a
+    // non-setuid execve RESETS dumpable to 1, so a pre_exec value would be clobbered (see
+    // `set_process_undumpable`). Load-bearing for HIGH-1 ⇒ fail-closed (refuse to serve if it fails). Own
+    // `/proc/self/*` access is unaffected, so the container `/proc/self/ns` self-check + `/proc/self/fd`
+    // magic symlinks below keep working. Covers OsProcess + Container instances (and every per-tenant
+    // child, which also re-execs through here); the in-guest VM frontend is a separate kernel + out of
+    // scope. Linux-only (the whole serving path above is already Linux+`sandbox`-gated).
+    #[cfg(target_os = "linux")]
+    boatramp_server::sandbox::set_process_undumpable().map_err(|e| PrivsepError::InstanceServe {
+        label: label.to_string(),
+        reason: format!(
+            "marking the instance non-dumpable (HIGH-1 cross-instance /proc/<pid>/mem disclosure): {e}"
+        ),
+    })?;
 
     let config = ServerConfig::load(config_path, None).map_err(PrivsepError::from)?;
 
@@ -1228,6 +1266,18 @@ fn run_vm_relay_confined(
     //     gone before any client byte is relayed, and no raw/packet socket can be opened.
     boatramp_server::sandbox::clear_current_capabilities()
         .map_err(|e| format!("clearing the __vm-relay effective capabilities (INFO): {e}"))?;
+
+    // HIGH-1 (final privsep Security re-review) — mark the relay NON-dumpable, right AFTER the capability
+    // drop and BEFORE the profile install (prctl is not yet seccomp-filtered). The `__vm-relay` runs on
+    // the HOST, a same-node-uid process in the SHARED host pid namespace (only the in-guest frontend is on
+    // a separate kernel), so a compromised sibling could otherwise `openat`+`pread64` its `/proc/<pid>/mem`
+    // the same way it would an instance's; dumpable=0 makes its `/proc/<pid>/*` root-owned ⇒ the capless
+    // sibling gets `EPERM` regardless of `yama.ptrace_scope`. Unlike an instance the relay does NOT execve
+    // after this point, so there is no reset concern (this call is already post-exec either way). The
+    // relay is secret-blind, but it is still a host process and this is the SAME wall every instance gets
+    // (one path — `set_process_undumpable`). Load-bearing for HIGH-1 ⇒ fail-closed.
+    boatramp_server::sandbox::set_process_undumpable()
+        .map_err(|e| format!("marking the __vm-relay non-dumpable (HIGH-1): {e}"))?;
 
     // Derive + install the relay's bespoke least-authority profile, fail-closed Enforced (the SAME
     // install_derived + enforce_privsep_status machinery the root + every instance uses — one install
