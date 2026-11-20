@@ -111,6 +111,7 @@ fn spec_for(rootfs_hash: &str) -> ComputeSpec {
         user: None,
         isolation: IsolationRequirement::Trusted,
         prefer_backend: None,
+        require_backend: None,
         pull_secret: None,
         bindings: vec![],
         post_launch: vec![],

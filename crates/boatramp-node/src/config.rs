@@ -1483,6 +1483,50 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub registry_auth: BTreeMap<String, boatramp_core::registry_auth::OperatorRegistryAuth>,
+    /// **Node-scope operator backend-selection policy** (v0.67.0 `[compute.policy]`):
+    /// `allow` / `forbid` / `prefer` over backend ids, the OUTER hard bound on this node's
+    /// placement (on top of the capability floor + isolation posture). `None` (default) ⇒ no
+    /// node policy — every capable backend is eligible, today's behavior. Folded into the
+    /// scheduler's [`BackendPolicy`](boatramp_core::compute::BackendPolicy) at serve wiring and
+    /// composed (operator-first) with each project's per-project policy. Lets an operator
+    /// declare "docker-only on this node" or "default images to the native container, keep
+    /// docker available" as config instead of a capability-drop hack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<ComputePolicyConfig>,
+}
+
+/// The `[compute.policy]` block — the node-scope operator backend-selection policy
+/// (v0.67.0). A narrowing allow/forbid plus a soft `prefer`, mapped into the scheduler's
+/// [`BackendPolicy`](boatramp_core::compute::BackendPolicy). `force` is deliberately NOT
+/// exposed (unwired — use `allow: ["<one>"]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComputePolicyConfig {
+    /// If set, ONLY these backend ids may run compute on this node (an allowlist). Omit ⇒
+    /// every capable backend is permitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+    /// Backend ids that never run on this node (a denylist). Omit ⇒ none denied.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub forbid: Vec<String>,
+    /// A soft node-default preference among eligible backends (e.g. `"container"` to default
+    /// images to the daemonless native container while keeping docker available). Never
+    /// widens eligibility; overridden by a per-project or tenant preference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<String>,
+}
+
+impl ComputePolicyConfig {
+    /// Fold this node policy onto a posture-derived base
+    /// [`BackendPolicy`](boatramp_core::compute::BackendPolicy), yielding the node-scope
+    /// operator policy the scheduler selects on (the base keeps `require_strong_isolation`).
+    #[must_use]
+    pub fn to_backend_policy(
+        &self,
+        base: boatramp_core::compute::BackendPolicy,
+    ) -> boatramp_core::compute::BackendPolicy {
+        base.with_overlay(self.allow.clone(), &self.forbid, self.prefer.clone())
+    }
 }
 
 /// Default for [`ComputeConfig::internal_dns`] — on (activates only with the
@@ -1607,6 +1651,7 @@ impl Default for ComputeConfig {
             pg_client_image: None,
             mysql_client_image: None,
             registry_auth: BTreeMap::new(),
+            policy: None,
         }
     }
 }

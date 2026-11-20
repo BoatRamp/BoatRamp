@@ -1075,18 +1075,37 @@ pub struct VolumeStatus {
 // Backend selection policy
 // ---------------------------------------------------------------------------
 
-/// Per-site/tenant backend policy: which backends a workload may use. Default
-/// permits any backend; `force` pins one (overrides allow/forbid).
+/// The **operator** backend-selection policy in force for one scope (a node's
+/// `[compute.policy]`, or a per-project record), plus the isolation posture. The HARD
+/// outer bound on placement: capability eligibility ∧ this policy ∧ the isolation posture
+/// is the eligible set a tenant `prefer`/`require` then refines WITHIN — never past.
+///
+/// Default permits any capable backend (back-compat: no policy = today's behavior). The
+/// latent [`force`](Self::force) field is **unwired** (v0.67.0 PLAN: redundant with
+/// `allow: [one]`, and its "overrides allow/forbid" precedence is a footgun); it remains in
+/// the struct for wire-compat but is NOT consulted by [`permits`](Self::permits) or
+/// [`Node::pick_backend`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackendPolicy {
-    /// If set, only these backend ids are permitted.
+    /// If set, ONLY these backend ids are permitted (an allowlist). Omit ⇒ all capable
+    /// backends are permitted. A hard operator gate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow: Option<Vec<String>>,
-    /// Backend ids that are never permitted.
+    /// Backend ids that are NEVER permitted (a denylist). Omit ⇒ none denied. A hard
+    /// operator gate; composes as the UNION across scopes (node ∪ per-project).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub forbid: Vec<String>,
-    /// If set, the only permitted backend (e.g. force `vmm` for a tenant).
+    /// A **soft** operator default preference: among the eligible backends, prefer this one
+    /// (a node-scope affinity such as "default images to the daemonless native container,
+    /// keep docker available"). Never widens eligibility — ignored when the named backend is
+    /// not eligible. Narrower scope wins: a per-project `prefer` overrides the node `prefer`
+    /// (resolved at [`compose_project`](Self::compose_project) time), and a tenant
+    /// `prefer`/`require` on the spec overrides both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<String>,
+    /// **Unwired** (see the struct doc): a latent "the only permitted backend" field, NOT
+    /// consulted by selection. Kept for wire-compat; use `allow: [one]` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub force: Option<String>,
     /// Require a **strong** isolation class (VM/platform) for every placement,
@@ -1094,17 +1113,16 @@ pub struct BackendPolicy {
     /// for a workload that only declares `Trusted`. Set by the
     /// operator security posture (`!allow_shared_kernel_compute`); default `false`
     /// preserves the prior behavior. Closes the "misclassified workload lands on
-    /// a weak backend" gap.
+    /// a weak backend" gap. A NODE/posture concern — a per-project policy can never
+    /// RELAX it (a [`ProjectBackendPolicy`] structurally carries no isolation field).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_strong_isolation: bool,
 }
 
 impl BackendPolicy {
-    /// Whether backend `id` is permitted by this policy.
+    /// Whether backend `id` is permitted by this policy's HARD operator gates (`forbid`
+    /// then `allow`). The unwired [`force`](Self::force) field is deliberately NOT consulted.
     pub fn permits(&self, id: &str) -> bool {
-        if let Some(force) = &self.force {
-            return id == force;
-        }
         if self.forbid.iter().any(|x| x == id) {
             return false;
         }
@@ -1127,6 +1145,402 @@ impl BackendPolicy {
             ..Default::default()
         }
     }
+
+    /// Overlay a node operator `[compute.policy]`'s allow/forbid/prefer onto this policy
+    /// (which carries the isolation posture), producing the node-scope operator policy. A
+    /// `None` allow/prefer leaves the field untouched; a non-empty `forbid` is unioned in.
+    /// Used at serve wiring to fold `[compute.policy]` into the posture-derived base.
+    #[must_use]
+    pub fn with_overlay(
+        mut self,
+        allow: Option<Vec<String>>,
+        forbid: &[String],
+        prefer: Option<String>,
+    ) -> Self {
+        if allow.is_some() {
+            self.allow = allow;
+        }
+        for f in forbid {
+            if !self.forbid.iter().any(|x| x == f) {
+                self.forbid.push(f.clone());
+            }
+        }
+        if prefer.is_some() {
+            self.prefer = prefer;
+        }
+        self
+    }
+
+    /// Compose this NODE-scope operator policy with a PER-PROJECT operator policy, producing
+    /// the effective operator bound for a workload — **operator-first, narrowing-only**:
+    ///
+    /// - `allow`: the INTERSECTION of the two allowlists (a backend must pass BOTH). `None`
+    ///   means "all"; so `node=None ∧ project=Some(P) ⇒ Some(P)`, `node=Some(N) ∧
+    ///   project=None ⇒ Some(N)`, both `Some ⇒ Some(N ∩ P)` (possibly empty ⇒ nothing
+    ///   eligible, fail-closed).
+    /// - `forbid`: the UNION (either scope forbidding a backend forbids it).
+    /// - `prefer`: the per-project `prefer` wins when set, else the node `prefer` (narrower
+    ///   scope overrides wider).
+    /// - `require_strong_isolation`: kept from the node/posture (a project policy carries
+    ///   none and can never relax it).
+    ///
+    /// The per-project layer can only ever NARROW — it cannot re-admit a node-forbidden
+    /// backend nor relax the isolation posture. This is the authority split enforced
+    /// structurally.
+    #[must_use]
+    pub fn compose_project(&self, project: &ProjectBackendPolicy) -> BackendPolicy {
+        let allow = match (&self.allow, &project.allow) {
+            (None, None) => None,
+            (Some(n), None) => Some(n.clone()),
+            (None, Some(p)) => Some(p.clone()),
+            (Some(n), Some(p)) => Some(n.iter().filter(|id| p.contains(id)).cloned().collect()),
+        };
+        let mut forbid = self.forbid.clone();
+        for f in &project.forbid {
+            if !forbid.iter().any(|x| x == f) {
+                forbid.push(f.clone());
+            }
+        }
+        BackendPolicy {
+            allow,
+            forbid,
+            prefer: project.prefer.clone().or_else(|| self.prefer.clone()),
+            force: self.force.clone(),
+            require_strong_isolation: self.require_strong_isolation,
+        }
+    }
+}
+
+/// A **per-project operator** backend policy (operator/System·Admin-set, stored alongside
+/// the project's authz policy). Structurally a narrowing-only triple — `allow` / `forbid` /
+/// `prefer` — with NO isolation field, so a per-project record can never relax the node's
+/// isolation posture: it only ever intersects allows / unions forbids / overrides the soft
+/// prefer, composed operator-first by [`BackendPolicy::compose_project`]. The single
+/// mechanism (no second selection path): it folds into the same [`BackendPolicy`] the
+/// scheduler already selects on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectBackendPolicy {
+    /// If set, only these backend ids are permitted in this project (intersected with the
+    /// node allowlist). Omit ⇒ no project-level allowlist (defer to the node bound).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+    /// Backend ids this project forbids (unioned with the node denylist). Omit ⇒ none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub forbid: Vec<String>,
+    /// A soft per-project default preference among eligible backends; overrides the node
+    /// `prefer`, overridden by a tenant spec `prefer`/`require`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<String>,
+}
+
+impl ProjectBackendPolicy {
+    /// Whether this project policy carries no constraints (the back-compat "no policy" shape),
+    /// so a stored-empty record composes to exactly the node bound.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_none() && self.forbid.is_empty() && self.prefer.is_none()
+    }
+}
+
+/// Why a backend is — or is NOT — a placement candidate for a spec under the operator policy
+/// + isolation posture + capability floor. The **single** verdict the scheduler selects on
+/// ([`Node::pick_backend`]) and the placement-explain surfaces (`compute get`, and the
+/// no-placement `not scheduled: …` reason) report, so selection and legibility can never
+/// drift. `Eligible` ⇒ a valid candidate; any other variant is the FIRST hard gate the
+/// backend failed, evaluated operator-first (policy → posture → capability floor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "kebab-case")]
+pub enum BackendEligibility {
+    /// Passes every hard gate — a valid placement candidate.
+    Eligible,
+    /// Excluded by the NODE-scope operator policy (`[compute.policy]` allow/forbid).
+    ForbiddenByNodePolicy,
+    /// Excluded by the PER-PROJECT operator backend policy (allow/forbid).
+    ForbiddenByProjectPolicy,
+    /// The spec needs stronger isolation than this backend provides — the workload's own
+    /// `isolation` requirement, or the operator strict posture (`require_strong_isolation`)
+    /// which excludes shared-kernel backends regardless of the spec.
+    IsolationInsufficient,
+    /// The backend's `materialize` cannot run this spec's root source kind (an image backend
+    /// can't run a tar/rootfs; firecracker only a rootfs; …).
+    CannotRunSource,
+    /// A PRIVATE image (an `Image` source naming a `pull_secret`) but this backend cannot
+    /// apply a per-project registry pull credential (native container / kubernetes refuse it).
+    NoCredential,
+    /// The spec declares persistent volumes this backend cannot attach.
+    NoPersistentVolume,
+    /// The spec opts into scale-to-zero this backend cannot provide.
+    NoScaleToZero,
+}
+
+impl BackendEligibility {
+    /// Whether this verdict is a valid placement candidate.
+    #[must_use]
+    pub fn is_eligible(self) -> bool {
+        matches!(self, BackendEligibility::Eligible)
+    }
+
+    /// A short, operator-facing phrase for the no-placement reason (`compute status` /
+    /// `not scheduled: …`). Carries no credential material.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            BackendEligibility::Eligible => "eligible",
+            BackendEligibility::ForbiddenByNodePolicy => "forbidden by node policy",
+            BackendEligibility::ForbiddenByProjectPolicy => "forbidden by project policy",
+            BackendEligibility::IsolationInsufficient => "isolation insufficient",
+            BackendEligibility::CannotRunSource => "cannot run this source kind",
+            BackendEligibility::NoCredential => "no credential for a private image",
+            BackendEligibility::NoPersistentVolume => "no persistent-volume support",
+            BackendEligibility::NoScaleToZero => "no scale-to-zero support",
+        }
+    }
+}
+
+/// Classify one backend against the COMPOSED operator policy (node ∩ per-project) + the
+/// spec + the isolation posture — the single hard-eligibility predicate. The forbid verdict
+/// it returns ([`BackendEligibility::ForbiddenByNodePolicy`]) is a placeholder the attributed
+/// [`explain_backend`] refines to node-vs-project; [`Node::pick_backend`] only reads
+/// [`BackendEligibility::is_eligible`], so the placeholder never affects selection. Gates are
+/// checked operator-first: policy → isolation posture → capability floor.
+fn classify_backend_composed(
+    b: &BackendKind,
+    spec: &ComputeSpec,
+    policy: &BackendPolicy,
+) -> BackendEligibility {
+    if !policy.permits(&b.id) {
+        // Attribution (node vs project) is resolved by `explain_backend`, which has both
+        // layers; the composed path only needs "forbidden", so pick a stable placeholder.
+        return BackendEligibility::ForbiddenByNodePolicy;
+    }
+    if !b.isolation.satisfies(spec.isolation)
+        || (policy.require_strong_isolation && !b.isolation.is_strong())
+    {
+        return BackendEligibility::IsolationInsufficient;
+    }
+    if !b.accepted_sources.contains(&spec.root.kind()) {
+        return BackendEligibility::CannotRunSource;
+    }
+    // A PRIVATE image needs a credential-capable backend (the gate bites only where a
+    // credential is actually applied — an `Image` source with a `pull_secret`).
+    if spec.pull_secret.is_some()
+        && matches!(spec.root, RootSource::Image(_))
+        && !b.private_registry_credential
+    {
+        return BackendEligibility::NoCredential;
+    }
+    if !spec.volumes.is_empty() && !b.persistent_volumes {
+        return BackendEligibility::NoPersistentVolume;
+    }
+    if spec.scale_to_zero && !b.scale_to_zero {
+        return BackendEligibility::NoScaleToZero;
+    }
+    BackendEligibility::Eligible
+}
+
+/// Classify one backend with node-vs-project forbid **attribution** — the explain surface's
+/// verdict. Composes the two operator layers (so the same hard gates as selection apply),
+/// then, for a forbid, names the scope that caused it (node bound first — operator-first).
+#[must_use]
+pub fn explain_backend(
+    b: &BackendKind,
+    spec: &ComputeSpec,
+    node: &BackendPolicy,
+    project: &ProjectBackendPolicy,
+) -> BackendEligibility {
+    let composed = node.compose_project(project);
+    match classify_backend_composed(b, spec, &composed) {
+        BackendEligibility::ForbiddenByNodePolicy => {
+            // The node bound is the OUTER one; attribute to it first.
+            if !node.permits(&b.id) {
+                BackendEligibility::ForbiddenByNodePolicy
+            } else {
+                BackendEligibility::ForbiddenByProjectPolicy
+            }
+        }
+        other => other,
+    }
+}
+
+/// One candidate backend's placement verdict for a workload — the per-backend row
+/// `compute get` surfaces so an operator sees WHY each backend was or wasn't chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCandidate {
+    /// Backend id.
+    pub backend: String,
+    /// The hard-eligibility verdict (with node-vs-project forbid attribution).
+    #[serde(flatten)]
+    pub eligibility: BackendEligibility,
+    /// Whether this backend is the one the scheduler WOULD choose among the eligible set
+    /// (capacity aside). Exactly one eligible candidate is `selected` when any is eligible.
+    pub selected: bool,
+}
+
+/// The workload-level placement explanation — the per-candidate verdicts plus the backend
+/// the scheduler would choose — surfaced on `compute get` and persisted each reconcile so a
+/// stuck (no-placement) workload is legible even with zero replicas. Capacity is NOT folded
+/// in here (it is node-level and surfaced in the `not scheduled: …` reason); this answers
+/// "which backends may run this workload, and which would be picked".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementExplain {
+    /// Every distinct advertised backend (by id, across the node inventory), each with its
+    /// verdict, sorted by id for a stable view.
+    pub candidates: Vec<BackendCandidate>,
+    /// The backend the scheduler would choose among the eligible candidates (capacity
+    /// aside), or `None` ⇒ no eligible backend (a legible no-placement; see each candidate's
+    /// reason). A tenant `require_backend` that is not eligible yields `None` here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen: Option<String>,
+}
+
+/// Build the workload-level [`PlacementExplain`] from the node inventory + both operator
+/// layers + the spec: classify each DISTINCT backend id (first advertisement wins) with
+/// attribution, then mark the one [`choose_backend`] would pick among the eligible set. The
+/// same classify + choose the scheduler uses, so the explanation never drifts from the
+/// decision.
+#[must_use]
+pub fn explain_placement(
+    nodes: &[Node],
+    spec: &ComputeSpec,
+    node_policy: &BackendPolicy,
+    project_policy: &ProjectBackendPolicy,
+) -> PlacementExplain {
+    // Distinct backend kinds across the inventory, keyed by id (first advertisement wins),
+    // in sorted-id order for a stable, deterministic view.
+    let mut kinds: BTreeMap<String, &BackendKind> = BTreeMap::new();
+    for n in nodes {
+        for b in &n.backends {
+            kinds.entry(b.id.clone()).or_insert(b);
+        }
+    }
+    let composed = node_policy.compose_project(project_policy);
+    let eligible: Vec<&BackendKind> = kinds
+        .values()
+        .filter(|b| classify_backend_composed(b, spec, &composed).is_eligible())
+        .copied()
+        .collect();
+    let chosen = choose_backend(&eligible, spec, &composed);
+    let candidates = kinds
+        .values()
+        .map(|b| BackendCandidate {
+            backend: b.id.clone(),
+            eligibility: explain_backend(b, spec, node_policy, project_policy),
+            selected: chosen.as_deref() == Some(b.id.as_str()),
+        })
+        .collect();
+    PlacementExplain { candidates, chosen }
+}
+
+/// Choose one backend from an ALREADY-eligible set, applying the soft-preference precedence
+/// (capacity aside) — the single ordering authority [`Node::pick_backend`] and
+/// [`explain_placement`] share:
+///
+/// tenant `require_backend` (must be present in the set, else `None` — fail-closed)
+/// → tenant `prefer_backend`
+/// → operator `prefer` (per-project overrides node, already folded into `policy.prefer`)
+/// → the `primary_source` source-affinity tie-break
+/// → sorted-id order (deterministic last resort).
+fn choose_backend(
+    eligible: &[&BackendKind],
+    spec: &ComputeSpec,
+    policy: &BackendPolicy,
+) -> Option<String> {
+    if eligible.is_empty() {
+        return None;
+    }
+    // Tenant HARD require: run on exactly this backend or NOWHERE. Because `eligible` already
+    // applied the operator allow/forbid + isolation posture + capability floor, a `require` of
+    // an operator-forbidden / isolation-insufficient / incapable backend is simply absent here
+    // ⇒ `None` (a legible no-placement), NEVER an escape out of the operator bound.
+    if let Some(req) = &spec.require_backend {
+        return eligible.iter().find(|b| &b.id == req).map(|b| b.id.clone());
+    }
+    // Tenant SOFT prefer.
+    if let Some(pref) = &spec.prefer_backend
+        && let Some(b) = eligible.iter().find(|b| &b.id == pref)
+    {
+        return Some(b.id.clone());
+    }
+    // Operator SOFT prefer (per-project `prefer` overrides node `prefer`, folded in `compose_project`).
+    if let Some(pref) = &policy.prefer
+        && let Some(b) = eligible.iter().find(|b| &b.id == pref)
+    {
+        return Some(b.id.clone());
+    }
+    // Source-affinity tie-break: prefer a backend whose PRIMARY source matches the spec's.
+    let kind = spec.root.kind();
+    if let Some(b) = eligible.iter().find(|b| b.primary_source == Some(kind)) {
+        return Some(b.id.clone());
+    }
+    // Deterministic last resort: lowest backend id.
+    eligible.iter().map(|b| &b.id).min().cloned()
+}
+
+/// The legible reason a workload could not be placed — the v0.67.0 placement-explain's
+/// no-placement surface (extends the v0.64.2 bare `not scheduled: no eligible backend with
+/// capacity`). Distinguishes **why** across the candidate backends under the COMPOSED
+/// operator `policy`:
+///
+/// - no backends advertised at all;
+/// - a tenant `require_backend` that is not eligible (names the gate that excluded it, or
+///   "not advertised") — the authority-split no-placement, NOT an escape;
+/// - at least one eligible backend but no NODE had capacity (the classic shortfall);
+/// - NO eligible backend — each candidate's hard gate named (policy / source / credential /
+///   isolation / volume / scale-to-zero), so the incident's black-box stuck-at-0 is legible.
+///
+/// Node-vs-project forbid attribution is NOT made here (this path holds only the composed
+/// policy); a forbid reads as "forbidden by operator policy". The per-scope attribution lives
+/// in the persisted [`PlacementExplain`] that `compute get` surfaces.
+fn no_placement_reason(nodes: &[Node], spec: &ComputeSpec, policy: &BackendPolicy) -> String {
+    let need = format!("needs {}vcpu/{}MiB", spec.vcpus.max(1), spec.mem_mib.max(1));
+    // Distinct advertised backends across the inventory, by id (sorted for a stable message).
+    let mut kinds: BTreeMap<String, &BackendKind> = BTreeMap::new();
+    for n in nodes {
+        for b in &n.backends {
+            kinds.entry(b.id.clone()).or_insert(b);
+        }
+    }
+    if kinds.is_empty() {
+        return format!("no compute backend advertised on any node ({need})");
+    }
+    // A forbid verdict can't be scope-attributed from the composed policy here — phrase it
+    // neutrally (the per-scope reason is in the persisted PlacementExplain).
+    let phrase = |v: BackendEligibility| -> &'static str {
+        match v {
+            BackendEligibility::ForbiddenByNodePolicy
+            | BackendEligibility::ForbiddenByProjectPolicy => "forbidden by operator policy",
+            other => other.describe(),
+        }
+    };
+    let verdicts: Vec<(String, BackendEligibility)> = kinds
+        .values()
+        .map(|b| (b.id.clone(), classify_backend_composed(b, spec, policy)))
+        .collect();
+    // A HARD tenant require that did not land: name why the required backend is out.
+    if let Some(req) = &spec.require_backend
+        && !verdicts.iter().any(|(id, v)| id == req && v.is_eligible())
+    {
+        let why = verdicts
+            .iter()
+            .find(|(id, _)| id == req)
+            .map_or("not advertised on any node", |(_, v)| phrase(*v));
+        return format!("required backend `{req}` is not eligible: {why}");
+    }
+    if verdicts.iter().any(|(_, v)| v.is_eligible()) {
+        // Eligible backends exist but no node had room (or the required one had none).
+        return match &spec.require_backend {
+            Some(req) => format!("required backend `{req}` has no node with capacity ({need})"),
+            None => format!("no eligible backend with capacity ({need})"),
+        };
+    }
+    // No eligible backend at all — name each candidate's gate.
+    let detail = verdicts
+        .iter()
+        .map(|(id, v)| format!("{id}: {}", phrase(*v)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("no eligible backend ({detail})")
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,68 +1603,26 @@ pub struct Node {
 }
 
 impl Node {
-    /// The backend to use for `spec` on this node, honoring the spec's preferred
-    /// backend, the isolation requirement, and the policy. `None` ⇒ no eligible
-    /// backend here.
+    /// The backend to use for `spec` on this node under the (already-composed node ∩
+    /// per-project) operator `policy` — the full v0.67.0 precedence chain:
+    ///
+    /// capability floor ∧ operator `allow`/`forbid` ∧ isolation posture = the HARD eligible
+    /// set ([`classify_backend_composed`]) → tenant `require_backend` (must be in the set,
+    /// else `None`) → tenant `prefer_backend` → operator `prefer` → the `primary_source`
+    /// tie-break → sorted-id order ([`choose_backend`]).
+    ///
+    /// `None` ⇒ no eligible backend here (a legible no-placement). The operator gates live
+    /// INSIDE the eligible set, so a tenant `require`/`prefer` can only ever pick WITHIN the
+    /// operator bound + isolation posture — never climb out of it (the authority split).
+    /// [`choose_backend`] is the same ordering [`explain_placement`] reports, so selection
+    /// and the placement-explain can never drift.
     fn pick_backend(&self, spec: &ComputeSpec, policy: &BackendPolicy) -> Option<String> {
-        let eligible = |b: &BackendKind| {
-            policy.permits(&b.id)
-                && b.isolation.satisfies(spec.isolation)
-                // Strict posture: only strong isolation, regardless of the spec's
-                // (possibly misclassified) requirement.
-                && (!policy.require_strong_isolation || b.isolation.is_strong())
-                // A volume spec needs a volume-capable backend — else it would run
-                // storage-less (silent data loss). No capable backend ⇒ no placement.
-                && (spec.volumes.is_empty() || b.persistent_volumes)
-                // A scale-to-zero spec needs a scale-to-zero-capable backend — else it
-                // silently runs always-on. Fail loud (no placement) instead.
-                && (!spec.scale_to_zero || b.scale_to_zero)
-                // The backend must ACCEPT this spec's root source kind. A docker /
-                // kubernetes / cloudflare *image* backend cannot run a tar/rootfs source,
-                // the native `container` backend runs a tar OR a public image (but not a
-                // rootfs), and firecracker/VMM only a rootfs — see each backend's
-                // `materialize`. Placing a workload on a backend whose `materialize` would
-                // reject its source is a guaranteed crash, so fail closed (no placement).
-                && b.accepted_sources.contains(&spec.root.kind())
-                // A PRIVATE image — an `Image` source naming a `pull_secret` — needs a
-                // credential-capable backend. The native `container` + `kubernetes`
-                // backends REFUSE a per-project pull credential at `materialize` (they
-                // would crash-loop); only `docker` + `cloudflare` apply it. `pull_secret`
-                // is resolved (into `pull_auth`) only for an `Image` source and ignored
-                // for tar/rootfs (see the reconcile's pull_auth resolution), so the
-                // credential gate bites exactly where a credential is actually applied —
-                // never spuriously rejecting a tar/rootfs spec that merely carries one.
-                && (spec.pull_secret.is_none()
-                    || !matches!(spec.root, RootSource::Image(_))
-                    || b.private_registry_credential)
-        };
-        if let Some(pref) = &spec.prefer_backend
-            && let Some(b) = self.backends.iter().find(|b| &b.id == pref && eligible(b))
-        {
-            return Some(b.id.clone());
-        }
-        // Default source-affinity TIE-BREAK (ordering only, never an eligibility
-        // exclusion): among the eligible backends, prefer the one whose PRIMARY source
-        // matches the spec's source kind. So a public `Image` prefers an image-native
-        // backend (docker/cloudflare/kubernetes) over the native `container` backend —
-        // which can also run a public image — when both are eligible, preserving the
-        // documented `image()`→docker behavior on a dual node. The container backend
-        // stays ELIGIBLE for an image, so a container-only node (fly.io: daemonless +
-        // kvmless, where the native container backend is the sole backend and managed DBs
-        // are public images) still places it via the sorted-order fallback below. Being a
-        // pure tie-break, it composes with a future operator placement policy.
-        let kind = spec.root.kind();
-        if let Some(b) = self
+        let eligible: Vec<&BackendKind> = self
             .backends
             .iter()
-            .find(|b| eligible(b) && b.primary_source == Some(kind))
-        {
-            return Some(b.id.clone());
-        }
-        self.backends
-            .iter()
-            .find(|b| eligible(b))
-            .map(|b| b.id.clone())
+            .filter(|b| classify_backend_composed(b, spec, policy).is_eligible())
+            .collect();
+        choose_backend(&eligible, spec, policy)
     }
 }
 
@@ -1733,6 +2105,16 @@ pub fn replica_states_project_prefix(project: &str) -> String {
     format!("project/{project}/compute_state/")
 }
 
+/// The per-workload **placement-explanation** key, project-scoped:
+/// `project/<proj>/compute_placement/<workload>` → the latest [`PlacementExplain`] the
+/// reconcile computed for it (v0.67.0). Written each pass so a STUCK (no-placement)
+/// workload — which has zero replica-state rows — is still legible on `compute get`: it is
+/// the one surface that survives the "stuck at 0" case the incident exposed. Pure status
+/// (regenerated every reconcile), so a lost write self-heals on the next tick.
+pub fn placement_explain_key(project: &str, workload: &str) -> String {
+    format!("project/{project}/compute_placement/{workload}")
+}
+
 /// A reconcile action the driver executes against a backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -2050,21 +2432,24 @@ pub fn reconcile_plan_in(
             backend: place.backend,
         });
     }
-    // The ordinals past the placed count had no eligible backend with capacity. Name the
-    // resource need so the operator sees what to add (the same `need_cpu`/`need_mem` floor
-    // `place_replicas` uses).
-    let unscheduled: Vec<Unscheduled> = need[placed..]
-        .iter()
-        .map(|ord| Unscheduled {
-            workload: workload.name.clone(),
-            replica: *ord,
-            reason: format!(
-                "no eligible backend with capacity (needs {}vcpu/{}MiB)",
-                spec.vcpus.max(1),
-                spec.mem_mib.max(1)
-            ),
-        })
-        .collect();
+    // The ordinals past the placed count could not be placed. Name the LEGIBLE reason
+    // (v0.67.0 placement-explain) — policy / source / credential / isolation / capacity —
+    // instead of the old bare capacity line, so a stuck workload is never a black box. The
+    // reason is computed once per plan (it is the same for every unplaced ordinal of this
+    // spec) against the composed operator `policy`.
+    let unscheduled: Vec<Unscheduled> = if placed < need.len() {
+        let reason = no_placement_reason(nodes, spec, policy);
+        need[placed..]
+            .iter()
+            .map(|ord| Unscheduled {
+                workload: workload.name.clone(),
+                replica: *ord,
+                reason: reason.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     ReconcilePlan {
         actions,
         unscheduled,
@@ -2824,6 +3209,7 @@ pub fn managed_db_spec(
         user: None,
         isolation: IsolationRequirement::Trusted,
         prefer_backend: None,
+        require_backend: None,
         pull_secret: None,
         bindings: vec![],
         post_launch: vec![],
@@ -3111,12 +3497,38 @@ pub async fn reconcile_once(
             }
         }
 
+        // v0.67.0 backend-selection policy: compose the NODE operator policy (`policy`,
+        // carrying the isolation posture + `[compute.policy]`) with this project's
+        // PER-PROJECT operator policy — operator-first, narrowing-only (intersect allows /
+        // union forbids / per-project `prefer` wins). The composed policy is what the
+        // scheduler selects on, so a tenant `require`/`prefer` can only ever pick WITHIN the
+        // operator bound. A missing/empty per-project record composes to exactly `policy`
+        // (back-compat). A store read error is non-fatal: fall back to the node bound alone
+        // (never fail-OPEN past it — composition only narrows).
+        let project_policy = deploy
+            .get_project_backend_policy(project)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let effective_policy = policy.compose_project(&project_policy);
+        // Persist the per-workload placement-explain (legibility that survives the stuck-at-0
+        // case: a no-placement workload has zero replica rows but still gets this). Best-effort
+        // status — a failed write self-heals next tick, so it never aborts the pass.
+        let explain = explain_placement(nodes, &spec, policy, &project_policy);
+        if let Err(e) = deploy
+            .set_placement_explain(project, &workload.name, &explain)
+            .await
+        {
+            tracing::debug!(workload = %workload.name, error = %e, "compute: persist placement-explain");
+        }
+
         let workload_activity = activity.activity(&workload.name).await;
         let plan = reconcile_plan_in(
             &workload,
             &spec,
             nodes,
-            policy,
+            &effective_policy,
             &observed,
             workload_activity,
             &caps,
@@ -4263,6 +4675,7 @@ mod tests {
             user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
+            require_backend: None,
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
@@ -4358,7 +4771,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_permits_force_forbid_allow() {
+    fn policy_permits_forbid_allow() {
         assert!(BackendPolicy::default().permits("vmm"));
         let forbid = BackendPolicy {
             forbid: vec!["container".into()],
@@ -4372,13 +4785,20 @@ mod tests {
         };
         assert!(allow.permits("vmm"));
         assert!(!allow.permits("docker"));
+        // `force` is UNWIRED (v0.67.0): it must NOT override `forbid`/`allow`. A policy that
+        // forbids `vmm` still forbids it even with `force: vmm` set — the field is inert.
         let force = BackendPolicy {
             force: Some("vmm".into()),
             forbid: vec!["vmm".into()],
             ..Default::default()
         };
-        assert!(force.permits("vmm"), "force overrides forbid");
-        assert!(!force.permits("container"));
+        assert!(
+            !force.permits("vmm"),
+            "force is unwired and does NOT override forbid"
+        );
+        // And `force` does not act as an implicit allowlist either: with no `allow`, every
+        // non-forbidden backend stays permitted regardless of `force`.
+        assert!(force.permits("container"));
     }
 
     #[test]
@@ -4621,7 +5041,10 @@ mod tests {
     }
 
     #[test]
-    fn policy_force_overrides_preference() {
+    fn policy_force_is_unwired_and_does_not_override_preference() {
+        // v0.67.0: `force` is UNWIRED. A policy `force: vmm` must NOT override anything — the
+        // spec's tenant `prefer_backend` is honored exactly as if `force` were unset. (The
+        // historical "force vmm" intent is now `allow: ["vmm"]`.)
         let n = node(
             1,
             "eu",
@@ -4638,10 +5061,26 @@ mod tests {
             force: Some("vmm".into()),
             ..Default::default()
         };
-        let placed = place_replicas(1, &PlacementConstraints::default(), &s, &[n], &policy);
+        let placed = place_replicas(
+            1,
+            &PlacementConstraints::default(),
+            &s,
+            &[n.clone()],
+            &policy,
+        );
+        assert_eq!(
+            placed[0].backend, "container",
+            "force is inert, so the spec preference still wins"
+        );
+        // And the historical intent — "only vmm" — is expressed with `allow`, which DOES bind.
+        let allow_vmm = BackendPolicy {
+            allow: Some(vec!["vmm".into()]),
+            ..Default::default()
+        };
+        let placed = place_replicas(1, &PlacementConstraints::default(), &s, &[n], &allow_vmm);
         assert_eq!(
             placed[0].backend, "vmm",
-            "policy force beats the spec preference"
+            "allow:[vmm] (the force replacement) confines selection to vmm"
         );
     }
 
@@ -5055,9 +5494,13 @@ mod tests {
         );
         let u = &plan.unscheduled[0];
         assert_eq!(u.replica, 0);
+        // With an EMPTY node inventory the v0.67.0 placement-explain names the precise
+        // shortfall — no backend advertised at all — rather than the old generic
+        // "no eligible backend with capacity".
         assert!(
-            u.reason.contains("no eligible backend with capacity"),
-            "names the shortfall: {}",
+            u.reason
+                .contains("no compute backend advertised on any node"),
+            "names the precise shortfall: {}",
             u.reason
         );
         assert!(
@@ -6535,6 +6978,73 @@ mod tests {
         hash
     }
 
+    /// RUNTIME-PATH authority split (v0.67.0): a PER-PROJECT operator policy that forbids the
+    /// only backend must leave the workload UNSCHEDULED through the real `reconcile_once` loop
+    /// — not merely in the pure planner — AND the persisted placement-explain must attribute
+    /// the exclusion to the project scope with `chosen: None`. Proves the per-project policy is
+    /// actually loaded, composed, and enforced on execute, and that a tenant could not escape
+    /// it (there is no second code path).
+    #[tokio::test]
+    async fn per_project_forbid_blocks_placement_at_runtime_and_is_legible() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        put_workload(&deploy, "w", 256, 1).await;
+        // The per-project operator policy forbids the only backend the node offers ("fake").
+        deploy
+            .set_project_backend_policy(
+                crate::project::ProjectRef::DEFAULT,
+                &ProjectBackendPolicy {
+                    allow: None,
+                    forbid: vec!["fake".into()],
+                    prefer: None,
+                },
+            )
+            .await
+            .unwrap();
+        let nodes = vec![fake_node()];
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(FakeBackend));
+        // The NODE policy permits everything; the exclusion comes purely from the project.
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &BackendPolicy::default(),
+            &AlwaysActive,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r.launched, 0,
+            "a project-forbidden backend places nothing: {:?}",
+            r.errors
+        );
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("not scheduled") && e.contains("forbidden by operator policy")),
+            "the no-placement reason is surfaced + legible: {:?}",
+            r.errors
+        );
+        // The persisted placement-explain attributes the exclusion to the PROJECT scope.
+        let ex = deploy
+            .get_placement_explain(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap()
+            .expect("placement-explain persisted");
+        assert_eq!(ex.chosen, None);
+        assert_eq!(
+            ex.candidates
+                .iter()
+                .find(|c| c.backend == "fake")
+                .unwrap()
+                .eligibility,
+            BackendEligibility::ForbiddenByProjectPolicy,
+        );
+    }
+
     /// Cumulative bin-packing: two workloads that EACH fit the node alone but NOT together
     /// must not over-subscribe it. The node advertises 8192 MiB; each workload's single
     /// replica wants 5000 MiB (fits alone; 10000 together does not). The old scheduler sized
@@ -7484,5 +7994,415 @@ mod tests {
             Readiness::Provisioned
         );
         assert_eq!(m.provisions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // =====================================================================
+    // v0.67.0 backend-selection POLICY (PLAN-backend-policy-dx)
+    // =====================================================================
+
+    /// A fully-capable node advertising vmm (strong), container (weak), docker (weak) —
+    /// all accept every source kind (the `node()` fixture), so eligibility differences in
+    /// these tests come from POLICY, not capability.
+    fn tri_node() -> Node {
+        node(
+            1,
+            "eu",
+            8,
+            8192,
+            &[
+                ("vmm", IsolationClass::VmKvm),
+                ("container", IsolationClass::Namespace),
+                ("docker", IsolationClass::Container),
+            ],
+        )
+    }
+
+    fn proj(allow: Option<&[&str]>, forbid: &[&str], prefer: Option<&str>) -> ProjectBackendPolicy {
+        ProjectBackendPolicy {
+            allow: allow.map(|a| a.iter().map(|s| (*s).to_string()).collect()),
+            forbid: forbid.iter().map(|s| (*s).to_string()).collect(),
+            prefer: prefer.map(str::to_string),
+        }
+    }
+
+    /// BACK-COMPAT: no policy = today's behavior (every capable backend eligible). The
+    /// deterministic last resort is sorted-id order, so the lowest id wins absent any
+    /// preference.
+    #[test]
+    fn no_policy_is_backcompat_all_capable() {
+        let n = tri_node();
+        let s = spec(1, 128);
+        assert_eq!(
+            n.pick_backend(&s, &BackendPolicy::default()).as_deref(),
+            Some("container"),
+            "no policy ⇒ all capable; sorted-id last resort picks the lowest id"
+        );
+    }
+
+    /// Node-scope operator `prefer` steers selection among eligible backends; a `prefer`
+    /// naming an INELIGIBLE backend is ignored (never widens the set).
+    #[test]
+    fn node_prefer_is_honored_among_eligible_only() {
+        let n = tri_node();
+        let s = spec(1, 128);
+        let prefer_vmm = BackendPolicy {
+            prefer: Some("vmm".into()),
+            ..Default::default()
+        };
+        assert_eq!(n.pick_backend(&s, &prefer_vmm).as_deref(), Some("vmm"));
+        // Prefer a FORBIDDEN backend: the forbid (hard) wins, prefer is ignored, fall back.
+        let prefer_forbidden = BackendPolicy {
+            prefer: Some("vmm".into()),
+            forbid: vec!["vmm".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            n.pick_backend(&s, &prefer_forbidden).as_deref(),
+            Some("container"),
+            "a prefer of a forbidden backend is ignored; it never re-admits it"
+        );
+    }
+
+    /// `compose_project`: INTERSECTION of allows, UNION of forbids, per-project `prefer`
+    /// overrides node `prefer`, and the node posture (`require_strong_isolation`) is kept.
+    #[test]
+    fn compose_project_intersects_allow_unions_forbid_overrides_prefer() {
+        let node_policy = BackendPolicy {
+            allow: Some(vec!["vmm".into(), "container".into()]),
+            forbid: vec!["docker".into()],
+            prefer: Some("vmm".into()),
+            require_strong_isolation: true,
+            ..Default::default()
+        };
+        let project = proj(Some(&["container", "docker"]), &["vmm"], Some("container"));
+        let c = node_policy.compose_project(&project);
+        // allow = {vmm,container} ∩ {container,docker} = {container}
+        assert_eq!(c.allow, Some(vec!["container".to_string()]));
+        // forbid = {docker} ∪ {vmm} = {docker,vmm}
+        assert!(c.forbid.contains(&"docker".to_string()) && c.forbid.contains(&"vmm".to_string()));
+        // prefer: project wins
+        assert_eq!(c.prefer.as_deref(), Some("container"));
+        // posture kept (a project policy can never relax it — it carries no such field)
+        assert!(c.require_strong_isolation);
+        // A missing allowlist on either side defers to the other.
+        let only_node = BackendPolicy {
+            allow: Some(vec!["vmm".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            only_node
+                .compose_project(&ProjectBackendPolicy::default())
+                .allow,
+            Some(vec!["vmm".to_string()])
+        );
+        assert_eq!(
+            BackendPolicy::default()
+                .compose_project(&proj(Some(&["docker"]), &[], None))
+                .allow,
+            Some(vec!["docker".to_string()])
+        );
+    }
+
+    /// Precedence: tenant spec `prefer_backend` beats the operator `prefer`, which beats the
+    /// node `prefer` (project overrides node, resolved in `compose_project`).
+    #[test]
+    fn prefer_precedence_tenant_over_project_over_node() {
+        let n = tri_node();
+        let node_policy = BackendPolicy {
+            prefer: Some("vmm".into()),
+            ..Default::default()
+        };
+        // project prefer overrides node prefer.
+        let composed = node_policy.compose_project(&proj(None, &[], Some("container")));
+        let s = spec(1, 128);
+        assert_eq!(
+            n.pick_backend(&s, &composed).as_deref(),
+            Some("container"),
+            "per-project prefer overrides the node prefer"
+        );
+        // tenant spec prefer overrides BOTH.
+        let mut s_tenant = spec(1, 128);
+        s_tenant.prefer_backend = Some("docker".into());
+        assert_eq!(
+            n.pick_backend(&s_tenant, &composed).as_deref(),
+            Some("docker"),
+            "tenant prefer overrides the operator prefer"
+        );
+    }
+
+    /// Tenant HARD `require`: picks exactly that backend when eligible, else NO placement
+    /// (never falls back elsewhere — distinct from `prefer`).
+    #[test]
+    fn tenant_require_picks_exactly_or_no_placement() {
+        let n = tri_node();
+        let mut s = spec(1, 128);
+        s.require_backend = Some("vmm".into());
+        assert_eq!(
+            n.pick_backend(&s, &BackendPolicy::default()).as_deref(),
+            Some("vmm"),
+            "require picks exactly the named eligible backend"
+        );
+        // Require a backend that is not advertised ⇒ no placement, NOT a fallback.
+        let mut s_absent = spec(1, 128);
+        s_absent.require_backend = Some("nonesuch".into());
+        assert_eq!(
+            n.pick_backend(&s_absent, &BackendPolicy::default()),
+            None,
+            "require of an absent backend fails closed (no placement)"
+        );
+    }
+
+    /// AUTHORITY SPLIT: a tenant `require` of an operator-FORBIDDEN backend must yield a
+    /// legible no-placement — NEVER an escape onto the forbidden backend.
+    #[test]
+    fn tenant_require_cannot_escape_operator_forbid() {
+        let n = tri_node();
+        let mut s = spec(1, 128);
+        s.require_backend = Some("vmm".into());
+        let policy = BackendPolicy {
+            forbid: vec!["vmm".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            n.pick_backend(&s, &policy),
+            None,
+            "require of an operator-forbidden backend is NO placement, never an escape"
+        );
+        // And via per-project forbid composed with the node bound (operator-first).
+        let composed = BackendPolicy::default().compose_project(&proj(None, &["vmm"], None));
+        assert_eq!(
+            n.pick_backend(&s, &composed),
+            None,
+            "a per-project forbid is enforced against a tenant require just the same"
+        );
+    }
+
+    /// AUTHORITY SPLIT: a tenant `prefer` of an operator-forbidden backend is ignored and
+    /// falls back WITHIN the operator-permitted set — never onto the forbidden backend.
+    #[test]
+    fn tenant_prefer_cannot_escape_operator_forbid() {
+        let n = tri_node();
+        let mut s = spec(1, 128);
+        s.prefer_backend = Some("vmm".into());
+        let policy = BackendPolicy {
+            forbid: vec!["vmm".into()],
+            ..Default::default()
+        };
+        let picked = n.pick_backend(&s, &policy);
+        assert!(
+            picked.as_deref() != Some("vmm") && picked.is_some(),
+            "tenant prefer of a forbidden backend falls back within the allowed set: {picked:?}"
+        );
+    }
+
+    /// AUTHORITY SPLIT: a tenant `require` of an ISOLATION-INSUFFICIENT backend under the
+    /// strict posture is no-placement, not a climb out of the posture.
+    #[test]
+    fn tenant_require_cannot_escape_isolation_posture() {
+        let n = tri_node();
+        let strict = BackendPolicy::from_shared_kernel_allowed(false); // require strong isolation
+        // Require the shared-kernel `container` (Namespace, weak) under the strict posture.
+        let mut weak = spec(1, 128);
+        weak.require_backend = Some("container".into());
+        assert_eq!(
+            n.pick_backend(&weak, &strict),
+            None,
+            "require of a shared-kernel backend under the strict posture is refused, not an escape"
+        );
+        // Require the strong `vmm` under the same posture: permitted.
+        let mut strong = spec(1, 128);
+        strong.require_backend = Some("vmm".into());
+        assert_eq!(
+            n.pick_backend(&strong, &strict).as_deref(),
+            Some("vmm"),
+            "require of a strong-isolation backend is honored within the posture"
+        );
+    }
+
+    /// node ∩ per-project composition at the PLACEMENT layer: a backend must pass BOTH the
+    /// node allow and the project allow (intersection), and either scope's forbid excludes it
+    /// (union).
+    #[test]
+    fn node_intersect_project_composition_at_placement() {
+        let n = tri_node();
+        let s = spec(1, 128);
+        // Node allows {vmm,container}; project allows {container,docker} ⇒ only container.
+        let node_policy = BackendPolicy {
+            allow: Some(vec!["vmm".into(), "container".into()]),
+            ..Default::default()
+        };
+        let composed =
+            node_policy.compose_project(&proj(Some(&["container", "docker"]), &[], None));
+        assert_eq!(
+            n.pick_backend(&s, &composed).as_deref(),
+            Some("container"),
+            "intersection of allows leaves only container eligible"
+        );
+        // Union forbid: node forbids vmm, project forbids container ⇒ only docker left.
+        let node_forbid = BackendPolicy {
+            forbid: vec!["vmm".into()],
+            ..Default::default()
+        };
+        let composed2 = node_forbid.compose_project(&proj(None, &["container"], None));
+        assert_eq!(
+            n.pick_backend(&s, &composed2).as_deref(),
+            Some("docker"),
+            "union of forbids leaves only docker eligible"
+        );
+    }
+
+    /// `explain_placement` attributes forbids to the right SCOPE (node vs project), reports
+    /// the per-candidate hard gate, and marks exactly the chosen backend selected.
+    #[test]
+    fn explain_placement_attributes_scope_and_marks_chosen() {
+        let nodes = vec![tri_node()];
+        let s = spec(1, 128);
+        let node_policy = BackendPolicy {
+            forbid: vec!["vmm".into()],
+            ..Default::default()
+        };
+        let project = proj(None, &["container"], None);
+        let ex = explain_placement(&nodes, &s, &node_policy, &project);
+        let verdict = |id: &str| {
+            ex.candidates
+                .iter()
+                .find(|c| c.backend == id)
+                .map(|c| c.eligibility)
+                .unwrap()
+        };
+        assert_eq!(verdict("vmm"), BackendEligibility::ForbiddenByNodePolicy);
+        assert_eq!(
+            verdict("container"),
+            BackendEligibility::ForbiddenByProjectPolicy
+        );
+        assert_eq!(verdict("docker"), BackendEligibility::Eligible);
+        assert_eq!(ex.chosen.as_deref(), Some("docker"));
+        assert!(
+            ex.candidates
+                .iter()
+                .find(|c| c.backend == "docker")
+                .unwrap()
+                .selected,
+            "the chosen backend is marked selected"
+        );
+        assert!(
+            ex.candidates.iter().filter(|c| c.selected).count() == 1,
+            "exactly one candidate is selected when any is eligible"
+        );
+    }
+
+    /// `explain_placement` surfaces the capability-floor reasons (source / credential /
+    /// isolation), not just policy.
+    #[test]
+    fn explain_placement_surfaces_capability_reasons() {
+        // container (no credential, Image+Tar) + docker (credential, Image).
+        let nodes = vec![node_with_backends(vec![
+            container_backendkind(),
+            docker_backendkind(),
+        ])];
+        // A PRIVATE image: container lacks credential, docker has it.
+        let mut private_image = spec(1, 128);
+        private_image.root = RootSource::Image("r/acme/private:1".into());
+        private_image.pull_secret = Some("acme".into());
+        private_image.isolation = IsolationRequirement::Trusted;
+        let ex = explain_placement(
+            &nodes,
+            &private_image,
+            &BackendPolicy::default(),
+            &ProjectBackendPolicy::default(),
+        );
+        let verdict = |id: &str| {
+            ex.candidates
+                .iter()
+                .find(|c| c.backend == id)
+                .map(|c| c.eligibility)
+                .unwrap()
+        };
+        assert_eq!(verdict("container"), BackendEligibility::NoCredential);
+        assert_eq!(verdict("docker"), BackendEligibility::Eligible);
+        assert_eq!(ex.chosen.as_deref(), Some("docker"));
+
+        // Isolation: a rootfs spec under the strict posture on a weak-only node.
+        let weak_nodes = vec![node(
+            1,
+            "eu",
+            8,
+            8192,
+            &[("container", IsolationClass::Namespace)],
+        )];
+        let strict = BackendPolicy::from_shared_kernel_allowed(false);
+        let ex2 = explain_placement(
+            &weak_nodes,
+            &spec(1, 128),
+            &strict,
+            &ProjectBackendPolicy::default(),
+        );
+        assert_eq!(
+            ex2.candidates[0].eligibility,
+            BackendEligibility::IsolationInsufficient
+        );
+        assert_eq!(ex2.chosen, None, "no eligible backend ⇒ no chosen");
+    }
+
+    /// The no-placement REASON names WHY (policy / isolation / required-backend), extending
+    /// the v0.64.2 observability — the legibility the incident needed.
+    #[test]
+    fn no_placement_reason_is_legible() {
+        let w = workload(1, PlacementConstraints::default());
+        let s = spec(1, 128);
+        let plan_reason = |policy: &BackendPolicy, nodes: &[Node], spec: &ComputeSpec| {
+            let plan = reconcile_plan(
+                &w,
+                spec,
+                nodes,
+                policy,
+                &[],
+                WorkloadActivity::Active,
+                &BTreeMap::new(),
+                0,
+                &BTreeSet::new(),
+            );
+            plan.unscheduled.first().map(|u| u.reason.clone())
+        };
+        // All backends forbidden ⇒ "forbidden by operator policy".
+        let forbid_all = BackendPolicy {
+            forbid: vec!["vmm".into(), "container".into(), "docker".into()],
+            ..Default::default()
+        };
+        let r = plan_reason(&forbid_all, &[tri_node()], &s).unwrap();
+        assert!(
+            r.contains("forbidden by operator policy"),
+            "policy reason surfaced: {r}"
+        );
+        // Strict posture + a weak-only node ⇒ "isolation insufficient".
+        let strict = BackendPolicy::from_shared_kernel_allowed(false);
+        let weak = node(
+            1,
+            "eu",
+            8,
+            8192,
+            &[("container", IsolationClass::Namespace)],
+        );
+        let r = plan_reason(&strict, &[weak], &s).unwrap();
+        assert!(
+            r.contains("isolation insufficient"),
+            "isolation reason: {r}"
+        );
+        // A tenant require of an uneligible (forbidden) backend ⇒ names the required backend.
+        let mut req = spec(1, 128);
+        req.require_backend = Some("vmm".into());
+        let r = plan_reason(
+            &BackendPolicy {
+                forbid: vec!["vmm".into()],
+                ..Default::default()
+            },
+            &[tri_node()],
+            &req,
+        )
+        .unwrap();
+        assert!(
+            r.contains("required backend `vmm` is not eligible"),
+            "required-backend reason: {r}"
+        );
     }
 }

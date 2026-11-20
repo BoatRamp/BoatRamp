@@ -1317,6 +1317,98 @@ impl DeployStore {
         Ok(())
     }
 
+    /// The project's **per-project operator backend policy**
+    /// ([`ProjectBackendPolicy`](crate::compute::ProjectBackendPolicy)) — the operator/
+    /// System·Admin-set allow/forbid/prefer triple composed (operator-first) with the node
+    /// `[compute.policy]` at placement (v0.67.0). `None` ⇒ the project declared none (the
+    /// back-compat shape; placement uses the node bound alone). Stored as a small JSON
+    /// singleton at `project/<proj>/config/backend_policy`, exactly like
+    /// [`get_project_tenancy`](Self::get_project_tenancy). A record that fails to
+    /// deserialize degrades to `None` (never fatal to a placement pass).
+    pub async fn get_project_backend_policy(
+        &self,
+        project: ProjectRef<'_>,
+    ) -> Result<Option<crate::compute::ProjectBackendPolicy>, DeployError> {
+        match self
+            .kv
+            .get(&keys::project_config(project, "backend_policy"))
+            .await?
+        {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Store the project's per-project operator backend policy (replaces any prior one).
+    /// Security-load-bearing (it NARROWS placement — intersect allow / union forbid — within
+    /// the node bound), so frontier-sync it before ack, like the tenancy schema: a lost write
+    /// must never silently revert to a more-permissive (absent) policy.
+    pub async fn set_project_backend_policy(
+        &self,
+        project: ProjectRef<'_>,
+        policy: &crate::compute::ProjectBackendPolicy,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(policy).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put_durable_checkpointed(&keys::project_config(project, "backend_policy"), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// Clear the project's per-project operator backend policy, reverting to the node bound
+    /// alone. Idempotent; durable-past-frontier (a posture change must not silently revert).
+    pub async fn clear_project_backend_policy(
+        &self,
+        project: ProjectRef<'_>,
+    ) -> Result<(), DeployError> {
+        self.kv
+            .delete_checkpointed(&keys::project_config(project, "backend_policy"))
+            .await?;
+        Ok(())
+    }
+
+    /// Store the latest per-workload [`PlacementExplain`](crate::compute::PlacementExplain)
+    /// the reconcile computed (v0.67.0 placement-explain), at
+    /// `project/<proj>/compute_placement/<workload>`. Pure status — regenerated every
+    /// reconcile pass — so it is a plain `put` (a lost write self-heals next tick), never
+    /// frontier-synced.
+    pub async fn set_placement_explain(
+        &self,
+        project: ProjectRef<'_>,
+        workload: &str,
+        explain: &crate::compute::PlacementExplain,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(explain).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(
+                &crate::compute::placement_explain_key(project.as_str(), workload),
+                bytes,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Read a workload's latest [`PlacementExplain`](crate::compute::PlacementExplain), or
+    /// `None` if none has been computed yet (a workload the reconcile has not reached, or a
+    /// node with no compute plane). A record that fails to deserialize degrades to `None`.
+    pub async fn get_placement_explain(
+        &self,
+        project: ProjectRef<'_>,
+        workload: &str,
+    ) -> Result<Option<crate::compute::PlacementExplain>, DeployError> {
+        match self
+            .kv
+            .get(&crate::compute::placement_explain_key(
+                project.as_str(),
+                workload,
+            ))
+            .await?
+        {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            None => Ok(None),
+        }
+    }
+
     /// The typed declarative managed-DB binding stored for `(project, name)`, or
     /// `None` if the project has declared no database by that name (v0.6.0, #501
     /// Stage B). Stored as a small JSON singleton at `project/<proj>/database/<name>`,
@@ -7589,6 +7681,7 @@ mod tests {
             user: None,
             isolation: Default::default(),
             prefer_backend: None,
+            require_backend: None,
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
@@ -8532,6 +8625,7 @@ mod tests {
             user: None,
             isolation: Default::default(),
             prefer_backend: None,
+            require_backend: None,
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],

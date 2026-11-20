@@ -1703,6 +1703,7 @@ mod tests {
             user: None,
             isolation: Default::default(),
             prefer_backend: None,
+            require_backend: None,
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
@@ -2188,6 +2189,51 @@ mod tests {
         let req = c.to_request();
         assert_eq!(req.spec, c.spec);
         assert_eq!(req.replicas, 1);
+    }
+
+    #[test]
+    fn compute_spec_backend_selection_parses_from_ron_manifest() {
+        // v0.67.0: an apply.cfg manifest can pin the tenant backend selection directly on the
+        // typed spec (`prefer_backend` soft / `require_backend` hard) — the manifest path to
+        // `compute set --prefer-backend`/`--require-backend`. It round-trips to the exact
+        // PutComputeRequest the server stores.
+        let manifest = ApplyManifest::parse(
+            r#"(
+                compute: [
+                    (
+                        name: "db",
+                        spec: (
+                            root: image("pg:16"),
+                            vcpus: 1, mem_mib: 512, port: 5432,
+                            require_backend: "firecracker",
+                        ),
+                    ),
+                    (
+                        name: "web",
+                        spec: (
+                            root: image("nginx:1"),
+                            vcpus: 1, mem_mib: 256, port: 80,
+                            prefer_backend: "docker",
+                        ),
+                    ),
+                ],
+            )"#,
+        )
+        .expect("backend selection on the typed spec parses");
+        assert_eq!(
+            manifest.compute[0].spec.require_backend.as_deref(),
+            Some("firecracker")
+        );
+        assert_eq!(manifest.compute[0].spec.prefer_backend, None);
+        assert_eq!(
+            manifest.compute[1].spec.prefer_backend.as_deref(),
+            Some("docker")
+        );
+        // Round-trips to the server's PutComputeRequest unchanged.
+        assert_eq!(
+            manifest.compute[0].to_request().spec,
+            manifest.compute[0].spec
+        );
     }
 
     #[test]

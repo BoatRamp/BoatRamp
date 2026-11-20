@@ -2382,6 +2382,7 @@ mod tests {
             user: None,
             isolation: Default::default(),
             prefer_backend: None,
+            require_backend: None,
             pull_secret: None,
             bindings: Vec::new(),
             post_launch: Vec::new(),

@@ -493,6 +493,20 @@ pub fn router_with_fast(
             "/api/compute/registry-auth/{name}",
             axum::routing::delete(delete_operator_registry_auth),
         )
+        // Per-project operator BACKEND POLICY (v0.67.0 PLAN-backend-policy-dx): set/get/clear
+        // a project's allow/forbid/prefer backend triple, composed (operator-first) with the
+        // node `[compute.policy]` at placement. Registered BEFORE `/api/compute/{name}` so the
+        // literal `policy` segment wins over the `{name}` param. NODE-GLOBAL operator
+        // authority: `Right::required` gates it `System·Admin` (`is_compute_maintenance_path`
+        // `policy/` arm) — never the per-project right the general `/api/compute/*` mapping
+        // gives, so a tenant can never set its own backend policy (operator policy is the
+        // outer bound).
+        .route(
+            "/api/compute/policy/{project}",
+            get(get_project_backend_policy)
+                .put(set_project_backend_policy)
+                .delete(delete_project_backend_policy),
+        )
         // Native project export/import (env-clone): stream a project's BRPROJ bundle out,
         // or import one in. `Project·Admin` on the `?project=` target (scoped via the query in
         // `Right::required_for`, uniform with the `clone` family — NOT node-global System·Admin)

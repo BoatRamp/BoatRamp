@@ -206,6 +206,18 @@ enum ComputeCommand {
         /// from the blob store, never pulled).
         #[arg(long = "pull-policy", value_enum, default_value_t = PullPolicy::Always)]
         pull_policy: PullPolicy,
+        /// SOFT backend preference (`vmm`/`container`/`docker`/`cloudflare`/`kubernetes`):
+        /// among the operator-permitted + isolation-sufficient backends, prefer this one;
+        /// if it is not eligible, placement falls back to the next preference tier. Never
+        /// widens the operator bounds. Mutually exclusive with `--require-backend`.
+        #[arg(long = "prefer-backend", group = "backend_choice")]
+        prefer_backend: Option<String>,
+        /// HARD backend requirement: the workload must run on exactly this backend. If it is
+        /// not in the operator-permitted + isolation-sufficient eligible set, the workload
+        /// gets a LEGIBLE no-placement (it is never an escape out of the operator bounds or
+        /// the isolation posture). Mutually exclusive with `--prefer-backend`.
+        #[arg(long = "require-backend", group = "backend_choice")]
+        require_backend: Option<String>,
     },
     /// Build an ext4 rootfs from an OCI image, upload it, and set the workload.
     /// Needs the `e2fsprogs` `mke2fs` tool on this host.
@@ -406,6 +418,13 @@ enum ComputeCommand {
     /// is sealed server-side and is never echoed back.
     #[command(subcommand)]
     RegistryAuth(RegistryAuthCommand),
+    /// Manage the **per-project operator backend policy** (v0.67.0): the allow/forbid/prefer
+    /// backend triple composed (operator-first) with the node `[compute.policy]` at
+    /// placement. NODE-GLOBAL operator authority (System·Admin) — a tenant cannot set its own
+    /// backend policy. The policy only ever NARROWS placement within the node bound; it can
+    /// never re-admit a node-forbidden backend nor relax the isolation posture.
+    #[command(subcommand)]
+    Policy(PolicyCommand),
     /// Reap stuck ORPHANED compute replicas — a replica with NO desired workload AND no
     /// live container that the reconcile plane ignores (it converges only against desired
     /// workloads). DESTRUCTIVE + node-global; admin-scoped. **Dry-run by default**: it
@@ -430,6 +449,44 @@ enum ComputeCommand {
         /// target (the no-desired-workload + container-gone checks are the real guarantee).
         #[arg(long)]
         grace_secs: Option<u64>,
+    },
+}
+
+/// `boatramp compute policy …` — set / show / clear a project's operator backend policy
+/// (System·Admin, node-global). The triple is `allow` (only these backends) / `forbid`
+/// (never these) / `prefer` (soft default among eligible); composed with the node policy
+/// operator-first (intersect allow, union forbid).
+#[derive(Debug, clap::Subcommand)]
+enum PolicyCommand {
+    /// Set (replace) the project's backend policy. Omitting all of `--allow`/`--forbid`/
+    /// `--prefer` stores the empty policy (equivalent to `clear`).
+    Set {
+        /// Project to set the policy on (default: the resolved `--project`).
+        #[arg(long)]
+        project: Option<String>,
+        /// Allowlist backend id (repeatable): ONLY these backends may run compute in this
+        /// project (intersected with the node allowlist). Omit for no project allowlist.
+        #[arg(long = "allow")]
+        allow: Vec<String>,
+        /// Forbid backend id (repeatable): these never run in this project (unioned with the
+        /// node denylist).
+        #[arg(long = "forbid")]
+        forbid: Vec<String>,
+        /// Soft preferred backend among eligible ones (overrides the node `prefer`).
+        #[arg(long = "prefer")]
+        prefer: Option<String>,
+    },
+    /// Show the project's current backend policy (the empty triple if none is set).
+    Get {
+        /// Project to read (default: the resolved `--project`).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Clear the project's backend policy, reverting to the node bound alone.
+    Rm {
+        /// Project to clear (default: the resolved `--project`).
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -671,6 +728,13 @@ pub enum ComputeOutput {
     },
     /// `compute registry-auth rm` — a registry credential was removed.
     RegistryAuthRemoved { name: String, operator: bool },
+    /// `compute policy set`/`get` — the project's operator backend policy (the stored triple).
+    Policy {
+        project: String,
+        policy: boatramp_core::compute::ProjectBackendPolicy,
+    },
+    /// `compute policy rm` — the project's backend policy was cleared.
+    PolicyCleared { project: String },
     /// `compute reap` — the orphan-reaper report (dry-run or executed).
     Reap {
         /// Whether this was a dry-run (report-only).
@@ -777,6 +841,25 @@ impl crate::output::Rendered for ComputeOutput {
             Self::RegistryAuthRemoved { name, operator } => {
                 let scope = if *operator { "operator " } else { "" };
                 writeln!(w, "removed {scope}registry credential {name}")
+            }
+            Self::Policy { project, policy } => {
+                writeln!(w, "backend policy for project {project}:")?;
+                match &policy.allow {
+                    Some(a) if !a.is_empty() => writeln!(w, "  allow:  {}", a.join(", "))?,
+                    _ => writeln!(w, "  allow:  (all capable)")?,
+                }
+                if policy.forbid.is_empty() {
+                    writeln!(w, "  forbid: (none)")?;
+                } else {
+                    writeln!(w, "  forbid: {}", policy.forbid.join(", "))?;
+                }
+                match &policy.prefer {
+                    Some(p) => writeln!(w, "  prefer: {p}"),
+                    None => writeln!(w, "  prefer: (none)"),
+                }
+            }
+            Self::PolicyCleared { project } => {
+                writeln!(w, "cleared backend policy for project {project}")
             }
             Self::Reap { dry_run, entries } => write_reap(*dry_run, entries, w),
         }
@@ -1085,6 +1168,8 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             bind,
             pull_secret,
             pull_policy,
+            prefer_backend,
+            require_backend,
         } => {
             // Exactly one of `--image` (an OCI reference, verbatim), `--tar` (a rootfs
             // archive, uploaded), or `--rootfs` (a rootfs filesystem image, uploaded)
@@ -1134,6 +1219,8 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 parse_bindings(&bind)?,
                 pull_secret,
                 pull_policy.into(),
+                prefer_backend,
+                require_backend,
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             ComputeOutput::Set { name, spec: hash }
@@ -1215,6 +1302,10 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 // moot (the default `Always` is never consulted for a rootfs source).
                 None,
                 SpecPullPolicy::Always,
+                // `compute build` exposes no backend-selection flags (it always targets the
+                // micro-VM substrate it just built a rootfs for).
+                None,
+                None,
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             ComputeOutput::Build { name, spec: hash }
@@ -1570,6 +1661,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             ComputeOutput::Netdiag { workload, replicas }
         }
         ComputeCommand::RegistryAuth(cmd) => run_registry_auth(cmd, &http, &server, config).await?,
+        ComputeCommand::Policy(cmd) => run_policy(cmd, &http, &server, config).await?,
         ComputeCommand::Reap {
             workload,
             replica,
@@ -1618,6 +1710,76 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 dry_run: report["dry_run"].as_bool().unwrap_or(true),
                 entries: report["entries"].as_array().cloned().unwrap_or_default(),
             }
+        }
+    };
+    Ok(out)
+}
+
+/// Drive `compute policy {set,get,rm}` against the node-global per-project backend-policy
+/// endpoint (`/api/compute/policy/{project}`, System·Admin). The project defaults to the
+/// resolved `--project`. An allowlist given as the empty list means "no project allowlist"
+/// (`None`), never "allow nothing" — so `policy set` with no flags stores the empty triple.
+async fn run_policy(
+    cmd: PolicyCommand,
+    http: &client::ApiClient,
+    server: &str,
+    config: &ProjectConfig,
+) -> Result<ComputeOutput> {
+    let out = match cmd {
+        PolicyCommand::Set {
+            project,
+            allow,
+            forbid,
+            prefer,
+        } => {
+            let project = project.unwrap_or_else(|| client::resolve_project(config));
+            let policy = boatramp_core::compute::ProjectBackendPolicy {
+                allow: (!allow.is_empty()).then_some(allow),
+                forbid,
+                prefer,
+            };
+            let resp = http
+                .put(format!("{server}/api/compute/policy/{project}"))
+                .json(&policy)
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Server(format!(
+                    "set backend policy failed: {status}: {}",
+                    text.trim()
+                )));
+            }
+            let policy: boatramp_core::compute::ProjectBackendPolicy = resp.json().await?;
+            ComputeOutput::Policy { project, policy }
+        }
+        PolicyCommand::Get { project } => {
+            let project = project.unwrap_or_else(|| client::resolve_project(config));
+            let policy: boatramp_core::compute::ProjectBackendPolicy = http
+                .get(format!("{server}/api/compute/policy/{project}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            ComputeOutput::Policy { project, policy }
+        }
+        PolicyCommand::Rm { project } => {
+            let project = project.unwrap_or_else(|| client::resolve_project(config));
+            let resp = http
+                .delete(format!("{server}/api/compute/policy/{project}"))
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Server(format!(
+                    "clear backend policy failed: {status}: {}",
+                    text.trim()
+                )));
+            }
+            ComputeOutput::PolicyCleared { project }
         }
     };
     Ok(out)
@@ -1816,6 +1978,8 @@ fn build_spec(
     bindings: Vec<ComputeBinding>,
     pull_secret: Option<String>,
     pull_policy: SpecPullPolicy,
+    prefer_backend: Option<String>,
+    require_backend: Option<String>,
 ) -> Result<ComputeSpec> {
     let mut env_map = BTreeMap::new();
     for pair in env {
@@ -1845,7 +2009,8 @@ fn build_spec(
         cap_add,
         user,
         isolation: isolation.into(),
-        prefer_backend: None,
+        prefer_backend,
+        require_backend,
         pull_secret,
         pull_policy,
         bindings,
@@ -1995,6 +2160,110 @@ mod tests {
     }
 
     #[test]
+    fn compute_set_backend_choice_parses_and_is_mutually_exclusive() {
+        // `--prefer-backend` parses onto the Set command.
+        match parse(&[
+            "compute",
+            "set",
+            "w",
+            "--image",
+            "nginx:1",
+            "--port",
+            "80",
+            "--prefer-backend",
+            "docker",
+        ]) {
+            Ok(ComputeCommand::Set {
+                prefer_backend,
+                require_backend,
+                ..
+            }) => {
+                assert_eq!(prefer_backend.as_deref(), Some("docker"));
+                assert!(require_backend.is_none());
+            }
+            other => panic!("expected compute set, got {other:?}"),
+        }
+        // `--require-backend` parses too.
+        match parse(&[
+            "compute",
+            "set",
+            "w",
+            "--rootfs",
+            "abc",
+            "--port",
+            "80",
+            "--require-backend",
+            "firecracker",
+        ]) {
+            Ok(ComputeCommand::Set {
+                prefer_backend,
+                require_backend,
+                ..
+            }) => {
+                assert!(prefer_backend.is_none());
+                assert_eq!(require_backend.as_deref(), Some("firecracker"));
+            }
+            other => panic!("expected compute set, got {other:?}"),
+        }
+        // The two are mutually exclusive (clap `backend_choice` group).
+        assert!(
+            parse(&[
+                "compute",
+                "set",
+                "w",
+                "--image",
+                "nginx:1",
+                "--port",
+                "80",
+                "--prefer-backend",
+                "docker",
+                "--require-backend",
+                "vmm",
+            ])
+            .is_err(),
+            "--prefer-backend and --require-backend cannot be combined"
+        );
+    }
+
+    #[test]
+    fn compute_policy_subcommand_parses() {
+        match parse(&[
+            "compute",
+            "policy",
+            "set",
+            "--project",
+            "acme",
+            "--allow",
+            "docker",
+            "--forbid",
+            "vmm",
+            "--prefer",
+            "docker",
+        ]) {
+            Ok(ComputeCommand::Policy(PolicyCommand::Set {
+                project,
+                allow,
+                forbid,
+                prefer,
+            })) => {
+                assert_eq!(project.as_deref(), Some("acme"));
+                assert_eq!(allow, vec!["docker".to_string()]);
+                assert_eq!(forbid, vec!["vmm".to_string()]);
+                assert_eq!(prefer.as_deref(), Some("docker"));
+            }
+            other => panic!("expected compute policy set, got {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["compute", "policy", "get"]),
+            Ok(ComputeCommand::Policy(PolicyCommand::Get { project: None }))
+        ));
+        assert!(matches!(
+            parse(&["compute", "policy", "rm"]),
+            Ok(ComputeCommand::Policy(PolicyCommand::Rm { project: None }))
+        ));
+    }
+
+    #[test]
     fn compute_registry_auth_subcommand_parses() {
         // set: project scope by default, --operator flips it; the two password sources are
         // mutually exclusive and at least one is required.
@@ -2128,6 +2397,8 @@ mod tests {
             vec![],
             None,
             SpecPullPolicy::Always,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(with.startup_grace_secs, 45);
@@ -2149,6 +2420,8 @@ mod tests {
             vec![],
             None,
             SpecPullPolicy::Always,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(dflt.startup_grace_secs, 30);

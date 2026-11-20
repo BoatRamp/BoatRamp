@@ -1910,6 +1910,8 @@ Create or update a workload from a rootfs + kernel (blob hash, file, or URL)
 | `--bind <BIND>` | — | — | — | Managed binding the workload depends on, `<kind>[:<name>]` (repeatable): `sql` binds the site database, `sql:analytics` a named external DB; `kv` binds the site key/value store, `kv:cache` one named bucket; `blob` binds the site blob store, `blob:assets` one named container; `messaging` binds the project bus — BOTH halves, publish AND consume (claim/ack/nack) — `messaging:deliver` one topic. The endpoint URL + token are injected into the guest env (`BOATRAMP_SQL_URL` / `BOATRAMP_KV_URL` / `BOATRAMP_BLOB_URL` / `BOATRAMP_MESSAGING_URL`). NOTE: a bare `kv`/`blob` (no `:<name>`) is SITE-WIDE — the workload can read/write EVERY bucket/container in its site's `hkv/{site}/` (kv) / `hblob/{site}/` (blob) space; use `kv:<name>` / `blob:<name>` to confine it. Likewise a bare `messaging` is PROJECT-BUS-WIDE (any topic under `{project}/bus/`, for both publish and claim); use `messaging:<topic>` to confine it to one topic. `invoke` (compute→function) is declared only — no shim resolver yet, so it parses but injects no env (Phase 3). FOOTGUN: a `kv`/`blob` binding resolves its namespace under THIS WORKLOAD'S NAME as the site segment (`hblob/{project}/{workload}/…`), exactly as a `wasi:blobstore` handler uses its SITE name. So a workload shares a site's store ONLY when it is NAMED AFTER that site — a misnamed workload reads/writes an invisible, empty namespace of its own with no error. Name the workload after the site whose data it shares. (The server logs a warning at set time when a `blob`-bound workload's name matches no known site in the project.) |
 | `--pull-secret <PULL_SECRET>` | — | — | — | Name of a **sealed registry pull credential** in THIS project's secret store for a private `--image` pull (set it first with `boatramp compute registry-auth set <name> --username … --password-stdin`). The host unseals it and authenticates the image pull at launch; a missing/unauthorized credential fails the pull CLOSED (never an anonymous fallback). Only meaningful with `--image`. Omit for a public image (or when an operator node-wide credential covers the registry host) |
 | `--pull-policy <PULL_POLICY>` | — | `always` | always \| if-not-present \| never | How the backend obtains the `--image` before launch (the opaque-compute analogue of Kubernetes' `imagePullPolicy`). `always` (the default) RE-PULLS from the registry every launch — the safe posture, since a node's local image store is SHARED across tenants, so a mutable `name:tag` there is ambient, poisonable state. `if-not-present` reuses a locally-present image (a `docker load`'d / `k3d image import`'d image, or a cached pull) and pulls only when it is absent; `never` requires it present already (a fully air-gapped node) and fails if absent. Reuse is SOUND only for a digest-pinned reference (`repo@sha256:…`, an immutable manifest); with a mutable `name:tag`, `if-not-present`/`never` are accepted but WARN, because the shared store could hold another tenant's (or a stale) image under that tag — pin by digest. Ignored for a `--tar`/`--rootfs` source (staged from the blob store, never pulled) |
+| `--prefer-backend <PREFER_BACKEND>` | — | — | — | SOFT backend preference (`vmm`/`container`/`docker`/`cloudflare`/`kubernetes`): among the operator-permitted + isolation-sufficient backends, prefer this one; if it is not eligible, placement falls back to the next preference tier. Never widens the operator bounds. Mutually exclusive with `--require-backend` |
+| `--require-backend <REQUIRE_BACKEND>` | — | — | — | HARD backend requirement: the workload must run on exactly this backend. If it is not in the operator-permitted + isolation-sufficient eligible set, the workload gets a LEGIBLE no-placement (it is never an escape out of the operator bounds or the isolation posture). Mutually exclusive with `--prefer-backend` |
 
 ### `boatramp compute build`
 
@@ -2132,6 +2134,45 @@ Remove a registry credential by name
 | --- | --- | --- | --- | --- |
 | `<NAME>` | — | — | — | The credential name |
 | `--operator` | — | — | — | Remove an OPERATOR node-wide credential instead of this project's |
+
+### `boatramp compute policy`
+
+Manage the **per-project operator backend policy** (v0.67.0): the allow/forbid/prefer backend triple composed (operator-first) with the node `[compute.policy]` at placement. NODE-GLOBAL operator authority (System·Admin) — a tenant cannot set its own backend policy. The policy only ever NARROWS placement within the node bound; it can never re-admit a node-forbidden backend nor relax the isolation posture
+
+**Usage:** `boatramp compute policy <COMMAND>`
+
+#### `boatramp compute policy set`
+
+Set (replace) the project's backend policy. Omitting all of `--allow`/`--forbid`/ `--prefer` stores the empty policy (equivalent to `clear`)
+
+**Usage:** `boatramp compute policy set [OPTIONS]`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `--project <PROJECT>` | — | — | — | Project to set the policy on (default: the resolved `--project`) |
+| `--allow <ALLOW>` | — | — | — | Allowlist backend id (repeatable): ONLY these backends may run compute in this project (intersected with the node allowlist). Omit for no project allowlist |
+| `--forbid <FORBID>` | — | — | — | Forbid backend id (repeatable): these never run in this project (unioned with the node denylist) |
+| `--prefer <PREFER>` | — | — | — | Soft preferred backend among eligible ones (overrides the node `prefer`) |
+
+#### `boatramp compute policy get`
+
+Show the project's current backend policy (the empty triple if none is set)
+
+**Usage:** `boatramp compute policy get [OPTIONS]`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `--project <PROJECT>` | — | — | — | Project to read (default: the resolved `--project`) |
+
+#### `boatramp compute policy rm`
+
+Clear the project's backend policy, reverting to the node bound alone
+
+**Usage:** `boatramp compute policy rm [OPTIONS]`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `--project <PROJECT>` | — | — | — | Project to clear (default: the resolved `--project`) |
 
 ### `boatramp compute reap`
 

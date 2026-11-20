@@ -1082,6 +1082,13 @@ fn is_compute_maintenance_path(path: &str) -> bool {
             // `/api/projects/<p>/secrets` surface (Project·Admin), NOT this path.
             || rest == "registry-auth"
             || rest.starts_with("registry-auth/")
+            // Per-project operator BACKEND POLICY (`compute policy set/get/clear <project>`,
+            // v0.67.0): the operator-set allow/forbid/prefer record composed with the node
+            // `[compute.policy]` at placement. NODE-GLOBAL operator authority — `system·admin`,
+            // never a per-project grant the general `/api/compute/*` catch-all would give (a
+            // tenant must not set its OWN backend policy; operator policy is the outer bound).
+            || rest == "policy"
+            || rest.starts_with("policy/")
 }
 
 /// Whether a granted target covers a required target:
@@ -2165,6 +2172,14 @@ mod tests {
             ("GET", "/api/compute/registry-auth"),
             ("POST", "/api/compute/registry-auth"),
             ("DELETE", "/api/compute/registry-auth/ghcr"),
+            // Per-project operator BACKEND POLICY (v0.67.0): operator-set allow/forbid/prefer,
+            // node-global authority — so system·admin, NEVER the per-project right the general
+            // `/api/compute/*` mapping would give. A tenant must not set its OWN backend
+            // policy (operator policy is the outer bound of the authority split), so a
+            // project token — even the target project's own admin — must be refused here.
+            ("GET", "/api/compute/policy/acme"),
+            ("PUT", "/api/compute/policy/acme"),
+            ("DELETE", "/api/compute/policy/acme"),
             // Project-scoped form (the `project_scope` rewrite's original path). NOTE:
             // `status` is DELIBERATELY ABSENT from this node-admin-only list — its
             // project-scoped form is per-project `Project·Read` (asserted separately

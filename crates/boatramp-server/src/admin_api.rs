@@ -1145,6 +1145,19 @@ pub(super) async fn get_compute(
                         .unwrap_or(serde_json::Value::Null),
                 );
             }
+            // v0.67.0 placement-explain: ride the latest per-workload backend-selection
+            // explanation (per-candidate eligibility + the chosen backend) the reconcile
+            // persisted, so an operator reading `compute get` sees WHY each backend was or
+            // wasn't chosen — including the legible reason a stuck workload got no placement.
+            // Absent (not yet reconciled / no compute plane) ⇒ simply omitted.
+            if let Ok(Some(explain)) = deploy.get_placement_explain(project.as_ref(), &name).await
+                && let Some(obj) = body.as_object_mut()
+            {
+                obj.insert(
+                    "placement".to_string(),
+                    serde_json::to_value(&explain).unwrap_or(serde_json::Value::Null),
+                );
+            }
             Json(body).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "no such workload\n").into_response(),
@@ -3391,6 +3404,84 @@ pub(super) async fn delete_operator_registry_auth(
         )
             .into_response(),
         Err(e) => registry_auth_store_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-project operator BACKEND POLICY
+// (`/api/compute/policy/{project}`, System·Admin — v0.67.0 PLAN-backend-policy-dx)
+// ---------------------------------------------------------------------------
+
+/// `PUT /api/compute/policy/{project}` — set (replace) a project's operator backend policy
+/// (allow/forbid/prefer over backend ids). NODE-GLOBAL operator authority: `System·Admin`,
+/// re-asserted defense-in-depth here. The policy only ever NARROWS placement within the node
+/// bound (intersect allow / union forbid) and is composed operator-first in the reconcile —
+/// a tenant can never set its OWN backend policy. `200` with the stored policy.
+pub(super) async fn set_project_backend_policy(
+    State(deploy): State<DeployStore>,
+    axum::extract::Path(project): axum::extract::Path<String>,
+    Json(policy): Json<boatramp_core::compute::ProjectBackendPolicy>,
+) -> Response {
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "PUT",
+        "/api/compute/policy/_",
+        "compute backend policy",
+    ) {
+        return forbidden;
+    }
+    if let Some(resp) = reject_invalid_name("project", &project) {
+        return resp;
+    }
+    let pref = boatramp_core::project::ProjectRef::new(&project);
+    match deploy.set_project_backend_policy(pref, &policy).await {
+        Ok(()) => Json(policy).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `GET /api/compute/policy/{project}` — read a project's operator backend policy (the empty
+/// triple when none is set). `System·Admin`.
+pub(super) async fn get_project_backend_policy(
+    State(deploy): State<DeployStore>,
+    axum::extract::Path(project): axum::extract::Path<String>,
+) -> Response {
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "GET",
+        "/api/compute/policy/_",
+        "compute backend policy",
+    ) {
+        return forbidden;
+    }
+    if let Some(resp) = reject_invalid_name("project", &project) {
+        return resp;
+    }
+    let pref = boatramp_core::project::ProjectRef::new(&project);
+    match deploy.get_project_backend_policy(pref).await {
+        Ok(policy) => Json(policy.unwrap_or_default()).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `DELETE /api/compute/policy/{project}` — clear a project's operator backend policy,
+/// reverting to the node bound alone. Idempotent (`204`). `System·Admin`.
+pub(super) async fn delete_project_backend_policy(
+    State(deploy): State<DeployStore>,
+    axum::extract::Path(project): axum::extract::Path<String>,
+) -> Response {
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "DELETE",
+        "/api/compute/policy/_",
+        "compute backend policy",
+    ) {
+        return forbidden;
+    }
+    if let Some(resp) = reject_invalid_name("project", &project) {
+        return resp;
+    }
+    let pref = boatramp_core::project::ProjectRef::new(&project);
+    match deploy.clear_project_backend_policy(pref).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
     }
 }
 

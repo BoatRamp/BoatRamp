@@ -1104,11 +1104,23 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             .with_dynamic_cred_sweeper(reaper_dynamic_cred_sweeper),
     );
 
+    // The NODE-scope operator backend policy: the posture-derived base (isolation stance)
+    // with the `[compute.policy]` allow/forbid/prefer overlaid (v0.67.0). `None` ⇒ the base
+    // alone (today's behavior). Composed per-project inside the reconcile.
+    let node_backend_policy = {
+        let base =
+            boatramp_core::compute::BackendPolicy::from_shared_kernel_allowed(allow_shared_kernel);
+        match config.compute.as_ref().and_then(|c| c.policy.as_ref()) {
+            Some(p) => p.to_backend_policy(base),
+            None => base,
+        }
+    };
+
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
         vec![compute_node],
-        boatramp_core::compute::BackendPolicy::from_shared_kernel_allowed(allow_shared_kernel),
+        node_backend_policy,
         is_leader.clone(),
         compute_reconcile_tick(),
         COMPUTE_IDLE_TIMEOUT,

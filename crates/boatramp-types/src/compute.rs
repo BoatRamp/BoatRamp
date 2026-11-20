@@ -314,10 +314,27 @@ pub struct ComputeSpec {
     /// spec when default, so existing specs keep their content hash.
     #[serde(default, skip_serializing_if = "IsolationRequirement::is_trusted")]
     pub isolation: IsolationRequirement,
-    /// Optional preferred backend id (`vmm`/`container`/`cloudflare`/`docker`);
-    /// the scheduler honors it when the backend is eligible, else falls back.
+    /// Optional **preferred** backend id (`vmm`/`container`/`cloudflare`/`docker`) — a
+    /// SOFT tenant/workload preference: the scheduler honors it when the backend is in the
+    /// operator-permitted + isolation-sufficient eligible set, else falls back to the next
+    /// preference tier (per-project `prefer`, node `prefer`, then the source tie-break). It
+    /// can never widen the operator bounds — a `prefer_backend` naming a backend the operator
+    /// forbids is simply ignored. Set via `compute set --prefer-backend <id>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_backend: Option<String>,
+    /// Optional **required** backend id — a HARD tenant/workload constraint: the workload
+    /// must run on exactly this backend. If the named backend is NOT in the
+    /// operator-permitted + isolation-sufficient eligible set (operator `allow`/`forbid`,
+    /// the isolation posture, or the capability floor excludes it), the workload gets a
+    /// **legible no-placement** — it is NEVER an escape hatch out of the operator bounds or
+    /// the isolation posture (the authority split: operator policy is the outer bound,
+    /// enforced BEFORE a tenant `require`/`prefer` can select). Distinct from
+    /// [`prefer_backend`](Self::prefer_backend), which softly falls back; a `require_backend`
+    /// that is ineligible fails closed rather than running elsewhere. Set via `compute set
+    /// --require-backend <id>`. Omitted from the wire + the content hash when `None`
+    /// (back-compat: existing specs keep their id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_backend: Option<String>,
     /// Optional **project-scoped registry pull credential reference** for an
     /// [`RootSource::Image`] source: the NAME of a sealed secret in THIS workload's
     /// own project secret store (`project/<proj>/secret/<name>`) whose plaintext is a
@@ -907,6 +924,7 @@ mod tests {
             user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
+            require_backend: None,
             pull_secret: None,
             bindings: vec![],
             post_launch: vec![],
@@ -936,6 +954,27 @@ mod tests {
             b.id(),
             "a declared post-launch action changes the id"
         );
+    }
+
+    #[test]
+    fn absent_require_backend_is_omitted_and_does_not_change_the_spec_hash() {
+        // v0.67.0: `require_backend` (like `prefer_backend`) is omitted from the wire when
+        // `None`, so an existing spec keeps its content hash (back-compat; an older server
+        // never sees the field).
+        let a = spec();
+        assert_eq!(a.require_backend, None);
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("require_backend"),
+            "an absent require_backend is omitted from the wire"
+        );
+        // Setting it IS recorded, round-trips, and changes the content hash (it is part of
+        // the workload's placement identity).
+        let mut b = spec();
+        b.require_backend = Some("firecracker".into());
+        assert_ne!(a.id(), b.id(), "a require_backend changes the id");
+        let round: ComputeSpec = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(round.require_backend.as_deref(), Some("firecracker"));
     }
 
     #[test]
