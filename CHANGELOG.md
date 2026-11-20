@@ -7,6 +7,34 @@ versions.
 
 ## [Unreleased]
 
+## [0.67.0] — 2026-11-20
+
+### Added
+
+- **Operator and tenant control over compute backend selection.** Building on v0.66.2's
+  capability-aware scheduler, backend selection is now policy-driven through one matcher (backend
+  capabilities ⋈ workload requirements ⋈ policy):
+  - **Operator policy** at NODE scope (`[compute.policy]` in the config) and PER-PROJECT scope
+    (System·Admin; `PUT/GET/DELETE /api/compute/policy/{project}`): `allow` (allowlist — only these
+    backends may run compute in scope), `forbid` (denylist), and `prefer` (a soft default affinity).
+    Node and per-project policy compose by intersecting `allow`s and unioning `forbid`s, and a
+    per-project record can only NARROW the node's bounds — it carries no isolation field, so it can
+    never relax the node's posture. This makes e.g. "docker-only on this node" a declared, reversible
+    config instead of an out-of-band workaround.
+  - **Tenant policy** per workload: `compute set --prefer-backend <id>` (soft) and
+    `--require-backend <id>` (hard — the workload is left legibly unscheduled if that backend is not
+    eligible). A tenant choice is honored only WITHIN the operator's bounds and the capability floor:
+    it can never escape an operator `forbid` or the isolation posture.
+  - **Placement legibility:** `compute get` now reports, per candidate backend, whether it was
+    eligible and (if not) why — forbidden by node/project policy, can't run the source kind, no
+    credential for a private image, insufficient isolation, or no capacity — and a no-placement
+    surfaces that reason rather than a bare stuck-at-0.
+  Fail-closed throughout: no capable/permitted backend ⇒ the workload is left unscheduled (never
+  crash-looped onto an incapable one), and a per-project-policy store-read error HOLDS new placement
+  (without tearing down running replicas) rather than silently reverting to a more-permissive bound.
+  No policy configured = the prior all-capable behavior, with v0.66.2's capability floor underneath.
+  (Design: `PLAN-backend-policy-dx`.)
+
 ## [0.66.2] — 2026-11-20
 
 ### Fixed
