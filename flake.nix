@@ -1607,7 +1607,123 @@
                 machine.succeed("ip -4 addr show dev br-boatramp | grep -qw 10.0.0.1")
               '';
             };
-          };
+          }
+          # Durable Gap-B gate (compute-net-turnkey). Boot a NixOS VM that DEPLOYS the
+          # boatramp module (compute = true + computeShimUrls, so the firewall port is
+          # AUTO-DERIVED from the shim URL — the single-source path S1), then assert on a
+          # REAL booted kernel that the module's realized compute-firewall ADMITS the
+          # container->shim data plane on the boatramp compute bridges (the per-project
+          # `boatramp-*`/`boatramp-+` bridge AND the static `br-boatramp`) while DROPPING
+          # the same shim port OFF-NODE (a peer on a non-boatramp interface), even though
+          # the shim binds 0.0.0.0 — so the firewall, not the bind scope, is what gates
+          # off-node. Parameterized over the firewall backend so BOTH the iptables and the
+          # nftables (M1) paths are exercised live. A stub `package` keeps the Rust binary
+          # out of the closure: this gate verifies the firewall seam, which the module
+          # realizes independently of the server process. The "container" is a child netns
+          # on a boatramp-named kernel bridge — faithful to what the firewall MATCHES (the
+          # interface name); the docker-specific host.docker.internal rewrite is covered by
+          # the boatramp-docker unit tests + the live lighthouse gate (scripts/compute-net-turnkey-gate.sh).
+          // lib.optionalAttrs pkgs.stdenv.isLinux (
+            let
+              cntPort = 18090;
+              mkComputeNetTurnkeyVm =
+                { nftables }:
+                let
+                  rulesetCmd = if nftables then "${pkgs.nftables}/bin/nft list ruleset" else "iptables -S";
+                in
+                pkgs.testers.runNixOSTest {
+                  name = "boatramp-compute-net-turnkey-${if nftables then "nftables" else "iptables"}";
+                  nodes = {
+                    machine =
+                      { pkgs, ... }:
+                      {
+                        imports = [ inputs.self.nixosModules.default ];
+                        networking.nftables.enable = nftables;
+                        services.boatramp = {
+                          enable = true;
+                          compute = true;
+                          # Single source: the shim URL both configures the server (env) and
+                          # auto-derives the firewall port opened on the boatramp bridges.
+                          computeShimUrls.kv = "http://10.77.0.1:${toString cntPort}";
+                          # Stub binary — this gate is about the firewall, not the process.
+                          package = pkgs.writeShellScriptBin "boatramp" "exec ${pkgs.coreutils}/bin/sleep infinity";
+                          configFile = pkgs.writeText "boatramp.cfg" ''
+                            (serve: (addr: "127.0.0.1:8080", data_dir: "/var/lib/boatramp/data"))
+                          '';
+                        };
+                        environment.systemPackages = [
+                          pkgs.iproute2
+                          pkgs.curl
+                        ];
+                      };
+                    peer =
+                      { pkgs, ... }:
+                      {
+                        environment.systemPackages = [
+                          pkgs.curl
+                          pkgs.iputils
+                        ];
+                      };
+                  };
+                  testScript = ''
+                    start_all()
+                    # Wait until the firewall (whichever backend) has applied the module's
+                    # boatramp admit rule — robust across the iptables/nftables unit split.
+                    machine.wait_until_succeeds("${rulesetCmd} | grep -q 'boatramp-'")
+                    peer.wait_until_succeeds("ping -c1 -W2 machine")
+
+                    # Record the realized rule for the log.
+                    print(machine.succeed("${rulesetCmd} | grep -i boatramp || true"))
+
+                    # Per-project docker bridge (matches boatramp-* / boatramp-+) + a
+                    # "container" child netns reaching the host over that bridge.
+                    machine.succeed("ip netns add cnet")
+                    machine.succeed("ip -n cnet link set lo up")
+                    machine.succeed("ip link add name boatramp-vmt01 type bridge")
+                    machine.succeed("ip addr add 10.77.0.1/24 dev boatramp-vmt01")
+                    machine.succeed("ip link set boatramp-vmt01 up")
+                    machine.succeed("ip link add vh type veth peer name vc")
+                    machine.succeed("ip link set vh master boatramp-vmt01")
+                    machine.succeed("ip link set vh up")
+                    machine.succeed("ip link set vc netns cnet")
+                    machine.succeed("ip -n cnet addr add 10.77.0.2/24 dev vc")
+                    machine.succeed("ip -n cnet link set vc up")
+                    machine.succeed("ip -n cnet route add default via 10.77.0.1")
+
+                    # Static native-container/firecracker bridge br-boatramp + a 2nd veth.
+                    machine.succeed("ip link add name br-boatramp type bridge")
+                    machine.succeed("ip addr add 10.78.0.1/24 dev br-boatramp")
+                    machine.succeed("ip link set br-boatramp up")
+                    machine.succeed("ip link add vh2 type veth peer name vc2")
+                    machine.succeed("ip link set vh2 master br-boatramp")
+                    machine.succeed("ip link set vh2 up")
+                    machine.succeed("ip link set vc2 netns cnet")
+                    machine.succeed("ip -n cnet addr add 10.78.0.2/24 dev vc2")
+                    machine.succeed("ip -n cnet link set vc2 up")
+
+                    # Shim on 0.0.0.0 so ONLY the firewall gates off-node.
+                    machine.succeed(
+                        "systemd-run --unit=shim --collect "
+                        "${pkgs.python3}/bin/python3 -m http.server ${toString cntPort} --bind 0.0.0.0"
+                    )
+                    machine.wait_until_succeeds("curl -fsS -m 2 -o /dev/null http://10.77.0.1:${toString cntPort}/")
+
+                    # ADMIT: the container reaches the shim over BOTH boatramp bridges.
+                    machine.succeed("ip netns exec cnet curl -fsS -m 5 -o /dev/null http://10.77.0.1:${toString cntPort}/")
+                    machine.succeed("ip netns exec cnet curl -fsS -m 5 -o /dev/null http://10.78.0.1:${toString cntPort}/")
+
+                    # OFF-NODE: a peer on a non-boatramp interface (eth1) must be DROPPED,
+                    # though the shim listens on 0.0.0.0 — the admit rule is scoped to the
+                    # boatramp bridges only.
+                    peer.fail("curl -fsS -m 5 -o /dev/null http://machine:${toString cntPort}/")
+                  '';
+                };
+            in
+            {
+              compute-net-turnkey-vm-iptables = mkComputeNetTurnkeyVm { nftables = false; };
+              compute-net-turnkey-vm-nftables = mkComputeNetTurnkeyVm { nftables = true; };
+            }
+          );
 
           # ---- Git hooks -----------------------------------------------------
           # `nix develop` (or `direnv allow`, via ./.envrc) installs these into
