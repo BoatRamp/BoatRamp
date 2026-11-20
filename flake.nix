@@ -1340,6 +1340,65 @@
                 machine.succeed("docker rm -f brexport-pg brexport-mysql || true")
               '';
             };
+
+            # Compute-bridge sandbox-relaxation GATE. The `services.boatramp.compute =
+            # true` module option must relax the systemd sandbox enough for the Linux
+            # compute backends to run. The regression it guards: with a non-root `User=`
+            # under `NoNewPrivileges=true`, a capability in the bounding set alone is
+            # INERT (only an AMBIENT cap is effective), and `AF_NETLINK` was never
+            # allowed — so the node's `ensure_bridge` rtnetlink socket failed
+            # EAFNOSUPPORT ("os error 97") and EVERY container/VMM backend was disabled
+            # at node init. This boots a real VM with `compute = true` + a `[compute]`
+            # config section (which switches the node into compute mode so it actually
+            # runs `ensure_bridge` on start — no `/dev/kvm` or docker needed to exercise
+            # the bridge path) and asserts the `br-boatramp` bridge is created + addressed
+            # under the relaxed sandbox, with the failure line absent from the journal.
+            # kind = "gate": a regression (e.g. dropping the ambient caps or AF_NETLINK)
+            # fails the check.
+            compute-bridge = vmtest.mkBoatrampVmTest {
+              name = "boatramp-compute-bridge";
+              kind = "gate";
+              services = {
+                # The relaxation under test: ambient net_admin/sys_admin/setuid/setgid +
+                # AF_NETLINK, gated strictly behind this option.
+                services.boatramp.compute = true;
+                # A `[compute]` section switches the node into compute mode, so `serve`
+                # assembles the backends — and thus runs `ensure_bridge` — on start. Every
+                # other compute field defaults (bridge `br-boatramp`, subnet
+                # `10.0.0.0/24`, gateway `.1`), so no backend capability is required to
+                # reach the bridge-creation path this gate covers.
+                services.boatramp.configFile = pkgs.writeText "boatramp-compute.cfg" ''
+                  (serve: (addr: "127.0.0.1:8080", data_dir: "/var/lib/boatramp/data"), compute: ())
+                '';
+                # `ip` for the host-side bridge assertions. The service runs without
+                # PrivateNetwork, so the bridge it creates is visible in the host netns.
+                environment.systemPackages = [ pkgs.iproute2 ];
+              };
+              testScript = ''
+                machine.wait_for_unit("boatramp.service")
+                # The node assembles its compute backends — running `ensure_bridge` over
+                # rtnetlink — BEFORE it binds the HTTP listener, so an open :8080 proves
+                # the bridge-creation attempt has already completed (whether it succeeded
+                # or, on a regression, failed and disabled the backends).
+                machine.wait_for_open_port(8080)
+
+                # Regression assertion #1: the exact EAFNOSUPPORT ("os error 97") failure
+                # this fix closes must be ABSENT — i.e. the backends were not disabled at
+                # init for want of AF_NETLINK / an effective CAP_NET_ADMIN. `grep -q`
+                # returns non-zero when the line is absent, which is the pass condition.
+                machine.fail(
+                    "journalctl -b -u boatramp.service --no-pager | "
+                    "grep -q 'could not create the compute bridge'"
+                )
+
+                # Regression assertion #2: the bridge actually exists on the host AND
+                # carries its `.1` gateway address — proving the full rtnetlink path
+                # (SIOCBRADDBR create + link-up + addr-add) ran under the relaxed sandbox,
+                # not merely that the process started.
+                machine.succeed("ip link show br-boatramp")
+                machine.succeed("ip -4 addr show dev br-boatramp | grep -qw 10.0.0.1")
+              '';
+            };
           };
 
           # ---- Git hooks -----------------------------------------------------
