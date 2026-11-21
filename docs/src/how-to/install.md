@@ -95,29 +95,33 @@ nixpkgs.overlays = [ inputs.boatramp.overlays.default ];
 services.boatramp.enable = true;
 ```
 
-To run **compute workloads** (containers / microVMs) on a NixOS node, also set
+To run the **native** compute backends (`container` / `firecracker`) on a NixOS node, also set
 `services.boatramp.compute = true`. The default systemd sandbox is too tight to build the
 compute bridge — a non-root service under `NoNewPrivileges=true` needs the capabilities as
 **ambient** (a bounding-set-only grant is inert), and `AF_NETLINK` must be permitted for the
 rtnetlink socket. Setting `compute = true` grants the service the ambient `CAP_NET_ADMIN`,
-`CAP_SYS_ADMIN`, `CAP_SETUID`, and `CAP_SETGID` capabilities and allows `AF_NETLINK`, which
-is what boatramp needs to create the `br-boatramp` bridge and per-guest veths; without it the
-bridge fails to come up (`EAFNOSUPPORT`) and the compute backends stay disabled:
+`CAP_SYS_ADMIN`, `CAP_SETUID`, and `CAP_SETGID` capabilities, the `/dev/kvm`+`/dev/net/tun`
+device access, and allows `AF_NETLINK`, which is what those backends need to create the
+`br-boatramp` bridge and per-guest veths; without it the bridge fails to come up
+(`EAFNOSUPPORT`) and the native backends stay disabled:
 
 ```nix
 services.boatramp.enable = true;
-services.boatramp.compute = true;   # grants the ambient caps + AF_NETLINK for the compute bridge
+services.boatramp.compute = true;   # grants the ambient caps + kvm/tun + AF_NETLINK for the native backends
 ```
 
 `CAP_SYS_ADMIN` is broad — it is the documented opt-in, so enable `compute` only on a node you
-intend to run compute workloads on.
+intend to run **native** compute workloads on. The **docker** backend runs through the docker
+daemon and needs none of this relaxation, so a **docker-only node leaves `compute = false`** and
+keeps the tight sandbox.
 
-Enabling `compute` also opens the firewall for the token-gated compute-shim data plane on the
-boatramp compute bridges **only** — the static `br-boatramp` (native container / firecracker) and
-the per-project docker `boatramp-*` bridges — so a bridged workload can reach its `--bind`
-shims on a default-firewall host. The opening never touches the LAN/public interface or an
-unrelated docker bridge. Set the shim URLs via `services.boatramp.computeShimUrls` and the module
-feeds them to the server AND opens only their ports (least privilege). See
+The compute-shim firewall opening and the `BOATRAMP_COMPUTE_*_SHIM_URL` server env follow
+`services.boatramp.computeShimUrls` (plus `computeShimPorts`) — **independent of `compute`**.
+Set the shim URLs and the module feeds them to the server AND opens **only** their ports on the
+boatramp compute bridges (least privilege) — the static `br-boatramp` and the per-project docker
+`boatramp-*` bridges **only**, never the LAN/public interface or an unrelated docker bridge — so a
+bridged workload reaches its `--bind` shims on a default-firewall host whether the node runs the
+docker backend (`compute = false`) or the native backends (`compute = true`). See
 [Shim reachability + the compute firewall](./compute.md#nixos-open-the-compute-firewall), which also
 covers the one-time upgrade step (cycle docker compute workloads so their networks recreate with the
 scoped bridge name).
