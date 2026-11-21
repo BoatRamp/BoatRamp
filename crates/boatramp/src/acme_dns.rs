@@ -97,6 +97,11 @@ pub enum DnsProviderKind {
     Akamai,
     /// Gandi LiveDNS (`GANDI_ZONE`, `GANDI_PAT` — a Gandi Personal Access Token).
     Gandi,
+    /// RFC 2136 dynamic DNS UPDATE with TSIG (self-hosted BIND / PowerDNS / Knot):
+    /// `RFC2136_SERVER` (the authoritative server `host[:port]`), `RFC2136_ZONE`
+    /// (the zone apex), `RFC2136_TSIG_KEY_NAME`, `RFC2136_TSIG_ALGORITHM`
+    /// (optional, default `hmac-sha256`), `RFC2136_TSIG_SECRET` (base64 key).
+    Rfc2136,
 }
 
 fn env(var: &str) -> Result<String> {
@@ -197,6 +202,18 @@ pub async fn build_provider_opts(
             env("GANDI_ZONE")?,
             env("GANDI_PAT")?,
         )),
+        DnsProviderKind::Rfc2136 => Box::new(
+            boatramp_acme::rfc2136::Rfc2136Dns::new(
+                &env("RFC2136_SERVER")?,
+                &env("RFC2136_ZONE")?,
+                &env("RFC2136_TSIG_KEY_NAME")?,
+                // The algorithm defaults to hmac-sha256 (the dynamic-DNS norm) when unset.
+                &std::env::var("RFC2136_TSIG_ALGORITHM")
+                    .unwrap_or_else(|_| "hmac-sha256".to_string()),
+                &env("RFC2136_TSIG_SECRET")?,
+            )
+            .map_err(|e| Error::DnsProvider(format!("RFC 2136: {e}")))?,
+        ),
     })
 }
 

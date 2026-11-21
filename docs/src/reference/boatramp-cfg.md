@@ -727,7 +727,8 @@ capability in grants no one by itself). This is the config-file form of the
 
 - **`provider`** — which provider adapter writes guest DNS: the same grammar as
   `--acme-dns-provider` (`manual` | `cloudflare` | `route53` | `oci` | `digitalocean` |
-  `hetzner` | `ns1` | `dnsimple` | `gcp-dns` | `azure-dns` | `akamai`). `manual` installs
+  `hetzner` | `ns1` | `dnsimple` | `gcp-dns` | `azure-dns` | `akamai` | `gandi` | `rfc2136`).
+  `manual` installs
   the credential-free Manual provider (records/echoes the intended writes — an offline
   proof). Absent ⇒ fail-closed.
 - **`zone_root`** — the authoritative zone apex the credential writes (e.g.
@@ -772,13 +773,14 @@ Each entry:
 - **`kind`** — a quoted string, the SAME grammar + aliases as `--acme-dns-provider`
   (`"manual"` | `"cloudflare"` | `"route53"` | `"oci"` | `"digitalocean"`/`"do"` |
   `"hetzner"` | `"ns1"` | `"dnsimple"` | `"gcp-dns"`/`"gcp"` | `"azure-dns"`/`"azure"` |
-  `"akamai"`). It is a string (not a bare enum) so a hyphenated kind is expressible.
+  `"akamai"` | `"gandi"` | `"rfc2136"`). It is a string (not a bare enum) so a hyphenated
+  kind is expressible.
 - **`zone_root`** — the authoritative zone apex (e.g. `mailroom.pro`): the routing key AND
   the apex passed to the `validate_writable` guardrail (so an apex `NS` is refused).
 - **per-kind fields** — each a `type:value` pointer (literal, `env:VAR`, `boatramp:NAME`),
   resolved independently at startup against the control-plane KV + `[secrets]` envelope. A
-  **secret** field (`token`/`api_key`/`access_token`/`client_token`/`client_secret`) MUST
-  be a `env:`/`boatramp:` ref — a plaintext literal is refused (no secrets in config). A
+  **secret** field (`token`/`api_key`/`access_token`/`client_token`/`client_secret`/`tsig_secret`)
+  MUST be a `env:`/`boatramp:` ref — a plaintext literal is refused (no secrets in config). A
   `boatramp:` ref with no `[secrets]` envelope is a fail-closed startup error. The full
   per-kind field table is in [DNS providers & credentials](dns-providers.md#per-kind-config-fields).
 

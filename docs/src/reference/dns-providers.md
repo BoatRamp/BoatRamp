@@ -1,7 +1,7 @@
 # DNS providers & credentials
 
 The managed-DNS providers boatramp drives directly, and the `manual` fallback.
-Ten providers are built in. Each entry lists the value passed to `--provider`,
+Twelve providers are built in. Each entry lists the value passed to `--provider`,
 any accepted alias, and the exact credential environment variables the provider
 reads.
 
@@ -25,11 +25,25 @@ and `boatramp domain add --provider <name>`.
 | `gcp-dns` | `gcp` | Google Cloud DNS | `GCP_DNS_ZONE`, `GCP_SERVICE_ACCOUNT_JSON` |
 | `azure-dns` | `azure` | Azure DNS | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`, `AZURE_DNS_ZONE` |
 | `akamai` | — | Akamai Edge DNS | `AKAMAI_HOST`, `AKAMAI_CLIENT_TOKEN`, `AKAMAI_CLIENT_SECRET`, `AKAMAI_ACCESS_TOKEN`, `AKAMAI_ZONE` |
+| `gandi` | — | Gandi LiveDNS | `GANDI_ZONE`, `GANDI_PAT` |
+| `rfc2136` | — | RFC 2136 + TSIG (self-hosted BIND / PowerDNS / Knot) | `RFC2136_SERVER`, `RFC2136_ZONE`, `RFC2136_TSIG_KEY_NAME`, `RFC2136_TSIG_ALGORITHM` *(optional, default `hmac-sha256`)*, `RFC2136_TSIG_SECRET` |
 
 ## Notes
 
-- `manual` prints the records to apply by hand and reads no credentials. It is
-  the fallback for self-hosted authoritative servers (BIND, PowerDNS, Knot).
+- `manual` prints the records to apply by hand and reads no credentials. It is the
+  universal credential-free fallback; for a self-hosted authoritative server that
+  accepts dynamic updates, prefer `rfc2136` (below) for the same hands-off `--auto`
+  experience as the hosted providers.
+- `rfc2136` drives a **self-hosted** authoritative server (BIND, PowerDNS, Knot,
+  NSD) over the DNS-wire **dynamic UPDATE** protocol (RFC 2136), authenticating
+  every message with a **TSIG** key (RFC 8945). `RFC2136_SERVER` is the server to
+  send updates to (`host[:port]`, default port 53), `RFC2136_ZONE` the zone apex,
+  and the key is `RFC2136_TSIG_KEY_NAME` + `RFC2136_TSIG_ALGORITHM` (`hmac-sha256`
+  | `hmac-sha384` | `hmac-sha512`) + the base64 `RFC2136_TSIG_SECRET`. Generate a
+  key with `tsig-keygen` and grant it update rights on the zone (BIND:
+  `allow-update { key <name>; };`). The secret, like every provider credential, is
+  read only from the environment (or a sealed ref in `[serve.dns_providers]`) —
+  never a plaintext literal in a config file. Supports A, AAAA, CNAME, and TXT.
 - `gcp-dns` and `azure-dns` take a **long-lived** credential and exchange it for a short-lived token
   **host-side** (cap-req #31 — no short-lived token is accepted anywhere): GCP a service-account JSON key
   (`GCP_SERVICE_ACCOUNT_JSON`, the whole key file; the project is read from its `project_id`), Azure a
@@ -108,6 +122,8 @@ Mirror each provider's env vars, lowercased/namespaced. **Bold** = secret (must 
 | `gcp-dns` | `zone` (managed-zone name), **`service_account_json`** (project read from it) |
 | `azure-dns` | `tenant_id`, `client_id`, **`client_secret`**, `subscription_id`, `resource_group`, `zone` |
 | `akamai` | `host`, **`client_token`**, **`client_secret`**, **`access_token`**, `zone` |
+| `gandi` | `zone`, **`token`** |
+| `rfc2136` | `server`, `zone`, `tsig_key_name`, `tsig_algorithm` (optional, default `hmac-sha256`), **`tsig_secret`** |
 
 For **guest `dns-publish`** over the multi-zone registry, set
 `--dns-publish-provider list` (or `[serve.dns_publish].provider = "list"`); the posture

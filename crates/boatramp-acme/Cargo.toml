@@ -37,6 +37,20 @@ gandi = ["dep:reqwest", "dep:serde_json"]
 gcp-dns = ["dep:reqwest", "dep:serde_json", "dep:rsa"]
 azure-dns = ["dep:reqwest", "dep:serde_json"]
 akamai = ["dep:reqwest", "dep:serde_json", "dep:hmac"]
+# RFC 2136 dynamic DNS UPDATE (self-hosted BIND / PowerDNS / Knot) with RFC 8945
+# TSIG signing. The DNS-wire codec + TSIG come from `hickory-proto` — ALREADY in
+# the tree (pulled by the `acme` feature's `hickory-resolver`, and used directly
+# by `boatramp-overlay-tunnel`), so this adds NO new heavy dependency: it only
+# enables that crate's `dnssec-ring` feature (TSIG HMAC over the `ring` crate the
+# `oci`/`gcp-dns` adapters already pull) and uses its `op::Message` UPDATE
+# builders. The UDP/TCP transport is hand-rolled over `tokio` (no hickory async
+# client / runtime transport, so no `rustls`/`__tls` stack is dragged in).
+rfc2136 = [
+  "dep:tokio",
+  "dep:hickory-proto",
+  "hickory-proto/std",
+  "hickory-proto/dnssec-ring",
+]
 
 [dependencies]
 async-trait.workspace = true
@@ -49,7 +63,17 @@ sha2.workspace = true
 thiserror.workspace = true
 
 # Optional, feature-gated.
-tokio = { workspace = true, optional = true }
+# `time` is added on top of the workspace feature set (net/io-util/…) for the
+# RFC 2136 adapter's `tokio::time::timeout` over the hand-rolled TCP transport.
+tokio = { workspace = true, optional = true, features = ["time"] }
+# DNS-wire codec + RFC 8945 TSIG for the RFC 2136 dynamic-UPDATE provider
+# (`rfc2136` feature). `default-features = false` + just `std`/`dnssec-ring`: the
+# `op::Message` UPDATE builders and `rr::tsig::TSigner` — no `tokio`/`__tls`
+# transport pulled (this crate hand-rolls the UDP/TCP exchange). Pinned to the
+# same 0.26 line `hickory-resolver` (via `acme`) and `boatramp-overlay-tunnel`
+# already lock, so no new crate enters the tree — only the `dnssec-ring` edge
+# (which reuses the `ring` dep the `oci`/`gcp-dns` adapters pull).
+hickory-proto = { version = "0.26", default-features = false, optional = true }
 reqwest = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 # 0.8.5 is the first published release that tolerates a tokenless challenge

@@ -220,6 +220,7 @@ acme-dns = [
   "boatramp-acme/azure-dns",
   "boatramp-acme/akamai",
   "boatramp-acme/gandi",
+  "boatramp-acme/rfc2136",
 ]
 # Embedded, in-process Rust bundler for the `bundle` subcommand: Rolldown for
 # JS/TS (tree-shake + minify) and lightningcss for CSS (`@import` inline +

@@ -286,6 +286,35 @@ async fn build_adapter(
                 .await?;
             Arc::new(boatramp_acme::gandi::GandiDns::new(zone, token))
         }
+        DnsProviderKind::Rfc2136 => {
+            // Self-hosted dynamic UPDATE + TSIG: the server address, zone apex, and
+            // TSIG key NAME/ALGORITHM are non-secret config; only the TSIG SECRET is
+            // a sealed/env ref (no plaintext key in the manifest, like every other
+            // provider credential).
+            let server = r
+                .required(label, kname, "server", s(&cfg.server), false)
+                .await?;
+            let zone = r
+                .required(label, kname, "zone", s(&cfg.zone), false)
+                .await?;
+            let key_name = r
+                .required(label, kname, "tsig_key_name", s(&cfg.tsig_key_name), false)
+                .await?;
+            // The algorithm defaults to hmac-sha256 (the dynamic-DNS norm) when unset.
+            let algorithm = match s(&cfg.tsig_algorithm) {
+                Some(v) => r.resolve("tsig_algorithm", v, false).await?,
+                None => "hmac-sha256".to_string(),
+            };
+            let secret = r
+                .required(label, kname, "tsig_secret", s(&cfg.tsig_secret), true)
+                .await?;
+            Arc::new(
+                boatramp_acme::rfc2136::Rfc2136Dns::new(
+                    &server, &zone, &key_name, &algorithm, &secret,
+                )
+                .map_err(|e| Error::DnsProvidersConfig(format!("provider {label:?}: {e}")))?,
+            )
+        }
     })
 }
 
@@ -314,7 +343,8 @@ pub async fn build_routing_registry(
         let kind = cfg.kind.ok_or_else(|| {
             Error::DnsProvidersConfig(format!(
                 "provider {:?}: `kind` is required (one of manual | cloudflare | route53 | oci | \
-                 digitalocean | hetzner | ns1 | dnsimple | gcp-dns | azure-dns | akamai | gandi)",
+                 digitalocean | hetzner | ns1 | dnsimple | gcp-dns | azure-dns | akamai | gandi | \
+                 rfc2136)",
                 cfg.name
             ))
         })?;
@@ -427,6 +457,77 @@ mod tests {
             .expect_err("missing zone_id refused");
         assert!(
             err.to_string().contains("zone_id"),
+            "names the missing field: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc2136_plaintext_tsig_secret_is_refused() {
+        // The TSIG key is a credential: a raw literal in the SECRET field (`tsig_secret`)
+        // must be refused at startup, exactly like every other provider's secret — only
+        // the non-secret server/zone/key-name/algorithm may be literals.
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mut p = provider("ns", DnsProviderKind::Rfc2136, "example.com");
+        p.server = Some("192.0.2.53".to_string());
+        p.zone = Some("example.com".to_string());
+        p.tsig_key_name = Some("update-key".to_string());
+        p.tsig_secret = Some("MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=".to_string()); // raw secret
+        let err = build_routing_registry(&[p], kv, None, true)
+            .await
+            .expect_err("a plaintext TSIG secret literal must be refused");
+        assert!(matches!(err, Error::DnsProvidersConfig(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tsig_secret") && msg.contains("secret"),
+            "clear error names the TSIG secret field: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc2136_builds_with_an_env_tsig_secret_ref() {
+        // With the secret as an `env:` ref (posture allows it), the provider builds —
+        // proving the whole rfc2136 field set resolves and the TSIG signer constructs.
+        // SAFETY: single-threaded test; set/remove a process env var around the build.
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mut p = provider("ns", DnsProviderKind::Rfc2136, "example.com");
+        p.server = Some("192.0.2.53:53".to_string());
+        p.zone = Some("example.com".to_string());
+        p.tsig_key_name = Some("update-key".to_string());
+        p.tsig_algorithm = Some("hmac-sha256".to_string());
+        p.tsig_secret = Some("env:BOATRAMP_TEST_RFC2136_SECRET".to_string());
+        unsafe {
+            std::env::set_var(
+                "BOATRAMP_TEST_RFC2136_SECRET",
+                "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=",
+            );
+        }
+        let built = build_routing_registry(&[p], kv, None, true).await;
+        unsafe {
+            std::env::remove_var("BOATRAMP_TEST_RFC2136_SECRET");
+        }
+        let registry = built
+            .expect("rfc2136 with an env-ref secret builds")
+            .expect("one provider builds a registry");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.resolve_zone_root("_acme-challenge.example.com"),
+            boatramp_acme::ZoneResolution::Zone("example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc2136_missing_server_is_refused() {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mut p = provider("ns", DnsProviderKind::Rfc2136, "example.com");
+        // No `server`.
+        p.zone = Some("example.com".to_string());
+        p.tsig_key_name = Some("update-key".to_string());
+        p.tsig_secret = Some("env:SOME_SECRET".to_string());
+        let err = build_routing_registry(&[p], kv, None, true)
+            .await
+            .expect_err("rfc2136 without a server is refused");
+        assert!(
+            err.to_string().contains("server"),
             "names the missing field: {err}"
         );
     }
