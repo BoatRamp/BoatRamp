@@ -689,11 +689,16 @@ host-internal address (the bridge gateway / loopback, not a public interface), a
 firewall admits their port only on traffic arriving on the boatramp bridges — so a LAN
 or internet peer is blocked at both layers.
 
-> **Upgrade note.** The scoped docker bridge name applies only when a per-project network
-> is CREATED. After upgrading, a pre-existing `boatramp-net-<project>` keeps docker's old
-> `br-<hash>` bridge, which the firewall rule does not match — that workload's shim traffic
-> is DROPped (fail-closed) until the network is recreated. Redeploy/cycle docker compute
-> workloads after upgrading so their networks recreate with the scoped bridge name.
+> **Upgrade note.** The scoped docker bridge name is fixed when a per-project network is
+> CREATED, so a `boatramp-net-<project>` that pre-dates the scoped bridge keeps docker's old
+> `br-<hash>` bridge, which the firewall rule does not match — that workload's shim traffic is
+> DROPped (fail-closed) until the network is migrated. This migration is now **automatic**: on
+> launch, boatramp detects a stale unscoped bridge and, when the network has no attached
+> containers, recreates it on the scoped bridge (its per-project isolation labels preserved). So
+> a plain `compute restart` of a project's **last** workload migrates its network — the restart
+> stops the old container (emptying the network) before launching the new one, which triggers the
+> rebuild. A network that still has a live attached container is never torn down; cycle every
+> workload on that project (stop them all, then relaunch) to migrate it.
 
 ## Use a managed Postgres/MySQL from a compute workload (a real DSN)
 
