@@ -455,6 +455,7 @@ async fn launch_with_env(
         spec,
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let inst = backend
         .launch(&req)

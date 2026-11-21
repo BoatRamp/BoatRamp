@@ -218,6 +218,35 @@ enum ComputeCommand {
         /// the isolation posture). Mutually exclusive with `--prefer-backend`.
         #[arg(long = "require-backend", group = "backend_choice")]
         require_backend: Option<String>,
+        /// PRIORITY CLASS (`system`/`standard`/`spot`) — the operator-owned cross-tenant TIER.
+        /// Omit for the operator default (`standard`). A project may only request a class at or
+        /// below its ceiling (default `standard`, so `system` is operator-reserved); a higher
+        /// request is REFUSED, naming the allowed max. Stored on the mutable workload (a cheap
+        /// pointer update — NEVER reminted into the content-addressed spec), so re-prioritizing
+        /// never stops/relaunches a replica.
+        #[arg(long = "priority-class")]
+        priority_class: Option<String>,
+        /// PRIORITY RANK (signed) — the tenant-owned axis that orders your OWN workloads only
+        /// (higher wins). It can NEVER leapfrog another project (the global order is
+        /// tier → project → rank), so it is safe for a tenant to set freely. Default 0.
+        #[arg(
+            long = "priority-rank",
+            default_value_t = 0,
+            allow_negative_numbers = true
+        )]
+        priority_rank: i32,
+        /// MIN-AVAILABLE floor — the minimum running replicas preemption must leave this
+        /// workload (the PodDisruptionBudget-equivalent). Omit for the class default (`spot`→0,
+        /// `standard`/`system`→protected at the full replica count). A HARD floor to a same-tier
+        /// preemptor; ADVISORY to a strictly-higher operator tier.
+        #[arg(long = "min-available")]
+        min_available: Option<u32>,
+        /// DRY-RUN: preview the preemption BLAST RADIUS of this priority (which replicas it would
+        /// evict, and the capacity it would free) WITHOUT applying anything. A tenant view
+        /// aggregates cross-tenant impact without naming other projects; the operator view names
+        /// them. Combine with the priority flags to preview a bump before committing it.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
     /// Build an ext4 rootfs from an OCI image, upload it, and set the workload.
     /// Needs the `e2fsprogs` `mke2fs` tool on this host.
@@ -365,6 +394,13 @@ enum ComputeCommand {
         /// Show only this workload's replicas (default: every workload).
         workload: Option<String>,
     },
+    /// Show one workload's PREEMPTION events — the durable, attributed eviction timeline (which
+    /// replicas were evicted, and by whom). A tenant view aggregates a cross-tenant preemptor's
+    /// identity ("a higher-priority workload"); the operator (node-global) view names it.
+    Events {
+        /// Workload name.
+        workload: String,
+    },
     /// Force one replica's stored health flag — the escape hatch when a recovered
     /// replica is stuck `healthy=false` and the endpoint resolver therefore won't serve
     /// it (the v0.3.12→v0.3.13 class), without waiting for a binary patch. Targets the
@@ -475,6 +511,12 @@ enum PolicyCommand {
         /// Soft preferred backend among eligible ones (overrides the node `prefer`).
         #[arg(long = "prefer")]
         prefer: Option<String>,
+        /// The PRIORITY-CLASS ceiling this project may request (`system`/`standard`/`spot`) —
+        /// the operator cap on `compute set --priority-class`. Omit to leave it at the node
+        /// default (`standard`, so `system` is reserved). Raise it (e.g. to `system`) to let a
+        /// trusted project request a higher class; a request above the ceiling is refused.
+        #[arg(long = "priority-ceiling")]
+        priority_ceiling: Option<String>,
     },
     /// Show the project's current backend policy (the empty triple if none is set).
     Get {
@@ -631,6 +673,10 @@ struct PutComputeRequest {
     spec: ComputeSpec,
     replicas: u32,
     placement: PlacementConstraints,
+    /// The workload's scheduling priority (class/rank/min-available). Omitted from the wire when
+    /// all-default (back-compat: an older server never sees the field).
+    #[serde(skip_serializing_if = "boatramp_core::compute::Priority::is_default")]
+    priority: boatramp_core::compute::Priority,
 }
 
 /// The result of a `boatramp compute` subcommand, rendered by [`crate::output`].
@@ -651,6 +697,11 @@ pub enum ComputeOutput {
     Get { workload: serde_json::Value },
     /// `compute set` — the workload was created/updated.
     Set { name: String, spec: String },
+    /// `compute set --dry-run` — the priority preemption preview (tenant-redacted blast radius).
+    PriorityDryRun {
+        workload: String,
+        preview: serde_json::Value,
+    },
     /// `compute build` — the rootfs was built, uploaded, and the workload set.
     Build { name: String, spec: String },
     /// `compute rm` — the workload was removed. `drained_dependents` is non-empty only
@@ -687,6 +738,11 @@ pub enum ComputeOutput {
     Status {
         /// The replica views (optionally filtered to one workload).
         states: Vec<serde_json::Value>,
+    },
+    /// `compute events` — one workload's preemption (eviction) timeline.
+    Events {
+        workload: String,
+        events: Vec<serde_json::Value>,
     },
     /// `compute set-health` — a replica's stored health flag was forced.
     SetHealth {
@@ -748,12 +804,32 @@ impl crate::output::Rendered for ComputeOutput {
     fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         match self {
             Self::Ls { workloads } => write_ls(workloads, w),
-            Self::Get { workload } => writeln!(
-                w,
-                "{}",
-                serde_json::to_string_pretty(workload).map_err(std::io::Error::other)?
-            ),
+            Self::Get { workload } => {
+                // A resolved PRIORITY summary line (class + tier) above the raw desired state —
+                // the class is on the mutable workload; the tier resolves against the built-in
+                // catalog. The project ceiling is an operator per-project setting (see
+                // `compute policy get`).
+                let priority: boatramp_core::compute::Priority =
+                    serde_json::from_value(workload.get("priority").cloned().unwrap_or_default())
+                        .unwrap_or_default();
+                let catalog = boatramp_core::compute::PriorityClassCatalog::builtin();
+                let (class, pclass) = catalog.resolve(&priority);
+                writeln!(
+                    w,
+                    "priority: {class} (tier {}; rank {})",
+                    pclass.tier,
+                    priority.rank()
+                )?;
+                writeln!(
+                    w,
+                    "{}",
+                    serde_json::to_string_pretty(workload).map_err(std::io::Error::other)?
+                )
+            }
             Self::Set { name, spec } => writeln!(w, "workload {name} set (spec {spec})"),
+            Self::PriorityDryRun { workload, preview } => {
+                write_priority_dry_run(workload, preview, w)
+            }
             Self::Build { name, spec } => {
                 writeln!(w, "workload {name} built + set (spec {spec})")
             }
@@ -781,6 +857,7 @@ impl crate::output::Rendered for ComputeOutput {
             Self::VolumeLs { volumes } => write_volume_ls(volumes, w),
             Self::VolumeRm { name } => writeln!(w, "removed {name}"),
             Self::Status { states } => write_status(states, w),
+            Self::Events { workload, events } => write_events(workload, events, w),
             Self::SetHealth {
                 project,
                 workload,
@@ -953,8 +1030,16 @@ fn write_status(states: &[serde_json::Value], w: &mut dyn std::io::Write) -> std
     }
     writeln!(
         w,
-        "{:<28}  {:>3}  {:<7}  {:<21}  {:<7}  {:<16}  {:>6}  BACKEND",
-        "PROJECT/WORKLOAD", "REP", "HEALTHY", "ENDPOINT", "PHASE", "READINESS", "AGE"
+        "{:<28}  {:>3}  {:<8}  {:<7}  {:<21}  {:<7}  {:<13}  {:<12}  {:>6}  BACKEND",
+        "PROJECT/WORKLOAD",
+        "REP",
+        "PRI",
+        "HEALTHY",
+        "ENDPOINT",
+        "PHASE",
+        "READINESS",
+        "REASON",
+        "AGE"
     )?;
     for s in states {
         let owner = format!(
@@ -963,6 +1048,8 @@ fn write_status(states: &[serde_json::Value], w: &mut dyn std::io::Write) -> std
             s["workload"].as_str().unwrap_or("?")
         );
         let rep = s["replica"].as_u64().unwrap_or(0);
+        // PRI column: the workload's priority class (joined server-side), or `-` if unknown.
+        let pri = s["priority_class"].as_str().unwrap_or("-");
         let healthy = if s["healthy"].as_bool().unwrap_or(false) {
             "yes"
         } else {
@@ -974,24 +1061,53 @@ fn write_status(states: &[serde_json::Value], w: &mut dyn std::io::Write) -> std
             s["port"].as_u64().unwrap_or(0)
         );
         let phase = s["phase"].as_str().unwrap_or("?");
-        // Readiness is the serving/launch state (distinct from the TCP-level `HEALTHY`); a
-        // `launch_failed` / `provision_failed` here is the once-silent failure now made
-        // visible, so append its reason inline (the server omits it for the healthy states).
+        // Readiness is the serving/launch state (distinct from the TCP-level `HEALTHY`).
         let readiness = s["readiness"].as_str().unwrap_or("-");
+        // REASON column: a distinct machine token for a non-running replica (never a bare
+        // "unresolved") — PREEMPTED (evicted by a higher-priority workload), LAUNCHFAIL,
+        // PROVFAIL — else `-`. The full detail (preemptor attribution, backend error) is
+        // appended inline from the server `reason`.
+        let reason_token = match readiness {
+            "preempted" => "PREEMPTED",
+            "launch_failed" => "LAUNCHFAIL",
+            "provision_failed" => "PROVFAIL",
+            _ => "-",
+        };
         let age = match s["age_secs"].as_u64() {
             Some(a) => format!("{a}s"),
             None => "-".to_string(),
         };
         let backend = s["backend"].as_str().unwrap_or("?");
-        let reason = match s["reason"].as_str() {
+        let detail = match s["reason"].as_str() {
             Some(r) if !r.is_empty() => format!("  ({r})"),
             _ => String::new(),
         };
         writeln!(
             w,
-            "{owner:<28}  {rep:>3}  {healthy:<7}  {endpoint:<21}  {phase:<7}  {readiness:<16}  \
-             {age:>6}  {backend}{reason}"
+            "{owner:<28}  {rep:>3}  {pri:<8}  {healthy:<7}  {endpoint:<21}  {phase:<7}  \
+             {readiness:<13}  {reason_token:<12}  {age:>6}  {backend}{detail}"
         )?;
+    }
+    Ok(())
+}
+
+/// Render the `compute events` preemption timeline for one workload — each evicted replica with
+/// its attribution (`reason`, already tenant-redacted by the server). Durable: sourced from the
+/// persisted `preempted` replica markers.
+fn write_events(
+    workload: &str,
+    events: &[serde_json::Value],
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    if events.is_empty() {
+        return writeln!(w, "no preemption events for {workload}");
+    }
+    writeln!(w, "preemption events for {workload}:")?;
+    for e in events {
+        let rep = e["replica"].as_u64().unwrap_or(0);
+        let node = e["node"].as_u64().unwrap_or(0);
+        let reason = e["reason"].as_str().unwrap_or("preempted");
+        writeln!(w, "  replica {rep} (node {node}) EVICTED — {reason}")?;
     }
     Ok(())
 }
@@ -1170,6 +1286,10 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             pull_policy,
             prefer_backend,
             require_backend,
+            priority_class,
+            priority_rank,
+            min_available,
+            dry_run,
         } => {
             // Exactly one of `--image` (an OCI reference, verbatim), `--tar` (a rootfs
             // archive, uploaded), or `--rootfs` (a rootfs filesystem image, uploaded)
@@ -1222,8 +1342,28 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 prefer_backend,
                 require_backend,
             )?;
-            let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
-            ComputeOutput::Set { name, spec: hash }
+            // Assemble the workload PRIORITY (on the mutable workload, never the spec).
+            let priority = boatramp_core::compute::Priority::new()
+                .with_class(priority_class)
+                .with_rank(priority_rank)
+                .with_min_available(min_available);
+            if dry_run {
+                // Preview the preemption blast radius WITHOUT applying. The server runs the pure
+                // engine with the proposed priority and returns a (tenant-redacted) projection.
+                let preview =
+                    priority_dry_run(&http, &server, &seg, &name, &spec, replicas, &priority)
+                        .await?;
+                ComputeOutput::PriorityDryRun {
+                    workload: name,
+                    preview,
+                }
+            } else {
+                let hash = put_workload(
+                    &http, &server, &seg, &name, spec, replicas, regions, priority,
+                )
+                .await?;
+                ComputeOutput::Set { name, spec: hash }
+            }
         }
         ComputeCommand::Build {
             name,
@@ -1307,7 +1447,18 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 None,
                 None,
             )?;
-            let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
+            // `compute build` carries no priority flags — the default class (`standard`, rank 0).
+            let hash = put_workload(
+                &http,
+                &server,
+                &seg,
+                &name,
+                spec,
+                replicas,
+                regions,
+                Default::default(),
+            )
+            .await?;
             ComputeOutput::Build { name, spec: hash }
         }
         ComputeCommand::Rm { name } => {
@@ -1501,6 +1652,26 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 states.retain(|s| s["workload"].as_str() == Some(wl.as_str()));
             }
             ComputeOutput::Status { states }
+        }
+        ComputeCommand::Events { workload } => {
+            // The preemption timeline is the set of durably-persisted `preempted` replica
+            // markers for this workload (attribution included; the server already tenant-
+            // redacts a cross-tenant preemptor). Sourced from the same status surface.
+            let states: Vec<serde_json::Value> = http
+                .get(status_url(&server, &seg))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let events: Vec<serde_json::Value> = states
+                .into_iter()
+                .filter(|s| {
+                    s["workload"].as_str() == Some(workload.as_str())
+                        && s["readiness"].as_str() == Some("preempted")
+                })
+                .collect();
+            ComputeOutput::Events { workload, events }
         }
         // The remaining node-global operator tools hit the direct `/api/compute/…`
         // maintenance surface (admin-scoped, tenant-agnostic) rather than `seg`.
@@ -1731,12 +1902,14 @@ async fn run_policy(
             allow,
             forbid,
             prefer,
+            priority_ceiling,
         } => {
             let project = project.unwrap_or_else(|| client::resolve_project(config));
             let policy = boatramp_core::compute::ProjectBackendPolicy {
                 allow: (!allow.is_empty()).then_some(allow),
                 forbid,
                 prefer,
+                priority_ceiling,
             };
             let resp = http
                 .put(format!("{server}/api/compute/policy/{project}"))
@@ -2034,6 +2207,85 @@ fn parse_bindings(flags: &[String]) -> Result<Vec<ComputeBinding>> {
 }
 
 /// PUT a workload's desired state; returns the stored spec hash.
+/// Render the `compute set --dry-run` priority preemption preview — the tenant-redacted blast
+/// radius. Same-project replicas are named; cross-project impact is an aggregate (no identities).
+fn write_priority_dry_run(
+    workload: &str,
+    preview: &serde_json::Value,
+    w: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    let class = preview["resolved_class"].as_str().unwrap_or("?");
+    let tier = preview["resolved_tier"].as_i64().unwrap_or(0);
+    let ceiling = preview["ceiling"].as_str().unwrap_or("?");
+    writeln!(
+        w,
+        "DRY-RUN: priority for `{workload}` → class {class} (tier {tier}; project ceiling: {ceiling})"
+    )?;
+    writeln!(w, "nothing was applied.")?;
+    let same = preview["same_project_evicts"].as_array();
+    match same {
+        Some(v) if !v.is_empty() => {
+            writeln!(w, "would EVICT (your project):")?;
+            for e in v {
+                writeln!(
+                    w,
+                    "  {} rep {} on node {} ({}vcpu/{}MiB)",
+                    e["workload"].as_str().unwrap_or("?"),
+                    e["replica"].as_u64().unwrap_or(0),
+                    e["node"].as_u64().unwrap_or(0),
+                    e["vcpus"].as_u64().unwrap_or(0),
+                    e["mem_mib"].as_u64().unwrap_or(0),
+                )?;
+            }
+        }
+        _ => writeln!(w, "would EVICT (your project): none")?,
+    }
+    let cp = &preview["cross_project"];
+    let reps = cp["candidate_replicas"].as_u64().unwrap_or(0);
+    if reps > 0 {
+        writeln!(
+            w,
+            "could also displace {reps} lower-priority replica(s) across {} other project(s), \
+             freeing up to {}vcpu/{}MiB (identities withheld)",
+            cp["projects"].as_u64().unwrap_or(0),
+            cp["freed_vcpus"].as_u64().unwrap_or(0),
+            cp["freed_mem_mib"].as_u64().unwrap_or(0),
+        )?;
+    }
+    if let Some(note) = preview["note"].as_str() {
+        writeln!(w, "note: {note}")?;
+    }
+    Ok(())
+}
+
+/// POST a priority DRY-RUN (`?dry_run=true`) and return the preview JSON; stores nothing.
+async fn priority_dry_run(
+    http: &crate::client::ApiClient,
+    server: &str,
+    seg: &str,
+    name: &str,
+    spec: &ComputeSpec,
+    replicas: u32,
+    priority: &boatramp_core::compute::Priority,
+) -> Result<serde_json::Value> {
+    let request = PutComputeRequest {
+        spec: spec.clone(),
+        replicas,
+        placement: PlacementConstraints::default(),
+        priority: priority.clone(),
+    };
+    let preview: serde_json::Value = http
+        .put(format!("{server}/api/{seg}/{name}?dry_run=true"))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(preview)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn put_workload(
     http: &crate::client::ApiClient,
     server: &str,
@@ -2042,6 +2294,7 @@ async fn put_workload(
     spec: ComputeSpec,
     replicas: u32,
     regions: Vec<String>,
+    priority: boatramp_core::compute::Priority,
 ) -> Result<String> {
     let request = PutComputeRequest {
         spec,
@@ -2050,6 +2303,7 @@ async fn put_workload(
             regions,
             labels: BTreeMap::new(),
         },
+        priority,
     };
     let resp: serde_json::Value = http
         .put(format!("{server}/api/{seg}/{name}"))
@@ -2233,6 +2487,7 @@ mod tests {
                 allow,
                 forbid,
                 prefer,
+                priority_ceiling: _,
             })) => {
                 assert_eq!(project.as_deref(), Some("acme"));
                 assert_eq!(allow, vec!["docker".to_string()]);

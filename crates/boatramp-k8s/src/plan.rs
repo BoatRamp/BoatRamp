@@ -225,6 +225,22 @@ pub struct PlanContext {
     /// backend sets this from its own `strict` flag (threaded from the node's
     /// `allow_shared_kernel` posture), NEVER from a tenant-supplied spec.
     pub strict: bool,
+    /// The native k8s `PriorityClass` NAME to set on the generated pod (`boatramp-<class>`),
+    /// mapped from the workload's operator priority tier — the k8s backend's half of the v0.70.0
+    /// priority feature, delegating preemption to the cluster's own scheduler (a k8s workload is
+    /// `preemptible: false` in boatramp's engine). `None` ⇒ no `priorityClassName` is set (the
+    /// cluster's global default applies). The named PriorityClass objects are operator-created
+    /// in the cluster (documented in the chart); boatramp only references them by name.
+    pub priority_class_name: Option<String>,
+}
+
+/// Map a workload's operator priority CLASS name to the native k8s `PriorityClass` object name
+/// boatramp references (`boatramp-<class>`, e.g. `boatramp-system` / `boatramp-standard` /
+/// `boatramp-spot`). The operator pre-creates these PriorityClass objects with `value`s that
+/// mirror the boatramp tiers (documented in the chart), so the cluster scheduler honors the same
+/// ordering. A caller passes `None` to omit `priorityClassName` entirely.
+pub fn k8s_priority_class_name(class: &str) -> String {
+    format!("boatramp-{class}")
 }
 
 /// The typed Kubernetes objects for one managed database — what the backend applies
@@ -452,6 +468,9 @@ pub fn managed_db_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Resource
         // default ServiceAccount token into it — removing unnecessary apiserver reach from
         // a SQL-reachable operand image (a classic SQL→RCE surface).
         automount_service_account_token: Some(false),
+        // The native k8s PriorityClass mapped from the workload's operator tier (delegates
+        // preemption to the cluster scheduler). `None` ⇒ the cluster default applies.
+        priority_class_name: ctx.priority_class_name.clone(),
         ..Default::default()
     };
 
@@ -1045,6 +1064,8 @@ pub fn deployment_plan(ctx: &PlanContext, spec: &ComputeSpec) -> Result<Deployme
         // A generic workload pod never calls the k8s API — do not auto-mount the default
         // ServiceAccount token (no unnecessary apiserver reach from a workload image).
         automount_service_account_token: Some(false),
+        // The native k8s PriorityClass mapped from the workload's operator tier.
+        priority_class_name: ctx.priority_class_name.clone(),
         ..Default::default()
     };
 
@@ -1486,6 +1507,7 @@ mod tests {
             // Default the unit fixtures to the single-tenant posture (today's behavior); the
             // strict-posture tests build their own strict ctx.
             strict: false,
+            priority_class_name: None,
         }
     }
 
@@ -2372,6 +2394,37 @@ mod tests {
         .entrypoint(vec!["/app/server".to_string()])
         .env(BTreeMap::from([("PORT".to_string(), "8080".to_string())]))
         .build()
+    }
+
+    #[test]
+    fn priority_tier_maps_to_a_native_priority_class_name() {
+        // The pure mapping: an operator class name → the `boatramp-<class>` PriorityClass object.
+        assert_eq!(k8s_priority_class_name("system"), "boatramp-system");
+        assert_eq!(k8s_priority_class_name("standard"), "boatramp-standard");
+        assert_eq!(k8s_priority_class_name("spot"), "boatramp-spot");
+
+        // A PlanContext carrying the mapped name sets `priorityClassName` on BOTH the generic
+        // Deployment pod and the managed-DB StatefulSet pod (delegating preemption to k8s).
+        let mut c = ctx("web-0");
+        c.priority_class_name = Some("boatramp-system".to_string());
+        let dplan = deployment_plan(&c, &generic_spec()).expect("valid deployment plan");
+        let dpod = dplan.deployment.spec.unwrap().template.spec.unwrap();
+        assert_eq!(dpod.priority_class_name.as_deref(), Some("boatramp-system"));
+
+        // And `None` leaves it unset (the cluster default applies).
+        let c2 = ctx("web-1");
+        let dplan2 = deployment_plan(&c2, &generic_spec()).expect("valid deployment plan");
+        assert!(
+            dplan2
+                .deployment
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap()
+                .priority_class_name
+                .is_none()
+        );
     }
 
     #[test]

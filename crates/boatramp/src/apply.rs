@@ -529,6 +529,10 @@ impl ApplyCompute {
             spec: self.spec.clone(),
             replicas: self.replicas,
             placement: self.placement.clone(),
+            // Manifest-declared priority is a thin follow-on; a manifest-applied workload lands
+            // on the operator default class (`standard`, rank 0). Set priority via
+            // `compute set --priority-class` for now.
+            priority: Default::default(),
         }
     }
 }

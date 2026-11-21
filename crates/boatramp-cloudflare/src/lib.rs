@@ -216,6 +216,9 @@ impl ComputeBackend for CloudflareBackend {
             persistent_volumes: false,
             max_vcpus: None,
             max_mem_mib: Some(InstanceType::Standard.mem_mib()),
+            // A DELEGATED managed platform: boatramp owns neither its capacity nor its
+            // eviction, so a cloudflare workload is never a preemptor and never a victim.
+            preemptible: false,
         }
     }
 
@@ -413,6 +416,7 @@ mod tests {
                     reference: "registry/app:1".into(),
                 },
                 redaction: Default::default(),
+                priority_class: None,
             })
             .await
             .unwrap_err();

@@ -773,6 +773,111 @@ impl PlacementConstraints {
     }
 }
 
+/// A workload's **scheduling priority** — a two-axis key carried on the MUTABLE
+/// [`ComputeWorkload`] (NEVER on the content-addressed [`ComputeSpec`]). Putting it here is
+/// deliberate: a reprioritize is a cheap pointer update, not a spec remint — if priority lived
+/// on the spec, bumping it would mint a new content hash and force a stop+relaunch of every
+/// replica (catastrophic for a running service), and it would not even BE a priority of the
+/// workload but of a frozen artifact. The two axes have different owners:
+///
+/// - **`class`** — the operator-owned, cross-tenant TIER name (`system` / `standard` / `spot`,
+///   resolved against the node's [`crate` operator catalog]). `None` ⇒ the operator default
+///   class (`standard`). A project can only request a class at or below its per-project
+///   CEILING (default `standard`); the server refuses a request above it fail-closed, so a
+///   tenant can never self-assign `system`. The class decides preemption AUTHORITY across
+///   tenants.
+/// - **`rank`** — a tenant-owned `i32` that orders a tenant's OWN workloads only. Because the
+///   global placement comparator sorts by `operator_tier → project → rank → name`, a tenant's
+///   huge `rank` reshuffles only its own workloads and can NEVER leapfrog another project — the
+///   fairness boundary is the key ORDERING, not a runtime check.
+///
+/// `min_available` is the PodDisruptionBudget-equivalent: preemption refuses to drop a victim
+/// workload below this many running replicas (a HARD floor within its own project/tier; only
+/// ADVISORY to a strictly-higher operator tier, so a `system` workload can still displace a
+/// node-hogging `spot`/`standard` rather than deadlock). `None` ⇒ the class-derived default.
+///
+/// An existing stored workload (written before this field) deserializes to the all-default
+/// `Priority` — class `None` (⇒ operator default `standard`), rank `0`, no `min_available` — so
+/// turning the feature on changes the relative order of NOTHING and evicts NOTHING on upgrade
+/// (the least-surprise invariant). `#[non_exhaustive]`: construct via [`Priority::new`] +
+/// `with_*` so a future axis stays non-breaking.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Priority {
+    /// The operator-owned cross-tenant class/tier NAME. `None` ⇒ the operator default class
+    /// (`standard`). A project may only name a class at or below its ceiling; the server
+    /// refuses a higher one fail-closed at `compute set`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// The tenant-owned rank — orders a tenant's OWN workloads only (higher wins). `0` default.
+    /// Because `project` outranks `rank` in the global comparator, it can never leapfrog
+    /// another project.
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    pub rank: i32,
+    /// The minimum running replicas preemption must leave this workload — the PDB-equivalent
+    /// floor. `None` ⇒ the class-derived default (`spot`→0, `standard`/`system`→protected at
+    /// `replicas`). HARD within-project/same-tier; ADVISORY to a strictly-higher operator tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_available: Option<u32>,
+}
+
+/// Omit a zero `rank` from the serialized workload (back-compat: an existing workload stays
+/// byte-identical, schema v1).
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
+}
+
+impl Priority {
+    /// The all-default priority: operator default class (`None` ⇒ `standard`), rank 0, no
+    /// explicit `min_available`. The value every pre-feature workload deserializes to.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the operator-owned class/tier name (`None` ⇒ the operator default).
+    #[must_use]
+    pub fn with_class(mut self, class: Option<String>) -> Self {
+        self.class = class;
+        self
+    }
+
+    /// Set the tenant-owned rank (orders the tenant's own workloads only).
+    #[must_use]
+    pub fn with_rank(mut self, rank: i32) -> Self {
+        self.rank = rank;
+        self
+    }
+
+    /// Set the minimum-available floor (`None` ⇒ the class-derived default).
+    #[must_use]
+    pub fn with_min_available(mut self, min_available: Option<u32>) -> Self {
+        self.min_available = min_available;
+        self
+    }
+
+    /// The requested class name, or `None` for the operator default.
+    pub fn class(&self) -> Option<&str> {
+        self.class.as_deref()
+    }
+
+    /// The tenant rank.
+    pub fn rank(&self) -> i32 {
+        self.rank
+    }
+
+    /// The explicit `min_available` floor, if any.
+    pub fn min_available(&self) -> Option<u32> {
+        self.min_available
+    }
+
+    /// Whether this is the all-default priority — used to omit it from the serialized workload
+    /// so an existing record stays byte-identical (schema v1, zero churn on upgrade).
+    pub fn is_default(&self) -> bool {
+        self.class.is_none() && self.rank == 0 && self.min_available.is_none()
+    }
+}
+
 /// The mutable desired state for a workload (`compute/<name>`): the active spec
 /// version, replica count, and placement. Activation is a pointer flip to a new
 /// spec hash — the same atomic, roll-back-able model as a site deployment.
@@ -791,6 +896,13 @@ pub struct ComputeWorkload {
     /// Placement constraints.
     #[serde(default)]
     pub placement: PlacementConstraints,
+    /// Scheduling [`Priority`] — the operator class/tier + tenant rank + min-available floor.
+    /// A cheap pointer update (never a spec remint). Omitted from the wire when all-default, so
+    /// an existing stored workload stays byte-identical and deserializes to the default
+    /// (`standard`, rank 0) — zero churn/eviction on upgrade. `#[serde(default)]` keeps older
+    /// records (no field) deserializing — schema stays v1.
+    #[serde(default, skip_serializing_if = "Priority::is_default")]
+    pub priority: Priority,
 }
 
 /// The default replica count for a workload (1) — a service runs one replica
@@ -819,6 +931,12 @@ pub struct PutComputeRequest {
     /// Placement constraints.
     #[serde(default)]
     pub placement: PlacementConstraints,
+    /// Scheduling [`Priority`] carried onto the stored [`ComputeWorkload`] (NOT the
+    /// content-addressed spec). The server validates the requested `class` against the
+    /// project's ceiling fail-closed before storing it. Omitted when all-default (back-compat:
+    /// an older client/server never sees the field).
+    #[serde(default, skip_serializing_if = "Priority::is_default")]
+    pub priority: Priority,
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,6 +1257,38 @@ impl ApplyDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workload_without_priority_deserializes_to_default_and_omits_it_on_the_wire() {
+        // An existing stored workload (pre-priority) has no `priority` field — it must
+        // deserialize to the all-default Priority (class None ⇒ standard, rank 0), so turning
+        // the feature on reorders/evicts nothing.
+        let json = r#"{"version":1,"name":"w","active":"h","replicas":2}"#;
+        let wl: ComputeWorkload = serde_json::from_str(json).expect("back-compat deserialize");
+        assert!(wl.priority.is_default());
+        assert_eq!(wl.priority.class(), None);
+        assert_eq!(wl.priority.rank(), 0);
+        // A default-priority workload re-serializes WITHOUT a `priority` field (schema stays v1,
+        // byte-identical to the pre-feature record).
+        let out = serde_json::to_string(&wl).unwrap();
+        assert!(
+            !out.contains("priority"),
+            "default priority is omitted: {out}"
+        );
+
+        // A non-default priority round-trips.
+        let mut wl2 = wl.clone();
+        wl2.priority = Priority::new()
+            .with_class(Some("spot".into()))
+            .with_rank(-5)
+            .with_min_available(Some(1));
+        let s = serde_json::to_string(&wl2).unwrap();
+        assert!(s.contains("spot") && s.contains("-5"));
+        let back: ComputeWorkload = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.priority.class(), Some("spot"));
+        assert_eq!(back.priority.rank(), -5);
+        assert_eq!(back.priority.min_available(), Some(1));
+    }
 
     fn spec() -> ComputeSpec {
         ComputeSpec {

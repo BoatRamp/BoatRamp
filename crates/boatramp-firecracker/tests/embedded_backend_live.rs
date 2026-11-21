@@ -135,6 +135,7 @@ async fn launches_pings_and_stops_a_microvm() {
             kernel_path: kernel,
         },
         redaction: Default::default(),
+        priority_class: None,
     };
 
     let instance = backend.launch(&req).await.expect("launch replica");
@@ -276,6 +277,7 @@ async fn serves_an_oci_workload_end_to_end() {
             kernel_path: kernel,
         },
         redaction: Default::default(),
+        priority_class: None,
     };
 
     let instance = backend.launch(&req).await.expect("launch replica");
@@ -394,6 +396,7 @@ async fn serves_a_shell_less_scratch_image() {
             kernel_path: kernel,
         },
         redaction: Default::default(),
+        priority_class: None,
     };
 
     let instance = backend.launch(&req).await.expect("launch replica");
@@ -514,6 +517,7 @@ async fn snapshots_and_restores_a_serving_workload() {
             kernel_path: kernel,
         },
         redaction: Default::default(),
+        priority_class: None,
     };
 
     let cleanup = || {
@@ -676,6 +680,7 @@ async fn persistent_volume_survives_a_restart() {
             kernel_path: kernel,
         },
         redaction: Default::default(),
+        priority_class: None,
     };
 
     let cleanup = || {

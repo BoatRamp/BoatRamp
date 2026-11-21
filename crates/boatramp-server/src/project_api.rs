@@ -466,6 +466,7 @@ mod tests {
                     active: hash,
                     replicas: 1,
                     placement: PlacementConstraints::default(),
+                    priority: Default::default(),
                 },
             )
             .await

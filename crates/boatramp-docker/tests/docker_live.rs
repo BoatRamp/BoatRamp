@@ -46,6 +46,7 @@ async fn docker_round_trip() {
         spec: spec.clone(),
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let instance = backend.launch(&req).await.expect("launch");
     assert_eq!(
@@ -161,6 +162,7 @@ async fn docker_per_project_network_dns_and_cross_project_isolation() {
             spec: spec.clone(),
             artifact,
             redaction: Default::default(),
+            priority_class: None,
         };
         backend.launch(&req).await.expect("launch")
     }
@@ -319,6 +321,7 @@ async fn docker_resolves_long_managed_db_workload_by_short_alias() {
             spec: spec.clone(),
             artifact,
             redaction: Default::default(),
+            priority_class: None,
         };
         backend.launch(&req).await.expect("launch")
     }
@@ -431,6 +434,7 @@ async fn docker_recreate_on_spec_change_replaces_container_and_reattaches_projec
             spec: spec.clone(),
             artifact,
             redaction: Default::default(),
+            priority_class: None,
         };
         backend.launch(&req).await.expect("launch")
     }
@@ -791,6 +795,7 @@ async fn docker_reconcile_heals_a_producer_carrying_a_stale_managed_db_alias_on_
             spec: spec.clone(),
             artifact,
             redaction: Default::default(),
+            priority_class: None,
         };
         backend.launch(&req).await.expect("launch")
     }
@@ -1083,6 +1088,7 @@ async fn docker_stale_unscoped_bridge_is_upgraded_on_relaunch_and_a_live_network
             spec: spec.clone(),
             artifact,
             redaction: Default::default(),
+            priority_class: None,
         };
         backend.launch(&req).await.expect("launch")
     }
@@ -1469,6 +1475,7 @@ async fn docker_log_forwarding_to_the_shared_sink() {
         spec: spec.clone(),
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let instance = backend.launch(&req).await.expect("launch");
 
@@ -1599,6 +1606,7 @@ async fn docker_log_redaction_to_the_shared_sink() {
         spec: spec.clone(),
         artifact,
         redaction,
+        priority_class: None,
     };
     let instance = backend.launch(&req).await.expect("launch");
 

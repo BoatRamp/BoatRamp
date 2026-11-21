@@ -325,6 +325,8 @@ impl ComputeBackend for VzBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            // Directly scheduled against the node ledger — a preemption participant.
+            preemptible: true,
         }
     }
 
@@ -665,6 +667,7 @@ mod tests {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            preemptible: true,
         };
         assert!(caps.isolation.is_strong());
         assert!(caps.scale_to_zero);

@@ -1169,6 +1169,48 @@ pub(super) async fn get_compute(
 /// is the shared [`boatramp_core::compute::PutComputeRequest`] (re-exported from
 /// `boatramp-types`), so the `apply` manifest client parses the SAME type: no
 /// duplicated schema between the server and the CLI.
+/// Query params on `PUT /api/compute/:name`. `dry_run=true` computes + returns the priority
+/// PREEMPTION PREVIEW (the tenant-redacted potential blast radius) WITHOUT storing anything.
+#[derive(Deserialize, Default)]
+pub(super) struct PutComputeParams {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// The tenant-facing PREEMPTION PREVIEW returned for `compute set --dry-run`: the resolved
+/// priority, the SAME-project replicas this priority could evict (named — the tenant owns them),
+/// and an AGGREGATE of the cross-project impact (counts + freed capacity, NEVER another tenant's
+/// identity). Computed from PERSISTED state; the note explains that the live eviction set depends
+/// on the leader's current capacity ledger (preemption only triggers under real contention).
+#[derive(Serialize)]
+struct PreemptionPreview {
+    resolved_class: String,
+    resolved_tier: i32,
+    ceiling: String,
+    /// Same-project replicas this priority could preempt (named).
+    same_project_evicts: Vec<PreviewVictim>,
+    /// Aggregate cross-project impact (no identities).
+    cross_project: CrossProjectImpact,
+    note: String,
+}
+
+#[derive(Serialize)]
+struct PreviewVictim {
+    workload: String,
+    replica: u32,
+    node: u64,
+    vcpus: u32,
+    mem_mib: u32,
+}
+
+#[derive(Serialize, Default)]
+struct CrossProjectImpact {
+    candidate_replicas: usize,
+    projects: usize,
+    freed_vcpus: u32,
+    freed_mem_mib: u32,
+}
+
 #[derive(Serialize)]
 struct PutComputeResponse {
     /// The content hash of the stored spec (`computever/<hash>`).
@@ -1187,6 +1229,7 @@ pub(super) async fn put_compute(
     Extension(daemon): Extension<Arc<DaemonRuntime>>,
     Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PutComputeParams>,
     Json(mut request): Json<PutComputeRequest>,
 ) -> Response {
     if let Some(resp) = reject_invalid_name("compute", &name) {
@@ -1285,6 +1328,39 @@ pub(super) async fn put_compute(
         tracing::warn!(workload = %name, image = %reference, pull_policy = ?request.spec.pull_policy, "{msg}");
         warnings.push(msg);
     }
+    // PRIORITY-CLASS CEILING gate (v0.70.0). A tenant may only request a class at or below its
+    // project ceiling — the operator-gated cap (default `standard`, so `system` is reserved).
+    // Fail CLOSED: refuse a class above the ceiling (or an unknown class) with a message naming
+    // the allowed maximum, BEFORE storing anything. The ceiling lives on the SAME per-project
+    // operator record as the backend policy (`priority_ceiling`); an unreadable record fails
+    // closed to the node default ceiling (never a silent grant of a higher class). The catalog
+    // is the built-in owner-set `system`/`standard`/`spot` tiers.
+    let catalog = boatramp_core::compute::PriorityClassCatalog::builtin();
+    let ceiling: Option<String> = match deploy.get_project_backend_policy(project.as_ref()).await {
+        Ok(p) => p.and_then(|pp| pp.priority_ceiling),
+        // Policy read failed → fall back to the node default ceiling (fail-closed: the default
+        // is `standard`, so this never widens what a project may request).
+        Err(_) => None,
+    };
+    if let Err(msg) = catalog.check_request(request.priority.class(), ceiling.as_deref()) {
+        return (StatusCode::BAD_REQUEST, format!("{msg}\n")).into_response();
+    }
+    // DRY-RUN: preview the preemption blast radius without storing. Computed from persisted
+    // state — the SET of replicas this priority COULD preempt under the tenancy boundary.
+    // Same-project victims are named (the tenant owns them); cross-project impact is an aggregate
+    // (no other-tenant identity). The LIVE eviction set depends on the leader's capacity ledger
+    // (preemption only triggers under real contention); the note says so.
+    if params.dry_run {
+        return compute_priority_dry_run(
+            &deploy,
+            &catalog,
+            project.as_ref().as_str(),
+            &name,
+            &request,
+            ceiling.as_deref(),
+        )
+        .await;
+    }
     let spec_hash = match deploy.put_compute_spec(&request.spec).await {
         Ok(hash) => hash,
         Err(err) => return deploy_error_response(err),
@@ -1295,6 +1371,7 @@ pub(super) async fn put_compute(
         active: spec_hash.clone(),
         replicas: request.replicas,
         placement: request.placement,
+        priority: request.priority,
     };
     match deploy
         .set_compute_workload(project.as_ref(), &workload)
@@ -1310,6 +1387,94 @@ pub(super) async fn put_compute(
             .into_response(),
         Err(err) => deploy_error_response(err),
     }
+}
+
+/// Whether a backend id is one boatramp directly schedules against the node ledger (so its
+/// replicas are preemption participants). A server-side APPROXIMATION of `Capabilities::preemptible`
+/// for the dry-run preview (the handler has no live backend-capability view): the DELEGATED
+/// backends (`cloudflare` / `kubernetes`) are not preemptible; everything else is.
+fn preview_backend_preemptible(backend: &str) -> bool {
+    !matches!(backend, "cloudflare" | "kubernetes")
+}
+
+/// Compute the tenant-facing [`PreemptionPreview`] for `compute set --dry-run` from PERSISTED
+/// state: the SET of replicas the proposed priority COULD preempt under the tenancy boundary.
+/// Same-project victims are named; cross-project impact is aggregated (no other-tenant identity).
+async fn compute_priority_dry_run(
+    deploy: &DeployStore,
+    catalog: &boatramp_core::compute::PriorityClassCatalog,
+    viewer_project: &str,
+    name: &str,
+    request: &PutComputeRequest,
+    ceiling: Option<&str>,
+) -> Response {
+    use boatramp_core::compute::{Readiness, ReplicaPhase};
+    let (class_name, class) = catalog.resolve(&request.priority);
+    let all = match deploy.list_compute_workloads_all().await {
+        Ok(w) => w,
+        Err(err) => return deploy_error_response(err),
+    };
+    let mut same: Vec<PreviewVictim> = Vec::new();
+    let mut cross = CrossProjectImpact::default();
+    let mut cross_projects: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (vproj, vwl) in &all {
+        // Skip the proposed workload itself.
+        if vproj == viewer_project && vwl.name == name {
+            continue;
+        }
+        if !catalog.may_preempt(&request.priority, viewer_project, &vwl.priority, vproj) {
+            continue;
+        }
+        // The victim's per-replica sizing (for the freed-capacity aggregate).
+        let (vcpus, mem_mib) = match deploy.get_compute_spec(&vwl.active).await {
+            Ok(Some(s)) => (s.vcpus.max(1), s.mem_mib.max(1)),
+            _ => (1, 1024),
+        };
+        let pref = boatramp_core::project::ProjectRef::new(vproj);
+        let states = match deploy.list_replica_states(pref, &vwl.name).await {
+            Ok(s) => s,
+            Err(_) => continue, // best-effort preview
+        };
+        for st in states.iter().filter(|s| {
+            s.phase == ReplicaPhase::Running
+                && !matches!(
+                    s.readiness,
+                    Readiness::LaunchFailed { .. } | Readiness::Preempted { .. }
+                )
+                && preview_backend_preemptible(&s.backend)
+        }) {
+            if vproj == viewer_project {
+                same.push(PreviewVictim {
+                    workload: vwl.name.clone(),
+                    replica: st.handle.replica,
+                    node: st.node,
+                    vcpus,
+                    mem_mib,
+                });
+            } else {
+                cross.candidate_replicas += 1;
+                cross.freed_vcpus = cross.freed_vcpus.saturating_add(vcpus);
+                cross.freed_mem_mib = cross.freed_mem_mib.saturating_add(mem_mib);
+                cross_projects.insert(vproj.clone());
+            }
+        }
+    }
+    cross.projects = cross_projects.len();
+    let preview = PreemptionPreview {
+        resolved_class: class_name.to_string(),
+        resolved_tier: class.tier,
+        ceiling: ceiling
+            .unwrap_or_else(|| catalog.default_ceiling())
+            .to_string(),
+        same_project_evicts: same,
+        cross_project: cross,
+        note: "potential blast radius computed from persisted state; the LIVE eviction set \
+               depends on the leader's current capacity ledger — preemption only triggers under \
+               real contention, and dry-run-before-evict never evicts a replica the preemptor \
+               cannot use"
+            .to_string(),
+    };
+    (StatusCode::OK, Json(preview)).into_response()
 }
 
 /// WS5 drain grace window (PLAN-managed-dependency-readiness): how long `delete_compute`
@@ -2701,6 +2866,9 @@ fn readiness_to_json(readiness: Option<&boatramp_core::compute::Readiness>) -> s
         }
         Some(Readiness::LaunchFailed { reason }) => {
             serde_json::json!({ "state": "launch_failed", "reason": reason })
+        }
+        Some(Readiness::Preempted { by, .. }) => {
+            serde_json::json!({ "state": "preempted", "reason": by })
         }
         Some(Readiness::Provisioned) => serde_json::json!({ "state": "provisioned" }),
         Some(Readiness::ServiceReady) => serde_json::json!({ "state": "service_ready" }),
@@ -4933,10 +5101,18 @@ struct ReplicaStatusView {
     /// from `healthy` (runner/TCP-level) — a `launch_failed` replica never started at all,
     /// so this is the signal that turns a once-silent launch failure into a visible one.
     readiness: String,
-    /// The short failure reason for a `provision_failed` / `launch_failed` replica (the
-    /// backend error for a launch failure); absent otherwise. Carries no credential material.
+    /// The short failure reason for a `provision_failed` / `launch_failed` / `preempted`
+    /// replica (the backend error for a launch failure; the preemptor attribution, tenant-
+    /// redacted, for a preemption); absent otherwise. Carries no credential material.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// The workload's priority CLASS name (`system`/`standard`/`spot`); `None` when the
+    /// workload is unknown to the join (best-effort). Powers the `compute status` PRI column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority_class: Option<String>,
+    /// The workload's resolved priority TIER (higher = stronger); `None` when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority_tier: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at: Option<u64>,
     /// Seconds since launch (`now - started_at`); `None` for older/restored records.
@@ -4945,9 +5121,27 @@ struct ReplicaStatusView {
 }
 
 impl ReplicaStatusView {
-    fn of(o: &boatramp_core::compute::ObservedInstance, now: u64) -> Self {
-        let (readiness, reason) = readiness_label(&o.readiness);
+    /// Build a view, redacting a cross-tenant `preempted` reason for `viewer_project` (a tenant
+    /// scope; `None` = operator) and joining the owning workload's `priority` (class + tier) via
+    /// `priority`, resolved against the built-in class `catalog`.
+    fn of(
+        o: &boatramp_core::compute::ObservedInstance,
+        now: u64,
+        viewer_project: Option<&str>,
+        priority: Option<&boatramp_core::compute::Priority>,
+        catalog: &boatramp_core::compute::PriorityClassCatalog,
+    ) -> Self {
+        let (readiness, reason) = readiness_label(&o.readiness, viewer_project);
+        let (priority_class, priority_tier) = match priority {
+            Some(p) => {
+                let (name, class) = catalog.resolve(p);
+                (Some(name.to_string()), Some(class.tier))
+            }
+            None => (None, None),
+        };
         Self {
+            priority_class,
+            priority_tier,
             project: o.handle.project.clone(),
             workload: o.handle.workload.clone(),
             replica: o.handle.replica,
@@ -4975,8 +5169,17 @@ impl ReplicaStatusView {
 /// Map a replica's [`Readiness`](boatramp_core::compute::Readiness) to the `(state, reason)`
 /// pair `compute status` renders per replica. The `state` token matches the one
 /// [`readiness_to_json`] uses for `db status`, so the two surfaces speak the same vocabulary;
-/// `reason` is set only for the two failure states.
-fn readiness_label(r: &boatramp_core::compute::Readiness) -> (String, Option<String>) {
+/// `reason` is set only for the failure/preempted states.
+///
+/// `viewer_project` drives TENANT REDACTION of a `preempted` reason: `None` is the operator
+/// (node-global) view — it NAMES the preemptor; `Some(p)` is a project-scoped (tenant) view —
+/// a CROSS-tenant preemptor (its project != `p`) is redacted to a non-identifying aggregate, so
+/// a tenant never learns which other tenant's workload outbid it. A same-project preemptor is
+/// named (the tenant owns both sides).
+fn readiness_label(
+    r: &boatramp_core::compute::Readiness,
+    viewer_project: Option<&str>,
+) -> (String, Option<String>) {
     use boatramp_core::compute::Readiness;
     match r {
         Readiness::Starting => ("starting".to_string(), None),
@@ -4986,6 +5189,21 @@ fn readiness_label(r: &boatramp_core::compute::Readiness) -> (String, Option<Str
             ("provision_failed".to_string(), Some(reason.clone()))
         }
         Readiness::LaunchFailed { reason } => ("launch_failed".to_string(), Some(reason.clone())),
+        Readiness::Preempted {
+            by,
+            preemptor_project,
+            ..
+        } => {
+            let reason = match viewer_project {
+                // Tenant view + a cross-tenant preemptor → redact to an aggregate.
+                Some(vp) if vp != preemptor_project => {
+                    "preempted by a higher-priority workload".to_string()
+                }
+                // Operator view, or a same-project preemptor → name it.
+                _ => format!("preempted by {by}"),
+            };
+            ("preempted".to_string(), Some(reason))
+        }
     }
 }
 
@@ -5026,9 +5244,32 @@ pub(super) async fn compute_status(
                 ))
             });
             let now = boatramp_core::time::now_unix();
+            let catalog = boatramp_core::compute::PriorityClassCatalog::builtin();
+            // Join each replica to its workload's priority (class + tier) for the PRI column.
+            // Best-effort: a failed/absent listing just leaves the join empty (no PRI shown).
+            let priorities: std::collections::BTreeMap<
+                (String, String),
+                boatramp_core::compute::Priority,
+            > = deploy
+                .list_compute_workloads_all()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(proj, wl)| ((proj, wl.name.clone()), wl.priority))
+                .collect();
+            // Tenant view (project-scoped) redacts a cross-tenant preemptor; operator view names it.
+            let viewer: Option<&str> = if project_scoped.is_some() {
+                Some(project.as_ref().as_str())
+            } else {
+                None
+            };
             let views: Vec<ReplicaStatusView> = states
                 .iter()
-                .map(|o| ReplicaStatusView::of(o, now))
+                .map(|o| {
+                    let pri =
+                        priorities.get(&(o.handle.project.clone(), o.handle.workload.clone()));
+                    ReplicaStatusView::of(o, now, viewer, pri, &catalog)
+                })
                 .collect();
             Json(views).into_response()
         }
@@ -5077,7 +5318,13 @@ pub(super) async fn compute_set_health(
         return deploy_error_response(err);
     }
     let now = boatramp_core::time::now_unix();
-    (StatusCode::OK, Json(ReplicaStatusView::of(&target, now))).into_response()
+    // Operator-only escape hatch (System·Admin): no tenant redaction, no priority join.
+    let catalog = boatramp_core::compute::PriorityClassCatalog::builtin();
+    (
+        StatusCode::OK,
+        Json(ReplicaStatusView::of(&target, now, None, None, &catalog)),
+    )
+        .into_response()
 }
 
 /// One IP → the replica(s) that claim it, drawn from the persisted observed state.
@@ -7693,6 +7940,7 @@ mod tests {
                     active: "0".repeat(64),
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7744,6 +7992,7 @@ mod tests {
                     active: "0".repeat(64),
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await

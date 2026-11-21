@@ -669,6 +669,7 @@ async fn provision_single(
         active: spec_id,
         replicas: 1,
         placement: PlacementConstraints::default(),
+        priority: Default::default(),
     };
     deploy
         .set_compute_workload(proj, &wl)
@@ -3798,6 +3799,7 @@ mod tests {
                 persistent_volumes: true,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(

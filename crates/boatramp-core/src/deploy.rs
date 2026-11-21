@@ -7677,6 +7677,7 @@ mod tests {
             active: hash.clone(),
             replicas: 3,
             placement: PlacementConstraints::default(),
+            priority: Default::default(),
         };
         s.set_compute_workload(ProjectRef::DEFAULT, &workload)
             .await
@@ -8593,6 +8594,7 @@ mod tests {
                     active: hash,
                     replicas: 1,
                     placement: PlacementConstraints::default(),
+                    priority: Default::default(),
                 },
             )
             .await
