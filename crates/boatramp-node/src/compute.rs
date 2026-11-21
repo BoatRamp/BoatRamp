@@ -404,8 +404,16 @@ pub async fn build_compute(
 
     // Install the operator's registry-pull timeouts (U30) so a dead/stalling registry fails the
     // pull in bounded time instead of hanging every launch behind it. Unset ⇒ the built-in
-    // defaults (10s connect / 30s idle / 120s overall on the small control-plane requests).
+    // defaults (10s connect / 30s idle / 120s overall on the small control-plane requests /
+    // 600s overall wall-clock deadline on the whole pull — the last bounds a slow-drip registry
+    // that would otherwise freeze the serial reconcile loop, a cross-tenant DoS).
     boatramp_firecracker::oci::install_registry_pull_timeouts(cfg.registry_pull_timeouts);
+
+    // Install the operator's registry-pull byte ceilings (Security HIGH follow-up) so a
+    // malicious registry cannot exhaust node memory/disk by streaming an oversize body — each
+    // blob is aborted mid-download past its cap. Unset ⇒ the built-in defaults (10 GiB per blob /
+    // 20 GiB per image), generous enough that no real image is refused.
+    boatramp_firecracker::oci::install_registry_pull_limits(cfg.registry_pull_limits);
 
     // Compute-backend selection (mailroom #26): the `kubernetes` backend is used when it
     // is explicitly pinned (`[compute].backend = "kubernetes"`) OR auto-detected
