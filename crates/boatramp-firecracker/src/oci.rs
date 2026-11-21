@@ -849,10 +849,14 @@ impl reqwest::dns::Resolve for ScreeningResolver {
 //
 // Byte ceilings ([`RegistryPullLimits`], enforced DURING the read, never after — so an oversize
 // body is aborted mid-stream, never buffered whole):
-//   * each blob is capped at `min(its manifest-declared size, max_layer_bytes)` — a layer that
-//     streams past its own declared size is malformed and aborted; the operator ceiling backstops
-//     a registry that declares (or omits) an implausible size.
+//   * each LAYER blob is capped at `min(its manifest-declared size, max_layer_bytes)` — a layer
+//     that streams past its own declared size is malformed and aborted; the operator ceiling
+//     backstops a registry that declares (or omits) an implausible size.
 //   * `max_image_bytes` caps the running total across all layers (the whole image).
+//   * each MANIFEST/CONFIG read ([`manifest_cap`]) is capped by the much tighter `max_manifest_bytes`
+//     (default 32 MiB), not the generous layer ceiling: these are KB-scale JSON documents held in
+//     MEMORY, and a manifest declares no size of its own, so without this they would be bounded only
+//     by `max_layer_bytes` (10 GiB).
 // Layers are STREAMED to a temp file as they download (and the tarball dropped right after it is
 // overlaid), so node memory stays O(one chunk) instead of buffering every layer in a `Vec<Vec<u8>>`.
 
@@ -883,6 +887,15 @@ const DEFAULT_PULL_MAX_LAYER_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// image whose individual layers each sit under the per-blob cap. 20 GiB is above any realistic
 /// compressed image. `0` ⇒ no whole-image ceiling.
 const DEFAULT_PULL_MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Default byte ceiling for a MANIFEST or CONFIG read — both small JSON documents buffered in
+/// MEMORY (not streamed to disk like a layer). A manifest declares no `size` of its own, so
+/// without a dedicated ceiling it is bounded only by the generous per-layer `max_layer_bytes`
+/// (10 GiB) — far too loose for a KB-scale document. 32 MiB is generous (no real manifest/config
+/// — a fat multi-arch index, an attestation/SBOM manifest, a config with a long `history` — comes
+/// anywhere near it) yet ~320× tighter than the layer ceiling. `0` ⇒ no manifest/config ceiling
+/// (the config's own declared size still caps it; a size-undeclared manifest is then bounded only
+/// by the pull timeouts/deadline).
+const DEFAULT_PULL_MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Operator-tunable timeouts bounding a registry pull (U30) — the value of
 /// `[compute].registry_pull_timeouts`. Node operator config (System·Admin), NEVER
@@ -1016,6 +1029,14 @@ pub struct RegistryPullLimits {
     /// many-layer image that would exceed it even though each layer is individually under the
     /// per-blob cap. `0` ⇒ no whole-image ceiling. Default 20 GiB.
     pub max_image_bytes: u64,
+    /// Manifest/config ceiling, bytes — the max a single MANIFEST or CONFIG read may download.
+    /// Unlike a layer these are small JSON documents buffered in MEMORY, so this is a far tighter
+    /// cap than `max_layer_bytes`: a manifest declares no `size`, so without it the manifest read
+    /// is bounded only by the generous 10 GiB layer ceiling. A read past `min(this, the config's
+    /// declared size)` is aborted mid-download. `0` ⇒ no manifest/config ceiling (the config's
+    /// declared size still caps it; a size-undeclared manifest is then bounded only by the pull
+    /// timeouts/deadline). Default 32 MiB.
+    pub max_manifest_bytes: u64,
 }
 
 impl RegistryPullLimits {
@@ -1023,6 +1044,7 @@ impl RegistryPullLimits {
     const DEFAULT: Self = Self {
         max_layer_bytes: DEFAULT_PULL_MAX_LAYER_BYTES,
         max_image_bytes: DEFAULT_PULL_MAX_IMAGE_BYTES,
+        max_manifest_bytes: DEFAULT_PULL_MAX_MANIFEST_BYTES,
     };
 
     /// `v` bytes as a ceiling, or `None` when `v == 0` (ceiling disabled).
@@ -1066,6 +1088,22 @@ fn registry_pull_limits() -> RegistryPullLimits {
 /// apply). A blob whose running byte count exceeds this is aborted DURING the read.
 fn blob_cap(declared_size: Option<u64>) -> Option<u64> {
     let operator = RegistryPullLimits::cap(registry_pull_limits().max_layer_bytes);
+    match (declared_size.filter(|&s| s > 0), operator) {
+        (Some(declared), Some(op)) => Some(declared.min(op)),
+        (declared, op) => declared.or(op),
+    }
+}
+
+/// The effective byte cap for a MANIFEST or CONFIG read — both small JSON documents buffered in
+/// memory (not streamed to disk like a layer), so bounded by the TIGHT `max_manifest_bytes`
+/// ceiling rather than the generous per-layer `max_layer_bytes`, tightened further by the blob's
+/// own manifest-declared `size` when it has one (a manifest declares none). `None` ⇒
+/// `max_manifest_bytes` is disabled AND the blob declares no size ⇒ the read is uncapped in
+/// memory (bounded then only by the pull timeouts/deadline). A read whose running byte count
+/// exceeds this is aborted DURING the read, same as [`blob_cap`]. Mirrors [`blob_cap`] but reads
+/// the manifest/config ceiling instead of the layer ceiling.
+fn manifest_cap(declared_size: Option<u64>) -> Option<u64> {
+    let operator = RegistryPullLimits::cap(registry_pull_limits().max_manifest_bytes);
     match (declared_size.filter(|&s| s > 0), operator) {
         (Some(declared), Some(op)) => Some(declared.min(op)),
         (declared, op) => declared.or(op),
@@ -1461,9 +1499,9 @@ async fn fetch_manifest(
     expect: Option<&str>,
 ) -> Result<serde_json::Value, OciError> {
     // A manifest is small → cap it with the overall per-request timeout (U30) AND stream it under
-    // the per-blob byte ceiling, so a malicious registry cannot OOM the node by streaming an
-    // unbounded body in place of a manifest (the operator ceiling backstops; a manifest declares
-    // no size of its own).
+    // the TIGHT manifest/config byte ceiling, so a malicious registry cannot OOM the node by
+    // streaming an unbounded body in place of a manifest (a manifest declares no size of its own,
+    // so `max_manifest_bytes` — not the generous 10 GiB layer ceiling — is what bounds it).
     let resp = get_authed(
         client,
         url,
@@ -1479,7 +1517,7 @@ async fn fetch_manifest(
         )));
     }
     let mut bytes: Vec<u8> = Vec::new();
-    stream_body(resp, blob_cap(None), None, "manifest", &mut bytes).await?;
+    stream_body(resp, manifest_cap(None), None, "manifest", &mut bytes).await?;
     if let Some(d) = expect {
         verify_digest(&bytes, d)?;
     }
@@ -1487,10 +1525,12 @@ async fn fetch_manifest(
 }
 
 /// Fetch + verify a SMALL blob (the image config) by `digest` from `base`, into memory. The
-/// body is streamed under `blob_cap(declared_size)` (aborted mid-read if it exceeds the cap, so
-/// a registry cannot OOM the node by streaming an unbounded body under a tiny declared size) and
-/// verified against `digest` via [`verify_digest`], which fails closed on an unknown algorithm.
-/// Used only for the config blob; layer blobs stream to disk via [`fetch_layer_to_file`].
+/// body is streamed under `manifest_cap(declared_size)` — the TIGHT manifest/config ceiling, not
+/// the generous per-layer one (a config is a KB-scale JSON document) — aborted mid-read if it
+/// exceeds the cap, so a registry cannot OOM the node by streaming an unbounded body under a tiny
+/// declared size, and verified against `digest` via [`verify_digest`], which fails closed on an
+/// unknown algorithm. Used only for the config blob; layer blobs stream to disk via
+/// [`fetch_layer_to_file`].
 async fn fetch_blob(
     client: &reqwest::Client,
     base: &str,
@@ -1509,7 +1549,7 @@ async fn fetch_blob(
     let mut bytes: Vec<u8> = Vec::new();
     stream_body(
         resp,
-        blob_cap(declared_size),
+        manifest_cap(declared_size),
         None,
         "config blob",
         &mut bytes,
@@ -1615,8 +1655,17 @@ async fn apply_image_layers_in(
 /// is already staged (layers cached), so a bare `pg_dump`/`pg_restore`/`psql` resolves
 /// against the image's own `PATH` instead of failing with `127`. Network seam.
 pub async fn pull_image_config(image: &str) -> Result<ImageConfig, OciError> {
-    let mut r = resolve_manifest(image).await?;
-    parse_image_config(&mut r).await
+    // Bound the WHOLE config-only network fetch (manifest resolve + the small config blob) by the
+    // operator overall wall-clock deadline, exactly as `build_rootfs`/`build_rootfs_dir` bound the
+    // layer pulls. Without this, a registry drip-feeding bytes just under the idle `read_secs` on
+    // the manifest or config response holds THIS path — and the serial reconcile loop awaiting it —
+    // open indefinitely, the same cross-tenant DoS the layer deadline closes. It downloads no
+    // layers, so the wrap is a plain span around the two small fetches.
+    with_pull_deadline(async {
+        let mut r = resolve_manifest(image).await?;
+        parse_image_config(&mut r).await
+    })
+    .await
 }
 
 /// Fetch + parse the image config blob into an [`ImageConfig`].
@@ -3065,20 +3114,23 @@ mod tests {
         let def = RegistryPullLimits::default();
         assert_eq!(def.max_layer_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(def.max_image_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(def.max_manifest_bytes, 32 * 1024 * 1024);
         // `cap` maps a byte count → ceiling; `0` disables it.
         assert_eq!(RegistryPullLimits::cap(123), Some(123));
         assert_eq!(RegistryPullLimits::cap(0), None);
 
-        // With a 1 KiB operator per-blob ceiling installed, `blob_cap` is the TIGHTER of the
-        // declared size and the operator ceiling — and falls back to whichever is set.
+        // With a 1 KiB per-LAYER ceiling and a distinct 2 KiB per-MANIFEST ceiling installed,
+        // `blob_cap` reads the layer knob and `manifest_cap` reads the manifest knob — each is the
+        // TIGHTER of the declared size and its own operator ceiling (the two paths are decoupled).
         install_registry_pull_limits(RegistryPullLimits {
             max_layer_bytes: 1024,
             max_image_bytes: 0, // whole-image ceiling disabled
+            max_manifest_bytes: 2048,
         });
         assert_eq!(
             blob_cap(None),
             Some(1024),
-            "operator ceiling with no declared size"
+            "layer ceiling with no declared size"
         );
         assert_eq!(
             blob_cap(Some(512)),
@@ -3088,29 +3140,62 @@ mod tests {
         assert_eq!(
             blob_cap(Some(4096)),
             Some(1024),
-            "operator ceiling is tighter → wins"
+            "layer ceiling is tighter → wins"
         );
         assert_eq!(
             blob_cap(Some(0)),
             Some(1024),
             "a 0 declared size is ignored"
         );
+        // `manifest_cap` is governed by `max_manifest_bytes`, NOT `max_layer_bytes` (decoupled).
+        assert_eq!(
+            manifest_cap(None),
+            Some(2048),
+            "manifest ceiling with no declared size (not the 1 KiB layer ceiling)"
+        );
+        assert_eq!(
+            manifest_cap(Some(512)),
+            Some(512),
+            "declared config size is tighter → wins"
+        );
+        assert_eq!(
+            manifest_cap(Some(4096)),
+            Some(2048),
+            "manifest ceiling is tighter → wins"
+        );
+        assert_eq!(
+            manifest_cap(Some(0)),
+            Some(2048),
+            "a 0 declared size is ignored"
+        );
 
-        // Disabling the operator ceiling leaves only the declared size.
+        // Disabling both operator ceilings leaves only the declared size on each path.
         install_registry_pull_limits(RegistryPullLimits {
             max_layer_bytes: 0,
             max_image_bytes: 0,
+            max_manifest_bytes: 0,
         });
         assert_eq!(
             blob_cap(None),
             None,
-            "no ceiling + no declared size ⇒ uncapped"
+            "no layer ceiling + no declared size ⇒ uncapped"
         );
         assert_eq!(blob_cap(Some(777)), Some(777), "declared size still caps");
+        assert_eq!(
+            manifest_cap(None),
+            None,
+            "max_manifest_bytes = 0 + no declared size ⇒ uncapped in memory (time-bounded only)"
+        );
+        assert_eq!(
+            manifest_cap(Some(777)),
+            Some(777),
+            "the config's declared size still caps even with max_manifest_bytes = 0"
+        );
 
         // Restore the defaults so no other test observes the mutated global.
         install_registry_pull_limits(RegistryPullLimits::default());
         assert_eq!(blob_cap(None), Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(manifest_cap(None), Some(32 * 1024 * 1024));
     }
 
     #[tokio::test]
@@ -3147,9 +3232,11 @@ mod tests {
         });
 
         // A 64 KiB operator per-blob ceiling; no declared size; no deadline/idle interference.
+        // (The layer path reads `max_layer_bytes`; `max_manifest_bytes` is irrelevant here.)
         install_registry_pull_limits(RegistryPullLimits {
             max_layer_bytes: 64 * 1024,
             max_image_bytes: 0,
+            max_manifest_bytes: 0,
         });
         install_registry_pull_timeouts(RegistryPullTimeouts {
             connect_secs: 5,
@@ -3228,6 +3315,7 @@ mod tests {
         install_registry_pull_limits(RegistryPullLimits {
             max_layer_bytes: 0,
             max_image_bytes: 0,
+            max_manifest_bytes: 0,
         });
         let client = screening_client().unwrap();
         let base = format!("http://{addr}");
@@ -3301,5 +3389,178 @@ mod tests {
             !msg.starts_with("error sending request"),
             "the generic transport message leaked instead of the typed redirect refusal: {msg}"
         );
+    }
+
+    // ---- Security LOW follow-ups: config-only deadline (a) + tight manifest/config cap (b) ----
+
+    #[tokio::test]
+    // See `pull_client_fails_…`: the guard is deliberately held across await to serialize the
+    // process-global pull config across parallel test threads (per-test current-thread runtimes).
+    #[allow(clippy::await_holding_lock)]
+    async fn oversize_manifest_is_aborted_during_the_read_by_the_manifest_cap() {
+        let _guard = pull_globals_lock();
+        // A malicious registry that streams FAR more than a KB-scale manifest must be cut off
+        // MID-READ by `max_manifest_bytes` — NOT by the generous `max_layer_bytes` (left at 10 GiB
+        // here, which would never abort an 8 MiB body: the two caps are decoupled). The manifest
+        // read is in memory, so the proof is the mid-download cap error naming "manifest" (a wrongly
+        // layer-capped read would instead buffer the 8 MiB whole and then fail to parse it as JSON).
+        const BODY: usize = 8 * 1024 * 1024; // 8 MiB streamed as a "manifest"
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_http_request(&mut stream);
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {BODY}\r\n\r\n");
+                if stream.write_all(header.as_bytes()).is_err() {
+                    return;
+                }
+                let block = vec![b'A'; 64 * 1024];
+                let mut sent = 0;
+                while sent < BODY {
+                    // The client hangs up after the cap → the write errors; stop.
+                    if stream.write_all(&block).is_err() {
+                        break;
+                    }
+                    sent += block.len();
+                }
+            }
+        });
+
+        // Tight 64 KiB manifest ceiling; the LAYER ceiling left generous (10 GiB) to prove the
+        // manifest path is governed by `max_manifest_bytes`, not `max_layer_bytes`.
+        install_registry_pull_limits(RegistryPullLimits {
+            max_layer_bytes: 10 * 1024 * 1024 * 1024,
+            max_image_bytes: 0,
+            max_manifest_bytes: 64 * 1024,
+        });
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 5,
+            read_secs: 5,
+            response_secs: 0,
+            overall_pull_secs: 0,
+        });
+        let client = screening_client().unwrap();
+        let url = format!("http://{addr}/v2/repo/manifests/latest");
+        let mut token = None;
+        let res = fetch_manifest(&client, &url, &mut token, None).await;
+
+        let err = res.expect_err("an oversize manifest must be aborted, not accepted");
+        let OciError::Registry(msg) = err else {
+            panic!("expected OciError::Registry, got {err:?}");
+        };
+        assert!(
+            msg.contains("manifest") && msg.contains("size cap"),
+            "must be the mid-read manifest cap abort (not a parse error from buffering it whole), got: {msg}"
+        );
+
+        install_registry_pull_limits(RegistryPullLimits::default());
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+    }
+
+    #[tokio::test]
+    // See `pull_client_fails_…`: the guard is deliberately held across await to serialize the
+    // process-global pull config across parallel test threads (per-test current-thread runtimes).
+    #[allow(clippy::await_holding_lock)]
+    async fn normal_manifest_is_unaffected_by_the_manifest_cap() {
+        let _guard = pull_globals_lock();
+        // A normal KB-scale manifest streams well under the generous default 32 MiB ceiling and
+        // parses unchanged — the tight cap refuses no real manifest.
+        let manifest_body: &[u8] =
+            br#"{"schemaVersion":2,"config":{"digest":"sha256:abc","size":7},"layers":[]}"#;
+        let len = manifest_body.len();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_http_request(&mut stream);
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n");
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(manifest_body);
+            }
+        });
+
+        install_registry_pull_limits(RegistryPullLimits::default());
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+        let client = screening_client().unwrap();
+        let url = format!("http://{addr}/v2/repo/manifests/latest");
+        let mut token = None;
+        let manifest = fetch_manifest(&client, &url, &mut token, None)
+            .await
+            .expect("a normal manifest under the default ceiling must parse");
+        assert_eq!(manifest["schemaVersion"].as_u64(), Some(2));
+
+        install_registry_pull_limits(RegistryPullLimits::default());
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+    }
+
+    #[tokio::test]
+    // See `pull_client_fails_…`: the guard is deliberately held across await to serialize the
+    // process-global pull config across parallel test threads (per-test current-thread runtimes).
+    #[allow(clippy::await_holding_lock)]
+    async fn config_only_fetch_is_bounded_by_the_overall_deadline() {
+        let _guard = pull_globals_lock();
+        // The config-only path (`pull_image_config`, the ephemeral pg_dump/config helper) downloads
+        // no layers — only the manifest + the small config blob — but a registry can still drip-feed
+        // bytes just under the idle `read_secs` on THOSE responses forever, holding the path (and the
+        // serial reconcile loop awaiting it) open. `pull_image_config` now wraps its fetch in
+        // `with_pull_deadline`; this proves that wrapper bounds a slow-drip MANIFEST/config fetch by
+        // the wall-clock, not just the idle gap. Hermetic loopback: one byte every 50 ms (well under
+        // the 5 s idle timeout), far longer than the 1 s deadline.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_http_request(&mut stream);
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+                    .is_err()
+                {
+                    return;
+                }
+                for _ in 0..400 {
+                    if stream.write_all(b"A").is_err() {
+                        break;
+                    }
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        });
+
+        // Idle timeout 5 s (won't fire — a byte flows every 50 ms); deadline 1 s bounds the drip.
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 5,
+            read_secs: 5,
+            response_secs: 0,
+            overall_pull_secs: 1,
+        });
+        install_registry_pull_limits(RegistryPullLimits::default());
+        let client = screening_client().unwrap();
+        let url = format!("http://{addr}/v2/repo/manifests/latest");
+        let mut token = None;
+
+        let start = std::time::Instant::now();
+        let res = with_pull_deadline(fetch_manifest(&client, &url, &mut token, None)).await;
+        let elapsed = start.elapsed();
+
+        let err =
+            res.expect_err("a slow-drip manifest fetch must be aborted by the overall deadline");
+        let OciError::Registry(msg) = err else {
+            panic!("expected OciError::Registry, got {err:?}");
+        };
+        assert!(
+            msg.contains("deadline"),
+            "the abort must be the overall wall-clock deadline (not the idle timeout), got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the overall deadline must bound the config-only fetch's slow-drip (took {elapsed:?})"
+        );
+
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+        install_registry_pull_limits(RegistryPullLimits::default());
     }
 }
