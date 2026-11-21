@@ -1722,7 +1722,23 @@
                     machine.succeed(
                         "systemctl show boatramp.service -p Environment | "
                         "grep -q 'BOATRAMP_COMPUTE_KV_SHIM_URL=http://10.77.0.1:${toString cntPort}'"
-                    )
+                    )${
+                      lib.optionalString (!compute) ''
+
+
+                        # Regression-lock (Security belt-and-suspenders): a `compute = false`
+                        # (docker-only) node gets the shim env + firewall ABOVE, but NONE of the
+                        # native-backend privilege relaxation — "turnkey networking with a tight
+                        # sandbox". Assert the native-only caps + device access are ABSENT, not just
+                        # that the shim seam is present.
+                        amb = machine.succeed("systemctl show boatramp.service -p AmbientCapabilities")
+                        assert "CAP_NET_BIND_SERVICE" in amb, f"compute=false must keep the bind-service cap: {amb!r}"
+                        assert "CAP_SYS_ADMIN" not in amb, f"compute=false must NOT grant CAP_SYS_ADMIN: {amb!r}"
+                        assert "CAP_NET_ADMIN" not in amb, f"compute=false must NOT grant CAP_NET_ADMIN: {amb!r}"
+                        dev = machine.succeed("systemctl show boatramp.service -p DeviceAllow").strip()
+                        assert dev == "DeviceAllow=", f"compute=false must have no DeviceAllow (no kvm/tun): {dev!r}"
+                      ''
+                    }
 
                     # Per-project docker bridge (matches boatramp-* / boatramp-+) + a
                     # "container" child netns reaching the host over that bridge.
