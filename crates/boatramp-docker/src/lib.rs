@@ -216,15 +216,24 @@ pub struct DockerBackend {
     /// the backstop never kills legitimate work (the real unreachable-DSN hang is bounded
     /// far tighter by the client's own connect timeout).
     ephemeral_timeout: std::time::Duration,
-    /// Whether the guest-log forwarder **redacts secret-sourced env values** out of the
-    /// forwarded stream (the per-container log file + the `boatramp::guest` tracing
-    /// target). On by default; a node operator opts OUT via the node-global
-    /// `[compute].redact_guest_log_secrets = false` (System·Admin config — never a tenant
-    /// knob), wired by [`Self::with_guest_log_redaction`]. When off, logs forward
-    /// unredacted (the documented parity behavior). The redaction SET is per-launch
-    /// (carried in [`LaunchRequest::redaction`]); this flag only decides whether to apply
-    /// it.
+    /// The node-global **guest-log secret redaction default** — tier 1 of the two-tier
+    /// opt-out (v0.70.0). Whether the guest-log forwarder **redacts secret-sourced env
+    /// values** out of the forwarded stream (the per-container log file + the
+    /// `boatramp::guest` tracing target). On by default; a node operator opts OUT via the
+    /// node-global `[compute].redact_guest_log_secrets = false` (System·Admin config — never a
+    /// tenant knob), wired by [`Self::with_guest_log_redaction`]. When off, NOTHING on this
+    /// node is redacted and no per-project setting can re-enable it. The redaction SET is
+    /// per-launch (carried in [`LaunchRequest::redaction`]); this flag is the node default in
+    /// [`boatramp_guestlog::should_redact`].
     redact_guest_log_secrets: bool,
+    /// The node-global **admission gate** for a per-project redaction opt-out — tier 2 of the
+    /// two-tier opt-out (v0.70.0). Default `false`: a stored per-project opt-out
+    /// ([`LaunchRequest::redaction`]`.project_opt_out()`) is IGNORED unless this is on, so an
+    /// operator cannot opt a project out of redaction unless the node globally permits
+    /// per-project overrides first. Wired from `[compute].allow_per_project_redaction_override`
+    /// (System·Admin config) by [`Self::with_per_project_redaction_override`]. Composed with
+    /// the node default + the per-project preference in [`boatramp_guestlog::should_redact`].
+    allow_per_project_redaction_override: bool,
 }
 
 impl DockerBackend {
@@ -243,6 +252,7 @@ impl DockerBackend {
             local_image_reuse_allowed: false,
             ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
             redact_guest_log_secrets: true,
+            allow_per_project_redaction_override: false,
         })
     }
 
@@ -258,6 +268,7 @@ impl DockerBackend {
             local_image_reuse_allowed: false,
             ephemeral_timeout: EPHEMERAL_RUN_TIMEOUT,
             redact_guest_log_secrets: true,
+            allow_per_project_redaction_override: false,
         }
     }
 
@@ -276,13 +287,25 @@ impl DockerBackend {
         self
     }
 
-    /// Enable/disable **guest-log secret redaction** (default enabled). The node wires this
-    /// from the node-global `[compute].redact_guest_log_secrets` (System·Admin config);
-    /// `false` forwards guest logs unredacted. See
+    /// Enable/disable **guest-log secret redaction** (tier-1 node default; default enabled).
+    /// The node wires this from the node-global `[compute].redact_guest_log_secrets`
+    /// (System·Admin config); `false` forwards guest logs unredacted. See
     /// [`redact_guest_log_secrets`](Self::redact_guest_log_secrets).
     #[must_use]
     pub fn with_guest_log_redaction(mut self, enabled: bool) -> Self {
         self.redact_guest_log_secrets = enabled;
+        self
+    }
+
+    /// Admit (or not) a **per-project redaction opt-out** (tier-2 node admission gate; default
+    /// NOT admitted). The node wires this from the node-global
+    /// `[compute].allow_per_project_redaction_override` (System·Admin config). When `false`, a
+    /// project's stored opt-out is ignored and redaction follows the node default; when
+    /// `true`, a project that opted out has its guest logs forwarded unredacted. See
+    /// [`allow_per_project_redaction_override`](Self::allow_per_project_redaction_override).
+    #[must_use]
+    pub fn with_per_project_redaction_override(mut self, admit: bool) -> Self {
+        self.allow_per_project_redaction_override = admit;
         self
     }
 
@@ -361,15 +384,23 @@ impl DockerBackend {
         ));
     }
 
-    /// Build this launch's guest-log redactor from the request's secret-sourced redaction
-    /// set — unless the node-global opt-out ([`Self::redact_guest_log_secrets`]) is off, or
-    /// the set is empty (no secret-sourced env), in which case the forwarder runs with no
-    /// redactor and the stream forwards unredacted.
+    /// Build this launch's guest-log redactor from the request's secret-sourced redaction set
+    /// under the **two-tier opt-out** (v0.70.0). The forwarder runs with no redactor (the
+    /// stream forwards unredacted) when the composed [`boatramp_guestlog::should_redact`]
+    /// decision is off — the node default is off, OR a per-project opt-out is both stored AND
+    /// admitted by the node — or when the set is empty (no secret-sourced env). The decision
+    /// combines the two node-global flags with the request's carried per-project opt-out
+    /// preference, in ONE place shared with the native container backend.
     fn build_log_redactor(
         &self,
         req: &LaunchRequest,
     ) -> Option<std::sync::Arc<boatramp_guestlog::Redactor>> {
-        if !self.redact_guest_log_secrets || req.redaction.is_empty() {
+        if !boatramp_guestlog::should_redact(
+            self.redact_guest_log_secrets,
+            self.allow_per_project_redaction_override,
+            req.redaction.project_opt_out(),
+        ) || req.redaction.is_empty()
+        {
             return None;
         }
         boatramp_guestlog::Redactor::build(req.redaction.values().iter().cloned())
@@ -2632,6 +2663,55 @@ mod tests {
             logged.contains(boatramp_guestlog::REDACTED_PLACEHOLDER),
             "tracing missing the placeholder: {logged}"
         );
+    }
+
+    /// The two-tier opt-out, wired through the docker backend's `build_log_redactor` (v0.70.0).
+    /// Mirror of the native container backend's binding: the per-project opt-out flag on the
+    /// request + the two node-global flags reach `boatramp_guestlog::should_redact` (whose full
+    /// matrix is unit-tested in the guestlog crate), proving the docker path is CONNECTED too —
+    /// including that an admitted opt-out disables redaction for only the opted-out request.
+    #[test]
+    fn build_log_redactor_honors_the_two_tier_opt_out() {
+        // `with_client` connects lazily (no daemon needed to construct the backend).
+        let backend = || DockerBackend::with_client(Docker::connect_with_defaults().unwrap());
+        let req = |project_opt_out: bool| {
+            let mut redaction = boatramp_core::compute::RedactionSet::new();
+            redaction.push("postgres://u:P%40ss_FWD_UNIQ_dd11@bramp-db.flycast:5432/app".into());
+            redaction.set_project_opt_out(project_opt_out);
+            LaunchRequest {
+                project: "proj".into(),
+                workload: "w".into(),
+                replica: 0,
+                spec: ComputeSpec::builder(RootSource::Image("img:latest".into()), 1, 128, 0)
+                    .build(),
+                artifact: Artifact::Image {
+                    reference: "img:latest".into(),
+                },
+                redaction,
+            }
+        };
+
+        // Default posture (redact on, admission off): opt-out IGNORED → redactor built either way.
+        assert!(backend().build_log_redactor(&req(false)).is_some());
+        assert!(
+            backend().build_log_redactor(&req(true)).is_some(),
+            "opt-out ignored unless the node admits per-project overrides"
+        );
+
+        // Admission on: the opt-out is honored for the opted-out request ONLY.
+        let admit = backend().with_per_project_redaction_override(true);
+        assert!(
+            admit.build_log_redactor(&req(false)).is_some(),
+            "a project that did not opt out still redacts on an admitting node"
+        );
+        assert!(
+            admit.build_log_redactor(&req(true)).is_none(),
+            "an admitted per-project opt-out disables redaction for that project"
+        );
+
+        // Node default off: never redact.
+        let off = backend().with_guest_log_redaction(false);
+        assert!(off.build_log_redactor(&req(false)).is_none());
     }
 
     /// Build a `ContainerState` with a given `Status` (+ optional running bool / health),

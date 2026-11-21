@@ -879,10 +879,24 @@ bare password is covered on the server side. If a client must print discrete con
 parts, inject them as discrete `{{sql.password}}` / `{{sql.user}}` env vars so each is a
 redactable value in its own right.)
 
-A node operator can turn redaction off with the node-global, System·Admin-only
-`[compute].redact_guest_log_secrets = false` (env
-`BOATRAMP_COMPUTE_REDACT_GUEST_LOG_SECRETS=false`), which forwards guest logs unredacted;
-it is never a tenant-reachable setting.
+The opt-out is a **two-tier, admin-gated** control — never tenant-reachable at any tier:
+
+1. **Node default** — `[compute].redact_guest_log_secrets` (env
+   `BOATRAMP_COMPUTE_REDACT_GUEST_LOG_SECRETS`), default **on**. Setting it `false` forwards
+   every workload's guest logs on the node unredacted. When off, nothing on the node is
+   redacted and no per-project setting can re-enable it.
+2. **Per-project admission gate** — `[compute].allow_per_project_redaction_override` (env
+   `BOATRAMP_COMPUTE_ALLOW_PER_PROJECT_REDACTION_OVERRIDE`), default **off**. A per-project
+   opt-out is honored **only** when this is on, so an operator can't opt a project out unless
+   the node globally permits per-project overrides first.
+3. **Per-project opt-out** — a System·Admin per-project record set with
+   `PUT /api/compute/log-redaction/<project>` (`{"opt_out": true}`), read with `GET`, cleared
+   with `DELETE`. Honored only under tier 2; when honored it forwards **that project's** guest
+   logs unredacted — never another tenant's. A per-project opt-out can only ever *disable*
+   redaction, never re-enable it past a node-global off.
+
+All three are **System·Admin** (node config for tiers 1–2; a node-global operator endpoint for
+tier 3) — a tenant can never disable redaction of its own, or any other tenant's, logs.
 
 ### Reachability & tenancy
 

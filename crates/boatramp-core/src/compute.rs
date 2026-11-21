@@ -165,18 +165,34 @@ pub enum Artifact {
 /// larger residue, inherent to injecting env at all. This buffer just avoids keeping an
 /// extra non-scrubbed copy and keeps the set out of `Debug`/serialization.
 #[derive(Clone, Default)]
-pub struct RedactionSet(zeroize::Zeroizing<Vec<String>>);
+pub struct RedactionSet {
+    /// The collected secret VALUES, zeroized on drop (see the type-level note).
+    values: zeroize::Zeroizing<Vec<String>>,
+    /// Whether this workload's PROJECT has a stored guest-log redaction **opt-out** (a
+    /// System·Admin per-project setting, loaded by [`reconcile_once`] from the deploy store
+    /// — see [`DeployStore::get_project_log_redaction`](crate::deploy::DeployStore::get_project_log_redaction)).
+    ///
+    /// This is an **advisory preference**, NOT the decision: it is honored (redaction is
+    /// disabled for the workload) ONLY when the node globally admits per-project overrides
+    /// (`[compute].allow_per_project_redaction_override`). The backend composes the two-tier
+    /// decision via [`boatramp_guestlog::should_redact`] — a per-project opt-out can never
+    /// re-enable redaction past a node-global off, nor take effect on a node that does not
+    /// admit overrides. Default `false` (no opt-out → redaction follows the node default), so
+    /// a workload with no record behaves exactly as before. Not a secret, so it is safe in
+    /// the redacting [`Debug`] below.
+    project_opt_out: bool,
+}
 
 impl RedactionSet {
-    /// An empty set.
+    /// An empty set (no secret-sourced values; no per-project opt-out).
     #[must_use]
     pub fn new() -> Self {
-        Self(zeroize::Zeroizing::new(Vec::new()))
+        Self::default()
     }
 
     /// Record one secret-sourced resolved value.
     pub fn push(&mut self, value: String) {
-        self.0.push(value);
+        self.values.push(value);
     }
 
     /// The collected secret VALUES (to build a backend-side matcher from). Backends feed
@@ -184,28 +200,49 @@ impl RedactionSet {
     /// and de-dups.
     #[must_use]
     pub fn values(&self) -> &[String] {
-        &self.0
+        &self.values
     }
 
-    /// Whether nothing was collected (a workload with no secret-sourced env).
+    /// Whether nothing was collected (a workload with no secret-sourced env). Independent of
+    /// [`project_opt_out`](Self::project_opt_out) — an empty set means "no secret to redact",
+    /// not "redaction disabled".
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.values.is_empty()
     }
 
     /// How many secret-sourced values were collected (diagnostics only — never exposes a
     /// value).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.values.len()
+    }
+
+    /// Record this workload's PROJECT redaction opt-out preference (advisory — honored by a
+    /// backend only under the node-global admission gate). See the field doc.
+    pub fn set_project_opt_out(&mut self, opt_out: bool) {
+        self.project_opt_out = opt_out;
+    }
+
+    /// Whether this workload's PROJECT requested a redaction opt-out. Advisory — a backend
+    /// honors it only when the node admits per-project overrides (see
+    /// [`boatramp_guestlog::should_redact`]).
+    #[must_use]
+    pub fn project_opt_out(&self) -> bool {
+        self.project_opt_out
     }
 }
 
-/// Redacting `Debug`: a count, never a value — so the set cannot leak through a
-/// `{:?}` of the enclosing [`LaunchRequest`].
+/// Redacting `Debug`: a value count + the (non-secret) opt-out flag, never a value — so the
+/// set cannot leak through a `{:?}` of the enclosing [`LaunchRequest`].
 impl std::fmt::Debug for RedactionSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RedactionSet(<{} secret-sourced values>)", self.0.len())
+        write!(
+            f,
+            "RedactionSet(<{} secret-sourced values>, project_opt_out={})",
+            self.values.len(),
+            self.project_opt_out
+        )
     }
 }
 
@@ -226,10 +263,12 @@ pub struct LaunchRequest {
     /// The materialized artifact for `spec`.
     pub artifact: Artifact,
     /// The secret-sourced env VALUES to redact from this workload's forwarded guest-log
-    /// stream (see [`RedactionSet`]). Populated by [`launch_one`] from the resolved
-    /// binding / managed-DB env; empty for a workload with no secret-sourced env. A
-    /// backend builds its per-workload log redactor from this (unless the node-global
-    /// redaction opt-out is set). Transient — never persisted or serialized.
+    /// stream, plus the workload's per-project redaction opt-out preference (see
+    /// [`RedactionSet`]). Populated by [`launch_one`] from the resolved binding / managed-DB
+    /// env (values) and the per-project setting (opt-out); the values are empty for a workload
+    /// with no secret-sourced env. A backend composes the two-tier decision from these + its
+    /// node-global flags via [`boatramp_guestlog::should_redact`]. Transient — never persisted
+    /// or serialized.
     pub redaction: RedactionSet,
 }
 
@@ -1241,6 +1280,37 @@ impl ProjectBackendPolicy {
     pub fn is_empty(&self) -> bool {
         self.allow.is_none() && self.forbid.is_empty() && self.prefer.is_none()
     }
+}
+
+/// A **per-project guest-log redaction** setting (v0.70.0 two-tier opt-out, owner-settled):
+/// the per-project *tier* of the three-tier redaction posture. Set by System·Admin (stored
+/// alongside the project's backend policy / tenancy schema), it records only whether this
+/// project **opts out** of guest-log secret redaction.
+///
+/// The opt-out is **advisory** and **narrowing-only**: the reconcile loads it and carries it
+/// on each launch, but a backend honors it (disables redaction for the project) ONLY when the
+/// node globally admits per-project overrides
+/// (`[compute].allow_per_project_redaction_override`, default **off**) AND the node-global
+/// default (`[compute].redact_guest_log_secrets`, default **on**) is on. So:
+/// - on a node that does NOT admit overrides, a stored opt-out is IGNORED (redaction stays on);
+/// - a per-project opt-out can never re-enable redaction past a node-global off;
+/// - it affects only THIS project's workloads, never another tenant's.
+///
+/// The decision itself lives in [`boatramp_guestlog::should_redact`], the single source of
+/// truth both backends gate on. An absent record (the back-compat shape) is exactly
+/// `opt_out = false` (redaction follows the node default).
+///
+/// `#[non_exhaustive]`: this per-project record may grow more knobs (a future per-project
+/// placeholder, extra opt-in values); marking it now keeps adding a field a non-breaking
+/// change for the published `boatramp-core` crate — construct it from [`Default`] +
+/// field-set, or (within the crate / via serde) a literal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ProjectLogRedaction {
+    /// Whether this project opts OUT of guest-log secret redaction. Honored only under the
+    /// node-global admission gate (see the type doc). Default `false`.
+    pub opt_out: bool,
 }
 
 /// Why a backend is — or is NOT — a placement candidate for a spec under the operator policy,
@@ -3583,6 +3653,27 @@ pub async fn reconcile_once(
             tracing::debug!(workload = %workload.name, error = %e, "compute: persist placement-explain");
         }
 
+        // The project's guest-log redaction OPT-OUT preference (v0.70.0 two-tier opt-out):
+        // a System·Admin per-project record that the backend honors ONLY when the node admits
+        // per-project overrides (`[compute].allow_per_project_redaction_override`). Loaded once
+        // per workload and carried on every replica's launch request. FAIL SECURE on a read
+        // error (and on an absent record): default to NOT opted out, so a store blip keeps
+        // redaction ON (the secure state) rather than silently disabling a security control —
+        // and, unlike the backend policy above, never HOLDS placement, since redaction is
+        // defense-in-depth and must not block launches.
+        let project_opt_out_redaction = match deploy.get_project_log_redaction(project).await {
+            Ok(r) => r.map(|r| r.opt_out).unwrap_or(false),
+            Err(e) => {
+                tracing::debug!(
+                    project = %project_name,
+                    workload = %workload.name,
+                    error = %e,
+                    "compute: project log-redaction setting unavailable — defaulting to redaction ON",
+                );
+                false
+            }
+        };
+
         let workload_activity = activity.activity(&workload.name).await;
         let plan = reconcile_plan_in(
             &workload,
@@ -3769,6 +3860,7 @@ pub async fn reconcile_once(
                         &launch_env,
                         privilege.as_ref(),
                         pull_auth.as_ref(),
+                        project_opt_out_redaction,
                     )
                     .await
                     {
@@ -4197,6 +4289,7 @@ async fn launch_one(
     extra_env: &[(String, String)],
     privilege: Option<&PrivilegeDirective>,
     pull_auth: Option<&RegistryAuth>,
+    project_opt_out_redaction: bool,
 ) -> Result<ObservedInstance, BackendError> {
     // The launch wall-clock time, so the next reconcile tick can grant this replica a
     // startup grace before treating it as a broken launch (see `reconcile_plan`).
@@ -4235,6 +4328,10 @@ async fn launch_one(
             }
         }
     }
+    // Carry this workload's PROJECT redaction opt-out preference (loaded once per workload by
+    // the reconcile from the deploy store). Advisory — the backend honors it only under the
+    // node-global admission gate (see `RedactionSet::project_opt_out` / `should_redact`).
+    redaction.set_project_opt_out(project_opt_out_redaction);
     // A managed-DB privilege strategy (rootless user / cap allowlist) — launch spec
     // only; never overrides an operator-set `user`/`cap_add`.
     if let Some(p) = privilege {
@@ -6063,11 +6160,13 @@ mod tests {
         assert!(backend.snapshot(&inst.handle).await.unwrap().is_none());
     }
 
-    /// A backend that records the `LaunchRequest.redaction` set + the final `spec.env`
-    /// it was handed, so a test can assert what `launch_one` collected for redaction.
+    /// A backend that records the `LaunchRequest.redaction` set (its values + the carried
+    /// per-project opt-out flag) + the final `spec.env` it was handed, so a test can assert
+    /// what `launch_one` collected for redaction.
     #[derive(Clone, Default)]
     struct RedactionCaptureBackend {
         redaction: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        opt_out: std::sync::Arc<std::sync::Mutex<bool>>,
         env: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
     }
 
@@ -6098,6 +6197,7 @@ mod tests {
         }
         async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
             *self.redaction.lock().unwrap() = req.redaction.values().to_vec();
+            *self.opt_out.lock().unwrap() = req.redaction.project_opt_out();
             *self.env.lock().unwrap() = req.spec.env.clone();
             Ok(Instance {
                 handle: InstanceHandle {
@@ -6146,7 +6246,7 @@ mod tests {
         ];
 
         let _ = launch_one(
-            &backend, "default", "w", 0, 1, None, &s, "spec-a", &extra_env, None, None,
+            &backend, "default", "w", 0, 1, None, &s, "spec-a", &extra_env, None, None, false,
         )
         .await
         .expect("launch");
@@ -6177,6 +6277,43 @@ mod tests {
             env.get("DB_URL"),
             Some(&dsn),
             "template rendered to the secret value"
+        );
+        // This launch passed `project_opt_out = false`, so the carried flag is false.
+        assert!(
+            !*backend.opt_out.lock().unwrap(),
+            "no per-project opt-out was requested for this launch"
+        );
+    }
+
+    /// `launch_one` carries the per-project redaction OPT-OUT preference onto the
+    /// `LaunchRequest.redaction` so a backend can compose the two-tier decision. Plumbing
+    /// test: the reconcile loads the per-project setting once and passes it here; this binds
+    /// that it reaches the request (not dropped), while the admission GATE itself lives in the
+    /// backend's `should_redact` (unit-tested in `boatramp-guestlog`). Mutation-sensitive: if
+    /// `launch_one` ignores the argument the carried flag stays false and this goes RED.
+    #[tokio::test]
+    async fn launch_one_carries_the_project_redaction_opt_out() {
+        let backend = RedactionCaptureBackend::default();
+        let mut s = spec(1, 128);
+        s.env.insert("DB_URL".into(), "{{sql.dsn}}".into());
+        let dsn = "postgres://app:S3cr3t@bramp-db-abc.flycast:5432/app".to_string();
+        let extra_env = vec![("DB_URL".to_string(), dsn.clone())];
+
+        // opt_out = true is carried onto the request...
+        let _ = launch_one(
+            &backend, "default", "w", 0, 1, None, &s, "spec-a", &extra_env, None, None, true,
+        )
+        .await
+        .expect("launch");
+        assert!(
+            *backend.opt_out.lock().unwrap(),
+            "the per-project opt-out preference must reach the LaunchRequest"
+        );
+        // ...and the secret value is STILL collected regardless (the backend, not launch_one,
+        // decides whether to honor the opt-out — core always hands over the provenance set).
+        assert!(
+            backend.redaction.lock().unwrap().contains(&dsn),
+            "core always collects the secret-sourced value; the opt-out is a backend decision"
         );
     }
 
@@ -6253,6 +6390,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -6275,6 +6413,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         )
         .await
         .unwrap();

@@ -489,8 +489,10 @@ pub async fn build_compute(
                     .with_cap_add_allowed(!strict)
                     .with_local_image_reuse_allowed(!strict)
                     // Node-global guest-log secret redaction (System·Admin opt-out; on by
-                    // default). Never a tenant knob.
+                    // default). Never a tenant knob. The admission gate (tier 2) decides whether
+                    // a per-project opt-out is honored — default off.
                     .with_guest_log_redaction(cfg.redact_guest_log_secrets)
+                    .with_per_project_redaction_override(cfg.allow_per_project_redaction_override)
                     .with_ephemeral_timeout(std::time::Duration::from_secs(
                         cfg.docker_ephemeral_timeout_secs,
                     ));
@@ -605,8 +607,13 @@ pub async fn build_compute(
                     // keeps every capability dropped.
                     let c = c.with_cap_add_allowed(!strict);
                     // Node-global guest-log secret redaction (System·Admin opt-out; on by
-                    // default). Never a tenant knob.
-                    let c = c.with_guest_log_redaction(cfg.redact_guest_log_secrets);
+                    // default). Never a tenant knob. The admission gate (tier 2) decides whether
+                    // a per-project opt-out is honored — default off.
+                    let c = c
+                        .with_guest_log_redaction(cfg.redact_guest_log_secrets)
+                        .with_per_project_redaction_override(
+                            cfg.allow_per_project_redaction_override,
+                        );
                     // Point each container's resolv.conf at the internal DNS on the
                     // bridge gateway when the resolver is enabled (default on). The
                     // node starts the resolver task (see `spawn_internal_dns`); the

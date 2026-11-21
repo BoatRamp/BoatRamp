@@ -3480,6 +3480,87 @@ pub(super) async fn delete_project_backend_policy(
 }
 
 // ---------------------------------------------------------------------------
+// Per-project guest-log REDACTION opt-out
+// (`/api/compute/log-redaction/{project}`, System·Admin — v0.70.0 two-tier opt-out)
+// ---------------------------------------------------------------------------
+
+/// `PUT /api/compute/log-redaction/{project}` — set (replace) a project's guest-log redaction
+/// setting (currently just `{"opt_out": bool}`). NODE-GLOBAL operator authority:
+/// `System·Admin`, re-asserted defense-in-depth here (never the per-project right the general
+/// `/api/compute/*` mapping gives). The opt-out only ever DISABLES redaction, is honored ONLY
+/// when the node globally admits per-project overrides
+/// (`[compute].allow_per_project_redaction_override`), and never affects another tenant. `200`
+/// with the stored setting.
+pub(super) async fn set_project_log_redaction(
+    State(deploy): State<DeployStore>,
+    axum::extract::Path(project): axum::extract::Path<String>,
+    Json(setting): Json<boatramp_core::compute::ProjectLogRedaction>,
+) -> Response {
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "PUT",
+        "/api/compute/log-redaction/_",
+        "compute log redaction",
+    ) {
+        return forbidden;
+    }
+    if let Some(resp) = reject_invalid_name("project", &project) {
+        return resp;
+    }
+    let pref = boatramp_core::project::ProjectRef::new(&project);
+    match deploy.set_project_log_redaction(pref, &setting).await {
+        Ok(()) => Json(setting).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `GET /api/compute/log-redaction/{project}` — read a project's guest-log redaction setting
+/// (the default `{"opt_out": false}` when none is set). `System·Admin`.
+pub(super) async fn get_project_log_redaction(
+    State(deploy): State<DeployStore>,
+    axum::extract::Path(project): axum::extract::Path<String>,
+) -> Response {
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "GET",
+        "/api/compute/log-redaction/_",
+        "compute log redaction",
+    ) {
+        return forbidden;
+    }
+    if let Some(resp) = reject_invalid_name("project", &project) {
+        return resp;
+    }
+    let pref = boatramp_core::project::ProjectRef::new(&project);
+    match deploy.get_project_log_redaction(pref).await {
+        Ok(setting) => Json(setting.unwrap_or_default()).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `DELETE /api/compute/log-redaction/{project}` — clear a project's redaction setting,
+/// reverting to the node default (redaction follows `[compute].redact_guest_log_secrets`).
+/// Idempotent (`204`). `System·Admin`.
+pub(super) async fn delete_project_log_redaction(
+    State(deploy): State<DeployStore>,
+    axum::extract::Path(project): axum::extract::Path<String>,
+) -> Response {
+    if let Some(forbidden) = assert_project_export_is_system_admin(
+        "DELETE",
+        "/api/compute/log-redaction/_",
+        "compute log redaction",
+    ) {
+        return forbidden;
+    }
+    if let Some(resp) = reject_invalid_name("project", &project) {
+        return resp;
+    }
+    let pref = boatramp_core::project::ProjectRef::new(&project);
+    match deploy.clear_project_log_redaction(pref).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Native project export / import (`POST /api/project-export` / `/api/project-import`)
 // ---------------------------------------------------------------------------
 

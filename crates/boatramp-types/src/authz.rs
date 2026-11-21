@@ -1089,6 +1089,13 @@ fn is_compute_maintenance_path(path: &str) -> bool {
             // tenant must not set its OWN backend policy; operator policy is the outer bound).
             || rest == "policy"
             || rest.starts_with("policy/")
+            // Per-project guest-log REDACTION opt-out (`/api/compute/log-redaction/<project>`,
+            // v0.70.0 two-tier opt-out): the System·Admin per-project opt-out tier, honored by a
+            // backend only under the node-global admission gate. NODE-GLOBAL operator authority
+            // — `system·admin`, never a per-project grant the general `/api/compute/*` catch-all
+            // would give (a tenant must not disable redaction of its OWN — or any — logs).
+            || rest == "log-redaction"
+            || rest.starts_with("log-redaction/")
 }
 
 /// Whether a granted target covers a required target:
@@ -2180,6 +2187,13 @@ mod tests {
             ("GET", "/api/compute/policy/acme"),
             ("PUT", "/api/compute/policy/acme"),
             ("DELETE", "/api/compute/policy/acme"),
+            // Per-project guest-log REDACTION opt-out (v0.70.0): the System·Admin per-project
+            // opt-out tier. A security control's DISABLE — node-global authority, so
+            // system·admin, NEVER a per-project grant; a tenant (even the target project's own
+            // admin) must not be able to disable redaction of its own logs.
+            ("GET", "/api/compute/log-redaction/acme"),
+            ("PUT", "/api/compute/log-redaction/acme"),
+            ("DELETE", "/api/compute/log-redaction/acme"),
             // Project-scoped form (the `project_scope` rewrite's original path). NOTE:
             // `status` is DELIBERATELY ABSENT from this node-admin-only list — its
             // project-scoped form is per-project `Project·Read` (asserted separately

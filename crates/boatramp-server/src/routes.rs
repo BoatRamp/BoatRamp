@@ -507,6 +507,19 @@ pub fn router_with_fast(
                 .put(set_project_backend_policy)
                 .delete(delete_project_backend_policy),
         )
+        // Per-project guest-log REDACTION opt-out (v0.70.0 two-tier opt-out): set/get/clear a
+        // project's `{opt_out}`, honored by a backend only under the node-global admission gate
+        // (`[compute].allow_per_project_redaction_override`). Registered BEFORE
+        // `/api/compute/{name}` so the literal `log-redaction` segment wins over `{name}`.
+        // NODE-GLOBAL operator authority: `Right::required` gates it `System·Admin`
+        // (`is_compute_maintenance_path` `log-redaction/` arm) — never the per-project right the
+        // general `/api/compute/*` mapping gives, so a tenant can never flip its own redaction.
+        .route(
+            "/api/compute/log-redaction/{project}",
+            get(get_project_log_redaction)
+                .put(set_project_log_redaction)
+                .delete(delete_project_log_redaction),
+        )
         // Native project export/import (env-clone): stream a project's BRPROJ bundle out,
         // or import one in. `Project·Admin` on the `?project=` target (scoped via the query in
         // `Right::required_for`, uniform with the `clone` family — NOT node-global System·Admin)

@@ -1367,6 +1367,59 @@ impl DeployStore {
         Ok(())
     }
 
+    /// The project's **per-project guest-log redaction** setting
+    /// ([`ProjectLogRedaction`](crate::compute::ProjectLogRedaction)) — the System·Admin-set
+    /// per-project opt-out tier of the v0.70.0 two-tier redaction posture, honored by a
+    /// backend only under the node-global admission gate. `None` ⇒ the project set none (the
+    /// back-compat shape; `opt_out = false`, redaction follows the node default). Stored as a
+    /// small JSON singleton at `project/<proj>/config/log_redaction`, exactly like
+    /// [`get_project_backend_policy`](Self::get_project_backend_policy). A record that fails
+    /// to deserialize degrades to `None` (never fatal to a reconcile pass — the caller then
+    /// treats it as not-opted-out, the secure default).
+    pub async fn get_project_log_redaction(
+        &self,
+        project: ProjectRef<'_>,
+    ) -> Result<Option<crate::compute::ProjectLogRedaction>, DeployError> {
+        match self
+            .kv
+            .get(&keys::project_config(project, "log_redaction"))
+            .await?
+        {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Store the project's per-project guest-log redaction setting (replaces any prior one).
+    /// Security-load-bearing in the RE-ENABLING direction (clearing an opt-out restores a
+    /// security control), so frontier-sync it before ack like the backend policy / tenancy
+    /// schema: a lost write must never silently leave redaction DISABLED when the operator
+    /// meant to re-enable it.
+    pub async fn set_project_log_redaction(
+        &self,
+        project: ProjectRef<'_>,
+        setting: &crate::compute::ProjectLogRedaction,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(setting).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put_durable_checkpointed(&keys::project_config(project, "log_redaction"), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// Clear the project's per-project guest-log redaction setting, reverting to the node
+    /// default (redaction follows `[compute].redact_guest_log_secrets`). Idempotent;
+    /// durable-past-frontier (re-enabling a security control must not silently revert).
+    pub async fn clear_project_log_redaction(
+        &self,
+        project: ProjectRef<'_>,
+    ) -> Result<(), DeployError> {
+        self.kv
+            .delete_checkpointed(&keys::project_config(project, "log_redaction"))
+            .await?;
+        Ok(())
+    }
+
     /// Store the latest per-workload [`PlacementExplain`](crate::compute::PlacementExplain)
     /// the reconcile computed (v0.67.0 placement-explain), at
     /// `project/<proj>/compute_placement/<workload>`. Pure status — regenerated every
@@ -5157,6 +5210,40 @@ mod tests {
     use super::*;
     use crate::ObjectMeta;
     use crate::config::DeployConfig;
+
+    /// The per-project guest-log redaction setting round-trips through the deploy store, is
+    /// project-scoped, and clears back to absent (the node-default shape). An absent record
+    /// reads as `None`, which the reconcile treats as not-opted-out (redaction follows the
+    /// node default) — the secure back-compat default.
+    #[tokio::test]
+    async fn project_log_redaction_roundtrips_and_is_project_scoped() {
+        use crate::compute::ProjectLogRedaction;
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let acme = ProjectRef::new("acme");
+        let other = ProjectRef::new("other");
+
+        // Absent ⇒ None (back-compat: redaction follows the node default).
+        assert_eq!(store.get_project_log_redaction(acme).await.unwrap(), None);
+
+        // Set an opt-out for `acme` only.
+        store
+            .set_project_log_redaction(acme, &ProjectLogRedaction { opt_out: true })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_project_log_redaction(acme).await.unwrap(),
+            Some(ProjectLogRedaction { opt_out: true })
+        );
+        // Another project is unaffected (per-project, never cross-tenant).
+        assert_eq!(store.get_project_log_redaction(other).await.unwrap(), None);
+
+        // Clearing reverts to the node default (absent), idempotently.
+        store.clear_project_log_redaction(acme).await.unwrap();
+        assert_eq!(store.get_project_log_redaction(acme).await.unwrap(), None);
+        store.clear_project_log_redaction(acme).await.unwrap();
+    }
 
     // The cluster-uniform "does this site belong to this project?" probe backing the standalone-
     // function blob-upload mint binding: a site pointer exists after its config is written, is scoped
