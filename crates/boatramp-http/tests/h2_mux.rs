@@ -23,6 +23,12 @@ impl Handler for App {
                 200,
                 req.into_body().collect().await.unwrap_or_default().to_vec(),
             ),
+            // Forward the request body straight to the response, chunk by chunk, WITHOUT
+            // buffering it — so a chunk echoes back as soon as the handler receives it.
+            "/echo-stream" => response(
+                200,
+                boatramp_http::h2::Body::try_stream(req.into_body().into_data_stream()),
+            ),
             p => response(200, format!("{} {}", req.method(), p).into_bytes()),
         }
     }
@@ -109,6 +115,53 @@ async fn request_body_is_delivered_to_the_handler() {
     let response = response.await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(read_body(response.into_body()).await, b"hello body");
+}
+
+/// U27: the request body must stream to the handler incrementally — the handler sees a
+/// DATA chunk as soon as it arrives, NOT only after END_STREAM. Proven by echoing the
+/// request body straight to the response: the first chunk comes back *before* the client
+/// sends the rest of the body. With the old buffer-to-END_STREAM path the handler never
+/// runs until the whole body is in, so the first echoed chunk could not arrive first.
+#[tokio::test]
+async fn request_body_streams_incrementally_to_the_handler() {
+    use std::time::Duration;
+    let mut client = connect().await;
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://x/echo-stream")
+        .body(())
+        .unwrap();
+    // HEADERS without END_STREAM — the body follows in DATA frames.
+    let (response, mut send) = client.send_request(request, false).unwrap();
+    // Send ONLY the first chunk (not END_STREAM).
+    send.send_data(Bytes::from_static(b"first-"), false)
+        .unwrap();
+
+    // The response head + the first echoed chunk must arrive while the request body is
+    // still open — impossible if the server buffered the whole body first.
+    let response = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .expect("response head must arrive before the body completes")
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(5), body.data())
+        .await
+        .expect("first echoed chunk must arrive before the request body is complete")
+        .expect("a chunk")
+        .unwrap();
+    let _ = body.flow_control().release_capacity(first.len());
+    assert_eq!(&first[..], b"first-");
+
+    // Now finish the request; the rest echoes back and the stream ends.
+    send.send_data(Bytes::from_static(b"second"), true).unwrap();
+    let mut rest = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        let _ = body.flow_control().release_capacity(chunk.len());
+        rest.extend_from_slice(&chunk);
+    }
+    assert_eq!([&first[..], &rest[..]].concat(), b"first-second");
 }
 
 #[tokio::test]

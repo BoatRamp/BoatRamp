@@ -89,9 +89,10 @@ pub(super) async fn proxy(
     match client.send(req).await {
         Ok(resp) => {
             let status = resp.status();
-            // Pass response headers through, minus hop-by-hop + content-length
-            // (we re-stream, so let the framing be recomputed). `append` preserves
-            // REPEATED headers — notably every `Set-Cookie` (see `forward_response_headers`).
+            // Pass response headers through, minus hop-by-hop. A known `Content-Length` is
+            // KEPT so the serving stack can frame the re-streamed body with it (a proxied
+            // download keeps progress + range); `append` preserves REPEATED headers —
+            // notably every `Set-Cookie` (see `forward_response_headers`).
             let mut headers = HeaderMap::new();
             forward_response_headers(resp.headers(), &[], &mut headers);
             // Stream the upstream body straight to the client off the pooled connection —
@@ -130,14 +131,14 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 /// bounced back to the login page. [`HeaderMap::append`] keeps each value as a separate
 /// field, matching how the request leg (and the `splice` fast-path) already forward headers.
 ///
-/// Drops hop-by-hop headers and `Content-Length` (the body is re-streamed, so the downstream
-/// framing is recomputed) plus any header named in the upstream's `header_down.remove`.
+/// Drops hop-by-hop headers (including `Transfer-Encoding`, so a chunked upstream re-frames
+/// downstream) plus any header named in the upstream's `header_down.remove`. A known
+/// `Content-Length` is KEPT: the serving stack now frames the re-streamed body with it (a
+/// declared-length streaming body), so a proxied download keeps its length — and the h1
+/// writer is defensive if the upstream's length and body ever disagree.
 fn forward_response_headers(upstream_headers: &HeaderMap, remove: &[String], out: &mut HeaderMap) {
     for (name, value) in upstream_headers {
-        if is_hop_by_hop(name)
-            || name == header::CONTENT_LENGTH
-            || remove.iter().any(|h| name.as_str().eq_ignore_ascii_case(h))
-        {
+        if is_hop_by_hop(name) || remove.iter().any(|h| name.as_str().eq_ignore_ascii_case(h)) {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -2101,8 +2102,9 @@ mod tests {
     /// distinct `Set-Cookie` fields at once. `forward_response_headers` must keep EVERY one
     /// as a separate header — a `HeaderMap::insert` (the prior behavior) collapsed the repeats
     /// to the last value, silently dropping the session cookie so the browser was bounced back
-    /// to the login page. Hop-by-hop + `Content-Length` + the upstream's `header_down.remove`
-    /// are still dropped; other repeated headers survive too.
+    /// to the login page. Hop-by-hop headers + the upstream's `header_down.remove` are dropped;
+    /// a known `Content-Length` is now KEPT (preserved so the re-streamed body keeps its
+    /// length); other repeated headers survive too.
     #[test]
     fn forward_response_headers_preserves_repeated_set_cookie() {
         // A Gitea-shaped login 303's header set: five distinct cookies, plus a hop-by-hop
@@ -2158,10 +2160,17 @@ mod tests {
         }
         // Other repeated headers survive too.
         assert_eq!(out.get_all(header::VARY).iter().count(), 2);
-        // Hop-by-hop, Content-Length, and header_down.remove targets are dropped.
+        // Hop-by-hop + header_down.remove targets are dropped.
         assert!(!out.contains_key(header::CONNECTION));
-        assert!(!out.contains_key(header::CONTENT_LENGTH));
         assert!(!out.contains_key(HeaderName::from_static("x-internal")));
+        // A known Content-Length is now PRESERVED (U29: the re-streamed body keeps its
+        // length so the downstream frames it with Content-Length, not chunked).
+        assert_eq!(
+            out.get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "a known Content-Length must be preserved for the re-streamed body"
+        );
     }
 
     /// End-to-end over the real upstream codec: a raw mock upstream emits an actual

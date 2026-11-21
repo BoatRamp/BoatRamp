@@ -16,15 +16,16 @@
 //! reader and encode in the writer — HTTP/2 uses independent compression contexts
 //! per direction, so these are two separate, unsynchronized tables.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::h2::CLIENT_PREFACE;
 use crate::h2::error::{ErrorCode, H2Error};
@@ -352,7 +353,13 @@ where
     .await;
 }
 
-/// Per-request reader-local state accumulated between HEADERS and END_STREAM.
+/// Per-request reader-local state accumulated across a stream's frames.
+///
+/// The request is **dispatched to the handler as soon as its HEADERS are complete** (not
+/// at END_STREAM): a request that carries a body hands the handler a streaming
+/// [`ReqBody`](crate::ReqBody) whose chunks the reader feeds in from DATA frames as they
+/// arrive, so a large h2 upload streams straight through to the handler (a reverse proxy)
+/// without ever being buffered whole — mirroring the h1 loop's body pump.
 #[derive(Default)]
 struct ReaderState {
     /// In-progress header block awaiting END_HEADERS (HEADERS + CONTINUATION).
@@ -363,10 +370,21 @@ struct ReaderState {
     /// CONTINUATION frames seen for the current header block (flood guard).
     continuation_count: u32,
     last_client_id: u32,
-    /// Header-complete requests awaiting their body's END_STREAM.
-    requests: HashMap<u32, http::Request>,
-    bodies: HashMap<u32, Vec<u8>>,
+    /// Per-stream declared `content-length` (validated against the DATA total, §8.1.2.6).
     content_len: HashMap<u32, Option<u64>>,
+    /// Per-stream running total of received DATA bytes — checked against `body_limit` and
+    /// the declared `content-length`.
+    received: HashMap<u32, u64>,
+    /// The open request-body channel of a dispatched streaming request: the reader pushes
+    /// each DATA chunk in, and dropping the sender ends the handler's body stream. Present
+    /// from a stream's first (non-END_STREAM) HEADERS until its body ends (END_STREAM /
+    /// trailers) or the stream is reset.
+    body_tx: HashMap<u32, mpsc::UnboundedSender<Result<Bytes, http::BodyError>>>,
+    /// Streams whose request has already been dispatched to the handler, so a later header
+    /// block on the same stream is trailers (§8.1.2.3), not a fresh request. Only streams
+    /// with an open body are tracked here (a bodyless request can take no trailers), and an
+    /// entry is cleared when the body ends or the stream resets, so it stays bounded.
+    dispatched: HashSet<u32>,
     /// The connection's configured limits, threaded through dispatch (header-block size,
     /// concurrent-stream cap, request-body cap).
     max_header_block: usize,
@@ -460,39 +478,42 @@ where
         // the historical behavior.
         match next_frame_header(rd, shared, config.idle_timeout, &mut hdr).await {
             FrameRead::Ok => {}
-            FrameRead::Closed => return Ok(()), // client closed
+            FrameRead::Closed => break, // client closed
             FrameRead::Idle => {
                 // Idle past the timeout: tell the peer with a GOAWAY and close cleanly.
                 goaway(shared, notify, rs.last_client_id, ErrorCode::NoError);
-                return Ok(());
+                break;
             }
         }
         let header = FrameHeader::parse(&hdr);
         if header.length > OUR_MAX_FRAME_SIZE {
             goaway(shared, notify, rs.last_client_id, ErrorCode::FrameSizeError);
-            return Ok(());
+            break;
         }
         let mut payload = vec![0u8; header.length as usize];
         if header.length > 0 && rd.read_exact(&mut payload).await.is_err() {
-            return Ok(());
+            break;
         }
         if rs.expecting_continuation
             && (header.kind != FrameType::Continuation || header.stream_id != rs.header_sid)
         {
             goaway(shared, notify, rs.last_client_id, ErrorCode::ProtocolError);
-            return Ok(());
+            break;
         }
 
         match dispatch(
             shared, notify, handler, &mut hpack, &mut rs, header, payload,
         ) {
             Ok(true) => {}
-            Ok(false) => return Ok(()), // GOAWAY received
+            Ok(false) => break, // GOAWAY received
             Err(H2Error::Connection(code)) => {
                 goaway(shared, notify, rs.last_client_id, code);
-                return Ok(());
+                break;
             }
             Err(H2Error::Stream { id, code }) => {
+                // Unblock any handler still reading this stream's request body (a no-op if
+                // the raising site already ended it).
+                fail_body(&mut rs, id);
                 {
                     let mut s = shared.lock().unwrap();
                     if let Some(st) = s.streams.get_mut(&id) {
@@ -507,6 +528,13 @@ where
             }
         }
     }
+    // Connection teardown: fail every request body still open (never reached END_STREAM),
+    // so a handler reading one sees a truncation (BodyError), not a clean end it would
+    // forward upstream as complete — mirroring the h1 pump's truncated-body behavior.
+    for (_, tx) in rs.body_tx.drain() {
+        let _ = tx.send(Err(http::BodyError));
+    }
+    Ok(())
 }
 
 fn dispatch<H>(
@@ -620,6 +648,9 @@ where
                 return Err(H2Error::conn(ErrorCode::ProtocolError));
             }
             let _ = frame::parse_rst_stream(&payload)?;
+            // End any in-flight request body for this stream so a handler reading it
+            // unblocks (the request is cancelled; its response is dropped below).
+            fail_body(rs, header.stream_id);
             let mut s = shared.lock().unwrap();
             if !s.streams.contains_key(&header.stream_id) && header.stream_id > rs.last_client_id {
                 return Err(H2Error::conn(ErrorCode::ProtocolError));
@@ -740,16 +771,10 @@ where
                 s.streams.get_mut(&sid).unwrap().state = next;
             }
             let data = frame::strip_padding(&payload, header.has_flag(flag::PADDED))?;
-            let body = rs.bodies.entry(sid).or_default();
-            body.extend_from_slice(data);
-            // Enforce the optional request-body cap: an over-limit body resets the stream
-            // (the connection survives). `None` is unbounded — the historical behavior.
-            if rs.body_limit.is_some_and(|lim| body.len() as u64 > lim) {
-                rs.bodies.remove(&sid);
-                rs.requests.remove(&sid);
-                rs.content_len.remove(&sid);
-                return Err(H2Error::stream(sid, ErrorCode::EnhanceYourCalm));
-            }
+            // Receive flow control: replenish both windows immediately, as before — the
+            // window stays open so a fast uploader isn't throttled by us. (The request body
+            // now streams to the handler rather than buffering to END_STREAM, but the
+            // window-update timing is unchanged, so receive backpressure is not regressed.)
             let n = payload.len() as u32;
             if n > 0 {
                 push_ctrl(shared, notify, |out| {
@@ -757,14 +782,53 @@ where
                     frame::write_frame(out, FrameType::WindowUpdate, 0, sid, &n.to_be_bytes());
                 });
             }
+            // Account the bytes for the request-body cap + content-length validation.
+            let total = {
+                let r = rs.received.entry(sid).or_insert(0);
+                *r += data.len() as u64;
+                *r
+            };
+            // Over the optional request-body cap: reset the stream (the connection
+            // survives). `None` is unbounded — the historical behavior.
+            if rs.body_limit.is_some_and(|lim| total > lim) {
+                fail_body(rs, sid);
+                return Err(H2Error::stream(sid, ErrorCode::EnhanceYourCalm));
+            }
+            // Declared content-length over-run (§8.1.2.6) — malformed; reset the stream.
+            if rs
+                .content_len
+                .get(&sid)
+                .copied()
+                .flatten()
+                .is_some_and(|c| total > c)
+            {
+                fail_body(rs, sid);
+                return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
+            }
+            // Hand the chunk to the handler's streaming body (if it is still reading); if
+            // the handler dropped its body, stop feeding but keep accounting so the window
+            // updates + content-length validation stay correct.
+            if !data.is_empty()
+                && let Some(tx) = rs.body_tx.get(&sid)
+                && tx.send(Ok(Bytes::copy_from_slice(data))).is_err()
+            {
+                rs.body_tx.remove(&sid);
+            }
             if end_stream {
-                let cl = rs.content_len.get(&sid).copied().flatten();
-                let body = rs.bodies.remove(&sid).unwrap_or_default();
-                if cl.is_some_and(|c| c != body.len() as u64) {
+                // Declared content-length under-run (§8.1.2.6) — malformed; reset.
+                if rs
+                    .content_len
+                    .get(&sid)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|c| total != c)
+                {
+                    fail_body(rs, sid);
                     return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
                 }
-                let req = rs.requests.remove(&sid);
-                spawn_request(shared, notify, handler, sid, req, body);
+                // Clean end of the request body: drop the sender so the handler's body
+                // stream terminates.
+                end_body(rs, sid);
             }
             Ok(true)
         }
@@ -786,25 +850,21 @@ where
     H: Handler,
 {
     let headers = hpack.decode(&rs.header_buf)?;
-    // A second header block on a stream whose request is already parsed is trailers
-    // (§8.1.2.3): it MUST carry END_STREAM and MUST NOT contain pseudo-header fields.
-    // Deliver the stashed request + accumulated body to the handler.
-    if let Some(req) = rs.requests.remove(&sid) {
+    // A second header block on an already-dispatched stream is trailers (§8.1.2.3): it
+    // MUST carry END_STREAM and MUST NOT contain pseudo-header fields. The request is
+    // already running with its body streaming; trailers simply end that body (their field
+    // values are not delivered to the handler — the buffered path discarded them too).
+    if rs.dispatched.contains(&sid) {
         if !end_stream || headers.iter().any(|(n, _)| n.first() == Some(&b':')) {
-            rs.requests.insert(sid, req);
+            fail_body(rs, sid);
             return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
         }
-        let body = rs.bodies.remove(&sid).unwrap_or_default();
-        if rs
-            .content_len
-            .get(&sid)
-            .copied()
-            .flatten()
-            .is_some_and(|c| c != body.len() as u64)
-        {
+        // Validate the declared content-length against the DATA total before ending.
+        if content_len_mismatch(rs, sid) {
+            fail_body(rs, sid);
             return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
         }
-        spawn_request(shared, notify, handler, sid, Some(req), body);
+        end_body(rs, sid);
         return Ok(());
     }
     // Enforce SETTINGS_MAX_CONCURRENT_STREAMS (§5.1.2): if this freshly-opened stream
@@ -825,8 +885,6 @@ where
         s.shutting_down && sid > s.goaway_last
     };
     if refuse_shutdown {
-        rs.content_len.remove(&sid);
-        rs.bodies.remove(&sid);
         reset_local(shared, notify, sid, ErrorCode::RefusedStream);
         return Ok(());
     }
@@ -841,41 +899,75 @@ where
                 > max_concurrent
     };
     if over_cap {
-        rs.content_len.remove(&sid);
-        rs.bodies.remove(&sid);
         reset_local(shared, notify, sid, ErrorCode::RefusedStream);
         return Ok(());
     }
-    let req = http::request_from_headers(sid, headers)?;
+    let mut req = http::request_from_headers(sid, headers)?;
     let cl = req
         .headers()
         .get(::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
     rs.content_len.insert(sid, cl);
     if end_stream {
-        let body = rs.bodies.remove(&sid).unwrap_or_default();
-        if cl.is_some_and(|c| c != body.len() as u64) {
+        // No body follows. A non-zero declared content-length with no DATA is a mismatch.
+        if cl.is_some_and(|c| c != 0) {
+            rs.content_len.remove(&sid);
             return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
         }
-        spawn_request(shared, notify, handler, sid, Some(req), body);
+        rs.content_len.remove(&sid);
+        *req.body_mut() = http::ReqBody::empty();
+        spawn(shared, notify, handler, sid, req);
     } else {
-        rs.requests.insert(sid, req);
+        // A body follows: hand the handler a streaming body the reader feeds from DATA
+        // frames, and dispatch now so the upload streams straight through.
+        let (tx, rx) = mpsc::unbounded_channel();
+        *req.body_mut() = http::ReqBody::from_stream(UnboundedReceiverStream::new(rx));
+        rs.body_tx.insert(sid, tx);
+        rs.received.insert(sid, 0);
+        rs.dispatched.insert(sid);
+        spawn(shared, notify, handler, sid, req);
     }
     Ok(())
 }
 
-fn spawn_request<H>(
-    shared: &Conn,
-    notify: &Arc<Notify>,
-    handler: &Arc<H>,
-    sid: u32,
-    req: Option<http::Request>,
-    body: Vec<u8>,
-) where
+/// Whether a stream's declared `content-length` disagrees with its received DATA total.
+fn content_len_mismatch(rs: &ReaderState, sid: u32) -> bool {
+    rs.content_len
+        .get(&sid)
+        .copied()
+        .flatten()
+        .is_some_and(|c| rs.received.get(&sid).copied().unwrap_or(0) != c)
+}
+
+/// End a stream's request body **cleanly**: drop the body sender so the handler's body
+/// stream terminates, and clear the per-stream reader state.
+fn end_body(rs: &mut ReaderState, sid: u32) {
+    rs.body_tx.remove(&sid);
+    rs.received.remove(&sid);
+    rs.content_len.remove(&sid);
+    rs.dispatched.remove(&sid);
+}
+
+/// Fail a stream's request body: tell the handler (if still reading) the body source
+/// failed — so a truncated/malformed body is never seen as a clean end — and clear the
+/// per-stream reader state.
+fn fail_body(rs: &mut ReaderState, sid: u32) {
+    if let Some(tx) = rs.body_tx.remove(&sid) {
+        let _ = tx.send(Err(http::BodyError));
+    }
+    rs.received.remove(&sid);
+    rs.content_len.remove(&sid);
+    rs.dispatched.remove(&sid);
+}
+
+/// Spawn the handler task for a fully-built request (its body already set), bumping the
+/// in-flight-handler count the writer waits on. Unlike the buffered path, this runs the
+/// handler as soon as the request HEADERS are complete, concurrently with the reader
+/// feeding the request body in.
+fn spawn<H>(shared: &Conn, notify: &Arc<Notify>, handler: &Arc<H>, sid: u32, req: http::Request)
+where
     H: Handler,
 {
-    let Some(mut req) = req else { return };
-    *req.body_mut() = crate::ReqBody::from_bytes(Bytes::from(body));
     {
         let mut s = shared.lock().unwrap();
         s.active_handlers += 1;
@@ -895,98 +987,22 @@ fn spawn_request<H>(
 }
 
 /// Queue a response onto its stream's outbox, waking the writer. A buffered body
-/// (`Bytes`) is queued all at once; a [`http::Body::Stream`] is drained chunk
-/// by chunk over time and forwarded as DATA frames — so the writer streams it without
-/// the whole body ever being held (the reverse-proxy fast-path).
+/// (`Bytes`) is queued all at once; a [`http::Body::Stream`] / [`http::Body::StreamSized`]
+/// is drained chunk by chunk over time and forwarded as DATA frames — so the writer streams
+/// it without the whole body ever being held (the reverse-proxy fast-path). `StreamSized`
+/// additionally carries a `content-length` header so the client gets a known length.
 async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Response) {
     let (parts, body) = resp.into_parts();
     match body {
-        http::Body::Stream(mut stream) => {
-            // HEADERS carry the response's own headers verbatim — any content-length is
-            // the producer's (we don't re-derive one for a streamed body).
-            let fields = response_fields(&parts, None);
-            if !push_out(
-                shared,
-                notify,
-                sid,
-                OutFrame::Headers {
-                    fields,
-                    end_stream: false,
-                },
-            ) {
-                return;
-            }
-            // The per-stream drain signal the writer uses to wake us off backpressure.
-            let drain = match shared.lock().unwrap().streams.get(&sid) {
-                Some(st) if !st.reset => st.drain.clone(),
-                _ => return,
-            };
-            // Poll the stream directly in this per-stream task — no channel, no
-            // producer task; the writer frames each chunk as it arrives.
-            while let Some(item) = stream.next().await {
-                let chunk = match item {
-                    Ok(chunk) => chunk,
-                    // The source failed mid-stream (e.g. a proxy upstream dropped): reset
-                    // the client stream so a truncated body is never framed as complete.
-                    Err(_) => {
-                        reset_local(shared, notify, sid, ErrorCode::InternalError);
-                        return;
-                    }
-                };
-                if chunk.is_empty() {
-                    continue;
-                }
-                if !push_out(
-                    shared,
-                    notify,
-                    sid,
-                    OutFrame::Data {
-                        bytes: chunk,
-                        off: 0,
-                        end_stream: false,
-                    },
-                ) {
-                    return; // the stream was reset — stop pulling from the producer
-                }
-                // Backpressure: once the per-stream send buffer crosses the high-water
-                // mark (the writer is behind — usually a flow-control window the slow
-                // client hasn't opened), stop pulling the source until the writer
-                // drains it below the low-water mark. Bounds per-stream memory to
-                // ~STREAM_HIGH_WATER regardless of body size.
-                loop {
-                    let over = {
-                        let s = shared.lock().unwrap();
-                        match s.streams.get(&sid) {
-                            // A reset/gone stream, or a torn-down connection whose window
-                            // can no longer reopen, means we stop producing.
-                            Some(st) if st.reset => return,
-                            Some(st) if st.unsent > *STREAM_HIGH_WATER => {
-                                if s.reader_done {
-                                    return;
-                                }
-                                true
-                            }
-                            Some(_) => false,
-                            None => return,
-                        }
-                    };
-                    if !over {
-                        break;
-                    }
-                    drain.notified().await;
-                }
-            }
-            // The source ended: close the stream with an empty END_STREAM DATA frame.
-            push_out(
-                shared,
-                notify,
-                sid,
-                OutFrame::Data {
-                    bytes: Bytes::new(),
-                    off: 0,
-                    end_stream: true,
-                },
-            );
+        // A streamed body with no declared length: frame it with the producer's own headers
+        // (no re-derived content-length) — the stream ending delimits it.
+        http::Body::Stream(stream) => {
+            emit_streaming(shared, notify, sid, &parts, None, stream).await;
+        }
+        // A streamed body with a declared length: emit a `content-length` header (if the
+        // producer didn't already) so the client gets progress/range, then stream the body.
+        http::Body::StreamSized { stream, len } => {
+            emit_streaming(shared, notify, sid, &parts, Some(len as usize), stream).await;
         }
         other => {
             let frames = response_to_frames(parts, other).await;
@@ -1012,6 +1028,105 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
             notify.notify_one();
         }
     }
+}
+
+/// Stream a response body chunk-by-chunk onto its stream's outbox (shared by the
+/// unsized [`http::Body::Stream`] and the declared-length [`http::Body::StreamSized`]
+/// paths): push HEADERS (with `content_length` appended when `Some`, so a sized body
+/// gets a client-visible length), then forward each chunk as a DATA frame under the
+/// per-stream backpressure bound, and finally an empty END_STREAM marker. A mid-stream
+/// [`http::BodyError`] resets the client stream so a truncated body is never framed as a
+/// clean end.
+async fn emit_streaming(
+    shared: &Conn,
+    notify: &Arc<Notify>,
+    sid: u32,
+    parts: &::http::response::Parts,
+    content_length: Option<usize>,
+    mut stream: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = http::BodyChunk> + Send>>,
+) {
+    let fields = response_fields(parts, content_length);
+    if !push_out(
+        shared,
+        notify,
+        sid,
+        OutFrame::Headers {
+            fields,
+            end_stream: false,
+        },
+    ) {
+        return;
+    }
+    // The per-stream drain signal the writer uses to wake us off backpressure.
+    let drain = match shared.lock().unwrap().streams.get(&sid) {
+        Some(st) if !st.reset => st.drain.clone(),
+        _ => return,
+    };
+    // Poll the stream directly in this per-stream task — no channel, no producer task;
+    // the writer frames each chunk as it arrives.
+    while let Some(item) = stream.next().await {
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            // The source failed mid-stream (e.g. a proxy upstream dropped): reset the
+            // client stream so a truncated body is never framed as complete.
+            Err(_) => {
+                reset_local(shared, notify, sid, ErrorCode::InternalError);
+                return;
+            }
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        if !push_out(
+            shared,
+            notify,
+            sid,
+            OutFrame::Data {
+                bytes: chunk,
+                off: 0,
+                end_stream: false,
+            },
+        ) {
+            return; // the stream was reset — stop pulling from the producer
+        }
+        // Backpressure: once the per-stream send buffer crosses the high-water mark (the
+        // writer is behind — usually a flow-control window the slow client hasn't opened),
+        // stop pulling the source until the writer drains it below the low-water mark.
+        // Bounds per-stream memory to ~STREAM_HIGH_WATER regardless of body size.
+        loop {
+            let over = {
+                let s = shared.lock().unwrap();
+                match s.streams.get(&sid) {
+                    // A reset/gone stream, or a torn-down connection whose window can no
+                    // longer reopen, means we stop producing.
+                    Some(st) if st.reset => return,
+                    Some(st) if st.unsent > *STREAM_HIGH_WATER => {
+                        if s.reader_done {
+                            return;
+                        }
+                        true
+                    }
+                    Some(_) => false,
+                    None => return,
+                }
+            };
+            if !over {
+                break;
+            }
+            drain.notified().await;
+        }
+    }
+    // The source ended: close the stream with an empty END_STREAM DATA frame.
+    push_out(
+        shared,
+        notify,
+        sid,
+        OutFrame::Data {
+            bytes: Bytes::new(),
+            off: 0,
+            end_stream: true,
+        },
+    );
 }
 
 /// Build the h2 response header list (`:status` first, then the response's headers) as
@@ -1115,11 +1230,11 @@ async fn body_bytes(body: http::Body) -> Vec<u8> {
         http::Body::File { file, offset, len } => {
             crate::serving::read_file_region(&file, offset, len).unwrap_or_default()
         }
-        // `emit_response` streams a `Body::Stream` directly and never routes it here;
-        // buffer it if it ever does, so this stays correct. A mid-stream error ends the
-        // drain (best-effort — this fallback is only reached if a stream is ever routed
-        // through the buffered path).
-        http::Body::Stream(mut stream) => {
+        // `emit_response` streams a `Body::Stream` / `Body::StreamSized` directly and never
+        // routes either here; buffer it if it ever does, so this stays correct. A mid-stream
+        // error ends the drain (best-effort — this fallback is only reached if a stream is
+        // ever routed through the buffered path).
+        http::Body::Stream(mut stream) | http::Body::StreamSized { mut stream, .. } => {
             let mut buf = Vec::new();
             while let Some(item) = stream.next().await {
                 match item {
