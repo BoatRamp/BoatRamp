@@ -30,11 +30,9 @@
 
 #![cfg(feature = "k8s-backend")]
 
-use std::collections::BTreeMap;
-
 use boatramp_core::compute::{
-    Artifact, ComputeBackend, ComputeSpec, Health, IsolationRequirement, LaunchRequest,
-    ManagedDbEngine, RestartPolicy, RootSource, managed_db_spec,
+    Artifact, ComputeBackend, ComputeSpec, Health, LaunchRequest, ManagedDbEngine, RootSource,
+    managed_db_spec,
 };
 use boatramp_k8s::KubernetesBackend;
 
@@ -42,31 +40,10 @@ use boatramp_k8s::KubernetesBackend;
 const TEST_IMAGE: &str = "ghcr.io/nginxinc/nginx-unprivileged:stable";
 
 fn generic_spec() -> ComputeSpec {
-    ComputeSpec {
-        version: 1,
-        root: RootSource::Image(TEST_IMAGE.to_string()),
-        kernel: String::new(),
-        kernel_cmdline: None,
-        vcpus: 1,
-        mem_mib: 64,
-        entrypoint: vec![],
-        env: BTreeMap::new(),
-        port: 8080,
-        restart: RestartPolicy::Always,
-        startup_grace_secs: 60,
-        scale_to_zero: false,
-        volumes: vec![], // stateless ⇒ Deployment
-        writable_root: false,
-        cap_add: Vec::new(),
-        user: None,
-        isolation: IsolationRequirement::Trusted,
-        prefer_backend: None,
-        require_backend: None,
-        pull_secret: None,
-        bindings: vec![],
-        post_launch: vec![],
-        pull_policy: Default::default(),
-    }
+    // stateless (no volumes) ⇒ Deployment
+    ComputeSpec::builder(RootSource::Image(TEST_IMAGE.to_string()), 1, 64, 8080)
+        .startup_grace_secs(60)
+        .build()
 }
 
 #[tokio::test]

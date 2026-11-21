@@ -952,29 +952,6 @@ impl ContainerBackend {
     }
 }
 
-/// Merge an image config's `KEY=VALUE` environment (the base — notably `PATH`) with the
-/// caller's `(KEY, VALUE)` overrides applied on top: an override REPLACES the same-key
-/// image entry, a new key is appended. Mirrors `oci::effective_env` over the backend's
-/// pair shape. The caller's connection vars (`PG*`/`MYSQL*`) thus win, while the image
-/// supplies the `PATH` the client binaries live on. A malformed image entry (no `=`) is
-/// skipped.
-fn merge_env(image_env: &[String], overrides: &[(String, String)]) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = image_env
-        .iter()
-        .filter_map(|kv| {
-            kv.split_once('=')
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-        })
-        .collect();
-    for (k, v) in overrides {
-        match out.iter_mut().find(|(ek, _)| ek == k) {
-            Some(slot) => slot.1 = v.clone(),
-            None => out.push((k.clone(), v.clone())),
-        }
-    }
-    out
-}
-
 #[async_trait]
 impl ComputeBackend for ContainerBackend {
     fn id(&self) -> &'static str {
@@ -1438,11 +1415,12 @@ impl ComputeBackend for ContainerBackend {
         // Seed the client's environment + cwd from the pulled image's OCI config so a bare
         // `pg_dump`/`pg_restore`/`psql`/`mysql*` (no absolute path) resolves against the
         // image's own `PATH` (e.g. `/usr/lib/postgresql/16/bin` on `pgvector/pgvector`)
-        // instead of failing with `127`. The caller's env (the PG*/MYSQL* connection vars)
-        // is overlaid on top and WINS on any key conflict; the worker's `execvpe` performs
-        // the actual `PATH` search. A default (empty) config leaves behavior as before.
+        // instead of failing with `127`. Applied in `run_ephemeral_inner` via the shared
+        // `SandboxPlan::apply_image_config` seam (image `Env` the base, the caller's PG*/
+        // MYSQL* connection vars overlaid on top and winning); the worker then resolves the
+        // entrypoint against that `PATH` (U23). A default (empty) config leaves behavior as
+        // before.
         let image_cfg = self.client_image_config(image).await;
-        let merged_env = merge_env(&image_cfg.env, env);
 
         // A unique id (cgroup / veth / hostname / log stem) + a transient IP drawn from
         // the SAME shared pool as every replica, so it can't collide with a live workload.
@@ -1454,15 +1432,7 @@ impl ComputeBackend for ContainerBackend {
         // never hold a veth, a cgroup, or a pool address.
         let outcome = self
             .run_ephemeral_inner(
-                &id,
-                &rootfs,
-                ip,
-                image,
-                argv,
-                &merged_env,
-                &image_cfg.workdir,
-                stdin,
-                stdout,
+                &id, &rootfs, ip, image, argv, env, &image_cfg, stdin, stdout,
             )
             .await;
         self.ephemeral_teardown(&id, ip).await;
@@ -2252,6 +2222,18 @@ impl ContainerBackend {
             )));
         }
         let mut plan = SandboxPlan::for_spec(&req.spec, rootfs, id, uid, gid);
+        // Apply the image's OCI runtime config (`Env`/`WorkingDir`) on the long-running
+        // launch path too (U24) — parity with the ephemeral one-shot, via the SAME
+        // `apply_image_config` seam. Only a `RootSource::Image` workload has a registry
+        // image config (read from the sidecar `stage_image` persisted at materialize; a
+        // miss degrades to the default/empty config and leaves behavior as before). The
+        // spec's own `env` WINS over the image's; an empty/unset image config is a no-op.
+        // This is what seeds the image `PATH` onto `plan.env` so the worker's container-PATH
+        // entrypoint resolution (U23) finds a bare `argv[0]` under the image's own dirs.
+        if let RootSource::Image(image) = &req.spec.root {
+            let image_cfg = self.client_image_config(image).await;
+            plan.apply_image_config(&image_cfg.env, &image_cfg.workdir);
+        }
         plan.volumes = self.stage_volumes(&scope, &req.spec, &mapping).await?;
         // Point the guest at boatramp's internal DNS on the bridge gateway (when the
         // resolver is enabled), scoped to this container's project so a bare peer name
@@ -2457,7 +2439,7 @@ impl ContainerBackend {
         image: &str,
         argv: &[String],
         env: &[(String, String)],
-        workdir: &str,
+        image_cfg: &boatramp_firecracker::oci::ImageConfig,
         mut stdin: Option<&mut (dyn futures::io::AsyncRead + Send + Unpin)>,
         stdout: &mut (dyn futures::io::AsyncWrite + Send + Unpin),
     ) -> Result<i32, BackendError> {
@@ -2479,40 +2461,30 @@ impl ContainerBackend {
         // client runs as namespace-root (`0 → host base`) with EVERY capability dropped
         // (`cap_add` is left empty regardless of posture — a dump/restore client never
         // needs a privileged entrypoint), and NO persistent volume.
-        let spec = ComputeSpec {
-            version: 1,
-            root: RootSource::Image(image.to_string()),
-            kernel: String::new(),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib: EPHEMERAL_MEM_MIB,
-            entrypoint: argv.to_vec(),
-            env: env.iter().cloned().collect(),
-            port: 0,
-            restart: boatramp_core::compute::RestartPolicy::Never,
-            startup_grace_secs: 0,
-            scale_to_zero: false,
-            volumes: Vec::new(),
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: boatramp_core::compute::IsolationRequirement::Trusted,
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: Vec::new(),
-            post_launch: Vec::new(),
-            pull_policy: Default::default(),
-        };
+        let spec = ComputeSpec::builder(
+            RootSource::Image(image.to_string()),
+            1,
+            EPHEMERAL_MEM_MIB,
+            0,
+        )
+        .entrypoint(argv.to_vec())
+        .env(env.iter().cloned().collect())
+        .restart(boatramp_core::compute::RestartPolicy::Never)
+        .startup_grace_secs(0)
+        .build();
         let mut plan = SandboxPlan::for_spec(&spec, rootfs, id, GUEST_UID, GUEST_GID);
         // Read-only rootfs: a one-shot client never writes its rootfs (dumps stream to
         // stdout, scratch to the writable `/tmp`·`/run` tmpfs), and it pivots into the
         // SHARED cached staged image — so a read-only root keeps a buggy/hostile client
         // from mutating that cache. Matches the docker backend's `readonly_rootfs`.
         plan.readonly_root = true;
-        // Start the client in the image's `WorkingDir` (empty ⇒ the pivoted root `/`); the
-        // worker honors it best-effort just before `execvpe`.
-        plan.workdir = workdir.to_string();
+        // Overlay the image's OCI runtime config (`Env` base + `WorkingDir`) via the SAME
+        // shared seam the launch path uses (U24). The synthetic spec already seeded the
+        // caller's env onto the plan, so the image `PATH`/env is the base and the caller's
+        // `PG*`/`MYSQL*` connection vars win; the client starts in the image's `WorkingDir`
+        // (empty ⇒ the pivoted root `/`). The worker then resolves a bare entrypoint against
+        // that merged `PATH` (U23).
+        plan.apply_image_config(&image_cfg.env, &image_cfg.workdir);
         // Point the client at the internal resolver on the bridge gateway when enabled, so
         // an external DSN hostname resolves (the resolver forwards external queries). A
         // one-shot has no project scope, so the empty project drops the `search` line and
@@ -3904,58 +3876,13 @@ fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boatramp_core::compute::{IsolationRequirement, RestartPolicy};
     use boatramp_core::{GetObject, ObjectMeta, PutMeta, StorageError};
     use bytes::Bytes;
     use std::collections::BTreeMap;
 
-    #[test]
-    fn merge_env_seeds_image_path_and_caller_vars_win() {
-        // The image supplies `PATH` (where the client binaries live); the caller supplies
-        // only the connection vars. The result carries BOTH, so a bare `pg_dump` resolves.
-        let image_env = vec![
-            "PATH=/usr/local/bin:/usr/lib/postgresql/16/bin:/usr/bin:/bin".to_string(),
-            "LANG=en_US.utf8".to_string(),
-            "PGDATA=/var/lib/postgresql/data".to_string(),
-        ];
-        let overrides = vec![
-            ("PGHOST".to_string(), "db.internal".to_string()),
-            ("PGPASSWORD".to_string(), "s3cret".to_string()),
-            // A caller override of an image key MUST win.
-            ("PGDATA".to_string(), "/tmp/ignored".to_string()),
-        ];
-        let merged = merge_env(&image_env, &overrides);
-        let lookup = |k: &str| {
-            merged
-                .iter()
-                .find(|(ek, _)| ek == k)
-                .map(|(_, v)| v.as_str())
-        };
-        assert_eq!(
-            lookup("PATH"),
-            Some("/usr/local/bin:/usr/lib/postgresql/16/bin:/usr/bin:/bin"),
-            "the image PATH must survive so execvpe can find the client binary"
-        );
-        assert_eq!(lookup("PGHOST"), Some("db.internal"));
-        assert_eq!(lookup("PGPASSWORD"), Some("s3cret"));
-        assert_eq!(
-            lookup("PGDATA"),
-            Some("/tmp/ignored"),
-            "a caller override replaces the same-key image entry"
-        );
-        // No duplicate key for the overridden entry.
-        assert_eq!(merged.iter().filter(|(k, _)| k == "PGDATA").count(), 1);
-    }
-
-    #[test]
-    fn merge_env_handles_empty_image_env_and_malformed_entries() {
-        // No image config (air-gap / default) ⇒ just the caller's env, unchanged.
-        let only_caller = merge_env(&[], &[("PGHOST".to_string(), "h".to_string())]);
-        assert_eq!(only_caller, vec![("PGHOST".to_string(), "h".to_string())]);
-        // An image entry without '=' is skipped, not panicked on.
-        let merged = merge_env(&["BROKEN".to_string(), "PATH=/bin".to_string()], &[]);
-        assert_eq!(merged, vec![("PATH".to_string(), "/bin".to_string())]);
-    }
+    // (env-merge + workdir application is now the shared `SandboxPlan::apply_image_config`
+    // seam — unit-tested cross-platform in `sandbox.rs`, exercised on BOTH the launch and
+    // ephemeral paths here.)
 
     /// A `Storage` that serves one in-memory blob for every `get` — enough to
     /// exercise the `materialize` rootfs-staging path with no privilege (the
@@ -4035,31 +3962,9 @@ mod tests {
     }
 
     fn spec_for(hash: &str) -> ComputeSpec {
-        ComputeSpec {
-            version: 1,
-            root: RootSource::Tar(hash.into()),
-            kernel: String::new(),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib: 64,
-            entrypoint: vec!["/bin/hello".into()],
-            env: BTreeMap::new(),
-            port: 8080,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vec![],
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: IsolationRequirement::Trusted,
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        }
+        ComputeSpec::builder(RootSource::Tar(hash.into()), 1, 64, 8080)
+            .entrypoint(vec!["/bin/hello".into()])
+            .build()
     }
 
     #[test]
@@ -4455,16 +4360,8 @@ mod tests {
         .expect("backend");
         let mut spec = spec_for(&"d".repeat(64));
         spec.volumes = vec![
-            VolumeRef {
-                mount: "/data".into(),
-                name: "db".into(),
-                size_mib: 128,
-            },
-            VolumeRef {
-                mount: "/cache".into(),
-                name: "cache".into(),
-                size_mib: 64,
-            },
+            VolumeRef::new("/data", "db", 128),
+            VolumeRef::new("/cache", "cache", 64),
         ];
 
         // Per-volume chowns (here both read-as-is — the chown path itself is the root-gated live
@@ -4712,11 +4609,7 @@ mod tests {
             s.env
                 .insert("PGDATA".into(), "/var/lib/postgresql/data".into());
         }
-        s.volumes = vec![VolumeRef {
-            mount: "/var/lib/postgresql/data".into(),
-            name: vol.into(),
-            size_mib: 128,
-        }];
+        s.volumes = vec![VolumeRef::new("/var/lib/postgresql/data", vol, 128)];
         s
     }
 

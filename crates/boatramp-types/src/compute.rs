@@ -215,6 +215,7 @@ pub fn pull_reuse_is_unsound(policy: PullPolicy, reference: &str) -> bool {
 /// an ephemeral scratch drive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct VolumeRef {
     /// In-guest mount point.
     pub mount: String,
@@ -222,6 +223,19 @@ pub struct VolumeRef {
     pub name: String,
     /// Size in MiB (used when first provisioning).
     pub size_mib: u32,
+}
+
+impl VolumeRef {
+    /// A persistent-volume reference. The supported constructor — `VolumeRef` is
+    /// `#[non_exhaustive]`, so downstream crates construct it here rather than with a struct
+    /// literal (any field added later stays non-breaking). The public fields remain settable.
+    pub fn new(mount: impl Into<String>, name: impl Into<String>, size_mib: u32) -> Self {
+        Self {
+            mount: mount.into(),
+            name: name.into(),
+            size_mib,
+        }
+    }
 }
 
 /// The generic default startup grace (seconds) for a compute workload — the window a
@@ -237,6 +251,7 @@ pub fn default_startup_grace_secs() -> u32 {
 /// blob hashes in the shared blob store (deduped, cached forever).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ComputeSpec {
     /// Pinned schema discriminant (`v1`).
     #[serde(default = "crate::schema_version")]
@@ -405,6 +420,7 @@ pub enum PostLaunchAction {
 /// data. boatramp resolves it at launch and injects the endpoint into the guest env.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ComputeBinding {
     /// Which managed resource kind.
     pub kind: BindingKind,
@@ -452,6 +468,41 @@ pub enum BindingKind {
 }
 
 impl ComputeBinding {
+    /// A binding to the given managed-resource `kind` — the supported constructor
+    /// (`ComputeBinding` is `#[non_exhaustive]`). Defaults: the kind's default store (`name`
+    /// empty), the kind's default env var (`url_env` `None`), and no separate migration DSN
+    /// (`migration_url_env` `None`). Refine with the chainable `with_*` setters.
+    pub fn new(kind: BindingKind) -> Self {
+        Self {
+            kind,
+            name: String::new(),
+            url_env: None,
+            migration_url_env: None,
+        }
+    }
+
+    /// Set the named database/store within the kind (`""` = the site default).
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Set the env var the resolved endpoint URL is injected as (`None` ⇒ the kind default).
+    #[must_use]
+    pub fn with_url_env(mut self, url_env: Option<String>) -> Self {
+        self.url_env = url_env;
+        self
+    }
+
+    /// Set the env var the migration/DDL connection URL is injected as — the opt-in to a
+    /// separate owner-login migration DSN (`None` ⇒ not injected by default).
+    #[must_use]
+    pub fn with_migration_url_env(mut self, migration_url_env: Option<String>) -> Self {
+        self.migration_url_env = migration_url_env;
+        self
+    }
+
     /// The env var the endpoint URL is injected as (explicit `url_env`, else the kind
     /// default). The auth token is injected as this name plus `_AUTH_TOKEN`.
     pub fn url_env(&self) -> String {
@@ -504,6 +555,191 @@ impl ComputeSpec {
     pub fn id(&self) -> String {
         let canonical = serde_json::to_vec(self).expect("ComputeSpec serializes");
         sha256_hex(&canonical)
+    }
+
+    /// Start building a spec from its required core — the root source + sizing + listen
+    /// port. Every other field defaults (empty / `None` / the policy default) and is set with
+    /// the returned [`ComputeSpecBuilder`]'s `with_*` methods. This is the supported
+    /// construction path: `ComputeSpec` is `#[non_exhaustive]`, so a downstream crate cannot
+    /// (and need not) use a struct literal, and a field added in a later release stays a
+    /// non-breaking change.
+    ///
+    /// ```
+    /// use boatramp_types::compute::{ComputeSpec, RootSource, PullPolicy};
+    ///
+    /// // A downstream crate builds a spec with NO struct literal (so a future field add is
+    /// // non-breaking). Only the deviations from the defaults are set.
+    /// let spec = ComputeSpec::builder(RootSource::Image("pgvector/pgvector:pg16".into()), 2, 1024, 5432)
+    ///     .entrypoint(vec!["postgres".into()])
+    ///     .require_backend(Some("container".into()))
+    ///     .pull_policy(PullPolicy::IfNotPresent)
+    ///     .build();
+    /// assert_eq!(spec.vcpus, 2);
+    /// assert_eq!(spec.port, 5432);
+    /// assert_eq!(spec.require_backend.as_deref(), Some("container"));
+    /// // Unset fields take their documented defaults.
+    /// assert!(spec.env.is_empty());
+    /// assert_eq!(spec.version, boatramp_types::schema_version());
+    /// ```
+    pub fn builder(root: RootSource, vcpus: u32, mem_mib: u32, port: u16) -> ComputeSpecBuilder {
+        ComputeSpecBuilder {
+            inner: Self {
+                version: crate::schema_version(),
+                root,
+                kernel: String::new(),
+                kernel_cmdline: None,
+                vcpus,
+                mem_mib,
+                entrypoint: Vec::new(),
+                env: BTreeMap::new(),
+                port,
+                restart: RestartPolicy::default(),
+                startup_grace_secs: default_startup_grace_secs(),
+                scale_to_zero: false,
+                volumes: Vec::new(),
+                writable_root: false,
+                cap_add: Vec::new(),
+                user: None,
+                isolation: IsolationRequirement::default(),
+                prefer_backend: None,
+                require_backend: None,
+                pull_secret: None,
+                pull_policy: PullPolicy::default(),
+                bindings: Vec::new(),
+                post_launch: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Fluent builder for a [`ComputeSpec`] (`ComputeSpec::builder(...)`). Required fields are
+/// taken at construction; every optional field has a `with_*` setter and otherwise keeps its
+/// documented default. `build()` yields the spec. The ergonomic construction path for
+/// downstream crates now that [`ComputeSpec`] is `#[non_exhaustive]`.
+#[derive(Debug, Clone)]
+pub struct ComputeSpecBuilder {
+    inner: ComputeSpec,
+}
+
+impl ComputeSpecBuilder {
+    /// Override the schema version (defaults to the current [`crate::schema_version`]).
+    #[must_use]
+    pub fn version(mut self, version: u32) -> Self {
+        self.inner.version = version;
+        self
+    }
+    /// Set the kernel blob hash (micro-VM source only; empty ⇒ absent).
+    #[must_use]
+    pub fn kernel(mut self, kernel: impl Into<String>) -> Self {
+        self.inner.kernel = kernel.into();
+        self
+    }
+    /// Set the kernel boot cmdline override.
+    #[must_use]
+    pub fn kernel_cmdline(mut self, cmdline: Option<String>) -> Self {
+        self.inner.kernel_cmdline = cmdline;
+        self
+    }
+    /// Set the in-guest entrypoint (argv).
+    #[must_use]
+    pub fn entrypoint(mut self, entrypoint: Vec<String>) -> Self {
+        self.inner.entrypoint = entrypoint;
+        self
+    }
+    /// Set the entrypoint environment.
+    #[must_use]
+    pub fn env(mut self, env: BTreeMap<String, String>) -> Self {
+        self.inner.env = env;
+        self
+    }
+    /// Set the restart policy.
+    #[must_use]
+    pub fn restart(mut self, restart: RestartPolicy) -> Self {
+        self.inner.restart = restart;
+        self
+    }
+    /// Set the startup grace (seconds).
+    #[must_use]
+    pub fn startup_grace_secs(mut self, secs: u32) -> Self {
+        self.inner.startup_grace_secs = secs;
+        self
+    }
+    /// Enable snapshot-and-stop-when-idle (scale to zero).
+    #[must_use]
+    pub fn scale_to_zero(mut self, scale_to_zero: bool) -> Self {
+        self.inner.scale_to_zero = scale_to_zero;
+        self
+    }
+    /// Set the persistent volumes.
+    #[must_use]
+    pub fn volumes(mut self, volumes: Vec<VolumeRef>) -> Self {
+        self.inner.volumes = volumes;
+        self
+    }
+    /// Allow a writable root filesystem (single-tenant only).
+    #[must_use]
+    pub fn writable_root(mut self, writable_root: bool) -> Self {
+        self.inner.writable_root = writable_root;
+        self
+    }
+    /// Set the added Linux capabilities (single-tenant only).
+    #[must_use]
+    pub fn cap_add(mut self, cap_add: Vec<String>) -> Self {
+        self.inner.cap_add = cap_add;
+        self
+    }
+    /// Run the entrypoint as this `uid`/`uid:gid`.
+    #[must_use]
+    pub fn user(mut self, user: Option<String>) -> Self {
+        self.inner.user = user;
+        self
+    }
+    /// Set the required isolation.
+    #[must_use]
+    pub fn isolation(mut self, isolation: IsolationRequirement) -> Self {
+        self.inner.isolation = isolation;
+        self
+    }
+    /// Set the soft preferred backend id.
+    #[must_use]
+    pub fn prefer_backend(mut self, prefer_backend: Option<String>) -> Self {
+        self.inner.prefer_backend = prefer_backend;
+        self
+    }
+    /// Set the hard required backend id.
+    #[must_use]
+    pub fn require_backend(mut self, require_backend: Option<String>) -> Self {
+        self.inner.require_backend = require_backend;
+        self
+    }
+    /// Set the project-scoped registry pull-credential secret name.
+    #[must_use]
+    pub fn pull_secret(mut self, pull_secret: Option<String>) -> Self {
+        self.inner.pull_secret = pull_secret;
+        self
+    }
+    /// Set the image pull policy.
+    #[must_use]
+    pub fn pull_policy(mut self, pull_policy: PullPolicy) -> Self {
+        self.inner.pull_policy = pull_policy;
+        self
+    }
+    /// Set the managed-resource bindings.
+    #[must_use]
+    pub fn bindings(mut self, bindings: Vec<ComputeBinding>) -> Self {
+        self.inner.bindings = bindings;
+        self
+    }
+    /// Set the post-launch actions.
+    #[must_use]
+    pub fn post_launch(mut self, post_launch: Vec<PostLaunchAction>) -> Self {
+        self.inner.post_launch = post_launch;
+        self
+    }
+    /// Finish building the [`ComputeSpec`].
+    #[must_use]
+    pub fn build(self) -> ComputeSpec {
+        self.inner
     }
 }
 
@@ -1198,5 +1434,83 @@ mod tests {
         assert!(!c.allows(Some("eu"), &BTreeMap::new()), "missing label");
         // No constraints → any node.
         assert!(PlacementConstraints::default().allows(None, &BTreeMap::new()));
+    }
+
+    // ---- U26: constructors/builders for the now-`#[non_exhaustive]` public types ----
+
+    #[test]
+    fn spec_builder_matches_the_equivalent_literal() {
+        // The builder, with a setter for each field the literal `spec()` helper sets to a
+        // non-default, produces a byte-identical spec — so the construction path is complete
+        // and downstreams never need a struct literal.
+        let built = ComputeSpec::builder(RootSource::Rootfs("a".repeat(64)), 2, 512, 8080)
+            .kernel("b".repeat(64))
+            .entrypoint(vec!["/app".into(), "--serve".into()])
+            .env(BTreeMap::from([("PORT".to_string(), "8080".to_string())]))
+            .scale_to_zero(true)
+            .build();
+        assert_eq!(built, spec());
+        assert_eq!(built.id(), spec().id(), "same content hash");
+    }
+
+    #[test]
+    fn spec_builder_defaults_match_the_documented_defaults() {
+        let s = ComputeSpec::builder(RootSource::Tar("c".repeat(64)), 1, 128, 80).build();
+        assert_eq!(s.version, crate::schema_version());
+        assert!(s.kernel.is_empty() && s.kernel_cmdline.is_none());
+        assert!(s.entrypoint.is_empty() && s.env.is_empty());
+        assert_eq!(s.restart, RestartPolicy::Always);
+        assert_eq!(s.startup_grace_secs, default_startup_grace_secs());
+        assert!(!s.scale_to_zero && !s.writable_root);
+        assert!(s.volumes.is_empty() && s.cap_add.is_empty());
+        assert!(s.user.is_none() && s.prefer_backend.is_none() && s.require_backend.is_none());
+        assert_eq!(s.isolation, IsolationRequirement::Trusted);
+        assert!(s.pull_secret.is_none());
+        assert_eq!(s.pull_policy, PullPolicy::default());
+        assert!(s.bindings.is_empty() && s.post_launch.is_empty());
+        // A default-built spec omits every optional field from the wire (schema stays v1).
+        let json = serde_json::to_string(&s).unwrap();
+        for omitted in [
+            "kernel",
+            "scale_to_zero",
+            "require_backend",
+            "bindings",
+            "pull_policy",
+        ] {
+            assert!(
+                !json.contains(omitted),
+                "{omitted} is omitted at its default: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_binding_constructor_and_setters() {
+        // `new` defaults to the site default store + the kind's default env + no migration DSN.
+        let def = ComputeBinding::new(BindingKind::Sql);
+        assert!(def.name.is_empty() && def.url_env.is_none() && def.migration_url_env.is_none());
+        assert_eq!(def.url_env(), "BOATRAMP_SQL_URL");
+
+        let b = ComputeBinding::new(BindingKind::Sql)
+            .with_name("app")
+            .with_url_env(Some("SIMERTEC_DATABASE_URL".into()))
+            .with_migration_url_env(Some("APP_MIGRATE".into()));
+        assert_eq!(b.name, "app");
+        assert_eq!(b.url_env(), "SIMERTEC_DATABASE_URL");
+        assert_eq!(b.migration_url_env(), "APP_MIGRATE");
+        // Equivalent to a binding set through the spec builder's `.bindings(..)`.
+        let spec = ComputeSpec::builder(RootSource::Tar("h".repeat(64)), 1, 64, 80)
+            .bindings(vec![b.clone()])
+            .build();
+        assert_eq!(spec.bindings, vec![b]);
+    }
+
+    #[test]
+    fn volume_ref_constructor() {
+        let v = VolumeRef::new("/data", "db", 128);
+        assert_eq!(
+            (v.mount.as_str(), v.name.as_str(), v.size_mib),
+            ("/data", "db", 128)
+        );
     }
 }

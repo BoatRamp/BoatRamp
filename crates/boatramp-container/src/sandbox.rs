@@ -247,40 +247,116 @@ impl SandboxPlan {
             namespaces: Namespaces::default(),
         }
     }
+
+    /// Overlay an image's OCI runtime config (`Env` + `WorkingDir`) onto this plan —
+    /// the SINGLE shared seam the long-running **launch** AND the one-shot **ephemeral**
+    /// paths both call, so the guest sees the image's `PATH`/env + cwd on BOTH (U24
+    /// parity; before this the launch path dropped the image `Env`/`WorkingDir` entirely,
+    /// so a bare entrypoint had no image `PATH` and the image cwd was ignored).
+    ///
+    /// The image `Env` is the BASE (notably `PATH`); the plan's EXISTING env (seeded from
+    /// the spec / the ephemeral caller — e.g. `PG*`/`MYSQL*` connection vars, operator
+    /// overrides) WINS on a key conflict. `WorkingDir` is applied only when the plan has
+    /// none set, so an explicit spec workdir wins. A malformed image env entry (no `=`) is
+    /// skipped. `image_env` empty AND `image_workdir` empty ⇒ a no-op (a tar/rootfs source
+    /// or a default/empty image config leaves behavior exactly as before).
+    pub fn apply_image_config(&mut self, image_env: &[String], image_workdir: &str) {
+        if !image_env.is_empty() {
+            let mut merged: Vec<(String, String)> = image_env
+                .iter()
+                .filter_map(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect();
+            for (k, v) in &self.env {
+                match merged.iter_mut().find(|(ek, _)| ek == k) {
+                    Some(slot) => slot.1 = v.clone(),
+                    None => merged.push((k.clone(), v.clone())),
+                }
+            }
+            self.env = merged;
+        }
+        if self.workdir.is_empty() && !image_workdir.is_empty() {
+            self.workdir = image_workdir.to_string();
+        }
+    }
+}
+
+/// The OCI runtime-spec default `PATH` — the search path for a bare (non-absolute)
+/// container entrypoint when the image config's `Env` carries no `PATH`. Matches the
+/// `runtime-spec` default so resolution agrees with a conformant OCI runtime.
+pub const DEFAULT_OCI_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Resolve a container entrypoint `argv0` to an absolute (or verbatim) path, searching
+/// the **container's** `PATH` (`path_env`) when `argv0` is a bare name — NOT the host
+/// worker process's `PATH`.
+///
+/// This exists because glibc `execvpe(file, argv, envp)` performs its `PATH` search over
+/// the CALLER's environment (`getenv("PATH")`), **ignoring the `PATH` in `envp`** — so a
+/// bare entrypoint (`sh`, `pg_dump`) resolved against the worker's host `PATH` fails on a
+/// host (e.g. NixOS) whose `PATH` does not contain `/bin` (U23). We do the search
+/// ourselves over `path_env` (the image/spec `PATH`, falling back to [`DEFAULT_OCI_PATH`]
+/// when empty) and the worker then `execve`s the resolved path (no glibc `PATH` search).
+///
+/// `argv0` containing a `/` is returned verbatim (absolute or cwd-relative — no search),
+/// exactly as `execve` treats it. `exists` probes whether a candidate is a runnable file
+/// IN THE CONTAINER filesystem (the worker calls this AFTER `pivot_root`, so the paths are
+/// container paths). Returns `None` when a bare name is on no `PATH` entry.
+pub fn resolve_entrypoint(
+    argv0: &str,
+    path_env: &str,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    if argv0.is_empty() {
+        return None;
+    }
+    if argv0.contains('/') {
+        // Already a path — used verbatim, no PATH search (matches `execve`).
+        return Some(PathBuf::from(argv0));
+    }
+    let path = if path_env.is_empty() {
+        DEFAULT_OCI_PATH
+    } else {
+        path_env
+    };
+    for dir in path.split(':') {
+        // POSIX: an empty PATH element means the current directory.
+        let base: &Path = if dir.is_empty() {
+            Path::new(".")
+        } else {
+            Path::new(dir)
+        };
+        let candidate = base.join(argv0);
+        if exists(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Probe for [`resolve_entrypoint`]: is `p` a runnable (regular, any execute bit) file?
+/// Follows symlinks (a `PATH` entry is often a symlink to the real binary). The worker's
+/// concrete probe; the pure resolver is tested with an in-memory probe.
+#[cfg(unix)]
+pub fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boatramp_types::compute::{IsolationRequirement, RestartPolicy, RootSource};
+    use boatramp_types::compute::RootSource;
     use std::collections::BTreeMap;
 
     fn spec(vcpus: u32, mem_mib: u32) -> ComputeSpec {
-        ComputeSpec {
-            version: 1,
-            root: RootSource::Tar("r".repeat(64)),
-            kernel: "k".repeat(64),
-            kernel_cmdline: None,
-            vcpus,
-            mem_mib,
-            entrypoint: vec!["/app".into(), "--serve".into()],
-            env: BTreeMap::from([("PORT".to_string(), "8080".to_string())]),
-            port: 8080,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vec![],
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: IsolationRequirement::Trusted,
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        }
+        ComputeSpec::builder(RootSource::Tar("r".repeat(64)), vcpus, mem_mib, 8080)
+            .kernel("k".repeat(64))
+            .entrypoint(vec!["/app".into(), "--serve".into()])
+            .env(BTreeMap::from([("PORT".to_string(), "8080".to_string())]))
+            .build()
     }
 
     #[test]
@@ -426,5 +502,152 @@ mod tests {
         let back: SandboxPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back, plan);
         assert_eq!(back.volumes[0].mount, "/data");
+    }
+
+    // ---- U23: resolve a bare entrypoint against the CONTAINER's PATH ----
+
+    /// A probe standing in for the container filesystem: only the listed paths "exist".
+    fn present(paths: &[&str]) -> impl Fn(&std::path::Path) -> bool {
+        let owned: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+        move |p| owned.iter().any(|x| x == p)
+    }
+
+    #[test]
+    fn bare_entrypoint_resolves_against_the_container_path_not_the_host() {
+        // The image/spec PATH places `sh` in `/bin`; the resolver must find `/bin/sh`
+        // from THIS path, never the worker's host PATH (which `execvpe`'s getenv would
+        // use — the U23 bug on a NixOS host where `sh` is not on the host PATH).
+        let container_path = "/usr/local/bin:/usr/bin:/bin";
+        let got = resolve_entrypoint("sh", container_path, present(&["/bin/sh"]));
+        assert_eq!(got, Some(std::path::PathBuf::from("/bin/sh")));
+
+        // Earlier PATH entries win: `psql` present under the image's own non-default dir.
+        let image_path = "/usr/lib/postgresql/16/bin:/usr/bin:/bin";
+        let got = resolve_entrypoint(
+            "psql",
+            image_path,
+            present(&["/usr/lib/postgresql/16/bin/psql", "/usr/bin/psql"]),
+        );
+        assert_eq!(
+            got,
+            Some(std::path::PathBuf::from("/usr/lib/postgresql/16/bin/psql")),
+            "the first matching PATH entry wins"
+        );
+    }
+
+    #[test]
+    fn absent_path_env_falls_back_to_the_oci_default() {
+        // No PATH in the (image/spec) env ⇒ search the OCI runtime-spec default, so a bare
+        // `sh` is still found at `/bin/sh` even on a host whose own PATH lacks `/bin`.
+        let got = resolve_entrypoint("sh", "", present(&["/bin/sh"]));
+        assert_eq!(got, Some(std::path::PathBuf::from("/bin/sh")));
+        assert!(DEFAULT_OCI_PATH.split(':').any(|d| d == "/bin"));
+    }
+
+    #[test]
+    fn slash_entrypoint_is_used_verbatim_with_no_search() {
+        // An absolute (or cwd-relative) argv0 is returned verbatim — no PATH search, and
+        // the probe is never consulted (so an existing-but-irrelevant PATH can't shadow it).
+        let never = |_: &std::path::Path| panic!("must not probe a slash entrypoint");
+        assert_eq!(
+            resolve_entrypoint("/usr/local/bin/app", "/bin", never),
+            Some(std::path::PathBuf::from("/usr/local/bin/app"))
+        );
+        assert_eq!(
+            resolve_entrypoint("./run.sh", "/bin", never),
+            Some(std::path::PathBuf::from("./run.sh"))
+        );
+    }
+
+    #[test]
+    fn bare_entrypoint_absent_everywhere_is_unresolved() {
+        assert_eq!(
+            resolve_entrypoint("nope", "/usr/bin:/bin", present(&[])),
+            None
+        );
+        assert_eq!(resolve_entrypoint("", "/bin", present(&["/bin/"])), None);
+    }
+
+    // ---- U24: the image config's Env/WorkingDir apply on BOTH plan paths ----
+
+    #[test]
+    fn apply_image_config_merges_env_image_base_spec_overrides_win() {
+        let mut plan = SandboxPlan::for_spec(&spec(1, 128), "/r", "h", 0, 0);
+        // The spec seeded PORT=8080; the image supplies PATH + a PORT the spec must override.
+        let image_env = vec![
+            "PATH=/usr/lib/postgresql/16/bin:/usr/bin:/bin".to_string(),
+            "PORT=5432".to_string(),
+            "LANG=C.UTF-8".to_string(),
+            "MALFORMED".to_string(), // no '=' — skipped
+        ];
+        plan.apply_image_config(&image_env, "/var/lib/postgresql");
+        let lookup = |k: &str| {
+            plan.env
+                .iter()
+                .find(|(ek, _)| ek == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            lookup("PATH").as_deref(),
+            Some("/usr/lib/postgresql/16/bin:/usr/bin:/bin"),
+            "the image PATH survives so the entrypoint resolves against it"
+        );
+        assert_eq!(lookup("PORT").as_deref(), Some("8080"), "the spec env WINS");
+        assert_eq!(lookup("LANG").as_deref(), Some("C.UTF-8"));
+        assert!(
+            lookup("MALFORMED").is_none(),
+            "a no-`=` image entry is skipped"
+        );
+        assert_eq!(plan.workdir, "/var/lib/postgresql");
+    }
+
+    #[test]
+    fn launch_and_ephemeral_apply_the_same_image_config_identically() {
+        // U24 parity: the launch path and the ephemeral one-shot both reach `plan.env`/
+        // `plan.workdir` through the SAME `for_spec` → `apply_image_config` sequence, so a
+        // workload with the same spec env sees the same result on either path (before this
+        // the launch path dropped the image config, so only the ephemeral path had the PATH).
+        let image_env = vec!["PATH=/opt/app/bin:/usr/bin:/bin".to_string()];
+        let image_workdir = "/opt/app";
+
+        // Launch path: for_spec(spec) then apply_image_config.
+        let mut launch = SandboxPlan::for_spec(&spec(2, 512), "/r", "web-0", 1000, 1000);
+        launch.apply_image_config(&image_env, image_workdir);
+
+        // Ephemeral path: same spec env seeded, same seam.
+        let mut ephemeral = SandboxPlan::for_spec(&spec(2, 512), "/r2", "eph", 1000, 1000);
+        ephemeral.apply_image_config(&image_env, image_workdir);
+
+        assert_eq!(
+            launch.env, ephemeral.env,
+            "env is applied identically on both paths"
+        );
+        assert_eq!(launch.workdir, ephemeral.workdir, "/opt/app");
+        assert_eq!(launch.workdir, "/opt/app");
+        assert!(
+            launch
+                .env
+                .iter()
+                .any(|(k, v)| k == "PATH" && v == "/opt/app/bin:/usr/bin:/bin"),
+            "the image PATH is present on the launch path (U24)"
+        );
+    }
+
+    #[test]
+    fn apply_image_config_keeps_an_explicit_workdir_and_is_a_noop_when_empty() {
+        // An explicit (spec/ephemeral) workdir is never overwritten by the image's.
+        let mut plan = SandboxPlan::for_spec(&spec(1, 128), "/r", "h", 0, 0);
+        plan.workdir = "/srv".to_string();
+        plan.apply_image_config(&["PATH=/bin".to_string()], "/var/lib/postgresql");
+        assert_eq!(
+            plan.workdir, "/srv",
+            "an explicit workdir wins over the image's"
+        );
+
+        // Empty image config ⇒ a pure no-op (tar/rootfs source / default config).
+        let mut plan2 = SandboxPlan::for_spec(&spec(1, 128), "/r", "h", 0, 0);
+        let before = plan2.clone();
+        plan2.apply_image_config(&[], "");
+        assert_eq!(plan2, before, "an empty image config changes nothing");
     }
 }

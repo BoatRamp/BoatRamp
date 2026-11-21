@@ -1483,6 +1483,29 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub registry_auth: BTreeMap<String, boatramp_core::registry_auth::OperatorRegistryAuth>,
+    /// **Operator allow-list opt-in for private/internal registries** (U25). The OCI image
+    /// pull runs in the node process against a tenant-controlled reference, so it is
+    /// SSRF-screened: by default EVERY non-globally-routable registry address
+    /// (loopback/RFC-1918/link-local/CGNAT/ULA/…) is refused. This allow-list permits NAMED
+    /// private registries — exact `hosts` and/or `cidrs` — so an operator's in-house registry
+    /// on a private network can be used, while the screen stays **block-by-default** (an
+    /// unset/empty allow-list refuses every non-global address, exactly as before) and
+    /// cloud-metadata endpoints (`169.254.169.254` & the whole link-local range, Alibaba
+    /// `100.100.100.200`, AWS IMDSv6 `fd00:ec2::254`) stay ALWAYS blocked even if a broad CIDR
+    /// is allowed. Operator config only (System·Admin), NEVER guest-influenced — mirrors
+    /// `[compute].registry_auth`. A CIDR allow-list is COARSE (any name a tenant image ref
+    /// resolves into the range becomes reachable); prefer an exact `hosts` entry or the
+    /// narrowest CIDR. A malformed CIDR fails config load closed. Example (RON):
+    ///
+    /// ```ron
+    /// allow_private_registries: (
+    ///     hosts: ["registry.internal"],
+    ///     cidrs: ["10.42.0.0/16"],
+    /// )
+    /// ```
+    #[serde(default, skip_serializing_if = "is_default_allow_private_registries")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub allow_private_registries: boatramp_firecracker::oci::PrivateRegistryAllowlist,
     /// **Node-scope operator backend-selection policy** (v0.67.0 `[compute.policy]`):
     /// `allow` / `forbid` / `prefer` over backend ids, the OUTER hard bound on this node's
     /// placement (on top of the capability floor + isolation posture). `None` (default) ⇒ no
@@ -1544,6 +1567,14 @@ fn default_redact_guest_log_secrets() -> bool {
 /// Default for [`ComputeConfig::k8s_retain_pvc`] — retain a managed DB's PVC on stop.
 fn default_k8s_retain_pvc() -> bool {
     true
+}
+
+/// Whether [`ComputeConfig::allow_private_registries`] is at its (empty, block-all) default,
+/// so it is omitted from the serialized config when unset.
+fn is_default_allow_private_registries(
+    a: &boatramp_firecracker::oci::PrivateRegistryAllowlist,
+) -> bool {
+    a == &boatramp_firecracker::oci::PrivateRegistryAllowlist::default()
 }
 
 /// Default upstream resolver for [`ComputeConfig::dns_upstream`].
@@ -1651,6 +1682,8 @@ impl Default for ComputeConfig {
             pg_client_image: None,
             mysql_client_image: None,
             registry_auth: BTreeMap::new(),
+            allow_private_registries: boatramp_firecracker::oci::PrivateRegistryAllowlist::default(
+            ),
             policy: None,
         }
     }

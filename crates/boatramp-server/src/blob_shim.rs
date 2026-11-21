@@ -1421,12 +1421,7 @@ mod tests {
     }
 
     fn blob_binding(name: &str) -> ComputeBinding {
-        ComputeBinding {
-            kind: BindingKind::Blob,
-            name: name.to_string(),
-            url_env: None,
-            migration_url_env: None,
-        }
+        ComputeBinding::new(BindingKind::Blob).with_name(name)
     }
 
     #[tokio::test]

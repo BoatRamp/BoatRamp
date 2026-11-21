@@ -655,12 +655,7 @@ mod tests {
             "http://10.0.0.1:9999".to_string(),
             [7u8; 32],
         );
-        let bindings = vec![ComputeBinding {
-            kind: BindingKind::Sql,
-            name: String::new(),
-            url_env: None,
-            migration_url_env: None,
-        }];
+        let bindings = vec![ComputeBinding::new(BindingKind::Sql)];
 
         let env = resolver.resolve("acme", "api", 0, &bindings).await;
         let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());

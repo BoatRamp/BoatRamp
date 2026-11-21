@@ -300,8 +300,8 @@ async fn force_delete_project(
 mod tests {
     use super::*;
     use boatramp_core::compute::{
-        ComputeSpec, ComputeVolumes, ComputeWorkload, PlacementConstraints, RestartPolicy,
-        RootSource, VolumeError, VolumeRef, VolumeStatus,
+        ComputeSpec, ComputeVolumes, ComputeWorkload, PlacementConstraints, RootSource,
+        VolumeError, VolumeRef, VolumeStatus,
     };
     use boatramp_core::deploy::DeployStore;
     use boatramp_core::kv::MemoryKv;
@@ -451,35 +451,11 @@ mod tests {
             .await
             .unwrap();
 
-        let spec = ComputeSpec {
-            version: boatramp_core::SCHEMA_VERSION,
-            root: RootSource::Rootfs("r".repeat(64)),
-            kernel: "k".repeat(64),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib: 256,
-            entrypoint: vec!["/app".into()],
-            env: Default::default(),
-            port: 8080,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vec![VolumeRef {
-                mount: "/data".into(),
-                name: format!("{name}-data"),
-                size_mib: 512,
-            }],
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: Default::default(),
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        };
+        let spec = ComputeSpec::builder(RootSource::Rootfs("r".repeat(64)), 1, 256, 8080)
+            .kernel("k".repeat(64))
+            .entrypoint(vec!["/app".into()])
+            .volumes(vec![VolumeRef::new("/data", format!("{name}-data"), 512)])
+            .build();
         let hash = deploy.put_compute_spec(&spec).await.unwrap();
         deploy
             .set_compute_workload(

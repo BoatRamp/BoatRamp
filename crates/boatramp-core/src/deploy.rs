@@ -7658,35 +7658,12 @@ mod tests {
 
     #[tokio::test]
     async fn compute_store_round_trips() {
-        use crate::compute::{
-            ComputeSpec, ComputeWorkload, PlacementConstraints, RestartPolicy, RootSource,
-        };
+        use crate::compute::{ComputeSpec, ComputeWorkload, PlacementConstraints, RootSource};
         let s = store();
-        let spec = ComputeSpec {
-            version: crate::SCHEMA_VERSION,
-            root: RootSource::Rootfs("r".repeat(64)),
-            kernel: "k".repeat(64),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib: 256,
-            entrypoint: vec!["/app".into()],
-            env: Default::default(),
-            port: 8080,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vec![],
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: Default::default(),
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        };
+        let spec = ComputeSpec::builder(RootSource::Rootfs("r".repeat(64)), 1, 256, 8080)
+            .kernel("k".repeat(64))
+            .entrypoint(vec!["/app".into()])
+            .build();
         // Content-addressed spec: storing returns the hash; re-reads match.
         let hash = s.put_compute_spec(&spec).await.unwrap();
         assert_eq!(hash, spec.id());
@@ -8548,8 +8525,7 @@ mod tests {
     #[tokio::test]
     async fn enumerate_and_purge_project_are_scoped() {
         use crate::compute::{
-            ComputeSpec, ComputeWorkload, PlacementConstraints, RestartPolicy, RootSource,
-            VolumeRef,
+            ComputeSpec, ComputeWorkload, PlacementConstraints, RootSource, VolumeRef,
         };
         use crate::function::{Function, FunctionConfig, Lifecycle, Owner};
         use crate::kv::MemoryKv;
@@ -8602,35 +8578,11 @@ mod tests {
             .unwrap();
 
         // A compute workload whose active spec mounts a named volume.
-        let spec = ComputeSpec {
-            version: crate::SCHEMA_VERSION,
-            root: RootSource::Rootfs("r".repeat(64)),
-            kernel: "k".repeat(64),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib: 256,
-            entrypoint: vec!["/app".into()],
-            env: Default::default(),
-            port: 8080,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vec![VolumeRef {
-                mount: "/data".into(),
-                name: "pg-data".into(),
-                size_mib: 1024,
-            }],
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: Default::default(),
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        };
+        let spec = ComputeSpec::builder(RootSource::Rootfs("r".repeat(64)), 1, 256, 8080)
+            .kernel("k".repeat(64))
+            .entrypoint(vec!["/app".into()])
+            .volumes(vec![VolumeRef::new("/data", "pg-data", 1024)])
+            .build();
         let hash = store.put_compute_spec(&spec).await.unwrap();
         store
             .set_compute_workload(

@@ -1684,31 +1684,13 @@ mod tests {
 
     /// A minimal typed image-workload spec for the compute-apply tests.
     fn an_image_spec() -> boatramp_core::compute::ComputeSpec {
-        boatramp_core::compute::ComputeSpec {
-            version: boatramp_core::SCHEMA_VERSION,
-            root: boatramp_core::compute::RootSource::Image("nginx:latest".into()),
-            kernel: String::new(),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib: 256,
-            entrypoint: vec![],
-            env: Default::default(),
-            port: 8080,
-            restart: Default::default(),
-            startup_grace_secs: boatramp_core::compute::default_startup_grace_secs(),
-            scale_to_zero: false,
-            volumes: vec![],
-            writable_root: false,
-            cap_add: vec![],
-            user: None,
-            isolation: Default::default(),
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        }
+        boatramp_core::compute::ComputeSpec::builder(
+            boatramp_core::compute::RootSource::Image("nginx:latest".into()),
+            1,
+            256,
+            8080,
+        )
+        .build()
     }
 
     #[tokio::test]

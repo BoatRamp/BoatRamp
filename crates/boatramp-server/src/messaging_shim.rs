@@ -1098,12 +1098,7 @@ mod tests {
     }
 
     fn messaging_binding(name: &str) -> ComputeBinding {
-        ComputeBinding {
-            kind: BindingKind::Messaging,
-            name: name.to_string(),
-            url_env: None,
-            migration_url_env: None,
-        }
+        ComputeBinding::new(BindingKind::Messaging).with_name(name)
     }
 
     fn token_of(env: &[(String, String)]) -> String {

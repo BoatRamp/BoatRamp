@@ -492,12 +492,7 @@ mod tests {
     }
 
     fn sql_binding(name: &str) -> ComputeBinding {
-        ComputeBinding {
-            kind: BindingKind::Sql,
-            name: name.to_string(),
-            url_env: None,
-            migration_url_env: None,
-        }
+        ComputeBinding::new(BindingKind::Sql).with_name(name)
     }
 
     /// A Shared, project-scoped managed Postgres binding — the ONE shape phase 2's dynamic
@@ -608,12 +603,9 @@ mod tests {
     #[tokio::test]
     async fn managed_pg_injects_migration_dsn_only_when_opted_in() {
         let (_shim, resolver) = resolver();
-        let binding = ComputeBinding {
-            kind: BindingKind::Sql,
-            name: "app".to_string(),
-            url_env: None,
-            migration_url_env: Some("APP_MIGRATE_URL".to_string()),
-        };
+        let binding = ComputeBinding::new(BindingKind::Sql)
+            .with_name("app")
+            .with_migration_url_env(Some("APP_MIGRATE_URL".to_string()));
         let out = resolver
             .resolve_with_env("acme", "simertec", 0, &[binding], &BTreeMap::new())
             .await;

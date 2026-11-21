@@ -7,6 +7,67 @@ versions.
 
 ## [Unreleased]
 
+Four fixes reported by the uchron team integrating boatramp 0.67.0 — native-container
+backend defects, an over-strict registry SSRF screen, and a published-crate API-hygiene miss
+— plus a docs callout.
+
+### Breaking
+
+- **Published compute lib types are now `#[non_exhaustive]`, with constructors/builders.** The
+  growth-prone public structs peers (uchron, luigi) build against —
+  [`ComputeSpec`](https://docs.rs/boatramp-types) + [`ComputeBinding`] + [`VolumeRef`] in
+  `boatramp-types`, and [`BackendKind`] in `boatramp-core` — are now `#[non_exhaustive]`, so a
+  field or variant added in a later release is a non-breaking change (v0.67.0's
+  `ComputeSpec.require_backend` addition broke uchron's struct-literal build — U26). Adding
+  `#[non_exhaustive]` is itself a one-time breaking change: **a downstream struct literal
+  (`ComputeSpec { … }`) no longer compiles**. Use the new ergonomic constructors instead, which
+  never need a literal and stay source-stable across field adds:
+  - `ComputeSpec::builder(root, vcpus, mem_mib, port)` → a fluent `ComputeSpecBuilder` with a
+    `.with_*`-style setter per optional field and `.build()`.
+  - `ComputeBinding::new(kind)` with `.with_name(…)` / `.with_url_env(…)` /
+    `.with_migration_url_env(…)`.
+  - `VolumeRef::new(mount, name, size_mib)`.
+  - `BackendKind::new(id, isolation)` with `.with_persistent_volumes(…)` /
+    `.with_scale_to_zero(…)` / `.with_accepted_sources(…)` /
+    `.with_private_registry_credential(…)` / `.with_primary_source(…)`.
+
+### Added
+
+- **Operator allow-list opt-in for private/internal registries
+  (`[compute].allow_private_registries`).** The v0.66.1 registry SSRF hardening refused EVERY
+  non-globally-routable pull target with no override, so an operator's in-house registry on a
+  private network (RFC-1918 / ULA / CGNAT) could not be used (U25). An operator can now exempt
+  NAMED private registries — exact `hosts` and/or `cidrs` — while the screen stays
+  **block-by-default** (an unset/empty allow-list refuses every non-global address, exactly as
+  before) and cloud instance-metadata endpoints (`169.254.169.254` and the whole link-local
+  range, Alibaba `100.100.100.200`, AWS IMDSv6 `fd00:ec2::254`) stay **always blocked** even if a
+  broad CIDR would contain them. Operator config only (System·Admin, node-side — never
+  influenced by a tenant's image reference); a malformed CIDR fails config load closed. A `cidrs`
+  entry is coarse (any name resolving into the range becomes reachable); prefer an exact `hosts`
+  entry or the narrowest CIDR. See
+  [Run a container or microVM](https://boatramp.dev/how-to/compute.html).
+
+### Fixed
+
+- **Native-container entrypoint resolves against the CONTAINER's `PATH`, not the worker's host
+  `PATH`** (U23). A bare (non-absolute) entrypoint was resolved by glibc `execvpe`, whose `PATH`
+  search reads the worker PROCESS's environment (`getenv("PATH")`), IGNORING the `PATH` in the
+  env it is handed — so on a host whose `PATH` lacks `/bin` (e.g. NixOS) a bare `sh` / `pg_dump`
+  failed with `ENOENT`. The worker now searches the container's own `PATH` (the image/spec
+  `PATH`, else the OCI runtime-spec default) and `execve`s the resolved absolute path. An
+  absolute-path entrypoint is unchanged.
+- **The image config's `Env` and `WorkingDir` now apply on the native-container LAUNCH path**
+  (U24), not only the one-shot ephemeral path. A long-running `RootSource::Image` workload now
+  starts with the image's `PATH`/env (the spec's own env winning on conflict) and `WorkingDir`,
+  through a single shared `SandboxPlan::apply_image_config` seam both paths call — so a stock
+  image's bare entrypoint resolves (pairs with U23) and its working directory is honored.
+
+### Documentation
+
+- Document that the **microVM (`firecracker`/VMM) backend hard-requires `nft`** under every
+  posture — beyond the multi-tenant anti-spoof filter, it builds guest egress NAT with `nft`, so
+  a microVM has no outbound connectivity without it even on a single-tenant/dev node.
+
 ## [0.68.0] — 2026-11-20
 
 ### Added
