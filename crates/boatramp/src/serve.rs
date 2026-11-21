@@ -207,6 +207,17 @@ pub enum Error {
     /// UX-C4): a multi-writer SQL control-plane KV backend configured alongside a Raft cluster.
     #[error("{0}")]
     ContradictoryCoordination(String),
+    /// `--tls acme` (TLS-ALPN-01) selected in a clustered / Anycast posture, refused at startup
+    /// (PLAN-anycast AC-2): the challenge connection can land on any node, but only the
+    /// order-initiating node holds the challenge cert, so validation fails. Steer to DNS-01 or the
+    /// cluster-managed cert store.
+    #[cfg(feature = "cluster")]
+    #[error(
+        "`--tls acme` (TLS-ALPN-01) cannot work behind an Anycast VIP / cluster: the ACME \
+         validation connection may reach a different node than the one holding the challenge cert. \
+         Use `--tls acme-dns` (DNS-01) or the cluster-managed cert store instead."
+    )]
+    AcmeTlsAlpnUnderCluster,
 }
 
 impl From<boatramp_core::migrate::MigrateError> for Error {
@@ -708,11 +719,40 @@ pub struct ServeArgs {
     #[arg(long, env = "BOATRAMP_PROTECT_PREVIEWS")]
     protect_previews: bool,
 
+    /// Graceful-drain hold (seconds) on SIGTERM/Ctrl-C before listeners close: the
+    /// node flips `/readyz` to 503 (not `/healthz`), then keeps accepting for this
+    /// long so an Anycast/ECMP load balancer health-gated on `/readyz` withdraws
+    /// this node BEFORE it stops accepting connections — removing the rolling-restart
+    /// connection blip. Flag/env > `[serve] drain_delay_secs` > default 5s. `0`
+    /// disables the hold (close immediately on signal).
+    #[arg(long = "drain-delay", env = "BOATRAMP_DRAIN_DELAY")]
+    drain_delay_secs: Option<u64>,
+
     /// Also serve HTTP/3 (QUIC) on the same UDP port (with `--tls custom`).
     /// Requires the `http3` build feature.
     #[cfg(feature = "http3")]
     #[arg(long)]
     http3: bool,
+
+    /// (HTTP/3 behind Anycast) Encode this node id (0-255) in the first byte of
+    /// every QUIC Connection ID, so an Anycast-aware L4 load balancer can steer each
+    /// H3 connection's packets back to the node that owns it (QUIC otherwise rehashes
+    /// mid-connection onto another node under ECMP). The operator MUST configure the
+    /// LB to route QUIC short-header packets by the first CID byte — see the Anycast
+    /// how-to. Unset ⇒ quinn's default random CIDs (correct for a single / non-Anycast
+    /// node). Flag/env > `[serve] anycast_node_id`. Requires the `http3` feature.
+    #[cfg(feature = "http3")]
+    #[arg(long, env = "BOATRAMP_ANYCAST_NODE_ID")]
+    anycast_node_id: Option<u8>,
+
+    /// (HTTP/3) Advertise HTTP/3 to clients via the `Alt-Svc` header (default true).
+    /// Set `false` behind a plain Anycast VIP that has NO QUIC-aware CID steering, so
+    /// clients stay on HTTP/2 over TCP (ECMP-pinned, unaffected by rehash) instead of
+    /// discovering an h3 endpoint that could break mid-connection. Flag/env >
+    /// `[serve] http3_advertise`. Requires the `http3` feature.
+    #[cfg(feature = "http3")]
+    #[arg(long, env = "BOATRAMP_HTTP3_ADVERTISE")]
+    http3_advertise: Option<bool>,
 
     /// OIDC issuer URL for control-plane bearer-JWT auth (its JWKS is fetched at
     /// startup; tokens' scope claim must carry boatramp scopes). Requires the
@@ -1430,6 +1470,130 @@ async fn spawn_overlay_roles(
     ))
 }
 
+/// Default graceful-drain hold (seconds) before listeners close on shutdown
+/// (PLAN-anycast AC-1) — long enough for a BGP/LB `/readyz` health poll to fail and
+/// withdraw the Anycast route, and for in-flight requests to finish. Overridable via
+/// `--drain-delay` / `[serve] drain_delay_secs`.
+const DEFAULT_DRAIN_DELAY_SECS: u64 = 5;
+
+/// Resolve the graceful-drain hold (AC-1): `--drain-delay` / `BOATRAMP_DRAIN_DELAY`
+/// wins over `[serve] drain_delay_secs`, else [`DEFAULT_DRAIN_DELAY_SECS`].
+fn resolve_drain_delay(
+    args: &ServeArgs,
+    serve_cfg: &crate::config::ServeConfig,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        args.drain_delay_secs
+            .or(serve_cfg.drain_delay_secs)
+            .unwrap_or(DEFAULT_DRAIN_DELAY_SECS),
+    )
+}
+
+/// Resolve the per-node Anycast QUIC Connection-ID node id (AC-3): `--anycast-node-id`
+/// wins over `[serve] anycast_node_id`. `None` ⇒ default random CIDs (non-Anycast).
+#[cfg(feature = "http3")]
+fn resolve_anycast_node_id(args: &ServeArgs, serve_cfg: &crate::config::ServeConfig) -> Option<u8> {
+    args.anycast_node_id.or(serve_cfg.anycast_node_id)
+}
+
+/// Resolve whether to advertise HTTP/3 via `Alt-Svc` (AC-3): `--http3-advertise` wins
+/// over `[serve] http3_advertise`, default `true` (advertise).
+#[cfg(feature = "http3")]
+fn resolve_http3_advertise(args: &ServeArgs, serve_cfg: &crate::config::ServeConfig) -> bool {
+    args.http3_advertise
+        .or(serve_cfg.http3_advertise)
+        .unwrap_or(true)
+}
+
+/// PLAN-anycast AC-2 decision (pure): is `--tls acme` (TLS-ALPN-01) refused in this
+/// posture? `true` iff clustered — TLS-ALPN-01 validation can land on any node, but
+/// only the order node holds the challenge cert, so it fails behind Anycast.
+// Called only on the `cluster`-gated serve path; the pure core is still compiled (and
+// unit-tested) in every tier, so a lean build without `cluster` would see it unused.
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+fn acme_tls_refused_under_cluster(clustered: bool, tls: TlsMode) -> bool {
+    clustered && matches!(tls, TlsMode::Acme)
+}
+
+/// PLAN-anycast AC-6 decision (pure): the set of Anycast-unsafe config codes implied
+/// by the three signals, so the decision is unit-testable without building a full
+/// `ServeArgs`. Empty ⇒ nothing to warn about.
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+fn anycast_unsafe_warning_codes(
+    node_local_fs_blobs: bool,
+    per_node_rate_limit: bool,
+    h3_advertised_without_node_id: bool,
+) -> Vec<&'static str> {
+    let mut codes = Vec::new();
+    if node_local_fs_blobs {
+        codes.push("node-local-fs-blobs");
+    }
+    if per_node_rate_limit {
+        codes.push("per-node-rate-limit");
+    }
+    if h3_advertised_without_node_id {
+        codes.push("h3-advertised-without-node-id");
+    }
+    codes
+}
+
+/// PLAN-anycast AC-6 startup self-check: on a clustered node bound to a non-loopback
+/// address (the Anycast posture — any node may front the VIP), warn LOUD on config
+/// combinations that are NOT Anycast-safe. Defense in depth — none of these is fatal
+/// here (AC-2 already refuses `--tls acme`); they are the silent-misconfig traps the
+/// Anycast deployment contract (AC-5) documents. Returns the warning codes it emitted
+/// ([`anycast_unsafe_warning_codes`]) so the decision is observable in tests.
+#[cfg(feature = "cluster")]
+fn warn_anycast_unsafe_config(
+    args: &ServeArgs,
+    serve_cfg: &crate::config::ServeConfig,
+    blob_args: &BlobArgs,
+    cluster_rate_limit: bool,
+) -> Vec<&'static str> {
+    // HTTP/3 behind Anycast rehashes mid-connection unless the LB steers QUIC by the CID node id.
+    #[cfg(feature = "http3")]
+    let h3_unsteered = args.http3
+        && resolve_http3_advertise(args, serve_cfg)
+        && resolve_anycast_node_id(args, serve_cfg).is_none();
+    #[cfg(not(feature = "http3"))]
+    let h3_unsteered = {
+        let _ = (args, serve_cfg);
+        false
+    };
+    let codes = anycast_unsafe_warning_codes(
+        blob_args.blobs == BlobBackend::Fs,
+        !cluster_rate_limit,
+        h3_unsteered,
+    );
+    for code in &codes {
+        match *code {
+            // Node-local `fs` blobs are not shared across PoPs — a request landing on another node
+            // can't read a blob only this node wrote. Anycast needs a SHARED object store.
+            "node-local-fs-blobs" => tracing::warn!(
+                "anycast: blob backend is node-local `fs`, which is NOT shared across PoPs — a \
+                 request served by another node behind the VIP cannot read blobs only this node \
+                 holds. Use a shared object store (`--blobs s3|gcs|azure`). See the Anycast how-to."
+            ),
+            // Per-node rate-limit buckets under-count behind Anycast (each node counts only the
+            // share ECMP steers to it); the KV-backed cluster-wide limiter counts fleet-wide.
+            "per-node-rate-limit" => tracing::warn!(
+                "anycast: rate limiting uses PER-NODE in-process buckets, which under-count behind \
+                 a VIP (each node sees only its ECMP share). Enable cluster-wide KV-backed limiting \
+                 (`--cluster-rate-limit` / `[serve] cluster_rate_limit`)."
+            ),
+            "h3-advertised-without-node-id" => tracing::warn!(
+                "anycast: HTTP/3 is served AND advertised (Alt-Svc) but no `--anycast-node-id` is \
+                 set, so QUIC uses random Connection IDs. An ECMP rehash can then deliver a \
+                 connection's packets to a different node and break it. Set `--anycast-node-id` + \
+                 configure the LB to steer QUIC by the first CID byte, OR disable advertisement \
+                 (`--http3-advertise false`) so clients stay on HTTP/2 over TCP."
+            ),
+            _ => {}
+        }
+    }
+    codes
+}
+
 pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let serve_cfg = config.serve.clone().unwrap_or_default();
     // cap-req #27: a `[serve.dns_providers]` list needs the ACME/provider adapters, pulled only by the
@@ -1609,6 +1773,25 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         args.cluster_join.is_some(),
     ) {
         return Err(Error::ContradictoryCoordination(msg));
+    }
+
+    // PLAN-anycast AC-2 + AC-6: a clustered node is the Anycast posture (any node may front the VIP).
+    #[cfg(feature = "cluster")]
+    {
+        let clustered =
+            config.cluster.is_some() || args.cluster_init || args.cluster_join.is_some();
+        // AC-2: `--tls acme` is TLS-ALPN-01 — the CA's validation connection can land on any node,
+        // but only the order-initiating node holds the challenge cert, so it fails behind Anycast.
+        // Refuse LOUD (DNS-01 / cluster certs are the Anycast-safe modes).
+        if acme_tls_refused_under_cluster(clustered, args.tls) {
+            return Err(Error::AcmeTlsAlpnUnderCluster);
+        }
+        // AC-6: a non-loopback bind in a clustered posture is almost certainly behind a shared/VIP
+        // front end; warn (loud, not fatal) on the Anycast-UNSAFE config combinations so a silent
+        // misconfiguration surfaces at startup.
+        if clustered && !addr.ip().is_loopback() {
+            warn_anycast_unsafe_config(&args, &serve_cfg, &blob_args, cluster_rate_limit);
+        }
     }
 
     // Cluster mode: triggered by a `[cluster]` config section OR the founding/
@@ -2329,6 +2512,12 @@ async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
     let serve_cfg = config.serve.clone().unwrap_or_default();
     let storage = built_blobs.storage.clone();
 
+    // PLAN-anycast AC-1: the graceful-drain hold the serve loops honor (flip `/readyz` to 503, then
+    // keep accepting this long so an Anycast/LB withdraws this node before listeners close). Carried
+    // in `options` so both the plaintext (`serve_with`) and TLS (`serve_router_over_tls`) paths read
+    // it; the `Readiness` handle in `options` is already shared with the router's `/readyz`.
+    options.drain_delay = resolve_drain_delay(&args, &serve_cfg);
+
     // Cluster-wide rate limiting (already resolved per path to the right store).
     if let Some(rl_kv) = cluster_rate_limit_kv {
         options.cluster_rate_limit_kv = Some(rl_kv);
@@ -2501,7 +2690,21 @@ async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
         TlsMode::Off => boatramp_server::serve_with(addr, deploy, auth, handlers, options)
             .await
             .map_err(Error::Serve),
-        TlsMode::Custom => serve_custom(&args, addr, deploy, auth, handlers, options).await,
+        TlsMode::Custom => {
+            serve_custom(
+                &args,
+                addr,
+                deploy,
+                auth,
+                handlers,
+                options,
+                #[cfg(feature = "http3")]
+                resolve_anycast_node_id(&args, &serve_cfg),
+                #[cfg(feature = "http3")]
+                resolve_http3_advertise(&args, &serve_cfg),
+            )
+            .await
+        }
         TlsMode::Acme => serve_acme(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::Rpk => serve_rpk(&args, addr, deploy, auth, handlers, options, &data_dir).await,
         #[cfg(feature = "acme-dns")]
@@ -2519,6 +2722,10 @@ async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
                 #[cfg(feature = "tcp-listener")]
                 &serve_cfg.listeners,
                 &serve_cfg.control_plane_tls,
+                #[cfg(feature = "http3")]
+                resolve_anycast_node_id(&args, &serve_cfg),
+                #[cfg(feature = "http3")]
+                resolve_http3_advertise(&args, &serve_cfg),
             )
             .await
         }
@@ -5325,6 +5532,9 @@ async fn serve_acme_dns(
     // lets each `--acme-domain` be obtained via DNS-01 or TLS-ALPN-01. Empty ⇒ every domain uses the
     // `--tls acme-dns` default (DNS-01); the common path is unchanged.
     control_plane_tls: &[boatramp_node::config::ControlPlaneDomainTls],
+    // AC-3: the per-node Anycast QUIC Connection-ID node id (routable CIDs) + whether to advertise h3.
+    #[cfg(feature = "http3")] anycast_node_id: Option<u8>,
+    #[cfg(feature = "http3")] advertise_h3: bool,
 ) -> Result<()> {
     use boatramp_acme::acme::CertRequest;
     use std::time::Duration;
@@ -5450,8 +5660,11 @@ async fn serve_acme_dns(
             on_demand_resolver.clone(),
             node_challenge.clone(),
         );
-        let endpoint =
-            boatramp_server::http3_endpoint(addr, boatramp_server::quinn_server_config(h3)?)?;
+        let endpoint = boatramp_server::http3_endpoint(
+            addr,
+            boatramp_server::quinn_server_config(h3)?,
+            anycast_node_id,
+        )?;
         (tcp, Some(endpoint))
     } else {
         (
@@ -5575,6 +5788,8 @@ async fn serve_acme_dns(
         (deploy, auth, handlers, options),
         #[cfg(feature = "http3")]
         h3_endpoint,
+        #[cfg(feature = "http3")]
+        advertise_h3,
     )
     .await
 }
@@ -5785,36 +6000,60 @@ async fn serve_router_over_tls(
         boatramp_server::ServerOptions,
     ),
     #[cfg(feature = "http3")] http3_endpoint: Option<boatramp_server::Http3Endpoint>,
+    // AC-3: whether to advertise HTTP/3 via `Alt-Svc`. `false` behind a plain Anycast VIP without
+    // QUIC-CID steering keeps clients on HTTP/2 over TCP (only consulted when an endpoint is served).
+    #[cfg(feature = "http3")] advertise_h3: bool,
 ) -> Result<()> {
     let (deploy, auth, handlers, options) = serve;
+    // AC-1: the drain flag (shared with the router's `/readyz`) + the drain hold, captured before
+    // `options` moves into the router. The serve loops below use a drain-aware shutdown future so a
+    // SIGTERM flips `/readyz` to 503 and holds the listener(s) open until the LB withdraws this node.
+    let readiness = options.readiness.clone();
+    let drain_delay = options.drain_delay;
     // Background scheduler (consumers/crons) — must run under TLS too, not only `--tls off`; in cluster
     // mode its cron tick is gated on `is_leader`. The handle is fully quiesced on graceful shutdown
     // (below) so no scheduler task can issue a KV write after the store is closed (Part A).
     #[cfg(feature = "handlers")]
     let scheduler = handlers.spawn_scheduler(deploy.clone());
     let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
-    // Serve h3 over the prepared QUIC endpoint (sharing the port + the same router) and advertise it
-    // (`Alt-Svc`) on the HTTPS responses so clients upgrade to h3 — without the header the h3 listener
-    // is never discovered. The bypass gets the same Alt-Svc so a hot-path response advertises h3
-    // identically to the router.
+    // Serve h3 over the prepared QUIC endpoint (sharing the port + the same router) and — unless
+    // advertisement is disabled (AC-3) — advertise it (`Alt-Svc`) on the HTTPS responses so clients
+    // upgrade to h3; without the header the h3 listener is never discovered and clients stay on
+    // HTTP/2 over TCP. The bypass gets the same Alt-Svc so a hot-path response advertises h3
+    // identically to the router. The h3 listener uses the SAME drain-aware shutdown as TCP (AC-1).
     #[cfg(feature = "http3")]
     let (app, fast) = if let Some(endpoint) = http3_endpoint {
         let app_h3 = app.clone();
+        let h3_shutdown = boatramp_server::drain_aware_shutdown(readiness.clone(), drain_delay);
         tokio::spawn(async move {
-            if let Err(err) = boatramp_server::serve_http3_endpoint(endpoint, app_h3).await {
+            if let Err(err) =
+                boatramp_server::serve_http3_endpoint(endpoint, app_h3, h3_shutdown).await
+            {
                 tracing::error!(%err, "HTTP/3 listener failed");
             }
         });
-        (
-            boatramp_server::advertise_http3(app, addr.port()),
-            fast.advertise_http3(addr.port()),
-        )
+        if advertise_h3 {
+            (
+                boatramp_server::advertise_http3(app, addr.port()),
+                fast.advertise_http3(addr.port()),
+            )
+        } else {
+            tracing::info!(
+                "anycast: HTTP/3 is served but Alt-Svc advertisement is disabled; clients stay on \
+                 HTTP/2 over TCP"
+            );
+            (app, fast)
+        }
     } else {
         (app, fast)
     };
-    let serve_result =
-        boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal())
-            .await;
+    let serve_result = boatramp_server::serve_tls(
+        addr,
+        tls,
+        (app, fast),
+        boatramp_server::drain_aware_shutdown(readiness, drain_delay),
+    )
+    .await;
     // Fully quiesce the background scheduler (delivery drainer + blob watchers + in-flight crons)
     // once the serve future returns, BEFORE the caller's `quiesce_and_close` closes the store — so
     // no scheduler task can land a KV write into a fresh WAL segment after `close()` (Part A). This
@@ -5828,6 +6067,7 @@ async fn serve_router_over_tls(
 }
 
 #[cfg(feature = "tls")]
+#[allow(clippy::too_many_arguments)] // the two trailing args are `http3`-only Anycast knobs (AC-3)
 async fn serve_custom(
     args: &ServeArgs,
     addr: SocketAddr,
@@ -5835,6 +6075,8 @@ async fn serve_custom(
     auth: boatramp_server::Auth,
     handlers: boatramp_server::HandlerRuntime,
     options: boatramp_server::ServerOptions,
+    #[cfg(feature = "http3")] anycast_node_id: Option<u8>,
+    #[cfg(feature = "http3")] advertise_h3: bool,
 ) -> Result<()> {
     install_crypto_provider();
     let cert = args.tls_cert.clone().ok_or(Error::TlsCertRequired)?;
@@ -5850,7 +6092,8 @@ async fn serve_custom(
     // uses a STATIC cert (no renewal), so the QUIC endpoint is prepared here from the SAME cert/key and
     // handed to the shared tail, which advertises + serves it exactly as the ACME paths do. A failed
     // h3 setup is logged and serving continues over TCP (never a hard serve failure), matching the
-    // prior in-task `serve_http3` error handling.
+    // prior in-task `serve_http3` error handling. `anycast_node_id` (AC-3) installs the routable-CID
+    // generator when set.
     #[cfg(feature = "http3")]
     let h3_endpoint = if args.http3 {
         let build = || -> Result<boatramp_server::Http3Endpoint> {
@@ -5863,6 +6106,7 @@ async fn serve_custom(
             Ok(boatramp_server::http3_endpoint(
                 addr,
                 boatramp_server::quinn_server_config(h3_tls)?,
+                anycast_node_id,
             )?)
         };
         match build() {
@@ -5881,6 +6125,8 @@ async fn serve_custom(
         (deploy, auth, handlers, options),
         #[cfg(feature = "http3")]
         h3_endpoint,
+        #[cfg(feature = "http3")]
+        advertise_h3,
     )
     .await
 }
@@ -5958,8 +6204,11 @@ async fn serve_rpk(
         addr,
         config.into(),
         (deploy, auth, handlers, options),
+        // RPK bootstrap TLS has no HTTP/3 listener; advertise flag is moot.
         #[cfg(feature = "http3")]
         None,
+        #[cfg(feature = "http3")]
+        true,
     )
     .await
 }
@@ -6054,8 +6303,11 @@ async fn serve_acme(
         addr,
         rustls_config.into(),
         (deploy, auth, handlers, options),
+        // `--tls acme` (TLS-ALPN-01) serves no HTTP/3 listener; advertise flag is moot.
         #[cfg(feature = "http3")]
         None,
+        #[cfg(feature = "http3")]
+        true,
     )
     .await
 }
@@ -6133,9 +6385,64 @@ mod tests {
     };
     // Per-project blob-backend fail-closed gates (PLAN-per-project-blob-backend) — NOT cluster-gated.
     use super::{Error, build_per_project_blob_backends};
+    // PLAN-anycast AC-2/AC-6 pure decision cores — NOT cluster-gated (run in every tier). Explicit
+    // imports alongside the cluster-only `use super::*` glob (the explicit name wins, no conflict).
+    use super::{TlsMode, acme_tls_refused_under_cluster, anycast_unsafe_warning_codes};
     use boatramp_core::kv::WriterModel;
     use boatramp_node::backends::KvBackend;
     use boatramp_node::config::SqlKvConfig;
+
+    /// AC-2: `--tls acme` (TLS-ALPN-01) is refused ONLY in a clustered/Anycast posture;
+    /// every Anycast-safe mode (and single-node `--tls acme`) is unaffected.
+    #[test]
+    fn acme_tls_alpn_refused_under_cluster_only() {
+        // Clustered + `--tls acme` ⇒ refused (the AC-2 defect this closes).
+        assert!(acme_tls_refused_under_cluster(true, TlsMode::Acme));
+        // Single-node `--tls acme` is fine (TLS-ALPN-01 validates on the one node).
+        assert!(!acme_tls_refused_under_cluster(false, TlsMode::Acme));
+        // Anycast-safe modes are never refused, clustered or not.
+        for tls in [
+            TlsMode::Off,
+            TlsMode::Custom,
+            TlsMode::AcmeDns,
+            TlsMode::Rpk,
+        ] {
+            assert!(
+                !acme_tls_refused_under_cluster(true, tls),
+                "{tls:?} is Anycast-safe"
+            );
+            assert!(!acme_tls_refused_under_cluster(false, tls));
+        }
+    }
+
+    /// AC-6: the startup self-check flags exactly the Anycast-unsafe signals that are set.
+    #[test]
+    fn anycast_unsafe_warnings_fire_on_the_misconfig_and_stay_quiet_when_safe() {
+        // A fully Anycast-safe config warns about nothing.
+        assert!(anycast_unsafe_warning_codes(false, false, false).is_empty());
+
+        // The classic misconfig: node-local fs blobs + per-node rate limiting + h3 advertised
+        // with no CID steering — all three fire.
+        let codes = anycast_unsafe_warning_codes(true, true, true);
+        assert_eq!(
+            codes,
+            vec![
+                "node-local-fs-blobs",
+                "per-node-rate-limit",
+                "h3-advertised-without-node-id",
+            ]
+        );
+
+        // Each signal is independent.
+        assert_eq!(
+            anycast_unsafe_warning_codes(true, false, false),
+            vec!["node-local-fs-blobs"]
+        );
+        assert_eq!(
+            anycast_unsafe_warning_codes(false, false, true),
+            vec!["h3-advertised-without-node-id"]
+        );
+    }
 
     fn sql_cfg(kind: &str) -> SqlKvConfig {
         SqlKvConfig {

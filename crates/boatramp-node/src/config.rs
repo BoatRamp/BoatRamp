@@ -2878,6 +2878,24 @@ pub struct ServeConfig {
     /// [`boatramp_core::health_alert::AlertsConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alerts: Option<boatramp_core::health_alert::AlertsConfig>,
+    /// Graceful-drain hold (seconds) before listeners close on SIGTERM/Ctrl-C
+    /// (PLAN-anycast AC-1): the node flips `/readyz` to 503 and keeps accepting for
+    /// this long, so an Anycast/ECMP load balancer health-gated on `/readyz`
+    /// withdraws this node before it stops accepting connections. Config-level analog
+    /// of `--drain-delay` (flag/env wins). Absent ⇒ the built-in default (5s); `0`
+    /// disables the hold.
+    pub drain_delay_secs: Option<u64>,
+    /// (HTTP/3 behind Anycast, AC-3) Per-node QUIC Connection-ID node id (0-255),
+    /// encoded in the first byte of every CID this node issues so an Anycast-aware L4
+    /// load balancer can steer each H3 connection back to its owning node. Config-level
+    /// analog of `--anycast-node-id` (flag/env wins). Absent ⇒ quinn's default random
+    /// CIDs (correct for a single / non-Anycast node).
+    pub anycast_node_id: Option<u8>,
+    /// (HTTP/3, AC-3) Advertise HTTP/3 to clients via `Alt-Svc`. Config-level analog
+    /// of `--http3-advertise` (flag/env wins). Absent ⇒ `true` (advertise). Set
+    /// `false` behind a plain Anycast VIP without QUIC-aware CID steering so clients
+    /// stay on HTTP/2 over TCP.
+    pub http3_advertise: Option<bool>,
 }
 
 /// `[serve.on_demand_tls]` — on-demand per-SNI TLS issuance (cap-req 03). Off unless `enabled`. When

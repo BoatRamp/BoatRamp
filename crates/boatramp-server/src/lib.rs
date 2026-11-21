@@ -360,7 +360,8 @@ mod workflow;
 pub use auth::{Auth, require_auth};
 #[cfg(feature = "http3")]
 pub use http3::{
-    Http3Endpoint, Http3Error, advertise_http3, http3_endpoint, quinn_server_config, serve_http3,
+    ANYCAST_CID_LEN, ANYCAST_NODE_ID_OFFSET, Http3Endpoint, Http3Error, NodeCidGenerator,
+    advertise_http3, http3_endpoint, node_id_from_cid, quinn_server_config, serve_http3,
     serve_http3_endpoint,
 };
 pub use limits::{ServerLimits, UploadGuard};
@@ -3102,6 +3103,19 @@ pub struct ServerOptions {
     /// the handler serves the pre-WS4 SlateDB-flavored shape (the cluster path and embedders that
     /// don't set it), so existing behavior is unchanged.
     pub kv_coordination: Option<KvStatusInfo>,
+    /// Process readiness/drain flag (PLAN-anycast AC-1). `/readyz` returns `503`
+    /// once [`Readiness::begin_drain`] fires (on `SIGTERM`/Ctrl-C via
+    /// [`drain_aware_shutdown`]), so an Anycast/ECMP LB withdraws this node from
+    /// rotation before its listeners close. Default = ready; `boatramp serve`
+    /// shares one handle between the router (so `/readyz` reads it) and the serve
+    /// loop's shutdown future (which flips it).
+    pub readiness: Readiness,
+    /// How long the graceful-shutdown path holds listeners open AFTER flipping
+    /// [`readiness`](Self::readiness) to draining (AC-1), so a load balancer's
+    /// `/readyz` poll fails and withdraws this node first. `0` (the default for an
+    /// embedder) ⇒ no hold (prior timing). `boatramp serve` sets it from
+    /// `[serve] drain_delay_secs` / `--drain-delay` (default 5s).
+    pub drain_delay: Duration,
 }
 
 /// Backend + derived-coordination description for `GET /api/kv-status` (kv-sql WS4, Architect C7).
@@ -3648,19 +3662,25 @@ pub async fn serve_with(
     // backends of upstreams with `active_health` so a dead one leaves rotation
     // before client traffic. Idle until a request arms an upstream.
     let gateway_prober = gateway::spawn_active_health_prober();
+    // Drain state (PLAN-anycast AC-1): the router's `/readyz` reads this handle, and
+    // the serve loop's shutdown future (below) flips it on `SIGTERM`/Ctrl-C and holds
+    // listeners open for `drain_delay`, so a load balancer withdraws this node before
+    // the listener closes. Captured before `options` moves into the router.
+    let readiness = options.readiness.clone();
+    let drain_delay = options.drain_delay;
     // Connect-info make-service so handlers can see the peer address (for IP
     // rules / rate limiting / access logs).
     let (router, fast) = router_with_fast(deploy, auth, handlers, options);
 
-    // The graceful drain begins when the OS signal fires; `signalled` flips at
-    // that instant so the drain deadline is measured from the signal, not from
-    // server start.
+    // The graceful drain begins when the OS signal fires; `signalled` flips when the
+    // drain-aware shutdown future resolves (i.e. after the AC-1 drain delay), so the
+    // in-flight drain deadline covers the actual connection drain that follows.
     let (signalled_tx, signalled_rx) = tokio::sync::watch::channel(false);
     // The splice serve loop intercepts eligible plaintext reverse-proxy connections
     // (Linux) and serves everything else through `boatramp-http` — an eligible plain
     // site GET/HEAD via the `fast` hot-path bypass, the rest through the full `router`.
     let server = splice::serve(tcp, splice_ctx, (router, fast), async move {
-        shutdown_signal().await;
+        drain_aware_shutdown(readiness, drain_delay).await;
         let _ = signalled_tx.send(true);
     });
     let signalled = {
@@ -3793,6 +3813,59 @@ where
     }
 }
 
+/// A shared process **readiness / drain** flag (PLAN-anycast AC-1). `/readyz`
+/// returns `503 Service Unavailable` once [`begin_drain`](Self::begin_drain) is
+/// called — which the graceful-shutdown path does on `SIGTERM`/Ctrl-C — while
+/// `/healthz` stays `200`. A BGP/ECMP speaker or load balancer health-gated on
+/// `/readyz` then withdraws this node from the Anycast rotation *before* its
+/// listeners close, removing the rolling-restart connection blip.
+///
+/// Cloneable; every clone shares one flag. Default = **ready** (not draining), so
+/// an embedder or test that never flips it sees the pre-AC-1 behaviour.
+#[derive(Clone, Default)]
+pub struct Readiness(Arc<std::sync::atomic::AtomicBool>);
+
+impl Readiness {
+    /// A fresh, ready (not-draining) handle.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Flip the node into **draining**: `/readyz` now answers `503`. Idempotent.
+    pub fn begin_drain(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the node is draining (a shutdown is in progress).
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Await the OS shutdown signal (Ctrl-C / SIGTERM), then flip `readiness` to
+/// **draining** and hold for `drain_delay` before resolving (PLAN-anycast AC-1).
+/// Used in place of [`shutdown_signal`] as a serve loop's graceful-shutdown
+/// future: the listener keeps accepting during the hold, so a load balancer's
+/// next `/readyz` poll fails and withdraws this node from the Anycast/ECMP set
+/// *before* the loop stops accepting — no new connection lands on a node that is
+/// about to vanish. A zero `drain_delay` flips the flag and resolves at once (the
+/// default for an embedder, so `serve`/`serve_with` keep their prior timing).
+pub async fn drain_aware_shutdown(readiness: Readiness, drain_delay: Duration) {
+    shutdown_signal().await;
+    readiness.begin_drain();
+    if !drain_delay.is_zero() {
+        tracing::info!(
+            drain_delay_s = drain_delay.as_secs(),
+            "draining: /readyz now reports 503 (not ready); holding listeners open for the drain \
+             delay so an Anycast/LB health check withdraws this node before it stops accepting \
+             connections"
+        );
+        tokio::time::sleep(drain_delay).await;
+    }
+}
+
 /// Resolve when the process receives Ctrl-C or SIGTERM, so in-flight requests
 /// can drain before exit.
 pub async fn shutdown_signal() {
@@ -3828,7 +3901,19 @@ async fn healthz(Extension(daemon): Extension<Arc<DaemonRuntime>>) -> String {
 }
 
 /// Readiness probe: `200 ready` when the metadata backend answers, else `503`.
-async fn readyz(State(deploy): State<DeployStore>) -> Response {
+///
+/// AC-1 (PLAN-anycast): a node that has begun draining (`SIGTERM`/Ctrl-C)
+/// returns `503` **before** the KV probe, so an Anycast/ECMP front-end or load
+/// balancer health-gated on `/readyz` withdraws it from rotation while its
+/// listeners are still open (the configurable drain delay). `/healthz` stays
+/// `200` throughout, so a k8s/liveness probe does not restart the draining node.
+async fn readyz(
+    State(deploy): State<DeployStore>,
+    Extension(readiness): Extension<Readiness>,
+) -> Response {
+    if readiness.is_draining() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "draining\n").into_response();
+    }
     match deploy.ready().await {
         Ok(()) => (StatusCode::OK, "ready\n").into_response(),
         Err(err) => {

@@ -77,6 +77,7 @@
 - [Run boatramp in production]()
   - [Deploy a single node in production](./how-to/deploy-single-node.md)
   - [Deploy a self-hosted cluster](./how-to/deploy-cluster.md)
+  - [Expose a cluster behind an Anycast VIP](./how-to/anycast-vip.md)
   - [Bring up a cluster on Hetzner](./how-to/cluster-on-hetzner.md)
   - [Run on Kubernetes (the in-binary operator)](./how-to/kubernetes.md)
   - [Deploy on Cloudflare Containers](./how-to/deploy-cloudflare.md)
