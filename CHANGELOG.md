@@ -7,6 +7,26 @@ versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`computeShimUrls` turnkey networking now works on a docker-only node (no `compute = true`).**
+  The NixOS module's compute-shim env (`BOATRAMP_COMPUTE_*_SHIM_URL`) and the derived firewall
+  admit rule were gated on `services.boatramp.compute = true` — but that flag exists only to relax
+  the systemd sandbox for the **native** container/microVM backends (ambient `CAP_SYS_ADMIN`/etc.,
+  `/dev/kvm`, namespace/mount relaxations). The **docker** backend needs none of that relaxation,
+  so a docker-only node that set `computeShimUrls` (leaving `compute = false`, as it should) got no
+  shim env and no firewall opening — the whole turnkey-networking feature was silently inert for it.
+  The shim env and the shim-port firewall rule are now driven by
+  `computeShimUrls`/`computeShimPorts`/`computeTrustBridges` **independently of `compute`**, so a
+  docker-only node gets its shims configured and its boatramp bridges admitted while keeping the
+  tight sandbox. Everything genuinely native-backend-only — the ambient/bounding caps, the
+  `/dev/kvm`+`/dev/net/tun` `DeviceAllow`, and the `PrivateDevices`/`RestrictNamespaces`/`AF_NETLINK`
+  relaxations — stays gated on `compute` and is unchanged. The firewall rule itself is **unchanged**
+  (still interface-scoped to `br-boatramp` + the per-project docker `boatramp-*` bridges and
+  port-scoped to the shim ports; off-node stays default-DROP) — only *when* it is installed changed.
+  On a docker-only node `br-boatramp` does not exist and that arm of the rule harmlessly never
+  matches. No new off-node exposure. (nix-module only; no Rust/behavioral change.)
+
 ## [0.69.0] — 2026-11-21
 
 Four fixes reported by the uchron team integrating boatramp 0.67.0 — native-container

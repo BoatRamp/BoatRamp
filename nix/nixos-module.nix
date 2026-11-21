@@ -13,7 +13,11 @@
 # The systemd hardening mirrors packaging/systemd/boatramp.service: a dedicated
 # system user, CAP_NET_BIND_SERVICE only, and a full ProtectSystem/Restrict*
 # sandbox tuned for the static/handler/TLS/cluster profile. `compute = true`
-# relaxes exactly the knobs the Linux microVM/container backends need.
+# relaxes exactly the knobs the NATIVE (microVM/container) Linux backends need —
+# the DOCKER backend needs none of that relaxation. The compute-shim env +
+# firewall opening are therefore driven by `computeShimUrls`/`computeShimPorts`/
+# `computeTrustBridges` INDEPENDENTLY of `compute`, so a docker-only node gets
+# turnkey shim networking while keeping the tight sandbox.
 {
   config,
   lib,
@@ -99,10 +103,11 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Relax the systemd sandbox so the Linux compute backends (microVM/container:
-        `/dev/kvm`, namespaces, mounts) can run, AND admit the compute-shim traffic
-        on the boatramp compute bridges in the firewall (see below). Off by default —
-        a hardened static/handler/TLS node needs none of it.
+        Relax the systemd sandbox so the **native** Linux compute backends
+        (microVM/container: `/dev/kvm`, namespaces, mounts) can run. Off by default — a
+        hardened static/handler/TLS node needs none of it, and NEITHER does a docker-only
+        compute node (the docker backend runs through the docker daemon and needs no
+        in-process cap/sandbox relaxation).
 
         This is an opt-in operator posture change: it grants the (non-root) service
         the **ambient** capabilities `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_SETUID`
@@ -111,21 +116,20 @@ in
         veths/taps over rtnetlink, unshare the container network namespace, mount +
         pivot the guest rootfs, and write the user-namespace uid/gid map. (Ambient,
         not merely bounding-set, because `NoNewPrivileges` + a non-root `User` make a
-        bounding-set-only capability ineffective.) `CAP_SYS_ADMIN` is broad; enable
-        this only on a node you intend to run compute workloads on.
+        bounding-set-only capability ineffective.) It also grants `DeviceAllow` for
+        `/dev/kvm` + `/dev/net/tun` and relaxes `PrivateDevices`/`RestrictNamespaces`.
+        `CAP_SYS_ADMIN` is broad; enable this only on a node you intend to run NATIVE
+        compute workloads on.
 
-        It ALSO opens the firewall for the token-gated compute-shim data plane on the
-        boatramp compute bridges ONLY — `br-boatramp` (native-container/firecracker)
-        and the per-project docker bridges (the `boatramp-` interface-name prefix
-        boatramp pins via the bridge driver-opt). A compute workload runs on a bridge
-        whose gateway is the host, and the shims are bound host-side; on a
-        default-firewall host the INPUT chain would otherwise DROP the
-        container→host:shim-port packet even though the caps to create the bridge were
-        granted. The rule is scoped to the boatramp bridges, so it never admits the
-        LAN/public interface or an unrelated docker bridge (`br-<hash>`). By default it
-        opens ONLY the shim ports (derived from `computeShimUrls`, plus any
-        `computeShimPorts`); with neither set it opens nothing (no bindings to admit).
-        See `computeShimUrls` / `computeShimPorts` / `computeTrustBridges`.
+        NOTE: the compute-shim firewall opening and the `BOATRAMP_COMPUTE_*_SHIM_URL`
+        env are driven by `computeShimUrls` / `computeShimPorts` / `computeTrustBridges`
+        and take effect **independently of this flag** — a docker-only node sets those
+        (with `compute = false`) and gets its shims configured + its bridges admitted
+        while keeping the tight sandbox. The rule is scoped to the boatramp bridges
+        (`br-boatramp` + the per-project docker `boatramp-*` bridges) and port-scoped to
+        the shim ports, so it never admits the LAN/public interface or an unrelated
+        docker bridge (`br-<hash>`); on a docker-only node the `br-boatramp` arm simply
+        never matches. See `computeShimUrls` / `computeShimPorts` / `computeTrustBridges`.
       '';
     };
 
@@ -154,7 +158,10 @@ in
         is both enabled AND reachable — no separate `computeShimPorts` to hand-list. For
         the docker backend, bind on the host-gateway IP (`http://172.17.0.1:<port>`); the
         backend rewrites the guest's view to `host.docker.internal` automatically.
-        Unset ⇒ that shim is off. Has no effect unless `compute` is enabled.
+        Unset ⇒ that shim is off. Takes effect independently of `compute`: the docker
+        backend needs no cap/sandbox relaxation, so setting this on a docker-only node
+        (`compute = false`) both exports the shim env AND opens the firewall for the
+        boatramp bridges. (`compute` is only for the native container/microVM backends.)
       '';
     };
 
@@ -169,8 +176,8 @@ in
         EXTRA TCP ports to open on the boatramp compute bridges, added on top of the
         ports auto-derived from `computeShimUrls`. Use it only when a shim URL is set
         outside this module (e.g. in the RON config) so its port is not auto-derived.
-        Normally leave empty and let `computeShimUrls` drive both. Has no effect unless
-        `compute` is enabled.
+        Normally leave empty and let `computeShimUrls` drive both. Opens the firewall
+        independently of `compute` (the docker backend needs no cap/sandbox relaxation).
       '';
     };
 
@@ -182,8 +189,8 @@ in
         instead of opening only the shim ports. Still scoped to the boatramp bridges
         (never the LAN/public interface), so the off-node boundary is unchanged, but it
         widens the container→host surface to every host port. Prefer leaving this off
-        and letting `computeShimUrls` open only the shim ports. Has no effect unless
-        `compute` is enabled.
+        and letting `computeShimUrls` open only the shim ports. Takes effect
+        independently of `compute` (the docker backend needs no cap/sandbox relaxation).
       '';
     };
   };
@@ -206,9 +213,10 @@ in
           443
         ];
       })
-      # Gap B — firewall coherence. `compute` grants the caps to CREATE the compute
-      # bridges, but a default-firewall host still DROPs the container→host:shim-port
-      # packet at INPUT. Admit the compute-shim data plane on the boatramp compute
+      # Gap B — firewall coherence. A compute node creates per-project/static bridges
+      # whose gateway is the host and binds its shims host-side, but a default-firewall
+      # host still DROPs the container→host:shim-port packet at INPUT. Admit the
+      # compute-shim data plane on the boatramp compute
       # bridges ONLY: the static `br-boatramp` (native-container/firecracker) and the
       # per-project docker bridges, whose Linux interface names boatramp pins to the
       # `boatramp-` prefix (boatramp-docker's `project_bridge_name` /
@@ -226,7 +234,18 @@ in
       # `computeShimPorts`); `computeTrustBridges` opts out to a bare-protocol accept on
       # the interfaces; with no ports and no opt-out there is nothing to admit, so no
       # rule is emitted (the enclosing `mkIf` is false).
-      (lib.mkIf (cfg.compute && (cfg.computeTrustBridges || shimPorts != [ ])) (
+      #
+      # NOT gated on `cfg.compute`: the DOCKER compute backend needs no cap/sandbox
+      # relaxation (that's what `compute` is for — the native container/microVM backends),
+      # yet a docker-only node still binds host-side shims its per-project `boatramp-*`
+      # bridges must reach. So this admit rule fires whenever shim ports are configured
+      # (or `computeTrustBridges`), regardless of `compute`. On a docker-only node the
+      # `br-boatramp` arm simply never matches (that interface only exists for the native
+      # backends) and is harmless; the `boatramp-*` arm matches the docker per-project
+      # bridges. The off-node boundary is UNCHANGED either way — the rule is still
+      # interface-scoped to the boatramp bridges and port-scoped to the shim ports, so an
+      # off-node peer on the LAN/public interface is still default-DROPped.
+      (lib.mkIf (cfg.computeTrustBridges || shimPorts != [ ]) (
         let
           useNft = config.networking.nftables.enable;
           trust = cfg.computeTrustBridges;
@@ -360,14 +379,21 @@ in
         UMask = "0077";
       }
       // lib.optionalAttrs cfg.compute {
+        # Device access for the native backends ONLY (microVM/container): `/dev/kvm` and
+        # `/dev/net/tun`. Genuinely `compute`-gated — a docker-only node must NOT get it.
         DeviceAllow = [
           "/dev/kvm rw"
           "/dev/net/tun rw"
         ];
-        # Feed the compute shim URLs set in `computeShimUrls` to the server as
-        # `BOATRAMP_COMPUTE_<KIND>_SHIM_URL` (figment layers env over the RON config), so
-        # the SAME option that opens the firewall ports also enables the shims. Empty ⇒
-        # no override (the RON config, if any, stands).
+      }
+      # Feed the compute shim URLs set in `computeShimUrls` to the server as
+      # `BOATRAMP_COMPUTE_<KIND>_SHIM_URL` (figment layers env over the RON config), so the
+      # SAME option that opens the firewall ports also enables the shims. NOT gated on
+      # `cfg.compute`: the docker backend needs the shim env too and needs no cap/sandbox
+      # relaxation. Merged via `//` so it composes with any other serviceConfig env; empty
+      # `shimEnv` (no `computeShimUrls`) ⇒ no `Environment` key at all (unchanged — the RON
+      # config, if any, stands).
+      // lib.optionalAttrs (shimEnv != [ ]) {
         Environment = shimEnv;
       };
     };

@@ -927,8 +927,11 @@
             # port-scoped to the ports AUTO-DERIVED from `computeShimUrls` (least
             # privilege — no hand-listing); that those URLs are ALSO fed to the server as
             # env; that `computeTrustBridges` opts out to a bare-protocol accept using a
-            # VALID `meta l4proto tcp` match (NOT a bare `tcp`, the M1 regression); and
-            # that it opens nothing without compute / without shim config. The dedicated
+            # VALID `meta l4proto tcp` match (NOT a bare `tcp`, the M1 regression); that a
+            # DOCKER-ONLY node (`compute = false` + `computeShimUrls`) STILL gets both the
+            # admit rule and the exported shim env (the v0.69.1 ungating — the docker backend
+            # needs no cap/sandbox relaxation); and that it opens/exports nothing with neither
+            # compute nor shim config. The dedicated
             # `compute-firewall-nft-ruleset` check (Linux-only, below) then REALIZES the
             # nft ruleset through `nft --check`. Forced at `nix flake check` eval time via
             # the `assert`, so `--no-build` still catches a regression.
@@ -1000,8 +1003,26 @@
                   compute = true;
                   nftables = true;
                 };
-                # Compute OFF.
+                # DOCKER-ONLY (v0.69.1 gap fix): compute OFF but shim URLs set → the shims
+                # must still be configured (env) AND the firewall must still admit them on the
+                # boatramp bridges. The docker backend needs no cap/sandbox relaxation, so
+                # `compute = false` must NOT make this turnkey feature inert.
+                dockerIpt = fwOf {
+                  compute = false;
+                  shimUrls = shims;
+                };
+                dockerNft = fwOf {
+                  compute = false;
+                  shimUrls = shims;
+                  nftables = true;
+                };
+                dockerEnv = envOf {
+                  compute = false;
+                  shimUrls = shims;
+                };
+                # Compute OFF, nothing set.
                 offIpt = fwOf { compute = false; };
+                offEnv = envOf { compute = false; };
 
                 has = hay: needle: lib.hasInfix needle hay;
                 a = lib.asserts.assertMsg;
@@ -1031,10 +1052,21 @@
                     !has trustNft.extraInputRules ''br-boatramp" tcp accept''
                   ) "trust(nft): must NOT emit a bare `tcp` match (invalid nft)")
                   (a (has trustIpt.extraCommands "-i boatramp-+ -p tcp -j nixos-fw-accept") "trust(ipt): must accept all TCP on the boatramp bridges")
-                  # --- Empty / off: open nothing ---
+                  # --- Docker-only (compute OFF + shim URLs): the v0.69.1 ungating ---
+                  # The firewall admit rule must fire WITHOUT `compute` (the docker backend
+                  # needs no cap/sandbox relaxation), on both backends, port-scoped as usual.
+                  (a (has dockerIpt.extraCommands "-i boatramp-+ ") "docker-only: iptables admit rule must fire without compute")
+                  (a (has dockerIpt.extraCommands "-i br-boatramp ") "docker-only: iptables rule still lists br-boatramp (harmless when absent)")
+                  (a (has dockerIpt.extraCommands "--dports 8083,8084") "docker-only: must auto-derive the shim ports without compute")
+                  (a (has dockerNft.extraInputRules ''iifname "boatramp-*" tcp dport { 8083, 8084 } accept'') "docker-only(nft): port-scoped admit rule must fire without compute")
+                  # The SAME URLs must also feed the server env without compute.
+                  (a (lib.elem "BOATRAMP_COMPUTE_SQL_SHIM_URL=http://172.17.0.1:8083" dockerEnv) "docker-only: must export the sql shim URL to the server env without compute")
+                  (a (lib.elem "BOATRAMP_COMPUTE_KV_SHIM_URL=http://0.0.0.0:8084" dockerEnv) "docker-only: must export the kv shim URL to the server env without compute")
+                  # --- Empty / off: open nothing, export nothing (unchanged) ---
                   (a (!has emptyIpt.extraCommands "boatramp") "empty: no shim config ⇒ no iptables compute rule")
                   (a (!has emptyNft.extraInputRules "boatramp") "empty: no shim config ⇒ no nft compute rule")
                   (a (!has offIpt.extraCommands "boatramp") "no-compute: firewall must not touch the compute bridges")
+                  (a (offEnv == [ ]) "no-compute, nothing set: no shim env ⇒ no serviceConfig.Environment")
                 ];
               in
               assert lib.all (x: x) assertions;
@@ -1617,9 +1649,11 @@
           # the same shim port OFF-NODE (a peer on a non-boatramp interface), even though
           # the shim binds 0.0.0.0 — so the firewall, not the bind scope, is what gates
           # off-node. Parameterized over the firewall backend so BOTH the iptables and the
-          # nftables (M1) paths are exercised live. A stub `package` keeps the Rust binary
-          # out of the closure: this gate verifies the firewall seam, which the module
-          # realizes independently of the server process. The "container" is a child netns
+          # nftables (M1) paths are exercised live, plus a `compute = false` variant that
+          # proves the v0.69.1 ungating live — a DOCKER-ONLY node (no cap/sandbox relaxation)
+          # still gets the admit rule + the exported shim env. A stub `package` keeps the
+          # Rust binary out of the closure: this gate verifies the firewall seam, which the
+          # module realizes independently of the server process. The "container" is a child netns
           # on a boatramp-named kernel bridge — faithful to what the firewall MATCHES (the
           # interface name); the docker-specific host.docker.internal rewrite is covered by
           # the boatramp-docker unit tests + the live lighthouse gate (scripts/compute-net-turnkey-gate.sh).
@@ -1627,12 +1661,19 @@
             let
               cntPort = 18090;
               mkComputeNetTurnkeyVm =
-                { nftables }:
+                {
+                  nftables,
+                  # v0.69.1: with `compute = false` (a DOCKER-ONLY node) the firewall admit
+                  # rule + shim env must STILL fire — the docker backend needs no cap/sandbox
+                  # relaxation. The test script is identical; only the gate shape changes.
+                  compute ? true,
+                }:
                 let
                   rulesetCmd = if nftables then "${pkgs.nftables}/bin/nft list ruleset" else "iptables -S";
+                  suffix = (if nftables then "nftables" else "iptables") + (if compute then "" else "-nocompute");
                 in
                 pkgs.testers.runNixOSTest {
-                  name = "boatramp-compute-net-turnkey-${if nftables then "nftables" else "iptables"}";
+                  name = "boatramp-compute-net-turnkey-${suffix}";
                   nodes = {
                     machine =
                       { pkgs, ... }:
@@ -1641,9 +1682,10 @@
                         networking.nftables.enable = nftables;
                         services.boatramp = {
                           enable = true;
-                          compute = true;
+                          inherit compute;
                           # Single source: the shim URL both configures the server (env) and
-                          # auto-derives the firewall port opened on the boatramp bridges.
+                          # auto-derives the firewall port opened on the boatramp bridges —
+                          # and (v0.69.1) does so independently of `compute`.
                           computeShimUrls.kv = "http://10.77.0.1:${toString cntPort}";
                           # Stub binary — this gate is about the firewall, not the process.
                           package = pkgs.writeShellScriptBin "boatramp" "exec ${pkgs.coreutils}/bin/sleep infinity";
@@ -1674,6 +1716,13 @@
 
                     # Record the realized rule for the log.
                     print(machine.succeed("${rulesetCmd} | grep -i boatramp || true"))
+
+                    # Single source: the shim URL is ALSO exported to the server unit, on a
+                    # real booted systemd — independent of `compute` (v0.69.1).
+                    machine.succeed(
+                        "systemctl show boatramp.service -p Environment | "
+                        "grep -q 'BOATRAMP_COMPUTE_KV_SHIM_URL=http://10.77.0.1:${toString cntPort}'"
+                    )
 
                     # Per-project docker bridge (matches boatramp-* / boatramp-+) + a
                     # "container" child netns reaching the host over that bridge.
@@ -1722,6 +1771,14 @@
             {
               compute-net-turnkey-vm-iptables = mkComputeNetTurnkeyVm { nftables = false; };
               compute-net-turnkey-vm-nftables = mkComputeNetTurnkeyVm { nftables = true; };
+              # v0.69.1: a DOCKER-ONLY node (`compute = false`) must STILL get the admit
+              # rule + shim env live on a real kernel. The firewall ungating is backend-
+              # agnostic, so one live backend (nftables, the M1 path) proves it end-to-end;
+              # both backends' compute=false eval is covered by `compute-firewall-eval`.
+              compute-net-turnkey-vm-nocompute = mkComputeNetTurnkeyVm {
+                nftables = true;
+                compute = false;
+              };
             }
           );
 
