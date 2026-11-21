@@ -536,6 +536,7 @@ async fn reconcile(
         None,
         None,
         None,
+        boatramp_core::compute::BinPackTuning::default(),
     )
     .await
     .expect("reconcile pass")

@@ -1168,6 +1168,7 @@ pub fn spawn_compute_reconcile(
     resolver: Option<std::sync::Arc<dyn boatramp_core::compute::ComputeBindingResolver>>,
     managed_db: Option<std::sync::Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>>,
     registry_auth: Option<std::sync::Arc<dyn boatramp_core::registry_auth::RegistryAuthResolver>>,
+    tuning: boatramp_core::compute::BinPackTuning,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // drive scale-to-zero from the gateway's per-workload activity —
@@ -1193,6 +1194,7 @@ pub fn spawn_compute_reconcile(
                 resolver.as_deref(),
                 managed_db.as_deref(),
                 registry_auth.as_deref(),
+                tuning,
             )
             .await
             {

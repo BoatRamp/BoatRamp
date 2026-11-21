@@ -1116,6 +1116,29 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         }
     };
 
+    // Operator-tunable bin-packing floor: the conservative reservation the cumulative pre-pass
+    // charges a RUNNING replica whose own/workload spec can't be resolved (never zero, to avoid
+    // re-opening over-subscription). Defaults to the built-in 1 vCPU + 1 GiB floor; an operator
+    // raises either dimension via `[compute].unresolved_reservation_{vcpus,mib}` when their
+    // genuinely-orphaned replicas legitimately run larger. Operator-scope (node config), never
+    // tenant-settable.
+    let compute_binpack_tuning = {
+        let default = boatramp_core::compute::BinPackTuning::default();
+        match config.compute.as_ref() {
+            Some(c) => boatramp_core::compute::BinPackTuning {
+                unresolved_reservation: boatramp_core::compute::Reservation {
+                    vcpus: c
+                        .unresolved_reservation_vcpus
+                        .unwrap_or(default.unresolved_reservation.vcpus),
+                    mem_mib: c
+                        .unresolved_reservation_mib
+                        .unwrap_or(default.unresolved_reservation.mem_mib),
+                },
+            },
+            None => default,
+        }
+    };
+
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -1127,6 +1150,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         binding_resolver,
         managed_db_resolver,
         registry_auth_resolver,
+        compute_binpack_tuning,
     );
 
     // Tenant tombstone reaper: leader-gated hard-drop of soft-deleted Shared-Postgres
