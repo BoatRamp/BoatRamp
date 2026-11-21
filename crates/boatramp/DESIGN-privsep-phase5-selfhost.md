@@ -1,11 +1,17 @@
 # DESIGN — privsep Phase 5: node SELF-HOSTING
 
-**Status: DESIGN-FIRST. Nothing in this note is wired. Self-hosting is REFUSED, fail-closed.**
-This cut ships only the composition *vocabulary* (`[privsep].node_serve`, `NodeServeMode`) and a
-fail-closed *gate* that refuses it in the root before any spawn, plus an invertible `#[ignore]`d
-end-to-end gate. The self-host serve path itself is the Phase-5 workstream and lands only after its
-own Security review. This note defines the target, sequences the increments, and SURFACES — without
-deciding — the owner questions. It is the companion to `DESIGN-privsep-phase3-container.md`,
+**Status: P5-0 + P5-1 + P5-2 IMPLEMENTED on `feat/privsep` (pending the P5-2 Security review).**
+P5-0 shipped the composition *vocabulary* (`[privsep].node_serve`, `NodeServeMode`) + a fail-closed
+root *gate*. P5-1 added the authority-scoped app-router *seam*. **P5-2 (this cut) WIRES that seam LIVE**
+on the backend serve path for the READ data plane on the LIGHTWEIGHT substrates (`os-process` /
+`container`): under `node_serve = node-self-host` a `backend.*` data-holder serves the node's own read
+plane through the authority-scoped router (classify → route → a real control-plane KV read), replacing
+the Phase-1 `MinimalHandler` stub; the **VM data-holder stays REFUSED** (design §3a). The remaining
+self-host surfaces — control-plane WRITES, the gateway, the node-own handler engine, and any VM/net-ns
+data-reach — stay fail-closed per request and are P5-3..P5-5; `NodeServeMode::is_wired(NodeSelfHost)`
+stays `false` (it tracks the FULL mode, flipped only at P5-6 after each increment's Security review).
+This note defines the target, sequences the increments, and SURFACES — without deciding — the owner
+questions. It is the companion to `DESIGN-privsep-phase3-container.md`,
 `DESIGN-privsep-phase3-vm-scoped.md`, and `DESIGN-privsep-phase3-vm.md`.
 
 Terminology note: "self-hosted" is overloaded in this codebase (the self-hosted-vs-Vercel product
@@ -160,13 +166,46 @@ over the appropriate link (crown-jewel grammar, or a backend request). Unit-test
 backend still serves the stub until P5-2 wires a real surface. Proves the router shape + the
 "construct-only-what-you-hold" discipline without serving the node's real app.
 
-**P5-2 — read-only data-plane on `backend.*`, Container/OsProcess substrate only.**
+**P5-2 — read-only data-plane on `backend.*`, Container/OsProcess substrate only. — IMPLEMENTED.**
 The smallest real surface: serve the node's READ path (a site/media/static read that touches
 `backend.kv`/`backend.blob`) from a `backend.*` instance, reached by the `listen.http-parse` frontend
-over the splice, with the backend scoping every access by the request's verified principal. Confined
-by `substrate: container` (Option C) or `os-process`, where **the net ns is SHARED**, so the backend
-reaches its store with no new crossing (this sidesteps §3a entirely for the first real surface). Live
-gate on lighthouse: a real read served end-to-end through the composed, confined node.
+over the splice. Confined by `substrate: container` (Option C) or `os-process`, where **the net ns is
+SHARED**, so the backend reaches its store with no new crossing (this sidesteps §3a entirely for the
+first real surface).
+
+*What landed (code):*
+- `instance_serve::run_backend` branches on `node_serve`: under `node-self-host` it builds a
+  `NodeServeHandler` (the gate-derived `NodeServeRouter` + the node read plane) ONCE and serves every
+  client fd through it — replacing `MinimalHandler` on the LIVE apply path; `guest-workloads` keeps the
+  stub unchanged. Fail-closed stand-up: a read-plane open failure exits the instance → `FailNodeClosed`.
+- `NodeServeHandler::serve` classifies each request (`classify_request_surface`: a safe GET/HEAD ⇒ the
+  `backend.kv` READ surface, a mutating method ⇒ the `control.admin-api` write surface), makes the
+  authority-scoped `NodeRoute` decision from the gate's held set + the reachability map derived LIVE
+  from the link topology (`derive_node_reachability`), and EXECUTES it: a HELD data-plane READ surface
+  is served from the read plane (`NodeReadPlane::Kv` — a real `domain/<host>` control-plane KV read);
+  every other surface (a write, a crown-jewel / backend RELAY, or a REFUSE) fails closed with a 503,
+  never a stubbed 200 (the "no silent downgrade" invariant).
+- The root gate (`check_node_self_host_gate` → `check_node_self_host_read_plane`) ADMITS node-self-host
+  for the P5-2 shape and REFUSES a `backend.*` data-holder on `substrate: vm`
+  (`PrivsepError::NodeSelfHostVmDataHolder`, marker `PRIVSEP_NODE_SELF_HOST_VM_DATA_HOLDER_REFUSED`) —
+  defence-in-depth beside the structural S2 `VmInstanceOutsideApprovedScope` scope lint (which fires
+  first in `plan_root`) and `resolve_spawn_backend`'s VM-shape gate.
+
+*Isolation (HIGH-1):* P5-2 adds NO new exec/fork path — the data-holder is the existing fork+exec'd
+`__instance`, which already runs `set_process_undumpable()` (`PR_SET_DUMPABLE(0)`) at entry, before the
+gate is built. The read plane + router run inside that already-hardened instance, so the HIGH-1
+cross-instance `/proc/<pid>/mem` wall holds unchanged on every substrate P5-2 touches.
+
+*Tests:* host-tested on the real `serve_connection` apply path with an in-memory KV (a seeded host ⇒
+200, an unseeded host ⇒ 404, a write/relay/refuse ⇒ 503) + the gate admit/refuse + the reachability
+derivation; live gates (lighthouse, `#[ignore]`d): `PRIVSEP NODE SELF-HOST READ-PLANE OK` (os-process
+serve) + `PRIVSEP NODE SELF-HOST VM DATA-HOLDER REFUSED OK`. **The real control-plane KV opening +
+reading under the derived per-capability Landlock profile is NOT yet validated live** (authored on
+macOS) — it is the biggest P5-2 unknown (§5) and MUST pass the lighthouse live gate before any cut; an
+`EPERM` on the pool open FailNodeCloses the node (the gate surfaces it). The **Container** substrate
+read-plane serve is a flagged lighthouse follow-on: the substrate wiring is already proven by
+`PRIVSEP CONTAINER SUBSTRATE OK` and the read-plane handler is substrate-independent (host-tested), so
+only a Container re-run of gate B remains to confirm the KV opens under the container's Landlock FS wall.
 
 **P5-3 — control-plane MUTATION on `control.admin-api` + the crown-jewel grammars.**
 Wire `/api/*` mutations: the frontend relays to `control.admin-api`, which relays mint/sign to the
@@ -326,27 +365,29 @@ number, they are independent workstreams.
 
 ---
 
-## 6. What THIS cut ships (safe-only scaffolding)
+## 6. What the P5-0/P5-1/P5-2 cuts ship
 
-- **Vocabulary** (`boatramp-types/src/privsep.rs`): `NodeServeMode { GuestWorkloads, NodeSelfHost }`
+- **Vocabulary** (`boatramp-types/src/privsep.rs`, P5-0): `NodeServeMode { GuestWorkloads, NodeSelfHost }`
   with `tag()` / `is_wired()` / `is_node_self_host()` (mirrors `InstanceSubstrate`), and a
   `node_serve: NodeServeMode` field on `PrivsepConfig` (struct-level `#[serde(default)]` ⇒ every
-  pre-Phase-5 config is byte-unchanged; default `GuestWorkloads`).
-- **Fail-closed gate** (`boatramp/src/privsep.rs`): `NODE_SELF_HOST_UNWIRED_MARKER`
-  (`"PRIVSEP_NODE_SELF_HOST_UNWIRED"`), a pure `check_node_self_host_gate`, a new
-  `PrivsepError::NodeSelfHostUnwired` variant carrying the marker, and a call wired into `plan_root`
-  (step 2d) so the root refuses `node-self-host` BEFORE any spawn. `GuestWorkloads` is a no-op — no
-  running composition changes.
-- **Tests:** a pure host-testable unit test
-  (`node_self_host_mode_is_refused_fail_closed_before_any_spawn_spec`) asserting the default authorizes
-  and `NodeSelfHost` refuses end-to-end through `plan_root` with the marker; and an invertible
-  `#[ignore]`d live gate (`privsep_node_self_host_refuses_fail_closed_end_to_end`, in
-  `tests/privsep_live.rs`) that forks the real `__root` on an otherwise-valid composition selecting
-  `node_serve: NodeSelfHost`, asserts it refuses + exits with the marker + never serves, and prints
-  `PRIVSEP NODE SELF-HOST REFUSED OK` for the CI gate. When Phase 5 lands, this gate flips to a serve
-  gate (the fixture is already the serving-gate shape) and `is_wired(NodeSelfHost)` flips — one
-  mechanical inversion point.
+  pre-Phase-5 config is byte-unchanged; default `GuestWorkloads`). `is_wired(NodeSelfHost)` stays
+  `false` through P5-2 (it tracks the FULL mode; P5-6 flips it).
+- **Gate** (`boatramp/src/privsep.rs`): `check_node_self_host_gate`, wired into `plan_root` (step 2d).
+  `GuestWorkloads` is a no-op. **P5-2 REPLACED P5-0's whole-mode "unwired" refusal** (the
+  `NODE_SELF_HOST_UNWIRED_MARKER` / `PrivsepError::NodeSelfHostUnwired` scaffolding, now removed) with
+  `check_node_self_host_read_plane`: it ADMITS node-self-host for the P5-2 read-plane shape and REFUSES
+  a `backend.*` data-holder on `substrate: vm` (`PrivsepError::NodeSelfHostVmDataHolder`, marker
+  `NODE_SELF_HOST_VM_DATA_HOLDER_MARKER` = `"PRIVSEP_NODE_SELF_HOST_VM_DATA_HOLDER_REFUSED"`).
+- **Serve path** (P5-1 seam → P5-2 live): `NodeServeRouter` / `NodeRoute` / `NodeServeHandler` /
+  `NodeReadPlane` + `run_backend`'s `node_serve` branch (see §2 P5-2 for the detail).
+- **Tests:** host unit/apply-path tests — `node_self_host_read_plane_admits_lightweight_and_refuses_vm_data_holder`,
+  `p5_2_node_serve_handler_serves_a_held_read_on_the_live_apply_path`,
+  `p5_2_node_serve_handler_fail_closes_write_relay_and_refuse`,
+  `p5_2_derive_node_reachability_maps_peer_authorities_over_links`, plus the P5-1 router tests; live
+  gates (`tests/privsep_live.rs`, `#[ignore]`d) `privsep_node_self_host_read_plane_serves_end_to_end`
+  (`PRIVSEP NODE SELF-HOST READ-PLANE OK`) + `privsep_node_self_host_vm_data_holder_refused_end_to_end`
+  (`PRIVSEP NODE SELF-HOST VM DATA-HOLDER REFUSED OK`); `ci.yml` bumped to 9 privsep-live tests.
 
-**Not shipped (by design):** any serve path, any `is_wired` flip, any change to an existing go-live
-gate or substrate arm. Self-hosting stays refused, fail-closed, pending the Phase-5 workstream and its
-Security review.
+**Still NOT wired (fail-closed, pending P5-3..P5-6 + their Security reviews):** control-plane WRITES,
+the gateway, the node-own handler engine, any VM/net-ns data-reach, and the full `is_wired(NodeSelfHost)`
+flip. These are refused per request by the router (a 503), never served from a stub.

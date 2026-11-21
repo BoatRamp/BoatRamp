@@ -119,20 +119,23 @@ pub enum PrivsepError {
     /// node down rather than serving degraded.
     #[error("privsep root supervisor: {0}")]
     Supervise(String),
-    /// The composition asked the node to SELF-HOST its own serve path under privsep
-    /// (`[privsep].node_serve = node-self-host`) — the node's OWN control-plane/admin API, gateway,
-    /// handler engine, and managed-DB/KV/blob backends served UNDER the composition, not only guest
-    /// workloads — but that serve path is **NOT YET WIRED** (design §Phase-5, pending its own
-    /// Security review). Refused fail-closed in the root BEFORE any spawn rather than silently
-    /// serving the node's REAL app from a stubbed / under-confined instance (the "no silent
-    /// downgrade" invariant). The marker [`NODE_SELF_HOST_UNWIRED_MARKER`] is greppable + invertible:
-    /// when the Phase-5 serve path lands it flips from this refusal to a live serve gate.
+    /// A `node_serve = node-self-host` composition (Phase-5 P5-2, the read-plane increment) places a
+    /// `backend.*` DATA-HOLDER instance on the `vm` substrate. The VM data-holder stays **REFUSED** —
+    /// a confined guest in its own kernel/network stack cannot reach its DB/KV/blob store without either
+    /// widening the guest's egress or a host-mediated data relay that would route data-plane bytes
+    /// through the secret-blind root (design `DESIGN-privsep-phase5-selfhost.md` §3a, the owner-gated
+    /// P5-5 question). P5-2 runs the node's read plane only on the LIGHTWEIGHT, shared-net substrates
+    /// (`os-process` / `container` Option C), where the data-holder reaches its store with no new
+    /// crossing. This is a Phase-5-worded, defence-in-depth refusal BESIDE the structural
+    /// `check_vm_secret_blindness_closure` Tier-3 scope lint (`VmInstanceOutsideApprovedScope`) +
+    /// [`resolve_spawn_backend`]'s VM-shape gate, both of which already refuse a VM `backend.*` for
+    /// EVERY `node_serve` mode. The marker [`NODE_SELF_HOST_VM_DATA_HOLDER_MARKER`] is greppable.
     #[error(
-        "privsep node self-hosting refused: {0} — {marker}. Refusing fail-closed; use the default \
-         `node_serve = guest-workloads` composition until the Phase-5 self-host serve path is wired",
-        marker = NODE_SELF_HOST_UNWIRED_MARKER
+        "privsep node self-hosting refused: {0} — {marker}. The VM data-holder stays refused; place \
+         `backend.*` instances on `substrate: os-process` or `substrate: container`",
+        marker = NODE_SELF_HOST_VM_DATA_HOLDER_MARKER
     )]
-    NodeSelfHostUnwired(String),
+    NodeSelfHostVmDataHolder(String),
     /// A feature-instance runtime failure (sandbox derive/install, fd receive, or serve). The
     /// instance refuses to serve rather than degrade.
     #[error("privsep instance {label:?}: {reason}")]
@@ -272,34 +275,121 @@ impl RootPlan {
     }
 }
 
-/// The greppable, invertible marker the root emits when it refuses node self-hosting because the
-/// Phase-5 serve path is not wired (design §Phase-5). It is the counterpart of the live-serve
-/// markers the `live gate (privsep)` CI job greps (e.g. `PRIVSEP LIVE OK`): the `#[ignore]`d
-/// end-to-end gate asserts THIS marker today, and the SAME gate flips to assert a live serve marker
-/// once the self-host serve path + its Security review land — the single, mechanical inversion point.
-pub const NODE_SELF_HOST_UNWIRED_MARKER: &str = "PRIVSEP_NODE_SELF_HOST_UNWIRED";
+/// The greppable, invertible marker the root emits when it refuses a `node_serve = node-self-host`
+/// composition that places a `backend.*` DATA-HOLDER on the `vm` substrate (design §Phase-5 P5-2 / §3a).
+/// The P5-2 read-plane runs data-holders only on the lightweight, shared-net substrates
+/// (`os-process` / `container`); the VM data-holder stays refused (see
+/// [`PrivsepError::NodeSelfHostVmDataHolder`]).
+pub const NODE_SELF_HOST_VM_DATA_HOLDER_MARKER: &str = "PRIVSEP_NODE_SELF_HOST_VM_DATA_HOLDER_REFUSED";
 
-/// The root's fail-closed NODE SELF-HOSTING gate (design §Phase-5). Refuses a composition that asks
-/// the node to serve its OWN serve path (control-plane/admin API, gateway, handler engine, the
-/// managed-DB/KV/blob backends) UNDER the privsep composition — [`NodeServeMode::NodeSelfHost`] —
-/// because that serve path is **NOT YET WIRED** (today a `backend.*` instance serves only the minimal
-/// stub; the authority-scoped node app router is the Phase-5 workstream, pending its own Security
-/// review). A `None` / [`NodeServeMode::GuestWorkloads`] composition (every pre-Phase-5 node) is a
-/// NO-OP, so no running composition changes — this only refuses the not-yet-buildable self-host mode,
-/// loud and fail-closed, never a silent downgrade to the stubbed serve.
+/// The root's NODE SELF-HOSTING gate (design §Phase-5). A `None` / [`NodeServeMode::GuestWorkloads`]
+/// composition (every pre-Phase-5 node) is a NO-OP, so no running composition changes. Mirrors
+/// [`resolve_spawn_backend`]'s substrate gate: keyed on the serve mode, decided BEFORE any allocation.
+/// Pure (host-testable).
 ///
-/// Mirrors [`resolve_spawn_backend`]'s substrate gate: keyed on a wired/not-wired vocabulary
-/// ([`NodeServeMode::is_wired`]), refusing BEFORE any allocation. Pure (host-testable). When the
-/// Phase-5 serve path lands, [`NodeServeMode::is_wired`] flips for `NodeSelfHost` and this gate
-/// admits it (and the `#[ignore]`d live gate inverts from the refusal marker to a live serve marker).
+/// **Phase-5 P5-2 (this cut) — the READ-PLANE increment.** `node_serve = node-self-host` is now
+/// ADMITTED for the P5-2 shape: the node's own READ data plane served by a `backend.*` data-holder
+/// instance confined to a LIGHTWEIGHT, shared-net substrate (`os-process` / `container` Option C),
+/// reached by a `listen.*` frontend over the splice (the authority-scoped node app router,
+/// [`instance_serve::NodeServeHandler`], runs LIVE on the backend serve path — design §1). The ONE
+/// composition constraint P5-2 enforces here is the VM-data-holder refusal
+/// ([`check_node_self_host_read_plane`]): a `backend.*` data-holder on `substrate: vm` is refused
+/// fail-closed, because a confined guest cannot reach its store without the owner-gated P5-5 data-reach
+/// mechanism (§3a). Everything the read plane cannot yet serve — a write/mutation surface, a
+/// crown-jewel or backend RELAY — is refused fail-closed PER REQUEST by the router (never a stubbed
+/// 200), so admitting the mode never silently downgrades an unbuilt surface.
+///
+/// [`NodeServeMode::is_wired`] stays `false` for `NodeSelfHost`: it tracks the FULL self-host serve
+/// path (control-plane mutations, the gateway, the node-own handler engine — Phase-5 P5-3..P5-5), which
+/// is NOT wired; P5-2 wires only the read plane. The gate therefore keys on the mode + the P5-2 shape,
+/// not on `is_wired`.
 fn check_node_self_host_gate(privsep: &PrivsepConfig) -> Result<(), PrivsepError> {
-    if privsep.node_serve.is_wired() {
+    if !privsep.node_serve.is_node_self_host() {
+        // `guest-workloads` (the wired default): a no-op — every pre-Phase-5 composition is unchanged.
         return Ok(());
     }
-    Err(PrivsepError::NodeSelfHostUnwired(format!(
-        "composition selects `node_serve = {}`, whose self-host serve path is not wired in this cut",
-        privsep.node_serve.tag()
+    // `node-self-host` (P5-2 read plane): admit the lightweight-substrate shape; refuse a VM data-holder.
+    check_node_self_host_read_plane(privsep)
+}
+
+/// The Phase-5 P5-2 read-plane shape lint: a `node_serve = node-self-host` composition may run its
+/// `backend.*` DATA-HOLDER instances only on a LIGHTWEIGHT, shared-net substrate (`os-process` /
+/// `container`), never a `vm` (design §3a — the VM data-holder's egress/secret-blindness problem is
+/// the owner-gated P5-5 question). Refuses fail-closed, naming every offending instance, with the
+/// greppable [`NODE_SELF_HOST_VM_DATA_HOLDER_MARKER`].
+///
+/// This is a Phase-5-worded, DEFENCE-IN-DEPTH refusal: a `backend.*` on `vm` is ALSO refused — for
+/// every `node_serve` mode — by [`check_vm_secret_blindness_closure`]'s Tier-3 scope lint
+/// (`VmInstanceOutsideApprovedScope`, run at `plan_root` step 2b-vm, BEFORE this gate) and by
+/// [`resolve_spawn_backend`]'s VM-shape gate at spawn. Keeping an explicit P5-2 clause here documents
+/// the read-plane's substrate contract at its own gate and guards against a future reordering that
+/// might move this check ahead of the S2 lint. Pure (host-testable).
+fn check_node_self_host_read_plane(privsep: &PrivsepConfig) -> Result<(), PrivsepError> {
+    let vm_data_holders: Vec<String> = privsep
+        .instances
+        .iter()
+        .filter(|(_, inst)| {
+            matches!(inst.substrate, InstanceSubstrate::Vm)
+                && inst.capabilities.iter().any(|a| a.is_backend())
+        })
+        .map(|(label, _)| label.clone())
+        .collect();
+    if vm_data_holders.is_empty() {
+        return Ok(());
+    }
+    Err(PrivsepError::NodeSelfHostVmDataHolder(format!(
+        "composition selects `node_serve = node-self-host` but places backend.* data-holder \
+         instance(s) {vm_data_holders:?} on the `vm` substrate; the P5-2 read plane runs data-holders \
+         only on the lightweight shared-net substrates (`os-process` / `container`)"
     )))
+}
+
+/// Derive the node-self-host **reachability map** for one instance (Phase-5 P5-2): for every feature-
+/// link incident to `label` in the resolved composition, the PEER instance's held authorities become
+/// reachable over that named link. A HELD authority is excluded (it is served locally, never relayed —
+/// design §4 item 5 "construct-only-what-you-hold"); the first link (deterministic — `links` is a
+/// `BTreeMap`) that reaches an authority wins. The [`instance_serve::NodeServeRouter`] consumes this to
+/// route each request's serve surface: HELD ⇒ local, reachable ⇒ relay, neither ⇒ refuse fail-closed.
+///
+/// This REPLACES the P5-1 constructor-input reachability map with one derived from the live link
+/// topology (the FLAGGED P5-1 → P5-2 sub-decision). Pure (host-testable): derived entirely from the
+/// resolved [`ServerConfig`].
+fn derive_node_reachability(
+    config: &ServerConfig,
+    label: &str,
+) -> BTreeMap<HostAuthority, String> {
+    let mut reachable: BTreeMap<HostAuthority, String> = BTreeMap::new();
+    let Some(privsep) = config.privsep.as_ref() else {
+        return reachable;
+    };
+    let Some(me) = privsep.instances.get(label) else {
+        return reachable;
+    };
+    let held: BTreeSet<HostAuthority> = me.capabilities.iter().copied().collect();
+    for (link_name, link) in &privsep.links {
+        if link.from == link.to {
+            continue; // a self-link reaches no peer
+        }
+        let peer = if link.from == label {
+            &link.to
+        } else if link.to == label {
+            &link.from
+        } else {
+            continue; // not incident to this instance
+        };
+        let Some(peer_inst) = privsep.instances.get(peer) else {
+            continue;
+        };
+        for &authority in &peer_inst.capabilities {
+            if held.contains(&authority) {
+                continue; // HELD ⇒ served locally, never relayed
+            }
+            reachable
+                .entry(authority)
+                .or_insert_with(|| link_name.clone());
+        }
+    }
+    reachable
 }
 
 /// Build the root's authorized spawn plan — the PURE, fail-closed authorization gate
@@ -362,14 +452,15 @@ where
         privsep.per_tenant.validate()?;
     }
 
-    // 2d. NODE SELF-HOSTING gate (design §Phase-5): a composition that asks the node to serve its OWN
-    //     serve path (control-plane/admin API, gateway, handler engine, managed-DB/KV/blob backends)
-    //     UNDER the privsep composition (`node_serve = node-self-host`) is refused fail-closed — that
-    //     serve path is not yet wired (today a backend instance serves only the minimal stub; the
-    //     authority-scoped node app router is the Phase-5 workstream, pending its own Security
-    //     review). A `guest-workloads` (the default) composition is a no-op here, so no running
-    //     composition changes; this only refuses the not-yet-buildable self-host mode, loud and
-    //     fail-closed, before any spawn — never a silent downgrade to the stubbed serve.
+    // 2d. NODE SELF-HOSTING gate (design §Phase-5). `guest-workloads` (the default) is a no-op here.
+    //     `node-self-host` is ADMITTED for the Phase-5 P5-2 READ-PLANE shape (the node's own read data
+    //     plane served by a `backend.*` data-holder on a lightweight shared-net substrate; the
+    //     authority-scoped node app router runs live on the backend serve path), with ONE fail-closed
+    //     constraint enforced here before any spawn: a `backend.*` data-holder on `substrate: vm` is
+    //     refused (the VM data-holder's egress problem is the owner-gated P5-5 question, §3a). Surfaces
+    //     the read plane cannot yet serve (writes, control mutations, the gateway, the node-own handler
+    //     engine — P5-3..P5-5) are refused fail-closed PER REQUEST by the router, never a stubbed serve,
+    //     so admitting the mode is not a silent downgrade of an unbuilt surface.
     check_node_self_host_gate(privsep)?;
 
     // 3. The per-instance re-exec spawn spec (F11-B minimal env). Reached ONLY after
@@ -3468,7 +3559,7 @@ mod instance_serve {
             // authority was split onto.
             run_per_tenant_supervisor(label, gate, fds, config, config_path)
         } else if let Some((lname, link_fd)) = fds.links.iter().next() {
-            run_backend(label, lname, *link_fd)
+            run_backend(label, lname, *link_fd, gate, config)
         } else {
             tracing::info!(
                 instance = %label,
@@ -3976,20 +4067,61 @@ mod instance_serve {
     /// the hand-rolled HTTP stack. The received fd is treated as opaque CLIENT bytes conferring no
     /// authority (design F5). A dedicated blocking thread drains the link (the link I/O is
     /// blocking) and feeds a Tokio consumer that serves each connection.
-    fn run_backend(label: &str, link_name: &str, link_fd: i32) -> Result<(), String> {
+    ///
+    /// **The serve HANDLER depends on the node's serve mode (design §Phase-5):**
+    /// - `guest-workloads` (the wired default) ⇒ [`MinimalHandler`], the Phase-1 byte-path stub (a
+    ///   fixed 200) — every pre-Phase-5 composition is UNCHANGED, and the existing guest-workloads live
+    ///   gates keep asserting the stub body;
+    /// - `node-self-host` (Phase-5 **P5-2**, the read-plane increment) ⇒ the authority-scoped
+    ///   [`NodeServeHandler`] running LIVE: it is built ONCE from this instance's
+    ///   [`MaterializationGate`] + the reachability map derived from the live link topology + the node
+    ///   read plane (the held `backend.kv` control-plane KV), then serves every received client fd. It
+    ///   classifies each request into its serve surface, makes the authority-scoped [`NodeRoute`]
+    ///   decision, and EXECUTES it — serving a real read for a HELD data-plane read surface, and
+    ///   fail-closing every surface the P5-2 read plane does not yet serve (a write/mutation, a
+    ///   crown-jewel or backend RELAY — P5-3..P5-5). Stand-up is fail-closed: if the read plane cannot
+    ///   be built (e.g. the control-plane KV will not open under the instance's Landlock grant), the
+    ///   instance EXITS → the root's `FailNodeClosed` tears the node down rather than serving degraded.
+    fn run_backend(
+        label: &str,
+        link_name: &str,
+        link_fd: i32,
+        gate: &MaterializationGate,
+        config: &ServerConfig,
+    ) -> Result<(), String> {
         // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
         let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("building the Tokio runtime: {e}"))?;
-        tracing::info!(
-            instance = %label,
-            link = %link_name,
-            "[privsep] backend: receiving client fds over the local link; serving each with the \
-             hand-rolled HTTP stack"
-        );
+        let self_host = config
+            .privsep
+            .as_ref()
+            .is_some_and(|p| p.node_serve.is_node_self_host());
         rt.block_on(async move {
+            // Build the per-connection serve handler ONCE (an owned, cheaply-cloneable value — no
+            // borrow escapes into a spawned task). Under node-self-host this opens the node read plane;
+            // a stand-up failure returns `Err` → the instance exits → FailNodeClosed (no degraded serve).
+            let handler = if self_host {
+                let h = build_self_host_backend_handler(label, gate, config).await?;
+                tracing::info!(
+                    instance = %label,
+                    link = %link_name,
+                    "[privsep] backend (node-self-host, P5-2): serving the authority-scoped node app \
+                     router LIVE — read surfaces served from the held data plane, all else fail-closed"
+                );
+                h
+            } else {
+                tracing::info!(
+                    instance = %label,
+                    link = %link_name,
+                    "[privsep] backend (guest-workloads): receiving client fds over the local link; \
+                     serving each with the hand-rolled HTTP stack (Phase-1 minimal handler)"
+                );
+                BackendHandler::Minimal
+            };
+
             let (tx, mut rx) = tokio::sync::mpsc::channel::<OwnedFd>(64);
             // Blocking link-drain on a dedicated thread (recv is blocking); it hands each received
             // client fd to the async consumer. EOF/err ends the loop (the frontend went away).
@@ -4009,20 +4141,65 @@ mod instance_serve {
                 }
             });
             while let Some(fd) = rx.recv().await {
-                tokio::spawn(serve_client_fd(fd));
+                tokio::spawn(serve_client_fd(fd, handler.clone()));
             }
             let _ = drain.join();
-        });
-        Ok(())
+            Ok::<(), String>(())
+        })
+    }
+
+    /// Build the node-self-host serve handler (Phase-5 P5-2): the authority-scoped [`NodeServeRouter`]
+    /// (from the instance's held authority set + the reachability map derived from the live composition
+    /// link topology) + the node read plane (the held `backend.kv` control-plane KV). Fail-closed: a
+    /// read-plane stand-up failure returns `Err` so the caller exits the instance (FailNodeClosed).
+    async fn build_self_host_backend_handler(
+        label: &str,
+        gate: &MaterializationGate,
+        config: &ServerConfig,
+    ) -> Result<BackendHandler, String> {
+        let reachable = super::derive_node_reachability(config, label);
+        let router = NodeServeRouter::new(gate, reachable);
+        let read_plane = build_node_read_plane(label, gate, config).await?;
+        Ok(BackendHandler::SelfHost(NodeServeHandler::new(
+            router, read_plane,
+        )))
+    }
+
+    /// Build the P5-2 node READ PLANE for a data-holder instance: the held `backend.kv` control-plane
+    /// store (a [`DeployStore`](boatramp_core::deploy::DeployStore) over the node KV + blob `Storage`),
+    /// opened UNDER this instance's Landlock grant by REUSING [`build_routing_deploy_store`] (the exact
+    /// node control-plane store the per-tenant router opens). An instance that does NOT hold `backend.kv`
+    /// gets a [`NodeReadPlane::Refusing`] placeholder — the router never routes a read to it (a non-held
+    /// surface is a relay/refuse, not a local serve), so the placeholder is defensive, never reached.
+    ///
+    /// **Live-gated (lighthouse).** Whether the real control-plane store actually opens + reads under the
+    /// derived per-capability seccomp/Landlock profile (vs. a fail-closed `EPERM` the `MinimalHandler`
+    /// stub never surfaced) is the single biggest P5-2 unknown and can only be confirmed by a live run
+    /// on Linux (design §5; memory `ship-the-fix-not-the-incident`). Host tests inject a
+    /// [`NodeReadPlane::Deploy`] over an in-memory store, which exercises the router + read serve on the
+    /// real apply path WITHOUT the fork/sandbox/pool-open — that remains the live gate's job.
+    async fn build_node_read_plane(
+        label: &str,
+        gate: &MaterializationGate,
+        config: &ServerConfig,
+    ) -> Result<NodeReadPlane, String> {
+        if !gate.may_materialize(HostAuthority::BackendKv) {
+            return Ok(NodeReadPlane::Refusing);
+        }
+        tracing::info!(
+            instance = %label,
+            "[privsep] node-self-host backend: opening the control-plane deploy store for the P5-2 \
+             read plane (under the backend.kv Landlock grant)"
+        );
+        let store = build_routing_deploy_store(config).await?;
+        Ok(NodeReadPlane::Deploy(store))
     }
 
     /// Serve one received client connection with the hand-rolled HTTP/1+2 stack (the same
-    /// `boatramp_http::serve_connection` the monolith's `serve_router_conn` wraps) + a minimal
-    /// handler. The full authority-scoped app router is the self-host serve follow-on: the typed
-    /// [`NodeServeHandler`] seam (P5-1, design §Phase-5) is the drop-in that replaces
-    /// [`MinimalHandler`] here once P5-2 wires a real surface. Today — behind the unwired self-host
-    /// path ([`super::check_node_self_host_gate`] refuses `node-self-host`) — this stays the stub.
-    async fn serve_client_fd(fd: OwnedFd) {
+    /// `boatramp_http::serve_connection` the monolith's `serve_router_conn` wraps) + the backend's
+    /// per-connection handler ([`BackendHandler`] — the guest-workloads stub or the node-self-host
+    /// authority-scoped router, chosen once in [`run_backend`]).
+    async fn serve_client_fd(fd: OwnedFd, handler: BackendHandler) {
         let std_stream = std::net::TcpStream::from(fd);
         if let Err(e) = std_stream.set_nonblocking(true) {
             tracing::debug!(error = %e, "[privsep] backend: set_nonblocking on a client fd");
@@ -4038,16 +4215,36 @@ mod instance_serve {
                 return;
             }
         };
-        if let Err(e) = boatramp_http::serve_connection(stream, MinimalHandler).await {
+        if let Err(e) = boatramp_http::serve_connection(stream, handler).await {
             tracing::debug!(%peer, error = %e, "[privsep] backend: connection served with error");
+        }
+    }
+
+    /// The per-connection serve handler a `backend.*` instance uses. Cheaply cloneable (cloned into
+    /// each connection task): [`MinimalHandler`] is unit, [`NodeServeHandler`] holds a [`Clone`] router
+    /// + an `Arc`-backed read plane.
+    #[derive(Clone)]
+    pub(super) enum BackendHandler {
+        /// `guest-workloads`: the Phase-1 byte-path stub (a fixed 200).
+        Minimal,
+        /// `node-self-host` (P5-2): the authority-scoped node app router (real routing + read serve).
+        SelfHost(NodeServeHandler),
+    }
+
+    impl boatramp_http::Handler for BackendHandler {
+        async fn handle(&self, req: boatramp_http::Request) -> boatramp_http::Response {
+            match self {
+                Self::Minimal => MinimalHandler.handle(req).await,
+                Self::SelfHost(h) => h.handle(req).await,
+            }
         }
     }
 
     /// The Phase-1 minimal backend handler: a fixed 200. It proves the end-to-end byte path
     /// (client → frontend listener fd → SCM_RIGHTS splice → backend → hand-rolled HTTP → response)
-    /// with the sandbox enforced in both instances. The authority-scoped app router is a follow-on:
-    /// the [`NodeServeHandler`] seam (P5-1) is introduced below and swapped in here by P5-2 (it keeps
-    /// the identical stub body in the unwired cut, so wiring it changes the serve, not the byte path).
+    /// with the sandbox enforced in both instances, and is the `guest-workloads` backend handler (the
+    /// authority-scoped [`NodeServeHandler`] replaces it under `node-self-host`, P5-2).
+    #[derive(Clone)]
     struct MinimalHandler;
 
     impl boatramp_http::Handler for MinimalHandler {
@@ -4060,17 +4257,23 @@ mod instance_serve {
     }
 
     // =========================================================================
-    // P5-1: the authority-scoped node app-router SEAM (design §Phase-5 P5-1)
+    // P5-2: the authority-scoped node app-router — WIRED LIVE (design §Phase-5 P5-2)
     // =========================================================================
     //
-    // This is the typed seam that REPLACES `MinimalHandler` when a `backend.*` / authority instance
-    // serves the node's OWN serve path (`node_serve = node-self-host`). It is introduced BEHIND the
-    // still-unwired self-host path: the root gate (`check_node_self_host_gate`) refuses `NodeSelfHost`
-    // fail-closed, `NodeServeMode::is_wired(NodeSelfHost)` is still false, and the live
-    // `serve_client_fd` above still serves the `MinimalHandler` stub. P5-1 proves the ROUTER SHAPE +
-    // the "construct-only-what-you-hold" discipline (design §4 item 5) host-side; P5-2 derives the
-    // reachability map from the live link topology, classifies each request into its serve surface,
-    // executes each route, and swaps this handler in. NOTHING here runs live.
+    // The typed seam P5-1 introduced is now WIRED LIVE on the backend serve path: under
+    // `node_serve = node-self-host` [`run_backend`] builds a [`NodeServeHandler`] (this router + the
+    // node read plane) and serves every received client fd through it (replacing the `MinimalHandler`
+    // stub). The handler CLASSIFIES each request into its serve surface, makes the authority-scoped
+    // [`NodeRoute`] decision from the gate-derived held set + the live-derived reachability map
+    // ([`super::derive_node_reachability`]), and EXECUTES it: a HELD data-plane READ surface is served
+    // from the node read plane (the control-plane KV), and every surface the P5-2 read plane does not
+    // yet serve (a write/mutation, or a crown-jewel / backend RELAY — P5-3..P5-5) is refused fail-closed
+    // (a 503, never a stubbed 200). `guest-workloads` is unchanged (it keeps `MinimalHandler`).
+    //
+    // The read plane itself (opening + reading the real control-plane KV under the instance's Landlock
+    // grant) is the biggest live-gated P5-2 unknown — host tests exercise the router + read serve over
+    // an in-memory KV on the real `serve_connection` apply path; the fork+sandbox+real-pool path is the
+    // lighthouse live gate's job (design §5).
 
     /// The routing decision the node app-router makes for one serve surface, identified by the
     /// [`HostAuthority`] that surface needs (design §Phase-5 P5-1, §4 item 5). It encodes the
@@ -4082,7 +4285,6 @@ mod instance_serve {
     /// reachable over any wired link is REFUSED fail-closed (a composition-closure bug, never a
     /// degraded serve — the node fails closed).
     #[derive(Debug, Clone, PartialEq, Eq)]
-    #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
     pub(super) enum NodeRoute {
         /// Serve LOCALLY: this instance HOLDS the authority, so it constructs and uses the authority
         /// object in-process (materialization-by-construction — never a dropped authority).
@@ -4112,28 +4314,24 @@ mod instance_serve {
     /// reachable over which named root-wired link, and makes the [`NodeRoute`] decision for each
     /// surface — routing ONLY to held authorities and relaying everything else (design §4 item 5).
     ///
-    /// P5-1 scope is the routing DECISION + the "construct-only-what-you-hold" discipline, host-tested
-    /// in isolation. Deriving the reachability map from the live link topology, classifying a real
-    /// request into its serve surface, and executing each route (local serve / crown-jewel relay /
-    /// backend relay) is P5-2 — this cut takes the map as a constructor input and serves the stub.
+    /// P5-1 scope was the routing DECISION + the "construct-only-what-you-hold" discipline, host-tested
+    /// in isolation (the reachability map a constructor input). P5-2 wires it live: the reachability map
+    /// is now derived from the live composition link topology ([`super::derive_node_reachability`]) and
+    /// the router's decision is EXECUTED per request by [`NodeServeHandler`].
     #[derive(Debug, Clone)]
-    #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
     pub(super) struct NodeServeRouter {
         /// The authorities this instance holds (from its [`MaterializationGate`]) — the ONLY surfaces
         /// it may serve locally.
         held: BTreeSet<HostAuthority>,
-        /// Non-held authority → the named root-wired link that reaches its holder. P5-1 takes this as
-        /// a constructor input so the routing decision is host-testable; P5-2 derives it live.
+        /// Non-held authority → the named root-wired link that reaches its holder, derived from the
+        /// live link topology by [`super::derive_node_reachability`].
         reachable: BTreeMap<HostAuthority, String>,
     }
 
     impl NodeServeRouter {
         /// Build the router from an instance's [`MaterializationGate`] (its held authority set) and
         /// the reachability map (non-held authority → the named root-wired link that reaches its
-        /// holder). Reversible P5-1 sub-decision (FLAGGED): the reachability map is a constructor
-        /// input here so the routing decision is host-testable in isolation; P5-2 derives it from the
-        /// live link topology (`fds.links` + the composition's `[privsep.links]` purposes).
-        #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
+        /// holder, derived live by [`super::derive_node_reachability`]).
         pub(super) fn new(
             gate: &MaterializationGate,
             reachable: BTreeMap<HostAuthority, String>,
@@ -4144,13 +4342,12 @@ mod instance_serve {
             }
         }
 
-        /// The P5-1 routing decision for a serve surface identified by the [`HostAuthority`] it needs.
+        /// The routing decision for a serve surface identified by the [`HostAuthority`] it needs.
         /// HELD ⇒ [`NodeRoute::Local`] (construct-only-what-you-hold); else reachable over a wired
         /// link ⇒ relay ([`NodeRoute::RelayCrownJewel`] for a group-A authority, else
         /// [`NodeRoute::RelayBackend`]); else [`NodeRoute::Refuse`] fail-closed. A HELD authority is
         /// NEVER relayed and a non-held one is NEVER served locally — the structural invariant this
         /// seam exists to prove (design §4 item 5).
-        #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
         pub(super) fn route(&self, surface: HostAuthority) -> NodeRoute {
             if self.held.contains(&surface) {
                 return NodeRoute::Local(surface);
@@ -4169,43 +4366,200 @@ mod instance_serve {
         }
     }
 
-    /// The P5-1 node app-router HANDLER: the [`boatramp_http::Handler`] drop-in an authority instance
-    /// constructs from its [`MaterializationGate`] to replace [`MinimalHandler`] on the self-host
-    /// serve path. It holds a [`NodeServeRouter`] ready to route each request's serve surface, but in
-    /// THIS unwired cut it still answers the Phase-1 stub 200 — P5-2 adds the request→surface
-    /// classifier and executes each [`NodeRoute`] (local serve / relay) against a real surface. Kept
-    /// behaviorally identical to the stub so wiring it in P5-2 changes the serve, not the byte path.
-    #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
+    /// The node app-router HANDLER (design §Phase-5 P5-2): the [`boatramp_http::Handler`] a data-holder
+    /// instance constructs from its [`MaterializationGate`] + the live reachability map + the node read
+    /// plane to serve the node's OWN serve path under `node_serve = node-self-host`, REPLACING
+    /// [`MinimalHandler`]. For each request it CLASSIFIES the serve surface
+    /// ([`classify_request_surface`]), makes the authority-scoped [`NodeRoute`] decision, and EXECUTES
+    /// it — serving a real read from the held data plane for a HELD data-plane READ surface, and
+    /// fail-closing every surface the P5-2 read plane does not yet serve. Cheaply cloneable (the router
+    /// is [`Clone`]; the read plane is `Arc`-backed) so it is cloned into each connection task.
+    #[derive(Clone)]
     pub(super) struct NodeServeHandler {
         router: NodeServeRouter,
+        read_plane: NodeReadPlane,
     }
 
     impl NodeServeHandler {
-        /// Construct the handler around the instance's [`NodeServeRouter`].
-        #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
-        pub(super) fn new(router: NodeServeRouter) -> Self {
-            Self { router }
+        /// Construct the handler around the instance's [`NodeServeRouter`] + node read plane.
+        pub(super) fn new(router: NodeServeRouter, read_plane: NodeReadPlane) -> Self {
+            Self { router, read_plane }
         }
 
-        /// The router this handler routes each request's serve surface through (consumed by P5-2's
-        /// request→surface classifier). Exposed so P5-1 host tests can assert the handler carries the
-        /// gate-derived router.
-        #[allow(dead_code)] // the P5-1 API seam — exercised by this module's host tests; P5-2 wires it live.
-        pub(super) fn router(&self) -> &NodeServeRouter {
-            &self.router
+        /// Serve ONE classified request through the authority-scoped router (the live P5-2 apply path).
+        /// Takes OWNED inputs (`surface`, `is_read`, `host`) extracted from the request BEFORE any await,
+        /// so the future holds no `&Request` across the await and stays `Send` (the `Handler` bound) —
+        /// `http::Request<ReqBody>` is not `Sync`. Split out so host tests can drive it directly: it
+        /// routes the surface and either serves the held data-plane read or refuses fail-closed (never a
+        /// stub 200 for a surface P5-2 does not serve).
+        pub(super) async fn serve_surface(
+            &self,
+            surface: HostAuthority,
+            is_read: bool,
+            host: String,
+        ) -> boatramp_http::Response {
+            let route = self.router.route(surface);
+            match &route {
+                // A HELD data-plane READ surface: serve the node's own read from the held control-plane
+                // store. This is the P5-2 read-only data plane (design §2 P5-2).
+                NodeRoute::Local(authority) if is_read && authority.is_backend() => {
+                    match self.read_plane.resolve_domain(&host).await {
+                        ReadOutcome::Resolved => boatramp_http::response(
+                            200,
+                            format!(
+                                "boatramp privsep node-self-host read plane ({}): domain {host:?} \
+                                 resolves\n",
+                                authority.tag()
+                            )
+                            .into_bytes(),
+                        ),
+                        ReadOutcome::NotFound => boatramp_http::response(
+                            404,
+                            format!(
+                                "boatramp privsep node-self-host read plane ({}): no deploy for \
+                                 {host:?}\n",
+                                authority.tag()
+                            )
+                            .into_bytes(),
+                        ),
+                        // A read-plane error is fail-closed (503) — never a degraded / empty 200.
+                        ReadOutcome::Unavailable(why) => {
+                            tracing::warn!(route = ?route, %host, reason = %why, "[privsep] node-self-host read plane: read failed — refusing fail-closed");
+                            fail_closed_response(&format!(
+                                "node read plane unavailable ({}): {why}",
+                                authority.tag()
+                            ))
+                        }
+                    }
+                }
+                // Everything else the P5-2 read plane does NOT yet serve: a non-read method on a held
+                // data surface (a write — P5-3), a held non-data surface (control/exec), or any RELAY /
+                // REFUSE. Fail-closed (503), never a stubbed 200 — the "no silent downgrade" invariant.
+                other => {
+                    tracing::info!(
+                        surface = %surface.tag(),
+                        is_read,
+                        route = ?other,
+                        "[privsep] node-self-host: surface not served by the P5-2 read plane — \
+                         refusing fail-closed (write / control / relay are P5-3..P5-5)"
+                    );
+                    fail_closed_response(&format!(
+                        "surface {} ({:?}) is not served by the Phase-5 P5-2 read plane",
+                        surface.tag(),
+                        other
+                    ))
+                }
+            }
         }
     }
 
     impl boatramp_http::Handler for NodeServeHandler {
-        async fn handle(&self, _req: boatramp_http::Request) -> boatramp_http::Response {
-            // P5-1 is BEHIND the unwired self-host path: no real serve surface is classified or served
-            // yet (that is P5-2), so this answers the SAME Phase-1 stub `MinimalHandler` does. The
-            // gate-derived router is held ready; nothing here serves the node's real app.
-            boatramp_http::response(
-                200,
-                b"boatramp privsep backend instance (Phase 1 minimal serve)\n".to_vec(),
-            )
+        async fn handle(&self, req: boatramp_http::Request) -> boatramp_http::Response {
+            // Extract everything from the (non-`Sync`) request SYNCHRONOUSLY, before any await, so no
+            // `&Request` is held across the await (the `Handler::handle` future must be `Send`).
+            let (surface, is_read) = classify_request_surface(&req);
+            let host = request_host(&req);
+            drop(req);
+            self.serve_surface(surface, is_read, host).await
         }
+    }
+
+    /// A fail-closed response for a surface the P5-2 read plane does not serve (`503`, a clear body,
+    /// never a 200). Centralized so every non-served route fails closed identically.
+    fn fail_closed_response(reason: &str) -> boatramp_http::Response {
+        boatramp_http::response(
+            503,
+            format!("boatramp privsep node-self-host: refused fail-closed — {reason}\n").into_bytes(),
+        )
+    }
+
+    /// The outcome of a node read-plane lookup (the held control-plane store).
+    pub(super) enum ReadOutcome {
+        /// The host resolved to a registered deploy (a real read that returned an owner).
+        Resolved,
+        /// The host is absent (a real read that found no deploy).
+        NotFound,
+        /// The read could not be performed (store error / no read authority) — fail-closed.
+        Unavailable(String),
+    }
+
+    /// The node READ PLANE a `node-self-host` data-holder serves its P5-2 read surface from: the held
+    /// `backend.kv` control-plane store (a [`DeployStore`](boatramp_core::deploy::DeployStore)). Cloneable
+    /// (the store is `Arc`-backed); [`NodeReadPlane::Refusing`] is the placeholder for an instance that
+    /// holds no `backend.kv` (the router never routes a read to it, so it is never reached for a held read).
+    #[derive(Clone)]
+    pub(super) enum NodeReadPlane {
+        /// Backed by the held control-plane deploy store (KV + blob), which `resolve_site_by_host` reads.
+        Deploy(boatramp_core::deploy::DeployStore),
+        /// No read authority held — every read fail-closes (defensive; never reached for a held read).
+        Refusing,
+    }
+
+    impl NodeReadPlane {
+        /// Resolve a `Host` against the control-plane deploy table via the PUBLIC
+        /// [`DeployStore::resolve_site_by_host`](boatramp_core::deploy::DeployStore::resolve_site_by_host)
+        /// read path (it canonicalizes the host and walks the control-plane KV — a genuine `backend.kv`
+        /// read). `Some(owner)` ⇒ the host is a registered deploy ([`ReadOutcome::Resolved`]), `None` ⇒
+        /// no deploy ([`ReadOutcome::NotFound`]), a store error / no read authority ⇒
+        /// [`ReadOutcome::Unavailable`] (fail-closed). An empty host is `NotFound` (no host named).
+        pub(super) async fn resolve_domain(&self, host: &str) -> ReadOutcome {
+            if host.is_empty() {
+                return ReadOutcome::NotFound;
+            }
+            match self {
+                Self::Deploy(store) => match store.resolve_site_by_host(host).await {
+                    Ok(Some(_owner)) => ReadOutcome::Resolved,
+                    Ok(None) => ReadOutcome::NotFound,
+                    Err(e) => ReadOutcome::Unavailable(format!("control-plane deploy read: {e}")),
+                },
+                Self::Refusing => {
+                    ReadOutcome::Unavailable("this instance holds no backend.kv read authority".into())
+                }
+            }
+        }
+    }
+
+    /// Classify a request into (the serve surface its route needs, whether it is a SAFE READ). P5-2's
+    /// read plane serves only the data-plane READ surface; this maps a safe method (`GET`/`HEAD`) to
+    /// the `backend.kv` read surface and any other (mutating) method to the `control.admin-api` write
+    /// surface, which the router then routes (and the handler fail-closes under P5-2). Deliberately
+    /// coarse — the full method/path → surface map is a P5-3+ follow-on; P5-2 needs only the read vs.
+    /// not-read split. Pure (host-testable).
+    pub(super) fn classify_request_surface(
+        req: &boatramp_http::Request,
+    ) -> (HostAuthority, bool) {
+        let method = req.method().as_str();
+        let is_read = matches!(method, "GET" | "HEAD");
+        if is_read {
+            (HostAuthority::BackendKv, true)
+        } else {
+            (HostAuthority::ControlAdminApi, false)
+        }
+    }
+
+    /// Extract the request `Host` (HTTP/1.1 `Host` header, else the HTTP/2 `:authority`), lowercased
+    /// with any port stripped. Empty when the request named no host. Pure (host-testable).
+    pub(super) fn request_host(req: &boatramp_http::Request) -> String {
+        if let Some(h) = req
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
+            // Strip a `:port` suffix on a non-bracketed authority (an IPv6 literal `[..]` keeps its
+            // colons; the deploy-key canonicalizer normalizes it further).
+            let host = if h.starts_with('[') {
+                h
+            } else {
+                h.split(':').next().unwrap_or(h)
+            };
+            return host.to_ascii_lowercase();
+        }
+        req.uri()
+            .authority()
+            .map(|a| a.host().to_ascii_lowercase())
+            .unwrap_or_default()
     }
 
     // =========================================================================
@@ -5125,19 +5479,22 @@ mod tests {
         );
     }
 
-    // ---- Phase-5: the node self-hosting gate (vocabulary + fail-closed refusal) ----
+    // ---- Phase-5 P5-2: the node self-hosting read-plane gate ----
 
     #[test]
-    fn node_self_host_mode_is_refused_fail_closed_before_any_spawn_spec() {
+    fn node_self_host_read_plane_admits_lightweight_and_refuses_vm_data_holder() {
         // The DEFAULT mode (guest-workloads) is the Phase-1..4 wired behavior — the gate is a no-op
         // and a clean composition still authorizes (no running composition changes).
         assert_eq!(NodeServeMode::default(), NodeServeMode::GuestWorkloads);
         assert!(NodeServeMode::GuestWorkloads.is_wired());
+        // `is_wired(NodeSelfHost)` stays FALSE: it tracks the FULL self-host serve path (writes /
+        // control / gateway / node-own exec — P5-3..P5-5), which is NOT wired. P5-2 wires only the
+        // read plane, admitted by the gate's P5-2 shape lint, not by `is_wired`.
         assert!(!NodeServeMode::NodeSelfHost.is_wired());
         assert!(NodeServeMode::NodeSelfHost.is_node_self_host());
         let clean = clean_privsep();
         assert_eq!(clean.node_serve, NodeServeMode::GuestWorkloads);
-        check_node_self_host_gate(&clean).expect("the default guest-workloads mode is wired");
+        check_node_self_host_gate(&clean).expect("the default guest-workloads mode is a no-op");
         plan_root(
             &cfg_with(Some(clean)),
             Path::new("boatramp.cfg"),
@@ -5145,33 +5502,60 @@ mod tests {
         )
         .expect("a clean guest-workloads composition still authorizes");
 
-        // Selecting node self-hosting (the Phase-5 target) is REFUSED fail-closed — the serve path
-        // is not wired. The pure gate refuses with the greppable, invertible marker...
-        let mut privsep = clean_privsep();
-        privsep.node_serve = NodeServeMode::NodeSelfHost;
-        let gate_err = check_node_self_host_gate(&privsep)
-            .expect_err("node self-hosting must be refused until its serve path is wired");
-        assert!(
-            matches!(&gate_err, PrivsepError::NodeSelfHostUnwired(_)),
-            "node self-hosting is its own fail-closed refusal, got {gate_err:?}"
-        );
-        assert!(
-            gate_err.to_string().contains(NODE_SELF_HOST_UNWIRED_MARKER),
-            "the refusal must carry the invertible marker {NODE_SELF_HOST_UNWIRED_MARKER:?}, got: {gate_err}"
-        );
-
-        // ...and the gate is WIRED INTO `plan_root`, so the whole root authorization refuses
-        // end-to-end BEFORE any spawn spec is produced (a not-yet-buildable self-host composition
-        // never spawns — the same posture as the secret-blind / closure refusals above).
-        let err = plan_root(
-            &cfg_with(Some(privsep)),
+        // P5-2: node self-hosting with every `backend.*` data-holder on a LIGHTWEIGHT substrate
+        // (`clean_privsep`'s `data` is on the default OsProcess) is ADMITTED — the read plane runs.
+        let mut lightweight = clean_privsep();
+        lightweight.node_serve = NodeServeMode::NodeSelfHost;
+        check_node_self_host_gate(&lightweight)
+            .expect("P5-2 admits node-self-host with data-holders on a lightweight substrate");
+        plan_root(
+            &cfg_with(Some(lightweight)),
             Path::new("boatramp.cfg"),
             fake_env(),
         )
-        .expect_err("plan_root must refuse node self-hosting end-to-end before any spawn");
+        .expect("a P5-2 read-plane composition (lightweight data-holders) authorizes end-to-end");
+
+        // A `backend.*` data-holder on the `vm` substrate is REFUSED fail-closed. The pure P5-2 gate
+        // refuses directly with the greppable VM-data-holder marker...
+        let mut vm = clean_privsep();
+        vm.node_serve = NodeServeMode::NodeSelfHost;
+        vm.instances
+            .get_mut("data")
+            .expect("the data-holder instance")
+            .substrate = InstanceSubstrate::Vm;
+        let gate_err = check_node_self_host_gate(&vm)
+            .expect_err("a backend.* data-holder on vm must be refused under node-self-host");
         assert!(
-            matches!(err, PrivsepError::NodeSelfHostUnwired(_)),
-            "plan_root must surface the self-host refusal, got {err:?}"
+            matches!(&gate_err, PrivsepError::NodeSelfHostVmDataHolder(_)),
+            "a VM data-holder is its own fail-closed refusal, got {gate_err:?}"
+        );
+        assert!(
+            gate_err
+                .to_string()
+                .contains(NODE_SELF_HOST_VM_DATA_HOLDER_MARKER),
+            "the refusal must carry the marker {NODE_SELF_HOST_VM_DATA_HOLDER_MARKER:?}, got: {gate_err}"
+        );
+        assert!(
+            gate_err.to_string().contains("data"),
+            "the refusal must name the offending data-holder instance, got: {gate_err}"
+        );
+
+        // ...and `plan_root` refuses a VM data-holder end-to-end before any spawn. The structural S2
+        // VM-secret-blindness scope lint (step 2b-vm, `VmInstanceOutsideApprovedScope`) fires BEFORE
+        // the P5-2 gate (step 2d) — defence in depth — so either refusal is acceptable; what matters
+        // is that NO spawn plan is produced for a VM data-holder.
+        let err = plan_root(
+            &cfg_with(Some(vm)),
+            Path::new("boatramp.cfg"),
+            fake_env(),
+        )
+        .expect_err("plan_root must refuse a VM data-holder before any spawn");
+        assert!(
+            matches!(
+                err,
+                PrivsepError::Composition(_) | PrivsepError::NodeSelfHostVmDataHolder(_)
+            ),
+            "plan_root must refuse a VM data-holder (S2 scope lint or the P5-2 gate), got {err:?}"
         );
     }
 
@@ -6461,55 +6845,194 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         }
     }
 
-    /// The P5-1 [`NodeServeHandler`] is a valid `boatramp_http::Handler` drop-in: it serves one real
-    /// request end-to-end over an in-process `socketpair` (no listener fd, no SCM_RIGHTS splice, no
-    /// sandbox), returning the SAME Phase-1 stub `MinimalHandler` does. This proves the router shape at
-    /// the serve boundary while P5-1 stays behind the unwired path (no real surface served yet; P5-2
-    /// swaps in the request→surface classifier). Host-testable; the live splice path stays on the
-    /// `#[ignore]` Linux gate.
+    /// Drive ONE HTTP/1.1 request through a [`NodeServeHandler`] over an in-process `socketpair` — the
+    /// SAME `boatramp_http::serve_connection` call `serve_client_fd` makes on the live backend path,
+    /// minus only the fork / listener / SCM_RIGHTS splice / sandbox. This is the REAL apply-path
+    /// exercise (not a serve-proof / one-view false-green): the router classifies, routes, and executes
+    /// against the handler's read plane for real.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn p5_1_node_serve_handler_drops_into_serve_connection_and_answers_the_stub() {
+    async fn p5_2_roundtrip(
+        handler: super::instance_serve::NodeServeHandler,
+        request: &[u8],
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        use super::instance_serve::{NodeServeHandler, NodeServeRouter};
-
-        // Construct the handler the way an instance would: from its gate-derived router.
-        let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
-        let router = NodeServeRouter::new(&gate, BTreeMap::new());
-        let handler = NodeServeHandler::new(router);
-
-        // An in-process connected pair stands in for the spliced client fd — no fork / listener /
-        // SCM_RIGHTS / sandbox needed.
-        let (client, server) = tokio::net::UnixStream::pair().expect("socketpair");
-
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
         let serve = tokio::spawn(async move {
-            // The exact call `serve_client_fd` makes, minus the TcpStream adoption (generic over IO).
             let _ = boatramp_http::serve_connection(server, handler).await;
         });
-
-        let mut client = client;
-        client
-            .write_all(b"GET / HTTP/1.1\r\nHost: node.local\r\nConnection: close\r\n\r\n")
-            .await
-            .expect("write the request");
-
+        client.write_all(request).await.expect("write the request");
         let mut resp = Vec::new();
-        client
-            .read_to_end(&mut resp)
-            .await
-            .expect("read the response");
-        let text = String::from_utf8_lossy(&resp);
-        assert!(
-            text.starts_with("HTTP/1.1 200"),
-            "the NodeServeHandler drop-in answers the stub 200 (got: {:?})",
-            &text[..text.len().min(64)]
+        client.read_to_end(&mut resp).await.expect("read response");
+        serve.await.expect("serve task joins");
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    /// P5-2 LIVE apply-path: a `node-self-host` data-holder holding `backend.kv` serves a real READ
+    /// from its held control-plane deploy store. The router classifies the GET → `backend.kv` read
+    /// surface → `Local` → the read plane does a REAL `DeployStore::resolve_site_by_host` lookup against
+    /// the (empty) control-plane KV → a genuine `NotFound` ⇒ 404 from the READ PLANE (NOT the Phase-1
+    /// stub, NOT a canned 200). Exercises the router + read serve end-to-end over `serve_connection`
+    /// with an in-memory store — the fork+sandbox+real-pool-open stays the lighthouse live gate's job.
+    /// (`fs`-gated: the in-memory `DeployStore` uses a `FsStorage` for its inert blob half — the
+    /// resolve reads only the KV.)
+    #[cfg(all(unix, feature = "fs"))]
+    #[tokio::test]
+    async fn p5_2_node_serve_handler_serves_a_held_read_on_the_live_apply_path() {
+        use std::sync::Arc;
+
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_storage::FsStorage;
+
+        use super::instance_serve::{NodeReadPlane, NodeServeHandler, NodeServeRouter};
+
+        // An in-memory control-plane deploy store (empty KV + an inert FS blob half the resolve never
+        // touches). The data-holder holds `backend.kv`, so the read surface is HELD → served locally.
+        let store = DeployStore::new(
+            Arc::new(FsStorage::new(
+                std::env::temp_dir().join("boatramp-p5-2-readplane-inert-blobs"),
+            )),
+            Arc::new(MemoryKv::new()),
         );
+        let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
+        let router = NodeServeRouter::new(&gate, BTreeMap::new());
+        let handler = NodeServeHandler::new(router, NodeReadPlane::Deploy(store));
+
+        // Two GETs (distinct hosts) → the router classifies each → `Local(backend.kv)` → a REAL
+        // `resolve_site_by_host` read against the empty store → 404 from the read plane. A real read
+        // (per request), NOT the guest-workloads stub, NOT a canned 200.
+        for host in ["node.local", "absent.example"] {
+            let req =
+                format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").into_bytes();
+            let resp = p5_2_roundtrip(handler.clone(), &req).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 404"),
+                "an unregistered host is a real 404 from the read plane, got: {:?}",
+                &resp[..resp.len().min(80)]
+            );
+            assert!(
+                resp.contains("node-self-host read plane"),
+                "the body must be the node read-plane result (the authority-scoped router ran live), \
+                 got: {resp}"
+            );
+            assert!(
+                !resp.contains("Phase 1 minimal serve"),
+                "the node-self-host handler must NOT serve the guest-workloads stub body, got: {resp}"
+            );
+        }
+    }
+
+    /// P5-2 fail-closed: every surface the read plane does NOT serve is a 503 (never a stubbed 200) —
+    /// a WRITE (a mutating method → `control.admin-api` surface), a RELAY (a read surface held by a
+    /// PEER, reachable over a link), and a REFUSE (a read surface neither held nor reachable). Exercised
+    /// over the live `serve_connection` apply path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn p5_2_node_serve_handler_fail_closes_write_relay_and_refuse() {
+        use super::instance_serve::{NodeReadPlane, NodeServeHandler, NodeServeRouter};
+
+        // (a) WRITE — a POST classifies to the control write surface; this data-holder does not hold it
+        //     and cannot reach it → Refuse → 503 (the P5-2 read plane serves no write). The read plane is
+        //     never invoked (the route is not a held READ), so a `Refusing` placeholder is fine.
+        let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
+        let handler = NodeServeHandler::new(
+            NodeServeRouter::new(&gate, BTreeMap::new()),
+            NodeReadPlane::Refusing,
+        );
+        let resp = p5_2_roundtrip(
+            handler,
+            b"POST / HTTP/1.1\r\nHost: node.local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert!(
-            text.contains("Phase 1 minimal serve"),
-            "P5-1 is still behind the unwired path — identical stub body to MinimalHandler"
+            resp.starts_with("HTTP/1.1 503"),
+            "a write surface must fail closed (503), got: {:?}",
+            &resp[..resp.len().min(80)]
         );
 
-        serve.await.expect("serve task joins");
+        // (b) RELAY — an instance NOT holding `backend.kv` but able to REACH it over a link: a GET read
+        //     surface routes to `RelayBackend`, which the P5-2 read plane does not execute → 503.
+        let gate = MaterializationGate::new(&[HostAuthority::ControlAdminApi]);
+        let reachable = BTreeMap::from([(HostAuthority::BackendKv, "to-data".to_string())]);
+        let handler = NodeServeHandler::new(
+            NodeServeRouter::new(&gate, reachable),
+            NodeReadPlane::Refusing,
+        );
+        let resp = p5_2_roundtrip(
+            handler,
+            b"GET / HTTP/1.1\r\nHost: node.local\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503"),
+            "a relayed read surface must fail closed in P5-2 (503), got: {:?}",
+            &resp[..resp.len().min(80)]
+        );
+
+        // (c) REFUSE — a read surface neither held nor reachable → Refuse → 503 (a composition bug fails
+        //     the serve closed, never degrades).
+        let gate = MaterializationGate::new(&[HostAuthority::ControlAdminApi]);
+        let handler = NodeServeHandler::new(
+            NodeServeRouter::new(&gate, BTreeMap::new()),
+            NodeReadPlane::Refusing,
+        );
+        let resp = p5_2_roundtrip(
+            handler,
+            b"GET / HTTP/1.1\r\nHost: node.local\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503"),
+            "an unreachable read surface must fail closed (503), got: {:?}",
+            &resp[..resp.len().min(80)]
+        );
+    }
+
+    /// `derive_node_reachability` maps each PEER instance's held authorities to the named link reaching
+    /// it, excluding this instance's OWN held authorities (held ⇒ local, never relayed). Pure.
+    #[test]
+    fn p5_2_derive_node_reachability_maps_peer_authorities_over_links() {
+        // A frontend (listen.http-parse) linked to a data-holder (backend.kv + backend.blob).
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "frontend".to_string(),
+            inst(&[HostAuthority::ListenHttpParse], &["l"]),
+        );
+        instances.insert(
+            "data".to_string(),
+            inst(
+                &[HostAuthority::BackendKv, HostAuthority::BackendBlob],
+                &["l"],
+            ),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(
+            "l".to_string(),
+            PrivsepLink {
+                from: "frontend".to_string(),
+                to: "data".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::Unspecified,
+            },
+        );
+        let mut privsep = clean_privsep();
+        privsep.instances = instances;
+        privsep.links = links;
+        let cfg = cfg_with(Some(privsep));
+
+        // From the frontend: the data-holder's backends are reachable over `l`; its own listener is not
+        // in the map (nothing peers it with a holder of it).
+        let from_frontend = super::derive_node_reachability(&cfg, "frontend");
+        assert_eq!(from_frontend.get(&HostAuthority::BackendKv), Some(&"l".to_string()));
+        assert_eq!(from_frontend.get(&HostAuthority::BackendBlob), Some(&"l".to_string()));
+        assert!(!from_frontend.contains_key(&HostAuthority::ListenHttpParse));
+
+        // From the data-holder: it HOLDS the backends (excluded); the frontend's listener is reachable.
+        let from_data = super::derive_node_reachability(&cfg, "data");
+        assert!(!from_data.contains_key(&HostAuthority::BackendKv));
+        assert_eq!(
+            from_data.get(&HostAuthority::ListenHttpParse),
+            Some(&"l".to_string())
+        );
     }
 }

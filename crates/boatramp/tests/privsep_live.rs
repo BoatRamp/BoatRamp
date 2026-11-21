@@ -1740,61 +1740,219 @@ fn relay_mount_ns_contains_pathname_uds_pivot() {
 }
 
 // =============================================================================
-// PHASE-5 FAIL-CLOSED GATE — node SELF-HOSTING is refused end-to-end (not yet wired).
+// PHASE-5 P5-2 — node SELF-HOSTING read plane: WIRED LIVE on the lightweight substrates,
+//                VM data-holder still REFUSED.
 // =============================================================================
 //
-// Phase-5 ("self-hosting") makes the node serve its OWN serve path — control-plane/admin API, the
-// gateway, the handler engine, the managed-DB/KV/blob backends — UNDER the privsep composition, not
-// only guest workloads. That serve path is NOT yet wired (today a `backend.*` instance serves only
-// the minimal stub; the authority-scoped node app router is the Phase-5 workstream, pending its own
-// Security review). The composition vocabulary exists (`[privsep].node_serve = node-self-host`,
-// `NodeServeMode`) and the root REFUSES it fail-closed in `plan_root` BEFORE any spawn, emitting the
-// greppable marker `PRIVSEP_NODE_SELF_HOST_UNWIRED` (`privsep::NODE_SELF_HOST_UNWIRED_MARKER`).
+// Phase-5 ("self-hosting") makes the node serve its OWN serve path UNDER the privsep composition, not
+// only guest workloads. P5-2 — the READ-PLANE increment — wires the authority-scoped node app router
+// LIVE on the backend serve path: under `node_serve = node-self-host` a `backend.*` data-holder
+// instance on a LIGHTWEIGHT, shared-net substrate (`os-process` / `container`) serves the node's own
+// READ data plane (classify → authority-scoped route → a real control-plane KV read), replacing the
+// Phase-1 `MinimalHandler` stub. The VM data-holder stays REFUSED (design §3a): a `backend.*` on
+// `substrate: vm` is refused fail-closed (the structural S2 scope lint `VmInstanceOutsideApprovedScope`
+// at `plan_root`, plus the P5-2 defence-in-depth `NodeSelfHostVmDataHolder` gate).
 //
-// This is the INVERTIBLE gate: today it asserts the node REFUSES to stand up and prints
-// `PRIVSEP NODE SELF-HOST REFUSED OK`. When the Phase-5 serve path + its Security review land, this
-// gate flips — like the `..._serves_end_to_end` gates above — to assert a real 200 from a
-// node-self-host instance and print a serve-OK marker instead (and `NodeServeMode::is_wired` flips
-// for `NodeSelfHost`). One mechanical inversion point; the composition fixture is otherwise identical
-// to the serving gates, so the diff is only the assertion + the marker.
+// Two gates below, both `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]` and run
+// by the CI `live gate (privsep)` job via `--include-ignored`:
+//   (A) `privsep_node_self_host_vm_data_holder_refused_end_to_end` (marker
+//       `PRIVSEP NODE SELF-HOST VM DATA-HOLDER REFUSED OK`): a node-self-host composition that puts a
+//       `backend.*` data-holder on `vm` is REFUSED fail-closed before any spawn, never served.
+//   (B) `privsep_node_self_host_read_plane_serves_end_to_end` (marker
+//       `PRIVSEP NODE SELF-HOST READ-PLANE OK`): a node-self-host composition with the data-holder on
+//       `os-process` serves a REAL read-plane response (the authority-scoped router ran live — the body
+//       is the node read-plane result, NOT the `Phase 1 minimal serve` stub).
+//
+// LIVE-GATE PROVENANCE: these were authored + compile-checked (musl clippy, `-D warnings`) but NOT run
+// on the authoring host (macOS); the `backend.kv` control-plane KV opening + reading under the derived
+// per-capability Landlock profile is the single biggest P5-2 unknown (design §5) and MUST be validated
+// on lighthouse (Linux + `sandbox`) before any cut — an `EPERM` on the pool open would FailNodeClosed
+// (gate B's "exited early" panic), which is exactly what the live gate exists to surface.
 
-/// The marker literal the root emits + the CI greps (mirrors `privsep::NODE_SELF_HOST_UNWIRED_MARKER`;
-/// kept a literal here, like the other CI-grepped markers, so a drift in the const is caught).
+/// The VM-data-holder refusal marker (mirrors `privsep::NODE_SELF_HOST_VM_DATA_HOLDER_MARKER`; a
+/// literal here so a drift in the const is caught by the gate).
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
-const NODE_SELF_HOST_UNWIRED_MARKER: &str = "PRIVSEP_NODE_SELF_HOST_UNWIRED";
+const NODE_SELF_HOST_VM_DATA_HOLDER_MARKER: &str = "PRIVSEP_NODE_SELF_HOST_VM_DATA_HOLDER_REFUSED";
 
-/// Live fail-closed gate for **Phase-5 node self-hosting**: an OTHERWISE-VALID privsep composition
-/// that additionally selects `node_serve: node-self-host` must be REFUSED by the root fail-closed,
-/// before any instance is spawned and before anything serves. Proves it end-to-end against the real
-/// binary: `boatramp __root` resolves the topology, runs its screens + lints, reaches the Phase-5
-/// self-host gate, and EXITS non-zero with the `PRIVSEP_NODE_SELF_HOST_UNWIRED` marker on stderr —
-/// never standing up a serving instance from the not-yet-wired self-host serve path (the "no silent
-/// downgrade to the stubbed serve" invariant).
+/// (A) Live fail-closed gate for the **P5-2 VM data-holder refusal**: a `node_serve: node-self-host`
+/// composition that places a `backend.*` DATA-HOLDER on `substrate: vm` must be REFUSED by the root
+/// fail-closed, before any instance is spawned and before anything serves (design §3a — the VM
+/// data-holder's egress/secret-blindness problem is the owner-gated P5-5 question). Proves it
+/// end-to-end: `boatramp __root` resolves the topology, runs its screens + lints, refuses (the
+/// structural S2 scope lint `VmInstanceOutsideApprovedScope` fires at `plan_root` step 2b-vm, ahead of
+/// the P5-2 defence-in-depth gate at 2d), and EXITS non-zero, never binding the listener.
 ///
 /// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]` like the other live gates;
-/// the CI `live gate (privsep)` job runs it via `--include-ignored` and greps the
-/// `PRIVSEP NODE SELF-HOST REFUSED OK` marker, so a silent skip / compile-out — or a regression that
-/// let self-hosting stand up unwired — fails the merge. INVERTIBLE: flip to a serve gate when Phase-5
-/// lands (see the section comment above).
+/// the CI `live gate (privsep)` job greps `PRIVSEP NODE SELF-HOST VM DATA-HOLDER REFUSED OK`, so a
+/// regression that let a VM data-holder stand up — or a silent skip / compile-out — fails the merge.
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 #[test]
-#[ignore = "live: forks boatramp __root for an otherwise-valid composition that selects \
-            `node_serve: node-self-host`; the root must refuse fail-closed (the Phase-5 self-host \
-            serve path is not wired) and exit with the PRIVSEP_NODE_SELF_HOST_UNWIRED marker, never \
-            serving; run via --include-ignored in the `live gate (privsep)` job"]
-fn privsep_node_self_host_refuses_fail_closed_end_to_end() {
+#[ignore = "live: forks boatramp __root for a node-self-host composition that puts a backend.* \
+            data-holder on `substrate: vm`; the root must refuse fail-closed (the VM data-holder is \
+            not a P5-2 shape) and exit non-zero, never serving; run via --include-ignored in the \
+            `live gate (privsep)` job"]
+fn privsep_node_self_host_vm_data_holder_refused_end_to_end() {
     let bin = env!("CARGO_BIN_EXE_boatramp");
     let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("boatramp-privsep-selfhost-{}", std::process::id()));
+        .join(format!("boatramp-privsep-selfhost-vm-{}", std::process::id()));
     let data_dir = tmp.join("data");
     std::fs::create_dir_all(&data_dir).expect("create the node data dir");
     let port = free_port();
     let cfg_path = tmp.join("boatramp.cfg");
 
-    // The SAME valid 4-instance composition the serving gate uses (edge/aux/ops/core: union == ALL,
-    // no forbidden co-residency, grants disjoint) — so the ONLY thing to refuse is `node_serve`.
-    // `node_serve: NodeSelfHost` asks the node to serve its own app router under privsep (Phase-5),
-    // which is NOT wired → the root must refuse before any spawn.
+    // A valid union==ALL composition (no forbidden co-residency), node-self-host, with the `backend.*`
+    // authorities split onto their OWN `data` instance pinned to `substrate: vm` — the ONE thing to
+    // refuse. `core` holds the crown jewels only (a valid P1 bundle); `data` holds the backends and is
+    // a key-free non-listener VM instance → outside the approved VM scope (refused fail-closed).
+    let cfg = format!(
+        r#"(
+    serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
+    privsep: (
+        instances: {{
+            "edge": (
+                capabilities: ["listen.public-tls", "listen.http-parse"],
+                sandbox: Derived,
+                links: ["to-data"],
+            ),
+            "aux": (
+                capabilities: [
+                    "listen.mail", "listen.overlay",
+                    "listen.s3ingress", "listen.inbound-tcp", "listen.gateway",
+                    "exec.wasmtime", "acme.dns-control",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "ops": (
+                capabilities: ["exec.compute", "control.admin-api"],
+                sandbox: Derived,
+                links: [],
+            ),
+            "core": (
+                capabilities: [
+                    "secrets.sealer", "token.signer", "image.signer", "overlay.dial-signer",
+                    "s3ingress.root", "cluster.join-signer",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "data": (
+                capabilities: [
+                    "backend.kv", "backend.sql", "backend.blob", "backend.messaging",
+                ],
+                sandbox: Derived,
+                substrate: Vm,
+                links: ["to-data"],
+            ),
+        }},
+        links: {{ "to-data": (from: "edge", to: "data", transport: Local) }},
+        node_serve: NodeSelfHost,
+    ),
+)"#,
+        port = port,
+        data_dir = data_dir.display(),
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write the vm-data-holder privsep config");
+
+    let mut root = Command::new(bin)
+        .arg("__root")
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "boatramp=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn `boatramp __root`");
+
+    // The root must REFUSE and exit promptly — it never binds the listener, so a GET never connects.
+    // Poll for the exit; past the deadline (or on any served 200) fail LOUD.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Ok(Some(status)) = root.try_wait() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "`boatramp __root` did not refuse a VM `backend.*` data-holder within 20s — the P5-2 \
+                 / S2 VM scope gate regressed (the node must fail closed, not stand up a VM data-holder)"
+            );
+        }
+        if try_http_get(&format!("127.0.0.1:{port}"))
+            .map(|r| r.contains("200"))
+            .unwrap_or(false)
+        {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "a node-self-host composition with a VM `backend.*` data-holder served a 200 — the VM \
+                 data-holder MUST be refused fail-closed, never served"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    let mut stderr = String::new();
+    if let Some(mut e) = root.stderr.take() {
+        let _ = e.read_to_string(&mut stderr);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert!(
+        !status.success(),
+        "the root must EXIT NON-ZERO refusing a VM data-holder (it must not stand the node up), \
+         got a success exit.\n--- root stderr ---\n{stderr}"
+    );
+    // The refusal fires at the structural S2 scope lint (which names the offending VM instance) OR the
+    // P5-2 defence-in-depth gate (which carries the marker); accept EITHER, since both are fail-closed
+    // refusals of the SAME unsafe VM data-holder shape — what matters is no spawn, no serve.
+    assert!(
+        stderr.contains("data")
+            && (stderr.contains("VM instance")
+                || stderr.contains(NODE_SELF_HOST_VM_DATA_HOLDER_MARKER)),
+        "the refusal must name the offending VM data-holder (`data`) via the S2 scope lint or the \
+         P5-2 {NODE_SELF_HOST_VM_DATA_HOLDER_MARKER} marker, got exit {:?}:\n--- root stderr ---\n{stderr}",
+        status.code(),
+    );
+
+    // The marker the CI gate greps — reached only after the root refused the VM data-holder fail-closed.
+    println!("PRIVSEP NODE SELF-HOST VM DATA-HOLDER REFUSED OK");
+}
+
+/// (B) Live SERVE gate for the **P5-2 read plane** on the lightweight `os-process` substrate: a
+/// `node_serve: node-self-host` composition whose serving `core` holds `backend.kv` + is on
+/// `substrate: os-process` serves a REAL read-plane response. `boatramp __root` stands up the
+/// composition (sandbox Enforced in every instance), the `edge` frontend splices the accepted client fd
+/// to `core`, and `core`'s authority-scoped node app router CLASSIFIES the GET → `backend.kv` read
+/// surface → `Local` → opens + reads the control-plane KV and answers from the READ PLANE (not the
+/// Phase-1 stub). The node's KV is empty, so a GET resolves to a `404` from the read plane — which is a
+/// REAL read (not a canned 200), proving the router + read serve ran live under the sandbox.
+///
+/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]`; the CI `live gate (privsep)`
+/// job greps `PRIVSEP NODE SELF-HOST READ-PLANE OK`. NB the control-plane KV opening under the derived
+/// Landlock profile is the biggest live-gated P5-2 unknown (design §5): an `EPERM` here FailNodeCloses
+/// (the "exited early" panic below), which is exactly what this gate exists to surface.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live: forks boatramp __root for a node-self-host composition with a backend.kv \
+            data-holder on os-process; the backend's authority-scoped router serves a REAL read-plane \
+            response (not the Phase-1 stub) over the splice; run via --include-ignored in the \
+            `live gate (privsep)` job"]
+fn privsep_node_self_host_read_plane_serves_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_boatramp");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("boatramp-privsep-selfhost-serve-{}", std::process::id()));
+    let data_dir = tmp.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let port = free_port();
+    let cfg_path = tmp.join("boatramp.cfg");
+
+    // The SAME known-valid 4-instance composition the 2-instance serve gate uses (edge/aux/ops/core:
+    // union == ALL, no forbidden co-residency), with `node_serve: node-self-host` — so `core` (holding
+    // backend.kv on the default os-process) serves the node's OWN read plane instead of the stub.
     let cfg = format!(
         r#"(
     serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
@@ -1826,17 +1984,18 @@ fn privsep_node_self_host_refuses_fail_closed_end_to_end() {
                     "backend.kv", "backend.sql", "backend.blob", "backend.messaging",
                 ],
                 sandbox: Derived,
+                substrate: OsProcess,
                 links: ["to-core"],
             ),
         }},
-        links: {{ "to-core": (from: "edge", to: "core", transport: Local) }},
+        links: {{ "to-core": (from: "edge", to: "core", transport: Local, purpose: Relay) }},
         node_serve: NodeSelfHost,
     ),
 )"#,
         port = port,
         data_dir = data_dir.display(),
     );
-    std::fs::write(&cfg_path, &cfg).expect("write the self-host privsep config");
+    std::fs::write(&cfg_path, &cfg).expect("write the self-host serve privsep config");
 
     let mut root = Command::new(bin)
         .arg("__root")
@@ -1844,64 +2003,58 @@ fn privsep_node_self_host_refuses_fail_closed_end_to_end() {
         .arg(&cfg_path)
         .env("RUST_LOG", "boatramp=info")
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn `boatramp __root`");
 
-    // The root must REFUSE at the Phase-5 gate and exit promptly — it never binds the listener, so a
-    // GET would never connect. Poll for the exit; if the node is still alive past the deadline it did
-    // NOT refuse (a regression that stood self-hosting up unwired) — kill it and fail LOUD (never a
-    // hang, never a silent serve).
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Ok(Some(status)) = root.try_wait() {
-            break status;
-        }
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let response = loop {
         if Instant::now() > deadline {
             let _ = root.kill();
             let _ = root.wait();
             let _ = std::fs::remove_dir_all(&tmp);
-            panic!(
-                "`boatramp __root` did not refuse `node_serve: node-self-host` within 20s — the \
-                 Phase-5 self-host gate regressed (the node must fail closed, not stand up unwired)"
-            );
+            panic!("the node-self-host read-plane node did not serve a response within 25s");
         }
-        // Belt-and-suspenders: a self-host instance must NEVER serve while this gate is in force.
-        if try_http_get(&format!("127.0.0.1:{port}"))
-            .map(|r| r.contains("200"))
-            .unwrap_or(false)
-        {
-            let _ = root.kill();
-            let _ = root.wait();
+        // Fail-closed: if the root exited, the composition failed to stand up — most tellingly here, the
+        // control-plane KV would not open under `core`'s Landlock grant (the live-gated P5-2 unknown).
+        if let Ok(Some(status)) = root.try_wait() {
             let _ = std::fs::remove_dir_all(&tmp);
             panic!(
-                "a `node_serve: node-self-host` composition served a 200 — self-hosting is NOT wired \
-                 and MUST be refused fail-closed, never served"
+                "`boatramp __root` exited early ({status}) — the node-self-host read-plane composition \
+                 failed to stand up (the backend.kv control-plane KV would not open under the derived \
+                 Landlock profile? sandbox not Enforced? link/listener wiring?)"
             );
         }
-        std::thread::sleep(Duration::from_millis(200));
+        match try_http_get(&addr) {
+            Ok(resp) if !resp.is_empty() => break resp,
+            _ => std::thread::sleep(Duration::from_millis(250)),
+        }
     };
 
-    let mut stderr = String::new();
-    if let Some(mut e) = root.stderr.take() {
-        let _ = e.read_to_string(&mut stderr);
-    }
+    let _ = root.kill();
+    let _ = root.wait();
     let _ = std::fs::remove_dir_all(&tmp);
 
+    // The authority-scoped node app router ran LIVE: the body is the node READ-PLANE result (a real KV
+    // read), NOT the Phase-1 `MinimalHandler` stub. An empty node KV ⇒ a 404 from the read plane.
     assert!(
-        !status.success(),
-        "the root must EXIT NON-ZERO refusing node self-hosting (it must not stand the node up), \
-         got a success exit.\n--- root stderr ---\n{stderr}"
+        response.contains("node-self-host read plane"),
+        "expected the node read-plane body (the authority-scoped router served a real read), got:\n{response}"
     );
     assert!(
-        stderr.contains(NODE_SELF_HOST_UNWIRED_MARKER),
-        "the refusal must carry the invertible {NODE_SELF_HOST_UNWIRED_MARKER} marker (the Phase-5 \
-         self-host gate), got exit {:?}:\n--- root stderr ---\n{stderr}",
-        status.code(),
+        !response.contains("Phase 1 minimal serve"),
+        "the node-self-host backend must NOT serve the guest-workloads stub body (the router must run \
+         live), got:\n{response}"
+    );
+    assert!(
+        response.contains("404") || response.contains("200"),
+        "expected a real read-plane status (404 for an empty KV, or 200 if seeded), got:\n{response}"
     );
 
-    // The marker the CI gate greps — reached only after the root refused self-hosting fail-closed.
-    println!("PRIVSEP NODE SELF-HOST REFUSED OK");
+    // The marker the CI gate greps — only reached after a real read-plane response came back over the
+    // full composed, sandboxed path.
+    println!("PRIVSEP NODE SELF-HOST READ-PLANE OK");
 }
 
 // =============================================================================
