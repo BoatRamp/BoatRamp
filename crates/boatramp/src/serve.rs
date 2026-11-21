@@ -218,6 +218,21 @@ pub enum Error {
          Use `--tls acme-dns` (DNS-01) or the cluster-managed cert store instead."
     )]
     AcmeTlsAlpnUnderCluster,
+    /// A TLS-ALPN-01 ACME entry point OTHER than `--tls acme` is enabled in a clustered / Anycast
+    /// posture (security-review F1 extending AC-2): `[serve.on_demand_tls]` with a TLS-ALPN-01
+    /// challenge (INCLUDING the silent default) and/or a `[serve.control_plane_tls]` override with
+    /// `challenge = "tls-alpn-01"`. The ephemeral `acme-tls/1` challenge cert is node-local (the
+    /// in-memory `CertCache.challenge` slot — never replicated), so a validation the VIP lands on
+    /// another node finds no cert and fails. `{0}` names the offending config key(s).
+    #[cfg(feature = "cluster")]
+    #[error(
+        "{0} use(s) the ACME TLS-ALPN-01 challenge, which cannot work behind an Anycast VIP / \
+         cluster: the `acme-tls/1` validation connection may reach a different node than the one \
+         holding the ephemeral challenge cert (it is node-local, never replicated). Use the DNS-01 \
+         challenge instead — set `challenge = \"dns-01\"` and configure an ACME DNS provider \
+         (`[serve.dns_providers]`), or disable the feature."
+    )]
+    TlsAlpn01EntrypointUnderCluster(String),
 }
 
 impl From<boatramp_core::migrate::MigrateError> for Error {
@@ -1515,6 +1530,58 @@ fn acme_tls_refused_under_cluster(clustered: bool, tls: TlsMode) -> bool {
     clustered && matches!(tls, TlsMode::Acme)
 }
 
+/// PLAN-anycast AC-2 (security-review F1): TLS-ALPN-01 has two MORE entry points than the node-wide
+/// `--tls acme` above, both live on `--tls acme-dns` and neither caught by [`acme_tls_refused_under_cluster`]:
+/// does an enabled `[serve.on_demand_tls]` use the TLS-ALPN-01 challenge, INCLUDING the silent default?
+/// [`OnDemandChallenge`](crate::config::OnDemandChallenge) defaults to `TlsAlpn01`, so `enabled = true`
+/// with no explicit `challenge` issues tenant certs via TLS-ALPN-01 on the `:443` edge. The ephemeral
+/// `acme-tls/1` challenge cert lives in a NODE-LOCAL in-memory slot (the `CertCache.challenge` map —
+/// only ISSUED certs replicate), so it is unreachable when the Anycast VIP lands the CA's validation
+/// handshake on another node.
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+fn on_demand_tls_uses_alpn01(on_demand: Option<&crate::config::OnDemandTlsConfig>) -> bool {
+    on_demand.is_some_and(|c| {
+        c.enabled && matches!(c.challenge, crate::config::OnDemandChallenge::TlsAlpn01)
+    })
+}
+
+/// PLAN-anycast AC-2 (security-review F1): does any `[serve.control_plane_tls]` override obtain its
+/// control-plane cert via TLS-ALPN-01? Same node-local challenge-cert constraint as
+/// [`on_demand_tls_uses_alpn01`]. `ControlPlaneChallenge` defaults to `Dns01`, so this is opt-in per
+/// entry (an empty / all-DNS-01 list is Anycast-safe).
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+fn control_plane_tls_uses_alpn01(
+    control_plane_tls: &[crate::config::ControlPlaneDomainTls],
+) -> bool {
+    control_plane_tls
+        .iter()
+        .any(|e| matches!(e.challenge, crate::config::ControlPlaneChallenge::TlsAlpn01))
+}
+
+/// PLAN-anycast AC-2 (security-review F1): the TLS-ALPN-01 **config entry points** (beyond `--tls acme`)
+/// refused in a clustered posture — `[serve.on_demand_tls]` and/or `[serve.control_plane_tls]`. Returns
+/// the offending config keys (named in the refusal message / asserted in tests); empty ⇒ nothing to
+/// refuse. The challenge cert is node-local, so neither can satisfy an `acme-tls/1` validation the VIP
+/// may land on a different node — refuse at startup, same as `--tls acme`, steering to DNS-01.
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+fn tls_alpn01_entrypoints_refused_under_cluster(
+    clustered: bool,
+    on_demand_alpn01: bool,
+    control_plane_alpn01: bool,
+) -> Vec<&'static str> {
+    if !clustered {
+        return Vec::new();
+    }
+    let mut v = Vec::new();
+    if on_demand_alpn01 {
+        v.push("[serve.on_demand_tls]");
+    }
+    if control_plane_alpn01 {
+        v.push("[serve.control_plane_tls]");
+    }
+    v
+}
+
 /// PLAN-anycast AC-6 decision (pure): the set of Anycast-unsafe config codes implied
 /// by the three signals, so the decision is unit-testable without building a full
 /// `ServeArgs`. Empty ⇒ nothing to warn about.
@@ -1523,6 +1590,7 @@ fn anycast_unsafe_warning_codes(
     node_local_fs_blobs: bool,
     per_node_rate_limit: bool,
     h3_advertised_without_node_id: bool,
+    tls_alpn01_entrypoint: bool,
 ) -> Vec<&'static str> {
     let mut codes = Vec::new();
     if node_local_fs_blobs {
@@ -1533,6 +1601,14 @@ fn anycast_unsafe_warning_codes(
     }
     if h3_advertised_without_node_id {
         codes.push("h3-advertised-without-node-id");
+    }
+    // security-review F1: a TLS-ALPN-01 issuance entry point (`[serve.on_demand_tls]` with the
+    // TLS-ALPN-01 challenge incl. the default, or a `[serve.control_plane_tls]` tls-alpn-01 override)
+    // under cluster. The startup refusal ([`tls_alpn01_entrypoints_refused_under_cluster`]) normally
+    // preempts this (it is fatal), so this is defense-in-depth / self-check completeness: the AC-6 set
+    // must name every Anycast-unsafe signal so the decision stays observable and unit-tested.
+    if tls_alpn01_entrypoint {
+        codes.push("tls-alpn-01-entrypoint-under-cluster");
     }
     codes
 }
@@ -1560,10 +1636,16 @@ fn warn_anycast_unsafe_config(
         let _ = (args, serve_cfg);
         false
     };
+    // security-review F1: a TLS-ALPN-01 issuance entry point behind the VIP (node-local challenge
+    // cert). The startup refusal preempts this on the live path, but the self-check names it for
+    // completeness (and in case the refusal is ever relaxed per the "revisit" note).
+    let tls_alpn01_entrypoint = on_demand_tls_uses_alpn01(serve_cfg.on_demand_tls.as_ref())
+        || control_plane_tls_uses_alpn01(&serve_cfg.control_plane_tls);
     let codes = anycast_unsafe_warning_codes(
         blob_args.blobs == BlobBackend::Fs,
         !cluster_rate_limit,
         h3_unsteered,
+        tls_alpn01_entrypoint,
     );
     for code in &codes {
         match *code {
@@ -1587,6 +1669,17 @@ fn warn_anycast_unsafe_config(
                  connection's packets to a different node and break it. Set `--anycast-node-id` + \
                  configure the LB to steer QUIC by the first CID byte, OR disable advertisement \
                  (`--http3-advertise false`) so clients stay on HTTP/2 over TCP."
+            ),
+            // security-review F1: a TLS-ALPN-01 issuance path whose ephemeral challenge cert is
+            // node-local (never replicated), so the CA's `acme-tls/1` validation landing on another
+            // node behind the VIP fails. The startup refusal normally preempts this.
+            "tls-alpn-01-entrypoint-under-cluster" => tracing::warn!(
+                "anycast: a TLS-ALPN-01 ACME issuance entry point is enabled \
+                 (`[serve.on_demand_tls]` with the TLS-ALPN-01 challenge — the DEFAULT when \
+                 `challenge` is unset — and/or a `[serve.control_plane_tls]` `tls-alpn-01` override). \
+                 Its ephemeral challenge cert is node-local, so an `acme-tls/1` validation the VIP \
+                 steers to another node cannot complete. Use the DNS-01 challenge instead \
+                 (`challenge = \"dns-01\"` + an ACME DNS provider)."
             ),
             _ => {}
         }
@@ -1785,6 +1878,21 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         // Refuse LOUD (DNS-01 / cluster certs are the Anycast-safe modes).
         if acme_tls_refused_under_cluster(clustered, args.tls) {
             return Err(Error::AcmeTlsAlpnUnderCluster);
+        }
+        // AC-2 (security-review F1): TLS-ALPN-01 has two MORE entry points, both on `--tls acme-dns`
+        // and neither caught above — an enabled `[serve.on_demand_tls]` whose challenge is TLS-ALPN-01
+        // (the DEFAULT when `challenge` is unset) and a `[serve.control_plane_tls]` `tls-alpn-01`
+        // override. Both rely on the node-local challenge cert, so both break behind Anycast. Refuse
+        // the same way, naming the offending key(s) and steering to DNS-01.
+        let refused_alpn01 = tls_alpn01_entrypoints_refused_under_cluster(
+            clustered,
+            on_demand_tls_uses_alpn01(serve_cfg.on_demand_tls.as_ref()),
+            control_plane_tls_uses_alpn01(&serve_cfg.control_plane_tls),
+        );
+        if !refused_alpn01.is_empty() {
+            return Err(Error::TlsAlpn01EntrypointUnderCluster(
+                refused_alpn01.join(" + "),
+            ));
         }
         // AC-6: a non-loopback bind in a clustered posture is almost certainly behind a shared/VIP
         // front end; warn (loud, not fatal) on the Anycast-UNSAFE config combinations so a silent
@@ -6387,7 +6495,11 @@ mod tests {
     use super::{Error, build_per_project_blob_backends};
     // PLAN-anycast AC-2/AC-6 pure decision cores — NOT cluster-gated (run in every tier). Explicit
     // imports alongside the cluster-only `use super::*` glob (the explicit name wins, no conflict).
-    use super::{TlsMode, acme_tls_refused_under_cluster, anycast_unsafe_warning_codes};
+    use super::{
+        TlsMode, acme_tls_refused_under_cluster, anycast_unsafe_warning_codes,
+        control_plane_tls_uses_alpn01, on_demand_tls_uses_alpn01,
+        tls_alpn01_entrypoints_refused_under_cluster,
+    };
     use boatramp_core::kv::WriterModel;
     use boatramp_node::backends::KvBackend;
     use boatramp_node::config::SqlKvConfig;
@@ -6419,28 +6531,103 @@ mod tests {
     #[test]
     fn anycast_unsafe_warnings_fire_on_the_misconfig_and_stay_quiet_when_safe() {
         // A fully Anycast-safe config warns about nothing.
-        assert!(anycast_unsafe_warning_codes(false, false, false).is_empty());
+        assert!(anycast_unsafe_warning_codes(false, false, false, false).is_empty());
 
         // The classic misconfig: node-local fs blobs + per-node rate limiting + h3 advertised
-        // with no CID steering — all three fire.
-        let codes = anycast_unsafe_warning_codes(true, true, true);
+        // with no CID steering + a TLS-ALPN-01 issuance entry point — all four fire, in order.
+        let codes = anycast_unsafe_warning_codes(true, true, true, true);
         assert_eq!(
             codes,
             vec![
                 "node-local-fs-blobs",
                 "per-node-rate-limit",
                 "h3-advertised-without-node-id",
+                "tls-alpn-01-entrypoint-under-cluster",
             ]
         );
 
         // Each signal is independent.
         assert_eq!(
-            anycast_unsafe_warning_codes(true, false, false),
+            anycast_unsafe_warning_codes(true, false, false, false),
             vec!["node-local-fs-blobs"]
         );
         assert_eq!(
-            anycast_unsafe_warning_codes(false, false, true),
+            anycast_unsafe_warning_codes(false, false, true, false),
             vec!["h3-advertised-without-node-id"]
+        );
+        // security-review F1: the TLS-ALPN-01 entry-point signal is in the AC-6 set.
+        assert_eq!(
+            anycast_unsafe_warning_codes(false, false, false, true),
+            vec!["tls-alpn-01-entrypoint-under-cluster"]
+        );
+    }
+
+    /// AC-2 (security-review F1): TLS-ALPN-01 via `[serve.on_demand_tls]` (INCLUDING the silent
+    /// default challenge) and via a `[serve.control_plane_tls]` `tls-alpn-01` override is refused
+    /// under cluster; a non-cluster or DNS-01 config is unaffected.
+    #[test]
+    fn tls_alpn01_config_entrypoints_refused_under_cluster_only() {
+        use boatramp_node::config::{
+            ControlPlaneChallenge, ControlPlaneDomainTls, OnDemandChallenge, OnDemandTlsConfig,
+        };
+
+        // On-demand: enabled with the DEFAULT challenge is TLS-ALPN-01 (the silent-default trap).
+        let od_default = OnDemandTlsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            on_demand_tls_uses_alpn01(Some(&od_default)),
+            "enabled on-demand defaults to TLS-ALPN-01"
+        );
+        // Explicit DNS-01 is Anycast-safe; disabled is not an entry point; absent is not either.
+        let od_dns = OnDemandTlsConfig {
+            enabled: true,
+            challenge: OnDemandChallenge::Dns01,
+            ..Default::default()
+        };
+        assert!(!on_demand_tls_uses_alpn01(Some(&od_dns)));
+        let od_off = OnDemandTlsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(!on_demand_tls_uses_alpn01(Some(&od_off)));
+        assert!(!on_demand_tls_uses_alpn01(None));
+
+        // Control-plane: a `tls-alpn-01` override fires; an all-DNS-01 / empty list does not.
+        let cp_alpn = [ControlPlaneDomainTls {
+            domain: "cp.example".into(),
+            challenge: ControlPlaneChallenge::TlsAlpn01,
+        }];
+        assert!(control_plane_tls_uses_alpn01(&cp_alpn));
+        let cp_dns = [ControlPlaneDomainTls {
+            domain: "cp.example".into(),
+            challenge: ControlPlaneChallenge::Dns01,
+        }];
+        assert!(!control_plane_tls_uses_alpn01(&cp_dns));
+        assert!(!control_plane_tls_uses_alpn01(&[]));
+
+        // The refusal fires under cluster for either entry point (and names it), and never
+        // off-cluster.
+        assert_eq!(
+            tls_alpn01_entrypoints_refused_under_cluster(true, true, false),
+            vec!["[serve.on_demand_tls]"]
+        );
+        assert_eq!(
+            tls_alpn01_entrypoints_refused_under_cluster(true, false, true),
+            vec!["[serve.control_plane_tls]"]
+        );
+        assert_eq!(
+            tls_alpn01_entrypoints_refused_under_cluster(true, true, true),
+            vec!["[serve.on_demand_tls]", "[serve.control_plane_tls]"]
+        );
+        assert!(
+            tls_alpn01_entrypoints_refused_under_cluster(false, true, true).is_empty(),
+            "single-node / non-cluster is unaffected"
+        );
+        assert!(
+            tls_alpn01_entrypoints_refused_under_cluster(true, false, false).is_empty(),
+            "all-DNS-01 cluster config is Anycast-safe"
         );
     }
 

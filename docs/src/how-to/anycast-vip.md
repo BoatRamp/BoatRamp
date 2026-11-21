@@ -85,6 +85,16 @@ cure. The Anycast-safe modes are:
 - the **cluster-managed cert store** (the leader issues; followers serve the
   replicated cert) — see [Manage certificates in a cluster](./cluster-certs.md).
 
+TLS-ALPN-01 has two **other** entry points — both on `--tls acme-dns` — that are
+refused under cluster for the same reason (the ephemeral challenge certificate is
+node-local, never replicated):
+
+- `[serve.on_demand_tls]` with `enabled = true` and a TLS-ALPN-01 challenge — note
+  this is the **default** when `challenge` is unset, so set `challenge = "dns-01"`
+  (and configure a `[serve.dns_providers]` ACME DNS provider) under cluster;
+- a `[serve.control_plane_tls]` override set to `challenge = "tls-alpn-01"` — use
+  `"dns-01"` instead.
+
 ## Drain cleanly on every deploy (readiness-gated BGP)
 
 Health-gate your BGP speaker on **`GET /readyz`**. On `SIGTERM` (every deploy,
@@ -161,8 +171,9 @@ connection can break on a rehash. (Simply leaving `--http3` off also works.)
 On a clustered node bound to a non-loopback address, boatramp emits a loud startup
 **warning** for Anycast-unsafe combinations — a node-local `fs` blob backend,
 per-node (non-KV) rate limiting, or HTTP/3 advertised without `--anycast-node-id`.
-These are warnings, not failures (except `--tls acme`, which is refused outright);
-treat them as a checklist against this page.
+These are warnings, not failures (except the TLS-ALPN-01 entry points — `--tls acme`
+and an `[serve.on_demand_tls]` / `[serve.control_plane_tls]` TLS-ALPN-01 challenge —
+which are refused outright); treat them as a checklist against this page.
 
 ## See also
 
