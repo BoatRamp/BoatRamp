@@ -932,11 +932,16 @@ pub struct PutComputeRequest {
     #[serde(default)]
     pub placement: PlacementConstraints,
     /// Scheduling [`Priority`] carried onto the stored [`ComputeWorkload`] (NOT the
-    /// content-addressed spec). The server validates the requested `class` against the
-    /// project's ceiling fail-closed before storing it. Omitted when all-default (back-compat:
-    /// an older client/server never sees the field).
-    #[serde(default, skip_serializing_if = "Priority::is_default")]
-    pub priority: Priority,
+    /// content-addressed spec). **`None` ⇒ PRESERVE** the stored workload's existing priority: a
+    /// spec/replica change (or a manifest `apply`) that OMITS priority must never silently demote
+    /// a previously-set `class`/`rank` back to the default. For a brand-NEW workload with no
+    /// stored priority, `None` resolves to [`Priority::default`] (`standard`, rank 0). `Some(p)`
+    /// sets the priority explicitly — the server still validates the requested `class` against
+    /// the project's ceiling fail-closed before storing it. Omitted from the wire when `None`
+    /// (back-compat: an older client that never sends the field deserializes to `None` ⇒
+    /// preserve/default, and an older server that does not know the field never sees it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Priority>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,6 +1293,82 @@ mod tests {
         assert_eq!(back.priority.class(), Some("spot"));
         assert_eq!(back.priority.rank(), -5);
         assert_eq!(back.priority.min_available(), Some(1));
+    }
+
+    #[test]
+    fn put_request_priority_is_option_with_preserve_on_omit_back_compat() {
+        // FIND #2 wire contract. `PutComputeRequest.priority` is `Option<Priority>`: `None` is the
+        // PRESERVE sentinel (the server keeps the stored workload's priority), `Some` an explicit
+        // set. The distinction must survive serde.
+
+        // An older client that never sends the field ⇒ `None` (preserve) — not a forced default,
+        // so a spec/replica-only put never silently demotes a stored class.
+        let old_client = r#"{"spec":{"version":1,"root":{"image":"nginx:1"},"vcpus":1,"mem_mib":256,"port":80},"replicas":3}"#;
+        let req: PutComputeRequest =
+            serde_json::from_str(old_client).expect("omitted priority ⇒ None");
+        assert!(
+            req.priority.is_none(),
+            "an omitted priority deserializes to None (preserve)"
+        );
+
+        // `None` serializes WITHOUT the field (an older server never sees it).
+        let omit = PutComputeRequest {
+            spec: req.spec.clone(),
+            replicas: 3,
+            placement: PlacementConstraints::default(),
+            priority: None,
+        };
+        let s_omit = serde_json::to_string(&omit).unwrap();
+        assert!(
+            !s_omit.contains("priority"),
+            "None omits the field: {s_omit}"
+        );
+        assert!(
+            serde_json::from_str::<PutComputeRequest>(&s_omit)
+                .unwrap()
+                .priority
+                .is_none()
+        );
+
+        // An explicit priority ⇒ `Some(p)`, round-tripping class + rank.
+        let set = PutComputeRequest {
+            spec: req.spec.clone(),
+            replicas: 1,
+            placement: PlacementConstraints::default(),
+            priority: Some(
+                Priority::new()
+                    .with_class(Some("system".into()))
+                    .with_rank(3),
+            ),
+        };
+        let s_set = serde_json::to_string(&set).unwrap();
+        assert!(s_set.contains("system") && s_set.contains("\"rank\":3"));
+        let back: PutComputeRequest = serde_json::from_str(&s_set).unwrap();
+        assert_eq!(
+            back.priority.as_ref().and_then(|p| p.class()),
+            Some("system")
+        );
+        assert_eq!(back.priority.as_ref().map(Priority::rank), Some(3));
+
+        // `Some(default)` is DISTINCT from `None` on the wire: an explicit "set to standard/0"
+        // serializes to an empty object and round-trips to `Some(default)` — not preserve.
+        let set_default = PutComputeRequest {
+            spec: req.spec,
+            replicas: 1,
+            placement: PlacementConstraints::default(),
+            priority: Some(Priority::default()),
+        };
+        let s_def = serde_json::to_string(&set_default).unwrap();
+        assert!(
+            s_def.contains("\"priority\":{}"),
+            "an explicit default priority is an empty object (distinct from omitted): {s_def}"
+        );
+        assert_eq!(
+            serde_json::from_str::<PutComputeRequest>(&s_def)
+                .unwrap()
+                .priority,
+            Some(Priority::default())
+        );
     }
 
     fn spec() -> ComputeSpec {

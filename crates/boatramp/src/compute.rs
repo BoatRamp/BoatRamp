@@ -228,13 +228,12 @@ enum ComputeCommand {
         priority_class: Option<String>,
         /// PRIORITY RANK (signed) — the tenant-owned axis that orders your OWN workloads only
         /// (higher wins). It can NEVER leapfrog another project (the global order is
-        /// tier → project → rank), so it is safe for a tenant to set freely. Default 0.
-        #[arg(
-            long = "priority-rank",
-            default_value_t = 0,
-            allow_negative_numbers = true
-        )]
-        priority_rank: i32,
+        /// tier → project → rank), so it is safe for a tenant to set freely. Default 0. Omitting
+        /// ALL of `--priority-class`/`--priority-rank`/`--min-available` PRESERVES the workload's
+        /// current priority (a spec/replica change never resets it); passing any one sets the
+        /// priority (an unset axis among them takes its default).
+        #[arg(long = "priority-rank", allow_negative_numbers = true)]
+        priority_rank: Option<i32>,
         /// MIN-AVAILABLE floor — the minimum running replicas preemption must leave this
         /// workload (the PodDisruptionBudget-equivalent). Omit for the class default (`spot`→0,
         /// `standard`/`system`→protected at the full replica count). A HARD floor to a same-tier
@@ -242,9 +241,11 @@ enum ComputeCommand {
         #[arg(long = "min-available")]
         min_available: Option<u32>,
         /// DRY-RUN: preview the preemption BLAST RADIUS of this priority (which replicas it would
-        /// evict, and the capacity it would free) WITHOUT applying anything. A tenant view
-        /// aggregates cross-tenant impact without naming other projects; the operator view names
-        /// them. Combine with the priority flags to preview a bump before committing it.
+        /// evict, and the capacity it would free) WITHOUT applying anything. Your OWN project's
+        /// replicas are named; cross-project impact is ALWAYS reported as aggregate counts + freed
+        /// capacity, never naming another tenant's workloads (the server redacts it the same way
+        /// for every viewer). Combine with the priority flags to preview a bump before committing
+        /// it.
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
@@ -673,10 +674,11 @@ struct PutComputeRequest {
     spec: ComputeSpec,
     replicas: u32,
     placement: PlacementConstraints,
-    /// The workload's scheduling priority (class/rank/min-available). Omitted from the wire when
-    /// all-default (back-compat: an older server never sees the field).
-    #[serde(skip_serializing_if = "boatramp_core::compute::Priority::is_default")]
-    priority: boatramp_core::compute::Priority,
+    /// The workload's scheduling priority (class/rank/min-available). `None` ⇒ PRESERVE the
+    /// stored workload's priority (omitted from the wire, so an older server never sees the field);
+    /// `Some(p)` sets it explicitly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<boatramp_core::compute::Priority>,
 }
 
 /// The result of a `boatramp compute` subcommand, rendered by [`crate::output`].
@@ -1342,11 +1344,21 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 prefer_backend,
                 require_backend,
             )?;
-            // Assemble the workload PRIORITY (on the mutable workload, never the spec).
-            let priority = boatramp_core::compute::Priority::new()
-                .with_class(priority_class)
-                .with_rank(priority_rank)
-                .with_min_available(min_available);
+            // Assemble the workload PRIORITY (on the mutable workload, never the spec). PRESERVE
+            // semantics: when NONE of the priority flags are given, send `None` so the server keeps
+            // the workload's stored priority (a spec/replica-only `compute set` never demotes it);
+            // when ANY is given, send `Some` (an unset axis among them takes its default: rank 0).
+            let priority: Option<boatramp_core::compute::Priority> =
+                if priority_class.is_some() || priority_rank.is_some() || min_available.is_some() {
+                    Some(
+                        boatramp_core::compute::Priority::new()
+                            .with_class(priority_class)
+                            .with_rank(priority_rank.unwrap_or(0))
+                            .with_min_available(min_available),
+                    )
+                } else {
+                    None
+                };
             if dry_run {
                 // Preview the preemption blast radius WITHOUT applying. The server runs the pure
                 // engine with the proposed priority and returns a (tenant-redacted) projection.
@@ -1447,18 +1459,11 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 None,
                 None,
             )?;
-            // `compute build` carries no priority flags — the default class (`standard`, rank 0).
-            let hash = put_workload(
-                &http,
-                &server,
-                &seg,
-                &name,
-                spec,
-                replicas,
-                regions,
-                Default::default(),
-            )
-            .await?;
+            // `compute build` carries no priority flags, so it PRESERVES the workload's stored
+            // priority (`None`) — a rebuild changes the rootfs, never the priority; a brand-new
+            // workload defaults to `standard`/rank 0 server-side.
+            let hash =
+                put_workload(&http, &server, &seg, &name, spec, replicas, regions, None).await?;
             ComputeOutput::Build { name, spec: hash }
         }
         ComputeCommand::Rm { name } => {
@@ -2266,7 +2271,7 @@ async fn priority_dry_run(
     name: &str,
     spec: &ComputeSpec,
     replicas: u32,
-    priority: &boatramp_core::compute::Priority,
+    priority: &Option<boatramp_core::compute::Priority>,
 ) -> Result<serde_json::Value> {
     let request = PutComputeRequest {
         spec: spec.clone(),
@@ -2294,7 +2299,7 @@ async fn put_workload(
     spec: ComputeSpec,
     replicas: u32,
     regions: Vec<String>,
-    priority: boatramp_core::compute::Priority,
+    priority: Option<boatramp_core::compute::Priority>,
 ) -> Result<String> {
     let request = PutComputeRequest {
         spec,
@@ -2668,6 +2673,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dflt.startup_grace_secs, 30);
+    }
+
+    #[test]
+    fn compute_set_priority_flags_signal_preserve_vs_set() {
+        // FIND #2 CLI wiring: `--priority-rank` is now `Option<i32>` so OMITTING every priority
+        // flag is distinguishable from passing `--priority-rank 0`. No flags ⇒ all `None` ⇒ the
+        // `run` arm sends `priority: None` (PRESERVE the stored priority).
+        match parse(&["compute", "set", "db", "--image", "img", "--port", "80"]) {
+            Ok(ComputeCommand::Set {
+                priority_class,
+                priority_rank,
+                min_available,
+                ..
+            }) => {
+                assert_eq!(priority_class, None);
+                assert_eq!(priority_rank, None);
+                assert_eq!(min_available, None);
+            }
+            other => panic!("expected compute set, got {other:?}"),
+        }
+        // An EXPLICIT `--priority-rank 0` is now a real signal (Some(0)) ⇒ `run` sends `Some` ⇒ the
+        // priority is SET (to standard/0), not preserved — the previously-ambiguous case.
+        match parse(&[
+            "compute",
+            "set",
+            "db",
+            "--image",
+            "img",
+            "--port",
+            "80",
+            "--priority-rank",
+            "0",
+        ]) {
+            Ok(ComputeCommand::Set { priority_rank, .. }) => assert_eq!(priority_rank, Some(0)),
+            other => panic!("expected compute set, got {other:?}"),
+        }
+        // Any one priority flag parses (and would make `run` send `Some`).
+        match parse(&[
+            "compute",
+            "set",
+            "db",
+            "--image",
+            "img",
+            "--port",
+            "80",
+            "--priority-class",
+            "system",
+        ]) {
+            Ok(ComputeCommand::Set {
+                priority_class,
+                priority_rank,
+                ..
+            }) => {
+                assert_eq!(priority_class.as_deref(), Some("system"));
+                assert_eq!(
+                    priority_rank, None,
+                    "an unset rank among set flags defaults to 0 in run"
+                );
+            }
+            other => panic!("expected compute set, got {other:?}"),
+        }
+        // A negative rank still parses (signed, tenant-owned axis).
+        match parse(&[
+            "compute",
+            "set",
+            "db",
+            "--image",
+            "img",
+            "--port",
+            "80",
+            "--priority-rank",
+            "-5",
+        ]) {
+            Ok(ComputeCommand::Set { priority_rank, .. }) => assert_eq!(priority_rank, Some(-5)),
+            other => panic!("expected compute set, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1450,6 +1450,43 @@ impl PriorityClassCatalog {
         (name, class)
     }
 
+    /// Resolve a workload's [`Priority`] to its EFFECTIVE `(class_name, class)` CLAMPED to a
+    /// project `ceiling`: if the stored class's tier EXCEEDS the ceiling's tier, the workload
+    /// resolves AS the ceiling class — losing any over-ceiling tier AND preemption authority. This
+    /// is the RECONCILE-time half of the per-project ceiling that completes revocation: the
+    /// write-time [`check_request`](Self::check_request) gate only bounds a NEW request, so a class
+    /// stored while the ceiling was temporarily HIGHER (then the operator lowers it back) would
+    /// otherwise KEEP its over-ceiling authority until the workload is re-set/deleted. Clamping
+    /// here makes a stored `system` in a now-`standard`-ceiling project behave AS `standard`
+    /// (within-project only) at placement + preemption time. `ceiling` is the project's CURRENT
+    /// ceiling class name (`None` ⇒ the node [`Self::default_ceiling`]); a missing or unknown
+    /// ceiling name fails SAFE to the node default ceiling — never a silent grant (the same
+    /// fail-closed posture as the write path). The clamp only ever LOWERS a tier (a stored class
+    /// at/under the ceiling is returned unchanged), so an all-default fleet resolves identically
+    /// to [`resolve`](Self::resolve) — zero churn on upgrade.
+    pub fn resolve_clamped<'a>(
+        &'a self,
+        priority: &'a Priority,
+        ceiling: Option<&str>,
+    ) -> (&'a str, &'a PriorityClass) {
+        let (name, class) = self.resolve(priority);
+        // The project's effective ceiling class, FAIL-CLOSED to the node default ceiling when the
+        // configured name is absent or unknown (never a widening of a project's authority).
+        let ceiling_lookup = ceiling
+            .filter(|n| self.classes.contains_key(*n))
+            .unwrap_or_else(|| self.default_ceiling());
+        let (ceiling_name, ceiling_class) = self
+            .classes
+            .get_key_value(ceiling_lookup)
+            .map(|(n, c)| (n.as_str(), c))
+            .unwrap_or(("standard", &NEUTRAL_STANDARD));
+        if class.tier > ceiling_class.tier {
+            (ceiling_name, ceiling_class)
+        } else {
+            (name, class)
+        }
+    }
+
     /// The operator TIER a workload's priority resolves to (higher wins globally).
     pub fn tier_of(&self, priority: &Priority) -> i32 {
         self.resolve(priority).1.tier
@@ -1554,6 +1591,30 @@ pub fn workload_priority_key(
     (
         // Negate so a HIGHER tier compares as the SMALLER (earlier) key.
         tier.saturating_neg(),
+        project.to_string(),
+        workload.priority.rank.saturating_neg(),
+        workload.name.clone(),
+    )
+}
+
+/// The CEILING-CLAMPED global comparator key — [`workload_priority_key`] with the workload's
+/// effective TIER clamped to the project `ceiling` (see
+/// [`PriorityClassCatalog::resolve_clamped`]). The reconcile placement sort and the preemption
+/// engine's victim ordering use this (not the raw key) so a stored over-ceiling class loses its
+/// placement PRECEDENCE exactly as it loses its preemption AUTHORITY — a stored `system` in a
+/// now-`standard`-ceiling project sorts as `standard`. `ceiling` `None` ⇒ the node default
+/// ceiling (fail-closed). `rank` and `name` are unchanged (the clamp is tier-only); an
+/// at/under-ceiling workload yields exactly [`workload_priority_key`]'s key.
+pub fn workload_priority_key_clamped(
+    catalog: &PriorityClassCatalog,
+    project: &str,
+    workload: &ComputeWorkload,
+    ceiling: Option<&str>,
+) -> (i32, String, i32, String) {
+    let (_, class) = catalog.resolve_clamped(&workload.priority, ceiling);
+    (
+        // Negate so a HIGHER tier compares as the SMALLER (earlier) key.
+        class.tier.saturating_neg(),
         project.to_string(),
         workload.priority.rank.saturating_neg(),
         workload.name.clone(),
@@ -3195,14 +3256,29 @@ fn preemptor_uses_preemptible_backend(
 /// exactly what the main loop reproduces — the engine decides the evictions; the main loop does
 /// the authoritative placement. PURE: a function of the snapshot + the catalog + `now` only (the
 /// sole carry-over is each replica's persisted preemption-cooldown marker, read via the snapshot).
+///
+/// `project_ceilings` maps `project → current priority-class ceiling` (the operator per-project
+/// cap; a project absent from the map, or mapped to `None`, takes the node default ceiling). Every
+/// workload's effective tier/authority is CLAMPED to its project ceiling via
+/// [`PriorityClassCatalog::resolve_clamped`] — so a class stored above the project's NOW-current
+/// ceiling (e.g. `system` stored while the ceiling was raised, then lowered back to `standard`)
+/// loses its over-ceiling cross-tenant preemption authority here, not only at the write path. The
+/// clamp only lowers a tier, so an all-default or at/under-ceiling fleet is unaffected.
 pub fn plan_preemptions(
     inputs: &[PreemptInput],
     nodes: &[Node],
     caps: &BTreeMap<String, Capabilities>,
     catalog: &PriorityClassCatalog,
+    project_ceilings: &BTreeMap<String, Option<String>>,
     base_ledger: &NodeCapacities,
     _now: u64,
 ) -> PreemptionPlan {
+    // The project's CURRENT ceiling class name (`None` ⇒ the node default ceiling), used to clamp
+    // every resolve below so a stored over-ceiling class loses its over-ceiling placement
+    // precedence + preemption authority at reconcile.
+    let ceiling_of = |project: &str| -> Option<&str> {
+        project_ceilings.get(project).and_then(|c| c.as_deref())
+    };
     // Working ledger: reserves each workload's placements AND credits chosen victims, mirroring
     // the main loop so later (lower-priority) workloads see the same contended capacity.
     let mut sim = base_ledger.clone();
@@ -3220,7 +3296,11 @@ pub fn plan_preemptions(
     let mut placed_workloads: Vec<(String, i32, i32)> = Vec::new();
 
     for (idx, p) in inputs.iter().enumerate() {
-        let (p_class_name, p_class) = catalog.resolve(&p.workload.priority);
+        // CEILING-CLAMPED resolve: a class stored above the project's current ceiling resolves AS
+        // the ceiling class, so an over-ceiling `system` preemptor loses its cross-tenant authority
+        // (it becomes `standard` = within-project) — the reconcile-time completion of revocation.
+        let (p_class_name, p_class) =
+            catalog.resolve_clamped(&p.workload.priority, ceiling_of(p.project));
         let p_tier = p_class.tier;
         let p_rank = p.workload.priority.rank;
         let p_mode = p_class.preemption;
@@ -3273,7 +3353,11 @@ pub fn plan_preemptions(
             if vidx == idx {
                 continue; // never preempt one's own workload's replicas to place itself
             }
-            let (_v_name, v_class) = catalog.resolve(&v.workload.priority);
+            // CEILING-CLAMPED victim tier: the cross-tenant eligibility check uses the victim's
+            // effective (clamped) tier, so a victim whose stored class now exceeds its project
+            // ceiling is weighed at the ceiling tier (consistent with the preemptor clamp above).
+            let (_v_name, v_class) =
+                catalog.resolve_clamped(&v.workload.priority, ceiling_of(v.project));
             let v_tier = v_class.tier;
             let v_rank = v.workload.priority.rank;
             if !can_preempt(p_tier, p_rank, p_mode, p.project, v_tier, v_rank, v.project) {
@@ -3312,7 +3396,12 @@ pub fn plan_preemptions(
                     victim_tier: v_tier,
                     can_park,
                     drain_grace: v.spec.startup_grace_secs,
-                    key: workload_priority_key(catalog, v.project, v.workload),
+                    key: workload_priority_key_clamped(
+                        catalog,
+                        v.project,
+                        v.workload,
+                        ceiling_of(v.project),
+                    ),
                 });
             }
         }
@@ -3361,7 +3450,10 @@ pub fn plan_preemptions(
                 .find(|v| v.project == cand.project && v.workload.name == cand.workload);
             let (floor, same_tier) = match v_input {
                 Some(v) => {
-                    let (_n, vc) = catalog.resolve(&v.workload.priority);
+                    // Clamp the victim to its project ceiling so both the min-available floor and
+                    // the same-tier test weigh its EFFECTIVE tier (matching `can_preempt` above).
+                    let (_n, vc) =
+                        catalog.resolve_clamped(&v.workload.priority, ceiling_of(v.project));
                     (victim_floor(v.workload, vc), vc.tier == p_tier)
                 }
                 None => (0, false),
@@ -4308,6 +4400,28 @@ pub async fn reconcile_once(
 
     // Every project's workloads (compute is project-scoped in 0.2.0), fetched once.
     let mut workloads = deploy.list_compute_workloads_all().await?;
+    // Each project's CURRENT priority-class ceiling (the operator per-project cap), fetched once
+    // and shared by BOTH the priority-ordered placement sort and the preemption engine. The
+    // ceiling is authoritative at RECONCILE, not only at the write path: a class stored while the
+    // project ceiling was temporarily HIGHER (then lowered back) is CLAMPED to the current ceiling
+    // wherever a tier is resolved below, so it loses any over-ceiling placement precedence AND
+    // cross-tenant preemption authority — completing the revocation the write-time `check_request`
+    // gate alone cannot. A missing/unreadable per-project policy ⇒ `None` = the node default
+    // ceiling (FAIL-CLOSED: the default is `standard`, never a silent grant of a higher tier).
+    let mut project_ceilings: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (project_name, _) in &workloads {
+        if project_ceilings.contains_key(project_name) {
+            continue;
+        }
+        let ceiling = match deploy
+            .get_project_backend_policy(ProjectRef::new(project_name))
+            .await
+        {
+            Ok(pp) => pp.and_then(|p| p.priority_ceiling),
+            Err(_) => None,
+        };
+        project_ceilings.insert(project_name.clone(), ceiling);
+    }
     // DETERMINISTIC, PRIORITY-ORDERED placement. With one shared capacity ledger (below) the
     // order in which workloads consume contended capacity is observable, so sort by the global
     // priority comparator — `operator_tier DESC → project → rank DESC → name` (see
@@ -4318,7 +4432,10 @@ pub async fn reconcile_once(
     // capacity-tight workload stays unplaced on the same stable basis each tick (it doesn't
     // flap), and freed capacity is handed to the earliest (highest-priority) such workload.
     workloads.sort_by(|(pa, wa), (pb, wb)| {
-        workload_priority_key(&catalog, pa, wa).cmp(&workload_priority_key(&catalog, pb, wb))
+        let ca = project_ceilings.get(pa).and_then(|c| c.as_deref());
+        let cb = project_ceilings.get(pb).and_then(|c| c.as_deref());
+        workload_priority_key_clamped(&catalog, pa, wa, ca)
+            .cmp(&workload_priority_key_clamped(&catalog, pb, wb, cb))
     });
 
     // BIN-PACKING PRE-PASS. Seed one shared remaining-capacity ledger for the whole pass:
@@ -4436,7 +4553,15 @@ pub async fn reconcile_once(
             observed: &o.observed,
         })
         .collect();
-    let preemption = plan_preemptions(&preempt_inputs, nodes, &caps, &catalog, &capacity, now_unix);
+    let preemption = plan_preemptions(
+        &preempt_inputs,
+        nodes,
+        &caps,
+        &catalog,
+        &project_ceilings,
+        &capacity,
+        now_unix,
+    );
     // EXECUTE the evictions. Park snapshots+zeros a scale-to-zero-capable victim (it wakes via
     // the existing capacity-gated Restore once the preemptor leaves); Drain stops the container
     // (its persistent volume survives) and persists a durable `Preempted` marker so `compute
@@ -4940,8 +5065,21 @@ pub async fn reconcile_once(
                         _ => None,
                     };
                     // The workload's resolved priority class, threaded so a delegated backend
-                    // (k8s) can map it to its native PriorityClass.
-                    let priority_class = Some(catalog.resolve(&workload.priority).0.to_string());
+                    // (k8s) can map it to its native PriorityClass. CEILING-CLAMPED so a stored
+                    // over-ceiling class cannot smuggle its over-ceiling authority onto the
+                    // delegated substrate either — the native PriorityClass tracks the same
+                    // effective (clamped) tier the local engine enforces.
+                    let priority_class = Some(
+                        catalog
+                            .resolve_clamped(
+                                &workload.priority,
+                                project_ceilings
+                                    .get(project_name.as_str())
+                                    .and_then(|c| c.as_deref()),
+                            )
+                            .0
+                            .to_string(),
+                    );
                     match launch_one(
                         b.as_ref(),
                         &project_name,
@@ -9923,6 +10061,18 @@ mod priority_tests {
         m
     }
 
+    /// Every project's ceiling raised to the top class (`system`), so the reconcile-time ceiling
+    /// CLAMP is a no-op — these engine tests then exercise the pure preemption logic exactly as
+    /// before the clamp landed (a `system` workload HAS its cross-tenant authority ONLY because its
+    /// project's ceiling permits it, which the write path enforced). The dedicated ceiling tests
+    /// below instead LOWER a project's ceiling to prove the clamp revokes an over-ceiling class.
+    fn open_ceilings() -> BTreeMap<String, Option<String>> {
+        ["proj", "projA", "projB", "p1", "p2"]
+            .into_iter()
+            .map(|p| (p.to_string(), Some("system".to_string())))
+            .collect()
+    }
+
     /// Seed a ledger from advertised capacity minus the running victims' reservations (what the
     /// reconcile pre-pass produces).
     fn seeded(nodes: &[Node], running: &[(u64, &ComputeSpec)]) -> NodeCapacities {
@@ -10063,7 +10213,7 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[(1, &vspec)]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert!(
             plan.victims.is_empty(),
             "a delegated-backend workload is never a victim/preemptor"
@@ -10105,7 +10255,7 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[(1, &vspec)]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert_eq!(plan.victims.len(), 1, "the lower-rank sibling is preempted");
         assert_eq!(plan.victims[0].handle.workload, "v");
         assert!(matches!(
@@ -10146,7 +10296,7 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[(1, &vspec)]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert!(
             plan.victims.is_empty(),
             "standard never preempts across tenants"
@@ -10182,7 +10332,7 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[(1, &vspec)]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert_eq!(plan.victims.len(), 1, "system preempts projB's standard");
         assert_eq!(plan.victims[0].project, "projB");
     }
@@ -10222,7 +10372,7 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[(1, &filler), (2, &vspec)]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert!(
             plan.victims.is_empty(),
             "evicting the east victim can't help a west-pinned preemptor"
@@ -10260,7 +10410,7 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[(1, &vspec)]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert_eq!(plan.victims.len(), 1);
         assert!(
             matches!(plan.victims[0].disposition, PreemptDisposition::Park),
@@ -10302,7 +10452,7 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[(1, &vspec), (1, &vspec)]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert!(
             plan.victims.is_empty(),
             "a HARD min_available floor blocks a same-tier preemptor"
@@ -10338,7 +10488,7 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[(1, &vspec)]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert_eq!(
             plan.victims.len(),
             1,
@@ -10378,7 +10528,15 @@ mod priority_tests {
             },
         ];
         let base1 = seeded(&nodes, &[(1, &vspec)]);
-        let plan1 = plan_preemptions(&inputs1, &nodes, &caps, &cat, &base1, 1000);
+        let plan1 = plan_preemptions(
+            &inputs1,
+            &nodes,
+            &caps,
+            &cat,
+            &open_ceilings(),
+            &base1,
+            1000,
+        );
         assert_eq!(plan1.victims.len(), 1, "pass 1 preempts the victim once");
 
         let vobs_after = vec![ObservedInstance {
@@ -10409,7 +10567,8 @@ mod priority_tests {
                 },
             ];
             let base = seeded(&nodes, &[(1, &pspec)]);
-            let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 2000);
+            let plan =
+                plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 2000);
             assert!(
                 plan.victims.is_empty(),
                 "pass {pass}: converged — no re-preemption, no oscillation"
@@ -10446,7 +10605,7 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[(1, &vspec)]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert!(
             plan.victims.is_empty(),
             "a preemptor that already fits never evicts (anti-thrash)"
@@ -10495,11 +10654,157 @@ mod priority_tests {
             },
         ];
         let base = seeded(&nodes, &[]);
-        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &base, 1000);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
         assert!(
             plan.outbid.contains(&("p2".to_string(), "t".to_string())),
             "standard outbid by a system workload that took the node: {:?}",
             plan.outbid
         );
+    }
+
+    // ---- 14. reconcile-time ceiling CLAMP (revocation completion) -----------
+
+    #[test]
+    fn resolve_clamped_lowers_an_over_ceiling_class() {
+        let cat = PriorityClassCatalog::builtin();
+        let system = pri(Some("system"), 0, None);
+        // Granted (ceiling `system`): resolves AS system — full tier + cross-tenant authority.
+        let (name, class) = cat.resolve_clamped(&system, Some("system"));
+        assert_eq!(name, "system");
+        assert_eq!(class.tier, 100);
+        assert_eq!(class.preemption, PreemptionMode::CrossTenantOptIn);
+        // Ceiling lowered to `standard` (or ABSENT ⇒ the node default `standard`): the stored
+        // `system` clamps to `standard`, losing the over-ceiling tier AND cross-tenant authority.
+        for ceiling in [Some("standard"), None] {
+            let (name, class) = cat.resolve_clamped(&system, ceiling);
+            assert_eq!(
+                name, "standard",
+                "clamped to the ceiling class ({ceiling:?})"
+            );
+            assert_eq!(class.tier, 0);
+            assert_eq!(class.preemption, PreemptionMode::WithinProject);
+        }
+        // At/under the ceiling is UNAFFECTED (the clamp only ever lowers).
+        let standard = pri(None, 0, None);
+        assert_eq!(cat.resolve_clamped(&standard, Some("system")).0, "standard");
+        let spot = pri(Some("spot"), 0, None);
+        assert_eq!(cat.resolve_clamped(&spot, Some("standard")).0, "spot");
+        // An unknown ceiling name fails SAFE to the node default ceiling — never a grant.
+        assert_eq!(cat.resolve_clamped(&system, Some("bogus")).0, "standard");
+    }
+
+    #[test]
+    fn clamped_comparator_demotes_an_over_ceiling_class() {
+        let cat = PriorityClassCatalog::builtin();
+        let system = wl("w", 1, pri(Some("system"), 0, None));
+        // Ceiling grants `system` ⇒ sorts at the system tier (negated, earliest).
+        let granted = workload_priority_key_clamped(&cat, "projA", &system, Some("system"));
+        assert_eq!(granted.0, -100, "system tier (negated)");
+        // Ceiling lowered to `standard` ⇒ the SAME stored class sorts as standard: it loses its
+        // placement precedence exactly as it loses its preemption authority.
+        let clamped = workload_priority_key_clamped(&cat, "projA", &system, Some("standard"));
+        assert_eq!(clamped.0, 0, "clamped to the standard tier");
+        // ...identical to the key an actual standard workload (same project+name) would get.
+        let standard = wl("w", 1, pri(None, 0, None));
+        assert_eq!(clamped, workload_priority_key(&cat, "projA", &standard));
+    }
+
+    #[test]
+    fn engine_clamps_an_over_ceiling_system_to_within_project() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        // STORED as `system` (set when projA's ceiling was raised), but projA's ceiling is now
+        // lowered back to `standard` — the incomplete-revocation shape.
+        let sys_pre = wl("p", 1, pri(Some("system"), 0, None));
+        let vobs = vec![running("projB", "v", 0, 1, "container")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "projA",
+                workload: &sys_pre,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "projB",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        // projA ceiling LOWERED to standard (projB absent ⇒ node default standard).
+        let lowered: BTreeMap<String, Option<String>> =
+            [("projA".to_string(), Some("standard".to_string()))]
+                .into_iter()
+                .collect();
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &lowered, &base, 1000);
+        assert!(
+            plan.victims.is_empty(),
+            "an over-ceiling `system` clamps to `standard` ⇒ no cross-tenant preemption"
+        );
+        // CONTROL: the SAME inputs with projA's ceiling GRANTED to `system` DO preempt projB —
+        // proving the clamp (not some other gate) neutralized the eviction.
+        let granted = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert_eq!(
+            granted.victims.len(),
+            1,
+            "with the ceiling granted the stored system preempts projB"
+        );
+        assert_eq!(granted.victims[0].project, "projB");
+    }
+
+    #[test]
+    fn engine_at_ceiling_workload_is_unaffected_by_the_clamp() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        // Both workloads are `standard` (at the default ceiling); the preemptor outranks within
+        // its own project and the victim opts into preemptibility (floor 0).
+        let victim = wl("v", 1, pri(None, 1, Some(0)));
+        let preemptor = wl("p", 1, pri(None, 10, None));
+        let vobs = vec![running("proj", "v", 0, 1, "container")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "proj",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "proj",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        // An explicitly-lowered (standard) ceiling leaves an AT-ceiling (standard) workload's
+        // within-project rank preemption fully intact — the clamp only ever lowers an OVER-ceiling
+        // class, never restricts one already within its ceiling.
+        let ceilings: BTreeMap<String, Option<String>> =
+            [("proj".to_string(), Some("standard".to_string()))]
+                .into_iter()
+                .collect();
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &ceilings, &base, 1000);
+        assert_eq!(
+            plan.victims.len(),
+            1,
+            "within-ceiling preemption is unaffected"
+        );
+        assert_eq!(plan.victims[0].handle.workload, "v");
     }
 }

@@ -1222,6 +1222,21 @@ struct PutComputeResponse {
     warnings: Vec<String>,
 }
 
+/// The EFFECTIVE priority a `put_compute` stores under the PRESERVE-ON-OMIT rule (v0.70.0 fold):
+/// an explicit `requested` (`Some`) wins; otherwise the `stored` workload's current priority is
+/// PRESERVED (so a spec/replica-only put never silently demotes a previously-set class/rank);
+/// otherwise — a brand-NEW workload with nothing stored — the default (`standard`/rank 0). Pure, so
+/// the read-modify-write decision is unit-tested without the HTTP/daemon machinery. The handler
+/// CEILING-CHECKS a `Some` BEFORE calling this; the preserve path deliberately does NOT re-check a
+/// stored value (it already passed the gate when set — the reconcile-time clamp handles a
+/// now-over-ceiling stored class).
+fn effective_put_priority(
+    requested: Option<boatramp_core::compute::Priority>,
+    stored: Option<boatramp_core::compute::Priority>,
+) -> boatramp_core::compute::Priority {
+    requested.or(stored).unwrap_or_default()
+}
+
 /// Create/update a workload: content-address its spec, then flip the desired
 /// state (replicas/placement) — the atomic activation pointer.
 pub(super) async fn put_compute(
@@ -1342,21 +1357,46 @@ pub(super) async fn put_compute(
         // is `standard`, so this never widens what a project may request).
         Err(_) => None,
     };
-    if let Err(msg) = catalog.check_request(request.priority.class(), ceiling.as_deref()) {
-        return (StatusCode::BAD_REQUEST, format!("{msg}\n")).into_response();
-    }
+    // PRESERVE-ON-OMIT (v0.70.0 fold). A request that OMITS priority (`None`) must never silently
+    // demote a previously-set `class`/`rank` — a `compute set` that only changes the spec/replicas,
+    // or a manifest `apply`, no longer resets the priority. Resolve the EFFECTIVE priority
+    // read-modify-write:
+    //   * `Some(p)` ⇒ an EXPLICIT set — CEILING-CHECK it fail-closed (a tenant can never
+    //     self-assign a class above its project ceiling), then store it.
+    //   * `None` ⇒ PRESERVE the stored workload's existing priority; for a brand-NEW workload
+    //     (nothing stored) default to `standard`/rank 0. No ceiling re-check on this path — the
+    //     stored value already passed the gate when it was set, and the reconcile-time ceiling
+    //     CLAMP (not the write path) is what neutralizes a now-over-ceiling stored class at
+    //     placement/preemption time.
+    let effective_priority = match request.priority.take() {
+        Some(p) => {
+            if let Err(msg) = catalog.check_request(p.class(), ceiling.as_deref()) {
+                return (StatusCode::BAD_REQUEST, format!("{msg}\n")).into_response();
+            }
+            effective_put_priority(Some(p), None)
+        }
+        None => {
+            // PRESERVE: read-modify-write the stored workload's priority (default for a new one).
+            let stored = match deploy.get_compute_workload(project.as_ref(), &name).await {
+                Ok(w) => w.map(|w| w.priority),
+                Err(err) => return deploy_error_response(err),
+            };
+            effective_put_priority(None, stored)
+        }
+    };
     // DRY-RUN: preview the preemption blast radius without storing. Computed from persisted
-    // state — the SET of replicas this priority COULD preempt under the tenancy boundary.
-    // Same-project victims are named (the tenant owns them); cross-project impact is an aggregate
-    // (no other-tenant identity). The LIVE eviction set depends on the leader's capacity ledger
-    // (preemption only triggers under real contention); the note says so.
+    // state — the SET of replicas the EFFECTIVE priority COULD preempt under the tenancy boundary.
+    // Same-project victims are named (the tenant owns them); cross-project impact is ALWAYS an
+    // aggregate (counts + freed capacity, never another tenant's identity). The LIVE eviction set
+    // depends on the leader's capacity ledger (preemption only triggers under real contention); the
+    // note says so.
     if params.dry_run {
         return compute_priority_dry_run(
             &deploy,
             &catalog,
             project.as_ref().as_str(),
             &name,
-            &request,
+            &effective_priority,
             ceiling.as_deref(),
         )
         .await;
@@ -1371,7 +1411,7 @@ pub(super) async fn put_compute(
         active: spec_hash.clone(),
         replicas: request.replicas,
         placement: request.placement,
-        priority: request.priority,
+        priority: effective_priority,
     };
     match deploy
         .set_compute_workload(project.as_ref(), &workload)
@@ -1405,11 +1445,11 @@ async fn compute_priority_dry_run(
     catalog: &boatramp_core::compute::PriorityClassCatalog,
     viewer_project: &str,
     name: &str,
-    request: &PutComputeRequest,
+    priority: &boatramp_core::compute::Priority,
     ceiling: Option<&str>,
 ) -> Response {
     use boatramp_core::compute::{Readiness, ReplicaPhase};
-    let (class_name, class) = catalog.resolve(&request.priority);
+    let (class_name, class) = catalog.resolve(priority);
     let all = match deploy.list_compute_workloads_all().await {
         Ok(w) => w,
         Err(err) => return deploy_error_response(err),
@@ -1422,7 +1462,7 @@ async fn compute_priority_dry_run(
         if vproj == viewer_project && vwl.name == name {
             continue;
         }
-        if !catalog.may_preempt(&request.priority, viewer_project, &vwl.priority, vproj) {
+        if !catalog.may_preempt(priority, viewer_project, &vwl.priority, vproj) {
             continue;
         }
         // The victim's per-replica sizing (for the freed-capacity aggregate).
@@ -6472,6 +6512,31 @@ mod tests {
 
         // A delta REQUIRES resumable (the base is a node-local member-object dir).
         assert!(parse_export_delta(Some("incremental"), Some("base"), None).is_err());
+    }
+
+    #[test]
+    fn effective_put_priority_preserves_on_omit() {
+        use boatramp_core::compute::Priority;
+        // FIND #2 read-modify-write: an explicit `Some` sets the priority (and wins over any stored
+        // value); omitting it PRESERVES the stored priority; a brand-new workload (nothing stored)
+        // defaults to `standard`/rank 0.
+        let sys = Priority::new()
+            .with_class(Some("system".into()))
+            .with_rank(7);
+        // Explicit `Some` wins — even over a stored priority.
+        assert_eq!(
+            effective_put_priority(Some(sys.clone()), Some(Priority::default())),
+            sys
+        );
+        // OMIT + a stored priority ⇒ PRESERVE it (no silent demotion to standard/0).
+        let preserved = effective_put_priority(None, Some(sys.clone()));
+        assert_eq!(preserved.class(), Some("system"));
+        assert_eq!(preserved.rank(), 7);
+        // OMIT + nothing stored (brand-new workload) ⇒ default standard/rank 0.
+        assert!(
+            effective_put_priority(None, None).is_default(),
+            "a new workload with no priority defaults to standard/0"
+        );
     }
 
     #[test]
