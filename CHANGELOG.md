@@ -7,6 +7,30 @@ versions.
 
 ## [Unreleased]
 
+### Added
+
+- **`boatramp config convert <file> --to <ron|json>` — convert a config FILE between RON and
+  JSON.** Works for BOTH config kinds (the node daemon config `boatramp.cfg` and the project config
+  `project.cfg`). It reuses the one existing config parser — RON ⇒ `ron`, JSON ⇒ `serde_json`, both
+  decoding into the SAME typed structs — and re-serializes the parsed value in the target format
+  (`ron` pretty / `serde_json` pretty), so there is no second parser. The source format is
+  auto-detected by extension (`.json` ⇒ JSON, else RON; override with `--from`) and the kind by
+  filename/content (`boatramp.cfg` ⇒ node, `project.cfg` ⇒ project, else inferred from the top-level
+  keys; override with `--kind`). It is **lossless at the typed level** — RON→JSON→RON and
+  JSON→RON→JSON preserve the config value — but it converts the config **value**, so source comments
+  and formatting are dropped. Purely client-side; the converted document is printed to stdout.
+- **`boatramp config diff <a> <b>` — semantic config diff + a CI drift-lint.** Both files are parsed
+  into the same typed config and the typed values compared, so a pure RON-vs-JSON **format**
+  difference reports **no** diff — only real value/topology changes do. Each file may be in either
+  format and of either kind (node or project; the two must match). `--exit-code` turns it into a
+  fail-closed drift-lint that exits non-zero when the configs differ (after printing the diff, like
+  `git diff --exit-code`), so `config diff --exit-code prod.json dev.json` can gate CI on topology
+  drift. `--topology` narrows the comparison to the deployment topology (routes, handler↔component
+  bindings, functions, consumer topics, and the `imports`/`invoke_targets` capability grants),
+  dropping the dev/prod expected-to-differ set — the per-route `tenancy`/`token_claims` block,
+  domains, and the project's publish target (`PLAN-dev-prod-manifest-overlay`). Both renderings honor
+  `--output-format` (human text or JSON).
+
 ## [0.69.1] — 2026-11-21
 
 ### Fixed

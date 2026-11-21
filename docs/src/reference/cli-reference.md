@@ -2721,6 +2721,33 @@ Resolve the STATIC daemon config (`boatramp.cfg` + `BOATRAMP_*` env, via the lay
 | `--file <FILE>` | — | `boatramp.cfg` | — | The daemon config file to resolve (default `boatramp.cfg`). Env overlays it |
 | `--explain` | — | — | — | Also print the resolution-order legend to stderr |
 
+### `boatramp config convert`
+
+Convert a local config FILE between RON and JSON. Reuses the one config parser (RON ⇒ ron, JSON ⇒ serde_json, into the SAME typed structs) and re-serializes the parsed value in the target format. Works for BOTH kinds (node `boatramp.cfg` / project `project.cfg`). Lossless at the TYPED level (round-trips RON↔JSON), but it converts the config VALUE — source comments and formatting are dropped. Purely client-side; the converted document is printed to stdout (redirect it to a file)
+
+**Usage:** `boatramp config convert [OPTIONS] <FILE>`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `<FILE>` | — | — | — | The config file to convert (RON or JSON). The source format is auto-detected by extension (`.json` ⇒ JSON, else RON); override with `--from` |
+| `--to <TO>` | — | — | ron \| json | Target format to render |
+| `--from <FROM>` | — | — | ron \| json | Force the SOURCE format instead of detecting it from the file extension |
+| `--kind <KIND>` | — | — | node \| project | Force the config KIND when the filename/content can't disambiguate it |
+
+### `boatramp config diff`
+
+Diff two local config FILES and report the SEMANTIC differences (values, not text): both are parsed into the same typed config and the typed values compared, so a pure RON-vs-JSON format difference shows NO diff — only real value/topology changes do. Each file may be in either format. Purely client-side
+
+**Usage:** `boatramp config diff [OPTIONS] <A> <B>`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `<A>` | — | — | — | First config file (node or project; RON or JSON) |
+| `<B>` | — | — | — | Second config file (must be the same kind as the first) |
+| `--exit-code` | — | — | — | CI drift-lint: exit non-zero when the two configs differ (after printing the diff) |
+| `--topology` | — | — | — | Restrict the comparison to deployment TOPOLOGY (routes / handler↔component bindings / functions / consumer topics / capability grants), dropping the expected-to-differ set (per-route tenancy/token_claims, domains, and the project publish target) — the dev/prod-overlay drift-lint subset |
+| `--kind <KIND>` | — | — | node \| project | Force the config KIND for both files when it can't be inferred |
+
 ## `boatramp migrate`
 
 Migrate a pre-0.2.0 control-plane store to the project-scoped layout (`--dry-run` to preview; `--stage`/`--finalize` for a soak window)

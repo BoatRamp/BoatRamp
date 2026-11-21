@@ -49,6 +49,9 @@ pub enum Error {
     /// Resolving the STATIC daemon config (`boatramp.cfg` + env) for `config dump` failed.
     #[error(transparent)]
     DaemonConfig(#[from] crate::config::ConfigError),
+    /// A `config convert` / `config diff` (local config-FILE tooling) failure.
+    #[error(transparent)]
+    ConfigFile(#[from] crate::config_file::Error),
 }
 
 /// `config` module result; `Err` is [`Error`].
@@ -117,6 +120,48 @@ enum ConfigCommand {
         #[arg(long)]
         explain: bool,
     },
+    /// Convert a local config FILE between RON and JSON. Reuses the one config parser
+    /// (RON ⇒ ron, JSON ⇒ serde_json, into the SAME typed structs) and re-serializes the
+    /// parsed value in the target format. Works for BOTH kinds (node `boatramp.cfg` /
+    /// project `project.cfg`). Lossless at the TYPED level (round-trips RON↔JSON), but it
+    /// converts the config VALUE — source comments and formatting are dropped. Purely
+    /// client-side; the converted document is printed to stdout (redirect it to a file).
+    Convert {
+        /// The config file to convert (RON or JSON). The source format is auto-detected by
+        /// extension (`.json` ⇒ JSON, else RON); override with `--from`.
+        file: PathBuf,
+        /// Target format to render.
+        #[arg(long)]
+        to: crate::config::ConfigFormat,
+        /// Force the SOURCE format instead of detecting it from the file extension.
+        #[arg(long)]
+        from: Option<crate::config::ConfigFormat>,
+        /// Force the config KIND when the filename/content can't disambiguate it.
+        #[arg(long)]
+        kind: Option<crate::config_file::ConfigKind>,
+    },
+    /// Diff two local config FILES and report the SEMANTIC differences (values, not text):
+    /// both are parsed into the same typed config and the typed values compared, so a pure
+    /// RON-vs-JSON format difference shows NO diff — only real value/topology changes do.
+    /// Each file may be in either format. Purely client-side.
+    Diff {
+        /// First config file (node or project; RON or JSON).
+        a: PathBuf,
+        /// Second config file (must be the same kind as the first).
+        b: PathBuf,
+        /// CI drift-lint: exit non-zero when the two configs differ (after printing the diff).
+        #[arg(long)]
+        exit_code: bool,
+        /// Restrict the comparison to deployment TOPOLOGY (routes / handler↔component
+        /// bindings / functions / consumer topics / capability grants), dropping the
+        /// expected-to-differ set (per-route tenancy/token_claims, domains, and the project
+        /// publish target) — the dev/prod-overlay drift-lint subset.
+        #[arg(long)]
+        topology: bool,
+        /// Force the config KIND for both files when it can't be inferred.
+        #[arg(long)]
+        kind: Option<crate::config_file::ConfigKind>,
+    },
 }
 
 /// The `GET /api/daemon/config` response.
@@ -181,6 +226,52 @@ pub enum ConfigOutput {
         /// The parsed redacted config, so a JSON consumer reads it structurally.
         config: serde_json::Value,
     },
+    /// `config convert` — a config document re-rendered in the target format.
+    Converted {
+        /// The config kind that was parsed (`"node"` / `"project"`).
+        kind: &'static str,
+        /// The format it was rendered to (`"ron"` / `"json"`).
+        to: &'static str,
+        /// The converted document (printed verbatim in human mode).
+        text: String,
+    },
+    /// `config diff` — the semantic differences between two config files.
+    Diff {
+        /// The config kind both inputs were parsed as.
+        kind: &'static str,
+        /// Whether `--topology` narrowed the comparison.
+        topology: bool,
+        /// Whether `--exit-code` was set (drives the process exit, not rendered to JSON).
+        #[serde(skip)]
+        exit_code: bool,
+        /// Whether the two configs differ.
+        differ: bool,
+        /// The differences, sorted by path (empty ⇒ equal).
+        entries: Vec<crate::config_file::DiffEntry>,
+    },
+}
+
+impl ConfigOutput {
+    /// Whether a `config diff --exit-code` found drift — the process should exit non-zero
+    /// AFTER [`crate::output::emit`] has rendered the diff.
+    pub fn drift_exit(&self) -> bool {
+        matches!(
+            self,
+            Self::Diff {
+                exit_code: true,
+                differ: true,
+                ..
+            }
+        )
+    }
+}
+
+/// The lowercase label for a [`crate::config::ConfigFormat`] (output only).
+fn format_label(f: crate::config::ConfigFormat) -> &'static str {
+    match f {
+        crate::config::ConfigFormat::Ron => "ron",
+        crate::config::ConfigFormat::Json => "json",
+    }
 }
 
 impl crate::output::Rendered for ConfigOutput {
@@ -263,6 +354,47 @@ impl crate::output::Rendered for ConfigOutput {
                 }
             }
             Self::Dump { text, .. } => writeln!(w, "{text}"),
+            Self::Converted { text, .. } => {
+                // The converted document itself (so `… > out.json` captures it); the
+                // kind/target metadata lives in the JSON rendering, not the human stream.
+                write!(w, "{text}")?;
+                if !text.ends_with('\n') {
+                    writeln!(w)?;
+                }
+                Ok(())
+            }
+            Self::Diff {
+                topology,
+                differ,
+                entries,
+                ..
+            } => {
+                let scope = if *topology { " (topology)" } else { "" };
+                if !*differ {
+                    return writeln!(w, "no differences{scope}");
+                }
+                // Render a value on one line (compact JSON), empty for an absent side.
+                let compact = |v: &Option<serde_json::Value>| {
+                    v.as_ref()
+                        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| v.to_string()))
+                        .unwrap_or_default()
+                };
+                for e in entries {
+                    use crate::config_file::DiffChange::{Added, Changed, Removed};
+                    match e.change {
+                        Changed => writeln!(
+                            w,
+                            "~ {}: {} => {}",
+                            e.path,
+                            compact(&e.left),
+                            compact(&e.right)
+                        )?,
+                        Added => writeln!(w, "+ {}: {}", e.path, compact(&e.right))?,
+                        Removed => writeln!(w, "- {}: {}", e.path, compact(&e.left))?,
+                    }
+                }
+                writeln!(w, "{} difference(s){scope}", entries.len())
+            }
         }
     }
 }
@@ -294,6 +426,35 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<ConfigOutpu
             let config = serde_json::from_str(&text)?;
             return Ok(ConfigOutput::Dump { text, config });
         }
+        ConfigCommand::Convert {
+            file,
+            to,
+            from,
+            kind,
+        } => {
+            let c = crate::config_file::convert(file, *from, *to, *kind)?;
+            return Ok(ConfigOutput::Converted {
+                kind: c.kind.as_str(),
+                to: format_label(c.to),
+                text: c.text,
+            });
+        }
+        ConfigCommand::Diff {
+            a,
+            b,
+            exit_code,
+            topology,
+            kind,
+        } => {
+            let d = crate::config_file::diff(a, b, *kind, *topology)?;
+            return Ok(ConfigOutput::Diff {
+                kind: d.kind.as_str(),
+                topology: d.topology,
+                exit_code: *exit_code,
+                differ: d.differs(),
+                entries: d.entries,
+            });
+        }
         _ => {}
     }
     let server = client::resolve_server(args.server, config)?;
@@ -306,7 +467,9 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<ConfigOutpu
         ConfigCommand::List
         | ConfigCommand::Describe { .. }
         | ConfigCommand::Migrate { .. }
-        | ConfigCommand::Dump { .. } => {
+        | ConfigCommand::Dump { .. }
+        | ConfigCommand::Convert { .. }
+        | ConfigCommand::Diff { .. } => {
             unreachable!("handled above")
         }
     }
