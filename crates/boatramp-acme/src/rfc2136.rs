@@ -49,10 +49,28 @@
 //! sealed-store / `env:` pointer the other providers' secrets use — never a
 //! plaintext literal in the manifest.
 //!
+//! # Authenticating the reply (not just the request)
+//!
+//! Our outbound UPDATE is fully TSIG-signed, so no attacker can forge a *write*.
+//! But the *outcome* must be authenticated too: acting on the RCODE alone would let
+//! an on-path / TCP-injection attacker spoof the result — e.g. a forged `NXRRSet`
+//! answering a `delete` would make us believe a failed teardown succeeded, leaving a
+//! stale custom-domain `A`/`CNAME` pointer (subdomain-takeover-adjacent). So, exactly
+//! as hickory's own client does, [`Message::finalize`] hands back a [`TSigVerifier`]
+//! bound to the request's MAC + inception time, and every reply is run through it
+//! (RFC 8945 §5.4): any outcome we would *believe* as success (`NoError`, or the
+//! idempotent `NXDomain`/`NXRRSet` of a `delete`) MUST carry a valid response MAC and
+//! echo the request's transaction id, or it is refused. A plain error RCODE — a
+//! signed `BADSIG`/`BADKEY`/`BADTIME`, or the spec'd *unsigned* pre-TSIG error a
+//! server may return (RFC 8945 §5.3.2) — is surfaced as a hard failure without being
+//! trusted, never as a success.
+//!
 //! The request-construction + signing are pure and unit-tested (including a
 //! sign→verify round-trip against hickory's own RFC 8945 verifier and a
-//! wrong-key-rejected negative); the TCP exchange is a live seam exercised
-//! against a real dynamic-DNS server (no nameserver in CI).
+//! wrong-key-rejected negative); the reply-authentication path is unit-tested against
+//! responses signed by hickory's own `TSigResponseContext` (accept) plus
+//! unsigned / tampered / id-mismatched / error negatives (reject). The TCP exchange
+//! is a live seam exercised against a real dynamic-DNS server (no nameserver in CI).
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -63,7 +81,7 @@ use hickory_proto::op::update_message::UpdateMessage;
 use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, TXT};
-use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType, TSigner};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType, TSigVerifier, TSigner};
 
 use crate::dns::{DnsError, DnsProvider, DnsRecord, RecordKind, RecordKindTag};
 
@@ -81,6 +99,16 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// minutes is the RFC 8945 norm — wide enough to tolerate ordinary host/server
 /// clock drift, narrow enough to bound replay.
 const TSIG_FUDGE: u16 = 300;
+
+/// A signed UPDATE ready to send, paired with everything needed to AUTHENTICATE the
+/// reply to it: the wire bytes, hickory's response [`TSigVerifier`] (bound to our
+/// request MAC + inception time, RFC 8945 §5.4), and the request transaction id to
+/// match against the response.
+struct SignedUpdate {
+    wire: Vec<u8>,
+    verifier: TSigVerifier,
+    id: u16,
+}
 
 /// An RFC 2136 dynamic-UPDATE editor for ONE zone on ONE authoritative server,
 /// authenticating every message with a TSIG key.
@@ -227,22 +255,35 @@ impl Rfc2136Dns {
         Ok(message)
     }
 
-    /// Sign `message` in place with the TSIG key and serialize it to the wire.
-    /// The MAC covers the message as emitted plus the TSIG rdata, so this must be
-    /// the last mutation before sending.
-    fn sign_to_wire(&self, message: &mut Message) -> Result<Vec<u8>, DnsError> {
+    /// Sign `message` in place with the TSIG key and serialize it to the wire,
+    /// returning the bytes alongside what is needed to AUTHENTICATE the reply: the
+    /// [`TSigVerifier`] hickory derives from the request (bound to the request MAC +
+    /// inception time) and the request transaction id. The MAC covers the message as
+    /// emitted plus the TSIG rdata, so signing is the last mutation before sending.
+    fn sign_update(&self, message: &mut Message) -> Result<SignedUpdate, DnsError> {
         let now = crate::now_secs();
-        message
+        // The header id is assigned at `Message::query()` and unchanged by signing;
+        // the server echoes it in the response (RFC 1035 §4.1.1) and we match it.
+        let id = message.id;
+        let verifier = message
             .finalize(&self.signer, now)
-            .map_err(|e| DnsError::Backend(format!("rfc2136 TSIG signing failed: {e}")))?;
-        message
+            .map_err(|e| DnsError::Backend(format!("rfc2136 TSIG signing failed: {e}")))?
+            // `finalize` always yields a verifier for a TSIG signer; a `None` would be
+            // an upstream contract change — fail closed rather than skip verification.
+            .ok_or_else(|| {
+                DnsError::Backend("rfc2136 TSIG signing produced no response verifier".to_string())
+            })?;
+        let wire = message
             .to_vec()
-            .map_err(|e| DnsError::Backend(format!("rfc2136 message encode failed: {e}")))
+            .map_err(|e| DnsError::Backend(format!("rfc2136 message encode failed: {e}")))?;
+        Ok(SignedUpdate { wire, verifier, id })
     }
 
     /// Send the already-signed `wire` bytes to the server over TCP (length-prefixed
-    /// per RFC 1035 §4.2.2) and return the parsed response, all under one timeout.
-    async fn exchange(&self, wire: Vec<u8>) -> Result<Message, DnsError> {
+    /// per RFC 1035 §4.2.2) and return the RAW response bytes, all under one timeout.
+    /// Parsing + TSIG authentication of the reply happen in [`check_signed_response`],
+    /// which needs the exact bytes the server emitted to verify the MAC over them.
+    async fn exchange(&self, wire: Vec<u8>) -> Result<Vec<u8>, DnsError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
 
@@ -286,8 +327,7 @@ impl Rfc2136Dns {
                 .read_exact(&mut resp)
                 .await
                 .map_err(|e| DnsError::Backend(format!("rfc2136 read response: {e}")))?;
-            Message::from_vec(&resp)
-                .map_err(|e| DnsError::Backend(format!("rfc2136 parse response: {e}")))
+            Ok::<_, DnsError>(resp)
         };
 
         tokio::time::timeout(EXCHANGE_TIMEOUT, run)
@@ -317,6 +357,66 @@ fn check_response(resp: &Message, is_delete: bool) -> Result<(), DnsError> {
             u16::from(other)
         ))),
     }
+}
+
+/// Authenticate and interpret a reply to a signed UPDATE (finding F1). Our request is
+/// TSIG-signed, so a *write* cannot be forged — but the *outcome* must be authenticated
+/// too, or an on-path / TCP-injection attacker could spoof it (e.g. a forged `NXRRSet`
+/// answering a `delete`, making us believe a failed teardown succeeded and leaving a
+/// stale custom-domain pointer). On top of the RCODE mapping in [`check_response`] this:
+///
+/// 1. matches the response's transaction id to the request's (RFC 1035 §4.1.1) — a
+///    mismatch is a spoofed or stale datagram, refused whatever the RCODE claims;
+/// 2. for any outcome we would BELIEVE as success (`NoError`, or the idempotent
+///    `NXDomain`/`NXRRSet` of a `delete`), REQUIRES a valid response TSIG MAC bound to
+///    our request MAC and within the fudge window — verified by hickory's own response
+///    verifier (RFC 8945 §5.4). An unsigned or MAC-invalid "success" is NOT trusted.
+///
+/// A plain error RCODE is a failure we need not authenticate to DISBELIEVE: a signed
+/// `BADSIG`/`BADKEY`/`BADTIME`, and the spec'd *unsigned* pre-TSIG error a server may
+/// return (RFC 8945 §5.3.2), both surface here as a hard error — never a success, and
+/// never a panic.
+fn check_signed_response(
+    resp_bytes: &[u8],
+    verifier: &mut TSigVerifier,
+    request_id: u16,
+    is_delete: bool,
+) -> Result<(), DnsError> {
+    // Parse once, UNauthenticated, to read the id + RCODE. These must stay legible even
+    // for a reply the authenticated path below refuses (an unsigned error, a tampered
+    // MAC) — so we can surface a precise error instead of crashing.
+    let resp = Message::from_vec(resp_bytes)
+        .map_err(|e| DnsError::Backend(format!("rfc2136 parse response: {e}")))?;
+
+    // (1) Transaction-id match. Hickory's verifier binds the MAC to our *request* MAC
+    // (so a reply to a different exchange cannot verify), but the on-wire header id is
+    // covered only via the TSIG original-id; an explicit match is cheap defence in
+    // depth against a spoofed or stale datagram and gives a precise error.
+    if resp.id != request_id {
+        return Err(DnsError::Backend(format!(
+            "rfc2136 response id {:#06x} does not match request id {:#06x} \
+             (spoofed or stale reply)",
+            resp.id, request_id
+        )));
+    }
+
+    // (2) An error RCODE is a rejection we surface immediately — no MAC required to
+    // DISBELIEVE it. This covers a signed BADSIG/BADKEY/BADTIME and a spec'd unsigned
+    // pre-TSIG error alike, without trusting either as success.
+    check_response(&resp, is_delete)?;
+
+    // (3) We reached here only on a believed-success RCODE. REQUIRE a valid response
+    // MAC before trusting it: hickory's verifier re-checks the MAC over these exact
+    // bytes (prefixed with our request MAC) and the fudge window. Fail closed — an
+    // unsigned or tampered success must not be believed.
+    verifier.verify(resp_bytes).map_err(|e| {
+        DnsError::Backend(format!(
+            "rfc2136 response reported success ({}) but its TSIG MAC did not verify; \
+             refusing to trust the outcome: {e}",
+            resp.response_code
+        ))
+    })?;
+    Ok(())
 }
 
 /// Normalize a configured server authority into a `host:port` string for
@@ -398,16 +498,24 @@ fn decode_secret(secret_b64: &str) -> Result<Vec<u8>, DnsError> {
 impl DnsProvider for Rfc2136Dns {
     async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
         let mut message = self.build_upsert(record)?;
-        let wire = self.sign_to_wire(&mut message)?;
+        let SignedUpdate {
+            wire,
+            mut verifier,
+            id,
+        } = self.sign_update(&mut message)?;
         let resp = self.exchange(wire).await?;
-        check_response(&resp, false)
+        check_signed_response(&resp, &mut verifier, id, false)
     }
 
     async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError> {
         let mut message = self.build_delete(record)?;
-        let wire = self.sign_to_wire(&mut message)?;
+        let SignedUpdate {
+            wire,
+            mut verifier,
+            id,
+        } = self.sign_update(&mut message)?;
         let resp = self.exchange(wire).await?;
-        check_response(&resp, true)
+        check_signed_response(&resp, &mut verifier, id, true)
     }
 
     fn supported_kinds(&self) -> &'static [RecordKindTag] {
@@ -703,7 +811,7 @@ mod tests {
         let mut msg = p
             .build_upsert(&txt("_acme-challenge.example.com", "v"))
             .unwrap();
-        let wire = p.sign_to_wire(&mut msg).unwrap();
+        let wire = p.sign_update(&mut msg).unwrap().wire;
         // A TSIG RR is present after signing.
         assert!(msg.signature().is_some(), "finalize must attach a TSIG RR");
         // The emitted bytes carry a MAC the SAME signer accepts — this exercises
@@ -719,7 +827,7 @@ mod tests {
         let mut msg = p
             .build_upsert(&txt("_acme-challenge.example.com", "v"))
             .unwrap();
-        let wire = p.sign_to_wire(&mut msg).unwrap();
+        let wire = p.sign_update(&mut msg).unwrap().wire;
         // A signer with a DIFFERENT secret must reject the MAC (tamper/forgery).
         let other = Rfc2136Dns::new(
             "192.0.2.53",
@@ -781,13 +889,175 @@ mod tests {
         assert!(!msg.contains(TEST_SECRET_B64), "must not echo the secret");
     }
 
+    // ---- response authentication (finding F1) ----------------------------
+
+    /// Sign a fresh UPDATE the way the real `upsert`/`delete` path does, and hand back
+    /// the client state needed to authenticate a reply: the response verifier, the
+    /// request transaction id, and the request MAC (which a compliant server folds into
+    /// its reply signature, RFC 8945 §5.4).
+    fn signed_request(p: &Rfc2136Dns, is_delete: bool) -> (TSigVerifier, u16, Vec<u8>) {
+        let rec = txt("_acme-challenge.example.com", "challenge");
+        let mut msg = if is_delete {
+            p.build_delete(&rec).unwrap()
+        } else {
+            p.build_upsert(&rec).unwrap()
+        };
+        let signed = p.sign_update(&mut msg).unwrap();
+        let request_mac = msg
+            .signature()
+            .expect("a signed request carries a TSIG MAC")
+            .data
+            .mac
+            .clone();
+        (signed.verifier, signed.id, request_mac)
+    }
+
+    /// Forge the bytes a server returns for a signed UPDATE: a Response-type reply
+    /// carrying `rcode`, its id echoing `request_id`, and — when `signed` — TSIG-signed
+    /// over our `request_mac` exactly as a compliant server signs a reply, via hickory's
+    /// own [`TSigResponseContext`]. `signed == false` yields the identical reply with NO
+    /// TSIG: the spoofable, unsigned case an on-path attacker can inject.
+    fn server_reply(
+        signer: &TSigner,
+        request_id: u16,
+        request_mac: &[u8],
+        rcode: ResponseCode,
+        signed: bool,
+    ) -> Vec<u8> {
+        use hickory_proto::op::{Edns, MessageType};
+        use hickory_proto::rr::TSigResponseContext;
+
+        let mut resp = Message::query();
+        resp.metadata.id = request_id;
+        resp.metadata.message_type = MessageType::Response;
+        resp.metadata.op_code = OpCode::Update;
+        resp.metadata.response_code = rcode;
+        // Extended RCODEs (BADSIG/BADKEY/BADTIME, > 15) need an EDNS OPT to carry their
+        // high bits on the wire; we only use these on the unsigned error path.
+        if rcode.high() > 0 {
+            resp.set_edns(Edns::new());
+        }
+        if !signed {
+            return resp.to_vec().expect("encode unsigned reply");
+        }
+        let now = crate::now_secs();
+        let unsigned = resp.to_vec().expect("encode reply before signing");
+        let tsig =
+            TSigResponseContext::new(request_id, now, signer.clone(), request_mac.to_vec(), None)
+                .sign(&unsigned)
+                .expect("server signs the reply");
+        resp.set_signature(tsig);
+        resp.to_vec().expect("encode signed reply")
+    }
+
+    #[test]
+    fn signed_success_response_is_accepted() {
+        let p = provider();
+        let (mut verifier, id, mac) = signed_request(&p, false);
+        let reply = server_reply(&p.signer, id, &mac, ResponseCode::NoError, true);
+        check_signed_response(&reply, &mut verifier, id, false)
+            .expect("a correctly signed NoError reply must be accepted");
+    }
+
+    #[test]
+    fn unsigned_success_response_is_rejected() {
+        let p = provider();
+        let (mut verifier, id, mac) = signed_request(&p, false);
+        // A NoError with NO TSIG — an on-path attacker's spoofed "success". Not believed.
+        let reply = server_reply(&p.signer, id, &mac, ResponseCode::NoError, false);
+        let err = check_signed_response(&reply, &mut verifier, id, false)
+            .expect_err("an unsigned success must not be trusted");
+        assert!(matches!(err, DnsError::Backend(_)), "{err:?}");
+    }
+
+    #[test]
+    fn tampered_success_response_is_rejected() {
+        let p = provider();
+        let (mut verifier, id, mac) = signed_request(&p, false);
+        let good = server_reply(&p.signer, id, &mac, ResponseCode::NoError, true);
+        // Corrupt one MAC byte, leaving the id + RCODE intact, so the ONLY thing wrong
+        // is the signature: a believed-success whose MAC no longer verifies.
+        let mut resp = Message::from_vec(&good).unwrap();
+        let mut sig = resp.take_signature().expect("reply carries a TSIG RR");
+        sig.data.mac[0] ^= 0xFF;
+        resp.set_signature(sig);
+        let tampered = resp.to_vec().unwrap();
+        let err = check_signed_response(&tampered, &mut verifier, id, false)
+            .expect_err("a tampered success must not be trusted");
+        assert!(matches!(err, DnsError::Backend(_)), "{err:?}");
+    }
+
+    #[test]
+    fn response_id_mismatch_is_rejected() {
+        let p = provider();
+        let (mut verifier, id, mac) = signed_request(&p, false);
+        // A perfectly-signed reply whose header id does not echo our request: a spoofed
+        // or stale datagram, refused before the outcome is even weighed.
+        let reply = server_reply(&p.signer, id ^ 0x1, &mac, ResponseCode::NoError, true);
+        let err = check_signed_response(&reply, &mut verifier, id, false)
+            .expect_err("an id mismatch must be rejected");
+        match err {
+            DnsError::Backend(m) => {
+                assert!(m.contains("does not match request id"), "{m}");
+            }
+            other => panic!("expected a Backend error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spoofed_nxrrset_to_delete_is_not_believed() {
+        let p = provider();
+
+        // A SIGNED NXRRSet to a delete is the genuine authenticated idempotent no-op
+        // ("already gone") — accepted.
+        let (mut verifier, id, mac) = signed_request(&p, true);
+        let signed = server_reply(&p.signer, id, &mac, ResponseCode::NXRRSet, true);
+        check_signed_response(&signed, &mut verifier, id, true)
+            .expect("a signed NXRRSet on a delete is the authenticated idempotent no-op");
+
+        // An UNSIGNED NXRRSet is finding F1's attack: a forged "nothing to delete" that
+        // would make us believe a failed teardown succeeded, leaving a stale custom-
+        // domain pointer. It MUST NOT be believed.
+        let (mut verifier, id, mac) = signed_request(&p, true);
+        let spoofed = server_reply(&p.signer, id, &mac, ResponseCode::NXRRSet, false);
+        let err = check_signed_response(&spoofed, &mut verifier, id, true)
+            .expect_err("an unsigned NXRRSet on a delete must not be trusted as success");
+        assert!(matches!(err, DnsError::Backend(_)), "{err:?}");
+    }
+
+    #[test]
+    fn tsig_failure_rcodes_are_hard_errors() {
+        let p = provider();
+        // A TSIG/auth-failure RCODE is a hard error, never trusted as success, and
+        // reading the RCODE never panics — whether or not the reply is signed. Real
+        // servers return BADSIG/BADKEY/BADTIME UNSIGNED (RFC 8945 §5.3.2).
+        for rcode in [
+            ResponseCode::BADSIG,
+            ResponseCode::BADKEY,
+            ResponseCode::BADTIME,
+            ResponseCode::NotAuth,
+        ] {
+            let (mut verifier, id, mac) = signed_request(&p, false);
+            let reply = server_reply(&p.signer, id, &mac, rcode, false);
+            let err = check_signed_response(&reply, &mut verifier, id, false)
+                .expect_err("a TSIG-failure RCODE must be a hard error");
+            assert!(
+                matches!(err, DnsError::Backend(_)),
+                "rcode {rcode:?}: {err:?}"
+            );
+        }
+    }
+
     // ---- live seam (real dynamic-DNS server) -----------------------------
 
     /// End-to-end against a REAL RFC 2136 server (BIND / PowerDNS / Knot / nsd).
     /// `#[ignore]` by policy (no nameserver in CI — matches every other adapter's
     /// `#[ignore]` live seam); run on the lighthouse live gate with a configured
     /// `allow-update { key … };` zone. Proves the hand-rolled TCP framing + TSIG
-    /// round-trip against a server that actually validates the signature.
+    /// round-trip against a server that actually validates the signature, AND that the
+    /// reply-authentication path (finding F1) holds against a real server: a WRONG-KEY
+    /// provider's write is refused (the server answers a TSIG failure — BADKEY/BADSIG /
+    /// NOTAUTH — which must surface as an error, never a believed success).
     ///
     /// ```sh
     /// RFC2136_SERVER=127.0.0.1:53 RFC2136_ZONE=example.test \
@@ -800,11 +1070,13 @@ mod tests {
     async fn rfc2136_live_upsert_then_delete_txt() {
         let var =
             |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k} for the live seam"));
+        let algorithm =
+            std::env::var("RFC2136_TSIG_ALGORITHM").unwrap_or_else(|_| "hmac-sha256".to_string());
         let p = Rfc2136Dns::new(
             &var("RFC2136_SERVER"),
             &var("RFC2136_ZONE"),
             &var("RFC2136_TSIG_KEY_NAME"),
-            &std::env::var("RFC2136_TSIG_ALGORITHM").unwrap_or_else(|_| "hmac-sha256".to_string()),
+            &algorithm,
             &var("RFC2136_TSIG_SECRET"),
         )
         .expect("live config builds");
@@ -820,5 +1092,23 @@ mod tests {
         p.delete(&rec).await.expect("delete the challenge TXT");
         // Deleting an already-gone record is success (idempotent teardown).
         p.delete(&rec).await.expect("re-delete is a no-op");
+
+        // Finding F1, live: a WRONG-KEY provider (same key NAME, different secret) must
+        // be refused by the real server — the TSIG-failure reply surfaces as an error,
+        // not a believed success. This exercises the reply-authentication path end-to-
+        // end against a server that actually produces a BADKEY/BADSIG/NOTAUTH answer.
+        let wrong = Rfc2136Dns::new(
+            &var("RFC2136_SERVER"),
+            &zone,
+            &var("RFC2136_TSIG_KEY_NAME"),
+            &algorithm,
+            // A valid-base64 but WRONG 32-byte secret.
+            "d3Jvbmcta2V5LXdyb25nLWtleS13cm9uZy1rZXktMDE=",
+        )
+        .expect("wrong-key config builds");
+        wrong
+            .upsert(&rec)
+            .await
+            .expect_err("a wrong-key UPDATE must be refused by the server, not believed");
     }
 }
