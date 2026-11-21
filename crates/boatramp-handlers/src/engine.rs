@@ -2580,8 +2580,15 @@ impl HandlerEngine {
     ///
     /// No lane concurrency permit is taken — the embedder decides when a world component fires (it
     /// may already be inside an enclosing transaction), so acquiring a request/async permit here could
-    /// deadlock or wrongly bound it. The memory/epoch/fuel bounds (the engine's sync `Limits`) still
-    /// apply through `new_store`.
+    /// deadlock or wrongly bound it. The memory/epoch/fuel bounds still apply through `new_store`.
+    ///
+    /// # Per-call limits (`limits`)
+    /// `None` runs under the engine's sync `Limits` — the historical behavior. `Some(over)` is an
+    /// opt-in per-call override that may **tighten** below the engine default *or* **raise up to the
+    /// sync-lane ceiling**, but never beyond it: each field is floored to a sane minimum and then
+    /// clamped to the lane ceiling (`min(requested, lane_max)`), which is authoritative — a world
+    /// component can therefore never claim *more* memory/CPU/time than the operator's budget, only
+    /// the same or less. See [`world_call_limits`](Self::world_call_limits).
     ///
     /// # Security — `bindings` is the authority boundary
     /// `bindings` is the ONLY per-invocation bound on the host authority this component can exercise
@@ -2596,6 +2603,7 @@ impl HandlerEngine {
         host_state: Box<dyn Any + Send>,
         export: &str,
         params: &[Val],
+        limits: Option<Limits>,
     ) -> Result<Vec<Val>, HandlerError> {
         let pre = self
             .world_cache
@@ -2612,8 +2620,9 @@ impl HandlerEngine {
         // The world lane runs under the request (`Sync`) ceiling for memory/epoch/fuel — "the same
         // Limits as the request lane". `new_store` applies the linear-memory limiter, the epoch
         // deadline, and the fuel budget; the SQL session is built from `bindings` exactly as a
-        // request's.
-        let effective = self.effective_limits(Lane::Sync, self.limits);
+        // request's. A per-call `limits` override may tighten this (or raise it up to — never past —
+        // the lane ceiling); `None` is exactly the historical default.
+        let effective = self.world_call_limits(limits);
         let mut store = self.new_store(bindings, effective);
         // Move the embedder slot into THIS store so the embedder's host functions can downcast it.
         // Per-store ⇒ per-invocation isolation (dropped with the store when the call returns).
@@ -4104,6 +4113,26 @@ impl HandlerEngine {
         }
     }
 
+    /// Resolve the effective [`Limits`] for a world-lane [`call_export`](Self::call_export)
+    /// from its optional per-call override (authz follow-up 1a).
+    ///
+    /// - `None` ⇒ **exactly today's behavior**: the engine's sync default
+    ///   (`effective_limits(Sync, self.limits)`), unchanged for back-compat.
+    /// - `Some(requested)` ⇒ an opt-in override that may **tighten** below the engine
+    ///   default *or* **raise up to the lane max**, but never beyond it: each field is
+    ///   first floored to a sane minimum ([`floor_world_limits`], so a tighten can't
+    ///   produce a degenerate, call-breaking value) and then clamped to the sync-lane
+    ///   ceiling ([`effective_limits`](Self::effective_limits), the **authoritative**
+    ///   upper bound — `min(requested, lane_max)` per field). Net: every field lands in
+    ///   `[floor, lane_max]`, and exactly `lane_max` should a floor ever exceed it (the
+    ///   ceiling wins, so the operator budget is never breached).
+    fn world_call_limits(&self, requested: Option<Limits>) -> Limits {
+        match requested {
+            None => self.effective_limits(Lane::Sync, self.limits),
+            Some(requested) => self.effective_limits(Lane::Sync, floor_world_limits(requested)),
+        }
+    }
+
     fn new_store(&self, bindings: Bindings, limits: Limits) -> Store<HostState> {
         // Capture stdout/stderr into the host log sink. The server wires a sink for
         // *every* dispatched invocation (host-side observability, not a guest-requested
@@ -4689,6 +4718,45 @@ fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.min(y)),
         (x, None) | (None, x) => x,
+    }
+}
+
+/// Sane lower bounds for a per-call world-lane [`Limits`] override (authz follow-up 1a).
+/// A caller-supplied override may *tighten* a world call below the engine default, but
+/// not to a degenerate value that would make **every** such call fail regardless of the
+/// guest. These floor the override from below; [`HandlerEngine::effective_limits`] then
+/// clamps it to the lane ceiling from above and remains authoritative (so the result
+/// can never exceed the operator budget, even if a floor were set above the ceiling).
+mod world_limit_floor {
+    /// Below ~1 MiB of linear memory a component cannot instantiate; `0` certainly
+    /// cannot.
+    pub(super) const MEMORY_BYTES: usize = 1 << 20;
+    /// One full epoch tick ([`super::EPOCH_TICK_MS`]) — a sub-tick wall-clock budget
+    /// collapses to a single tick anyway, so this is the smallest *meaningful*
+    /// non-zero timeout.
+    pub(super) const TIMEOUT_MS: u64 = super::EPOCH_TICK_MS;
+    /// A metered CPU budget below this cannot run a non-trivial call; `Some(0)` traps
+    /// on entry. `None` (unmetered) is the *largest* budget and is never floored.
+    pub(super) const FUEL: u64 = 1 << 16;
+}
+
+/// Raise each field of a per-call world-lane [`Limits`] override to its
+/// [`world_limit_floor`] — the "never below a sane floor" half of the override
+/// semantics. The lane-ceiling clamp (the authoritative upper bound) is applied
+/// separately by [`HandlerEngine::effective_limits`]; this only moves degenerate
+/// (e.g. zero) fields *up* to a viable minimum. `fuel`/`max_body_bytes` keep `None`
+/// (unmetered / unbounded — the largest value, never floored down); a metered `fuel`
+/// is floored, while `max_body_bytes` is inert on the world-call path (no HTTP body)
+/// and passes through to the ceiling clamp unchanged.
+fn floor_world_limits(requested: Limits) -> Limits {
+    Limits {
+        memory_bytes: requested.memory_bytes.max(world_limit_floor::MEMORY_BYTES),
+        timeout_ms: requested.timeout_ms.max(world_limit_floor::TIMEOUT_MS),
+        // `call_export` takes no lane permit, so this field is inert here; keep it
+        // non-zero for sanity.
+        max_concurrency: requested.max_concurrency.max(1),
+        fuel: requested.fuel.map(|f| f.max(world_limit_floor::FUEL)),
+        max_body_bytes: requested.max_body_bytes,
     }
 }
 
@@ -6151,7 +6219,14 @@ mod u7_host_world_lane_tests {
             .precompile_and_serialize_world("cell", &cell)
             .expect("world lane links the embedder import");
         let results = engine
-            .call_export("cell", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .call_export(
+                "cell",
+                Bindings::new("test"),
+                Box::new(0u32),
+                "run",
+                &[],
+                None,
+            )
             .await
             .expect("run returns");
         assert_eq!(results.len(), 1, "run returns one result<_, string>");
@@ -6180,7 +6255,14 @@ mod u7_host_world_lane_tests {
             .precompile_and_serialize_world("run", &run_only)
             .expect("world lane compiles a run-export component");
         let results = engine
-            .call_export("run", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .call_export(
+                "run",
+                Bindings::new("test"),
+                Box::new(0u32),
+                "run",
+                &[],
+                None,
+            )
             .await
             .expect("run returns");
         assert_eq!(results.len(), 1);
@@ -6213,7 +6295,14 @@ mod u7_host_world_lane_tests {
             "resident after hydrate"
         );
         let results = consumer
-            .call_export("cell", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .call_export(
+                "cell",
+                Bindings::new("test"),
+                Box::new(0u32),
+                "run",
+                &[],
+                None,
+            )
             .await
             .expect("hydrated world component runs");
         assert_eq!(results.len(), 1);
@@ -6315,7 +6404,14 @@ mod u7_host_world_lane_tests {
             .precompile_and_serialize_world("spin", &spin)
             .expect("compiles");
         let err = engine
-            .call_export("spin", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .call_export(
+                "spin",
+                Bindings::new("test"),
+                Box::new(0u32),
+                "run",
+                &[],
+                None,
+            )
             .await
             .expect_err("an infinite loop must hit the epoch deadline");
         assert!(
@@ -6338,12 +6434,164 @@ mod u7_host_world_lane_tests {
             .precompile_and_serialize_world("spin", &spin)
             .expect("compiles");
         let err = engine
-            .call_export("spin", Bindings::new("test"), Box::new(0u32), "run", &[])
+            .call_export(
+                "spin",
+                Bindings::new("test"),
+                Box::new(0u32),
+                "run",
+                &[],
+                None,
+            )
             .await
             .expect_err("an infinite loop must exhaust the fuel budget");
         assert!(
             matches!(err, HandlerError::OutOfFuel),
             "expected OutOfFuel, got {err:?}"
+        );
+    }
+
+    // ---- Authz follow-up 1a: per-call `Option<Limits>` override on `call_export` ----------------
+
+    /// The override resolver (`world_call_limits`) in isolation: `None` reproduces the
+    /// engine default; a *tightening* override is honored; one that tries to *exceed
+    /// the lane ceiling* is clamped to the max (the ceiling is authoritative); a
+    /// *degenerate* (zero) override is raised to a sane floor. `Limits` is not `PartialEq`,
+    /// so each field is checked individually. (`#[tokio::test]` only because building a
+    /// `HandlerEngine` spawns the epoch ticker, which needs a runtime — nothing is awaited.)
+    #[tokio::test]
+    async fn world_call_limits_override_tightens_raises_and_floors() {
+        // The sync-lane ceiling IS the engine's configured `limits` — use the default.
+        let ceiling = Limits::default();
+        let (engine, _host) = engine_with_host(ceiling);
+
+        // `None` ⇒ exactly today's behavior (`effective_limits(Sync, self.limits)`).
+        let base = engine.world_call_limits(None);
+        assert_eq!(base.memory_bytes, ceiling.memory_bytes);
+        assert_eq!(base.timeout_ms, ceiling.timeout_ms);
+        assert_eq!(base.max_concurrency, ceiling.max_concurrency);
+        assert_eq!(base.fuel, ceiling.fuel);
+        assert_eq!(base.max_body_bytes, ceiling.max_body_bytes);
+
+        // A TIGHTENING override (each field below the ceiling, above the floor) passes
+        // through verbatim.
+        let tight = Limits {
+            memory_bytes: 8 * 1024 * 1024,     // < 64 MiB ceiling, > 1 MiB floor
+            timeout_ms: 500,                   // < 10_000 ceiling, > 10 ms floor
+            max_concurrency: 4,                // < 64
+            fuel: Some(5_000_000),             // metered, > 64 Ki floor; ceiling fuel None ⇒ kept
+            max_body_bytes: Some(1024 * 1024), // < 16 MiB ceiling
+        };
+        let got = engine.world_call_limits(Some(tight));
+        assert_eq!(got.memory_bytes, 8 * 1024 * 1024, "a tighten is honored");
+        assert_eq!(got.timeout_ms, 500);
+        assert_eq!(got.max_concurrency, 4);
+        assert_eq!(got.fuel, Some(5_000_000));
+        assert_eq!(got.max_body_bytes, Some(1024 * 1024));
+
+        // An override that tries to RAISE above the ceiling is clamped to the lane max.
+        let greedy = Limits {
+            memory_bytes: 1 << 30,   // 1 GiB ≫ 64 MiB
+            timeout_ms: 1_000_000,   // ≫ 10_000
+            max_concurrency: 10_000, // ≫ 64
+            fuel: Some(u64::MAX),
+            max_body_bytes: Some(1 << 40), // ≫ 16 MiB
+        };
+        let clamped = engine.world_call_limits(Some(greedy));
+        assert_eq!(
+            clamped.memory_bytes, ceiling.memory_bytes,
+            "memory is clamped to the lane max, never raised past it"
+        );
+        assert_eq!(clamped.timeout_ms, ceiling.timeout_ms);
+        assert_eq!(clamped.max_concurrency, ceiling.max_concurrency);
+        assert_eq!(clamped.max_body_bytes, ceiling.max_body_bytes);
+        // The DEFAULT ceiling does not meter fuel (`None` = unmetered = the largest
+        // budget), so `Some(MAX)` is within it; a metered operator ceiling clamps it —
+        // shown next.
+        assert_eq!(clamped.fuel, Some(u64::MAX));
+
+        // With an operator ceiling that DOES meter fuel, a raising override is clamped
+        // down to the operator's fuel budget — it can never buy more CPU than allowed.
+        let metered = Limits {
+            fuel: Some(1_000_000),
+            ..Limits::default()
+        };
+        let (engine2, _h2) = engine_with_host(metered);
+        let raised = engine2.world_call_limits(Some(Limits {
+            fuel: Some(1 << 40),
+            ..Limits::default()
+        }));
+        assert_eq!(
+            raised.fuel,
+            Some(1_000_000),
+            "fuel is clamped to the operator's metered ceiling"
+        );
+
+        // A DEGENERATE (zero) override is raised to the sane floor, never left in a
+        // call-breaking state — but still never above the ceiling.
+        let degenerate = Limits {
+            memory_bytes: 0,
+            timeout_ms: 0,
+            max_concurrency: 0,
+            fuel: Some(0),
+            max_body_bytes: Some(0),
+        };
+        let floored = engine.world_call_limits(Some(degenerate));
+        assert_eq!(
+            floored.memory_bytes,
+            world_limit_floor::MEMORY_BYTES,
+            "0 memory is floored"
+        );
+        assert_eq!(
+            floored.timeout_ms,
+            world_limit_floor::TIMEOUT_MS,
+            "0 timeout is floored"
+        );
+        assert_eq!(floored.max_concurrency, 1, "0 concurrency is floored to 1");
+        assert_eq!(
+            floored.fuel,
+            Some(world_limit_floor::FUEL),
+            "Some(0) fuel is floored"
+        );
+    }
+
+    /// Representative caller path: a per-call override that TIGHTENS fuel from the
+    /// engine's unmetered default to a small metered budget is honored end-to-end — the
+    /// otherwise-unbounded spin loop is cut by `OutOfFuel` (proving the override reaches
+    /// `new_store`, not just the resolver).
+    #[tokio::test]
+    async fn world_lane_call_honors_a_tightening_fuel_override() {
+        let spin = wasm(SPIN_COMPONENT);
+        // Engine default on this lane: fuel UNMETERED, generous wall clock — nothing here
+        // would stop the loop on its own.
+        let limits = Limits {
+            timeout_ms: 60_000,
+            fuel: None,
+            ..Limits::default()
+        };
+        let (engine, _host) = engine_with_host(limits);
+        engine
+            .precompile_and_serialize_world("spin", &spin)
+            .expect("compiles");
+        // The per-call override meters fuel (finite, well above the floor).
+        let over = Limits {
+            timeout_ms: 60_000,
+            fuel: Some(5_000_000),
+            ..Limits::default()
+        };
+        let err = engine
+            .call_export(
+                "spin",
+                Bindings::new("test"),
+                Box::new(0u32),
+                "run",
+                &[],
+                Some(over),
+            )
+            .await
+            .expect_err("the tightened fuel budget must cut the infinite loop");
+        assert!(
+            matches!(err, HandlerError::OutOfFuel),
+            "expected OutOfFuel from the tightened budget, got {err:?}"
         );
     }
 
@@ -6357,6 +6605,7 @@ mod u7_host_world_lane_tests {
                 Box::new(0u32),
                 "run",
                 &[],
+                None,
             )
             .await
             .expect_err("a non-resident world component cannot be called");
@@ -6376,11 +6625,25 @@ mod u7_host_world_lane_tests {
         // Two calls with DIFFERENT embedder state. Each `ping` must see exactly its own call's slot —
         // no leak from the first into the second, no reuse of a shared box.
         engine
-            .call_export("ping", Bindings::new("test"), Box::new(7u32), "run", &[])
+            .call_export(
+                "ping",
+                Bindings::new("test"),
+                Box::new(7u32),
+                "run",
+                &[],
+                None,
+            )
             .await
             .expect("first call");
         engine
-            .call_export("ping", Bindings::new("test"), Box::new(42u32), "run", &[])
+            .call_export(
+                "ping",
+                Bindings::new("test"),
+                Box::new(42u32),
+                "run",
+                &[],
+                None,
+            )
             .await
             .expect("second call");
 
@@ -6480,7 +6743,7 @@ mod u7_host_world_lane_tests {
             });
             let bindings = Bindings::new("test").with_sql("db", backend);
             let result = engine
-                .call_export("touch", bindings, Box::new(0u32), "run", &[])
+                .call_export("touch", bindings, Box::new(0u32), "run", &[], None)
                 .await;
             (
                 committed.load(Ordering::SeqCst),
@@ -6534,7 +6797,7 @@ mod u7_host_world_lane_tests {
             });
             let bindings = Bindings::new("test").with_sql("db", backend);
             let result = engine
-                .call_export("inst-trap", bindings, Box::new(0u32), "run", &[])
+                .call_export("inst-trap", bindings, Box::new(0u32), "run", &[], None)
                 .await;
             assert!(
                 matches!(result, Err(HandlerError::Trap(_))),
