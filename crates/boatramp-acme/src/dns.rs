@@ -352,6 +352,48 @@ pub trait DnsProvider: Send + Sync {
     /// Remove `record` (best-effort; absent is success).
     async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError>;
 
+    /// Converge the TXT RRset at `name` to EXACTLY `values` — the ACME DNS-01
+    /// **challenge set** (cap-req U20).
+    ///
+    /// A certificate order covering both an apex (`example.com`) and its wildcard
+    /// (`*.example.com`) yields TWO authorizations that both validate at
+    /// `_acme-challenge.example.com`, each with a DIFFERENT expected TXT value —
+    /// and BOTH must be live at once. The plain [`upsert`](Self::upsert) is
+    /// create-or-**replace** keyed by `(type, name)`, so writing the second value
+    /// overwrites the first and races that authorization to `invalid` (the
+    /// wildcard+apex drop U20 reports). `upsert_txt_set` instead publishes every
+    /// value in `values` as its own coexisting TXT resource record, idempotently.
+    ///
+    /// The default implementation covers the cases every existing adapter already
+    /// handles losslessly — a single-value set is exactly [`upsert`](Self::upsert)
+    /// (byte-for-byte the previous behaviour, so a single-wildcard or
+    /// distinct-subdomain order is unchanged), and an empty set is a no-op
+    /// (teardown is [`delete`](Self::delete)'s job). A genuinely multi-value set
+    /// is **refused** with a typed [`DnsError`] rather than silently writing only
+    /// one value: an adapter that can hold several TXT RRs at one name overrides
+    /// this to publish the whole set. Refusing loudly turns the old
+    /// non-deterministic overwrite race into one clear, actionable failure — never
+    /// a silent dropped challenge.
+    async fn upsert_txt_set(
+        &self,
+        name: &str,
+        values: &[String],
+        ttl: u32,
+    ) -> Result<(), DnsError> {
+        match values {
+            [] => Ok(()),
+            [one] => self.upsert(&txt_record(name, one, ttl)).await,
+            many => Err(DnsError::Backend(format!(
+                "provider '{}' cannot publish {} coexisting TXT values at '{}': a wildcard+apex \
+                 ACME order needs multiple TXT records at one name; use a provider that supports \
+                 a TXT set, or order the apex and wildcard separately",
+                self.name(),
+                many.len(),
+                name,
+            ))),
+        }
+    }
+
     /// The record-kind tags this adapter can write.
     ///
     /// **WS1:** every adapter inherits this default — the original writable set
@@ -618,6 +660,16 @@ pub fn acme_challenge_name(domain: &str) -> String {
     format!("_acme-challenge.{base}")
 }
 
+/// A single-value TXT [`DnsRecord`] at `name` — the one TXT resource record the
+/// default [`DnsProvider::upsert_txt_set`] and the ACME solver build per value.
+pub(crate) fn txt_record(name: &str, value: &str, ttl: u32) -> DnsRecord {
+    DnsRecord {
+        kind: RecordKind::Txt(vec![value.to_string()]),
+        name: name.to_string(),
+        ttl,
+    }
+}
+
 /// The DNS-01 TXT record value for an ACME `key_authorization`:
 /// base64url(SHA-256(key_authorization)), unpadded (RFC 8555 §8.4).
 pub fn dns01_txt_value(key_authorization: &str) -> String {
@@ -796,6 +848,27 @@ impl DnsProvider for ManualDnsProvider {
             .lock()
             .unwrap()
             .push((DnsOp::Delete, record.clone()));
+        Ok(())
+    }
+
+    /// Manual emits zone-file lines, so it supports an arbitrary TXT challenge set
+    /// (U20): it records one upsert op per value — an operator applies each as a
+    /// separate TXT record at `name`.
+    async fn upsert_txt_set(
+        &self,
+        name: &str,
+        values: &[String],
+        ttl: u32,
+    ) -> Result<(), DnsError> {
+        let mut ops = self.ops.lock().unwrap();
+        for value in values {
+            tracing::info!(
+                target: "boatramp::dns",
+                op = "upsert", kind = "TXT", name = %name, value = %value, ttl,
+                "manual DNS: create this record (ACME challenge set)"
+            );
+            ops.push((DnsOp::Upsert, txt_record(name, value, ttl)));
+        }
         Ok(())
     }
 
@@ -1542,5 +1615,66 @@ mod tests {
             assert_eq!(ops[i * 2].1.kind, record.kind);
             assert_eq!(ops[i * 2 + 1].0, DnsOp::Delete);
         }
+    }
+
+    // ---- U20: multi-TXT challenge set (wildcard + apex share a name) -----------
+
+    /// `ManualDnsProvider` publishes a MULTI-value TXT challenge set as one TXT
+    /// record per value at the shared name — the wildcard+apex set an operator
+    /// must apply by hand (U20).
+    #[tokio::test]
+    async fn manual_provider_publishes_a_multi_txt_challenge_set() {
+        let provider = ManualDnsProvider::new();
+        provider
+            .upsert_txt_set(
+                "_acme-challenge.example.com",
+                &["value-apex".to_string(), "value-wild".to_string()],
+                60,
+            )
+            .await
+            .unwrap();
+        let ops = provider.recorded();
+        assert_eq!(ops.len(), 2, "one upsert op per coexisting TXT value");
+        let values: Vec<String> = ops
+            .iter()
+            .map(|(op, r)| {
+                assert_eq!(*op, DnsOp::Upsert);
+                assert_eq!(r.name, "_acme-challenge.example.com");
+                r.kind.flat_value()
+            })
+            .collect();
+        assert!(values.contains(&"value-apex".to_string()));
+        assert!(values.contains(&"value-wild".to_string()));
+    }
+
+    /// The DEFAULT `upsert_txt_set` is lossless for the cases every adapter already
+    /// handled — a single value is exactly `upsert`, an empty set is a no-op — but
+    /// a genuinely multi-value set is REFUSED with a typed error rather than
+    /// silently writing one value (the no-silent-drop guarantee, U20).
+    #[tokio::test]
+    async fn default_upsert_txt_set_refuses_multi_value_but_allows_one() {
+        let p = DefaultOnly;
+        // One value delegates to `upsert` (Ok on DefaultOnly).
+        p.upsert_txt_set("_acme-challenge.example.com", &["only".to_string()], 60)
+            .await
+            .unwrap();
+        // Empty set is a no-op (teardown is `delete`'s job).
+        p.upsert_txt_set("_acme-challenge.example.com", &[], 60)
+            .await
+            .unwrap();
+        // Two values on a provider without multi-TXT support is a loud, typed
+        // refusal — never a silent single write.
+        let err = p
+            .upsert_txt_set(
+                "_acme-challenge.example.com",
+                &["a".to_string(), "b".to_string()],
+                60,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DnsError::Backend(ref m) if m.contains("coexisting TXT")),
+            "expected a typed multi-TXT refusal, got {err:?}"
+        );
     }
 }

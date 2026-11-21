@@ -289,6 +289,55 @@ impl CloudflareDns {
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(body.result.into_iter().next().map(|r| r.id))
     }
+
+    /// Every `(id, content)` TXT record at `name` — the current RRset, for
+    /// converging a TXT challenge set (U20).
+    async fn list_txt_records(&self, name: &str) -> Result<Vec<(String, String)>, DnsError> {
+        let resp = self
+            .client
+            .get(self.records_url())
+            .bearer_auth(&self.token)
+            .query(&[("type", "TXT"), ("name", name)])
+            .send()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        let body: ListResponse = resp
+            .error_for_status()
+            .map_err(|e| DnsError::Backend(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        Ok(body.result.into_iter().map(|r| (r.id, r.content)).collect())
+    }
+
+    /// Delete one record by its Cloudflare id.
+    async fn delete_record_by_id(&self, id: &str) -> Result<(), DnsError> {
+        self.client
+            .delete(format!("{}/{}", self.records_url(), id))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Create one TXT record `value` at `name` (POST, never replacing a sibling) —
+    /// used to add a value to a TXT challenge set (U20).
+    async fn create_txt_record(&self, name: &str, value: &str, ttl: u32) -> Result<(), DnsError> {
+        let body = self.record_body(&crate::dns::txt_record(name, value, ttl));
+        self.client
+            .post(self.records_url())
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -299,6 +348,39 @@ struct ListResponse {
 #[derive(Deserialize)]
 struct ListRecord {
     id: String,
+    /// The record's rdata (for TXT, the value) — used to converge a TXT challenge
+    /// set (U20). `default` so a list of record types without a `content` field
+    /// still deserializes.
+    #[serde(default)]
+    content: String,
+}
+
+/// Pure converge plan for a Cloudflare TXT RRset at one name toward the exact set
+/// `desired` (U20): the ids to DELETE and the values to CREATE. Idempotent — a
+/// set already equal to `desired` yields no deletes and no creates. Deletes every
+/// record whose content is unwanted AND every duplicate of a wanted value
+/// (keeping one), and creates each wanted value not already present. Pure (no
+/// network), so the converge logic is unit-tested; the list/delete/create
+/// round-trip is the documented live seam.
+fn txt_set_plan(existing: &[(String, String)], desired: &[String]) -> (Vec<String>, Vec<String>) {
+    use std::collections::HashSet;
+    let want: HashSet<&str> = desired.iter().map(String::as_str).collect();
+    let mut kept: HashSet<&str> = HashSet::new();
+    let mut to_delete = Vec::new();
+    for (id, content) in existing {
+        // Keep the FIRST record of each wanted value; delete unwanted values and
+        // any further duplicate of a wanted one.
+        if want.contains(content.as_str()) && kept.insert(content.as_str()) {
+            continue;
+        }
+        to_delete.push(id.clone());
+    }
+    let to_create: Vec<String> = desired
+        .iter()
+        .filter(|v| !existing.iter().any(|(_, c)| c == *v))
+        .cloned()
+        .collect();
+    (to_delete, to_create)
 }
 
 #[derive(Deserialize)]
@@ -334,6 +416,29 @@ impl DnsProvider for CloudflareDns {
             .map_err(|e| DnsError::Backend(e.to_string()))?
             .error_for_status()
             .map_err(|e| DnsError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Converge the TXT RRset at `name` to EXACTLY `values` (U20): a wildcard+apex
+    /// order's two authorizations publish different values at the SAME
+    /// `_acme-challenge.<base>`, and both must coexist — the plain `upsert`
+    /// (replace-first-match) would drop one. Lists the current TXT records,
+    /// computes the pure [`txt_set_plan`], then deletes the unwanted/duplicate ids
+    /// and creates the missing values. Idempotent across retries.
+    async fn upsert_txt_set(
+        &self,
+        name: &str,
+        values: &[String],
+        ttl: u32,
+    ) -> Result<(), DnsError> {
+        let existing = self.list_txt_records(name).await?;
+        let (to_delete, to_create) = txt_set_plan(&existing, values);
+        for id in to_delete {
+            self.delete_record_by_id(&id).await?;
+        }
+        for value in to_create {
+            self.create_txt_record(name, &value, ttl).await?;
+        }
         Ok(())
     }
 
@@ -665,5 +770,77 @@ mod tests {
             )),
             serde_json::json!({"type": "HTTPS", "name": "example.com", "data": {"priority": 1, "target": ".", "value": "alpn=\"h3,h2\" ipv4hint=\"127.0.0.1\" ipv6hint=\"::1\""}, "ttl": 3600})
         );
+    }
+
+    // ---- U20: TXT challenge-set converge plan (pure) ---------------------------
+
+    fn ids(v: Vec<String>) -> Vec<String> {
+        let mut v = v;
+        v.sort();
+        v
+    }
+
+    /// The converge plan from the empty set: create every desired value, delete
+    /// nothing. This is the wildcard+apex first publish.
+    #[test]
+    fn txt_set_plan_creates_all_from_empty() {
+        let (del, create) = txt_set_plan(&[], &["a".to_string(), "b".to_string()]);
+        assert!(del.is_empty());
+        assert_eq!(ids(create), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Adding a second value keeps the first (no churn on the already-present one):
+    /// exactly the apex value staying live while the wildcard value is added (U20).
+    #[test]
+    fn txt_set_plan_adds_second_value_without_touching_first() {
+        let existing = vec![("id-a".to_string(), "a".to_string())];
+        let (del, create) = txt_set_plan(&existing, &["a".to_string(), "b".to_string()]);
+        assert!(
+            del.is_empty(),
+            "the already-present value must not be deleted"
+        );
+        assert_eq!(
+            create,
+            vec!["b".to_string()],
+            "only the missing value is created"
+        );
+    }
+
+    /// An already-converged set is a no-op (idempotent across issuance retries).
+    #[test]
+    fn txt_set_plan_is_idempotent_when_converged() {
+        let existing = vec![
+            ("id-a".to_string(), "a".to_string()),
+            ("id-b".to_string(), "b".to_string()),
+        ];
+        let (del, create) = txt_set_plan(&existing, &["a".to_string(), "b".to_string()]);
+        assert!(del.is_empty() && create.is_empty());
+    }
+
+    /// Unwanted values and duplicates of a wanted value are deleted (keeping one),
+    /// and a genuinely missing value is created — a full reconcile.
+    #[test]
+    fn txt_set_plan_deletes_unwanted_and_duplicates() {
+        let existing = vec![
+            ("id-a1".to_string(), "a".to_string()),
+            ("id-a2".to_string(), "a".to_string()), // duplicate of a wanted value
+            ("id-stale".to_string(), "stale".to_string()), // unwanted
+        ];
+        let (del, create) = txt_set_plan(&existing, &["a".to_string(), "b".to_string()]);
+        assert_eq!(ids(del), vec!["id-a2".to_string(), "id-stale".to_string()]);
+        assert_eq!(create, vec!["b".to_string()]);
+    }
+
+    /// Reducing to a single value (one authorization's teardown) deletes exactly
+    /// the withdrawn value's record and leaves the survivor.
+    #[test]
+    fn txt_set_plan_reduces_to_the_surviving_value() {
+        let existing = vec![
+            ("id-a".to_string(), "a".to_string()),
+            ("id-b".to_string(), "b".to_string()),
+        ];
+        let (del, create) = txt_set_plan(&existing, &["b".to_string()]);
+        assert_eq!(del, vec!["id-a".to_string()]);
+        assert!(create.is_empty());
     }
 }
