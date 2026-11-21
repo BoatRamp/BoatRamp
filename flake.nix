@@ -1731,12 +1731,18 @@
                         # native-backend privilege relaxation — "turnkey networking with a tight
                         # sandbox". Assert the native-only caps + device access are ABSENT, not just
                         # that the shim seam is present.
-                        amb = machine.succeed("systemctl show boatramp.service -p AmbientCapabilities")
-                        assert "CAP_NET_BIND_SERVICE" in amb, f"compute=false must keep the bind-service cap: {amb!r}"
-                        assert "CAP_SYS_ADMIN" not in amb, f"compute=false must NOT grant CAP_SYS_ADMIN: {amb!r}"
-                        assert "CAP_NET_ADMIN" not in amb, f"compute=false must NOT grant CAP_NET_ADMIN: {amb!r}"
-                        dev = machine.succeed("systemctl show boatramp.service -p DeviceAllow").strip()
-                        assert dev == "DeviceAllow=", f"compute=false must have no DeviceAllow (no kvm/tun): {dev!r}"
+                        # NOTE: `systemctl show -p AmbientCapabilities` prints caps LOWERCASE
+                        # (`cap_net_bind_service`), so compare lowercased on both sides — an
+                        # uppercase `"CAP_SYS_ADMIN" not in amb` would be VACUOUSLY true (false-green).
+                        amb = machine.succeed("systemctl show boatramp.service -p AmbientCapabilities").lower()
+                        assert "cap_net_bind_service" in amb, f"compute=false must keep the bind-service cap: {amb!r}"
+                        assert "cap_sys_admin" not in amb, f"compute=false must NOT grant CAP_SYS_ADMIN: {amb!r}"
+                        assert "cap_net_admin" not in amb, f"compute=false must NOT grant CAP_NET_ADMIN: {amb!r}"
+                        # `ProtectClock = true` always adds a benign `char-rtc r` to DeviceAllow
+                        # (RTC read, regardless of compute); the genuinely compute-gated devices are
+                        # `/dev/kvm` + `/dev/net/tun`, so assert only those are absent (char-rtc is fine).
+                        dev = machine.succeed("systemctl show boatramp.service -p DeviceAllow")
+                        assert "kvm" not in dev and "tun" not in dev, f"compute=false must have no kvm/tun DeviceAllow: {dev!r}"
                       ''
                     }
 
