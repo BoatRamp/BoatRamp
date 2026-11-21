@@ -1552,6 +1552,7 @@ fn no_placement_reason(nodes: &[Node], spec: &ComputeSpec, policy: &BackendPolic
 /// volumes and scale a workload to zero. Populated from the backend's
 /// [`Capabilities`] at node advertisement.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BackendKind {
     /// Backend id (`"vmm"`, …).
     pub id: String,
@@ -1582,6 +1583,61 @@ pub struct BackendKind {
     /// eligible, without excluding the container backend (so container-only nodes still
     /// place images). Populated from [`SourceSupport`].
     pub primary_source: Option<RootSourceKind>,
+}
+
+impl BackendKind {
+    /// A backend advertisement for id `id` providing isolation class `isolation` — the
+    /// supported constructor (`BackendKind` is `#[non_exhaustive]`, so downstream crates
+    /// build it here, not with a struct literal). Defaults: no persistent volumes, no
+    /// scale-to-zero, no accepted sources, no private-registry-credential support, no primary
+    /// source — refine with the chainable `with_*` setters (typically from the backend's
+    /// [`Capabilities`] + [`SourceSupport`] at advertisement).
+    pub fn new(id: impl Into<String>, isolation: IsolationClass) -> Self {
+        Self {
+            id: id.into(),
+            isolation,
+            persistent_volumes: false,
+            scale_to_zero: false,
+            accepted_sources: Vec::new(),
+            private_registry_credential: false,
+            primary_source: None,
+        }
+    }
+
+    /// Set whether this backend can attach persistent volumes.
+    #[must_use]
+    pub fn with_persistent_volumes(mut self, persistent_volumes: bool) -> Self {
+        self.persistent_volumes = persistent_volumes;
+        self
+    }
+
+    /// Set whether this backend can scale a workload to zero.
+    #[must_use]
+    pub fn with_scale_to_zero(mut self, scale_to_zero: bool) -> Self {
+        self.scale_to_zero = scale_to_zero;
+        self
+    }
+
+    /// Set the [`RootSource`] kinds this backend can run.
+    #[must_use]
+    pub fn with_accepted_sources(mut self, accepted_sources: Vec<RootSourceKind>) -> Self {
+        self.accepted_sources = accepted_sources;
+        self
+    }
+
+    /// Set whether this backend can apply a per-project registry pull credential.
+    #[must_use]
+    pub fn with_private_registry_credential(mut self, private_registry_credential: bool) -> Self {
+        self.private_registry_credential = private_registry_credential;
+        self
+    }
+
+    /// Set this backend's primary (native) source kind — the placement tie-break.
+    #[must_use]
+    pub fn with_primary_source(mut self, primary_source: Option<RootSourceKind>) -> Self {
+        self.primary_source = primary_source;
+        self
+    }
 }
 
 /// A node's advertised capacity, attributes, and the backends it offers
@@ -3186,35 +3242,17 @@ pub fn managed_db_spec(
             }
         }
     }
-    ComputeSpec {
-        version: 1,
-        root: RootSource::Image(image.unwrap_or_else(|| engine.default_image()).to_string()),
-        kernel: String::new(),
-        kernel_cmdline: None,
-        vcpus: 1,
-        mem_mib: 512,
-        entrypoint,
-        env,
-        port: engine.port(),
-        restart: RestartPolicy::Always,
-        startup_grace_secs,
-        scale_to_zero: false,
-        volumes: vec![VolumeRef {
-            mount: data_dir.to_string(),
-            name: "data".to_string(),
-            size_mib: volume_size_mib,
-        }],
-        writable_root: false,
-        cap_add: Vec::new(),
-        user: None,
-        isolation: IsolationRequirement::Trusted,
-        prefer_backend: None,
-        require_backend: None,
-        pull_secret: None,
-        bindings: vec![],
-        post_launch: vec![],
-        pull_policy: Default::default(),
-    }
+    ComputeSpec::builder(
+        RootSource::Image(image.unwrap_or_else(|| engine.default_image()).to_string()),
+        1,
+        512,
+        engine.port(),
+    )
+    .entrypoint(entrypoint)
+    .env(env)
+    .startup_grace_secs(startup_grace_secs)
+    .volumes(vec![VolumeRef::new(data_dir, "data", volume_size_mib)])
+    .build()
 }
 
 /// Whether a workload that declares a `blob` [`ComputeBinding`] is likely **misnamed**: it
@@ -4259,12 +4297,7 @@ mod tests {
     use super::*;
 
     fn blob_bind(name: &str) -> ComputeBinding {
-        ComputeBinding {
-            kind: BindingKind::Blob,
-            name: name.to_string(),
-            url_env: None,
-            migration_url_env: None,
-        }
+        ComputeBinding::new(BindingKind::Blob).with_name(name)
     }
 
     #[test]
@@ -4284,12 +4317,7 @@ mod tests {
         ));
         // No blob binding ⇒ never warn, even for an unknown name (sql/kv/messaging don't
         // share this blob-shim site-identity footgun on the blob store).
-        let sql = ComputeBinding {
-            kind: BindingKind::Sql,
-            name: String::new(),
-            url_env: None,
-            migration_url_env: None,
-        };
+        let sql = ComputeBinding::new(BindingKind::Sql);
         assert!(!blob_bind_names_unknown_site("mail-worker", &[sql], &sites));
         // Matching is case-sensitive (store keys are) — a case-mismatch is still a "no site".
         assert!(blob_bind_names_unknown_site(
@@ -4678,31 +4706,9 @@ mod tests {
     }
 
     fn spec(vcpus: u32, mem_mib: u32) -> ComputeSpec {
-        ComputeSpec {
-            version: 1,
-            root: RootSource::Rootfs("r".repeat(64)),
-            kernel: "k".repeat(64),
-            kernel_cmdline: None,
-            vcpus,
-            mem_mib,
-            entrypoint: vec![],
-            env: BTreeMap::new(),
-            port: 80,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vec![],
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: IsolationRequirement::Trusted,
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        }
+        ComputeSpec::builder(RootSource::Rootfs("r".repeat(64)), vcpus, mem_mib, 80)
+            .kernel("k".repeat(64))
+            .build()
     }
 
     fn workload(replicas: u32, placement: PlacementConstraints) -> ComputeWorkload {
@@ -4921,11 +4927,7 @@ mod tests {
     #[test]
     fn volume_spec_needs_a_volume_capable_backend() {
         let mut s = spec(1, 128);
-        s.volumes = vec![VolumeRef {
-            mount: "/data".into(),
-            name: "db".into(),
-            size_mib: 64,
-        }];
+        s.volumes = vec![VolumeRef::new("/data", "db", 64)];
         // A backend that can't back volumes ⇒ no placement (fail loud, not
         // silently storage-less).
         let no_vol = vec![node_with_caps(

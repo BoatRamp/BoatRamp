@@ -7,10 +7,14 @@
 //! registry pull ([`pull_layers`], network) and the ext4 build ([`build_ext4`],
 //! the `e2fsprogs` `mke2fs` tool) are host seams.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
+use std::sync::RwLock;
+
+use ipnet::IpNet;
 
 /// An OCI build error.
 #[derive(Debug)]
@@ -483,6 +487,195 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// U25: operator allow-list opt-in for private/internal registries
+// ---------------------------------------------------------------------------
+//
+// The SSRF screen above (v0.66.1) blocks EVERY non-globally-routable pull target with no
+// override, so an operator's in-house registry on a private network (RFC-1918/ULA/CGNAT)
+// cannot be used. This adds a TYPED, EXPLICIT operator opt-in — a host/CIDR allow-list,
+// `[compute].allow_private_registries`, installed node-side at serve wiring — that permits
+// NAMED private registries while keeping the screen **block-by-default** (unset ⇒ every
+// non-global address refused, exactly as before) and keeping cloud-metadata endpoints
+// ALWAYS blocked even if a broad CIDR is allowed.
+//
+// SECURITY (the loosened control — scrutinize here):
+//   * This LOOSENS an SSRF control. The allow-list is OPERATOR config (node-side, never
+//     guest-influenced — mirrors `[compute].registry_auth`); a tenant's image reference can
+//     only ever reach a private address the OPERATOR explicitly allow-listed.
+//   * The pull-target host comes from the (tenant-controlled) image reference, so a CIDR
+//     allow-list is COARSE: ANY name a tenant puts in an image ref that resolves into the
+//     allowed CIDR becomes reachable — SSRF to any host in that range, not just the
+//     registry. Prefer an exact `hosts` entry, or the narrowest CIDR. A `hosts` entry is
+//     precise (that one name only); it still cannot reach metadata.
+//   * Cloud instance-metadata endpoints (169.254.169.254 & the whole IPv4/IPv6 link-local
+//     range, Alibaba 100.100.100.200, AWS IMDSv6 fd00:ec2::254) are refused BEFORE the
+//     allow-list is consulted — no allow-list entry, however broad, can exempt them.
+//   * The DNS-rebinding pin is preserved: the same `ScreeningResolver` lookup that screens
+//     an address is the one reqwest connects to; allowing a CIDR only widens which screened
+//     addresses pass, it does not reopen the rebinding window.
+//   * Fail-closed: a malformed CIDR at install is a hard error; the global then stays at its
+//     empty (block-all) default rather than a partial allow-list.
+
+/// Operator opt-in permitting image pulls from registries on otherwise-SSRF-blocked
+/// private/non-global networks — the value of `[compute].allow_private_registries`. Node
+/// operator config (System·Admin), NEVER guest-influenced; mirrors the shape conventions of
+/// `[compute].registry_auth`. Empty (the default) ⇒ the screen stays fully block-by-default.
+///
+/// This is the raw, serde form (operators write strings); it is compiled + validated into
+/// the internal screen form at [`install_private_registry_allowlist`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivateRegistryAllowlist {
+    /// Exact registry **hostnames** (case-insensitive; host only, no `:port`) that MAY be
+    /// pulled from even when they resolve to a non-global address — the PRECISE opt-in (that
+    /// one name only; it still cannot reach a cloud-metadata endpoint). e.g.
+    /// `"registry.internal"`.
+    pub hosts: Vec<String>,
+    /// Private/non-global **CIDRs** (`"10.0.0.0/8"`, `"192.168.0.0/16"`, `"fd00::/8"`, …) any
+    /// pull-target address inside which MAY be pulled from — the COARSE opt-in (any name
+    /// resolving into the range is reachable; cloud-metadata stays blocked). Parsed as
+    /// `ipnet::IpNet`; a malformed entry fails config load closed.
+    pub cidrs: Vec<String>,
+}
+
+/// The compiled, validated allow-list the screen consults (hostnames lowercased, CIDRs
+/// parsed). Built from a [`PrivateRegistryAllowlist`] at install; never guest-influenced.
+#[derive(Debug, Clone, Default)]
+struct CompiledAllowlist {
+    hosts: BTreeSet<String>,
+    cidrs: Vec<IpNet>,
+}
+
+impl CompiledAllowlist {
+    /// The empty (block-all) default — a `const fn` so it can seed the process-global static.
+    const fn empty() -> Self {
+        Self {
+            hosts: BTreeSet::new(),
+            cidrs: Vec::new(),
+        }
+    }
+
+    /// Compile + validate a raw [`PrivateRegistryAllowlist`]. A malformed CIDR is an error
+    /// (fail closed — the caller keeps the block-all default rather than a partial list).
+    fn compile(cfg: &PrivateRegistryAllowlist) -> Result<Self, OciError> {
+        let hosts = cfg
+            .hosts
+            .iter()
+            .map(|h| {
+                h.trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_ascii_lowercase()
+            })
+            .filter(|h| !h.is_empty())
+            .collect();
+        let mut cidrs = Vec::with_capacity(cfg.cidrs.len());
+        for raw in &cfg.cidrs {
+            let net: IpNet = raw.trim().parse().map_err(|_| {
+                OciError::Registry(format!(
+                    "[compute].allow_private_registries: {raw:?} is not a valid CIDR"
+                ))
+            })?;
+            cidrs.push(net);
+        }
+        Ok(Self { hosts, cidrs })
+    }
+
+    /// Does this allow-list permit a pull to `host` (the pull-target host — `None` for a
+    /// literal-IP target) resolving to `ip`? An exact host-name match OR a CIDR containing
+    /// `ip` permits. Does NOT consider cloud-metadata — that absolute deny is applied by
+    /// [`address_is_refused_with`] BEFORE this is consulted.
+    fn permits(&self, host: Option<&str>, ip: IpAddr) -> bool {
+        if let Some(h) = host {
+            let h = h
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase();
+            if self.hosts.contains(&h) {
+                return true;
+            }
+        }
+        self.cidrs.iter().any(|c| c.contains(&ip))
+    }
+}
+
+/// The process-global operator allow-list the OCI pull screen consults. Installed ONCE at
+/// node serve wiring from `[compute].allow_private_registries`
+/// ([`install_private_registry_allowlist`]); default = empty (block every non-global
+/// address — the fail-closed posture, identical to pre-v0.69 behavior). Node operator
+/// config, never guest-influenced. Read (not threaded) by the screen so the many pull
+/// entry points + callers need no signature change.
+static PRIVATE_REGISTRY_ALLOWLIST: RwLock<CompiledAllowlist> =
+    RwLock::new(CompiledAllowlist::empty());
+
+/// Install the operator's private-registry allow-list (U25) into the process-global SSRF
+/// screen. Called at node serve wiring BEFORE any backend can pull. Returns an error (and
+/// leaves the global at its block-all default — fail closed) when a configured CIDR is
+/// malformed. Idempotent: a later call replaces the installed list (config reload).
+pub fn install_private_registry_allowlist(cfg: &PrivateRegistryAllowlist) -> Result<(), OciError> {
+    let compiled = CompiledAllowlist::compile(cfg)?;
+    // Poison-tolerant (INFO-2): a panic elsewhere while the lock was held must not wedge the
+    // screen — recover the guard and install over it. The data is a plain config snapshot.
+    *PRIVATE_REGISTRY_ALLOWLIST
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = compiled;
+    Ok(())
+}
+
+/// An IPv4 cloud-provider instance-metadata endpoint — refused regardless of the allow-list.
+/// The whole link-local `/16` (never a legitimate registry) plus Alibaba Cloud's
+/// `100.100.100.200` (which lives inside CGNAT `100.64/10`, so a CGNAT allow-list must not
+/// reach it).
+fn is_metadata_v4(v4: Ipv4Addr) -> bool {
+    v4.is_link_local() || v4 == Ipv4Addr::new(100, 100, 100, 200)
+}
+
+/// Is `ip` a cloud instance-metadata endpoint that MUST remain unreachable even when an
+/// operator allow-lists a CIDR that would contain it? Decodes IPv6 transition forms (so a
+/// wrapped `169.254.169.254` cannot dodge the deny) and blocks the IPv6 link-local range +
+/// AWS IMDSv6 (`fd00:ec2::254`). Checked BEFORE the allow-list; no entry can exempt these.
+fn is_cloud_metadata(ip: IpAddr) -> bool {
+    if let IpAddr::V6(v6) = ip
+        && embedded_ipv4(v6).is_some_and(is_metadata_v4)
+    {
+        return true;
+    }
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => is_metadata_v4(v4),
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254) // AWS IMDSv6
+        }
+    }
+}
+
+/// The pull-screen decision against a given `allow`-list (pure; the global-reading wrapper
+/// is [`address_is_refused`]). Block-by-default: refuse `ip` (reached via pull-target `host`,
+/// `None` for a literal-IP target) when it is a cloud-metadata endpoint (ALWAYS), else when
+/// it is non-global AND the operator allow-list does not permit it.
+fn address_is_refused_with(host: Option<&str>, ip: IpAddr, allow: &CompiledAllowlist) -> bool {
+    if is_cloud_metadata(ip) {
+        return true; // metadata: always refused, no allow-list can exempt it
+    }
+    if !ip_is_disallowed(ip) {
+        return false; // globally routable → fine
+    }
+    !allow.permits(host, ip) // non-global → only if the operator allow-listed it
+}
+
+/// [`address_is_refused_with`] against the installed process-global allow-list (default
+/// block-all). The seam every screen site calls, so adding the allow-list needed no change
+/// to the pull entry points or their callers.
+fn address_is_refused(host: Option<&str>, ip: IpAddr) -> bool {
+    // Poison-tolerant (INFO-2): a startup/write panic must never wedge the screen into
+    // unavailability — recover the guard and read the last-good snapshot (default = block-all).
+    let allow = PRIVATE_REGISTRY_ALLOWLIST
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    address_is_refused_with(host, ip, &allow)
+}
+
 /// Split a URL authority (`host`, `host:port`, or `[v6]:port`) into host + port,
 /// defaulting to 443. No DNS; purely lexical.
 fn split_host_port(authority: &str) -> Result<(String, u16), OciError> {
@@ -517,8 +710,8 @@ fn split_host_port(authority: &str) -> Result<(String, u16), OciError> {
 
 /// Validate a `WWW-Authenticate` realm URL as a safe pull target: it MUST be
 /// `https://` (no `http://`, no other scheme — a tenant image's 401 realm is
-/// attacker-controlled), returning its (host, port). Lexical only; the IP screen
-/// is [`screen_literal_host`] (literal-IP realm) + [`ScreeningResolver`] (hostname).
+/// attacker-controlled), returning its (host, port). Lexical only; the IP screen of the
+/// realm host is [`screen_pull_url`] (normalized literal) + [`ScreeningResolver`] (hostname).
 fn parse_realm(realm: &str) -> Result<(String, u16), OciError> {
     let rest = realm
         .strip_prefix("https://")
@@ -529,20 +722,44 @@ fn parse_realm(realm: &str) -> Result<(String, u16), OciError> {
     split_host_port(authority)
 }
 
-/// Eagerly refuse a pull host that is a literal non-global IP. The DNS-screening
-/// [`ScreeningResolver`] only sees *hostnames* (reqwest never calls a resolver for
-/// a literal-IP URL), so a literal-IP registry/realm URL would otherwise skip the
-/// screen entirely. A hostname passes here and is screened at resolution time.
-fn screen_literal_host(host: &str) -> Result<(), OciError> {
-    let h = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = h.parse::<IpAddr>()
-        && ip_is_disallowed(ip)
+/// Screen an already-parsed pull-target URL's host against the SSRF decision, using the
+/// **WHATWG-normalized** host (`Url::host_str`) — the form reqwest will actually resolve +
+/// connect to. This closes a parser-differential bypass (Security HIGH): Rust's strict
+/// `str::parse::<IpAddr>()` REJECTS non-canonical IPv4 literals (`0xa9fea9fe`, decimal
+/// `2852039166`, octal `0251.0376.0251.0376`, short/overflow forms), but the WHATWG URL
+/// parser DECODES them to a real address and connects straight to it — for an IP-literal
+/// host reqwest never calls [`ScreeningResolver`], so a lexical screen of the raw string
+/// would miss it entirely and defeat the metadata-block guarantee. `host_str()` has already
+/// normalized the literal to canonical dotted-decimal / bracketed v6, so a literal IP is run
+/// through [`address_is_refused`] (metadata un-exemptable; the operator allow-list honored via
+/// the decoded IP). A domain host is left to [`ScreeningResolver`] at connect, exactly as
+/// before. A URL with no host is refused (fail closed).
+fn screen_url_host(url: &reqwest::Url) -> Result<(), OciError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| OciError::Registry(format!("refusing pull URL with no host: {url}")))?;
+    // `host_str()` brackets an IPv6 literal (`[::1]`); strip for the IP parse.
+    let stripped = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = stripped.parse::<IpAddr>()
+        && address_is_refused(Some(stripped), ip)
     {
         return Err(OciError::Registry(format!(
-            "refusing to pull from non-global address {host}"
+            "refusing to pull from non-global address {ip} (not on the \
+             `[compute].allow_private_registries` operator allow-list)"
         )));
     }
     Ok(())
+}
+
+/// Parse a pull-target URL the SAME way the connection will (WHATWG via `url`/reqwest) and
+/// screen its normalized host ([`screen_url_host`]). The initial-request screen for the
+/// registry base + the `WWW-Authenticate` realm — both are IP-literal-bypass surfaces because
+/// reqwest connects to a literal-IP host without consulting [`ScreeningResolver`]. Fail-CLOSED
+/// on an unparseable URL (an ambiguous/overflowing host literal is refused, never chased).
+fn screen_pull_url(url: &str) -> Result<(), OciError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| OciError::Registry(format!("refusing unparseable pull URL {url}: {e}")))?;
+    screen_url_host(&parsed)
 }
 
 /// A reqwest DNS resolver that screens EVERY resolved address against
@@ -567,9 +784,14 @@ impl reqwest::dns::Resolve for ScreeningResolver {
                 return Err(format!("no address resolved for {host}").into());
             }
             for sa in &addrs {
-                if ip_is_disallowed(sa.ip()) {
+                // Screen the resolved address against the SSRF block-list, consulting the
+                // operator allow-list (U25) by the HOSTNAME being resolved — so an exact
+                // `hosts` entry permits this name, a CIDR entry permits the address, and a
+                // cloud-metadata endpoint is refused regardless.
+                if address_is_refused(Some(&host), sa.ip()) {
                     return Err(format!(
-                        "refusing to connect to {host}: resolves to non-global address {}",
+                        "refusing to connect to {host}: resolves to non-global address {} \
+                         (not on the `[compute].allow_private_registries` operator allow-list)",
                         sa.ip()
                     )
                     .into());
@@ -593,13 +815,12 @@ fn screening_client() -> Result<reqwest::Client, OciError> {
         }
         // Copy what we need as owned values before consuming `attempt`.
         let is_https = attempt.url().scheme() == "https";
-        // A redirect to a literal-IP host bypasses the DNS resolver → screen here.
-        let literal_bad = attempt.url().host_str().is_some_and(|h| {
-            h.trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<IpAddr>()
-                .is_ok_and(ip_is_disallowed)
-        });
+        // A redirect to a literal-IP host bypasses the DNS resolver → screen its normalized
+        // host here, through the SAME `screen_url_host` helper the initial sites use (operator
+        // allow-list + always-blocked-metadata; a non-canonical literal is decoded by the url
+        // parser first). Behavior-identical to the prior inline check — a domain redirect is
+        // left to the resolver (Ok ⇒ not flagged), a non-global literal is refused.
+        let literal_bad = screen_url_host(attempt.url()).is_err();
         let shown = attempt.url().to_string();
         if !is_https {
             attempt.error(std::io::Error::other(format!(
@@ -661,7 +882,8 @@ async fn get_authed(
 /// The realm comes from the (tenant-controlled) registry's `401`, so it is
 /// screened before it is fetched: it MUST be `https://` ([`parse_realm`]) and its
 /// host must not be (or resolve to) a non-global address — a literal-IP realm via
-/// [`screen_literal_host`], a hostname via the shared client's [`ScreeningResolver`].
+/// [`screen_pull_url`] (the normalized host, so a non-canonical IPv4 literal is decoded +
+/// screened), a hostname via the shared client's [`ScreeningResolver`].
 /// So a malicious `realm="http://169.254.169.254/…"` (SSRF to cloud metadata /
 /// internal hosts, plus a credential-exfil tail) is refused rather than fetched.
 /// The same screened `client` serves the realm GET (its resolver screens the realm
@@ -682,8 +904,12 @@ async fn fetch_token(client: &reqwest::Client, challenge: &str) -> Result<String
         }
     }
     let realm = realm.ok_or_else(|| OciError::Registry("no realm in auth challenge".into()))?;
-    let (host, _port) = parse_realm(&realm)?;
-    screen_literal_host(&host)?;
+    // The realm comes from the (tenant-controlled) registry's 401. Enforce the https scheme
+    // (`parse_realm`) AND screen the WHATWG-NORMALIZED realm host the SAME way the GET below
+    // connects — a non-canonical IP-literal realm host (`0xa9fea9fe`) would otherwise slip the
+    // lexical screen but be decoded + dialed by reqwest without the resolver (Security HIGH).
+    parse_realm(&realm)?;
+    screen_pull_url(&realm)?;
     let resp = client
         .get(&realm)
         .query(&query)
@@ -742,12 +968,14 @@ fn oci_arch() -> &'static str {
 /// [`oci_arch`] (the host/guest arch).
 async fn resolve_manifest(image: &str) -> Result<ResolvedManifest, OciError> {
     let (registry, repo, reference) = parse_reference(image);
-    // Screen the registry host for SSRF (scheme is fixed `https` below; a
-    // literal-IP host is screened eagerly, a hostname by the client's resolver).
-    let (reg_host, _reg_port) = split_host_port(&registry)?;
-    screen_literal_host(&reg_host)?;
     let client = screening_client()?;
     let base = format!("https://{registry}/v2/{repo}");
+    // Screen the registry host for SSRF against the WHATWG-NORMALIZED host (the form reqwest
+    // resolves + connects to) — NOT the raw lexical string, which a non-canonical IPv4 literal
+    // (`0xa9fea9fe`, decimal, octal, short form) slips past while the url parser decodes it to a
+    // real address reqwest dials straight (no `ScreeningResolver`). A literal IP is screened
+    // here (metadata un-exemptable); a hostname is screened by the resolver at connect.
+    screen_pull_url(&base)?;
     let mut token = None;
 
     // When the ref is an `@<algo>:<hex>` digest pin, the manifest body itself must
@@ -1813,9 +2041,8 @@ mod tests {
             Err(OciError::Registry(_))
         ));
 
-        // https realms whose host is a non-global literal IP are refused by the
-        // eager literal screen (a literal-IP URL never reaches the DNS resolver).
-        // Hermetic — no DNS.
+        // URLs whose host is a non-global literal IP are refused by the eager host screen
+        // (a literal-IP URL never reaches the DNS resolver). Hermetic — no DNS.
         for ip in [
             "169.254.169.254",
             "127.0.0.1",
@@ -1823,26 +2050,93 @@ mod tests {
             "192.168.1.1",
             "172.16.0.1",
         ] {
-            let (host, _port) = parse_realm(&format!("https://{ip}/token")).unwrap();
             assert!(
-                matches!(screen_literal_host(&host), Err(OciError::Registry(_))),
+                matches!(
+                    screen_pull_url(&format!("https://{ip}/token")),
+                    Err(OciError::Registry(_))
+                ),
                 "{ip} (link-local/private/loopback) must be refused"
             );
         }
         for ip in ["::1", "fe80::1", "fc00::1"] {
-            let (host, _port) = parse_realm(&format!("https://[{ip}]:443/token")).unwrap();
             assert!(
-                matches!(screen_literal_host(&host), Err(OciError::Registry(_))),
+                matches!(
+                    screen_pull_url(&format!("https://[{ip}]:443/token")),
+                    Err(OciError::Registry(_))
+                ),
                 "{ip} (v6 loopback/link-local/unique-local) must be refused"
             );
         }
 
         // A public literal IP passes the eager screen; a hostname passes it too
         // (it is screened later, at DNS resolution, by `ScreeningResolver`).
-        let (host, port) = parse_realm("https://1.1.1.1/token").unwrap();
-        assert_eq!((host.as_str(), port), ("1.1.1.1", 443));
-        screen_literal_host("1.1.1.1").unwrap();
-        screen_literal_host("registry.example.com").unwrap();
+        screen_pull_url("https://1.1.1.1/token").unwrap();
+        screen_pull_url("https://registry.example.com/token").unwrap();
+    }
+
+    #[test]
+    fn noncanonical_ip_literal_hosts_are_decoded_and_refused() {
+        // Security HIGH (parser-differential SSRF bypass): Rust's strict `str::parse::<IpAddr>`
+        // REJECTS these non-canonical IPv4 literals, but the WHATWG url parser (reqwest) DECODES
+        // them to 169.254.169.254 and connects straight to it — never invoking `ScreeningResolver`.
+        // The screen MUST parse the host the same way and refuse them (metadata, un-exemptable).
+        for metadata_form in [
+            "https://0xa9fea9fe:443/x",      // hex single-number
+            "https://2852039166/x",          // decimal single-number
+            "https://0251.0376.0251.0376/x", // octal dotted
+            "https://169.254.169.254/x",     // canonical (control)
+            "https://0xa9.0xfe.0xa9.0xfe/x", // hex dotted
+            "https://169.16689150/x",        // short form (a.b where b is 24-bit)
+        ] {
+            // Sanity: the RAW lexical host would have slipped the old strict parse for the
+            // non-canonical forms — prove the normalized screen refuses the connect target.
+            assert!(
+                matches!(screen_pull_url(metadata_form), Err(OciError::Registry(_))),
+                "{metadata_form} decodes to cloud-metadata and MUST be refused"
+            );
+        }
+
+        // (A benign-looking NON-canonical internal literal — `0x0a2a0009` = 10.42.0.9 — is
+        // refused-by-default-unless-allow-listed in `noncanonical_literal_is_permitted_only_when_allow_listed`,
+        // which owns the process-global allow-list; kept out of this test so the two never race.)
+
+        // An ambiguous / overflowing host literal fails CLOSED (url parse refuses it).
+        assert!(matches!(
+            screen_pull_url("https://0xffffffffff/x"),
+            Err(OciError::Registry(_))
+        ));
+
+        // A normal public registry (hostname) still works — left to the resolver at connect.
+        screen_pull_url("https://registry-1.docker.io/v2/library/alpine").unwrap();
+        // A public literal IP in canonical form still works.
+        screen_pull_url("https://1.1.1.1/v2/x").unwrap();
+    }
+
+    #[test]
+    fn noncanonical_literal_is_permitted_only_when_allow_listed() {
+        // The allow-list honors the DECODED address: `0x0a2a0009` = 10.42.0.9 is refused by
+        // default but permitted once the operator allow-lists its /32 — proving the fix routes
+        // the normalized literal through the SAME `address_is_refused` decision (allow-list +
+        // un-exemptable metadata). Mutates the process-global, so it runs in its own test.
+        assert!(matches!(
+            screen_pull_url("https://0x0a2a0009:443/x"),
+            Err(OciError::Registry(_))
+        ));
+        install_private_registry_allowlist(&PrivateRegistryAllowlist {
+            hosts: vec![],
+            cidrs: vec!["10.42.0.9/32".into()],
+        })
+        .unwrap();
+        // Now the decoded internal literal is permitted.
+        screen_pull_url("https://0x0a2a0009:443/x").unwrap();
+        // But a decoded-metadata literal is STILL refused, even though 169.254.0.0/16 is not
+        // allow-listed here — and would be refused even if it were (metadata is un-exemptable).
+        assert!(matches!(
+            screen_pull_url("https://0xa9fea9fe/x"),
+            Err(OciError::Registry(_))
+        ));
+        // Restore the block-all default so no other test sees the allow-list.
+        install_private_registry_allowlist(&PrivateRegistryAllowlist::default()).unwrap();
     }
 
     #[test]
@@ -1876,6 +2170,125 @@ mod tests {
         )));
         // A 6to4 wrapping a PUBLIC v4 (1.1.1.1) stays allowed (no over-block).
         assert!(!ip_is_disallowed(v6(0x2002, 0x0101, 0x0101, 0, 0, 0, 0, 0)));
+    }
+
+    // ---- U25: operator allow-list for private/internal registries ----
+
+    #[test]
+    fn private_registry_allowlist_permits_configured_blocks_unconfigured_and_metadata() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+
+        // Fail-closed when UNSET: the empty (default) allow-list refuses every non-global
+        // address, exactly as before this opt-in existed.
+        let empty = CompiledAllowlist::default();
+        assert!(address_is_refused_with(
+            Some("registry.internal"),
+            ip("10.42.0.9"),
+            &empty
+        ));
+        assert!(address_is_refused_with(None, ip("10.42.0.9"), &empty));
+        // A globally-routable address is always fine (allow-list irrelevant).
+        assert!(!address_is_refused_with(
+            Some("ghcr.io"),
+            ip("140.82.121.33"),
+            &empty
+        ));
+
+        // An operator allow-list naming a host + its CIDRs.
+        let allow = CompiledAllowlist::compile(&PrivateRegistryAllowlist {
+            hosts: vec!["Registry.Internal".into()], // case-insensitive
+            cidrs: vec!["10.42.0.0/16".into(), "fd00::/8".into()],
+        })
+        .unwrap();
+
+        // Permits the configured host (matched by NAME) resolving into a private address.
+        assert!(!address_is_refused_with(
+            Some("registry.internal"),
+            ip("10.42.0.9"),
+            &allow
+        ));
+        // Permits any address inside an allowed CIDR, even for a host not named.
+        assert!(!address_is_refused_with(
+            Some("other.host"),
+            ip("10.42.1.2"),
+            &allow
+        ));
+        assert!(!address_is_refused_with(
+            Some("reg6.internal"),
+            ip("fd00::1"),
+            &allow
+        ));
+
+        // Blocks an UNCONFIGURED private address — a different RFC-1918 range stays refused.
+        assert!(address_is_refused_with(
+            Some("other.host"),
+            ip("192.168.1.1"),
+            &allow
+        ));
+        assert!(address_is_refused_with(
+            Some("other.host"),
+            ip("172.16.0.1"),
+            &allow
+        ));
+        // A host NOT on the list resolving outside every allowed CIDR is refused.
+        assert!(address_is_refused_with(
+            Some("evil.test"),
+            ip("10.99.0.1"),
+            &allow
+        ));
+
+        // ALWAYS blocks cloud metadata even when the host IS allow-listed.
+        assert!(address_is_refused_with(
+            Some("registry.internal"),
+            ip("169.254.169.254"),
+            &allow
+        ));
+
+        // Metadata wins even over a (foolishly) broad CIDR that would contain it.
+        let broad = CompiledAllowlist::compile(&PrivateRegistryAllowlist {
+            hosts: vec![],
+            cidrs: vec![
+                "169.254.0.0/16".into(),
+                "100.64.0.0/10".into(),
+                "fd00::/8".into(),
+            ],
+        })
+        .unwrap();
+        assert!(
+            address_is_refused_with(Some("x"), ip("169.254.169.254"), &broad),
+            "169.254.169.254 metadata wins over a link-local CIDR allow"
+        );
+        assert!(
+            address_is_refused_with(Some("x"), ip("100.100.100.200"), &broad),
+            "Alibaba metadata wins over a CGNAT CIDR allow"
+        );
+        assert!(
+            address_is_refused_with(Some("x"), ip("fd00:ec2::254"), &broad),
+            "AWS IMDSv6 wins over a ULA CIDR allow"
+        );
+        // A non-metadata ULA address in the allowed range is still permitted.
+        assert!(!address_is_refused_with(
+            Some("x"),
+            ip("fd00::1234"),
+            &broad
+        ));
+    }
+
+    #[test]
+    fn private_registry_allowlist_compile_rejects_a_malformed_cidr() {
+        assert!(
+            CompiledAllowlist::compile(&PrivateRegistryAllowlist {
+                hosts: vec![],
+                cidrs: vec!["not-a-cidr".into()],
+            })
+            .is_err(),
+            "a malformed CIDR fails config load CLOSED"
+        );
+        // The default is empty (block-all).
+        let def = PrivateRegistryAllowlist::default();
+        assert!(def.hosts.is_empty() && def.cidrs.is_empty());
+        let compiled = CompiledAllowlist::compile(&def).unwrap();
+        assert!(compiled.hosts.is_empty() && compiled.cidrs.is_empty());
     }
 
     #[test]

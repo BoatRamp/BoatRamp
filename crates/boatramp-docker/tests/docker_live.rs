@@ -11,42 +11,19 @@
 //! runs a command inside it via `exec` (stdout, stderr, stdin, exit code), then
 //! stops + removes it — exercising materialize → launch → health → exec → stop.
 
-use std::collections::BTreeMap;
-
 use boatramp_core::compute::{ComputeBackend, Health, LaunchRequest, compute_instance_id};
 use boatramp_docker::DockerBackend;
-use boatramp_types::compute::{ComputeSpec, IsolationRequirement, RestartPolicy, RootSource};
+use boatramp_types::compute::{ComputeSpec, RestartPolicy, RootSource};
 
 /// A small, widely-cached image with a long-lived entrypoint (no port needed —
 /// health is daemon-`inspect` based).
 const TEST_IMAGE: &str = "alpine:3.20";
 
 fn spec() -> ComputeSpec {
-    ComputeSpec {
-        version: 1,
-        root: RootSource::Image(TEST_IMAGE.to_string()),
-        kernel: String::new(),
-        kernel_cmdline: None,
-        vcpus: 1,
-        mem_mib: 64,
-        entrypoint: vec!["sleep".into(), "30".into()],
-        env: BTreeMap::new(),
-        port: 0,
-        restart: RestartPolicy::Never,
-        startup_grace_secs: 30,
-        scale_to_zero: false,
-        volumes: vec![],
-        writable_root: false,
-        cap_add: Vec::new(),
-        user: None,
-        isolation: IsolationRequirement::Trusted,
-        prefer_backend: None,
-        require_backend: None,
-        pull_secret: None,
-        bindings: vec![],
-        post_launch: vec![],
-        pull_policy: Default::default(),
-    }
+    ComputeSpec::builder(RootSource::Image(TEST_IMAGE.to_string()), 1, 64, 0)
+        .entrypoint(vec!["sleep".into(), "30".into()])
+        .restart(RestartPolicy::Never)
+        .build()
 }
 
 #[tokio::test]

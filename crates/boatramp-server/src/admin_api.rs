@@ -3136,12 +3136,9 @@ pub(super) async fn compute_dev_bind_blob(
     {
         return resp;
     }
-    let binding = boatramp_core::compute::ComputeBinding {
-        kind: boatramp_core::compute::BindingKind::Blob,
-        name: req.container.unwrap_or_default(),
-        url_env: None,
-        migration_url_env: None,
-    };
+    let binding =
+        boatramp_core::compute::ComputeBinding::new(boatramp_core::compute::BindingKind::Blob)
+            .with_name(req.container.unwrap_or_default());
     let env = resolver
         .resolve(
             project,
@@ -3248,12 +3245,9 @@ pub(super) async fn compute_dev_bind_messaging(
     if let Some(resp) = reject_invalid_name("project", project) {
         return resp;
     }
-    let binding = boatramp_core::compute::ComputeBinding {
-        kind: boatramp_core::compute::BindingKind::Messaging,
-        name: req.topic.unwrap_or_default(),
-        url_env: None,
-        migration_url_env: None,
-    };
+    let binding =
+        boatramp_core::compute::ComputeBinding::new(boatramp_core::compute::BindingKind::Messaging)
+            .with_name(req.topic.unwrap_or_default());
     let env = resolver
         .resolve(
             project,

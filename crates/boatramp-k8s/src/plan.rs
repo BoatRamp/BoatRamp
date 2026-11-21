@@ -2363,31 +2363,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn generic_spec() -> ComputeSpec {
-        ComputeSpec {
-            version: 1,
-            root: RootSource::Image("ghcr.io/acme/app:1.2".to_string()),
-            kernel: String::new(),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib: 256,
-            entrypoint: vec!["/app/server".to_string()],
-            env: BTreeMap::from([("PORT".to_string(), "8080".to_string())]),
-            port: 8080,
-            restart: Default::default(),
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: Vec::new(),
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: Default::default(),
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: Vec::new(),
-            post_launch: Vec::new(),
-            pull_policy: Default::default(),
-        }
+        ComputeSpec::builder(
+            RootSource::Image("ghcr.io/acme/app:1.2".to_string()),
+            1,
+            256,
+            8080,
+        )
+        .entrypoint(vec!["/app/server".to_string()])
+        .env(BTreeMap::from([("PORT".to_string(), "8080".to_string())]))
+        .build()
     }
 
     #[test]
@@ -2445,11 +2429,9 @@ mod tests {
     fn deployment_plan_refuses_a_volume_bearing_spec() {
         // A workload that declares a volume is the STATEFUL (StatefulSet) case.
         let mut spec = generic_spec();
-        spec.volumes.push(boatramp_core::compute::VolumeRef {
-            name: "data".to_string(),
-            mount: "/data".to_string(),
-            size_mib: 1024,
-        });
+        spec.volumes.push(boatramp_core::compute::VolumeRef::new(
+            "/data", "data", 1024,
+        ));
         assert!(matches!(
             deployment_plan(&ctx("web-0"), &spec).unwrap_err(),
             PlanError::VolumeCount(1)

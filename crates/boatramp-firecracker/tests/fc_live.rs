@@ -37,31 +37,11 @@ fn env(key: &str) -> Option<String> {
 }
 
 fn spec() -> ComputeSpec {
-    ComputeSpec {
-        version: 1,
-        root: RootSource::Rootfs("0".repeat(64)),
-        kernel: "0".repeat(64),
-        kernel_cmdline: None,
-        vcpus: 1,
-        mem_mib: 256,
-        entrypoint: vec!["/sbin/init".into()],
-        env: std::collections::BTreeMap::new(),
-        port: 8080,
-        restart: RestartPolicy::Never,
-        startup_grace_secs: 30,
-        scale_to_zero: false,
-        volumes: vec![],
-        writable_root: false,
-        cap_add: Vec::new(),
-        user: None,
-        isolation: boatramp_types::compute::IsolationRequirement::Trusted,
-        prefer_backend: None,
-        require_backend: None,
-        pull_secret: None,
-        bindings: vec![],
-        post_launch: vec![],
-        pull_policy: Default::default(),
-    }
+    ComputeSpec::builder(RootSource::Rootfs("0".repeat(64)), 1, 256, 8080)
+        .kernel("0".repeat(64))
+        .entrypoint(vec!["/sbin/init".into()])
+        .restart(RestartPolicy::Never)
+        .build()
 }
 
 /// Create a sparse 64 MiB ext4 scratch image with `mke2fs`, returning its path.

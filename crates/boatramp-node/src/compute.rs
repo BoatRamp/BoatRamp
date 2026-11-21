@@ -388,6 +388,20 @@ pub async fn build_compute(
         return (backends, empty_node(node_id));
     };
 
+    // Install the operator's private-registry SSRF allow-list (U25) into the shared OCI pull
+    // screen BEFORE any backend can pull. Unset ⇒ the screen stays fully block-by-default
+    // (fail-closed). A malformed CIDR leaves the global at its block-all default and logs —
+    // the private registry just won't resolve until the config is fixed (fail closed), rather
+    // than silently installing a partial list.
+    if let Err(e) =
+        boatramp_firecracker::oci::install_private_registry_allowlist(&cfg.allow_private_registries)
+    {
+        tracing::error!(
+            "invalid [compute].allow_private_registries ({e}); keeping the registry SSRF \
+             screen fully block-by-default until the config is corrected"
+        );
+    }
+
     // Compute-backend selection (mailroom #26): the `kubernetes` backend is used when it
     // is explicitly pinned (`[compute].backend = "kubernetes"`) OR auto-detected
     // in-cluster (`KUBERNETES_SERVICE_HOST` + a mounted ServiceAccount token, and no other
@@ -770,15 +784,12 @@ pub async fn build_compute(
             // `materialize` contract (which `RootSource` kinds it runs, whether it
             // applies a per-project registry pull credential).
             let support = b.source_support();
-            BackendKind {
-                id: id.clone(),
-                isolation: caps.isolation,
-                persistent_volumes: caps.persistent_volumes,
-                scale_to_zero: caps.scale_to_zero,
-                accepted_sources: support.accepted_sources,
-                private_registry_credential: support.private_registry_credential,
-                primary_source: support.primary_source,
-            }
+            BackendKind::new(id.clone(), caps.isolation)
+                .with_persistent_volumes(caps.persistent_volumes)
+                .with_scale_to_zero(caps.scale_to_zero)
+                .with_accepted_sources(support.accepted_sources)
+                .with_private_registry_credential(support.private_registry_credential)
+                .with_primary_source(support.primary_source)
         })
         .collect();
     tracing::info!(backends = ?advertised, free_vcpus, free_mem_mib, "compute node inventory");
@@ -1728,8 +1739,8 @@ mod tests {
     use async_trait::async_trait;
     use boatramp_core::compute::{
         Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, ComputeVolumes,
-        ComputeWorkload, Health, Instance, InstanceHandle, IsolationClass, IsolationRequirement,
-        LaunchRequest, RestartPolicy, RootSource, VolumeError, VolumeInfo, VolumeRef,
+        ComputeWorkload, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
+        RootSource, VolumeError, VolumeInfo, VolumeRef,
     };
     use boatramp_core::deploy::DeployStore;
     use boatramp_core::project::ProjectRef;
@@ -2036,39 +2047,12 @@ mod tests {
     }
 
     fn spec_with_volume(vol: Option<&str>) -> ComputeSpec {
-        ComputeSpec {
-            version: 1,
-            root: RootSource::Image("img".into()),
-            kernel: String::new(),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib: 64,
-            entrypoint: vec![],
-            env: BTreeMap::new(),
-            port: 8080,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vol
-                .map(|n| {
-                    vec![VolumeRef {
-                        mount: "/data".into(),
-                        name: n.into(),
-                        size_mib: 128,
-                    }]
-                })
-                .unwrap_or_default(),
-            writable_root: false,
-            cap_add: vec![],
-            user: None,
-            isolation: IsolationRequirement::Trusted,
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        }
+        ComputeSpec::builder(RootSource::Image("img".into()), 1, 64, 8080)
+            .volumes(
+                vol.map(|n| vec![VolumeRef::new("/data", n, 128)])
+                    .unwrap_or_default(),
+            )
+            .build()
     }
 
     /// Build a store with one workload named `wl` whose spec references volume

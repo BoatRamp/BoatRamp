@@ -454,24 +454,23 @@ fn nodes() -> Vec<Node> {
         labels: BTreeMap::new(),
         free_vcpus: 32,
         free_mem_mib: 65536,
-        backends: vec![boatramp_core::compute::BackendKind {
-            id: "container".into(),
-            isolation: IsolationClass::Namespace,
-            persistent_volumes: true,
-            scale_to_zero: true,
+        backends: vec![
             // Mirror the REAL native container backend's capability (the fake stands in for
             // id "container" on a daemonless/kvmless node): accepts a PUBLIC image + a tar,
             // is NOT private-registry-credential-capable, and is Tar-primary. The managed
             // DBs here are public `RootSource::Image` (pull_secret: None), so they place on
             // this sole container backend via the tie-break's sorted-order fallback — the
             // exact container-only placement path the Security review flagged.
-            accepted_sources: vec![
-                boatramp_core::compute::RootSourceKind::Image,
-                boatramp_core::compute::RootSourceKind::Tar,
-            ],
-            private_registry_credential: false,
-            primary_source: Some(boatramp_core::compute::RootSourceKind::Tar),
-        }],
+            boatramp_core::compute::BackendKind::new("container", IsolationClass::Namespace)
+                .with_persistent_volumes(true)
+                .with_scale_to_zero(true)
+                .with_accepted_sources(vec![
+                    boatramp_core::compute::RootSourceKind::Image,
+                    boatramp_core::compute::RootSourceKind::Tar,
+                ])
+                .with_private_registry_credential(false)
+                .with_primary_source(Some(boatramp_core::compute::RootSourceKind::Tar)),
+        ],
     }]
 }
 
@@ -810,31 +809,13 @@ async fn two_projects_same_workload_name_get_distinct_ids_and_ips() {
 
 /// A minimal always-on compute spec for a plain `web` workload (not a managed DB).
 fn plain_web_spec() -> ComputeSpec {
-    ComputeSpec {
-        version: 1,
-        root: boatramp_core::compute::RootSource::Image("web:latest".into()),
-        kernel: String::new(),
-        kernel_cmdline: None,
-        vcpus: 1,
-        mem_mib: 128,
-        entrypoint: vec![],
-        env: BTreeMap::new(),
-        port: 8080,
-        restart: boatramp_core::compute::RestartPolicy::Always,
-        startup_grace_secs: 30,
-        scale_to_zero: false,
-        volumes: vec![],
-        writable_root: false,
-        cap_add: Vec::new(),
-        user: None,
-        isolation: boatramp_core::compute::IsolationRequirement::Trusted,
-        prefer_backend: None,
-        require_backend: None,
-        pull_secret: None,
-        bindings: vec![],
-        post_launch: vec![],
-        pull_policy: Default::default(),
-    }
+    ComputeSpec::builder(
+        boatramp_core::compute::RootSource::Image("web:latest".into()),
+        1,
+        128,
+        8080,
+    )
+    .build()
 }
 
 // ===========================================================================

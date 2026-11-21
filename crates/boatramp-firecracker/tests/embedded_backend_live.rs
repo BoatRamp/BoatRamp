@@ -63,38 +63,17 @@ fn ip(args: &[&str]) -> bool {
 }
 
 fn sample_spec() -> ComputeSpec {
-    use boatramp_types::compute::{IsolationRequirement, RestartPolicy, RootSource};
-    ComputeSpec {
-        version: 1,
-        root: RootSource::Rootfs("r".repeat(64)),
-        kernel: "k".repeat(64),
-        // Deterministic cmdline: the guest gets `.2` (first pool IP) + a `/bin/sh`
-        // init so the read-only squashfs stays alive for the probe. The backend
-        // appends the virtio-MMIO `device=` fragments.
-        kernel_cmdline: Some(format!(
+    use boatramp_types::compute::RootSource;
+    // Deterministic cmdline: the guest gets `.2` (first pool IP) + a `/bin/sh` init so the
+    // read-only squashfs stays alive for the probe. The backend appends the virtio-MMIO
+    // `device=` fragments.
+    ComputeSpec::builder(RootSource::Rootfs("r".repeat(64)), 1, 512, 8080)
+        .kernel("k".repeat(64))
+        .kernel_cmdline(Some(format!(
             "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/bin/sh \
              ip={GUEST_IP}::{GATEWAY}:255.255.255.0::eth0:off"
-        )),
-        vcpus: 1,
-        mem_mib: 512,
-        entrypoint: vec![],
-        env: std::collections::BTreeMap::new(),
-        port: 8080,
-        restart: RestartPolicy::Always,
-        startup_grace_secs: 30,
-        scale_to_zero: false,
-        volumes: vec![],
-        writable_root: false,
-        cap_add: Vec::new(),
-        user: None,
-        isolation: IsolationRequirement::Trusted,
-        prefer_backend: None,
-        require_backend: None,
-        pull_secret: None,
-        bindings: vec![],
-        post_launch: vec![],
-        pull_policy: Default::default(),
-    }
+        )))
+        .build()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -686,11 +665,7 @@ async fn persistent_volume_survives_a_restart() {
     spec.kernel_cmdline = None;
     spec.port = APP_PORT;
     spec.mem_mib = 256;
-    spec.volumes = vec![VolumeRef {
-        mount: "/data".to_string(),
-        name: "persist".to_string(),
-        size_mib: 16,
-    }];
+    spec.volumes = vec![VolumeRef::new("/data", "persist", 16)];
     let req = LaunchRequest {
         project: "default".into(),
         workload: "vol".to_string(),

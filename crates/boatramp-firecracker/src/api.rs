@@ -217,35 +217,13 @@ fn check_response(path: &str, response: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::config::MachineResources;
-    use boatramp_types::compute::{ComputeSpec, RestartPolicy, RootSource};
-    use std::collections::BTreeMap;
+    use boatramp_types::compute::{ComputeSpec, RootSource};
 
     fn machine() -> FcMachine {
-        let spec = ComputeSpec {
-            version: 1,
-            root: RootSource::Rootfs("r".repeat(64)),
-            kernel: "k".repeat(64),
-            kernel_cmdline: None,
-            vcpus: 2,
-            mem_mib: 512,
-            entrypoint: vec!["/app".into()],
-            env: BTreeMap::new(),
-            port: 8080,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vec![],
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: boatramp_types::compute::IsolationRequirement::Trusted,
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        };
+        let spec = ComputeSpec::builder(RootSource::Rootfs("r".repeat(64)), 2, 512, 8080)
+            .kernel("k".repeat(64))
+            .entrypoint(vec!["/app".into()])
+            .build();
         let resources = MachineResources {
             kernel_path: "/k/vmlinux".into(),
             rootfs_path: "/r/app.ext4".into(),

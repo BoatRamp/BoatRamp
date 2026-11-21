@@ -25,10 +25,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boatramp_container::ContainerBackend;
-use boatramp_core::compute::{
-    Artifact, ComputeBackend, ComputeSpec, IsolationRequirement, LaunchRequest, RestartPolicy,
-    RootSource,
-};
+use boatramp_core::compute::{Artifact, ComputeBackend, ComputeSpec, LaunchRequest, RootSource};
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -92,31 +89,9 @@ fn nonce_entrypoint() -> Vec<String> {
 }
 
 fn spec_for(rootfs_hash: &str) -> ComputeSpec {
-    ComputeSpec {
-        version: 1,
-        root: RootSource::Tar(rootfs_hash.into()),
-        kernel: String::new(),
-        kernel_cmdline: None,
-        vcpus: 1,
-        mem_mib: 128,
-        entrypoint: nonce_entrypoint(),
-        env: std::collections::BTreeMap::new(),
-        port: 8080,
-        restart: RestartPolicy::Always,
-        startup_grace_secs: 30,
-        scale_to_zero: false,
-        volumes: vec![],
-        writable_root: false,
-        cap_add: Vec::new(),
-        user: None,
-        isolation: IsolationRequirement::Trusted,
-        prefer_backend: None,
-        require_backend: None,
-        pull_secret: None,
-        bindings: vec![],
-        post_launch: vec![],
-        pull_policy: Default::default(),
-    }
+    ComputeSpec::builder(RootSource::Tar(rootfs_hash.into()), 1, 128, 8080)
+        .entrypoint(nonce_entrypoint())
+        .build()
 }
 
 /// Launch a real container serving the boot_id nonce, print everything needed to

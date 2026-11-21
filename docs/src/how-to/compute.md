@@ -197,12 +197,32 @@ matches (a public image). A wrong/failed credential never echoes the token in an
 > against an SSRF block-list and requires **https**. Any name that resolves to a
 > loopback, private (RFC-1918), link-local, CGNAT, ULA, or v4-mapped / 6to4 / Teredo /
 > v4-compat IPv6, or multicast address is refused (the vetted address is pinned against
-> DNS-rebinding; a legitimate blob→CDN redirect is re-screened and allowed). A consequence
-> today is that a **private registry reachable only on an internal/localhost address is
-> refused** — host it on an externally-resolvable public address, or preload the image into
-> the node's local store and launch it with [`--pull-policy if-not-present`/`never`](#use-a-locally-loaded-image---pull-policy).
-> **Known limitation:** an operator allowlist to exempt a trusted internal registry is a
-> planned follow-up; it is not configurable yet.
+> DNS-rebinding; a legitimate blob→CDN redirect is re-screened and allowed). By default a
+> **private registry reachable only on an internal/localhost address is refused** — host it
+> on an externally-resolvable public address, preload the image into the node's local store
+> and launch it with [`--pull-policy if-not-present`/`never`](#use-a-locally-loaded-image---pull-policy),
+> or allow-list it (below).
+>
+> **Allow-list a trusted internal registry (`[compute].allow_private_registries`).** An
+> operator can exempt NAMED private registries from the screen — an exact host and/or a CIDR:
+>
+> ```ron
+> [compute]
+> allow_private_registries: (
+>     hosts: ["registry.internal"],   // this exact host only (precise)
+>     cidrs: ["10.42.0.0/16"],        // any address in this range (coarse)
+> )
+> ```
+>
+> This is **operator** config only (System·Admin, node-side — never influenced by a tenant's
+> image reference) and the screen stays **block-by-default**: an unset/empty allow-list
+> refuses every non-global address, exactly as before. Cloud instance-metadata endpoints
+> (`169.254.169.254` and the whole link-local range, Alibaba `100.100.100.200`, AWS IMDSv6
+> `fd00:ec2::254`) stay **always blocked** even if a broad CIDR would contain them. A `cidrs`
+> entry is **coarse** — any name a tenant image reference resolves into the range becomes
+> reachable (an SSRF window across that range) — so prefer an exact `hosts` entry, or the
+> narrowest CIDR. A malformed CIDR fails config load closed (the screen stays fully
+> block-by-default until corrected).
 >
 > **Digest-pinned pulls are verified.** A `repo@sha256:…` or `@sha512:…` reference has its
 > manifest and layer bytes hashed and checked against the pinned digest before boatramp
@@ -290,6 +310,14 @@ single-tenant. A refused multi-tenant launch reports it plainly (see
 [Diagnose compute issues](./diagnose-compute.md#launches-refused-nftables-anti-spoof-unavailable)).
 The Kubernetes backend does not use this bridge — it isolates workloads with
 [NetworkPolicies](#network-isolation-networkpolicy--cni) instead.
+
+> **The microVM (`firecracker`/VMM) backend hard-requires `nft` under every posture.** Beyond
+> the per-port anti-spoof filter above, the microVM backend also builds its guest **egress
+> NAT** with `nft` (an `nft` NAT table per node). So even on a `single-tenant` / `dev` node a
+> microVM has **no outbound connectivity** without a usable `nft` binary on the host `PATH`
+> (the native `container` backend uses the same bridge but does not add the NAT table). Install
+> `nftables` wherever the microVM backend runs — on NixOS, `services.boatramp.compute = true`
+> pulls it in.
 
 ## The Kubernetes backend (boatramp on k8s)
 

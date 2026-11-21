@@ -2878,30 +2878,10 @@ mod tests {
     #[tokio::test]
     async fn materialize_refuses_local_reuse_under_multi_tenant_and_admits_it_single_tenant() {
         let docker = Docker::connect_with_defaults().unwrap();
-        let spec = |policy: PullPolicy| ComputeSpec {
-            version: 1,
-            root: RootSource::Image("acme/app:local".into()),
-            kernel: String::new(),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib: 128,
-            entrypoint: vec![],
-            env: Default::default(),
-            port: 0,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vec![],
-            writable_root: false,
-            cap_add: vec![],
-            user: None,
-            isolation: Default::default(),
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            pull_policy: policy,
-            bindings: vec![],
-            post_launch: vec![],
+        let spec = |policy: PullPolicy| {
+            ComputeSpec::builder(RootSource::Image("acme/app:local".into()), 1, 128, 0)
+                .pull_policy(policy)
+                .build()
         };
 
         // Multi-tenant (reuse NOT allowed, the default): `if-not-present` is REFUSED with the
@@ -3063,11 +3043,7 @@ mod tests {
 
     #[test]
     fn named_volume_mode_builds_a_prefixed_daemon_volume_mount() {
-        let vol = VolumeRef {
-            name: "db".into(),
-            mount: "/data".into(),
-            size_mib: 64,
-        };
+        let vol = VolumeRef::new("/data", "db", 64);
         let m = volume_mount(&vol, DockerVolumeMode::Named, Path::new("/srv/data"));
         assert_eq!(m.typ, Some(MountTypeEnum::VOLUME));
         // Prefixed so it never clobbers an unrelated volume on a shared daemon.
@@ -3078,11 +3054,7 @@ mod tests {
 
     #[test]
     fn bind_volume_mode_builds_a_host_path_mount() {
-        let vol = VolumeRef {
-            name: "db".into(),
-            mount: "/data".into(),
-            size_mib: 64,
-        };
+        let vol = VolumeRef::new("/data", "db", 64);
         let m = volume_mount(&vol, DockerVolumeMode::Bind, Path::new("/srv/data"));
         assert_eq!(m.typ, Some(MountTypeEnum::BIND));
         assert_eq!(m.source.as_deref(), Some("/srv/data/compute/volumes/db"));
@@ -3441,11 +3413,10 @@ mod tests {
     #[test]
     fn docker_binding_reachability_rewrites_shim_urls_and_spares_managed_dsns() {
         use boatramp_core::compute::BindingKind;
-        let bind = |kind, url_env: Option<&str>, migration: Option<&str>| ComputeBinding {
-            kind,
-            name: String::new(),
-            url_env: url_env.map(str::to_string),
-            migration_url_env: migration.map(str::to_string),
+        let bind = |kind, url_env: Option<&str>, migration: Option<&str>| {
+            ComputeBinding::new(kind)
+                .with_url_env(url_env.map(str::to_string))
+                .with_migration_url_env(migration.map(str::to_string))
         };
         let mut env = std::collections::BTreeMap::from([
             // A kv/blob/messaging shim bound on loopback — always a shim, always rewritten.

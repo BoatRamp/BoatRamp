@@ -303,35 +303,9 @@ impl ComputeBackend for CloudflareBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boatramp_core::compute::{IsolationRequirement, RestartPolicy};
-    use std::collections::BTreeMap;
 
     fn spec(mem_mib: u32, image: &str) -> ComputeSpec {
-        ComputeSpec {
-            version: 1,
-            root: RootSource::Image(image.into()),
-            kernel: String::new(),
-            kernel_cmdline: None,
-            vcpus: 1,
-            mem_mib,
-            entrypoint: vec![],
-            env: BTreeMap::new(),
-            port: 8080,
-            restart: RestartPolicy::Always,
-            startup_grace_secs: 30,
-            scale_to_zero: false,
-            volumes: vec![],
-            writable_root: false,
-            cap_add: Vec::new(),
-            user: None,
-            isolation: IsolationRequirement::Trusted,
-            prefer_backend: None,
-            require_backend: None,
-            pull_secret: None,
-            bindings: vec![],
-            post_launch: vec![],
-            pull_policy: Default::default(),
-        }
+        ComputeSpec::builder(RootSource::Image(image.into()), 1, mem_mib, 8080).build()
     }
 
     #[test]

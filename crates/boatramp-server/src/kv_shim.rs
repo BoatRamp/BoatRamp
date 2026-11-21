@@ -706,12 +706,7 @@ mod tests {
     }
 
     fn kv_binding(name: &str) -> ComputeBinding {
-        ComputeBinding {
-            kind: BindingKind::Kv,
-            name: name.to_string(),
-            url_env: None,
-            migration_url_env: None,
-        }
+        ComputeBinding::new(BindingKind::Kv).with_name(name)
     }
 
     /// Drive one request through the real router (the enforced HTTP path).

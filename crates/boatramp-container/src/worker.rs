@@ -23,13 +23,14 @@ use nix::sched::{CloneFlags, unshare};
 use nix::sys::stat::{Mode, SFlag, mknod};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{
-    ForkResult, Gid, Uid, chdir, close, dup2, execvpe, fork, pivot_root, setgroups, sethostname,
+    ForkResult, Gid, Uid, chdir, close, dup2, execve, fork, pivot_root, setgroups, sethostname,
     setresgid, setresuid,
 };
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::fmt;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 /// A failure applying a [`SandboxPlan`].
@@ -427,24 +428,54 @@ fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
     if !plan.workdir.is_empty() {
         let _ = chdir(plan.workdir.as_str());
     }
+
+    // Resolve a bare entrypoint against the CONTAINER's `PATH` (U23) — BEFORE installing
+    // seccomp, so the executability probe (`stat`) needs no syscall allowance. glibc
+    // `execvpe` would search the WORKER's (host) `PATH` via `getenv`, IGNORING the `PATH` in
+    // `envp`; on a host (e.g. NixOS) whose `PATH` lacks `/bin`, a bare `sh`/`pg_dump` then
+    // fails with ENOENT. We search the container `PATH` ourselves (the image/spec `PATH`,
+    // seeded onto `plan.env` by `apply_image_config` on BOTH the launch and ephemeral paths;
+    // else the OCI default) and `execve` the resolved absolute path (no glibc `PATH` search).
+    // An `argv[0]` containing a `/` is used verbatim, so an absolute-path launch is unchanged.
+    let argv0 = plan
+        .argv
+        .first()
+        .ok_or_else(|| WorkerError::Plan("empty argv".into()))?;
+    let container_path = plan
+        .env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let resolved = crate::sandbox::resolve_entrypoint(
+        argv0,
+        container_path,
+        crate::sandbox::is_executable_file,
+    )
+    .ok_or_else(|| {
+        let searched = if container_path.is_empty() {
+            crate::sandbox::DEFAULT_OCI_PATH
+        } else {
+            container_path
+        };
+        WorkerError::Plan(format!(
+            "entrypoint {argv0:?} not found on the container PATH (searched {searched})"
+        ))
+    })?;
+
     if let Some(allow) = &plan.seccomp_allow {
         crate::seccomp::install(allow).map_err(WorkerError::Seccomp)?;
     }
 
-    let path = CString::new(plan.argv[0].as_str())
-        .map_err(|_| WorkerError::Plan("argv[0] has an interior NUL".into()))?;
+    let path = CString::new(resolved.as_os_str().as_bytes())
+        .map_err(|_| WorkerError::Plan("resolved entrypoint path has an interior NUL".into()))?;
     let argv = cstrings(&plan.argv)?;
     let env: Vec<String> = plan.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let envp = cstrings(&env)?;
-    // `execvpe` (not `execve`): a bare `argv[0]` without a `/` (e.g. `pg_dump`) is resolved
-    // against the `PATH` in `envp` — which the backend seeds from the pulled image's config
-    // `Env` — so a client binary under a non-default dir (e.g. `/usr/lib/postgresql/16/bin`
-    // on `pgvector/pgvector`) is found instead of failing with `127`. An `argv[0]` that
-    // DOES contain a `/` is used verbatim (no PATH search), so every existing launch whose
-    // entrypoint is an absolute path behaves exactly as `execve` did. The PATH search uses
-    // only `execve` syscalls (already allow-listed), so it is seccomp-safe.
-    execvpe(&path, &argv, &envp).map_err(|e| WorkerError::Syscall("execvpe", e))?;
-    unreachable!("execvpe returned without error");
+    // `execve` the RESOLVED path (no glibc PATH search): a bare `argv[0]` was resolved against
+    // the container PATH above; `argv[0]` keeps the ORIGINAL (conventional) name for the guest.
+    execve(&path, &argv, &envp).map_err(|e| WorkerError::Syscall("execve", e))?;
+    unreachable!("execve returned without error");
 }
 
 /// Make the mount tree private, then `pivot_root` into `root`, detaching the old

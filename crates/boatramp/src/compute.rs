@@ -1988,34 +1988,27 @@ fn build_spec(
             .ok_or_else(|| Error::BadEnv(pair.clone()))?;
         env_map.insert(k.to_string(), v.to_string());
     }
-    Ok(ComputeSpec {
-        version: boatramp_core::SCHEMA_VERSION,
-        root,
-        kernel,
-        kernel_cmdline: None,
-        vcpus,
-        mem_mib,
-        entrypoint,
-        env: env_map,
-        port,
-        restart: restart.into(),
+    Ok(ComputeSpec::builder(root, vcpus, mem_mib, port)
+        .kernel(kernel)
+        .entrypoint(entrypoint)
+        .env(env_map)
+        .restart(restart.into())
         // Omitted ⇒ the generic spec default (30). An operator raises it for a
         // slow-initializing image.
-        startup_grace_secs: startup_grace_secs
-            .unwrap_or_else(boatramp_core::compute::default_startup_grace_secs),
-        scale_to_zero,
-        volumes: vec![],
-        writable_root,
-        cap_add,
-        user,
-        isolation: isolation.into(),
-        prefer_backend,
-        require_backend,
-        pull_secret,
-        pull_policy,
-        bindings,
-        post_launch: Vec::new(),
-    })
+        .startup_grace_secs(
+            startup_grace_secs.unwrap_or_else(boatramp_core::compute::default_startup_grace_secs),
+        )
+        .scale_to_zero(scale_to_zero)
+        .writable_root(writable_root)
+        .cap_add(cap_add)
+        .user(user)
+        .isolation(isolation.into())
+        .prefer_backend(prefer_backend)
+        .require_backend(require_backend)
+        .pull_secret(pull_secret)
+        .pull_policy(pull_policy)
+        .bindings(bindings)
+        .build())
 }
 
 /// Parse `--bind <kind>[:<name>]` flags into [`ComputeBinding`]s. `sql` binds the
@@ -2035,12 +2028,7 @@ fn parse_bindings(flags: &[String]) -> Result<Vec<ComputeBinding>> {
                 "invoke" => BindingKind::Invoke,
                 other => return Err(Error::Args(format!("unknown binding kind `{other}`"))),
             };
-            Ok(ComputeBinding {
-                kind,
-                name: name.to_string(),
-                url_env: None,
-                migration_url_env: None,
-            })
+            Ok(ComputeBinding::new(kind).with_name(name))
         })
         .collect()
 }
@@ -2453,25 +2441,10 @@ mod tests {
                 assert_eq!(
                     bindings,
                     vec![
-                        ComputeBinding {
-                            kind: BindingKind::Kv,
-                            name: String::new(),
-                            url_env: None,
-                            migration_url_env: None,
-                        },
-                        ComputeBinding {
-                            kind: BindingKind::Kv,
-                            name: "cache".into(),
-                            url_env: None,
-                            migration_url_env: None,
-                        },
+                        ComputeBinding::new(BindingKind::Kv),
+                        ComputeBinding::new(BindingKind::Kv).with_name("cache"),
                         // `invoke` parses like every other kind (Phase 3 — no resolver yet).
-                        ComputeBinding {
-                            kind: BindingKind::Invoke,
-                            name: String::new(),
-                            url_env: None,
-                            migration_url_env: None,
-                        },
+                        ComputeBinding::new(BindingKind::Invoke),
                     ]
                 );
             }
