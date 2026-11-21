@@ -7,6 +7,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.69.1] — 2026-11-21
+
 ### Fixed
 
 - **`computeShimUrls` turnkey networking now works on a docker-only node (no `compute = true`).**
