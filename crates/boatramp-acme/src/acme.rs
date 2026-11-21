@@ -157,7 +157,9 @@ fn parse_retry_after_from_detail(detail: &str, now: std::time::SystemTime) -> Op
 /// [`SystemTime`](std::time::SystemTime), dependency-free (the crate pulls no
 /// date library). Only the `Z` (UTC) zone is accepted — an ACME `Retry-After`
 /// problem detail always uses it — and fractional seconds are discarded. `None`
-/// for anything malformed. Uses Howard Hinnant's days-from-civil algorithm.
+/// for anything malformed, including an out-of-range (`>9999`) year, which would
+/// otherwise overflow the civil-days arithmetic. Uses Howard Hinnant's
+/// days-from-civil algorithm.
 fn parse_rfc3339_utc(s: &str) -> Option<std::time::SystemTime> {
     let s = s.strip_suffix('Z').or_else(|| s.strip_suffix('z'))?;
     let (date, time) = s.split_once('T').or_else(|| s.split_once('t'))?;
@@ -179,7 +181,13 @@ fn parse_rfc3339_utc(s: &str) -> Option<std::time::SystemTime> {
         return None;
     }
 
-    if !(1..=12).contains(&month)
+    // RFC 3339 `date-fullyear` is 4 digits, so a valid year is `0000..=9999`.
+    // Bounding it here ALSO keeps the civil-days arithmetic below well inside
+    // `i64` — an absurd year from a malicious/garbled CA problem detail (the only
+    // reachable input, via `parse_retry_after_from_detail`) would otherwise
+    // overflow `days * 86400` (a debug panic, a release wrap). Reject it instead.
+    if !(0..=9999).contains(&year)
+        || !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
         || !(0..=23).contains(&hour)
         || !(0..=59).contains(&min)
@@ -1632,7 +1640,39 @@ mod tests {
         assert!(parse_rfc3339_utc("2000-01-01T00:00:00+01:00").is_none());
         assert!(parse_rfc3339_utc("not-a-date").is_none());
         assert!(parse_rfc3339_utc("2000-13-01T00:00:00Z").is_none());
+        // The far edge of the 4-digit year range still parses (no overflow).
+        assert!(parse_rfc3339_utc("9999-12-31T23:59:59Z").is_some());
         let _ = SystemTime::now();
+    }
+
+    /// F3 (security hardening): an absurd year from a garbled/hostile CA problem
+    /// detail must be rejected, not overflow the civil-days arithmetic (a debug
+    /// panic / a release wrap). `None`, no panic — and a sane date still parses.
+    #[test]
+    fn parse_rfc3339_utc_rejects_overflowing_year_without_panic() {
+        // Would overflow `days * 86400` in `i64` if the year were not bounded.
+        assert!(parse_rfc3339_utc("999999999999-01-01T00:00:00Z").is_none());
+        // A 5-digit year is already out of RFC 3339 range.
+        assert!(parse_rfc3339_utc("10000-01-01T00:00:00Z").is_none());
+        // i64::MAX + 1 worth of digits fails the integer parse outright.
+        assert!(parse_rfc3339_utc("99999999999999999999-01-01T00:00:00Z").is_none());
+        // Reached through the real extraction path (the only reachable input).
+        assert_eq!(
+            parse_retry_after_from_detail(
+                "rate limited, retry after 999999999999-01-01T00:00:00Z: see https://…",
+                std::time::UNIX_EPOCH,
+            ),
+            None,
+            "an unparseable absolute hint falls through to the caller's own backoff"
+        );
+        // A valid stamp through the same path still yields a duration.
+        assert_eq!(
+            parse_retry_after_from_detail(
+                "retry after 2021-01-01T00:01:00Z",
+                std::time::UNIX_EPOCH + Duration::from_secs(1_609_459_200),
+            ),
+            Some(Duration::from_secs(60))
+        );
     }
 
     #[test]
