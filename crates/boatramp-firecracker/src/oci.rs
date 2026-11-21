@@ -615,9 +615,11 @@ static PRIVATE_REGISTRY_ALLOWLIST: RwLock<CompiledAllowlist> =
 /// malformed. Idempotent: a later call replaces the installed list (config reload).
 pub fn install_private_registry_allowlist(cfg: &PrivateRegistryAllowlist) -> Result<(), OciError> {
     let compiled = CompiledAllowlist::compile(cfg)?;
+    // Poison-tolerant (INFO-2): a panic elsewhere while the lock was held must not wedge the
+    // screen — recover the guard and install over it. The data is a plain config snapshot.
     *PRIVATE_REGISTRY_ALLOWLIST
         .write()
-        .expect("private-registry allowlist lock poisoned") = compiled;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = compiled;
     Ok(())
 }
 
@@ -666,9 +668,11 @@ fn address_is_refused_with(host: Option<&str>, ip: IpAddr, allow: &CompiledAllow
 /// block-all). The seam every screen site calls, so adding the allow-list needed no change
 /// to the pull entry points or their callers.
 fn address_is_refused(host: Option<&str>, ip: IpAddr) -> bool {
+    // Poison-tolerant (INFO-2): a startup/write panic must never wedge the screen into
+    // unavailability — recover the guard and read the last-good snapshot (default = block-all).
     let allow = PRIVATE_REGISTRY_ALLOWLIST
         .read()
-        .expect("private-registry allowlist lock poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     address_is_refused_with(host, ip, &allow)
 }
 
@@ -706,8 +710,8 @@ fn split_host_port(authority: &str) -> Result<(String, u16), OciError> {
 
 /// Validate a `WWW-Authenticate` realm URL as a safe pull target: it MUST be
 /// `https://` (no `http://`, no other scheme — a tenant image's 401 realm is
-/// attacker-controlled), returning its (host, port). Lexical only; the IP screen
-/// is [`screen_literal_host`] (literal-IP realm) + [`ScreeningResolver`] (hostname).
+/// attacker-controlled), returning its (host, port). Lexical only; the IP screen of the
+/// realm host is [`screen_pull_url`] (normalized literal) + [`ScreeningResolver`] (hostname).
 fn parse_realm(realm: &str) -> Result<(String, u16), OciError> {
     let rest = realm
         .strip_prefix("https://")
@@ -718,21 +722,44 @@ fn parse_realm(realm: &str) -> Result<(String, u16), OciError> {
     split_host_port(authority)
 }
 
-/// Eagerly refuse a pull host that is a literal non-global IP. The DNS-screening
-/// [`ScreeningResolver`] only sees *hostnames* (reqwest never calls a resolver for
-/// a literal-IP URL), so a literal-IP registry/realm URL would otherwise skip the
-/// screen entirely. A hostname passes here and is screened at resolution time.
-fn screen_literal_host(host: &str) -> Result<(), OciError> {
-    let h = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = h.parse::<IpAddr>()
-        && address_is_refused(Some(h), ip)
+/// Screen an already-parsed pull-target URL's host against the SSRF decision, using the
+/// **WHATWG-normalized** host (`Url::host_str`) — the form reqwest will actually resolve +
+/// connect to. This closes a parser-differential bypass (Security HIGH): Rust's strict
+/// `str::parse::<IpAddr>()` REJECTS non-canonical IPv4 literals (`0xa9fea9fe`, decimal
+/// `2852039166`, octal `0251.0376.0251.0376`, short/overflow forms), but the WHATWG URL
+/// parser DECODES them to a real address and connects straight to it — for an IP-literal
+/// host reqwest never calls [`ScreeningResolver`], so a lexical screen of the raw string
+/// would miss it entirely and defeat the metadata-block guarantee. `host_str()` has already
+/// normalized the literal to canonical dotted-decimal / bracketed v6, so a literal IP is run
+/// through [`address_is_refused`] (metadata un-exemptable; the operator allow-list honored via
+/// the decoded IP). A domain host is left to [`ScreeningResolver`] at connect, exactly as
+/// before. A URL with no host is refused (fail closed).
+fn screen_url_host(url: &reqwest::Url) -> Result<(), OciError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| OciError::Registry(format!("refusing pull URL with no host: {url}")))?;
+    // `host_str()` brackets an IPv6 literal (`[::1]`); strip for the IP parse.
+    let stripped = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = stripped.parse::<IpAddr>()
+        && address_is_refused(Some(stripped), ip)
     {
         return Err(OciError::Registry(format!(
-            "refusing to pull from non-global address {host} (not on the \
+            "refusing to pull from non-global address {ip} (not on the \
              `[compute].allow_private_registries` operator allow-list)"
         )));
     }
     Ok(())
+}
+
+/// Parse a pull-target URL the SAME way the connection will (WHATWG via `url`/reqwest) and
+/// screen its normalized host ([`screen_url_host`]). The initial-request screen for the
+/// registry base + the `WWW-Authenticate` realm — both are IP-literal-bypass surfaces because
+/// reqwest connects to a literal-IP host without consulting [`ScreeningResolver`]. Fail-CLOSED
+/// on an unparseable URL (an ambiguous/overflowing host literal is refused, never chased).
+fn screen_pull_url(url: &str) -> Result<(), OciError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| OciError::Registry(format!("refusing unparseable pull URL {url}: {e}")))?;
+    screen_url_host(&parsed)
 }
 
 /// A reqwest DNS resolver that screens EVERY resolved address against
@@ -788,14 +815,12 @@ fn screening_client() -> Result<reqwest::Client, OciError> {
         }
         // Copy what we need as owned values before consuming `attempt`.
         let is_https = attempt.url().scheme() == "https";
-        // A redirect to a literal-IP host bypasses the DNS resolver → screen here (through
-        // the same operator allow-list + always-blocked-metadata decision, U25).
-        let literal_bad = attempt.url().host_str().is_some_and(|h| {
-            let stripped = h.trim_start_matches('[').trim_end_matches(']');
-            stripped
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| address_is_refused(Some(stripped), ip))
-        });
+        // A redirect to a literal-IP host bypasses the DNS resolver → screen its normalized
+        // host here, through the SAME `screen_url_host` helper the initial sites use (operator
+        // allow-list + always-blocked-metadata; a non-canonical literal is decoded by the url
+        // parser first). Behavior-identical to the prior inline check — a domain redirect is
+        // left to the resolver (Ok ⇒ not flagged), a non-global literal is refused.
+        let literal_bad = screen_url_host(attempt.url()).is_err();
         let shown = attempt.url().to_string();
         if !is_https {
             attempt.error(std::io::Error::other(format!(
@@ -857,7 +882,8 @@ async fn get_authed(
 /// The realm comes from the (tenant-controlled) registry's `401`, so it is
 /// screened before it is fetched: it MUST be `https://` ([`parse_realm`]) and its
 /// host must not be (or resolve to) a non-global address — a literal-IP realm via
-/// [`screen_literal_host`], a hostname via the shared client's [`ScreeningResolver`].
+/// [`screen_pull_url`] (the normalized host, so a non-canonical IPv4 literal is decoded +
+/// screened), a hostname via the shared client's [`ScreeningResolver`].
 /// So a malicious `realm="http://169.254.169.254/…"` (SSRF to cloud metadata /
 /// internal hosts, plus a credential-exfil tail) is refused rather than fetched.
 /// The same screened `client` serves the realm GET (its resolver screens the realm
@@ -878,8 +904,12 @@ async fn fetch_token(client: &reqwest::Client, challenge: &str) -> Result<String
         }
     }
     let realm = realm.ok_or_else(|| OciError::Registry("no realm in auth challenge".into()))?;
-    let (host, _port) = parse_realm(&realm)?;
-    screen_literal_host(&host)?;
+    // The realm comes from the (tenant-controlled) registry's 401. Enforce the https scheme
+    // (`parse_realm`) AND screen the WHATWG-NORMALIZED realm host the SAME way the GET below
+    // connects — a non-canonical IP-literal realm host (`0xa9fea9fe`) would otherwise slip the
+    // lexical screen but be decoded + dialed by reqwest without the resolver (Security HIGH).
+    parse_realm(&realm)?;
+    screen_pull_url(&realm)?;
     let resp = client
         .get(&realm)
         .query(&query)
@@ -938,12 +968,14 @@ fn oci_arch() -> &'static str {
 /// [`oci_arch`] (the host/guest arch).
 async fn resolve_manifest(image: &str) -> Result<ResolvedManifest, OciError> {
     let (registry, repo, reference) = parse_reference(image);
-    // Screen the registry host for SSRF (scheme is fixed `https` below; a
-    // literal-IP host is screened eagerly, a hostname by the client's resolver).
-    let (reg_host, _reg_port) = split_host_port(&registry)?;
-    screen_literal_host(&reg_host)?;
     let client = screening_client()?;
     let base = format!("https://{registry}/v2/{repo}");
+    // Screen the registry host for SSRF against the WHATWG-NORMALIZED host (the form reqwest
+    // resolves + connects to) — NOT the raw lexical string, which a non-canonical IPv4 literal
+    // (`0xa9fea9fe`, decimal, octal, short form) slips past while the url parser decodes it to a
+    // real address reqwest dials straight (no `ScreeningResolver`). A literal IP is screened
+    // here (metadata un-exemptable); a hostname is screened by the resolver at connect.
+    screen_pull_url(&base)?;
     let mut token = None;
 
     // When the ref is an `@<algo>:<hex>` digest pin, the manifest body itself must
@@ -2009,9 +2041,8 @@ mod tests {
             Err(OciError::Registry(_))
         ));
 
-        // https realms whose host is a non-global literal IP are refused by the
-        // eager literal screen (a literal-IP URL never reaches the DNS resolver).
-        // Hermetic — no DNS.
+        // URLs whose host is a non-global literal IP are refused by the eager host screen
+        // (a literal-IP URL never reaches the DNS resolver). Hermetic — no DNS.
         for ip in [
             "169.254.169.254",
             "127.0.0.1",
@@ -2019,26 +2050,93 @@ mod tests {
             "192.168.1.1",
             "172.16.0.1",
         ] {
-            let (host, _port) = parse_realm(&format!("https://{ip}/token")).unwrap();
             assert!(
-                matches!(screen_literal_host(&host), Err(OciError::Registry(_))),
+                matches!(
+                    screen_pull_url(&format!("https://{ip}/token")),
+                    Err(OciError::Registry(_))
+                ),
                 "{ip} (link-local/private/loopback) must be refused"
             );
         }
         for ip in ["::1", "fe80::1", "fc00::1"] {
-            let (host, _port) = parse_realm(&format!("https://[{ip}]:443/token")).unwrap();
             assert!(
-                matches!(screen_literal_host(&host), Err(OciError::Registry(_))),
+                matches!(
+                    screen_pull_url(&format!("https://[{ip}]:443/token")),
+                    Err(OciError::Registry(_))
+                ),
                 "{ip} (v6 loopback/link-local/unique-local) must be refused"
             );
         }
 
         // A public literal IP passes the eager screen; a hostname passes it too
         // (it is screened later, at DNS resolution, by `ScreeningResolver`).
-        let (host, port) = parse_realm("https://1.1.1.1/token").unwrap();
-        assert_eq!((host.as_str(), port), ("1.1.1.1", 443));
-        screen_literal_host("1.1.1.1").unwrap();
-        screen_literal_host("registry.example.com").unwrap();
+        screen_pull_url("https://1.1.1.1/token").unwrap();
+        screen_pull_url("https://registry.example.com/token").unwrap();
+    }
+
+    #[test]
+    fn noncanonical_ip_literal_hosts_are_decoded_and_refused() {
+        // Security HIGH (parser-differential SSRF bypass): Rust's strict `str::parse::<IpAddr>`
+        // REJECTS these non-canonical IPv4 literals, but the WHATWG url parser (reqwest) DECODES
+        // them to 169.254.169.254 and connects straight to it — never invoking `ScreeningResolver`.
+        // The screen MUST parse the host the same way and refuse them (metadata, un-exemptable).
+        for metadata_form in [
+            "https://0xa9fea9fe:443/x",      // hex single-number
+            "https://2852039166/x",          // decimal single-number
+            "https://0251.0376.0251.0376/x", // octal dotted
+            "https://169.254.169.254/x",     // canonical (control)
+            "https://0xa9.0xfe.0xa9.0xfe/x", // hex dotted
+            "https://169.16689150/x",        // short form (a.b where b is 24-bit)
+        ] {
+            // Sanity: the RAW lexical host would have slipped the old strict parse for the
+            // non-canonical forms — prove the normalized screen refuses the connect target.
+            assert!(
+                matches!(screen_pull_url(metadata_form), Err(OciError::Registry(_))),
+                "{metadata_form} decodes to cloud-metadata and MUST be refused"
+            );
+        }
+
+        // (A benign-looking NON-canonical internal literal — `0x0a2a0009` = 10.42.0.9 — is
+        // refused-by-default-unless-allow-listed in `noncanonical_literal_is_permitted_only_when_allow_listed`,
+        // which owns the process-global allow-list; kept out of this test so the two never race.)
+
+        // An ambiguous / overflowing host literal fails CLOSED (url parse refuses it).
+        assert!(matches!(
+            screen_pull_url("https://0xffffffffff/x"),
+            Err(OciError::Registry(_))
+        ));
+
+        // A normal public registry (hostname) still works — left to the resolver at connect.
+        screen_pull_url("https://registry-1.docker.io/v2/library/alpine").unwrap();
+        // A public literal IP in canonical form still works.
+        screen_pull_url("https://1.1.1.1/v2/x").unwrap();
+    }
+
+    #[test]
+    fn noncanonical_literal_is_permitted_only_when_allow_listed() {
+        // The allow-list honors the DECODED address: `0x0a2a0009` = 10.42.0.9 is refused by
+        // default but permitted once the operator allow-lists its /32 — proving the fix routes
+        // the normalized literal through the SAME `address_is_refused` decision (allow-list +
+        // un-exemptable metadata). Mutates the process-global, so it runs in its own test.
+        assert!(matches!(
+            screen_pull_url("https://0x0a2a0009:443/x"),
+            Err(OciError::Registry(_))
+        ));
+        install_private_registry_allowlist(&PrivateRegistryAllowlist {
+            hosts: vec![],
+            cidrs: vec!["10.42.0.9/32".into()],
+        })
+        .unwrap();
+        // Now the decoded internal literal is permitted.
+        screen_pull_url("https://0x0a2a0009:443/x").unwrap();
+        // But a decoded-metadata literal is STILL refused, even though 169.254.0.0/16 is not
+        // allow-listed here — and would be refused even if it were (metadata is un-exemptable).
+        assert!(matches!(
+            screen_pull_url("https://0xa9fea9fe/x"),
+            Err(OciError::Registry(_))
+        ));
+        // Restore the block-all default so no other test sees the allow-list.
+        install_private_registry_allowlist(&PrivateRegistryAllowlist::default()).unwrap();
     }
 
     #[test]

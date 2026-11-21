@@ -262,13 +262,18 @@ impl SandboxPlan {
     /// or a default/empty image config leaves behavior exactly as before).
     pub fn apply_image_config(&mut self, image_env: &[String], image_workdir: &str) {
         if !image_env.is_empty() {
-            let mut merged: Vec<(String, String)> = image_env
-                .iter()
-                .filter_map(|kv| {
-                    kv.split_once('=')
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                })
-                .collect();
+            // Build the image base, de-duplicating repeated keys (keep the FIRST occurrence —
+            // `getenv` semantics) so a malformed image `Env` with two `PATH=` entries can't leave
+            // a shadow key a guest iterating `environ` would see after the spec overwrites only the
+            // first (INFO-1). The spec/caller env then overlays and WINS per key.
+            let mut merged: Vec<(String, String)> = Vec::with_capacity(image_env.len());
+            for kv in image_env {
+                if let Some((k, v)) = kv.split_once('=')
+                    && !merged.iter().any(|(ek, _)| ek == k)
+                {
+                    merged.push((k.to_string(), v.to_string()));
+                }
+            }
             for (k, v) in &self.env {
                 match merged.iter_mut().find(|(ek, _)| ek == k) {
                     Some(slot) => slot.1 = v.clone(),
@@ -649,5 +654,42 @@ mod tests {
         let before = plan2.clone();
         plan2.apply_image_config(&[], "");
         assert_eq!(plan2, before, "an empty image config changes nothing");
+    }
+
+    #[test]
+    fn apply_image_config_dedups_shadowed_image_env_keys() {
+        // INFO-1: a malformed image `Env` with a repeated key must not leave a SHADOW entry
+        // after the spec overwrites only the first occurrence — a guest iterating `environ`
+        // would otherwise see both. De-dup keeps ONE entry per key, with the spec value winning.
+        let mut plan = SandboxPlan::for_spec(&spec(1, 128), "/r", "h", 0, 0); // spec sets PORT=8080
+        let image_env = vec![
+            "PATH=/a".to_string(),
+            "PATH=/b".to_string(),   // duplicate image key (shadow)
+            "PORT=5432".to_string(), // overwritten by the spec's PORT=8080
+            "PORT=6000".to_string(), // duplicate of an overwritten key
+        ];
+        plan.apply_image_config(&image_env, "");
+        assert_eq!(
+            plan.env.iter().filter(|(k, _)| k == "PATH").count(),
+            1,
+            "no shadow PATH key remains"
+        );
+        assert_eq!(
+            plan.env.iter().filter(|(k, _)| k == "PORT").count(),
+            1,
+            "no shadow PORT key remains"
+        );
+        let get = |k: &str| {
+            plan.env
+                .iter()
+                .find(|(ek, _)| ek == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            get("PATH"),
+            Some("/a"),
+            "first image occurrence kept (getenv semantics)"
+        );
+        assert_eq!(get("PORT"), Some("8080"), "the spec value wins");
     }
 }
