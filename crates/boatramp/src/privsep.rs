@@ -4191,7 +4191,33 @@ mod instance_serve {
             "[privsep] node-self-host backend: opening the control-plane deploy store for the P5-2 \
              read plane (under the backend.kv Landlock grant)"
         );
-        let store = build_routing_deploy_store(config).await?;
+        // Bound the control-plane store open with a fail-loud timeout, EXACTLY as the per-tenant
+        // supervisor does (see `run_per_tenant_supervisor`): if the open stalls — a `backend.kv`
+        // Landlock-grant/store-path mismatch makes SlateDB's retrying object store spin on EACCES
+        // forever rather than returning Err — this self-host data-holder EXITS with a clear error so
+        // the root's `FailNodeClosed` tears the node down (it fires on child DEATH, not on a hang),
+        // instead of hanging alive-but-serving-nothing (the node looking up while serving nothing).
+        // 30s is far beyond a healthy control-plane open (sub-second); it only ever fires on a real
+        // stall. Matches the sibling supervisor's duration + error shape.
+        let store = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            build_routing_deploy_store(config),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(
+                    "node-self-host read plane: opening the control-plane deploy store under the \
+                     backend.kv Landlock grant timed out after 30s — the store open is stuck. The \
+                     most likely cause is that the `backend.kv` Landlock grant does not cover the \
+                     store's real path (see `sandbox::backend_state_subdir(BackendKv)` vs \
+                     `build_slatedb_kv`'s `data_dir.join(\"kv-slate\")`). Failing closed so the \
+                     instance exits → FailNodeClosed fires."
+                        .to_string(),
+                );
+            }
+        };
         Ok(NodeReadPlane::Deploy(store))
     }
 
