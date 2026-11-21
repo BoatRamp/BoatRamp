@@ -13,6 +13,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
+use std::time::Duration;
 
 use ipnet::IpNet;
 
@@ -789,17 +790,171 @@ impl reqwest::dns::Resolve for ScreeningResolver {
                 // `hosts` entry permits this name, a CIDR entry permits the address, and a
                 // cloud-metadata endpoint is refused regardless.
                 if address_is_refused(Some(&host), sa.ip()) {
-                    return Err(format!(
-                        "refusing to connect to {host}: resolves to non-global address {} \
-                         (not on the `[compute].allow_private_registries` operator allow-list)",
-                        sa.ip()
-                    )
-                    .into());
+                    // Typed (U31) so the actionable message — the refused host + the
+                    // `[compute].allow_private_registries` hint — survives reqwest's error
+                    // wrapping and reaches the operator, instead of being flattened to a
+                    // generic "error sending request for url …". Recovered by `reqwest_err`.
+                    //
+                    // SECURITY: this message is persisted into a replica's `LaunchFailed`
+                    // reason and surfaced to the TENANT (`compute status`). The tenant supplied
+                    // the HOST, so naming it discloses nothing new — but the NODE-resolved IP
+                    // would, so it is deliberately OMITTED here (unlike the literal-IP screen,
+                    // whose address the tenant typed). This denies a tenant an internal
+                    // DNS→IP reconnaissance oracle while still pointing the operator at the
+                    // allow-list. The connect is refused regardless of what is logged.
+                    return Err(Box::new(ScreenRefusal(format!(
+                        "refusing to connect to {host}: it resolves to a non-global \
+                         (private/internal) address not on the \
+                         `[compute].allow_private_registries` operator allow-list"
+                    )))
+                        as Box<dyn std::error::Error + Send + Sync>);
                 }
             }
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// U30: bound the OCI registry pull with timeouts
+// ---------------------------------------------------------------------------
+//
+// The pull client previously had NO connect/read/overall timeout, so a registry that
+// accepts the TCP connection and then never answers held the pull FOREVER — and for an
+// embedder awaiting several launches together, one such image stalled everything behind it.
+// These bounds make a dead/stalling registry fail the pull in bounded time with a clear
+// error. Operator-tunable (`[compute].registry_pull_timeouts`), NEVER guest-influenced —
+// the values come from node config only, mirroring `[compute].allow_private_registries`.
+//
+// Design (why three knobs, and why a blob gets no overall cap):
+//   * `connect_secs` bounds the TCP+TLS handshake (a registry that never completes connect).
+//   * `read_secs` is the IDLE/read timeout — the max gap with NO bytes flowing on a response
+//     before the pull fails. This is what catches "accepts the connection and never answers"
+//     (connect succeeds, then silence). Because reqwest's read timeout resets on every chunk,
+//     it bounds a STALL without capping a legitimately large-but-progressing blob download.
+//   * `response_secs` is an overall per-request cap applied ONLY to the small control-plane
+//     requests (token exchange + manifest GET), whose bodies are tiny. It is deliberately NOT
+//     applied to a blob GET, so a genuinely large/slow layer stream is bounded by the idle
+//     `read_secs` alone and is never severed mid-progress.
+
+/// Default connect (TCP + TLS handshake) timeout for a registry pull, seconds.
+const DEFAULT_PULL_CONNECT_SECS: u64 = 10;
+/// Default read/idle timeout, seconds — the max no-bytes-flowing gap on a registry response
+/// before the pull fails. Resets per chunk, so it bounds a stall (incl. "accepts then never
+/// answers") WITHOUT capping a legitimately large blob stream.
+const DEFAULT_PULL_READ_SECS: u64 = 30;
+/// Default overall per-request cap, seconds, for the SMALL token + manifest requests only
+/// (never the blob stream). Keeps a never-answering control request from stalling the pull
+/// even past the idle budget, while leaving large blob downloads to `DEFAULT_PULL_READ_SECS`.
+const DEFAULT_PULL_RESPONSE_SECS: u64 = 120;
+
+/// Operator-tunable timeouts bounding a registry pull (U30) — the value of
+/// `[compute].registry_pull_timeouts`. Node operator config (System·Admin), NEVER
+/// guest-influenced; mirrors the wiring of `[compute].allow_private_registries`. A
+/// dead/stalling registry fails the pull in bounded time instead of hanging forever. Each
+/// field is in **seconds**; `0` disables that particular bound (an explicit operator opt-out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RegistryPullTimeouts {
+    /// Connect (TCP + TLS handshake) timeout, seconds. `0` ⇒ no connect bound. Default 10.
+    pub connect_secs: u64,
+    /// Read/idle timeout, seconds — the max no-bytes-flowing gap on a response before the pull
+    /// fails. Resets per chunk, so it bounds a stall without capping a legitimately large blob.
+    /// `0` ⇒ no idle bound. Default 30.
+    pub read_secs: u64,
+    /// Overall cap, seconds, for the SMALL token + manifest requests only (NEVER the blob
+    /// stream, which is bounded by `read_secs`). `0` ⇒ no overall cap. Default 120.
+    pub response_secs: u64,
+}
+
+impl RegistryPullTimeouts {
+    /// The default bounds, as a `const` so it can seed the process-global static (where
+    /// `Default::default()` is not callable).
+    const DEFAULT: Self = Self {
+        connect_secs: DEFAULT_PULL_CONNECT_SECS,
+        read_secs: DEFAULT_PULL_READ_SECS,
+        response_secs: DEFAULT_PULL_RESPONSE_SECS,
+    };
+
+    /// `d` seconds as a `Duration`, or `None` when `d == 0` (bound disabled).
+    fn dur(d: u64) -> Option<Duration> {
+        (d > 0).then(|| Duration::from_secs(d))
+    }
+}
+
+impl Default for RegistryPullTimeouts {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The process-global registry-pull timeouts the OCI client builder consults. Installed ONCE
+/// at node serve wiring from `[compute].registry_pull_timeouts`
+/// ([`install_registry_pull_timeouts`]); default = the built-in bounds above. Node operator
+/// config, never guest-influenced. Read (not threaded) by the client builder so the many pull
+/// entry points + callers need no signature change (mirrors the allow-list global).
+static REGISTRY_PULL_TIMEOUTS: RwLock<RegistryPullTimeouts> =
+    RwLock::new(RegistryPullTimeouts::DEFAULT);
+
+/// Install the operator's registry-pull timeouts (U30) into the process-global the OCI pull
+/// client reads. Called at node serve wiring; idempotent (a later call replaces the installed
+/// values — config reload). Infallible: every field is a plain duration-in-seconds (`0`
+/// disables a bound), so there is nothing to reject.
+pub fn install_registry_pull_timeouts(cfg: RegistryPullTimeouts) {
+    // Poison-tolerant: a panic elsewhere while the lock was held must not wedge the pull —
+    // recover the guard and install over it. The data is a plain config snapshot.
+    *REGISTRY_PULL_TIMEOUTS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = cfg;
+}
+
+/// Snapshot the installed [`RegistryPullTimeouts`] (default when unset).
+fn registry_pull_timeouts() -> RegistryPullTimeouts {
+    *REGISTRY_PULL_TIMEOUTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The overall per-request cap for the SMALL control-plane requests (token exchange + manifest
+/// GET), from the installed timeouts. `None` ⇒ no cap. Deliberately NOT used for a blob GET,
+/// whose legitimately-large body is bounded by the idle read timeout instead ([`fetch_blob`]).
+fn small_request_overall_timeout() -> Option<Duration> {
+    RegistryPullTimeouts::dur(registry_pull_timeouts().response_secs)
+}
+
+/// A typed SSRF-screen refusal carried OUT of the custom DNS resolver / redirect screen so its
+/// actionable message (the refused host + the `[compute].allow_private_registries` hint)
+/// survives reqwest's error wrapping (U31). On the HOSTNAME path the screen fails inside
+/// [`ScreeningResolver`] (reqwest never calls it for a literal IP), and reqwest would otherwise
+/// surface only its own generic transport Display ("error sending request for url …"), hiding
+/// the operator-facing allow-list hint. Boxed as the resolver's error, it rides reqwest's
+/// `source()` chain and is recovered by [`reqwest_err`].
+#[derive(Debug, Clone)]
+struct ScreenRefusal(String);
+
+impl std::fmt::Display for ScreenRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScreenRefusal {}
+
+/// Convert a `reqwest` error into an [`OciError`], PRESERVING a [`ScreenRefusal`] message when
+/// the SSRF screen is what rejected the request (U31). Walks the error's `source()` chain; the
+/// first `ScreenRefusal` found wins (its message names the refused host + points at
+/// `[compute].allow_private_registries`), so a hostname-named internal/metadata registry yields
+/// the actionable error instead of reqwest's generic transport string. Falls back to reqwest's
+/// own Display when the failure was an ordinary transport error.
+fn reqwest_err(e: &reqwest::Error) -> OciError {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(refusal) = err.downcast_ref::<ScreenRefusal>() {
+            return OciError::Registry(refusal.0.clone());
+        }
+        cur = err.source();
+    }
+    OciError::Registry(e.to_string())
 }
 
 /// Build the SSRF-screened pull client, shared across registry + blob + token
@@ -808,6 +963,10 @@ impl reqwest::dns::Resolve for ScreeningResolver {
 /// and rejects a hop to a literal non-global IP (which the resolver never sees).
 /// Redirects are FOLLOWED — a registry blob GET legitimately `307`s to a CDN — but
 /// an SSRF redirect to cloud metadata / an internal host is refused, not chased.
+///
+/// The client carries the operator's connect + read/idle timeouts (U30) so a
+/// dead/stalling registry fails the pull in bounded time; the overall per-request cap is
+/// applied per-call to the small control-plane requests only (see [`get_authed`]).
 fn screening_client() -> Result<reqwest::Client, OciError> {
     let redirect = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= 8 {
@@ -823,43 +982,64 @@ fn screening_client() -> Result<reqwest::Client, OciError> {
         let literal_bad = screen_url_host(attempt.url()).is_err();
         let shown = attempt.url().to_string();
         if !is_https {
-            attempt.error(std::io::Error::other(format!(
+            attempt.error(ScreenRefusal(format!(
                 "refusing non-https redirect to {shown}"
             )))
         } else if literal_bad {
-            attempt.error(std::io::Error::other(format!(
+            // Typed so the refusal message survives reqwest's wrapping (U31), same as the
+            // resolver (hostname) path — a redirect to a non-global host is the same SSRF class.
+            attempt.error(ScreenRefusal(format!(
                 "refusing redirect to non-global host {shown}"
             )))
         } else {
             attempt.follow()
         }
     });
-    reqwest::Client::builder()
+    let t = registry_pull_timeouts();
+    let mut builder = reqwest::Client::builder()
         .user_agent("boatramp-compute")
         .dns_resolver(std::sync::Arc::new(ScreeningResolver))
-        .redirect(redirect)
+        .redirect(redirect);
+    // Bound the pull (U30): a connect timeout (TCP+TLS handshake) and a read/idle timeout
+    // (the max no-bytes-flowing gap, which catches "accepts the connection and never
+    // answers" without capping a legitimately large blob — it resets per chunk). The overall
+    // cap is applied per-request to the small control-plane GETs only (see `get_authed`).
+    if let Some(d) = RegistryPullTimeouts::dur(t.connect_secs) {
+        builder = builder.connect_timeout(d);
+    }
+    if let Some(d) = RegistryPullTimeouts::dur(t.read_secs) {
+        builder = builder.read_timeout(d);
+    }
+    builder
         .build()
         .map_err(|e| OciError::Registry(e.to_string()))
 }
 
 /// GET `url` with the manifest Accept header, performing a one-shot
 /// `WWW-Authenticate: Bearer` token exchange on `401` (anonymous pull).
+///
+/// `overall` is the per-request total-time cap (U30): `Some(_)` for the small control-plane
+/// GETs (manifest), `None` for a blob GET whose legitimately-large body is bounded by the
+/// client's idle read timeout instead of a hard overall cap. The connect + read/idle bounds
+/// live on the shared `client` ([`screening_client`]).
 async fn get_authed(
     client: &reqwest::Client,
     url: &str,
     accept: &str,
     token: &mut Option<String>,
+    overall: Option<Duration>,
 ) -> Result<reqwest::Response, OciError> {
     let send = |bearer: &Option<String>| {
         let mut req = client.get(url).header(reqwest::header::ACCEPT, accept);
+        if let Some(d) = overall {
+            req = req.timeout(d);
+        }
         if let Some(t) = bearer {
             req = req.bearer_auth(t);
         }
         req.send()
     };
-    let resp = send(token)
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    let resp = send(token).await.map_err(|e| reqwest_err(&e))?;
     if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
         return Ok(resp);
     }
@@ -872,9 +1052,7 @@ async fn get_authed(
         .to_string();
     let new_token = fetch_token(client, &challenge).await?;
     *token = Some(new_token);
-    send(token)
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))
+    send(token).await.map_err(|e| reqwest_err(&e))
 }
 
 /// Resolve a `Bearer realm="…",service="…",scope="…"` challenge into a token.
@@ -910,16 +1088,14 @@ async fn fetch_token(client: &reqwest::Client, challenge: &str) -> Result<String
     // lexical screen but be decoded + dialed by reqwest without the resolver (Security HIGH).
     parse_realm(&realm)?;
     screen_pull_url(&realm)?;
-    let resp = client
-        .get(&realm)
-        .query(&query)
-        .send()
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    // The token exchange is a small control-plane request → bound it with the overall cap (U30)
+    // so a never-answering realm host can't stall the pull past the budget.
+    let mut req = client.get(&realm).query(&query);
+    if let Some(d) = small_request_overall_timeout() {
+        req = req.timeout(d);
+    }
+    let resp = req.send().await.map_err(|e| reqwest_err(&e))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| reqwest_err(&e))?;
     json.get("token")
         .or_else(|| json.get("access_token"))
         .and_then(|t| t.as_str())
@@ -1050,17 +1226,22 @@ async fn fetch_manifest(
     token: &mut Option<String>,
     expect: Option<&str>,
 ) -> Result<serde_json::Value, OciError> {
-    let resp = get_authed(client, url, MANIFEST_ACCEPT, token).await?;
+    // A manifest is small → cap it with the overall per-request timeout (U30).
+    let resp = get_authed(
+        client,
+        url,
+        MANIFEST_ACCEPT,
+        token,
+        small_request_overall_timeout(),
+    )
+    .await?;
     if !resp.status().is_success() {
         return Err(OciError::Registry(format!(
             "manifest GET {}",
             resp.status()
         )));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    let bytes = resp.bytes().await.map_err(|e| reqwest_err(&e))?;
     if let Some(d) = expect {
         verify_digest(&bytes, d)?;
     }
@@ -1077,14 +1258,13 @@ async fn fetch_blob(
     token: &mut Option<String>,
 ) -> Result<Vec<u8>, OciError> {
     let url = format!("{base}/blobs/{digest}");
-    let resp = get_authed(client, &url, "*/*", token).await?;
+    // No overall cap on a blob (U30): a layer may legitimately be large/slow, so it is bounded
+    // by the client's idle read timeout (which resets per chunk) — never severed mid-progress.
+    let resp = get_authed(client, &url, "*/*", token, None).await?;
     if !resp.status().is_success() {
         return Err(OciError::Registry(format!("blob GET {}", resp.status())));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    let bytes = resp.bytes().await.map_err(|e| reqwest_err(&e))?;
     verify_digest(&bytes, digest)?;
     Ok(bytes.to_vec())
 }
@@ -2369,6 +2549,154 @@ mod tests {
         assert_eq!(
             resolv_conf_body(Some("6.6.6.6\nnameserver 7.7.7.7")),
             "nameserver 1.1.1.1\n"
+        );
+    }
+
+    // ---- U30: bound the registry pull with timeouts ----
+
+    #[test]
+    fn registry_pull_timeouts_default_and_install_round_trip() {
+        // The built-in defaults are the documented, defensible bounds.
+        let def = RegistryPullTimeouts::default();
+        assert_eq!(def.connect_secs, 10);
+        assert_eq!(def.read_secs, 30);
+        assert_eq!(def.response_secs, 120);
+        // `dur` maps seconds → Duration, and `0` disables a bound.
+        assert_eq!(RegistryPullTimeouts::dur(10), Some(Duration::from_secs(10)));
+        assert_eq!(RegistryPullTimeouts::dur(0), None);
+
+        // Installing a config is honored by the process-global the client builder reads.
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 3,
+            read_secs: 4,
+            response_secs: 0, // disables the overall cap
+        });
+        let got = registry_pull_timeouts();
+        assert_eq!(
+            (got.connect_secs, got.read_secs, got.response_secs),
+            (3, 4, 0)
+        );
+        assert_eq!(small_request_overall_timeout(), None, "0 ⇒ no overall cap");
+        // Restore the defaults so no other test observes the mutated global.
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+        assert_eq!(
+            small_request_overall_timeout(),
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_client_fails_in_bounded_time_against_a_dead_endpoint() {
+        // A registry that ACCEPTS the connection and then NEVER answers must not hang the pull
+        // forever — the connect+read/idle bounds (and the per-request overall cap) make it fail
+        // in bounded time. Hermetic: a loopback listener that accepts + holds the socket without
+        // ever writing a response byte. (The SSRF screen does not fire here — reqwest connects to
+        // a literal-IP host without consulting `ScreeningResolver`, exactly the surface we test.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Accept connections and HOLD them open (never respond) for the test's lifetime.
+            let mut held = Vec::new();
+            while held.len() < 16 {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => break,
+                }
+            }
+            std::thread::sleep(Duration::from_secs(30));
+            drop(held);
+        });
+
+        // Install tight bounds so a bounded failure is quick + unambiguous.
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 2,
+            read_secs: 1,
+            response_secs: 2,
+        });
+        let client = screening_client().unwrap();
+        let url = format!("http://{addr}/v2/");
+
+        // (a) The shared client's read/idle timeout bounds a never-answering endpoint — no
+        // per-request overall cap applied, so this exercises `read_timeout` specifically.
+        let start = std::time::Instant::now();
+        let res = client.get(&url).send().await;
+        let elapsed = start.elapsed();
+        assert!(res.is_err(), "a dead endpoint must fail, not hang");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "read/idle timeout must bound the failure (took {elapsed:?})"
+        );
+
+        // (b) The overall per-request cap (`.timeout(...)`) also bounds it — the explicit
+        // control-plane cap used for token + manifest GETs.
+        let start = std::time::Instant::now();
+        let res = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await;
+        let elapsed = start.elapsed();
+        assert!(
+            res.is_err(),
+            "the overall request cap must fail a dead endpoint"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "overall timeout must bound the failure (took {elapsed:?})"
+        );
+
+        // Restore the defaults so no other test observes the mutated global.
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+    }
+
+    // ---- U31: typed, message-preserving SSRF refusal on the hostname path ----
+
+    #[tokio::test]
+    async fn hostname_ssrf_refusal_carries_the_allowlist_hint() {
+        // The HOSTNAME path: a registry named by host that resolves to a non-global address is
+        // refused INSIDE the DNS resolver. The refusal must reach the caller as a TYPED,
+        // message-preserving error that names the refused host AND points at
+        // `[compute].allow_private_registries` — not the generic reqwest transport string that
+        // swallowed the hint before (U31). Hermetic: `localhost` resolves to loopback via
+        // /etc/hosts with no network.
+        let client = screening_client().unwrap();
+        let err = client
+            .get("http://localhost:9/v2/")
+            .send()
+            .await
+            .expect_err("a loopback-resolving hostname must be refused by the SSRF screen");
+        let mapped = reqwest_err(&err);
+        let OciError::Registry(msg) = mapped else {
+            panic!("expected OciError::Registry, got {mapped:?}");
+        };
+        assert!(
+            msg.contains("localhost"),
+            "the typed refusal must name the refused host, got: {msg}"
+        );
+        assert!(
+            msg.contains("allow_private_registries"),
+            "the typed refusal must carry the actionable allow-list hint, got: {msg}"
+        );
+        // It must NOT be the generic reqwest transport string (which would have hidden the hint).
+        assert!(
+            !msg.starts_with("error sending request"),
+            "the generic transport message leaked instead of the typed refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn reqwest_err_without_a_screen_refusal_falls_back_to_transport_message() {
+        // When the failure is an ordinary transport error (no SSRF refusal in the chain),
+        // `reqwest_err` falls back to reqwest's own message — it never fabricates a hint.
+        let client = reqwest::Client::new();
+        // A syntactically bad URL yields a reqwest builder error with no `ScreenRefusal` source.
+        let err = client.get("http://[::bad url").build().unwrap_err();
+        let OciError::Registry(msg) = reqwest_err(&err) else {
+            panic!("expected OciError::Registry");
+        };
+        assert!(
+            !msg.contains("allow_private_registries"),
+            "a non-screen error must not gain an allow-list hint, got: {msg}"
         );
     }
 }

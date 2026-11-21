@@ -402,6 +402,11 @@ pub async fn build_compute(
         );
     }
 
+    // Install the operator's registry-pull timeouts (U30) so a dead/stalling registry fails the
+    // pull in bounded time instead of hanging every launch behind it. Unset ⇒ the built-in
+    // defaults (10s connect / 30s idle / 120s overall on the small control-plane requests).
+    boatramp_firecracker::oci::install_registry_pull_timeouts(cfg.registry_pull_timeouts);
+
     // Compute-backend selection (mailroom #26): the `kubernetes` backend is used when it
     // is explicitly pinned (`[compute].backend = "kubernetes"`) OR auto-detected
     // in-cluster (`KUBERNETES_SERVICE_HOST` + a mounted ServiceAccount token, and no other
