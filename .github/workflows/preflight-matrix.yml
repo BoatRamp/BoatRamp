@@ -154,11 +154,14 @@ jobs:
           #   • export-import-live — the project export/import round-trip against real Postgres
           #                        (pgvector) + MySQL in an in-VM docker daemon fed from an offline
           #                        registry mirror (institutionalizes the host-runner live-export job).
-          #   • compute-net-turnkey-vm-{iptables,nftables} — the compute-network turnkey +
+          #   • compute-net-turnkey-vm-{iptables,nftables,nocompute} — the compute-network turnkey +
           #                        firewall-coherence gate (Gap A/B): a VM deploys the module
           #                        (compute = true + computeShimUrls, firewall port auto-derived) and
           #                        asserts container→shim ADMITTED on the boatramp bridges yet DROPPED
-          #                        off-node, on each firewall backend (the nftables leg covers M1).
+          #                        off-node, on each firewall backend (the nftables leg covers M1). The
+          #                        nocompute leg is the v0.69.1 docker-only regression-lock: compute =
+          #                        false STILL gets the shim env + firewall, while the native-backend
+          #                        privileges (CAP_SYS_ADMIN/NET_ADMIN, kvm/tun DeviceAllow) stay ABSENT.
           - label: tunnel-tun gate vm
             build: .#checks.x86_64-linux.tunnel-tun
           - label: export-import-live gate vm
@@ -167,6 +170,8 @@ jobs:
             build: .#checks.x86_64-linux.compute-net-turnkey-vm-iptables
           - label: compute-net-turnkey vm (nftables)
             build: .#checks.x86_64-linux.compute-net-turnkey-vm-nftables
+          - label: compute-net-turnkey vm (nocompute)
+            build: .#checks.x86_64-linux.compute-net-turnkey-vm-nocompute
           - label: release artifacts + OCI images
             build: .#boatramp-static .#container .#container-cloudflare
     steps:
