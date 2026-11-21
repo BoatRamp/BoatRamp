@@ -44,6 +44,12 @@ impl Handler for App {
                 let chunks = tokio_stream::iter((0..2u8).map(|i| Bytes::from(vec![b'a' + i; 4])));
                 response(200, Body::stream_sized(12, chunks))
             }
+            // Declares 12 bytes but the stream yields 16 — the writer must write exactly 12
+            // and force-close (the excess would be read as the next response).
+            ("GET", "/stream-sized-long") => {
+                let chunks = tokio_stream::iter((0..4u8).map(|i| Bytes::from(vec![b'a' + i; 4])));
+                response(200, Body::stream_sized(12, chunks))
+            }
             // Reject WITHOUT reading the body, closing the connection (an early 413 shape).
             ("POST", "/reject") => {
                 let mut r = response(413, b"too large".to_vec());
@@ -216,6 +222,40 @@ async fn declared_length_underrun_force_closes_even_on_keep_alive() {
         &out[body_start..],
         b"aaaabbbb",
         "truncated body, not padded"
+    );
+}
+
+#[tokio::test]
+async fn declared_length_overrun_writes_exactly_len_and_force_closes_even_on_keep_alive() {
+    // U29 safety (the over-run counterpart to the under-run test above): a declared-length
+    // body that OVER-runs its Content-Length must write exactly `len` bytes and then
+    // force-close — the committed length is already on the wire, so the excess bytes would be
+    // read by the client as the start of the next response (a response-smuggling desync). A
+    // keep-alive request (no `Connection: close`) is used so the force-close is the ONLY thing
+    // that can stop the pipelined second request from being answered.
+    let mut c = spawn();
+    c.write_all(
+        b"GET /stream-sized-long HTTP/1.1\r\nHost: x\r\n\r\n\
+          GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).await.unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(
+        text.matches("HTTP/1.1 200 OK").count(),
+        1,
+        "the over-running body must force-close, not serve the pipelined request: {text}"
+    );
+    assert!(lower(&out).contains("content-length: 12\r\n"), "{text}");
+    // Exactly the committed 12 bytes are on the wire — the 13th..16th bytes are truncated,
+    // never written, so they can't be read as the next response.
+    let body_start = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    assert_eq!(
+        &out[body_start..],
+        b"aaaabbbbcccc",
+        "exactly `len` (12) bytes, the over-run excess dropped"
     );
 }
 

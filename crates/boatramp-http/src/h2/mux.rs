@@ -17,15 +17,17 @@
 //! per direction, so these are two separate, unsynchronized tables.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
-use tokio_stream::StreamExt as _;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::{Stream, StreamExt as _};
 
 use crate::h2::CLIENT_PREFACE;
 use crate::h2::error::{ErrorCode, H2Error};
@@ -63,6 +65,14 @@ pub const MAX_CONCURRENT_STREAMS: u32 = 256;
 /// Soft target for one batched socket write: keep draining ready streams into the
 /// buffer until it reaches this, then write and start a fresh batch.
 const WRITE_BATCH_TARGET: usize = 64 * 1024;
+/// Depth of a dispatched request's **bounded** body channel — the reader hands each DATA
+/// frame's payload into it and parks on a full channel, so a handler that stops draining
+/// its request body stops the reader from buffering the upload without limit. Mirrors the
+/// h1 body pump's `mpsc::channel(4)`. Paired with consume-gated receive flow control (the
+/// per-stream `WINDOW_UPDATE` is withheld until the handler takes a chunk — see the DATA
+/// path in [`dispatch`]) so a well-behaved uploader is throttled at the protocol level
+/// (its stream window closes) before the reader ever has to park.
+const REQ_BODY_CHANNEL_DEPTH: usize = 4;
 /// A streaming producer stops pulling its source once this many response bytes are
 /// queued-but-unsent for its stream (the writer is behind — usually a flow-control
 /// window the slow client hasn't opened). Bounds per-stream memory regardless of body
@@ -156,6 +166,14 @@ struct MuxStream {
     /// Woken by the writer when `unsent` falls below the low-water mark, to resume a
     /// producer parked on backpressure.
     drain: Arc<Notify>,
+    /// **Receive-side** flow control for this stream's request body: bytes of request DATA
+    /// handed toward the handler's body channel but not yet returned to the peer with a
+    /// stream-level `WINDOW_UPDATE`. The handler's body reader releases these as it consumes
+    /// each chunk (consume-driven replenishment — see [`ConsumeGatedBody`]); a non-draining
+    /// handler stops releasing, so the peer's stream window closes and the uploader is
+    /// backpressured at the protocol level. The reader flushes the remainder ([`drain_recv_window`])
+    /// if the handler abandons the body, so an abandoned upload can still drain to its end.
+    recv_unreleased: u32,
 }
 
 impl MuxStream {
@@ -168,6 +186,7 @@ impl MuxStream {
             reset: false,
             unsent: 0,
             drain: Arc::new(Notify::new()),
+            recv_unreleased: 0,
         }
     }
 }
@@ -375,11 +394,13 @@ struct ReaderState {
     /// Per-stream running total of received DATA bytes — checked against `body_limit` and
     /// the declared `content-length`.
     received: HashMap<u32, u64>,
-    /// The open request-body channel of a dispatched streaming request: the reader pushes
-    /// each DATA chunk in, and dropping the sender ends the handler's body stream. Present
-    /// from a stream's first (non-END_STREAM) HEADERS until its body ends (END_STREAM /
-    /// trailers) or the stream is reset.
-    body_tx: HashMap<u32, mpsc::UnboundedSender<Result<Bytes, http::BodyError>>>,
+    /// The open request-body sink of a dispatched streaming request: the reader pushes each
+    /// DATA chunk into its **bounded** channel (parking on a full channel — backpressure),
+    /// and dropping the sender ends the handler's body stream. Present from a stream's first
+    /// (non-END_STREAM) HEADERS until its body ends (END_STREAM / trailers) or the stream is
+    /// reset. A clean end drops the sink; an abnormal end ([`fail_body`]) first sets the
+    /// sink's truncation flag so the handler sees a `BodyError` rather than a clean short read.
+    body_tx: HashMap<u32, BodySink>,
     /// Streams whose request has already been dispatched to the handler, so a later header
     /// block on the same stream is trailers (§8.1.2.3), not a fresh request. Only streams
     /// with an open body are tracked here (a bodyless request can take no trailers), and an
@@ -390,6 +411,77 @@ struct ReaderState {
     max_header_block: usize,
     max_concurrent_streams: u32,
     body_limit: Option<u64>,
+}
+
+/// The reader's half of a dispatched request's streaming body.
+///
+/// Chunks flow through a **bounded** channel (`tx`); the reader parks on a full channel, so
+/// a non-draining handler cannot make it buffer the upload without limit. The channel
+/// carries plain `Bytes`: whether the body ended *cleanly* (sender dropped → the handler's
+/// stream yields `None`) or was *truncated* (RST, a malformed content-length, or connection
+/// teardown) is signalled out of band by `truncated`, set before the sender is dropped. This
+/// keeps the "never a clean short read" property independent of channel capacity — an
+/// in-band error marker could not be delivered into an already-full bounded channel, but a
+/// flag always can.
+struct BodySink {
+    tx: mpsc::Sender<Bytes>,
+    truncated: Arc<AtomicBool>,
+}
+
+impl BodySink {
+    /// Mark the body as truncated so the handler's reader surfaces a [`http::BodyError`]
+    /// instead of a clean end once the channel closes. Idempotent; the sender is dropped by
+    /// the caller (removing the sink from [`ReaderState::body_tx`]).
+    fn truncate(&self) {
+        self.truncated.store(true, Ordering::Release);
+    }
+}
+
+/// The handler-facing half of a streaming request body: a bounded-channel receiver that
+/// **drives consume-gated receive flow control**. Each chunk it hands to the handler
+/// releases that chunk's bytes of the stream's receive window back to the peer (a
+/// stream-level `WINDOW_UPDATE`), so the window reopens exactly as fast as the handler
+/// drains it — a legitimate large upload flows continuously, while a handler that stops
+/// reading stops the window and backpressures the uploader. On channel close it yields a
+/// final [`http::BodyError`] iff the body was truncated (see [`BodySink`]).
+struct ConsumeGatedBody {
+    rx: mpsc::Receiver<Bytes>,
+    truncated: Arc<AtomicBool>,
+    shared: Conn,
+    notify: Arc<Notify>,
+    sid: u32,
+    /// Set once the truncation `BodyError` has been yielded, so the stream then ends.
+    errored: bool,
+}
+
+impl Stream for ConsumeGatedBody {
+    type Item = Result<Bytes, http::BodyError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.errored {
+            return Poll::Ready(None);
+        }
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(chunk)) => {
+                // The handler is taking this chunk: return its bytes to the peer's stream
+                // window now (consume-driven replenishment).
+                let n = chunk.len() as u32;
+                release_recv_window(&self.shared, &self.notify, self.sid, n);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(None) => {
+                // Channel closed. A truncated body surfaces as one BodyError, never a clean
+                // end that a reverse-proxy handler would forward upstream as complete.
+                if self.truncated.load(Ordering::Acquire) {
+                    self.errored = true;
+                    Poll::Ready(Some(Err(http::BodyError)))
+                } else {
+                    Poll::Ready(None)
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// Outcome of reading the next frame header (see [`next_frame_header`]).
@@ -503,7 +595,9 @@ where
 
         match dispatch(
             shared, notify, handler, &mut hpack, &mut rs, header, payload,
-        ) {
+        )
+        .await
+        {
             Ok(true) => {}
             Ok(false) => break, // GOAWAY received
             Err(H2Error::Connection(code)) => {
@@ -530,14 +624,16 @@ where
     }
     // Connection teardown: fail every request body still open (never reached END_STREAM),
     // so a handler reading one sees a truncation (BodyError), not a clean end it would
-    // forward upstream as complete — mirroring the h1 pump's truncated-body behavior.
-    for (_, tx) in rs.body_tx.drain() {
-        let _ = tx.send(Err(http::BodyError));
+    // forward upstream as complete — mirroring the h1 pump's truncated-body behavior. The
+    // flag is set before each sink drops (closing its channel), so the signal reaches the
+    // handler regardless of whether the bounded channel had room.
+    for (_, sink) in rs.body_tx.drain() {
+        sink.truncate();
     }
     Ok(())
 }
 
-fn dispatch<H>(
+async fn dispatch<H>(
     shared: &Conn,
     notify: &Arc<Notify>,
     handler: &Arc<H>,
@@ -771,21 +867,33 @@ where
                 s.streams.get_mut(&sid).unwrap().state = next;
             }
             let data = frame::strip_padding(&payload, header.has_flag(flag::PADDED))?;
-            // Receive flow control: replenish both windows immediately, as before — the
-            // window stays open so a fast uploader isn't throttled by us. (The request body
-            // now streams to the handler rather than buffering to END_STREAM, but the
-            // window-update timing is unchanged, so receive backpressure is not regressed.)
-            let n = payload.len() as u32;
-            if n > 0 {
+            // §6.9.1: the WHOLE padded frame payload counts against flow control; §8.1.2.6:
+            // only the de-padded DATA counts toward content-length and the request-body cap.
+            let padded_len = payload.len() as u32;
+            let data_len = data.len() as u32;
+            let overhead = padded_len - data_len; // pad-length byte + padding; never delivered
+
+            // Connection-level receive flow control: replenish EAGERLY by the full padded
+            // length, as before. Keeping the connection window open means a single slow
+            // stream never head-of-line blocks its siblings at the connection level; the
+            // per-stream, consume-gated backpressure below is what bounds our buffering. The
+            // connection window therefore never shrinks below its initial size, so nothing
+            // under-runs it across the concurrent streams.
+            if padded_len > 0 {
                 push_ctrl(shared, notify, |out| {
-                    frame::write_frame(out, FrameType::WindowUpdate, 0, 0, &n.to_be_bytes());
-                    frame::write_frame(out, FrameType::WindowUpdate, 0, sid, &n.to_be_bytes());
+                    frame::write_frame(
+                        out,
+                        FrameType::WindowUpdate,
+                        0,
+                        0,
+                        &padded_len.to_be_bytes(),
+                    );
                 });
             }
-            // Account the bytes for the request-body cap + content-length validation.
+            // Account the de-padded bytes for the request-body cap + content-length validation.
             let total = {
                 let r = rs.received.entry(sid).or_insert(0);
-                *r += data.len() as u64;
+                *r += data_len as u64;
                 *r
             };
             // Over the optional request-body cap: reset the stream (the connection
@@ -805,14 +913,52 @@ where
                 fail_body(rs, sid);
                 return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
             }
-            // Hand the chunk to the handler's streaming body (if it is still reading); if
-            // the handler dropped its body, stop feeding but keep accounting so the window
-            // updates + content-length validation stay correct.
-            if !data.is_empty()
-                && let Some(tx) = rs.body_tx.get(&sid)
-                && tx.send(Ok(Bytes::copy_from_slice(data))).is_err()
-            {
-                rs.body_tx.remove(&sid);
+            // The stream survives this frame. Return the padding/overhead window immediately
+            // (it is consumed the instant it arrives — never handed to the handler).
+            if overhead > 0 {
+                push_ctrl(shared, notify, |out| {
+                    frame::write_frame(
+                        out,
+                        FrameType::WindowUpdate,
+                        0,
+                        sid,
+                        &overhead.to_be_bytes(),
+                    );
+                });
+            }
+            // Hand the DATA to the handler's body with CONSUME-GATED stream flow control: the
+            // window for these bytes is returned only as the handler takes each chunk (see
+            // `ConsumeGatedBody`), so a non-draining handler stops the window and the uploader
+            // is backpressured at the protocol level. If no handler is reading this body any
+            // more (it abandoned the upload), discard the bytes and return their window at
+            // once so the upload still drains to its end.
+            if data_len > 0 {
+                if let Some(tx) = rs.body_tx.get(&sid).map(|sink| sink.tx.clone()) {
+                    // Reserve the window for these bytes before the hand-off, so a mid-send
+                    // handler-drop can flush exactly what went un-consumed.
+                    reserve_recv_window(shared, sid, data_len);
+                    // Bounded hand-off: the reader PARKS here on a full channel — a
+                    // non-draining handler stops it from buffering the upload without limit
+                    // (mirrors the h1 body pump's bounded, backpressuring `send`).
+                    if tx.send(Bytes::copy_from_slice(data)).await.is_err() {
+                        // The handler dropped its body: stop feeding, flush the reserved but
+                        // un-consumed window so the peer can finish, then discard + replenish
+                        // eagerly for any further DATA (handled by the `else` branch below).
+                        rs.body_tx.remove(&sid);
+                        drain_recv_window(shared, notify, sid);
+                    }
+                } else {
+                    // No reader (abandoned body): discard and return the window at once.
+                    push_ctrl(shared, notify, |out| {
+                        frame::write_frame(
+                            out,
+                            FrameType::WindowUpdate,
+                            0,
+                            sid,
+                            &data_len.to_be_bytes(),
+                        );
+                    });
+                }
             }
             if end_stream {
                 // Declared content-length under-run (§8.1.2.6) — malformed; reset.
@@ -919,10 +1065,23 @@ where
         spawn(shared, notify, handler, sid, req);
     } else {
         // A body follows: hand the handler a streaming body the reader feeds from DATA
-        // frames, and dispatch now so the upload streams straight through.
-        let (tx, rx) = mpsc::unbounded_channel();
-        *req.body_mut() = http::ReqBody::from_stream(UnboundedReceiverStream::new(rx));
-        rs.body_tx.insert(sid, tx);
+        // frames over a BOUNDED channel, and dispatch now so the upload streams straight
+        // through. The handler's `ConsumeGatedBody` returns each chunk's receive window as it
+        // drains it (consume-driven replenishment), so a slow/non-draining handler is
+        // backpressured both in-process (the full bounded channel parks the reader) and at
+        // the protocol level (the un-replenished stream window closes on the peer).
+        let (tx, rx) = mpsc::channel(REQ_BODY_CHANNEL_DEPTH);
+        let truncated = Arc::new(AtomicBool::new(false));
+        let body = ConsumeGatedBody {
+            rx,
+            truncated: truncated.clone(),
+            shared: shared.clone(),
+            notify: notify.clone(),
+            sid,
+            errored: false,
+        };
+        *req.body_mut() = http::ReqBody::from_stream(body);
+        rs.body_tx.insert(sid, BodySink { tx, truncated });
         rs.received.insert(sid, 0);
         rs.dispatched.insert(sid);
         spawn(shared, notify, handler, sid, req);
@@ -950,14 +1109,81 @@ fn end_body(rs: &mut ReaderState, sid: u32) {
 
 /// Fail a stream's request body: tell the handler (if still reading) the body source
 /// failed — so a truncated/malformed body is never seen as a clean end — and clear the
-/// per-stream reader state.
+/// per-stream reader state. The truncation flag is set before the sink drops, so the signal
+/// reaches the handler even if the bounded channel is full.
 fn fail_body(rs: &mut ReaderState, sid: u32) {
-    if let Some(tx) = rs.body_tx.remove(&sid) {
-        let _ = tx.send(Err(http::BodyError));
+    if let Some(sink) = rs.body_tx.remove(&sid) {
+        sink.truncate();
     }
     rs.received.remove(&sid);
     rs.content_len.remove(&sid);
     rs.dispatched.remove(&sid);
+}
+
+/// Reserve `n` bytes of a stream's receive window as "handed toward the handler but not yet
+/// returned to the peer". Paired with [`release_recv_window`] (as the handler consumes each
+/// chunk) and [`drain_recv_window`] (if the handler abandons the body).
+fn reserve_recv_window(shared: &Conn, sid: u32, n: u32) {
+    let mut s = shared.lock().unwrap();
+    if let Some(st) = s.streams.get_mut(&sid) {
+        st.recv_unreleased = st.recv_unreleased.saturating_add(n);
+    }
+}
+
+/// Return `n` bytes of a stream's receive window to the peer (a stream-level `WINDOW_UPDATE`)
+/// as the handler consumes a chunk — the consume-driven replenishment that makes the receive
+/// window track handler progress. Skipped once the peer can no longer send DATA on the stream
+/// (it reached END_STREAM → half-closed-remote, was reset, or is gone), so a `WINDOW_UPDATE`
+/// is never emitted on a closed/half-closed-remote stream. Locks once — updating the tally
+/// and queueing the frame together — so it never re-enters the lock through [`push_ctrl`].
+fn release_recv_window(shared: &Conn, notify: &Arc<Notify>, sid: u32, n: u32) {
+    if n == 0 {
+        return;
+    }
+    {
+        let mut s = shared.lock().unwrap();
+        match s.streams.get_mut(&sid) {
+            Some(st)
+                if !st.reset
+                    && matches!(st.state, StreamState::Open | StreamState::HalfClosedLocal) =>
+            {
+                st.recv_unreleased = st.recv_unreleased.saturating_sub(n);
+                frame::write_frame(
+                    &mut s.ctrl,
+                    FrameType::WindowUpdate,
+                    0,
+                    sid,
+                    &n.to_be_bytes(),
+                );
+            }
+            _ => return,
+        }
+    }
+    notify.notify_one();
+}
+
+/// Flush a stream's remaining reserved-but-un-consumed receive window back to the peer when
+/// the handler abandons its body, so an abandoned upload can still drain to its end rather
+/// than stalling behind a window we would otherwise never reopen. A no-op once the stream can
+/// no longer receive DATA.
+fn drain_recv_window(shared: &Conn, notify: &Arc<Notify>, sid: u32) {
+    let n = {
+        let mut s = shared.lock().unwrap();
+        match s.streams.get_mut(&sid) {
+            Some(st)
+                if !st.reset
+                    && matches!(st.state, StreamState::Open | StreamState::HalfClosedLocal) =>
+            {
+                std::mem::take(&mut st.recv_unreleased)
+            }
+            _ => return,
+        }
+    };
+    if n > 0 {
+        push_ctrl(shared, notify, |out| {
+            frame::write_frame(out, FrameType::WindowUpdate, 0, sid, &n.to_be_bytes());
+        });
+    }
 }
 
 /// Spawn the handler task for a fully-built request (its body already set), bumping the
@@ -1062,6 +1288,9 @@ async fn emit_streaming(
         Some(st) if !st.reset => st.drain.clone(),
         _ => return,
     };
+    // For a declared-length (`StreamSized`) body, the bytes still owed against its committed
+    // `content-length`. `None` for an unsized `Body::Stream` (no length to enforce).
+    let mut remaining = content_length;
     // Poll the stream directly in this per-stream task — no channel, no producer task;
     // the writer frames each chunk as it arrives.
     while let Some(item) = stream.next().await {
@@ -1076,6 +1305,18 @@ async fn emit_streaming(
         };
         if chunk.is_empty() {
             continue;
+        }
+        // Declared-length OVER-run (§8.1.2.6): a `StreamSized` body whose source yields more
+        // than its committed `content-length`. RST rather than frame bytes past the length,
+        // so the client never sees a cleanly-ended body that is actually wrong — defense-in-
+        // depth parity with the h1 writer's force-close (the client's own §8.1.2.6 check is
+        // the backstop). An unsized body (`remaining` is `None`) is unaffected.
+        if let Some(rem) = remaining.as_mut() {
+            if chunk.len() > *rem {
+                reset_local(shared, notify, sid, ErrorCode::InternalError);
+                return;
+            }
+            *rem -= chunk.len();
         }
         if !push_out(
             shared,
@@ -1115,6 +1356,13 @@ async fn emit_streaming(
             }
             drain.notified().await;
         }
+    }
+    // Declared-length UNDER-run (§8.1.2.6): a `StreamSized` body whose source ended short of
+    // its committed `content-length` is truncated. RST rather than a clean END_STREAM, so the
+    // client sees an error, not a silently short body (h1-parity).
+    if remaining.is_some_and(|rem| rem != 0) {
+        reset_local(shared, notify, sid, ErrorCode::InternalError);
+        return;
     }
     // The source ended: close the stream with an empty END_STREAM DATA frame.
     push_out(
