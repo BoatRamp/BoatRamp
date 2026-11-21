@@ -7,7 +7,21 @@ versions.
 
 ## [Unreleased]
 
-## [0.68.0] — 2026-11-20
+## [0.68.1] — 2026-11-21
+
+### Fixed
+
+- **Docker compute: a legacy per-project network migrates to the scoped bridge on relaunch.** v0.68.0
+  pins each per-project docker network's Linux bridge to a scoped `boatramp-<hash>` name so the NixOS
+  compute-firewall can admit the shim ports on it, but the name applies only at network CREATE — a
+  network left over from before the upgrade kept its old unscoped `br-<hash>` bridge, which the firewall
+  does not match, and `stop()`'s best-effort reap raced the reconcile relaunch so a plain `compute
+  restart` re-used the stale network. `ensure_project_network` now inspects the existing network and,
+  when it is on a non-scoped bridge **and has no attached containers**, removes and recreates it with the
+  scoped bridge (same name, same per-project isolation labels) — so a `compute restart` of a project's
+  last workload migrates it automatically. A network with a live attached container is never torn down
+  (guarded on an explicitly-empty container set, with docker's own refusal to delete a network with
+  active endpoints as the backstop); a multi-workload project migrates once its workloads are cycled.
 
 ### Added
 
