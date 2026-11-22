@@ -199,6 +199,7 @@ See [boatramp.cfg](./boatramp-cfg.md) and
 | `BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN` | `overrides.ratelimit_fail_open` | Fail **open** instead of closed when the rate-limit KV is unreadable. |
 | `BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING` | `overrides.allow_implicit_routing` | Resolve an unmatched `Host` to a site without an explicit domain registration. |
 | `BOATRAMP_SECURITY_REQUIRE_POP` | `overrides.require_pop` | Require every token to be `cnf`-bound and PoP-proven fleet-wide. |
+| `BOATRAMP_SECURITY_REQUIRE_CHANNEL_BOUND_TOKENS` | `overrides.require_channel_bound_tokens` | Require every token to be channel-bound to its holder (`cnf`) key over mutual-RPK TLS (`--tls rpk`); a plain or unbound-channel token is refused. See [bootstrap TLS](../how-to/bootstrap-tls.md). |
 | `BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION` | `overrides.require_domain_verification` | Refuse to serve a non-local `Host` that isn't a verified, attached virtualhost. |
 | `BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS` | `overrides.allow_env_secret_refs` | Permit a handler's / function's `secrets` map to name a bare / `env:`-scheme reference into the serve process's own environment. Off under `multi-tenant`. |
 | `BOATRAMP_SECURITY_REQUIRE_TENANCY_DECLARATION` | `overrides.require_tenancy_declaration` | Require every `sql`/`orm`-opening component to make an explicit in-site tenancy decision (`disabled` or `scoped`). On under `multi-tenant`. |

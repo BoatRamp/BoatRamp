@@ -877,6 +877,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN",
     "BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING",
     "BOATRAMP_SECURITY_REQUIRE_POP",
+    "BOATRAMP_SECURITY_REQUIRE_CHANNEL_BOUND_TOKENS",
     "BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION",
     "BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS",
     "BOATRAMP_SECURITY_REQUIRE_TENANCY_DECLARATION",
@@ -4333,6 +4334,35 @@ mod tests {
         assert!(
             matches!(err, ConfigError::Resolve(_)),
             "garbage bool must fail loudly, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn env_toggles_require_channel_bound_tokens_into_the_resolved_posture() {
+        // The generic env overlay routes BOATRAMP_SECURITY_REQUIRE_CHANNEL_BOUND_TOKENS
+        // to `overrides.require_channel_bound_tokens`, and `resolve()` folds it onto the
+        // posture — the Stage-5 channel-binding knob reaches the enforcement point.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[(
+            "BOATRAMP_SECURITY_REQUIRE_CHANNEL_BOUND_TOKENS",
+            "true",
+        )]))
+        .expect("boolean parses");
+        assert_eq!(
+            cfg.security
+                .clone()
+                .unwrap()
+                .overrides
+                .require_channel_bound_tokens,
+            Some(true),
+        );
+        assert!(
+            cfg.security
+                .unwrap()
+                .resolve()
+                .unwrap()
+                .require_channel_bound_tokens,
+            "the env var must flip the resolved posture knob on"
         );
     }
 

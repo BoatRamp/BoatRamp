@@ -447,6 +447,94 @@ impl ServerCertVerifier for RpkServerVerifier {
     }
 }
 
+/// Server-side client-cert verifier that **accepts any** presented raw public key,
+/// proving only **possession** — rustls still verifies the TLS 1.3 `CertificateVerify`
+/// against the presented SPKI via [`Self::verify_tls13_signature`], so a connecting
+/// peer must control the private half of the key it shows. It pins **nothing** at
+/// the handshake, because the acceptable client keys are the holder (`cnf`) keys of
+/// valid tokens, which are unknown until the bearer is read on the HTTP request. The
+/// real authorization — "the presented client key equals the token's `cnf`" — is a
+/// **channel binding** enforced one layer up, at the auth middleware, over the exact
+/// SPKI this verifier admitted (surfaced via `peer_certificates()`).
+///
+/// Client auth is **offered but not mandated** ([`Self::client_auth_mandatory`] →
+/// `false`): an RPK-capable client that presents no key still completes the
+/// handshake, and the app layer then rejects it with a clean `401` when the posture
+/// requires a binding, rather than an opaque TLS alert. (This is mutual RPK per RFC
+/// 7250, so the client must be RPK-capable to negotiate client auth at all — a
+/// non-RPK / X.509 client is refused at the handshake, which is itself fail-closed.)
+/// Used **only** by the control-plane RPK bootstrap listener when
+/// `require_channel_bound_tokens` is on (see [`server_config_accept_any_client`]).
+#[derive(Debug)]
+struct AcceptAnyRawKeyClientVerifier {
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl ClientCertVerifier for AcceptAnyRawKeyClientVerifier {
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+
+    /// Offer client auth (send a `CertificateRequest`) so a client *can* present its
+    /// `cnf` key — but do not mandate it, so a bearer-only client still connects and
+    /// is rejected (when required) at the app layer with a clear message.
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, RustlsError> {
+        // Accept any raw public key: this verifier proves *possession* (the TLS 1.3
+        // signature below), not *trust*. Trust — the `cnf` channel binding — is the
+        // auth middleware's job, over the SPKI this admitted. We deliberately do NOT
+        // pin here: the server cannot know a token's `cnf` before the bearer arrives.
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Err(RustlsError::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        // Proof of possession: the client signed the handshake transcript with the
+        // private half of the raw public key it presented. Reject a forged binding.
+        verify_tls13_signature_with_raw_key(
+            message,
+            &SubjectPublicKeyInfoDer::from(cert.as_ref()),
+            dss,
+            &self.algs,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
 /// The **live** raw public key this node presents (RFC 7250). Held behind a lock
 /// and swapped in place on key rotation, so a node begins presenting `K_new` on
 /// new handshakes without rebuilding the rustls config — both the server and
@@ -554,6 +642,25 @@ pub fn client_config(
     Ok(config)
 }
 
+/// A dialer config that pins the server to the live `trust` keys for `peer` **and
+/// presents `client_identity`'s raw public key as the TLS client cert** — the
+/// channel-bound dialer that offers its token's holder (`cnf`) key as the client
+/// identity (so the server can bind the bearer to this channel). Mirrors
+/// [`client_config`] but takes the presented identity directly: the mesh wraps a
+/// node [`RpkIdentity`]; the control-plane CLI wraps the token's `cnf` key (built
+/// from the same Ed25519 seed via [`RpkIdentity::from_ed25519_seed`], so the
+/// presented SPKI equals the token's `cnf`). Resumption is disabled by
+/// [`client_config`], so the server's key is re-pinned on every handshake. TLS 1.3
+/// + PQ-hybrid only.
+pub fn client_config_presenting(
+    client_identity: &RpkIdentity,
+    trust: TrustSet,
+    peer: PeerId,
+) -> Result<ClientConfig, RpkError> {
+    let presented = PresentedKey::from_identity(client_identity)?;
+    client_config(&presented, trust, peer)
+}
+
 /// A **server-authenticated** server config: presents `presented`'s raw public
 /// key but requires **no client certificate** — for a channel where the client
 /// authenticates at a higher layer (e.g. a bearer token), such as the
@@ -566,6 +673,34 @@ pub fn server_config_server_auth(presented: &PresentedKey) -> Result<ServerConfi
         .with_cert_resolver(Arc::new(RpkServerKeyResolver(presented.clone())));
     // No TLS 1.3 tickets — a resumed handshake must never skip the dialer's live
     // trust-set re-check of this server's key (crate docs).
+    config.send_tls13_tickets = 0;
+    Ok(config)
+}
+
+/// A **channel-binding-capable** server config: presents `presented`'s raw public
+/// key and **requests** (but does not mandate) a client raw-public-key cert, so a
+/// client may present its token's holder (`cnf`) key as the TLS **client**
+/// identity. The client-cert verifier ([`AcceptAnyRawKeyClientVerifier`]) accepts
+/// **any** well-formed raw key — proving only *possession* — because the acceptable
+/// `cnf` keys are unknown until the bearer is read; the real check (presented client
+/// key == the token's `cnf`) is a **channel binding** enforced at the auth
+/// middleware over the admitted `peer_certificates()`. A bearer-only client that
+/// presents no cert still completes the handshake (auth is offered, not mandated),
+/// and is rejected — when the posture requires it — at the app layer with a clean
+/// `401`. This is the control-plane RPK listener's config under
+/// `require_channel_bound_tokens`. Note this is mutual RPK (RFC 7250): a connecting
+/// client must be RPK-capable to negotiate client auth, so a non-RPK (X.509 /
+/// no-client-auth) client is refused at the handshake. TLS 1.3 + PQ-hybrid only.
+pub fn server_config_accept_any_client(presented: &PresentedKey) -> Result<ServerConfig, RpkError> {
+    let provider = rpk_provider();
+    let algs = provider.signature_verification_algorithms;
+    let verifier = Arc::new(AcceptAnyRawKeyClientVerifier { algs });
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(Arc::new(RpkServerKeyResolver(presented.clone())));
+    // No TLS 1.3 tickets — a resumed handshake must never skip the client-cert
+    // verifier (or the dialer's live re-pin of this server's key) (crate docs).
     config.send_tls13_tickets = 0;
     Ok(config)
 }
@@ -739,6 +874,16 @@ impl RpkTls {
     /// TLS mode, where the client authenticates with a bearer token.
     pub fn server_auth(&self) -> Result<ServerConfig, RpkError> {
         server_config_server_auth(&self.presented)
+    }
+
+    /// A **channel-binding-capable** listener config: presents this node's key and
+    /// *requests* (but does not mandate) a client raw-public-key cert, so a client
+    /// may offer its token's holder (`cnf`) key as the TLS client identity — the
+    /// control-plane bootstrap TLS mode under `require_channel_bound_tokens`. The
+    /// presented client key is accepted (possession-proven) and surfaced for the auth
+    /// middleware to bind to the token's `cnf`. See [`server_config_accept_any_client`].
+    pub fn server_accept_any_client(&self) -> Result<ServerConfig, RpkError> {
+        server_config_accept_any_client(&self.presented)
     }
 
     /// The rustls config for dialing `peer`, verifying against the live keys the
@@ -1276,6 +1421,121 @@ mod tests {
             server_config_server_auth(&pk).unwrap().send_tls13_tickets,
             0,
             "server-auth config must issue no TLS 1.3 tickets"
+        );
+        assert_eq!(
+            server_config_accept_any_client(&pk)
+                .unwrap()
+                .send_tls13_tickets,
+            0,
+            "accept-any-client (channel-binding) config must issue no TLS 1.3 tickets"
+        );
+    }
+
+    /// Drive one localhost connection to a `server_config_accept_any_client` server.
+    /// `client` = `Some` → the dialer presents that identity as its TLS client cert
+    /// (via [`client_config_presenting`], pinning the server for peer `0`); `None` →
+    /// the dialer presents no client cert ([`client_config_server_auth`]). Returns the
+    /// SPKI the SERVER observed via `peer_certificates()` on a completed handshake
+    /// (`Ok(Some)` for a presented cert, `Ok(None)` for none), or `Err(())` if the
+    /// handshake failed.
+    async fn run_accept_any(
+        server: &RpkIdentity,
+        client: Option<&RpkIdentity>,
+        pinned_server_spki: &[u8],
+    ) -> Result<Option<Vec<u8>>, ()> {
+        let server_pk = PresentedKey::from_identity(server).unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(
+            server_config_accept_any_client(&server_pk).unwrap(),
+        ));
+        let trust = TrustSet::from_map(BTreeMap::from([(0u64, pinned_server_spki.to_vec())]));
+        let connector = TlsConnector::from(Arc::new(match client {
+            Some(id) => client_config_presenting(id, trust, 0).unwrap(),
+            None => client_config_server_auth(trust, 0).unwrap(),
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            match acceptor.accept(tcp).await {
+                Ok(mut tls) => {
+                    // The SPKI the app layer would read for channel binding.
+                    let presented = tls
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                        .map(|c| c.as_ref().to_vec());
+                    let mut buf = [0u8; 4];
+                    tls.read_exact(&mut buf).await.ok();
+                    tls.write_all(b"pong").await.ok();
+                    tls.flush().await.ok();
+                    Ok(presented)
+                }
+                Err(_) => Err(()),
+            }
+        });
+        let name = ServerName::try_from("rpk").unwrap();
+        let client_fut = async {
+            let tcp = TcpStream::connect(addr).await.map_err(|_| ())?;
+            let mut tls = connector.connect(name, tcp).await.map_err(|_| ())?;
+            tls.write_all(b"ping").await.map_err(|_| ())?;
+            tls.flush().await.map_err(|_| ())?;
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).await.map_err(|_| ())?;
+            Ok::<_, ()>(())
+        };
+        let (_client_ok, server_out) = tokio::join!(client_fut, server_task);
+        server_out.unwrap()
+    }
+
+    /// Stage 5 — the channel-binding listener: `server_config_accept_any_client`
+    /// admits ANY possession-proven client raw public key (no handshake pinning — the
+    /// acceptable `cnf` keys are unknown until the bearer is read) and surfaces the
+    /// presented SPKI via `peer_certificates()` so the app layer can bind it to the
+    /// token's `cnf`. Mutual RPK (RFC 7250) requires the client to be RPK-capable; a
+    /// non-RPK (X.509 / no-client-auth) client cannot negotiate client auth and is
+    /// refused at the handshake (fail-closed — stronger than an app-layer rejection).
+    /// The dialer still PINS the server (anti-impersonation preserved).
+    #[tokio::test]
+    async fn accept_any_client_surfaces_the_presented_key_and_pins_server() {
+        let server = RpkIdentity::generate().unwrap();
+        let server_spki = server.public_key().to_vec();
+        let client = RpkIdentity::generate().unwrap();
+        let client_spki = client.public_key().to_vec();
+
+        // An RPK client that presents its key → the server surfaces exactly that SPKI
+        // (the channel-binding material); possession is proven by the handshake itself.
+        assert_eq!(
+            run_accept_any(&server, Some(&client), &server_spki).await,
+            Ok(Some(client_spki)),
+            "the server must surface the presented client raw public key"
+        );
+        // An attacker's RPK key is ALSO admitted at the handshake (no pinning here, by
+        // design) and surfaced as a DIFFERENT SPKI — the app layer then rejects it
+        // because it does not equal the token's `cnf`. The handshake only proves
+        // possession; the binding is the auth layer's decision.
+        let attacker = RpkIdentity::generate().unwrap();
+        assert_eq!(
+            run_accept_any(&server, Some(&attacker), &server_spki).await,
+            Ok(Some(attacker.public_key().to_vec())),
+            "a different client key is admitted + surfaced (the app layer binds it)"
+        );
+        // A non-RPK (X.509 / no-client-auth) client cannot negotiate RFC 7250 client
+        // auth → refused at the handshake. The channel-binding listener is mutual-RPK:
+        // a client must be RPK-capable to connect.
+        assert_eq!(
+            run_accept_any(&server, None, &server_spki).await,
+            Err(()),
+            "a non-RPK client must be refused at the mutual-RPK channel-binding handshake"
+        );
+        // The dialer still pins the server: a wrong pinned server key is rejected even
+        // on the accept-any-client listener (the server-auth guarantee is unchanged).
+        let stranger = RpkIdentity::generate().unwrap();
+        assert_eq!(
+            run_accept_any(&server, Some(&client), stranger.public_key()).await,
+            Err(()),
+            "a wrong pinned server key must be rejected on the channel-binding listener"
         );
     }
 }

@@ -85,6 +85,14 @@ enum TokenCommand {
         /// Also set `BOATRAMP_POP_ORIGIN` to the server's `[serve] pop_origin`.
         #[arg(long, conflicts_with = "holder_pub")]
         pop: bool,
+        /// Mint the `--pop` holder keypair as **Ed25519** instead of the default
+        /// ES256, so the printed `BOATRAMP_TOKEN_HOLDER_KEY` can also be presented as
+        /// the RFC 7250 TLS **client** identity for **channel binding** (Stage 5): the
+        /// CLI offers it on an `--tls rpk` channel, and a server with
+        /// `require_channel_bound_tokens` on binds the token to that channel. Requires
+        /// `--pop`.
+        #[arg(long, requires = "pop")]
+        channel_bind: bool,
     },
     /// Mint the FIRST control-plane token on a fresh deploy by presenting the
     /// single-use bootstrap secret (`BOATRAMP_BOOTSTRAP_SECRET`) — no admin token
@@ -303,12 +311,19 @@ pub async fn run(args: TokenArgs, config: &ProjectConfig) -> Result<TokenOutput>
             ttl_secs,
             holder_pub,
             pop,
+            channel_bind,
         } => {
             // `--pop`: generate a holder keypair and bind the token to its public
-            // half; the printed private key is the per-request signing key.
-            let pop_holder = pop.then(|| {
-                boatramp_core::cose::LocalSigner::generate(boatramp_core::cose::TokenAlg::Es256)
-            });
+            // half; the printed private key is the per-request signing key. With
+            // `--channel-bind` the keypair is Ed25519 (RFC 7250-presentable as a TLS
+            // client identity for Stage-5 channel binding) instead of the default
+            // ES256; the same key then serves both the DPoP proof and the channel bind.
+            let pop_alg = if channel_bind {
+                boatramp_core::cose::TokenAlg::Ed25519
+            } else {
+                boatramp_core::cose::TokenAlg::Es256
+            };
+            let pop_holder = pop.then(|| boatramp_core::cose::LocalSigner::generate(pop_alg));
             let holder_pubkey = match &pop_holder {
                 Some(holder) => {
                     use boatramp_core::cose::Signer;
@@ -338,6 +353,14 @@ pub async fn run(args: TokenArgs, config: &ProjectConfig) -> Result<TokenOutput>
                     "PoP-bound token. Also set BOATRAMP_POP_ORIGIN to the server's \
                      [serve] pop_origin so the client binds the right origin."
                 );
+                if channel_bind {
+                    tracing::info!(
+                        "channel-bindable (Ed25519) holder key. On an --tls rpk channel, also set \
+                         BOATRAMP_SERVER_PUBKEY; the CLI then presents this key as the TLS client \
+                         identity so a server with require_channel_bound_tokens binds the token to \
+                         the channel."
+                    );
+                }
                 tracing::warn!("store both secrets now — they cannot be recovered");
                 Ok(TokenOutput::CreatedPop {
                     token: response.token,

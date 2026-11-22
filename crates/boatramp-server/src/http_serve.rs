@@ -82,6 +82,13 @@ impl From<(Router, crate::FastServe)> for ServeInput {
 pub struct RouterHandler {
     serve: ServeInput,
     peer: SocketAddr,
+    /// The raw public key (RFC 7250 SPKI DER) the client presented as its TLS client
+    /// cert on this connection, if any — surfaced as a [`crate::auth::ChannelPeerKey`]
+    /// request extension for the Stage-5 channel binding of holder-bound tokens.
+    /// `None` on plaintext, a server-auth-only RPK handshake, and every non-RPK
+    /// listener. Per-connection (the TLS identity), so it is the same for every
+    /// request on the connection.
+    client_rpk: Option<Vec<u8>>,
 }
 
 impl RouterHandler {
@@ -89,6 +96,21 @@ impl RouterHandler {
         Self {
             serve: serve.into(),
             peer,
+            client_rpk: None,
+        }
+    }
+
+    /// Like [`new`](Self::new) but carrying the client's presented raw public key
+    /// (the TLS client cert SPKI DER) for channel binding.
+    fn with_client_rpk(
+        serve: impl Into<ServeInput>,
+        peer: SocketAddr,
+        client_rpk: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            serve: serve.into(),
+            peer,
+            client_rpk,
         }
     }
 }
@@ -102,6 +124,15 @@ impl Handler for RouterHandler {
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(self.peer));
+        // Carry the client's presented raw public key (TLS client cert, RFC 7250) so
+        // the auth middleware can channel-bind a holder-bound token to it (Stage 5).
+        // Server-derived from the completed handshake — a client cannot set it at the
+        // HTTP layer. Absent for plaintext / server-auth-only / non-RPK connections.
+        if let Some(key) = &self.client_rpk {
+            request
+                .extensions_mut()
+                .insert(crate::auth::ChannelPeerKey(key.clone()));
+        }
 
         // Hot path: an eligible plain site GET/HEAD skips the axum router + middleware
         // future-composition (~15–20% of per-core CPU, profiled) and dispatches straight
@@ -197,8 +228,21 @@ async fn serve_tls_stream(
     peer: SocketAddr,
     serve: ServeInput,
 ) {
-    let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-    let handler = RouterHandler::new(serve, peer);
+    let (alpn, client_rpk) = {
+        let conn = stream.get_ref().1;
+        let alpn = conn.alpn_protocol().map(<[u8]>::to_vec);
+        // The client's presented RFC 7250 raw public key (SPKI DER), if it sent one —
+        // only the channel-binding RPK listener requests a client cert, so this is
+        // `None` for every server-auth-only / ACME / custom-cert handshake. rustls has
+        // already verified possession (the TLS 1.3 CertificateVerify) for any cert
+        // present here, so the app layer only needs to compare it to the token's `cnf`.
+        let client_rpk = conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| cert.as_ref().to_vec());
+        (alpn, client_rpk)
+    };
+    let handler = RouterHandler::with_client_rpk(serve, peer, client_rpk);
     let result = match alpn.as_deref() {
         // The challenge handshake alone satisfies the CA — nothing to serve.
         Some(p) if p == ACME_TLS_ALPN => {

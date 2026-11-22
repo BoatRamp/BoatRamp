@@ -309,7 +309,24 @@ pub fn build_client(
             let trust = boatramp_rpktls::TrustSet::from_map(std::collections::BTreeMap::from([(
                 0u64, spki,
             )]));
-            if let Ok(config) = boatramp_rpktls::client_config_server_auth(trust, 0) {
+            // Stage 5 — channel-bound tokens. If the configured holder (`cnf`) key is
+            // an Ed25519 key, present it as the TLS *client* identity (RFC 7250) so the
+            // server can bind the bearer to this channel (presented client key == the
+            // token's `cnf`) — a token captured off this channel is then inert. The
+            // server only *requests* a client cert when its posture requires channel
+            // binding; against a server-auth-only listener the client cert is simply
+            // never sent, so this is transparent and falls back to server-auth pinning.
+            // An ES256 holder cannot be an RPK client identity (the identity is
+            // Ed25519-only), so the server is pinned without a client cert — DPoP still
+            // binds the token per-request. Either way the server's key is pinned.
+            let channel_identity = holder_key
+                .and_then(ed25519_seed_from_holder_hex)
+                .and_then(|seed| boatramp_rpktls::RpkIdentity::from_ed25519_seed(&seed).ok());
+            let config = match &channel_identity {
+                Some(identity) => boatramp_rpktls::client_config_presenting(identity, trust, 0),
+                None => boatramp_rpktls::client_config_server_auth(trust, 0),
+            };
+            if let Ok(config) = config {
                 builder = builder.use_preconfigured_tls(config);
             }
         }
@@ -329,6 +346,20 @@ pub fn build_client(
         _ => None,
     };
     ApiClient { inner, pop }
+}
+
+/// Extract the 32-byte Ed25519 seed from a holder key spec `"ed25519:<hex>"` — the
+/// private half of a token's `cnf`, as carried in `BOATRAMP_TOKEN_HOLDER_KEY` — so
+/// it can be presented as the RFC 7250 TLS client identity for Stage-5 channel
+/// binding. For an Ed25519 `LocalSigner` the stored hex **is** the 32-byte seed, so
+/// the TLS identity built from it (`RpkIdentity::from_ed25519_seed`) is provably the
+/// same principal as the token's `cnf`. Returns `None` for an ES256 holder (not an
+/// RPK-presentable key) or any malformed value; the caller then pins the server
+/// without presenting a client cert.
+fn ed25519_seed_from_holder_hex(holder: &str) -> Option<[u8; 32]> {
+    let raw = holder.trim().strip_prefix("ed25519:")?;
+    let bytes = hex::decode(raw).ok()?;
+    bytes.as_slice().try_into().ok()
 }
 
 /// A control-plane HTTP client that transparently attaches a per-request
@@ -3356,6 +3387,39 @@ impl ControlPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stage 5 — the CLI's channel-bind identity is **provably the token's `cnf`**:
+    /// the Ed25519 TLS client identity built from `BOATRAMP_TOKEN_HOLDER_KEY`'s seed
+    /// presents an SPKI whose 32-byte key equals the holder's public key, so a server
+    /// binding `presented client key == cnf` accepts the channel. An ES256 or
+    /// malformed holder yields no seed (the CLI then pins the server with no client
+    /// cert — fail-safe, DPoP still binds).
+    #[test]
+    fn ed25519_holder_seed_builds_the_matching_tls_client_identity() {
+        use boatramp_core::cose::{LocalSigner, Signer, TokenAlg};
+        let holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let seed = ed25519_seed_from_holder_hex(&holder.private_hex())
+            .expect("an ed25519 holder yields a 32-byte seed");
+        let identity = boatramp_rpktls::RpkIdentity::from_ed25519_seed(&seed).unwrap();
+        // The presented TLS identity's SPKI (44-byte Ed25519 SPKI) carries exactly the
+        // holder's raw public key in its 32-byte tail — i.e. the token's `cnf`.
+        let spki = identity.public_key();
+        assert_eq!(spki.len(), 44);
+        let cnf_hex = holder.public_key().to_hex();
+        let raw = cnf_hex.strip_prefix("ed25519:").unwrap();
+        assert_eq!(
+            hex::encode(&spki[12..]),
+            raw,
+            "the presented TLS client key must equal the token's cnf"
+        );
+        // An ES256 holder is not RPK-presentable → no seed (server-auth pin only).
+        let es = LocalSigner::generate(TokenAlg::Es256);
+        assert!(ed25519_seed_from_holder_hex(&es.private_hex()).is_none());
+        // Malformed holder specs yield None (no client cert; never a panic).
+        assert!(ed25519_seed_from_holder_hex("ed25519:zz").is_none());
+        assert!(ed25519_seed_from_holder_hex("ed25519:00").is_none());
+        assert!(ed25519_seed_from_holder_hex("not-a-key").is_none());
+    }
 
     #[test]
     fn blob_hash_detection_is_exact() {
