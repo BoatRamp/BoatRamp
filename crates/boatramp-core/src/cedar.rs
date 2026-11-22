@@ -875,6 +875,97 @@ pub mod generic {
                     .unwrap()
             );
         }
+
+        /// LOAD-BEARING-SCHEMA regression gate (authz follow-up 1b).
+        ///
+        /// `CompiledPolicySet::evaluate` passes `Some(&self.schema)` into
+        /// `Request::new`, which rejects a caller-supplied request/context that does
+        /// not conform to the schema *before* Cedar evaluates it. This gate proves
+        /// that per-request check is **not** redundant with the compile-time
+        /// `Validator::validate` (which type-checks only the *policies*) and must not
+        /// be dropped: without it a request that omits a **required** context
+        /// attribute a `forbid` depends on would silently bypass that `forbid`
+        /// (Cedar *skips* a policy that errors mid-evaluation — see
+        /// `AuthzDecision::errors`), flipping a Deny into an Allow (fail-open).
+        ///
+        /// Context is the exposed surface: `prepare_context` parses it schema-free
+        /// (`Context::from_json_str(.., None)`) and `prepare_uid` parses uids
+        /// schema-free, so `Request::new(.., Some(schema))` is the *only* place the
+        /// caller's request shape is validated.
+        #[test]
+        fn request_schema_check_is_load_bearing_not_redundant_with_validate() {
+            // A required `blocked: Bool` context attribute, referenced by a `forbid`.
+            const SCHEMA_CTX: &str = r#"
+                entity User;
+                entity Photo;
+                action "view" appliesTo {
+                    principal: [User],
+                    resource: [Photo],
+                    context: { blocked: Bool }
+                };
+            "#;
+            // Broad permit + a conditional forbid that reads the required attribute.
+            const POLICY_CTX: &str = r#"
+                permit(principal, action == Action::"view", resource);
+                forbid(principal, action == Action::"view", resource)
+                    when { context.blocked };
+            "#;
+
+            // The policies type-check against the schema at compile time — i.e.
+            // `Validator::validate` is satisfied. This is the exact premise 1b would
+            // lean on; the point is that it is *not sufficient*.
+            let compiled = CompiledPolicySet::compile_and_validate(SCHEMA_CTX, POLICY_CTX)
+                .expect("permit + context-guarded forbid must validate against the schema");
+            let entities = compiled.prepare_entities(ENTITIES).unwrap();
+            let view = compiled.prepare_uid(r#"Action::"view""#).unwrap();
+            let vacation = compiled.prepare_uid(r#"Photo::"vacation""#).unwrap();
+            let alice = compiled.prepare_uid(r#"User::"alice""#).unwrap();
+
+            // (1) FAIL-CLOSED today: a request whose context omits the required
+            // `blocked` attribute is rejected by the per-request schema check inside
+            // `Request::new(.., Some(schema))` — a loud `Request` error, never an
+            // (accidental) Allow. `None` context ⇒ `Context::empty()`.
+            let err = compiled
+                .evaluate(&alice, &view, &vacation, None, &entities)
+                .expect_err("a request missing the required `blocked` context must be rejected");
+            assert!(
+                matches!(err, GenericCedarError::Request(_)),
+                "expected a Request (schema-conformance) error, got {err:?}"
+            );
+
+            // A well-formed context (blocked = true) is accepted AND the forbid then
+            // applies → Deny. (Proves the forbid is live when its input is present.)
+            let ctx_blocked = compiled.prepare_context(r#"{ "blocked": true }"#).unwrap();
+            let decided = compiled
+                .evaluate(&alice, &view, &vacation, Some(&ctx_blocked), &entities)
+                .expect("a schema-conforming request is accepted");
+            assert!(!decided.allow, "the forbid must deny when blocked = true");
+
+            // (2) COUNTERFACTUAL — what dropping the schema would do. Build the SAME
+            // request schema-free (`Request::new(.., None)`, as the internal path and
+            // as 1b proposed) with the empty context and run the shared engine
+            // directly. The forbid's `context.blocked` now *errors* (missing attr),
+            // so Cedar SKIPS the forbid and the broad permit carries the request to
+            // ALLOW — the fail-open the per-request schema check prevents.
+            let schemaless_req = Request::new(
+                r#"User::"alice""#.parse().unwrap(),
+                r#"Action::"view""#.parse().unwrap(),
+                r#"Photo::"vacation""#.parse().unwrap(),
+                Context::empty(),
+                None,
+            )
+            .expect("a schema-free request is always constructible");
+            let raw = compiled.engine.evaluate(&schemaless_req, &entities.0);
+            assert!(
+                raw.allow,
+                "counterfactual: schema-free eval ALLOWS (forbid skipped on the missing \
+                 required attr) — this is the fail-open the schema check closes: {raw:?}"
+            );
+            assert!(
+                !raw.errors.is_empty(),
+                "the skipped forbid must surface as an evaluation error: {raw:?}"
+            );
+        }
     }
 }
 
