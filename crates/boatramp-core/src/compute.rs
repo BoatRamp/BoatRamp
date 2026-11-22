@@ -7697,8 +7697,7 @@ mod tests {
         ];
 
         let _ = launch_one(
-            &backend, "default", "w", 0, 1, None, &s, "spec-a", &extra_env, None, None, false,
-            None,
+            &backend, "default", "w", 0, 1, None, &s, "spec-a", &extra_env, None, None, false, None,
         )
         .await
         .expect("launch");
