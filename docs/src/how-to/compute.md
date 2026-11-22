@@ -29,7 +29,7 @@ URL and the CLI uploads it for you:
 boatramp compute build web --image nginx:1.27 --kernel ./vmlinux --port 80
 # or a URL:
 boatramp compute build web --image nginx:1.27 \
-  --kernel https://example.com/vmlinux-6.1 --port 80
+  --kernel https://example.com/vmlinux-6.12 --port 80
 ```
 
 To upload a kernel once and reuse its hash across commands, use
