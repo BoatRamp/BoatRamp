@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use boatramp_core::daemon_config::{DaemonConfig, KernelRef};
+use boatramp_core::daemon_config::{ConfigLimits, DaemonConfig, KernelRef};
 use clap::Subcommand;
 use serde::Deserialize;
 
@@ -43,6 +43,12 @@ pub enum Error {
     /// The server rejected the config (validate-before-commit).
     #[error("server rejected the config: {0}")]
     Rejected(String),
+    /// A proposed write this server's posture/ceilings forbid, refused at SET time —
+    /// before any write reaches the server — with the reason, so the operator is told
+    /// immediately instead of via a late apply-time `400`. (Loosening a tighten-only
+    /// posture knob, or a cap above the server's static ceiling.)
+    #[error("{0}")]
+    PostureRefused(String),
     /// Migrating an `apply` manifest to the current schema failed.
     #[error(transparent)]
     Migrate(#[from] crate::apply::Error),
@@ -169,6 +175,13 @@ enum ConfigCommand {
 struct ConfigResponse {
     generation: Option<String>,
     config: DaemonConfig,
+    /// The server's advertised static ceilings (posture-derived upload cap + the
+    /// concurrency ceiling), used to refuse an over-ceiling/loosening write at set
+    /// time. `#[serde(default)]` so an older server that doesn't advertise them
+    /// yields no ceilings — the client then never *wrongly* refuses, and the server's
+    /// own validation stays the authority.
+    #[serde(default)]
+    limits: ConfigLimits,
 }
 
 /// One dynamic config key and its one-line note (the `config list` rows).
@@ -539,6 +552,18 @@ async fn get(
     })
 }
 
+/// Refuse — at SET time, before the write reaches the server — a proposed dynamic
+/// config the server's advertised ceilings / tighten-only posture ratchet would
+/// reject with a `400`. Runs the SAME [`DaemonConfig::validate_limits`] the server
+/// runs, against the [`ConfigLimits`] the client fetched, so the operator gets a
+/// clean, early, explained refusal (naming WHY + pointing at `boatramp.cfg` +
+/// restart for a posture loosening) instead of a late, bare apply-time `400`.
+/// `what` names the action for the message (e.g. `set compute.vcpus = 64`).
+fn refuse_if_invalid(cfg: &DaemonConfig, limits: &ConfigLimits, what: &str) -> Result<()> {
+    cfg.validate_limits(limits)
+        .map_err(|msg| Error::PostureRefused(format!("refusing to {what}: {msg}")))
+}
+
 async fn set(
     http: &crate::client::ApiClient,
     server: &str,
@@ -547,6 +572,10 @@ async fn set(
 ) -> Result<ConfigOutput> {
     let mut r = fetch(http, server).await?;
     write_key(&mut r.config, key, value)?;
+    // Set-time refusal: validate the proposed config against the server's advertised
+    // ceilings/posture ratchet BEFORE the PUT, so a loosening or over-ceiling write is
+    // refused cleanly and early rather than via a late apply-time 400.
+    refuse_if_invalid(&r.config, &r.limits, &format!("set {key} = {value}"))?;
     let generation = put(http, server, &r.config).await?;
     Ok(ConfigOutput::Set {
         key: key.to_string(),
@@ -576,6 +605,11 @@ async fn apply(
 ) -> Result<ConfigOutput> {
     let bytes = std::fs::read(file)?;
     let cfg: DaemonConfig = serde_json::from_slice(&bytes)?;
+    // Set-time refusal (same contract as `set`): fetch the server's advertised limits
+    // and refuse an over-ceiling/loosening replacement cleanly and early, before the
+    // PUT, instead of surfacing the identical late apply-time 400.
+    let limits = fetch(http, server).await?.limits;
+    refuse_if_invalid(&cfg, &limits, &format!("apply {}", file.display()))?;
     let generation = put(http, server, &cfg).await?;
     Ok(ConfigOutput::Applied {
         file: file.display().to_string(),
@@ -837,5 +871,59 @@ mod tests {
     fn read_key_reports_unset() {
         let cfg = DaemonConfig::default();
         assert!(read_key(&cfg, "default_site").unwrap().contains("unset"));
+    }
+
+    #[test]
+    fn set_time_refusal_catches_loosening_posture() {
+        // A loosening posture knob is refused at SET time (no server round-trip), with
+        // a clear, actionable message — not a bare late 400.
+        let mut cfg = DaemonConfig::default();
+        write_key(&mut cfg, "posture.ratelimit_fail_open", "true").unwrap();
+        let err = refuse_if_invalid(
+            &cfg,
+            &ConfigLimits::default(),
+            "set posture.ratelimit_fail_open = true",
+        )
+        .unwrap_err();
+        let Error::PostureRefused(msg) = &err else {
+            panic!("expected a set-time PostureRefused, got {err:?}");
+        };
+        assert!(
+            msg.contains("refusing to set posture.ratelimit_fail_open = true"),
+            "{msg}"
+        );
+        assert!(msg.contains("tighten-only"), "{msg}");
+        assert!(msg.contains("boatramp.cfg"), "{msg}");
+    }
+
+    #[test]
+    fn set_time_refusal_catches_over_ceiling_cap() {
+        // A cap above the server's advertised (posture-derived) ceiling is refused early.
+        let mut cfg = DaemonConfig::default();
+        write_key(&mut cfg, "max_upload_bytes", "1000").unwrap();
+        let limits = ConfigLimits {
+            max_upload_ceiling: 100,
+            max_concurrent_uploads_ceiling: None,
+        };
+        let err = refuse_if_invalid(&cfg, &limits, "set max_upload_bytes = 1000").unwrap_err();
+        assert!(
+            matches!(err, Error::PostureRefused(ref m) if m.contains("exceeds the static ceiling"))
+        );
+    }
+
+    #[test]
+    fn set_time_refusal_allows_a_valid_write() {
+        // A valid tighten / within-ceiling write is NOT refused — the accepted set is
+        // unchanged; only a would-be-400 write is turned into an early refusal.
+        let mut cfg = DaemonConfig::default();
+        write_key(&mut cfg, "posture.ratelimit_fail_open", "false").unwrap(); // tighten
+        write_key(&mut cfg, "max_upload_bytes", "50").unwrap();
+        let limits = ConfigLimits {
+            max_upload_ceiling: 100,
+            max_concurrent_uploads_ceiling: None,
+        };
+        assert!(refuse_if_invalid(&cfg, &limits, "set …").is_ok());
+        // With no advertised ceiling (older server), the cap check can't fire client-side.
+        assert!(refuse_if_invalid(&cfg, &ConfigLimits::default(), "set …").is_ok());
     }
 }

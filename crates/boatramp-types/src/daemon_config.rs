@@ -180,6 +180,52 @@ pub struct ConfigBaseline {
     pub posture: SecurityPosture,
 }
 
+/// The validate-relevant slice of the [`ConfigBaseline`] — the static numeric
+/// ceilings a dynamic-config **write** is checked against. Serializable so a
+/// client (the `boatramp config set`/`apply` path) can fetch it from
+/// `GET /api/daemon/config` and run the **same** [`DaemonConfig::validate_limits`]
+/// at *set* time, turning a would-be apply-time `400` into a clean, early,
+/// explained refusal.
+///
+/// These ceilings are the only baseline-dependent inputs to validation: the
+/// posture tighten-only ratchet needs no baseline — a loosening value is unsafe
+/// *regardless* of the server's posture — so advertising the ceilings is all a
+/// caller needs to pre-validate the full write. The upload ceiling is
+/// posture-derived (it is the file posture's `max_upload_bytes`), which is why
+/// the client cannot know it without this plumbing. Byte/count caps use the
+/// convention `0`/`None` = unlimited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigLimits {
+    /// Static ceiling for `max_upload_bytes` (`0` = no ceiling).
+    pub max_upload_ceiling: u64,
+    /// Static ceiling for `max_concurrent_uploads` (`None` = no ceiling).
+    pub max_concurrent_uploads_ceiling: Option<u64>,
+}
+
+impl Default for ConfigLimits {
+    /// No ceilings. A caller that lacks the real limits — e.g. an older server that
+    /// doesn't advertise them yet — thus never *wrongly* refuses a write client-side;
+    /// the server's own [`DaemonConfig::validate`] stays the authority.
+    fn default() -> Self {
+        Self {
+            max_upload_ceiling: 0,
+            max_concurrent_uploads_ceiling: None,
+        }
+    }
+}
+
+impl ConfigBaseline {
+    /// The validate-relevant ceilings as a serializable view the server can
+    /// advertise and a client can pre-validate against (see [`ConfigLimits`]).
+    pub fn limits(&self) -> ConfigLimits {
+        ConfigLimits {
+            max_upload_ceiling: self.max_upload_ceiling,
+            max_concurrent_uploads_ceiling: self.max_concurrent_uploads_ceiling,
+        }
+    }
+}
+
 /// The resolved, effective config the server actually runs on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveConfig {
@@ -367,8 +413,22 @@ impl DaemonConfig {
 
     /// Validate a proposed dynamic config against the baseline for the **write**
     /// path (leader-side, before Raft commit): reject a wrong schema version, a
-    /// cap above its static ceiling, or a loosening posture override.
+    /// cap above its static ceiling, or a loosening posture override. Thin wrapper
+    /// over [`validate_limits`](Self::validate_limits) — the one validation body —
+    /// passing the baseline's [`ConfigLimits`].
     pub fn validate(&self, base: &ConfigBaseline) -> Result<(), String> {
+        self.validate_limits(&base.limits())
+    }
+
+    /// The write-path validation against just the static [`ConfigLimits`] (plus the
+    /// baseline-independent tighten-only posture ratchet): reject a wrong schema
+    /// version, a cap above its static ceiling, or a loosening posture override.
+    ///
+    /// This is the shared validator the server runs (via [`validate`](Self::validate))
+    /// AND the CLI runs at *set* time — the client fetches the server's advertised
+    /// [`ConfigLimits`] and calls this to refuse a loosening or over-ceiling write
+    /// cleanly and early, instead of surfacing the identical late apply-time `400`.
+    pub fn validate_limits(&self, limits: &ConfigLimits) -> Result<(), String> {
         if self.version != crate::SCHEMA_VERSION {
             return Err(format!(
                 "unsupported daemon-config version {} (expected {})",
@@ -377,16 +437,16 @@ impl DaemonConfig {
             ));
         }
         if let Some(v) = self.max_upload_bytes
-            && exceeds_ceiling(v, base.max_upload_ceiling)
+            && exceeds_ceiling(v, limits.max_upload_ceiling)
         {
             return Err(format!(
                 "max_upload_bytes {v} exceeds the static ceiling {}",
-                base.max_upload_ceiling
+                limits.max_upload_ceiling
             ));
         }
         if let (Some(v), Some(c)) = (
             self.max_concurrent_uploads,
-            base.max_concurrent_uploads_ceiling,
+            limits.max_concurrent_uploads_ceiling,
         ) && v > c
         {
             return Err(format!(
@@ -594,5 +654,85 @@ mod tests {
         let back: DaemonConfig = serde_json::from_slice(&json).unwrap();
         assert_eq!(cfg, back);
         assert!(serde_json::from_slice::<DaemonConfig>(br#"{"nope":1}"#).is_err());
+    }
+
+    #[test]
+    fn baseline_limits_carry_the_posture_derived_ceilings() {
+        // The upload ceiling is the file posture's upload cap, so `limits()` differs
+        // per posture — exactly the value a client can't know without plumbing.
+        let mut base = baseline();
+        base.max_upload_ceiling = 4096;
+        base.max_concurrent_uploads_ceiling = Some(8);
+        let limits = base.limits();
+        assert_eq!(limits.max_upload_ceiling, 4096);
+        assert_eq!(limits.max_concurrent_uploads_ceiling, Some(8));
+        // A strict (multi-tenant) posture's upload cap flows through to the ceiling.
+        let strict = ConfigBaseline {
+            max_upload_ceiling: SecurityProfile::MultiTenant.preset().max_upload_bytes,
+            ..baseline()
+        };
+        assert_eq!(
+            strict.limits().max_upload_ceiling,
+            SecurityProfile::MultiTenant.preset().max_upload_bytes
+        );
+    }
+
+    #[test]
+    fn config_limits_json_round_trips_and_defaults_to_unlimited() {
+        let limits = ConfigLimits {
+            max_upload_ceiling: 100,
+            max_concurrent_uploads_ceiling: Some(8),
+        };
+        let json = serde_json::to_vec(&limits).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ConfigLimits>(&json).unwrap(),
+            limits
+        );
+        // An older server advertises no `limits`: a missing field defaults to no
+        // ceiling, so a client never wrongly refuses on the ceiling checks.
+        let empty: ConfigLimits = serde_json::from_slice(b"{}").unwrap();
+        assert_eq!(empty, ConfigLimits::default());
+        assert_eq!(empty.max_upload_ceiling, 0);
+        assert!(empty.max_concurrent_uploads_ceiling.is_none());
+    }
+
+    #[test]
+    fn validate_limits_matches_validate_and_catches_each_case() {
+        let base = baseline();
+        let limits = base.limits();
+        // `validate` delegates to `validate_limits` — identical verdicts.
+        let over = DaemonConfig {
+            max_upload_bytes: Some(1000), // ceiling is 100
+            ..Default::default()
+        };
+        assert!(over.validate(&base).is_err());
+        assert!(over.validate_limits(&limits).is_err());
+        assert!(
+            over.validate_limits(&limits)
+                .unwrap_err()
+                .contains("exceeds the static ceiling")
+        );
+        // A loosening posture override is caught with no baseline knowledge at all
+        // (the tighten-only ratchet is posture-independent).
+        let loosen = DaemonConfig {
+            posture: PostureTighten {
+                ratelimit_fail_open: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = loosen
+            .validate_limits(&ConfigLimits::default())
+            .unwrap_err();
+        assert!(err.contains("tighten-only"), "{err}");
+        assert!(err.contains("ratelimit_fail_open"), "{err}");
+        // A valid write passes both.
+        let ok = DaemonConfig {
+            max_upload_bytes: Some(50),
+            protect_previews: Some(true),
+            ..Default::default()
+        };
+        assert!(ok.validate(&base).is_ok());
+        assert!(ok.validate_limits(&limits).is_ok());
     }
 }

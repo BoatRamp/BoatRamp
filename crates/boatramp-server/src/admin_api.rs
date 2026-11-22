@@ -1011,6 +1011,11 @@ pub(super) async fn get_daemon_config(
         Ok(cfg) => Json(serde_json::json!({
             "generation": daemon.generation(),
             "config": cfg.unwrap_or_default(),
+            // Advertise the validate-relevant static ceilings (the posture-derived
+            // upload cap + the concurrency ceiling) so the CLI can run the SAME
+            // `validate_limits` at set time and refuse a loosening/over-ceiling write
+            // cleanly and early instead of via a late apply-time 400.
+            "limits": daemon.baseline().limits(),
         }))
         .into_response(),
         Err(err) => deploy_error_response(err),
