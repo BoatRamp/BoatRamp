@@ -2304,10 +2304,7 @@ async fn put_workload(
     let request = PutComputeRequest {
         spec,
         replicas,
-        placement: PlacementConstraints {
-            regions,
-            labels: BTreeMap::new(),
-        },
+        placement: PlacementConstraints::new().with_regions(regions),
         priority,
     };
     let resp: serde_json::Value = http

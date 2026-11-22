@@ -400,9 +400,12 @@ pub struct ComputeSpec {
 
 /// A single [`ComputeSpec::post_launch`] action. Extensible: `Exec` is the canonical
 /// general kind (run a command in the launched container via the backend's `exec`);
-/// future kinds (an HTTP warmup, a SQL script) are additive variants.
+/// future kinds (an HTTP warmup, a SQL script) are additive variants. `#[non_exhaustive]`
+/// so adding one is non-breaking for downstream crates — a consumer matching on it keeps a
+/// `_` arm (the runtime fails an action kind it does not understand, fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PostLaunchAction {
     /// Run a command inside the launched container via the backend's `exec` (needs a
     /// backend that supports exec — docker / native container; a backend without exec
@@ -743,9 +746,13 @@ impl ComputeSpecBuilder {
     }
 }
 
-/// Placement constraints: where a workload's replicas may run.
+/// Placement constraints: where a workload's replicas may run. `#[non_exhaustive]`:
+/// construct via [`PlacementConstraints::new`] + the `with_*` setters so a future
+/// placement axis (anti-affinity, spread, taints/tolerations) stays non-breaking for
+/// downstream crates (the sibling [`Priority`] follows the same contract).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PlacementConstraints {
     /// If non-empty, only nodes in one of these regions are eligible.
     pub regions: Vec<String>,
@@ -754,6 +761,27 @@ pub struct PlacementConstraints {
 }
 
 impl PlacementConstraints {
+    /// The empty (unconstrained) placement — any node is eligible. The supported
+    /// constructor now that `PlacementConstraints` is `#[non_exhaustive]`; refine with the
+    /// chainable `with_*` setters rather than a struct literal, so a later axis is additive.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restrict placement to nodes in one of these regions (empty ⇒ any region).
+    #[must_use]
+    pub fn with_regions(mut self, regions: Vec<String>) -> Self {
+        self.regions = regions;
+        self
+    }
+
+    /// Require these node labels (all must match a node's advertised labels).
+    #[must_use]
+    pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.labels = labels;
+        self
+    }
+
     /// Whether a node with `node_region` + `node_labels` satisfies these
     /// constraints.
     pub fn allows(
@@ -1020,8 +1048,12 @@ pub enum ReadinessLevel {
 /// - `answerability` — gateway/internal-DNS: whether a replica is an answerable upstream.
 /// - `routing` — the handler-runtime SQL connection: whether a request is routed to it.
 /// - `migration` — operator `sql exec` / `migrate` / `ensure`-await (container-backed DBs).
+///
+/// `#[non_exhaustive]`: a new readiness *surface* is an additive field, so downstream crates
+/// construct it via [`ReadinessGate::new`] + the `with_*` setters rather than a struct literal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct ReadinessGate {
     /// Gate for gateway/internal-DNS answerability. The strict default (`Provisioned`) is
     /// honored across all workloads today; per-DB relaxation to `service_ready` for this
@@ -1031,6 +1063,36 @@ pub struct ReadinessGate {
     pub routing: ReadinessLevel,
     /// Gate for operator migration/ensure (container-backed DBs).
     pub migration: ReadinessLevel,
+}
+
+impl ReadinessGate {
+    /// The all-strict gate (every surface [`ReadinessLevel::Provisioned`]) — the default.
+    /// The supported constructor now that `ReadinessGate` is `#[non_exhaustive]`; relax a
+    /// surface with the chainable `with_*` setters.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the gateway/internal-DNS answerability gate.
+    #[must_use]
+    pub fn with_answerability(mut self, level: ReadinessLevel) -> Self {
+        self.answerability = level;
+        self
+    }
+
+    /// Set the request-path handler SQL routing gate.
+    #[must_use]
+    pub fn with_routing(mut self, level: ReadinessLevel) -> Self {
+        self.routing = level;
+        self
+    }
+
+    /// Set the operator migration/ensure gate.
+    #[must_use]
+    pub fn with_migration(mut self, level: ReadinessLevel) -> Self {
+        self.migration = level;
+        self
+    }
 }
 
 /// A coarse sizing **preset** for a declared managed database — NOT raw VM knobs.
@@ -1743,5 +1805,36 @@ mod tests {
             (v.mount.as_str(), v.name.as_str(), v.size_mib),
             ("/data", "db", 128)
         );
+    }
+
+    #[test]
+    fn placement_constraints_builder_matches_the_literal() {
+        // The builder produces the same value a struct literal would (the literal is still
+        // legal inside the defining crate; `#[non_exhaustive]` only blocks it downstream).
+        let built = PlacementConstraints::new()
+            .with_regions(vec!["eu".into(), "us".into()])
+            .with_labels(BTreeMap::from([("gpu".to_string(), "yes".to_string())]));
+        let literal = PlacementConstraints {
+            regions: vec!["eu".into(), "us".into()],
+            labels: BTreeMap::from([("gpu".to_string(), "yes".to_string())]),
+        };
+        assert_eq!(built, literal);
+        // An empty builder is the unconstrained default (any node eligible).
+        let any = PlacementConstraints::new();
+        assert_eq!(any, PlacementConstraints::default());
+        assert!(any.allows(None, &BTreeMap::new()));
+    }
+
+    #[test]
+    fn readiness_gate_builder_and_defaults() {
+        // Default: every surface strict (`Provisioned`).
+        let def = ReadinessGate::new();
+        assert_eq!(def, ReadinessGate::default());
+        assert_eq!(def.answerability, ReadinessLevel::Provisioned);
+        // Relax only `routing`; the other surfaces keep the strict default.
+        let g = ReadinessGate::new().with_routing(ReadinessLevel::ServiceReady);
+        assert_eq!(g.routing, ReadinessLevel::ServiceReady);
+        assert_eq!(g.answerability, ReadinessLevel::Provisioned);
+        assert_eq!(g.migration, ReadinessLevel::Provisioned);
     }
 }
