@@ -8,6 +8,10 @@
 //! ([`build_ext4`], the `e2fsprogs` `mke2fs` tool) are host seams. Each layer is
 //! **streamed to disk** as it downloads (bounded memory + a size cap enforced
 //! mid-stream), and the whole pull is bounded by an overall wall-clock deadline.
+//! The *compressed* size cap does not bound how large a layer **inflates** to, so
+//! the overlay bounds the **decompressed** byte count too — a gzip zip-bomb (small
+//! compressed, huge decompressed) is aborted DURING inflation, per layer and across
+//! the whole rootfs, before it can fill the node disk.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -262,9 +266,97 @@ fn clear_dir(dir: &Path) -> Result<(), OciError> {
 /// - every other entry is unpacked normally.
 ///
 /// Layers must be applied in image order (lowest first).
+///
+/// The layer's **decompressed** size is bounded during inflation by the installed
+/// [`RegistryPullLimits`] (`max_decompressed_layer_bytes`): a gzip zip-bomb (small compressed,
+/// huge decompressed) is aborted the instant it exceeds the cap, so it is never fully inflated.
+/// (The whole-rootfs cross-layer cap is threaded by [`apply_image_layers_in`] via
+/// [`apply_layer_gz_bounded`]; a standalone call here bounds only this one layer.)
 pub fn apply_layer_gz(root: &Path, reader: impl Read) -> Result<(), OciError> {
+    let lim = registry_pull_limits();
+    let mut rootfs_total: u64 = 0;
+    apply_layer_gz_bounded(
+        root,
+        reader,
+        RegistryPullLimits::cap(lim.max_decompressed_layer_bytes),
+        RegistryPullLimits::cap(lim.max_rootfs_bytes),
+        &mut rootfs_total,
+    )
+}
+
+/// A `Read` adapter wrapped around a layer's **decompressed** (gunzip output) stream that bounds
+/// how many bytes may inflate through it, aborting FAIL-CLOSED the instant a running total exceeds
+/// a ceiling. The tar extractor pulls bytes from this reader incrementally as it unpacks each
+/// entry, so an over-cap read errors MID-INFLATION — the zip-bomb is never fully expanded and the
+/// bytes that would cross the cap are never delivered to (written by) the extractor, so disk usage
+/// stays bounded by the cap. Enforces TWO ceilings at once: a per-layer cap (`layer_read` resets
+/// per layer) and a whole-rootfs cap (`rootfs_total`, threaded ACROSS layers by the caller).
+struct DecompressionGuard<'a, R: Read> {
+    inner: R,
+    /// Bytes decompressed so far in THIS layer (reset per layer — a fresh guard per layer).
+    layer_read: u64,
+    /// Per-layer decompressed ceiling; `None` ⇒ disabled.
+    layer_cap: Option<u64>,
+    /// Running total of decompressed bytes across ALL layers of this rootfs; threaded by the
+    /// caller so the whole-rootfs ceiling spans the layers, not just one.
+    rootfs_total: &'a mut u64,
+    /// Whole-rootfs decompressed ceiling; `None` ⇒ disabled.
+    rootfs_cap: Option<u64>,
+}
+
+impl<R: Read> Read for DecompressionGuard<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        let n64 = n as u64;
+        self.layer_read = self.layer_read.saturating_add(n64);
+        *self.rootfs_total = self.rootfs_total.saturating_add(n64);
+        // Check AFTER counting but BEFORE handing the bytes back: an over-cap read returns an
+        // error and the just-read buffer is discarded (never written to disk), so the extractor
+        // only ever persists bytes up to the cap.
+        if let Some(cap) = self.layer_cap
+            && self.layer_read > cap
+        {
+            return Err(std::io::Error::other(format!(
+                "decompressed layer exceeded the {cap}-byte per-layer ceiling mid-inflation and \
+                 was aborted (possible gzip zip-bomb; refusing to fill the node disk)"
+            )));
+        }
+        if let Some(cap) = self.rootfs_cap
+            && *self.rootfs_total > cap
+        {
+            return Err(std::io::Error::other(format!(
+                "decompressed rootfs exceeded the {cap}-byte whole-rootfs ceiling mid-inflation \
+                 and was aborted (possible gzip zip-bomb across layers; refusing to fill the node \
+                 disk)"
+            )));
+        }
+        Ok(n)
+    }
+}
+
+/// As [`apply_layer_gz`] but with the decompressed-size ceilings passed in explicitly and the
+/// whole-rootfs running total threaded by the caller (`rootfs_total`, carried ACROSS layers). The
+/// gunzip output is wrapped in a [`DecompressionGuard`] so the tar extractor inflates through the
+/// bound — an over-cap layer aborts DURING decompression, never after the whole bomb is expanded.
+fn apply_layer_gz_bounded(
+    root: &Path,
+    reader: impl Read,
+    layer_cap: Option<u64>,
+    rootfs_cap: Option<u64>,
+    rootfs_total: &mut u64,
+) -> Result<(), OciError> {
     let gz = flate2::read::GzDecoder::new(reader);
-    apply_layer_tar(root, gz)
+    let guarded = DecompressionGuard {
+        inner: gz,
+        layer_read: 0,
+        layer_cap,
+        rootfs_total,
+        rootfs_cap,
+    };
+    apply_layer_tar(root, guarded)
 }
 
 /// As [`apply_layer_gz`] but over an already-decompressed tar stream (the
@@ -859,6 +951,14 @@ impl reqwest::dns::Resolve for ScreeningResolver {
 //     by `max_layer_bytes` (10 GiB).
 // Layers are STREAMED to a temp file as they download (and the tarball dropped right after it is
 // overlaid), so node memory stays O(one chunk) instead of buffering every layer in a `Vec<Vec<u8>>`.
+//
+// DECOMPRESSED ceilings ([`DecompressionGuard`], enforced DURING inflation) — the compressed caps
+// above bound the DOWNLOAD, not how large a layer inflates to. gzip is unbounded-ratio, so a layer
+// well under `max_layer_bytes` compressed can expand to terabytes (a zip-bomb) and fill the disk.
+// The overlay bounds the running DECOMPRESSED byte count as each layer inflates to disk and aborts
+// the instant it exceeds a ceiling (the over-cap bytes are never written), per layer
+// (`max_decompressed_layer_bytes`) and across the whole rootfs (`max_rootfs_bytes`, running total
+// over all layers) — so a bomb is aborted mid-inflation, never fully expanded.
 
 /// Default connect (TCP + TLS handshake) timeout for a registry pull, seconds.
 const DEFAULT_PULL_CONNECT_SECS: u64 = 10;
@@ -896,6 +996,23 @@ const DEFAULT_PULL_MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// (the config's own declared size still caps it; a size-undeclared manifest is then bounded only
 /// by the pull timeouts/deadline).
 const DEFAULT_PULL_MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+/// Default per-layer DECOMPRESSED byte ceiling. The compressed per-layer/per-image ceilings bound
+/// what a layer *downloads*, NOT what it *inflates* to: gzip is unbounded-ratio, so a layer well
+/// under `max_layer_bytes` compressed can expand to terabytes (a zip-bomb) and fill the node disk.
+/// This caps the bytes a single layer may inflate to during overlay, enforced DURING decompression.
+/// 32 GiB is far above any real single decompressed layer (even a CUDA/ML or full-desktop layer
+/// stays in the low tens of GiB) yet aborts a bomb long before it exhausts disk. It is comfortably
+/// above the 10 GiB compressed per-layer ceiling, leaving headroom for a maximally-sized real
+/// layer's normal ~2–4× (and even ~10×) expansion. `0` ⇒ no per-layer decompressed ceiling.
+const DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Default whole-rootfs DECOMPRESSED byte ceiling: the running total across ALL layers as they
+/// inflate onto the rootfs. Backstops a many-layer image whose layers each sit under the per-layer
+/// decompressed cap but together inflate to fill the disk. 64 GiB is above any realistic
+/// decompressed rootfs (a real rootfs is typically well under a few GiB; the largest legitimate
+/// images stay in the low tens of GiB) and above what even a maximally-sized compressed image at
+/// the 20 GiB `max_image_bytes` ceiling could inflate to, while still aborting a bomb that would
+/// expand to hundreds of GiB or more. `0` ⇒ no whole-rootfs decompressed ceiling.
+const DEFAULT_PULL_MAX_ROOTFS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Operator-tunable timeouts bounding a registry pull (U30) — the value of
 /// `[compute].registry_pull_timeouts`. Node operator config (System·Admin), NEVER
@@ -1037,6 +1154,19 @@ pub struct RegistryPullLimits {
     /// declared size still caps it; a size-undeclared manifest is then bounded only by the pull
     /// timeouts/deadline). Default 32 MiB.
     pub max_manifest_bytes: u64,
+    /// Per-layer DECOMPRESSED ceiling, bytes — the max a single layer may inflate to as it is
+    /// overlaid onto the rootfs. The compressed caps above bound the DOWNLOAD; gzip is
+    /// unbounded-ratio, so a layer under `max_layer_bytes` compressed can still inflate to
+    /// terabytes (a zip-bomb) and fill the node disk. Enforced DURING decompression — the overlay
+    /// is aborted the instant a layer's running decompressed byte count exceeds this — so the bomb
+    /// is never fully inflated. `0` ⇒ no per-layer decompressed ceiling. Default 32 GiB.
+    pub max_decompressed_layer_bytes: u64,
+    /// Whole-rootfs DECOMPRESSED ceiling, bytes — the max running total of decompressed bytes
+    /// across ALL layers as they inflate onto the rootfs. Backstops a many-layer image whose
+    /// layers each sit under `max_decompressed_layer_bytes` but together inflate to fill the disk.
+    /// Enforced DURING decompression, same as the per-layer cap. `0` ⇒ no whole-rootfs
+    /// decompressed ceiling. Default 64 GiB.
+    pub max_rootfs_bytes: u64,
 }
 
 impl RegistryPullLimits {
@@ -1045,6 +1175,8 @@ impl RegistryPullLimits {
         max_layer_bytes: DEFAULT_PULL_MAX_LAYER_BYTES,
         max_image_bytes: DEFAULT_PULL_MAX_IMAGE_BYTES,
         max_manifest_bytes: DEFAULT_PULL_MAX_MANIFEST_BYTES,
+        max_decompressed_layer_bytes: DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES,
+        max_rootfs_bytes: DEFAULT_PULL_MAX_ROOTFS_BYTES,
     };
 
     /// `v` bytes as a ceiling, or `None` when `v == 0` (ceiling disabled).
@@ -1628,8 +1760,15 @@ async fn apply_image_layers_in(
     layers_dir: &Path,
 ) -> Result<(), OciError> {
     let descriptors = layer_descriptors(&r.manifest)?;
-    let max_total = RegistryPullLimits::cap(registry_pull_limits().max_image_bytes);
+    let lim = registry_pull_limits();
+    let max_total = RegistryPullLimits::cap(lim.max_image_bytes);
+    // DECOMPRESSED ceilings — the compressed caps above bound the download, NOT how large a layer
+    // inflates to; these bound the inflation (zip-bomb guard). `rootfs_decompressed` carries the
+    // running decompressed total ACROSS layers so `max_rootfs_bytes` spans the whole rootfs.
+    let layer_decompressed_cap = RegistryPullLimits::cap(lim.max_decompressed_layer_bytes);
+    let rootfs_decompressed_cap = RegistryPullLimits::cap(lim.max_rootfs_bytes);
     let mut total: u64 = 0;
+    let mut rootfs_decompressed: u64 = 0;
     for (i, (digest, size)) in descriptors.iter().enumerate() {
         let path = layers_dir.join(format!("layer-{i}.tar.gz"));
         let n = fetch_layer_to_file(&r.client, &r.base, digest, &mut r.token, *size, &path).await?;
@@ -1641,9 +1780,17 @@ async fn apply_image_layers_in(
                 "image layers exceeded the {max}-byte whole-image pull ceiling; aborting"
             )));
         }
-        // Overlay this layer from disk (streaming gunzip), then drop its tarball.
+        // Overlay this layer from disk (streaming gunzip), bounding its DECOMPRESSED size per-layer
+        // AND the running total across all layers (so a zip-bomb is aborted mid-inflation, never
+        // fully expanded onto disk), then drop its tarball.
         let f = fs::File::open(&path)?;
-        apply_layer_gz(target, std::io::BufReader::new(f))?;
+        apply_layer_gz_bounded(
+            target,
+            std::io::BufReader::new(f),
+            layer_decompressed_cap,
+            rootfs_decompressed_cap,
+            &mut rootfs_decompressed,
+        )?;
         let _ = fs::remove_file(&path);
     }
     Ok(())
@@ -1970,6 +2117,13 @@ pub async fn build_rootfs_dir(image: &str, out: &Path) -> Result<(), OciError> {
     })
     .await;
     let _ = fs::remove_dir_all(&layers_dir);
+    // On ANY failure (incl. a decompressed-size / zip-bomb abort mid-inflation) remove the PARTIAL
+    // rootfs we were unpacking into, so an aborted bomb does not leave its half-inflated bytes
+    // filling the node disk — the same cleanup discipline as `build_rootfs` (which always removes
+    // its `work` staging dir) and the v0.70.0 streaming `layers_dir` cleanup.
+    if result.is_err() {
+        let _ = fs::remove_dir_all(out);
+    }
     result
 }
 
@@ -3115,6 +3269,8 @@ mod tests {
         assert_eq!(def.max_layer_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(def.max_image_bytes, 20 * 1024 * 1024 * 1024);
         assert_eq!(def.max_manifest_bytes, 32 * 1024 * 1024);
+        assert_eq!(def.max_decompressed_layer_bytes, 32 * 1024 * 1024 * 1024);
+        assert_eq!(def.max_rootfs_bytes, 64 * 1024 * 1024 * 1024);
         // `cap` maps a byte count → ceiling; `0` disables it.
         assert_eq!(RegistryPullLimits::cap(123), Some(123));
         assert_eq!(RegistryPullLimits::cap(0), None);
@@ -3126,6 +3282,8 @@ mod tests {
             max_layer_bytes: 1024,
             max_image_bytes: 0, // whole-image ceiling disabled
             max_manifest_bytes: 2048,
+            max_decompressed_layer_bytes: 0, // decompressed ceilings irrelevant to blob/manifest_cap
+            max_rootfs_bytes: 0,
         });
         assert_eq!(
             blob_cap(None),
@@ -3174,6 +3332,8 @@ mod tests {
             max_layer_bytes: 0,
             max_image_bytes: 0,
             max_manifest_bytes: 0,
+            max_decompressed_layer_bytes: 0,
+            max_rootfs_bytes: 0,
         });
         assert_eq!(
             blob_cap(None),
@@ -3196,6 +3356,245 @@ mod tests {
         install_registry_pull_limits(RegistryPullLimits::default());
         assert_eq!(blob_cap(None), Some(10 * 1024 * 1024 * 1024));
         assert_eq!(manifest_cap(None), Some(32 * 1024 * 1024));
+    }
+
+    // ---- v0.71.0 follow-up: DECOMPRESSED-size bound (anti-zip-bomb) ----
+
+    /// A gzip-compressed single-file tar layer that is TINY compressed but inflates to `inflated`
+    /// bytes — the zip-bomb shape. The `inflated` zero bytes are STREAMED through the gzip encoder
+    /// (never allocated whole), so building a 64 MiB-inflating bomb costs a few KiB of memory.
+    fn gz_bomb_layer(name: &str, inflated: u64) -> Vec<u8> {
+        use std::io::Read as _;
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(0o644);
+        h.set_size(inflated);
+        builder
+            .append_data(&mut h, name, std::io::repeat(0u8).take(inflated))
+            .unwrap();
+        let gz = builder.into_inner().unwrap(); // finish the tar (writes the trailer)
+        gz.finish().unwrap() // finish gzip → compressed bytes
+    }
+
+    /// Gzip-compress an already-built (uncompressed) tar — a legit layer for the "unpacks fine"
+    /// path (contrast with [`gz_bomb_layer`], which fabricates a high-ratio bomb).
+    fn gz_of(tar: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(tar).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Does `err`'s message — or any error in its `source()` chain — contain `needle`? The tar
+    /// extractor wraps our mid-inflation read error with its own "failed to unpack …" context, so
+    /// the decompressed-ceiling abort message rides the chain as a source, not the top-level Display.
+    fn io_err_chain_contains(err: &std::io::Error, needle: &str) -> bool {
+        let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+        while let Some(c) = cur {
+            if c.to_string().contains(needle) {
+                return true;
+            }
+            cur = c.source();
+        }
+        false
+    }
+
+    #[test]
+    fn zip_bomb_layer_aborted_during_inflation_without_filling_disk() {
+        let _guard = pull_globals_lock();
+        // A layer TINY compressed that inflates to 64 MiB — the zip-bomb the compressed byte cap
+        // misses. With a 1 MiB per-layer DECOMPRESSED ceiling installed, the overlay must abort
+        // DURING inflation, and the partial file must hold ~the cap, NOT the full 64 MiB.
+        const INFLATED: u64 = 64 * 1024 * 1024;
+        const CAP: u64 = 1024 * 1024;
+        let bomb = gz_bomb_layer("bomb.bin", INFLATED);
+        assert!(
+            (bomb.len() as u64) < CAP,
+            "the bomb must be SMALL compressed ({} bytes) or it is not a zip-bomb",
+            bomb.len()
+        );
+        install_registry_pull_limits(RegistryPullLimits {
+            max_layer_bytes: 0,
+            max_image_bytes: 0,
+            max_manifest_bytes: 0,
+            max_decompressed_layer_bytes: CAP,
+            max_rootfs_bytes: 0,
+        });
+        let root = tmpdir("zipbomb");
+        // The public `apply_layer_gz` path, which consults the installed global — proves the wiring.
+        let res = apply_layer_gz(&root, &bomb[..]);
+        install_registry_pull_limits(RegistryPullLimits::default());
+
+        let err =
+            res.expect_err("a zip-bomb layer must be aborted mid-inflation, not fully expanded");
+        let OciError::Io(e) = &err else {
+            panic!("expected OciError::Io from the decompressed-size abort, got {err:?}");
+        };
+        assert!(
+            io_err_chain_contains(e, "per-layer ceiling"),
+            "must carry the per-layer decompressed-ceiling abort, got: {e}"
+        );
+        // Proof it aborted DURING inflation: the on-disk file holds ~the cap, nowhere near 64 MiB.
+        let written = fs::metadata(root.join("bomb.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            written <= CAP + 1024 * 1024,
+            "must abort mid-inflation, not write the whole {INFLATED}-byte bomb (wrote {written})"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn whole_rootfs_decompressed_cap_spans_layers() {
+        // Two layers each well UNDER the per-layer cap but whose running DECOMPRESSED total exceeds
+        // the whole-rootfs cap — the cross-layer counter must abort the second layer mid-inflation.
+        let root = tmpdir("rootfs-cap");
+        let l1 = gz_bomb_layer("a.bin", 4 * 1024 * 1024); // 4 MiB inflated
+        let l2 = gz_bomb_layer("b.bin", 4 * 1024 * 1024); // 4 MiB inflated
+        let layer_cap = 16 * 1024 * 1024; // generous per-layer (neither layer trips it)
+        let rootfs_cap = 6 * 1024 * 1024; // whole-rootfs: l1 fits, l1+l2 does not
+        let mut total: u64 = 0;
+
+        // Layer 1 fits under the whole-rootfs cap.
+        apply_layer_gz_bounded(
+            &root,
+            &l1[..],
+            Some(layer_cap),
+            Some(rootfs_cap),
+            &mut total,
+        )
+        .expect("layer 1 is under the whole-rootfs cap");
+        assert!(
+            total >= 4 * 1024 * 1024 && total <= rootfs_cap,
+            "after layer 1 the running total ({total}) sits between 4 MiB and the 6 MiB rootfs cap"
+        );
+
+        // Layer 2 pushes the running total over the whole-rootfs cap → aborted mid-inflation.
+        let res = apply_layer_gz_bounded(
+            &root,
+            &l2[..],
+            Some(layer_cap),
+            Some(rootfs_cap),
+            &mut total,
+        );
+        let err = res.expect_err("the cross-layer running total must abort layer 2");
+        let OciError::Io(e) = &err else {
+            panic!("expected OciError::Io from the whole-rootfs abort, got {err:?}");
+        };
+        assert!(
+            io_err_chain_contains(e, "whole-rootfs ceiling"),
+            "must be the WHOLE-ROOTFS ceiling abort (not the per-layer one), got: {e}"
+        );
+        // Layer 2's file is bounded — it never fully inflated to 4 MiB.
+        let written_b = fs::metadata(root.join("b.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            written_b < 4 * 1024 * 1024,
+            "layer 2 must abort mid-inflation, not write its whole 4 MiB (wrote {written_b})"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normal_layer_unpacks_under_generous_decompressed_caps() {
+        // A legit layer inflates fine under the generous default-sized decompressed ceilings.
+        let root = tmpdir("normal-decomp");
+        let gz = gz_of(&tar_with(
+            &[("app/run", b"#!/bin/sh\n"), ("etc/conf", b"x")],
+            &["app", "etc"],
+        ));
+        let mut total: u64 = 0;
+        apply_layer_gz_bounded(
+            &root,
+            &gz[..],
+            Some(DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES),
+            Some(DEFAULT_PULL_MAX_ROOTFS_BYTES),
+            &mut total,
+        )
+        .expect("a normal layer must unpack under the generous default decompressed caps");
+        assert_eq!(fs::read(root.join("app/run")).unwrap(), b"#!/bin/sh\n");
+        assert!(root.join("etc/conf").exists());
+        assert!(
+            total > 0 && total < DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES,
+            "a normal layer's decompressed total ({total}) is well under the cap"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_layer_gz_default_globals_unpack_a_normal_layer() {
+        // The public `apply_layer_gz` reads the installed global; the GENEROUS default must never
+        // refuse a normal layer (the wiring must not regress real pulls).
+        let _guard = pull_globals_lock();
+        install_registry_pull_limits(RegistryPullLimits::default());
+        let root = tmpdir("gz-default");
+        let gz = gz_of(&tar_with(&[("bin/true", b"x")], &["bin"]));
+        let r = apply_layer_gz(&root, &gz[..]);
+        install_registry_pull_limits(RegistryPullLimits::default());
+        r.expect("default (generous) globals must not refuse a normal layer");
+        assert!(root.join("bin/true").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn decompressed_zero_disables_the_ceiling() {
+        // `0` ⇒ disabled: with BOTH decompressed caps off, a high-ratio layer inflates in full
+        // (the operator opt-out). This is the knob's documented escape hatch.
+        let bomb = gz_bomb_layer("z.bin", 8 * 1024 * 1024); // 8 MiB inflated
+        let root = tmpdir("zero-disables");
+        let mut total: u64 = 0;
+        apply_layer_gz_bounded(
+            &root,
+            &bomb[..],
+            RegistryPullLimits::cap(0), // per-layer cap disabled
+            RegistryPullLimits::cap(0), // whole-rootfs cap disabled
+            &mut total,
+        )
+        .expect("disabled (0 → None) decompressed caps must not abort inflation");
+        assert_eq!(
+            fs::metadata(root.join("z.bin")).unwrap().len(),
+            8 * 1024 * 1024,
+            "with the caps disabled the whole layer inflates to disk"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_pull_limits_serde_round_trips_new_fields_and_partial_default() {
+        // A full round-trip preserves the two new decompressed ceilings.
+        let custom = RegistryPullLimits {
+            max_layer_bytes: 1,
+            max_image_bytes: 2,
+            max_manifest_bytes: 3,
+            max_decompressed_layer_bytes: 4,
+            max_rootfs_bytes: 5,
+        };
+        let json = serde_json::to_string(&custom).unwrap();
+        let back: RegistryPullLimits = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, custom);
+
+        // Backward compat: a config written BEFORE the decompressed caps existed still loads — the
+        // two new fields fall back to their generous defaults (`#[serde(default)]`).
+        let old = r#"{"max_layer_bytes":10,"max_image_bytes":20,"max_manifest_bytes":30}"#;
+        let back: RegistryPullLimits = serde_json::from_str(old).unwrap();
+        assert_eq!(back.max_layer_bytes, 10);
+        assert_eq!(
+            back.max_decompressed_layer_bytes,
+            DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES
+        );
+        assert_eq!(back.max_rootfs_bytes, DEFAULT_PULL_MAX_ROOTFS_BYTES);
+
+        // `0` round-trips and reads back as "disabled".
+        let zero = r#"{"max_decompressed_layer_bytes":0,"max_rootfs_bytes":0}"#;
+        let back: RegistryPullLimits = serde_json::from_str(zero).unwrap();
+        assert_eq!(
+            RegistryPullLimits::cap(back.max_decompressed_layer_bytes),
+            None
+        );
+        assert_eq!(RegistryPullLimits::cap(back.max_rootfs_bytes), None);
     }
 
     #[tokio::test]
@@ -3237,6 +3636,8 @@ mod tests {
             max_layer_bytes: 64 * 1024,
             max_image_bytes: 0,
             max_manifest_bytes: 0,
+            max_decompressed_layer_bytes: 0,
+            max_rootfs_bytes: 0,
         });
         install_registry_pull_timeouts(RegistryPullTimeouts {
             connect_secs: 5,
@@ -3316,6 +3717,8 @@ mod tests {
             max_layer_bytes: 0,
             max_image_bytes: 0,
             max_manifest_bytes: 0,
+            max_decompressed_layer_bytes: 0,
+            max_rootfs_bytes: 0,
         });
         let client = screening_client().unwrap();
         let base = format!("http://{addr}");
@@ -3433,6 +3836,8 @@ mod tests {
             max_layer_bytes: 10 * 1024 * 1024 * 1024,
             max_image_bytes: 0,
             max_manifest_bytes: 64 * 1024,
+            max_decompressed_layer_bytes: 0,
+            max_rootfs_bytes: 0,
         });
         install_registry_pull_timeouts(RegistryPullTimeouts {
             connect_secs: 5,
