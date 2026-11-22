@@ -188,6 +188,7 @@ impl ComputeBackend for FakeComputeBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            preemptible: true,
         }
     }
 
@@ -764,6 +765,7 @@ async fn two_projects_same_workload_name_get_distinct_ids_and_ips() {
                     active: spec_id.clone(),
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -943,6 +945,7 @@ async fn compute_upstream_resolves_per_project() {
                     active: spec_id.clone(),
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -1018,6 +1021,7 @@ async fn internal_dns_refuses_cross_project() {
                     active: spec_id.clone(),
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await

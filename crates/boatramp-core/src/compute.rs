@@ -67,6 +67,17 @@ pub struct Capabilities {
     pub max_vcpus: Option<u32>,
     /// Max memory (MiB) per replica, if bounded.
     pub max_mem_mib: Option<u32>,
+    /// Whether boatramp **directly schedules** this backend's replicas against its own
+    /// [`NodeCapacities`] ledger — the gate for the priority **preemption** pass. `true`
+    /// (vmm / native container / docker / vz): boatramp owns both the capacity accounting AND
+    /// the eviction, so a replica on this backend can be a preemptor and a preemption VICTIM.
+    /// `false` (cloudflare / kubernetes): a DELEGATED backend — boatramp owns neither its
+    /// capacity nor its eviction, so such a workload is NEVER a preemptor and NEVER a victim
+    /// (it never enters the preemption pass). For the k8s backend the operator priority TIER is
+    /// instead mapped to a native k8s `PriorityClass` on the generated Deployment/StatefulSet,
+    /// delegating preemption to the cluster's own scheduler. Gated exactly like
+    /// [`scale_to_zero`](Self::scale_to_zero) / [`persistent_volumes`](Self::persistent_volumes).
+    pub preemptible: bool,
 }
 
 /// Which [`RootSource`] kinds a backend can actually run, plus whether it can apply a
@@ -270,6 +281,14 @@ pub struct LaunchRequest {
     /// node-global flags via [`boatramp_guestlog::should_redact`]. Transient — never persisted
     /// or serialized.
     pub redaction: RedactionSet,
+    /// The workload's resolved priority CLASS name (`system`/`standard`/`spot`), threaded from
+    /// the mutable workload at launch so a DELEGATED backend can map it to its own priority
+    /// primitive. The k8s backend maps it to a native `PriorityClass` (`boatramp-<class>`) on
+    /// the generated Deployment/StatefulSet, delegating preemption to the cluster scheduler; the
+    /// directly-scheduled backends (vmm/container/docker/vz) ignore it (boatramp's own
+    /// preemption engine handles their priority). `None` ⇒ the operator default class (no
+    /// explicit PriorityClass set). Transient — never persisted or serialized.
+    pub priority_class: Option<String>,
 }
 
 /// An opaque handle to a launched replica (for `stop`/`health`).
@@ -1271,6 +1290,18 @@ pub struct ProjectBackendPolicy {
     /// `prefer`, overridden by a tenant spec `prefer`/`require`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefer: Option<String>,
+    /// The **priority-class ceiling** this project may request — the operator-gated cap on
+    /// which [`PriorityClass`] a tenant's `compute set --priority-class` may name. A request
+    /// for a class whose tier EXCEEDS this ceiling's tier is REFUSED fail-closed at
+    /// `put_compute`, naming the allowed maximum. `None` ⇒ the node default ceiling
+    /// ([`PriorityClassCatalog::default_ceiling`], i.e. `standard`) — so by default a project
+    /// can request `standard`/`spot` but NOT the operator-reserved `system`. The operator
+    /// raises it (e.g. to `system`) for a trusted project exactly as it sets `allow`/`forbid`.
+    /// Stored on the SAME per-project operator record as the backend policy (one mechanism, no
+    /// second store); carried through [`BackendPolicy::compose_project`] untouched (it bounds
+    /// `compute set`, not placement). Omit ⇒ the node default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority_ceiling: Option<String>,
 }
 
 impl ProjectBackendPolicy {
@@ -1278,7 +1309,10 @@ impl ProjectBackendPolicy {
     /// so a stored-empty record composes to exactly the node bound.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.allow.is_none() && self.forbid.is_empty() && self.prefer.is_none()
+        self.allow.is_none()
+            && self.forbid.is_empty()
+            && self.prefer.is_none()
+            && self.priority_ceiling.is_none()
     }
 }
 
@@ -1311,6 +1345,350 @@ pub struct ProjectLogRedaction {
     /// Whether this project opts OUT of guest-log secret redaction. Honored only under the
     /// node-global admission gate (see the type doc). Default `false`.
     pub opt_out: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Priority classes + the global placement comparator (v0.70.0)
+// ---------------------------------------------------------------------------
+
+/// The preemption AUTHORITY a priority [`PriorityClass`] carries — the operator-set axis that
+/// decides, together with tier ordering, whether a workload of this class may EVICT another.
+/// Deliberately conservative by construction: the default-tier-vs-default-tier cross-project
+/// case can NEVER preempt (two `standard` tenants are fully isolated), because cross-tenant
+/// preemption needs BOTH [`CrossTenantOptIn`](Self::CrossTenantOptIn) AND a strictly-higher
+/// tier — the DoS/fairness-safe default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreemptionMode {
+    /// Never preempts anything (a strictly best-effort tier that only ever waits for room).
+    Disabled,
+    /// May preempt only a STRICTLY-LOWER-`rank` workload in its OWN project — the tenant's own
+    /// budget, always safe (a tenant reshuffling its own workloads). The default, and the only
+    /// authority `standard`/`spot` carry: two different projects are never touched.
+    #[default]
+    WithinProject,
+    /// Everything [`WithinProject`](Self::WithinProject) does, PLUS the operator opt-in to
+    /// preempt a STRICTLY-LOWER-TIER workload in ANOTHER project (cross-tenant). `rank` is
+    /// IGNORED across projects — only the operator tier ordering authorizes a cross-tenant
+    /// eviction. Never reaches an equal-or-higher tier in any project.
+    CrossTenantOptIn,
+}
+
+impl PreemptionMode {
+    /// Whether a class with this mode may preempt a lower-`rank` sibling in its own project.
+    pub fn preempts_within_project(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Whether a class with this mode may preempt a strictly-lower-TIER workload in ANOTHER
+    /// project (the operator cross-tenant opt-in).
+    pub fn preempts_cross_tenant(self) -> bool {
+        matches!(self, Self::CrossTenantOptIn)
+    }
+}
+
+/// One operator-defined **priority class** — the node/compute-config tier a workload's
+/// [`Priority::class`] names (mirroring [`BackendPolicy`] as an operator concern). It is the
+/// cross-tenant authority unit: the `tier` orders placement globally (higher wins, across
+/// every project), `preemption` is the eviction authority it carries, and `default` marks the
+/// single class an un-annotated workload resolves to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriorityClass {
+    /// The placement TIER — a signed rank ordering EVERY project's workloads of this class
+    /// against every other class (higher is scheduled/kept first). The operator-owned
+    /// cross-tenant axis.
+    pub tier: i32,
+    /// The preemption authority this class carries (default [`PreemptionMode::WithinProject`]).
+    #[serde(default)]
+    pub preemption: PreemptionMode,
+    /// Whether this is the operator DEFAULT class — the one an un-annotated workload (and an
+    /// unknown/relaxed class name) resolves to. Exactly one built-in carries it (`standard`).
+    #[serde(default)]
+    pub default: bool,
+    /// Whether this class is OPERATOR-RESERVED — a tenant can request it only when its project
+    /// ceiling is explicitly raised to it (the tier check already enforces this, since a
+    /// reserved class sits above the default ceiling; kept as explicit metadata/intent).
+    #[serde(default)]
+    pub operator_only: bool,
+}
+
+/// The operator catalog of [`PriorityClass`]es in force on a node — `name → class`. Mirrors
+/// the operator [`BackendPolicy`] as a node/compute-config concern. The built-in catalog
+/// ([`Self::builtin`]) is the owner-set three-tier default: **`system`** (top tier,
+/// operator-reserved, cross-tenant opt-in) · **`standard`** (the default tier, within-project
+/// preemption) · **`spot`** (bottom tier, within-project, freely preemptible as a victim). An
+/// operator may override the tiers/modes via node config, but the NAMES and relative order of
+/// these three are the stable contract the CLI + docs speak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorityClassCatalog {
+    classes: BTreeMap<String, PriorityClass>,
+}
+
+impl Default for PriorityClassCatalog {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+impl PriorityClassCatalog {
+    /// The owner-set built-in catalog: `system` / `standard` / `spot`. `standard` is the
+    /// default (un-annotated workloads land here, tier 0), `system` the operator-reserved top
+    /// (tier 100, the only class opted into cross-tenant preemption), `spot` the freely-
+    /// preemptible bottom (tier -100). The relative order (`system` > `standard` > `spot`) and
+    /// these exact names are the stable contract.
+    pub fn builtin() -> Self {
+        let mut classes = BTreeMap::new();
+        classes.insert(
+            "system".to_string(),
+            PriorityClass {
+                tier: 100,
+                preemption: PreemptionMode::CrossTenantOptIn,
+                default: false,
+                operator_only: true,
+            },
+        );
+        classes.insert(
+            "standard".to_string(),
+            PriorityClass {
+                tier: 0,
+                preemption: PreemptionMode::WithinProject,
+                default: true,
+                operator_only: false,
+            },
+        );
+        classes.insert(
+            "spot".to_string(),
+            PriorityClass {
+                tier: -100,
+                preemption: PreemptionMode::WithinProject,
+                default: false,
+                operator_only: false,
+            },
+        );
+        Self { classes }
+    }
+
+    /// Build a catalog from operator-supplied classes, falling back to the built-ins when the
+    /// map is empty (back-compat: no config ⇒ the owner-set default catalog). Used by the
+    /// server when wiring node `[compute]` config; the reconcile engine uses [`Self::builtin`].
+    pub fn from_classes(classes: BTreeMap<String, PriorityClass>) -> Self {
+        if classes.is_empty() {
+            Self::builtin()
+        } else {
+            Self { classes }
+        }
+    }
+
+    /// Look up a class by name.
+    pub fn get(&self, name: &str) -> Option<&PriorityClass> {
+        self.classes.get(name)
+    }
+
+    /// The operator DEFAULT class name (the one with `default: true`), falling back to
+    /// `"standard"` if no class is flagged (a malformed operator catalog never panics).
+    pub fn default_class_name(&self) -> &str {
+        self.classes
+            .iter()
+            .find(|(_, c)| c.default)
+            .map(|(n, _)| n.as_str())
+            .unwrap_or("standard")
+    }
+
+    /// The default per-project **ceiling** class name — the cap a project with no explicit
+    /// `priority_ceiling` may request. The operator default class (`standard`): a project
+    /// cannot self-assign a tier above `standard` (so never `system`) unless the operator
+    /// raises its ceiling.
+    pub fn default_ceiling(&self) -> &str {
+        self.default_class_name()
+    }
+
+    /// Resolve a workload's [`Priority`] to its `(class_name, class)` — the requested class if
+    /// present and KNOWN, else the operator default. An unknown class name fails SAFE to the
+    /// default (never a panic, never a privileged fallback).
+    pub fn resolve<'a>(&'a self, priority: &'a Priority) -> (&'a str, &'a PriorityClass) {
+        let default_name = self.default_class_name();
+        let name = priority
+            .class
+            .as_deref()
+            .filter(|n| self.classes.contains_key(*n))
+            .unwrap_or(default_name);
+        // `default_class_name` falls back to "standard"; if even that is absent (empty catalog
+        // can't occur — `from_classes` guards it), synthesize a neutral default so the resolve
+        // is total.
+        let class = self.classes.get(name).unwrap_or(&NEUTRAL_STANDARD);
+        (name, class)
+    }
+
+    /// Resolve a workload's [`Priority`] to its EFFECTIVE `(class_name, class)` CLAMPED to a
+    /// project `ceiling`: if the stored class's tier EXCEEDS the ceiling's tier, the workload
+    /// resolves AS the ceiling class — losing any over-ceiling tier AND preemption authority. This
+    /// is the RECONCILE-time half of the per-project ceiling that completes revocation: the
+    /// write-time [`check_request`](Self::check_request) gate only bounds a NEW request, so a class
+    /// stored while the ceiling was temporarily HIGHER (then the operator lowers it back) would
+    /// otherwise KEEP its over-ceiling authority until the workload is re-set/deleted. Clamping
+    /// here makes a stored `system` in a now-`standard`-ceiling project behave AS `standard`
+    /// (within-project only) at placement + preemption time. `ceiling` is the project's CURRENT
+    /// ceiling class name (`None` ⇒ the node [`Self::default_ceiling`]); a missing or unknown
+    /// ceiling name fails SAFE to the node default ceiling — never a silent grant (the same
+    /// fail-closed posture as the write path). The clamp only ever LOWERS a tier (a stored class
+    /// at/under the ceiling is returned unchanged), so an all-default fleet resolves identically
+    /// to [`resolve`](Self::resolve) — zero churn on upgrade.
+    pub fn resolve_clamped<'a>(
+        &'a self,
+        priority: &'a Priority,
+        ceiling: Option<&str>,
+    ) -> (&'a str, &'a PriorityClass) {
+        let (name, class) = self.resolve(priority);
+        // The project's effective ceiling class, FAIL-CLOSED to the node default ceiling when the
+        // configured name is absent or unknown (never a widening of a project's authority).
+        let ceiling_lookup = ceiling
+            .filter(|n| self.classes.contains_key(*n))
+            .unwrap_or_else(|| self.default_ceiling());
+        let (ceiling_name, ceiling_class) = self
+            .classes
+            .get_key_value(ceiling_lookup)
+            .map(|(n, c)| (n.as_str(), c))
+            .unwrap_or(("standard", &NEUTRAL_STANDARD));
+        if class.tier > ceiling_class.tier {
+            (ceiling_name, ceiling_class)
+        } else {
+            (name, class)
+        }
+    }
+
+    /// The operator TIER a workload's priority resolves to (higher wins globally).
+    pub fn tier_of(&self, priority: &Priority) -> i32 {
+        self.resolve(priority).1.tier
+    }
+
+    /// The preemption authority a workload's priority resolves to.
+    pub fn preemption_of(&self, priority: &Priority) -> PreemptionMode {
+        self.resolve(priority).1.preemption
+    }
+
+    /// Validate a tenant `compute set --priority-class <requested>` against a project ceiling —
+    /// the fail-closed per-project gate. `requested` is the requested class name (`None` ⇒ the
+    /// default, always allowed); `ceiling` is the project's ceiling class name (`None` ⇒ the
+    /// node [`Self::default_ceiling`]). Returns `Ok(())` iff the requested class is KNOWN and
+    /// its tier does NOT exceed the ceiling's tier; otherwise an operator-facing message naming
+    /// the allowed maximum (never leaks another tenant's data).
+    pub fn check_request(
+        &self,
+        requested: Option<&str>,
+        ceiling: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(req_name) = requested else {
+            return Ok(()); // the operator default is always requestable
+        };
+        let Some(req_class) = self.get(req_name) else {
+            let known: Vec<&str> = self.class_names();
+            return Err(format!(
+                "unknown priority class `{req_name}`; valid classes: {}",
+                known.join(", ")
+            ));
+        };
+        let ceiling_name = ceiling.unwrap_or_else(|| self.default_ceiling());
+        let ceiling_tier = self.get(ceiling_name).map(|c| c.tier).unwrap_or(0);
+        if req_class.tier > ceiling_tier {
+            return Err(format!(
+                "priority class `{req_name}` (tier {}) exceeds this project's ceiling `{ceiling_name}` (tier {ceiling_tier}); the operator must raise the project ceiling to allow it",
+                req_class.tier
+            ));
+        }
+        Ok(())
+    }
+
+    /// Every class name, sorted (stable for messages/tests).
+    pub fn class_names(&self) -> Vec<&str> {
+        self.classes.keys().map(String::as_str).collect()
+    }
+
+    /// Whether a workload with `preemptor` priority in `preemptor_project` MAY preempt a victim
+    /// workload with `victim` priority in `victim_project` under the TENANCY BOUNDARY (resolves
+    /// both classes, then applies [`can_preempt`]). The public, testable form the dry-run
+    /// preview + any external authority check use.
+    pub fn may_preempt(
+        &self,
+        preemptor: &Priority,
+        preemptor_project: &str,
+        victim: &Priority,
+        victim_project: &str,
+    ) -> bool {
+        let (_, pc) = self.resolve(preemptor);
+        let (_, vc) = self.resolve(victim);
+        can_preempt(
+            pc.tier,
+            preemptor.rank,
+            pc.preemption,
+            preemptor_project,
+            vc.tier,
+            victim.rank,
+            victim_project,
+        )
+    }
+}
+
+/// The neutral fallback class a totally-malformed catalog resolve lands on (tier 0, within-
+/// project) — unreachable in practice ([`PriorityClassCatalog::from_classes`] guarantees a
+/// non-empty catalog and the built-ins always carry `standard`), present so `resolve` is total
+/// without an `Option`/panic.
+static NEUTRAL_STANDARD: PriorityClass = PriorityClass {
+    tier: 0,
+    preemption: PreemptionMode::WithinProject,
+    default: true,
+    operator_only: false,
+};
+
+/// The **global placement comparator key** for a workload — the total order that replaces the
+/// pre-priority `(project, name)` sort in [`reconcile_once`]. Ordered so that:
+///
+/// `operator_tier DESC → project ASC → rank DESC → name ASC`
+///
+/// The key is returned in a form where the natural `Ord` of the tuple yields that order: tier
+/// and rank are NEGATED (so a higher tier/rank sorts EARLIER under ascending tuple order). The
+/// fairness boundary is this ordering, not a runtime check: because `project` outranks `rank`,
+/// a tenant's huge `rank` reshuffles ONLY its own workloads and can never leapfrog another
+/// project's. With every workload on the default class (tier 0) and rank 0, the key reduces to
+/// `(0, project, 0, name)` — exactly today's `(project, name)` order, so the change is
+/// non-regressive and evicts/reorders nothing on upgrade.
+pub fn workload_priority_key(
+    catalog: &PriorityClassCatalog,
+    project: &str,
+    workload: &ComputeWorkload,
+) -> (i32, String, i32, String) {
+    let tier = catalog.tier_of(&workload.priority);
+    (
+        // Negate so a HIGHER tier compares as the SMALLER (earlier) key.
+        tier.saturating_neg(),
+        project.to_string(),
+        workload.priority.rank.saturating_neg(),
+        workload.name.clone(),
+    )
+}
+
+/// The CEILING-CLAMPED global comparator key — [`workload_priority_key`] with the workload's
+/// effective TIER clamped to the project `ceiling` (see
+/// [`PriorityClassCatalog::resolve_clamped`]). The reconcile placement sort and the preemption
+/// engine's victim ordering use this (not the raw key) so a stored over-ceiling class loses its
+/// placement PRECEDENCE exactly as it loses its preemption AUTHORITY — a stored `system` in a
+/// now-`standard`-ceiling project sorts as `standard`. `ceiling` `None` ⇒ the node default
+/// ceiling (fail-closed). `rank` and `name` are unchanged (the clamp is tier-only); an
+/// at/under-ceiling workload yields exactly [`workload_priority_key`]'s key.
+pub fn workload_priority_key_clamped(
+    catalog: &PriorityClassCatalog,
+    project: &str,
+    workload: &ComputeWorkload,
+    ceiling: Option<&str>,
+) -> (i32, String, i32, String) {
+    let (_, class) = catalog.resolve_clamped(&workload.priority, ceiling);
+    (
+        // Negate so a HIGHER tier compares as the SMALLER (earlier) key.
+        class.tier.saturating_neg(),
+        project.to_string(),
+        workload.priority.rank.saturating_neg(),
+        workload.name.clone(),
+    )
 }
 
 /// Why a backend is — or is NOT — a placement candidate for a spec under the operator policy,
@@ -1881,6 +2259,20 @@ impl NodeCapacities {
             r.mem_mib = r.mem_mib.saturating_sub(res.mem_mib);
         }
     }
+
+    /// CREDIT `res` back onto `node`'s remaining capacity (**saturating** add) — the inverse of
+    /// [`reserve`](Self::reserve). Used by the preemption engine to free a to-be-evicted
+    /// victim's reservation so the dry-run can test whether the preemptor then fits, and to
+    /// build the credited ledger the reconcile driver hands to the main placement loop. Only
+    /// ever credits a reservation that was previously charged (a running victim the pre-pass
+    /// debited), so it never inflates a node past its advertised free figure in practice. A
+    /// node absent from the ledger is ignored.
+    pub fn credit(&mut self, node: u64, res: Reservation) {
+        if let Some(r) = self.remaining.get_mut(&node) {
+            r.vcpus = r.vcpus.saturating_add(res.vcpus);
+            r.mem_mib = r.mem_mib.saturating_add(res.mem_mib);
+        }
+    }
 }
 
 /// Place `count` replicas of `spec` (subject to `placement` + `policy`) across `nodes`.
@@ -2030,6 +2422,32 @@ pub enum Readiness {
         /// registry-auth layer's errors name only secret refs, never values).
         reason: String,
     },
+    /// The replica was **preempted** (evicted) by a strictly-higher-priority workload and
+    /// DRAINED (its container stopped; the persistent volume survived) — a durable marker,
+    /// parallel to [`LaunchFailed`](Self::LaunchFailed), so `compute status` shows `PREEMPTED`
+    /// (never a bare "unresolved") with the preemptor attribution instead of the ordinal
+    /// silently vanishing. The reconcile retries the ordinal like a failed launch once its
+    /// cooldown ([`PREEMPTION_COOLDOWN_SECS`]) expires and capacity frees; a successful
+    /// relaunch overwrites it with a fresh [`Starting`](Self::Starting). A PARKED victim does
+    /// NOT use this marker — it persists in [`ReplicaPhase::Zero`] and wakes via Restore.
+    /// Always gated (never routed): it has no live endpoint. `by` is the operator phrase
+    /// `"<project>/<workload>"` of the preemptor (a project-scoped surface redacts a
+    /// cross-tenant preemptor to an aggregate).
+    Preempted {
+        /// The preemptor identity (`"<project>/<workload> (<class>, tier <N>)"`). A tenant-
+        /// scoped render redacts a cross-tenant preemptor; the operator view names it.
+        by: String,
+        /// The preemptor's project — the single field a project-scoped surface compares against
+        /// the viewing project to decide REDACTION (never shown; drives redaction only).
+        preemptor_project: String,
+        /// Wall-clock unix seconds the eviction happened — the anti-thrash COOLDOWN stamp on
+        /// the replica record. While `now - since < `[`PREEMPTION_COOLDOWN_SECS`] the drained
+        /// ordinal's relaunch is held off, so it is not immediately re-placed onto the node it
+        /// was evicted from (which, with dry-run-before-evict + deterministic victim selection,
+        /// keeps placement from oscillating). A PARKED victim needs no stamp — its wake is
+        /// gated on the node having free capacity, which the preemptor holds until it leaves.
+        since: u64,
+    },
 }
 
 impl Readiness {
@@ -2094,6 +2512,14 @@ pub fn reduce_readiness(states: &[ObservedInstance]) -> Option<Readiness> {
             running
                 .iter()
                 .find(|r| matches!(r, Readiness::ProvisionFailed { .. }))
+        })
+        // A `Preempted` drain marker is a durable "evicted, not running" signal — surface it
+        // (with its preemptor attribution) over a merely-starting/provisioned sibling, below the
+        // launch/provision faults (a preemption is an expected, recoverable scheduling outcome).
+        .or_else(|| {
+            running
+                .iter()
+                .find(|r| matches!(r, Readiness::Preempted { .. }))
         })
     {
         return Some((*failed).clone());
@@ -2302,7 +2728,77 @@ pub enum Action {
         /// The backend that owns the snapshot.
         backend: String,
     },
+    /// **Preempt** a running replica to free its reservation for a strictly-higher-priority
+    /// workload. Distinct from [`Stop`](Self::Stop) purely for OBSERVABILITY — it carries the
+    /// preemptor identity + the disposition so an operator sees who evicted whom. A preemption
+    /// is only ever planned after a DRY-RUN-before-evict proved the preemptor then fits (never
+    /// a wasted eviction), by the global [`plan_preemptions`] engine. The driver executes it as
+    /// a Snapshot+Zero ([`Park`](PreemptDisposition::Park)) or a graceful drain+Stop
+    /// ([`Drain`](PreemptDisposition::Drain)); the victim's volumes always survive.
+    Preempt {
+        /// The running replica to evict.
+        handle: InstanceHandle,
+        /// How to evict it (park-to-snapshot vs graceful drain).
+        disposition: PreemptDisposition,
+        /// Who is preempting it (for the durable marker, events, and logs).
+        preemptor: PreemptorRef,
+    },
 }
+
+/// How a preemption victim is evicted — the disposition the [`plan_preemptions`] engine chooses
+/// per victim and the driver executes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreemptDisposition {
+    /// **Park** (preempt-to-snapshot): deregister from the endpoint set, Snapshot → Zero. The
+    /// victim auto-recovers via the EXISTING wake path once its cooldown expires AND capacity
+    /// frees. Chosen for a scale-to-zero-capable victim (its backend + spec support snapshot),
+    /// so its in-RAM state survives the eviction.
+    Park,
+    /// **Drain**: deregister → SIGTERM → wait `grace` → Stop (the existing redeploy drain path;
+    /// the persistent volume survives). Chosen when the victim cannot be parked. The victim's
+    /// ordinal returns to `need` and surfaces as `PreemptedBy` until capacity frees and it is
+    /// re-placed on a later pass.
+    Drain {
+        /// Graceful-shutdown grace in seconds before the Stop.
+        grace: u32,
+    },
+}
+
+/// The identity of the workload that triggered a preemption — carried on [`Action::Preempt`],
+/// the durable [`Readiness::Preempted`] marker, and the events timeline so attribution ("who
+/// evicted whom") is legible. Operator-facing; a TENANT-scoped surface REDACTS the cross-tenant
+/// identity to an aggregate (see the CLI's tenant-redacted projection) — only the operator view
+/// names another tenant's workload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreemptorRef {
+    /// The preemptor's owning project.
+    pub project: String,
+    /// The preemptor's workload name.
+    pub workload: String,
+    /// The preemptor's resolved operator tier (higher = stronger).
+    pub tier: i32,
+    /// The preemptor's resolved class name.
+    pub class: String,
+}
+
+impl PreemptorRef {
+    /// The operator phrase for this preemptor (`"<project>/<workload> (<class>, tier <N>)"`),
+    /// used in the durable marker + logs. Carries no credential material.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}/{} ({}, tier {})",
+            self.project, self.workload, self.class, self.tier
+        )
+    }
+}
+
+/// The cooldown (seconds) stamped on a just-preempted replica — the anti-thrash guard. A parked
+/// victim's wake (Restore) and a drained victim's relaunch are both held off this long after the
+/// eviction, so a victim cannot be immediately re-woken/re-placed onto the node it was evicted
+/// from (which, combined with the dry-run-before-evict strict-improvement rule and deterministic
+/// victim selection, keeps placement from oscillating). Also prevents a just-preempted replica
+/// from itself triggering a preemption within the window.
+pub const PREEMPTION_COOLDOWN_SECS: u64 = 60;
 
 /// A workload's recent traffic, the input that drives scale-to-zero decisions.
 /// Sourced from the gateway; the reconcile loop treats it as opaque.
@@ -2314,6 +2810,43 @@ pub enum WorkloadActivity {
     Active,
     /// Idle past the scale-to-zero threshold — eligible to **sleep**.
     Idle,
+}
+
+/// The STRUCTURED machine cause an ordinal could not be placed — the v0.70.0 reason enum, so a
+/// shortfall surfaces a distinct, stable token instead of only a logged string (the biggest
+/// pre-priority gap). Distinct from a persisted [`Readiness::Preempted`] marker (a victim that
+/// WAS running and got drained — carried on its replica record); this enum classifies an ordinal
+/// that was never placed this pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnplacedCause {
+    /// Lost the capacity CONTEST to a strictly-higher-priority workload that consumed the
+    /// contended node(s) this pass — the priority-specific shortfall (preemption could not free
+    /// enough, or was not authorized). A legible "outbid", distinct from an absolute shortage.
+    PriorityOutbid,
+    /// No eligible backend had capacity for the spec's needs, independent of priority — the
+    /// pre-priority reason, kept DISTINCT so an absolute shortage never reads as an outbid.
+    InsufficientCapacity,
+}
+
+impl UnplacedCause {
+    /// The stable machine token (`priority_outbid` / `insufficient_capacity`) a surface renders
+    /// — kept stable across releases.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::PriorityOutbid => "priority_outbid",
+            Self::InsufficientCapacity => "insufficient_capacity",
+        }
+    }
+
+    /// The short uppercase label the `compute status` REASON column shows (`OUTBID` /
+    /// `INSUFFICIENT`) — never a bare "unresolved".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PriorityOutbid => "OUTBID",
+            Self::InsufficientCapacity => "INSUFFICIENT",
+        }
+    }
 }
 
 /// One replica the planner needed to (re)launch but could **not place** this pass — a
@@ -2329,6 +2862,11 @@ pub struct Unscheduled {
     pub replica: u32,
     /// Human-readable reason (no eligible backend had capacity for the spec's needs).
     pub reason: String,
+    /// The STRUCTURED machine cause (v0.70.0 reason enum) — [`UnplacedCause::InsufficientCapacity`]
+    /// by default (the per-workload planner's view); the global driver upgrades it to
+    /// [`UnplacedCause::PriorityOutbid`] when a strictly-higher-priority workload consumed the
+    /// contended capacity this pass.
+    pub cause: UnplacedCause,
 }
 
 /// The output of [`reconcile_plan`]: the actions the driver executes **plus** the replicas
@@ -2462,6 +3000,22 @@ pub fn reconcile_plan_in(
         if ord < desired && matches!(inst.readiness, Readiness::LaunchFailed { .. }) {
             continue;
         }
+        // A durable PREEMPTION (drain) marker (evicted by a higher-priority workload — see
+        // `plan_preemptions`). While within its anti-thrash COOLDOWN it is HELD (treated like a
+        // `starting` replica: no Stop, and excluded from `need` so it is NOT immediately
+        // re-placed onto the node it was evicted from — the oscillation guard). Past the
+        // cooldown it is skipped like a `LaunchFailed` marker, so its ordinal lands in `need`
+        // and is retried; a successful relaunch overwrites the marker with a fresh `Starting`,
+        // and if capacity is still tight it simply surfaces `unscheduled` again. Out of range
+        // (scaled down) it falls through to the normal out-of-range `Stop`, cleaning up the marker.
+        if ord < desired
+            && let Readiness::Preempted { since, .. } = &inst.readiness
+        {
+            if now.saturating_sub(*since) < PREEMPTION_COOLDOWN_SECS {
+                starting.insert(ord);
+            }
+            continue;
+        }
         // A REDEPLOY check: this replica was launched from a spec pointer that no
         // longer matches the workload's current `active` (an operator flipped it to a
         // new spec). It must be RECREATED (stopped here → relaunched below from the new
@@ -2487,8 +3041,16 @@ pub fn reconcile_plan_in(
             });
         } else if inst.phase == ReplicaPhase::Zero {
             zeroed.insert(ord);
-            // Wake on activity; otherwise stay parked.
+            // Wake on activity, but ONLY when the node still has room for it (capacity-gated).
+            // The gate serves two ends: (1) a preempt-to-PARK victim stays parked until the
+            // higher-priority workload that took its slot leaves and capacity frees — the
+            // parked victim's recovery guard, needing no cooldown stamp because the preemptor
+            // holds the slot; and (2) it closes the residual wake-oversubscription where a
+            // normal scale-to-zero replica would reclaim a slot a higher-priority workload
+            // already took this pass. A normal parked replica's own slot is free (the pre-pass
+            // never charged a Zero replica), so it still wakes immediately on activity.
             if matches!(activity, WorkloadActivity::Active)
+                && capacity.fits(inst.node, Reservation::of_spec(spec))
                 && let Some(snapshot) = inst.snapshot.clone()
             {
                 // A wake restores the replica to Running (same node that holds its
@@ -2598,6 +3160,10 @@ pub fn reconcile_plan_in(
                 workload: workload.name.clone(),
                 replica: *ord,
                 reason: reason.clone(),
+                // The per-workload planner sees only an absolute shortfall; the global driver
+                // upgrades this to `PriorityOutbid` when a higher-priority workload took the
+                // contended capacity this pass (it has the cross-workload view to tell).
+                cause: UnplacedCause::InsufficientCapacity,
             })
             .collect()
     } else {
@@ -2606,6 +3172,485 @@ pub fn reconcile_plan_in(
     ReconcilePlan {
         actions,
         unscheduled,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preemption engine (pure — the priority tenancy boundary + anti-thrash)
+// ---------------------------------------------------------------------------
+
+/// One workload's snapshot for the global preemption pass — the inputs [`plan_preemptions`]
+/// needs, gathered once by the reconcile driver in PRIORITY ORDER: its project, the mutable
+/// workload (for priority/replicas/placement), the resolved spec, the EFFECTIVE operator policy
+/// (node ∩ per-project), and its observed replicas.
+#[derive(Debug, Clone, Copy)]
+pub struct PreemptInput<'a> {
+    /// Owning project.
+    pub project: &'a str,
+    /// The mutable workload (priority / replicas / placement / active).
+    pub workload: &'a ComputeWorkload,
+    /// The resolved active spec.
+    pub spec: &'a ComputeSpec,
+    /// The EFFECTIVE operator backend policy for this workload (node ∩ per-project).
+    pub policy: &'a BackendPolicy,
+    /// This workload's observed replicas.
+    pub observed: &'a [ObservedInstance],
+}
+
+/// One planned eviction — a victim replica, how to evict it, and who preempted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedPreemption {
+    /// The victim's owning project.
+    pub project: String,
+    /// The victim replica to evict.
+    pub handle: InstanceHandle,
+    /// The node the victim runs on (whose capacity its eviction frees).
+    pub node: u64,
+    /// The backend running the victim.
+    pub backend: String,
+    /// The reservation this eviction frees (credited back to the node ledger).
+    pub res: Reservation,
+    /// How to evict it (park vs drain).
+    pub disposition: PreemptDisposition,
+    /// Who preempted it.
+    pub preemptor: PreemptorRef,
+}
+
+/// The output of [`plan_preemptions`]: the victims to evict, the ledger CREDITED for their
+/// freed reservations (the reconcile driver threads it into the main placement loop so the
+/// preemptor places onto the freed capacity), and the `(project, workload)` set left OUTBID
+/// (a shortfall priority contention caused that preemption could not — or was not authorized to
+/// — resolve, so the driver tags those ordinals [`UnplacedCause::PriorityOutbid`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreemptionPlan {
+    /// The victims to evict (deterministic, least-important-first, each proven to help).
+    pub victims: Vec<PlannedPreemption>,
+    /// The base ledger credited for every victim's reservation.
+    pub credited: NodeCapacities,
+    /// `(project, workload)` left outbid by priority contention this pass.
+    pub outbid: BTreeSet<(String, String)>,
+}
+
+/// Whether an observed replica currently HOLDS node capacity (so it is a preemption VICTIM
+/// candidate and counts toward its workload's "occupied" ordinals): a `Running` replica that is
+/// NOT a durable failure/preemption marker (those never produced a live instance). A `Zero`
+/// (parked) replica holds none.
+fn holds_capacity(inst: &ObservedInstance) -> bool {
+    inst.phase == ReplicaPhase::Running
+        && !matches!(
+            inst.readiness,
+            Readiness::LaunchFailed { .. } | Readiness::Preempted { .. }
+        )
+}
+
+/// How many NEW replicas a workload still needs placed this pass — `desired` minus the in-range
+/// ordinals already occupied by a live/parked instance (a `Running` capacity-holder, or a `Zero`
+/// replica that wakes via Restore). A redeploy (a `Running` replica of a superseded spec) counts
+/// as occupied — it reuses its freed slot, needing no NEW capacity — so it never triggers
+/// preemption. Approximate but sufficient to TRIGGER the engine; the authoritative placement is
+/// still the main loop's [`reconcile_plan_in`].
+fn preempt_need_count(input: &PreemptInput) -> u32 {
+    let desired = input.workload.replicas;
+    let mut occupied: BTreeSet<u32> = BTreeSet::new();
+    for inst in input
+        .observed
+        .iter()
+        .filter(|i| i.handle.workload == input.workload.name)
+    {
+        let ord = inst.handle.replica;
+        if ord < desired && (holds_capacity(inst) || inst.phase == ReplicaPhase::Zero) {
+            occupied.insert(ord);
+        }
+    }
+    desired.saturating_sub(occupied.len() as u32)
+}
+
+/// The `min_available` floor a victim workload is protected by: its explicit
+/// [`Priority::min_available`], else the class-derived default — `0` for a bottom-tier
+/// (negative-tier, e.g. `spot`) class (freely preemptible), else the full `replicas` (protected,
+/// matching `standard`/`system`). A HARD floor to a same-tier preemptor; ADVISORY to a
+/// strictly-higher operator tier.
+fn victim_floor(workload: &ComputeWorkload, class: &PriorityClass) -> u32 {
+    workload
+        .priority
+        .min_available
+        .unwrap_or(if class.tier < 0 { 0 } else { workload.replicas })
+}
+
+/// A preemption VICTIM candidate — one evictable replica with the facts the engine's selection,
+/// min-available, and disposition logic read.
+struct Candidate {
+    project: String,
+    workload: String,
+    handle: InstanceHandle,
+    node: u64,
+    backend: String,
+    res: Reservation,
+    /// The victim's resolved operator tier (for the HARD-vs-ADVISORY floor decision).
+    victim_tier: i32,
+    /// Whether the victim can be PARKED (snapshot) rather than drained.
+    can_park: bool,
+    /// The victim spec's graceful-drain grace (seconds).
+    drain_grace: u32,
+    /// The victim's global priority key (for the least-important-first deterministic order).
+    key: (i32, String, i32, String),
+}
+
+/// Whether a preemptor at `(p_tier, p_rank, p_mode, p_project)` may EVICT a victim workload at
+/// `(v_tier, v_rank, v_project)` — the TENANCY BOUNDARY, enforced structurally:
+///
+/// - **Same project:** allowed iff the class may preempt within its project AND the preemptor's
+///   `(tier, rank)` is STRICTLY greater — the tenant's own budget (safe; a tenant reshuffling
+///   its own workloads). Within a project a higher `rank` (or higher class tier) wins.
+/// - **Across projects:** allowed ONLY when the class is opted into cross-tenant preemption AND
+///   the preemptor's TIER is strictly higher; `rank` is IGNORED across projects. So two
+///   `standard` (equal-tier) tenants can NEVER preempt each other — the DoS/fairness-safe
+///   default — and only an operator-opted higher tier (`system`) ever reaches another tenant.
+fn can_preempt(
+    p_tier: i32,
+    p_rank: i32,
+    p_mode: PreemptionMode,
+    p_project: &str,
+    v_tier: i32,
+    v_rank: i32,
+    v_project: &str,
+) -> bool {
+    if p_project == v_project {
+        p_mode.preempts_within_project() && (p_tier, p_rank) > (v_tier, v_rank)
+    } else {
+        p_mode.preempts_cross_tenant() && p_tier > v_tier
+    }
+}
+
+/// Whether, among `nodes`, the preemptor's `spec` could place on at least one PREEMPTIBLE
+/// backend under its effective `policy`. A workload whose only eligible backends are DELEGATED
+/// (cloudflare / kubernetes — `preemptible: false`) never preempts: boatramp owns neither their
+/// capacity nor their eviction.
+fn preemptor_uses_preemptible_backend(
+    spec: &ComputeSpec,
+    nodes: &[Node],
+    policy: &BackendPolicy,
+    caps: &BTreeMap<String, Capabilities>,
+) -> bool {
+    nodes.iter().any(|n| {
+        n.pick_backend(spec, policy)
+            .and_then(|b| caps.get(&b).map(|c| c.preemptible))
+            .unwrap_or(false)
+    })
+}
+
+/// The pure, global **preemption engine** — the priority slate's highest-stakes function. Given
+/// every workload's snapshot in PRIORITY ORDER and the post-pre-pass capacity ledger, it decides
+/// which lower-priority replicas to EVICT so a higher-priority workload can be placed, subject to
+/// the tenancy boundary, `min_available` floors, backend-preemptibility, and — critically — the
+/// DRY-RUN-BEFORE-EVICT strict-improvement rule that makes it anti-thrash: a victim is chosen
+/// ONLY when freeing it actually advances the preemptor's placement (never a wasted eviction),
+/// and victims are taken least-important-first by the deterministic global key. Returns the
+/// victims, the ledger credited for their freed capacity, and the outbid set.
+///
+/// It simulates the main reconcile loop's cumulative placement (same priority order, same
+/// [`place_replicas_in`]) against a working ledger, so the credited ledger it hands back is
+/// exactly what the main loop reproduces — the engine decides the evictions; the main loop does
+/// the authoritative placement. PURE: a function of the snapshot + the catalog + `now` only (the
+/// sole carry-over is each replica's persisted preemption-cooldown marker, read via the snapshot).
+///
+/// `project_ceilings` maps `project → current priority-class ceiling` (the operator per-project
+/// cap; a project absent from the map, or mapped to `None`, takes the node default ceiling). Every
+/// workload's effective tier/authority is CLAMPED to its project ceiling via
+/// [`PriorityClassCatalog::resolve_clamped`] — so a class stored above the project's NOW-current
+/// ceiling (e.g. `system` stored while the ceiling was raised, then lowered back to `standard`)
+/// loses its over-ceiling cross-tenant preemption authority here, not only at the write path. The
+/// clamp only lowers a tier, so an all-default or at/under-ceiling fleet is unaffected.
+pub fn plan_preemptions(
+    inputs: &[PreemptInput],
+    nodes: &[Node],
+    caps: &BTreeMap<String, Capabilities>,
+    catalog: &PriorityClassCatalog,
+    project_ceilings: &BTreeMap<String, Option<String>>,
+    base_ledger: &NodeCapacities,
+    _now: u64,
+) -> PreemptionPlan {
+    // The project's CURRENT ceiling class name (`None` ⇒ the node default ceiling), used to clamp
+    // every resolve below so a stored over-ceiling class loses its over-ceiling placement
+    // precedence + preemption authority at reconcile.
+    let ceiling_of = |project: &str| -> Option<&str> {
+        project_ceilings.get(project).and_then(|c| c.as_deref())
+    };
+    // Working ledger: reserves each workload's placements AND credits chosen victims, mirroring
+    // the main loop so later (lower-priority) workloads see the same contended capacity.
+    let mut sim = base_ledger.clone();
+    let mut victims: Vec<PlannedPreemption> = Vec::new();
+    let mut outbid: BTreeSet<(String, String)> = BTreeSet::new();
+    // Victim replicas already committed this pass (so a second preemptor can't double-free one),
+    // and per-victim-workload eviction counts (for the running `min_available` floor).
+    let mut evicted: BTreeSet<(String, String, u32)> = BTreeSet::new();
+    // Workloads that reserved capacity this pass, as `(project, tier, rank)`. A later workload's
+    // shortfall is `PriorityOutbid` (vs a plain `InsufficientCapacity`) ONLY when one of these
+    // STRICTLY DOMINATES it — a higher tier, or a higher rank in its OWN project (same tier).
+    // Two equal-tier workloads in DIFFERENT projects never dominate each other (the
+    // fairness-safe default), so a shortfall between two `standard` tenants reads as an absolute
+    // shortage, never an outbid.
+    let mut placed_workloads: Vec<(String, i32, i32)> = Vec::new();
+
+    for (idx, p) in inputs.iter().enumerate() {
+        // CEILING-CLAMPED resolve: a class stored above the project's current ceiling resolves AS
+        // the ceiling class, so an over-ceiling `system` preemptor loses its cross-tenant authority
+        // (it becomes `standard` = within-project) — the reconcile-time completion of revocation.
+        let (p_class_name, p_class) =
+            catalog.resolve_clamped(&p.workload.priority, ceiling_of(p.project));
+        let p_tier = p_class.tier;
+        let p_rank = p.workload.priority.rank;
+        let p_mode = p_class.preemption;
+
+        // Whether some already-placed workload STRICTLY dominates this one (so an unresolved
+        // shortfall is a true priority outbid, not just an absolute capacity shortage).
+        let dominated = |placed: &[(String, i32, i32)]| -> bool {
+            placed.iter().any(|(vp, vt, vr)| {
+                *vt > p_tier || (vp == p.project && *vt == p_tier && *vr > p_rank)
+            })
+        };
+
+        let need = preempt_need_count(p);
+        if need == 0 {
+            continue;
+        }
+        // Place what fits against the shared sim ledger (reserve it — mirror the main loop).
+        let placed = place_replicas_in(
+            need,
+            &p.workload.placement,
+            p.spec,
+            nodes,
+            p.policy,
+            &mut sim,
+        )
+        .len();
+        if placed > 0 {
+            placed_workloads.push((p.project.to_string(), p_tier, p_rank));
+        }
+        let shortfall = need as usize - placed;
+        if shortfall == 0 {
+            continue;
+        }
+        // Can this workload even preempt? It must run on a preemptible backend and its class
+        // must carry some preemption authority; otherwise its shortfall stands — flagged
+        // `PriorityOutbid` only if a strictly-higher-priority workload took the capacity.
+        if !p_mode.preempts_within_project()
+            || !preemptor_uses_preemptible_backend(p.spec, nodes, p.policy, caps)
+        {
+            if dominated(&placed_workloads) {
+                outbid.insert((p.project.to_string(), p.workload.name.clone()));
+            }
+            continue;
+        }
+
+        // Enumerate candidate victims: a capacity-holding replica of ANOTHER workload (any
+        // project) that (a) runs on a preemptible backend and (b) the tenancy boundary admits.
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (vidx, v) in inputs.iter().enumerate() {
+            if vidx == idx {
+                continue; // never preempt one's own workload's replicas to place itself
+            }
+            // CEILING-CLAMPED victim tier: the cross-tenant eligibility check uses the victim's
+            // effective (clamped) tier, so a victim whose stored class now exceeds its project
+            // ceiling is weighed at the ceiling tier (consistent with the preemptor clamp above).
+            let (_v_name, v_class) =
+                catalog.resolve_clamped(&v.workload.priority, ceiling_of(v.project));
+            let v_tier = v_class.tier;
+            let v_rank = v.workload.priority.rank;
+            if !can_preempt(p_tier, p_rank, p_mode, p.project, v_tier, v_rank, v.project) {
+                continue;
+            }
+            let v_res = Reservation::of_spec(v.spec);
+            for inst in v
+                .observed
+                .iter()
+                .filter(|i| i.handle.workload == v.workload.name && holds_capacity(i))
+            {
+                // Skip a replica already committed as a victim by an earlier (higher-priority)
+                // preemptor this pass — it can't be double-freed.
+                let evkey = (
+                    v.project.to_string(),
+                    v.workload.name.clone(),
+                    inst.handle.replica,
+                );
+                if evicted.contains(&evkey) {
+                    continue;
+                }
+                // Only replicas on a PREEMPTIBLE backend are victims (boatramp owns their
+                // capacity + eviction); a delegated backend's replica is never a victim.
+                if !caps.get(&inst.backend).is_some_and(|c| c.preemptible) {
+                    continue;
+                }
+                let can_park = v.spec.scale_to_zero
+                    && caps.get(&inst.backend).is_some_and(|c| c.scale_to_zero);
+                candidates.push(Candidate {
+                    project: v.project.to_string(),
+                    workload: v.workload.name.clone(),
+                    handle: inst.handle.clone(),
+                    node: inst.node,
+                    backend: inst.backend.clone(),
+                    res: v_res,
+                    victim_tier: v_tier,
+                    can_park,
+                    drain_grace: v.spec.startup_grace_secs,
+                    key: workload_priority_key_clamped(
+                        catalog,
+                        v.project,
+                        v.workload,
+                        ceiling_of(v.project),
+                    ),
+                });
+            }
+        }
+        // Deterministic order: LEAST-important victim first (largest global key — recall the key
+        // sorts higher-priority SMALLER), then lowest node id, then lowest replica ordinal.
+        candidates.sort_by(|a, b| {
+            b.key
+                .cmp(&a.key)
+                .then(a.node.cmp(&b.node))
+                .then(a.handle.replica.cmp(&b.handle.replica))
+        });
+
+        // Running count per victim workload (for the min_available floor), net of replicas
+        // ALREADY committed as victims this pass (by an earlier preemptor), and further
+        // decremented as this preemptor chooses victims from it.
+        let mut running_left: BTreeMap<(String, String), u32> = BTreeMap::new();
+        for v in inputs {
+            let n = v
+                .observed
+                .iter()
+                .filter(|i| i.handle.workload == v.workload.name && holds_capacity(i))
+                .count() as u32;
+            let already = evicted
+                .iter()
+                .filter(|(pr, wl, _)| pr == v.project && wl == &v.workload.name)
+                .count() as u32;
+            running_left.insert(
+                (v.project.to_string(), v.workload.name.clone()),
+                n.saturating_sub(already),
+            );
+        }
+
+        // DRY-RUN-BEFORE-EVICT with per-victim strict improvement: credit a candidate only when
+        // it actually advances the preemptor's placement; stop once the full shortfall fits.
+        let mut trial = sim.clone();
+        let mut chosen: Vec<Candidate> = Vec::new();
+        let mut fit = 0usize;
+        for cand in candidates {
+            if fit >= shortfall {
+                break;
+            }
+            // min_available floor for this victim workload.
+            let vkey = (cand.project.clone(), cand.workload.clone());
+            let v_input = inputs
+                .iter()
+                .find(|v| v.project == cand.project && v.workload.name == cand.workload);
+            let (floor, same_tier) = match v_input {
+                Some(v) => {
+                    // Clamp the victim to its project ceiling so both the min-available floor and
+                    // the same-tier test weigh its EFFECTIVE tier (matching `can_preempt` above).
+                    let (_n, vc) =
+                        catalog.resolve_clamped(&v.workload.priority, ceiling_of(v.project));
+                    (victim_floor(v.workload, vc), vc.tier == p_tier)
+                }
+                None => (0, false),
+            };
+            let left = running_left.get(&vkey).copied().unwrap_or(0);
+            let after = left.saturating_sub(1);
+            if after < floor {
+                // Dropping below the floor. HARD when same tier (refuse); ADVISORY to a strictly
+                // higher operator tier (allow, so `system` can still displace a node-holding
+                // lower-tier workload — the standoff is surfaced legibly rather than deadlocked).
+                if same_tier || !(p_tier > cand.victim_tier) {
+                    continue;
+                }
+            }
+            // Probe: does crediting this victim increase how much of the shortfall fits?
+            let mut probe = trial.clone();
+            probe.credit(cand.node, cand.res);
+            let mut probe2 = probe.clone();
+            let new_fit = place_replicas_in(
+                shortfall as u32,
+                &p.workload.placement,
+                p.spec,
+                nodes,
+                p.policy,
+                &mut probe2,
+            )
+            .len();
+            if new_fit > fit {
+                trial.credit(cand.node, cand.res);
+                fit = new_fit;
+                running_left.insert(vkey, after);
+                chosen.push(cand);
+            }
+            // else: this victim does not help the preemptor — never evict it (no wasted eviction).
+        }
+
+        if fit >= shortfall && !chosen.is_empty() {
+            // COMMIT: credit the sim ledger, record the victims, then reserve the preemptor's
+            // now-fitting placements so a later workload this pass sees the capacity taken.
+            // The preemptor is now a placed workload (it may itself dominate a later one).
+            placed_workloads.push((p.project.to_string(), p_tier, p_rank));
+            for cand in &chosen {
+                sim.credit(cand.node, cand.res);
+            }
+            place_replicas_in(
+                shortfall as u32,
+                &p.workload.placement,
+                p.spec,
+                nodes,
+                p.policy,
+                &mut sim,
+            );
+            for cand in chosen {
+                evicted.insert((
+                    cand.project.clone(),
+                    cand.workload.clone(),
+                    cand.handle.replica,
+                ));
+                let disposition = if cand.can_park {
+                    PreemptDisposition::Park
+                } else {
+                    PreemptDisposition::Drain {
+                        grace: cand.drain_grace,
+                    }
+                };
+                victims.push(PlannedPreemption {
+                    project: cand.project,
+                    handle: cand.handle,
+                    node: cand.node,
+                    backend: cand.backend,
+                    res: cand.res,
+                    disposition,
+                    preemptor: PreemptorRef {
+                        project: p.project.to_string(),
+                        workload: p.workload.name.clone(),
+                        tier: p_tier,
+                        class: p_class_name.to_string(),
+                    },
+                });
+            }
+        } else {
+            // Could not free enough (or nothing helped) — evict NOTHING (no wasted eviction).
+            // The shortfall is a true `PriorityOutbid` only if a strictly-higher-priority
+            // workload took the capacity; otherwise it is an absolute `InsufficientCapacity`.
+            if dominated(&placed_workloads) {
+                outbid.insert((p.project.to_string(), p.workload.name.clone()));
+            }
+        }
+    }
+
+    // The ledger the driver hands to the main loop: the post-pre-pass base credited for each
+    // committed victim's reservation (the main loop re-reserves placements itself).
+    let mut credited = base_ledger.clone();
+    for v in &victims {
+        credited.credit(v.node, v.res);
+    }
+    PreemptionPlan {
+        victims,
+        credited,
+        outbid,
     }
 }
 
@@ -2650,6 +3695,9 @@ pub struct ReconcileReport {
     pub slept: usize,
     /// Replicas woken (restored from a snapshot) this pass.
     pub woke: usize,
+    /// Replicas **preempted** (parked or drained to free capacity for a higher-priority
+    /// workload) this pass.
+    pub preempted: usize,
     /// Per-action failures (the pass continues past them; retried next tick).
     pub errors: Vec<String>,
 }
@@ -3371,12 +4419,51 @@ pub fn blob_bind_names_unknown_site(
         && !known_sites.iter().any(|s| s == workload)
 }
 
+/// Persist a drained preemption victim's durable [`Readiness::Preempted`] MARKER — the record
+/// (kept, not deleted) that makes `compute status` show `PREEMPTED` with the preemptor
+/// attribution and that the reconcile retries once its cooldown expires + capacity frees. Built
+/// from the victim's observed record with phase `Running` + `healthy: false` (like a
+/// `LaunchFailed` marker), carrying the preemptor identity + the eviction timestamp (the
+/// anti-thrash cooldown stamp).
+async fn persist_preempt_marker(
+    deploy: &DeployStore,
+    project: ProjectRef<'_>,
+    obs: &ObservedInstance,
+    v: &PlannedPreemption,
+    now: u64,
+    report: &mut ReconcileReport,
+) {
+    let marker = ObservedInstance {
+        healthy: false,
+        phase: ReplicaPhase::Running,
+        readiness: Readiness::Preempted {
+            by: v.preemptor.describe(),
+            preemptor_project: v.preemptor.project.clone(),
+            since: now,
+        },
+        snapshot: None,
+        data_dir: None,
+        ..obs.clone()
+    };
+    match deploy.set_replica_state(project, &marker).await {
+        Ok(()) => report.preempted += 1,
+        Err(e) => report.errors.push(format!(
+            "{}/{}: preempt-drain persist: {e}",
+            v.handle.workload, v.handle.replica
+        )),
+    }
+}
+
 /// One reconcile pass: for every workload, refresh replica health, compute the
 /// plan ([`reconcile_plan`]), and execute it against the chosen backends —
 /// launching/stopping replicas and persisting their observed state (which the
 /// gateway reads as the upstream pool). Per-action failures are collected (not
 /// fatal) so one bad workload can't stall the rest; a top-level KV failure
 /// aborts the pass. The caller leader-gates this (cron-style).
+///
+/// Before the per-workload loop a global PREEMPTION pass ([`plan_preemptions`]) may evict
+/// lower-priority replicas to free capacity for higher-priority workloads (priority-ordered by
+/// [`workload_priority_key`]); it threads a CREDITED capacity ledger into the loop.
 ///
 /// For now the chosen backend is invoked locally (the leader also runs it).
 /// Cross-node dispatch via messaging is a later refinement.
@@ -3404,15 +4491,50 @@ pub async fn reconcile_once(
     // reclaim it — it feeds this set to each backend's `gc_ip_pool`.
     let mut parked_keys: Vec<(String, String, u32)> = Vec::new();
 
+    // The operator priority-class catalog in force (the owner-set built-in `system`/`standard`/
+    // `spot` tiers). The reconcile engine uses the built-ins; operator tier/mode overrides via
+    // node config compose into this catalog at the server wiring (a thin follow-on).
+    let catalog = PriorityClassCatalog::builtin();
+
     // Every project's workloads (compute is project-scoped in 0.2.0), fetched once.
     let mut workloads = deploy.list_compute_workloads_all().await?;
-    // DETERMINISTIC placement order. With one shared capacity ledger (below) the order in
-    // which workloads consume contended capacity is observable, so sort by (project,
-    // workload name) — a total order that is stable across reconciles and independent of the
-    // store's iteration order. A workload that doesn't fit when capacity is tight stays
-    // unplaced on the same stable basis each tick (it doesn't flap), and freed capacity is
-    // handed to the earliest such workload in this order.
-    workloads.sort_by(|(pa, wa), (pb, wb)| pa.cmp(pb).then_with(|| wa.name.cmp(&wb.name)));
+    // Each project's CURRENT priority-class ceiling (the operator per-project cap), fetched once
+    // and shared by BOTH the priority-ordered placement sort and the preemption engine. The
+    // ceiling is authoritative at RECONCILE, not only at the write path: a class stored while the
+    // project ceiling was temporarily HIGHER (then lowered back) is CLAMPED to the current ceiling
+    // wherever a tier is resolved below, so it loses any over-ceiling placement precedence AND
+    // cross-tenant preemption authority — completing the revocation the write-time `check_request`
+    // gate alone cannot. A missing/unreadable per-project policy ⇒ `None` = the node default
+    // ceiling (FAIL-CLOSED: the default is `standard`, never a silent grant of a higher tier).
+    let mut project_ceilings: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (project_name, _) in &workloads {
+        if project_ceilings.contains_key(project_name) {
+            continue;
+        }
+        let ceiling = match deploy
+            .get_project_backend_policy(ProjectRef::new(project_name))
+            .await
+        {
+            Ok(pp) => pp.and_then(|p| p.priority_ceiling),
+            Err(_) => None,
+        };
+        project_ceilings.insert(project_name.clone(), ceiling);
+    }
+    // DETERMINISTIC, PRIORITY-ORDERED placement. With one shared capacity ledger (below) the
+    // order in which workloads consume contended capacity is observable, so sort by the global
+    // priority comparator — `operator_tier DESC → project → rank DESC → name` (see
+    // [`workload_priority_key`]). Because `project` outranks `rank`, a tenant's huge `rank`
+    // reshuffles only its OWN workloads and can never leapfrog another project — the fairness
+    // boundary is this key ordering, not a runtime check. With all-default classes + rank 0 it
+    // reduces to the prior `(project, name)` order, so the change is non-regressive: a
+    // capacity-tight workload stays unplaced on the same stable basis each tick (it doesn't
+    // flap), and freed capacity is handed to the earliest (highest-priority) such workload.
+    workloads.sort_by(|(pa, wa), (pb, wb)| {
+        let ca = project_ceilings.get(pa).and_then(|c| c.as_deref());
+        let cb = project_ceilings.get(pb).and_then(|c| c.as_deref());
+        workload_priority_key_clamped(&catalog, pa, wa, ca)
+            .cmp(&workload_priority_key_clamped(&catalog, pb, wb, cb))
+    });
 
     // Each workload's active spec + replica states, fetched exactly ONCE for this tick.
     struct WorkloadTickInputs {
@@ -3480,8 +4602,14 @@ pub async fn reconcile_once(
                 //    what makes cumulative bin-packing and launch-observability compose: the same
                 //    "a LaunchFailed marker has no live instance" rule the observe loop, binding
                 //    resolution, and the planner's classification already apply.
+                //  - a durable `Preempted` (drain) MARKER — the victim's container was stopped
+                //    by a preemption, so it holds no capacity either (its ordinal is retried
+                //    like a failed launch once its cooldown expires and capacity frees).
                 if state.phase != ReplicaPhase::Running
-                    || matches!(state.readiness, Readiness::LaunchFailed { .. })
+                    || matches!(
+                        state.readiness,
+                        Readiness::LaunchFailed { .. } | Readiness::Preempted { .. }
+                    )
                 {
                     continue;
                 }
@@ -3499,9 +4627,179 @@ pub async fn reconcile_once(
         }
     }
 
+    // PREEMPTION PASS (v0.70.0). Gather a priority-ordered snapshot of every workload — its
+    // resolved spec, EFFECTIVE operator policy (node ∩ per-project), and observed replicas — and
+    // run the pure global `plan_preemptions` engine against the post-pre-pass ledger. It decides
+    // which lower-priority replicas to EVICT so a higher-priority workload fits, under the
+    // tenancy boundary + min_available floors + dry-run-before-evict strict improvement. We then
+    // execute the evictions (park→snapshot+zero / drain→stop+marker) and thread the CREDITED
+    // ledger into the main loop, so the preemptor places onto the freed capacity. A workload
+    // whose per-project policy read ERRORS is left OUT of the snapshot entirely — it is neither
+    // preemptor nor victim this pass (fail-safe: never evict under an uncertain policy), mirroring
+    // the main loop's fail-closed placement hold.
+    struct PreemptOwned {
+        project: String,
+        workload: ComputeWorkload,
+        spec: ComputeSpec,
+        policy: BackendPolicy,
+        observed: Vec<ObservedInstance>,
+    }
+    let now_unix = crate::time::now_unix();
+    let mut preempt_owned: Vec<PreemptOwned> = Vec::new();
+    {
+        let mut policy_cache: BTreeMap<String, BackendPolicy> = BTreeMap::new();
+        for wi in &tick_inputs {
+            let project_name = &wi.project_name;
+            let workload = &wi.workload;
+            let project = ProjectRef::new(project_name);
+            // Reuse the single per-tick fetch (binpack's `WorkloadTickInputs`): the pre-pass is
+            // read-only and a workload's spec is immutable (content-addressed), so `wi.active_spec`
+            // / `wi.replica_states` are exactly what a fresh read here would return — no third
+            // per-workload store round-trip, keeping binpack's fetch-once invariant.
+            let Some(spec) = wi.active_spec.clone() else {
+                continue; // no spec → the main loop reports it; nothing to preempt for/with
+            };
+            let effective = if let Some(p) = policy_cache.get(project_name) {
+                p.clone()
+            } else {
+                match deploy.get_project_backend_policy(project).await {
+                    Ok(pp) => {
+                        let e = policy.compose_project(&pp.unwrap_or_default());
+                        policy_cache.insert(project_name.clone(), e.clone());
+                        e
+                    }
+                    // Policy unavailable → skip this workload from the preemption pass entirely
+                    // (fail-safe: never evict, never be evicted, under an uncertain policy).
+                    Err(_) => continue,
+                }
+            };
+            let observed = wi.replica_states.clone();
+            preempt_owned.push(PreemptOwned {
+                project: project_name.clone(),
+                workload: workload.clone(),
+                spec,
+                policy: effective,
+                observed,
+            });
+        }
+    }
+    let preempt_inputs: Vec<PreemptInput> = preempt_owned
+        .iter()
+        .map(|o| PreemptInput {
+            project: &o.project,
+            workload: &o.workload,
+            spec: &o.spec,
+            policy: &o.policy,
+            observed: &o.observed,
+        })
+        .collect();
+    let preemption = plan_preemptions(
+        &preempt_inputs,
+        nodes,
+        &caps,
+        &catalog,
+        &project_ceilings,
+        &capacity,
+        now_unix,
+    );
+    // EXECUTE the evictions. Park snapshots+zeros a scale-to-zero-capable victim (it wakes via
+    // the existing capacity-gated Restore once the preemptor leaves); Drain stops the container
+    // (its persistent volume survives) and persists a durable `Preempted` marker so `compute
+    // status` shows PREEMPTED with attribution and the ordinal is retried once its cooldown
+    // expires and capacity frees. A victim that vanished between plan + execute is skipped.
+    for v in &preemption.victims {
+        let project = ProjectRef::new(&v.project);
+        let owned = preempt_owned
+            .iter()
+            .find(|o| o.project == v.project && o.workload.name == v.handle.workload);
+        let Some(obs) =
+            owned.and_then(|o| o.observed.iter().find(|i| i.handle == v.handle).cloned())
+        else {
+            continue;
+        };
+        let Some(b) = backends.get(&v.backend) else {
+            report.errors.push(format!(
+                "{}/{}: preempt: no backend {:?}",
+                v.handle.workload, v.handle.replica, v.backend
+            ));
+            continue;
+        };
+        match &v.disposition {
+            PreemptDisposition::Park => match b.snapshot(&v.handle).await {
+                Ok(Some(mut snapshot)) => {
+                    snapshot.project = v.project.clone();
+                    let parked = ObservedInstance {
+                        healthy: false,
+                        phase: ReplicaPhase::Zero,
+                        snapshot: Some(snapshot),
+                        ..obs
+                    };
+                    match deploy.set_replica_state(project, &parked).await {
+                        Ok(()) => report.preempted += 1,
+                        Err(e) => report.errors.push(format!(
+                            "{}/{}: preempt-park persist: {e}",
+                            v.handle.workload, v.handle.replica
+                        )),
+                    }
+                }
+                // Backend declined to snapshot (e.g. not running) — fall back to a drain so the
+                // capacity is still freed; persist the durable marker.
+                Ok(None) => {
+                    let _ = b.stop(&v.handle).await;
+                    persist_preempt_marker(deploy, project, &obs, v, now_unix, &mut report).await;
+                }
+                Err(e) => report.errors.push(format!(
+                    "{}/{}: preempt-snapshot: {e}",
+                    v.handle.workload, v.handle.replica
+                )),
+            },
+            PreemptDisposition::Drain { grace: _ } => {
+                // Deregister + stop (the existing redeploy drain path; the volume survives).
+                if let Some(b2) = backends.get(&v.backend)
+                    && let Err(e) = b2.stop(&v.handle).await
+                {
+                    report.errors.push(format!(
+                        "{}/{}: preempt-stop: {e}",
+                        v.handle.workload, v.handle.replica
+                    ));
+                }
+                // Release the victim's shim tokens + revoke its dynamic DB cred (idempotent),
+                // exactly as a normal Stop does — a relaunch re-mints them.
+                if let Some(o) = owned {
+                    if let Some(resolver) = resolver
+                        && !o.spec.bindings.is_empty()
+                    {
+                        resolver
+                            .release(
+                                &v.project,
+                                &v.handle.workload,
+                                v.handle.replica,
+                                &o.spec.bindings,
+                            )
+                            .await;
+                    }
+                    if let Some(m) = managed_db {
+                        let _ = m
+                            .revoke_dynamic_db_cred(
+                                &v.project,
+                                &v.handle.workload,
+                                &o.spec.bindings,
+                                v.handle.replica,
+                            )
+                            .await;
+                    }
+                }
+                persist_preempt_marker(deploy, project, &obs, v, now_unix, &mut report).await;
+            }
+        }
+    }
+    // Thread the credited ledger into the main loop so the preemptor places onto freed capacity.
+    capacity = preemption.credited;
+    let outbid = preemption.outbid;
+
     // The owning project threads through every replica-state read/write below. Each workload's
     // active spec + replica states were already fetched ONCE into `tick_inputs` above (shared
-    // with the pre-pass) — reuse them here rather than re-reading the store.
+    // with the pre-pass AND the preemption pass) — reuse them here rather than re-reading the store.
     for wi in tick_inputs {
         let WorkloadTickInputs {
             project_name,
@@ -3764,14 +5062,29 @@ pub async fn reconcile_once(
         // per-ordinal `warn!` at the site AND an entry in `report.errors`, so the aggregated
         // "compute reconcile: partial" WARN fires instead of a stuck workload silently
         // vanishing from `compute status` with no reason.
+        // Did a strictly-higher-priority workload consume the capacity this workload wanted?
+        // The preemption engine marks such a workload OUTBID; upgrade its shortfall's structured
+        // cause from the planner's default `InsufficientCapacity` to `PriorityOutbid` so the
+        // reason enum distinguishes "lost the capacity contest" from an absolute shortage.
+        let was_outbid = outbid.contains(&(project_name.clone(), workload.name.clone()));
         for u in &plan.unscheduled {
+            let cause = if was_outbid {
+                UnplacedCause::PriorityOutbid
+            } else {
+                u.cause
+            };
             tracing::warn!(
                 project = %project_name,
                 workload = %u.workload,
                 replica = u.replica,
                 reason = %u.reason,
+                cause = cause.token(),
                 "compute: replica not scheduled",
             );
+            // The human log line stays stable (`not scheduled: <reason>`); the machine cause
+            // token (`priority_outbid` / `insufficient_capacity`) rides the structured `cause`
+            // tracing field above and the `compute get` placement-explain, so a surface can
+            // distinguish an outbid from an absolute shortage without parsing this string.
             report.errors.push(format!(
                 "{}/{}: not scheduled: {}",
                 u.workload, u.replica, u.reason
@@ -3920,6 +5233,22 @@ pub async fn reconcile_once(
                         }
                         _ => None,
                     };
+                    // The workload's resolved priority class, threaded so a delegated backend
+                    // (k8s) can map it to its native PriorityClass. CEILING-CLAMPED so a stored
+                    // over-ceiling class cannot smuggle its over-ceiling authority onto the
+                    // delegated substrate either — the native PriorityClass tracks the same
+                    // effective (clamped) tier the local engine enforces.
+                    let priority_class = Some(
+                        catalog
+                            .resolve_clamped(
+                                &workload.priority,
+                                project_ceilings
+                                    .get(project_name.as_str())
+                                    .and_then(|c| c.as_deref()),
+                            )
+                            .0
+                            .to_string(),
+                    );
                     match launch_one(
                         b.as_ref(),
                         &project_name,
@@ -3933,6 +5262,7 @@ pub async fn reconcile_once(
                         privilege.as_ref(),
                         pull_auth.as_ref(),
                         project_opt_out_redaction,
+                        priority_class,
                     )
                     .await
                     {
@@ -4159,6 +5489,16 @@ pub async fn reconcile_once(
                         )),
                     }
                 }
+                // Preemptions are planned + executed in the dedicated global pass BEFORE this
+                // per-workload loop (`plan_preemptions`), never emitted by `reconcile_plan_in`,
+                // so this arm is unreachable in the main loop. Kept for match exhaustiveness.
+                Action::Preempt { handle, .. } => {
+                    tracing::debug!(
+                        workload = %handle.workload,
+                        replica = handle.replica,
+                        "compute: unexpected Preempt action in the per-workload loop (ignored; handled in the preemption pass)",
+                    );
+                }
             }
         }
     }
@@ -4363,6 +5703,7 @@ async fn launch_one(
     privilege: Option<&PrivilegeDirective>,
     pull_auth: Option<&RegistryAuth>,
     project_opt_out_redaction: bool,
+    priority_class: Option<String>,
 ) -> Result<ObservedInstance, BackendError> {
     // The launch wall-clock time, so the next reconcile tick can grant this replica a
     // startup grace before treating it as a broken launch (see `reconcile_plan`).
@@ -4418,6 +5759,7 @@ async fn launch_one(
             spec: spec.clone(),
             artifact,
             redaction,
+            priority_class,
         })
         .await?;
     // Probe readiness right after launch instead of asserting `healthy: true`
@@ -4888,6 +6230,7 @@ mod tests {
             active: "h".into(),
             replicas,
             placement,
+            priority: Default::default(),
         }
     }
 
@@ -5514,6 +6857,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             },
         );
         m
@@ -6155,6 +7499,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -6223,6 +7568,7 @@ mod tests {
                 spec: s,
                 artifact,
                 redaction: Default::default(),
+                priority_class: None,
             })
             .await
             .unwrap();
@@ -6255,6 +7601,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -6320,6 +7667,7 @@ mod tests {
 
         let _ = launch_one(
             &backend, "default", "w", 0, 1, None, &s, "spec-a", &extra_env, None, None, false,
+            None,
         )
         .await
         .expect("launch");
@@ -6374,7 +7722,7 @@ mod tests {
 
         // opt_out = true is carried onto the request...
         let _ = launch_one(
-            &backend, "default", "w", 0, 1, None, &s, "spec-a", &extra_env, None, None, true,
+            &backend, "default", "w", 0, 1, None, &s, "spec-a", &extra_env, None, None, true, None,
         )
         .await
         .expect("launch");
@@ -6407,6 +7755,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -6464,6 +7813,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -6487,6 +7837,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -6502,6 +7853,7 @@ mod tests {
             active: "spec".into(),
             replicas: 1,
             placement: PlacementConstraints::default(),
+            priority: Default::default(),
         };
         let caps: BTreeMap<String, Capabilities> =
             [("fake".to_string(), FakeBackend.capabilities())]
@@ -6615,6 +7967,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -6702,6 +8055,7 @@ mod tests {
                     active: hash,
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -6808,6 +8162,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -6851,6 +8206,7 @@ mod tests {
                     active: hash,
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -6958,6 +8314,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -7029,6 +8386,7 @@ mod tests {
                     active: hash,
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7116,6 +8474,7 @@ mod tests {
                     active: hash.clone(),
                     replicas: 2,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7178,6 +8537,7 @@ mod tests {
                     active: hash,
                     replicas: 0,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7218,6 +8578,7 @@ mod tests {
                     active: hash.clone(),
                     replicas,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7243,6 +8604,7 @@ mod tests {
                     allow: None,
                     forbid: vec!["fake".into()],
                     prefer: None,
+                    priority_ceiling: None,
                 },
             )
             .await
@@ -7350,6 +8712,7 @@ mod tests {
                     allow: None,
                     forbid: vec!["fake".into()],
                     prefer: None,
+                    priority_ceiling: None,
                 },
             )
             .await
@@ -7538,6 +8901,7 @@ mod tests {
                     active: alpha_hash,
                     replicas: 0,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7584,6 +8948,7 @@ mod tests {
                     active: "missing-spec-hash".into(),
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7731,6 +9096,7 @@ mod tests {
                     active: hash.clone(),
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7841,6 +9207,7 @@ mod tests {
                     active: hash.clone(),
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7883,6 +9250,7 @@ mod tests {
                     active: hash,
                     replicas: 0,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -7975,6 +9343,7 @@ mod tests {
                 persistent_volumes: false,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -8030,6 +9399,7 @@ mod tests {
                     active: hash,
                     replicas: 1,
                     placement: Default::default(),
+                    priority: Default::default(),
                 },
             )
             .await
@@ -8394,6 +9764,7 @@ mod tests {
             allow: allow.map(|a| a.iter().map(|s| (*s).to_string()).collect()),
             forbid: forbid.iter().map(|s| (*s).to_string()).collect(),
             prefer: prefer.map(str::to_string),
+            priority_ceiling: None,
         }
     }
 
@@ -8861,6 +10232,7 @@ mod tests {
                         active: hash,
                         replicas: 1,
                         placement: Default::default(),
+                        priority: Default::default(),
                     },
                 )
                 .await
@@ -8943,6 +10315,7 @@ mod tests {
                         active: "missing-active-hash".into(),
                         replicas: 1,
                         placement: Default::default(),
+                        priority: Default::default(),
                     },
                 )
                 .await
@@ -8968,6 +10341,7 @@ mod tests {
                         active: fill_hash,
                         replicas: 1,
                         placement: Default::default(),
+                        priority: Default::default(),
                     },
                 )
                 .await
@@ -9029,5 +10403,905 @@ mod tests {
             "the held workload is surfaced as not scheduled: {:?}",
             r_big.errors
         );
+    }
+}
+
+// ===========================================================================
+// Priority / preemption engine tests (v0.70.0) — the slate's highest-stakes
+// feature: the tenancy boundary, the comparator, dry-run-before-evict + anti-
+// thrash, dispositions, min_available, the capability gate, and the reason enum.
+// ===========================================================================
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    // ---- helpers -----------------------------------------------------------
+
+    fn sp(vcpus: u32, mem: u32) -> ComputeSpec {
+        ComputeSpec::builder(RootSource::Image("img:1".into()), vcpus, mem, 80).build()
+    }
+
+    /// A scale-to-zero-capable spec (so a vmm victim is PARKED rather than drained).
+    fn sp_s2z(vcpus: u32, mem: u32) -> ComputeSpec {
+        ComputeSpec::builder(RootSource::Image("img:1".into()), vcpus, mem, 80)
+            .scale_to_zero(true)
+            .build()
+    }
+
+    fn pri(class: Option<&str>, rank: i32, min_available: Option<u32>) -> Priority {
+        Priority::new()
+            .with_class(class.map(str::to_string))
+            .with_rank(rank)
+            .with_min_available(min_available)
+    }
+
+    fn wl(name: &str, replicas: u32, priority: Priority) -> ComputeWorkload {
+        ComputeWorkload {
+            version: 1,
+            name: name.into(),
+            active: "h".into(),
+            replicas,
+            placement: PlacementConstraints::default(),
+            priority,
+        }
+    }
+
+    fn wl_region(name: &str, replicas: u32, priority: Priority, region: &str) -> ComputeWorkload {
+        let mut w = wl(name, replicas, priority);
+        w.placement = PlacementConstraints {
+            regions: vec![region.to_string()],
+            labels: BTreeMap::new(),
+        };
+        w
+    }
+
+    fn running(
+        project: &str,
+        workload: &str,
+        replica: u32,
+        node: u64,
+        backend: &str,
+    ) -> ObservedInstance {
+        ObservedInstance {
+            handle: InstanceHandle {
+                project: project.into(),
+                workload: workload.into(),
+                replica,
+                backend_ref: format!("ref-{workload}-{replica}"),
+            },
+            node,
+            backend: backend.into(),
+            endpoint: Endpoint {
+                scheme: Scheme::Http,
+                host: "10.0.0.2".into(),
+                port: 80,
+            },
+            region: None,
+            healthy: true,
+            started_at: None,
+            phase: ReplicaPhase::Running,
+            readiness: Readiness::Provisioned,
+            data_dir: None,
+            snapshot: None,
+            active_spec: Some("h".into()),
+        }
+    }
+
+    fn backend_kind(id: &str, iso: IsolationClass) -> BackendKind {
+        BackendKind::new(id, iso)
+            .with_persistent_volumes(true)
+            .with_scale_to_zero(true)
+            .with_accepted_sources(vec![
+                RootSourceKind::Image,
+                RootSourceKind::Tar,
+                RootSourceKind::Rootfs,
+            ])
+            .with_private_registry_credential(true)
+    }
+
+    fn node_with(id: u64, region: &str, cpus: u32, mem: u32, backends: &[&str]) -> Node {
+        Node {
+            id,
+            region: Some(region.into()),
+            labels: BTreeMap::new(),
+            free_vcpus: cpus,
+            free_mem_mib: mem,
+            backends: backends
+                .iter()
+                .map(|b| {
+                    let iso = match *b {
+                        "vmm" => IsolationClass::VmKvm,
+                        "cloudflare" | "kubernetes" => IsolationClass::Platform,
+                        _ => IsolationClass::Namespace,
+                    };
+                    backend_kind(b, iso)
+                })
+                .collect(),
+        }
+    }
+
+    fn caps() -> BTreeMap<String, Capabilities> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "vmm".to_string(),
+            Capabilities {
+                isolation: IsolationClass::VmKvm,
+                scale_to_zero: true,
+                persistent_volumes: true,
+                max_vcpus: None,
+                max_mem_mib: None,
+                preemptible: true,
+            },
+        );
+        m.insert(
+            "container".to_string(),
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: false,
+                persistent_volumes: true,
+                max_vcpus: None,
+                max_mem_mib: None,
+                preemptible: true,
+            },
+        );
+        m.insert(
+            "cloudflare".to_string(),
+            Capabilities {
+                isolation: IsolationClass::Platform,
+                scale_to_zero: true,
+                persistent_volumes: false,
+                max_vcpus: None,
+                max_mem_mib: None,
+                preemptible: false,
+            },
+        );
+        m
+    }
+
+    /// Every project's ceiling raised to the top class (`system`), so the reconcile-time ceiling
+    /// CLAMP is a no-op — these engine tests then exercise the pure preemption logic exactly as
+    /// before the clamp landed (a `system` workload HAS its cross-tenant authority ONLY because its
+    /// project's ceiling permits it, which the write path enforced). The dedicated ceiling tests
+    /// below instead LOWER a project's ceiling to prove the clamp revokes an over-ceiling class.
+    fn open_ceilings() -> BTreeMap<String, Option<String>> {
+        ["proj", "projA", "projB", "p1", "p2"]
+            .into_iter()
+            .map(|p| (p.to_string(), Some("system".to_string())))
+            .collect()
+    }
+
+    /// Seed a ledger from advertised capacity minus the running victims' reservations (what the
+    /// reconcile pre-pass produces).
+    fn seeded(nodes: &[Node], running: &[(u64, &ComputeSpec)]) -> NodeCapacities {
+        let mut c = NodeCapacities::advertised(nodes);
+        for (node, spec) in running {
+            c.reserve(*node, Reservation::of_spec(spec));
+        }
+        c
+    }
+
+    // ---- 1. comparator -----------------------------------------------------
+
+    #[test]
+    fn comparator_orders_by_tier_then_project_then_rank_then_name() {
+        let cat = PriorityClassCatalog::builtin();
+        let system = wl("z", 1, pri(Some("system"), 0, None));
+        let standard = wl("a", 1, pri(None, 0, None));
+        let spot = wl("a", 1, pri(Some("spot"), 0, None));
+        let k_system = workload_priority_key(&cat, "projB", &system);
+        let k_standard = workload_priority_key(&cat, "projA", &standard);
+        let k_spot = workload_priority_key(&cat, "projA", &spot);
+        assert!(k_system < k_standard, "system tier sorts before standard");
+        assert!(k_standard < k_spot, "standard sorts before spot");
+    }
+
+    #[test]
+    fn rollout_no_op_default_order_reduces_to_project_then_name() {
+        let cat = PriorityClassCatalog::builtin();
+        let a = wl("web", 1, Priority::default());
+        let b = wl("api", 1, Priority::default());
+        let ka = workload_priority_key(&cat, "p1", &a);
+        let kb = workload_priority_key(&cat, "p1", &b);
+        assert!(kb < ka, "same tier+project → ordered by name");
+        assert_eq!(ka.0, 0, "neutral tier component");
+        assert_eq!(ka.2, 0, "neutral rank component");
+    }
+
+    // ---- 2. a tenant's huge rank cannot leapfrog another project -----------
+
+    #[test]
+    fn huge_rank_cannot_leapfrog_another_project() {
+        let cat = PriorityClassCatalog::builtin();
+        let b_hot = wl("w", 1, pri(None, i32::MAX, None));
+        let a_cold = wl("w", 1, pri(None, 0, None));
+        let kb = workload_priority_key(&cat, "projB", &b_hot);
+        let ka = workload_priority_key(&cat, "projA", &a_cold);
+        assert!(ka < kb, "projA precedes projB despite projB's huge rank");
+    }
+
+    // ---- 3-5. tenancy boundary (may_preempt) -------------------------------
+
+    #[test]
+    fn same_project_higher_rank_may_preempt_lower() {
+        let cat = PriorityClassCatalog::builtin();
+        let hi = pri(None, 10, None);
+        let lo = pri(None, 1, None);
+        assert!(cat.may_preempt(&hi, "p", &lo, "p"));
+        assert!(!cat.may_preempt(&lo, "p", &hi, "p"));
+        assert!(
+            !cat.may_preempt(&hi, "p", &hi, "p"),
+            "equal rank never preempts (strict)"
+        );
+    }
+
+    #[test]
+    fn cross_project_needs_cross_tenant_opt_in_and_strictly_higher_tier() {
+        let cat = PriorityClassCatalog::builtin();
+        let system = pri(Some("system"), 0, None);
+        let standard = pri(None, 0, None);
+        let spot = pri(Some("spot"), 0, None);
+        assert!(cat.may_preempt(&system, "p1", &standard, "p2"));
+        assert!(cat.may_preempt(&system, "p1", &spot, "p2"));
+        assert!(!cat.may_preempt(&standard, "p1", &spot, "p2"));
+        let standard_hot = pri(None, i32::MAX, None);
+        assert!(
+            !cat.may_preempt(&standard_hot, "p1", &spot, "p2"),
+            "rank ignored cross-project"
+        );
+    }
+
+    #[test]
+    fn two_standard_tenants_never_preempt_each_other() {
+        let cat = PriorityClassCatalog::builtin();
+        let a = pri(None, 0, None);
+        let b = pri(None, 0, None);
+        assert!(!cat.may_preempt(&a, "p1", &b, "p2"));
+        assert!(!cat.may_preempt(&b, "p2", &a, "p1"));
+    }
+
+    // ---- 6. ceiling refusal ------------------------------------------------
+
+    #[test]
+    fn ceiling_refuses_a_class_above_the_cap() {
+        let cat = PriorityClassCatalog::builtin();
+        assert!(cat.check_request(None, None).is_ok());
+        assert!(cat.check_request(Some("standard"), None).is_ok());
+        assert!(cat.check_request(Some("spot"), None).is_ok());
+        let err = cat.check_request(Some("system"), None).unwrap_err();
+        assert!(
+            err.contains("system") && err.contains("ceiling"),
+            "names the refusal: {err}"
+        );
+        assert!(cat.check_request(Some("system"), Some("system")).is_ok());
+        assert!(
+            cat.check_request(Some("gold"), None).is_err(),
+            "unknown class refused"
+        );
+    }
+
+    // ---- 11. preemptible capability gate -----------------------------------
+
+    #[test]
+    fn delegated_backend_workload_never_enters_the_preemption_pass() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 2, 1000, &["cloudflare"])];
+        let vspec = sp(2, 1000);
+        let pspec = sp(2, 1000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        let preemptor = wl("p", 1, pri(Some("system"), 0, None));
+        let vobs = vec![running("p2", "v", 0, 1, "cloudflare")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "p1",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "p2",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert!(
+            plan.victims.is_empty(),
+            "a delegated-backend workload is never a victim/preemptor"
+        );
+    }
+
+    // ---- 3 (engine). same-project rank preemption with a real plan ---------
+
+    #[test]
+    fn engine_same_project_higher_rank_preempts_lower() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        // The victim is explicitly evictable (min_available 0) — the tenant's own budget. A
+        // DEFAULT standard victim is floor-protected at its replica count, so a same-tier rank
+        // preemptor would (correctly) be blocked; the tenant opts the lower-rank workload into
+        // preemptibility by lowering its floor.
+        let victim = wl("v", 1, pri(None, 1, Some(0)));
+        let preemptor = wl("p", 1, pri(None, 10, None));
+        let vobs = vec![running("proj", "v", 0, 1, "container")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "proj",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "proj",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert_eq!(plan.victims.len(), 1, "the lower-rank sibling is preempted");
+        assert_eq!(plan.victims[0].handle.workload, "v");
+        assert!(matches!(
+            plan.victims[0].disposition,
+            PreemptDisposition::Drain { .. }
+        ));
+        assert_eq!(plan.victims[0].preemptor.workload, "p");
+    }
+
+    // ---- 4 (engine). cross-tenant only for CrossTenantOptIn higher tier ----
+
+    #[test]
+    fn engine_standard_cannot_preempt_across_tenants() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        let vobs = vec![running("projB", "v", 0, 1, "container")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let std_pre = wl("p", 1, pri(None, i32::MAX, None));
+        let inputs = vec![
+            PreemptInput {
+                project: "projA",
+                workload: &std_pre,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "projB",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert!(
+            plan.victims.is_empty(),
+            "standard never preempts across tenants"
+        );
+    }
+
+    #[test]
+    fn engine_system_preempts_across_tenants() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        let sys_pre = wl("p", 1, pri(Some("system"), 0, None));
+        let vobs = vec![running("projB", "v", 0, 1, "container")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "projA",
+                workload: &sys_pre,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "projB",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert_eq!(plan.victims.len(), 1, "system preempts projB's standard");
+        assert_eq!(plan.victims[0].project, "projB");
+    }
+
+    // ---- 7. dry-run-before-evict: never a wasted eviction ------------------
+
+    #[test]
+    fn preemption_never_evicts_a_victim_it_cannot_use() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![
+            node_with(1, "west", 2, 1000, &["container"]),
+            node_with(2, "east", 8, 8000, &["container"]),
+        ];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        let preemptor = wl_region("p", 1, pri(Some("system"), 0, None), "west");
+        let vobs = vec![running("projB", "v", 0, 2, "container")];
+        let filler = sp(2, 1000);
+        let pobs: Vec<ObservedInstance> = vec![running("projA", "filler", 0, 1, "container")];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "projA",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "projB",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &filler), (2, &vspec)]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert!(
+            plan.victims.is_empty(),
+            "evicting the east victim can't help a west-pinned preemptor"
+        );
+    }
+
+    // ---- 8. Park vs Drain disposition --------------------------------------
+
+    #[test]
+    fn park_a_scale_to_zero_capable_victim() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["vmm"])];
+        let vspec = sp_s2z(8, 8000);
+        let pspec = sp(8, 8000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        let preemptor = wl("p", 1, pri(Some("system"), 0, None));
+        let vobs = vec![running("projB", "v", 0, 1, "vmm")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "projA",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "projB",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert_eq!(plan.victims.len(), 1);
+        assert!(
+            matches!(plan.victims[0].disposition, PreemptDisposition::Park),
+            "s2z victim is PARKED"
+        );
+    }
+
+    // ---- 9. min_available floor (hard same-tier, advisory higher tier) -----
+
+    #[test]
+    fn min_available_is_hard_within_same_tier() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 4, 4000, &["container"])];
+        let vspec = sp(2, 2000);
+        let pspec = sp(2, 2000);
+        let victim = wl("v", 2, pri(None, 1, Some(2)));
+        let preemptor = wl("p", 1, pri(None, 10, None));
+        let vobs = vec![
+            running("proj", "v", 0, 1, "container"),
+            running("proj", "v", 1, 1, "container"),
+        ];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "proj",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "proj",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec), (1, &vspec)]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert!(
+            plan.victims.is_empty(),
+            "a HARD min_available floor blocks a same-tier preemptor"
+        );
+    }
+
+    #[test]
+    fn min_available_is_advisory_to_a_strictly_higher_tier() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 2, 2000, &["container"])];
+        let vspec = sp(2, 2000);
+        let pspec = sp(2, 2000);
+        let victim = wl("v", 1, pri(Some("standard"), 0, Some(1)));
+        let preemptor = wl("p", 1, pri(Some("system"), 0, None));
+        let vobs = vec![running("projB", "v", 0, 1, "container")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "projA",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "projB",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert_eq!(
+            plan.victims.len(),
+            1,
+            "a strictly-higher operator tier overrides the advisory floor"
+        );
+    }
+
+    // ---- 10. anti-thrash convergence (>=3 passes, zero oscillation) --------
+
+    #[test]
+    fn anti_thrash_converges_with_zero_oscillation() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        let preemptor = wl("p", 1, pri(Some("system"), 0, None));
+        let np = BackendPolicy::default();
+
+        let vobs1 = vec![running("projB", "v", 0, 1, "container")];
+        let pobs1: Vec<ObservedInstance> = vec![];
+        let inputs1 = vec![
+            PreemptInput {
+                project: "projA",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs1,
+            },
+            PreemptInput {
+                project: "projB",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs1,
+            },
+        ];
+        let base1 = seeded(&nodes, &[(1, &vspec)]);
+        let plan1 = plan_preemptions(
+            &inputs1,
+            &nodes,
+            &caps,
+            &cat,
+            &open_ceilings(),
+            &base1,
+            1000,
+        );
+        assert_eq!(plan1.victims.len(), 1, "pass 1 preempts the victim once");
+
+        let vobs_after = vec![ObservedInstance {
+            healthy: false,
+            readiness: Readiness::Preempted {
+                by: "projA/p (system, tier 100)".into(),
+                preemptor_project: "projA".into(),
+                since: 1000,
+            },
+            ..running("projB", "v", 0, 1, "container")
+        }];
+        let pobs_after = vec![running("projA", "p", 0, 1, "container")];
+        for pass in 2..=3 {
+            let inputs = vec![
+                PreemptInput {
+                    project: "projA",
+                    workload: &preemptor,
+                    spec: &pspec,
+                    policy: &np,
+                    observed: &pobs_after,
+                },
+                PreemptInput {
+                    project: "projB",
+                    workload: &victim,
+                    spec: &vspec,
+                    policy: &np,
+                    observed: &vobs_after,
+                },
+            ];
+            let base = seeded(&nodes, &[(1, &pspec)]);
+            let plan =
+                plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 2000);
+            assert!(
+                plan.victims.is_empty(),
+                "pass {pass}: converged — no re-preemption, no oscillation"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_guard_strict_improvement_prevents_flapping() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 16, 16000, &["container"])];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        let preemptor = wl("p", 1, pri(Some("system"), 0, None));
+        let vobs = vec![running("projB", "v", 0, 1, "container")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "projA",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "projB",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert!(
+            plan.victims.is_empty(),
+            "a preemptor that already fits never evicts (anti-thrash)"
+        );
+    }
+
+    // ---- 13. reason enum tokens --------------------------------------------
+
+    #[test]
+    fn reason_enum_tokens_are_stable() {
+        assert_eq!(UnplacedCause::PriorityOutbid.token(), "priority_outbid");
+        assert_eq!(
+            UnplacedCause::InsufficientCapacity.token(),
+            "insufficient_capacity"
+        );
+        assert_eq!(UnplacedCause::PriorityOutbid.label(), "OUTBID");
+        assert_eq!(UnplacedCause::InsufficientCapacity.label(), "INSUFFICIENT");
+    }
+
+    #[test]
+    fn outbid_is_set_only_when_a_dominator_took_the_capacity() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let sspec = sp(8, 8000);
+        let tspec = sp(8, 8000);
+        let sys = wl("s", 1, pri(Some("system"), 0, None));
+        let std = wl("t", 1, pri(None, 0, None));
+        let sobs: Vec<ObservedInstance> = vec![];
+        let tobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "p1",
+                workload: &sys,
+                spec: &sspec,
+                policy: &np,
+                observed: &sobs,
+            },
+            PreemptInput {
+                project: "p2",
+                workload: &std,
+                spec: &tspec,
+                policy: &np,
+                observed: &tobs,
+            },
+        ];
+        let base = seeded(&nodes, &[]);
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert!(
+            plan.outbid.contains(&("p2".to_string(), "t".to_string())),
+            "standard outbid by a system workload that took the node: {:?}",
+            plan.outbid
+        );
+    }
+
+    // ---- 14. reconcile-time ceiling CLAMP (revocation completion) -----------
+
+    #[test]
+    fn resolve_clamped_lowers_an_over_ceiling_class() {
+        let cat = PriorityClassCatalog::builtin();
+        let system = pri(Some("system"), 0, None);
+        // Granted (ceiling `system`): resolves AS system — full tier + cross-tenant authority.
+        let (name, class) = cat.resolve_clamped(&system, Some("system"));
+        assert_eq!(name, "system");
+        assert_eq!(class.tier, 100);
+        assert_eq!(class.preemption, PreemptionMode::CrossTenantOptIn);
+        // Ceiling lowered to `standard` (or ABSENT ⇒ the node default `standard`): the stored
+        // `system` clamps to `standard`, losing the over-ceiling tier AND cross-tenant authority.
+        for ceiling in [Some("standard"), None] {
+            let (name, class) = cat.resolve_clamped(&system, ceiling);
+            assert_eq!(
+                name, "standard",
+                "clamped to the ceiling class ({ceiling:?})"
+            );
+            assert_eq!(class.tier, 0);
+            assert_eq!(class.preemption, PreemptionMode::WithinProject);
+        }
+        // At/under the ceiling is UNAFFECTED (the clamp only ever lowers).
+        let standard = pri(None, 0, None);
+        assert_eq!(cat.resolve_clamped(&standard, Some("system")).0, "standard");
+        let spot = pri(Some("spot"), 0, None);
+        assert_eq!(cat.resolve_clamped(&spot, Some("standard")).0, "spot");
+        // An unknown ceiling name fails SAFE to the node default ceiling — never a grant.
+        assert_eq!(cat.resolve_clamped(&system, Some("bogus")).0, "standard");
+    }
+
+    #[test]
+    fn clamped_comparator_demotes_an_over_ceiling_class() {
+        let cat = PriorityClassCatalog::builtin();
+        let system = wl("w", 1, pri(Some("system"), 0, None));
+        // Ceiling grants `system` ⇒ sorts at the system tier (negated, earliest).
+        let granted = workload_priority_key_clamped(&cat, "projA", &system, Some("system"));
+        assert_eq!(granted.0, -100, "system tier (negated)");
+        // Ceiling lowered to `standard` ⇒ the SAME stored class sorts as standard: it loses its
+        // placement precedence exactly as it loses its preemption authority.
+        let clamped = workload_priority_key_clamped(&cat, "projA", &system, Some("standard"));
+        assert_eq!(clamped.0, 0, "clamped to the standard tier");
+        // ...identical to the key an actual standard workload (same project+name) would get.
+        let standard = wl("w", 1, pri(None, 0, None));
+        assert_eq!(clamped, workload_priority_key(&cat, "projA", &standard));
+    }
+
+    #[test]
+    fn engine_clamps_an_over_ceiling_system_to_within_project() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        // STORED as `system` (set when projA's ceiling was raised), but projA's ceiling is now
+        // lowered back to `standard` — the incomplete-revocation shape.
+        let sys_pre = wl("p", 1, pri(Some("system"), 0, None));
+        let vobs = vec![running("projB", "v", 0, 1, "container")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "projA",
+                workload: &sys_pre,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "projB",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        // projA ceiling LOWERED to standard (projB absent ⇒ node default standard).
+        let lowered: BTreeMap<String, Option<String>> =
+            [("projA".to_string(), Some("standard".to_string()))]
+                .into_iter()
+                .collect();
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &lowered, &base, 1000);
+        assert!(
+            plan.victims.is_empty(),
+            "an over-ceiling `system` clamps to `standard` ⇒ no cross-tenant preemption"
+        );
+        // CONTROL: the SAME inputs with projA's ceiling GRANTED to `system` DO preempt projB —
+        // proving the clamp (not some other gate) neutralized the eviction.
+        let granted = plan_preemptions(&inputs, &nodes, &caps, &cat, &open_ceilings(), &base, 1000);
+        assert_eq!(
+            granted.victims.len(),
+            1,
+            "with the ceiling granted the stored system preempts projB"
+        );
+        assert_eq!(granted.victims[0].project, "projB");
+    }
+
+    #[test]
+    fn engine_at_ceiling_workload_is_unaffected_by_the_clamp() {
+        let cat = PriorityClassCatalog::builtin();
+        let caps = caps();
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let vspec = sp(8, 8000);
+        let pspec = sp(8, 8000);
+        // Both workloads are `standard` (at the default ceiling); the preemptor outranks within
+        // its own project and the victim opts into preemptibility (floor 0).
+        let victim = wl("v", 1, pri(None, 1, Some(0)));
+        let preemptor = wl("p", 1, pri(None, 10, None));
+        let vobs = vec![running("proj", "v", 0, 1, "container")];
+        let pobs: Vec<ObservedInstance> = vec![];
+        let np = BackendPolicy::default();
+        let inputs = vec![
+            PreemptInput {
+                project: "proj",
+                workload: &preemptor,
+                spec: &pspec,
+                policy: &np,
+                observed: &pobs,
+            },
+            PreemptInput {
+                project: "proj",
+                workload: &victim,
+                spec: &vspec,
+                policy: &np,
+                observed: &vobs,
+            },
+        ];
+        let base = seeded(&nodes, &[(1, &vspec)]);
+        // An explicitly-lowered (standard) ceiling leaves an AT-ceiling (standard) workload's
+        // within-project rank preemption fully intact — the clamp only ever lowers an OVER-ceiling
+        // class, never restricts one already within its ceiling.
+        let ceilings: BTreeMap<String, Option<String>> =
+            [("proj".to_string(), Some("standard".to_string()))]
+                .into_iter()
+                .collect();
+        let plan = plan_preemptions(&inputs, &nodes, &caps, &cat, &ceilings, &base, 1000);
+        assert_eq!(
+            plan.victims.len(),
+            1,
+            "within-ceiling preemption is unaffected"
+        );
+        assert_eq!(plan.victims[0].handle.workload, "v");
     }
 }

@@ -1284,6 +1284,7 @@ async fn register_shared_server(
         active: spec_id,
         replicas: 1,
         placement: PlacementConstraints::default(),
+        priority: Default::default(),
     };
     match deploy.set_compute_workload(ProjectRef::DEFAULT, &wl).await {
         Ok(()) => tracing::info!(
@@ -3385,6 +3386,7 @@ mod tests {
             active: "0".repeat(64),
             replicas: 1,
             placement: Default::default(),
+            priority: Default::default(),
         };
         deploy
             .set_compute_workload(boatramp_core::project::ProjectRef::new(project), &wl)
@@ -4254,6 +4256,7 @@ mod tests {
             active: "operatorspec".to_string(),
             replicas: 3,
             placement: PlacementConstraints::default(),
+            priority: Default::default(),
         };
         deploy.set_compute_workload(p, &operator).await.unwrap();
         auto_register_managed_db_workloads(&deploy, &dbs).await;

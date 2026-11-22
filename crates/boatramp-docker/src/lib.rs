@@ -1149,6 +1149,8 @@ impl ComputeBackend for DockerBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            // Directly scheduled against the node ledger — a preemption participant.
+            preemptible: true,
         }
     }
 

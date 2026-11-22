@@ -2029,6 +2029,7 @@ mod tests {
                 persistent_volumes: true,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -2091,6 +2092,7 @@ mod tests {
             active: hash,
             replicas: 1,
             placement: Default::default(),
+            priority: Default::default(),
         };
         store
             .set_compute_workload(ProjectRef::DEFAULT, &workload)
@@ -2171,6 +2173,7 @@ mod tests {
                 persistent_volumes: true,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -2395,6 +2398,7 @@ mod tests {
                 persistent_volumes: true,
                 max_vcpus: None,
                 max_mem_mib: None,
+                preemptible: true,
             }
         }
         async fn materialize(
@@ -2483,6 +2487,7 @@ mod tests {
                 active: hash,
                 replicas: 1,
                 placement: Default::default(),
+                priority: Default::default(),
             };
             store
                 .set_compute_workload(ProjectRef::new(project), &workload)

@@ -68,6 +68,7 @@
   - [Run a container or microVM](./how-to/compute.md)
   - [Write a native compute worker](./how-to/native-compute-worker.md)
   - [Scale compute to zero](./how-to/scale-to-zero.md)
+  - [Prioritize & preempt compute workloads](./how-to/compute-priority.md)
   - [Diagnose & work around compute issues](./how-to/diagnose-compute.md)
 - [Networking & gateway]()
   - [Load-balance & proxy upstreams](./how-to/gateway.md)

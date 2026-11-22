@@ -420,6 +420,7 @@ async fn provision_and_launch_tenant(
         spec,
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let inst = backend
         .launch(&req)

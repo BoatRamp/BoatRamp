@@ -142,6 +142,7 @@ async fn container_live_launch_and_hold() {
         spec,
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let inst = backend.launch(&req).await.expect("launch container");
     let id = format!("{}-{}", inst.handle.workload, inst.handle.replica);
@@ -262,6 +263,7 @@ async fn run_pg_e2e(host_root: bool) {
         spec,
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let inst = backend
         .launch(&req)
@@ -390,6 +392,7 @@ async fn launch_managed_pg(
         spec: spec.clone(),
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     backend
         .launch(&req)
@@ -1187,6 +1190,7 @@ async fn container_criu_roundtrip() {
         spec,
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let inst = backend.launch(&req).await.expect("launch");
     let nonce1 = probe_nonce(&inst.endpoint.host, inst.endpoint.port);
@@ -1267,6 +1271,7 @@ async fn container_exec_runs_command_and_round_trips_stdin() {
         spec,
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let inst = backend.launch(&req).await.expect("launch container");
 

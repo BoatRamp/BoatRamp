@@ -1915,6 +1915,10 @@ Create or update a workload from a rootfs + kernel (blob hash, file, or URL)
 | `--pull-policy <PULL_POLICY>` | — | `always` | always \| if-not-present \| never | How the backend obtains the `--image` before launch (the opaque-compute analogue of Kubernetes' `imagePullPolicy`). `always` (the default) RE-PULLS from the registry every launch — the safe posture, since a node's local image store is SHARED across tenants, so a mutable `name:tag` there is ambient, poisonable state. `if-not-present` reuses a locally-present image (a `docker load`'d / `k3d image import`'d image, or a cached pull) and pulls only when it is absent; `never` requires it present already (a fully air-gapped node) and fails if absent. Reuse is SOUND only for a digest-pinned reference (`repo@sha256:…`, an immutable manifest); with a mutable `name:tag`, `if-not-present`/`never` are accepted but WARN, because the shared store could hold another tenant's (or a stale) image under that tag — pin by digest. Ignored for a `--tar`/`--rootfs` source (staged from the blob store, never pulled) |
 | `--prefer-backend <PREFER_BACKEND>` | — | — | — | SOFT backend preference (`vmm`/`container`/`docker`/`cloudflare`/`kubernetes`): among the operator-permitted + isolation-sufficient backends, prefer this one; if it is not eligible, placement falls back to the next preference tier. Never widens the operator bounds. Mutually exclusive with `--require-backend` |
 | `--require-backend <REQUIRE_BACKEND>` | — | — | — | HARD backend requirement: the workload must run on exactly this backend. If it is not in the operator-permitted + isolation-sufficient eligible set, the workload gets a LEGIBLE no-placement (it is never an escape out of the operator bounds or the isolation posture). Mutually exclusive with `--prefer-backend` |
+| `--priority-class <PRIORITY_CLASS>` | — | — | — | PRIORITY CLASS (`system`/`standard`/`spot`) — the operator-owned cross-tenant TIER. Omit for the operator default (`standard`). A project may only request a class at or below its ceiling (default `standard`, so `system` is operator-reserved); a higher request is REFUSED, naming the allowed max. Stored on the mutable workload (a cheap pointer update — NEVER reminted into the content-addressed spec), so re-prioritizing never stops/relaunches a replica |
+| `--priority-rank <PRIORITY_RANK>` | — | — | — | PRIORITY RANK (signed) — the tenant-owned axis that orders your OWN workloads only (higher wins). It can NEVER leapfrog another project (the global order is tier → project → rank), so it is safe for a tenant to set freely. Default 0. Omitting ALL of `--priority-class`/`--priority-rank`/`--min-available` PRESERVES the workload's current priority (a spec/replica change never resets it); passing any one sets the priority (an unset axis among them takes its default) |
+| `--min-available <MIN_AVAILABLE>` | — | — | — | MIN-AVAILABLE floor — the minimum running replicas preemption must leave this workload (the PodDisruptionBudget-equivalent). Omit for the class default (`spot`→0, `standard`/`system`→protected at the full replica count). A HARD floor to a same-tier preemptor; ADVISORY to a strictly-higher operator tier |
+| `--dry-run` | — | — | — | DRY-RUN: preview the preemption BLAST RADIUS of this priority (which replicas it would evict, and the capacity it would free) WITHOUT applying anything. Your OWN project's replicas are named; cross-project impact is ALWAYS reported as aggregate counts + freed capacity, never naming another tenant's workloads (the server redacts it the same way for every viewer). Combine with the priority flags to preview a bump before committing it |
 
 ### `boatramp compute build`
 
@@ -2023,6 +2027,16 @@ Show observed per-replica runtime state — the reconcile plane's X-ray: stored 
 | Argument | Env | Default | Values | Description |
 | --- | --- | --- | --- | --- |
 | `[WORKLOAD]` | — | — | — | Show only this workload's replicas (default: every workload) |
+
+### `boatramp compute events`
+
+Show one workload's PREEMPTION events — the durable, attributed eviction timeline (which replicas were evicted, and by whom). A tenant view aggregates a cross-tenant preemptor's identity ("a higher-priority workload"); the operator (node-global) view names it
+
+**Usage:** `boatramp compute events <WORKLOAD>`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `<WORKLOAD>` | — | — | — | Workload name |
 
 ### `boatramp compute set-health`
 
@@ -2156,6 +2170,7 @@ Set (replace) the project's backend policy. Omitting all of `--allow`/`--forbid`
 | `--allow <ALLOW>` | — | — | — | Allowlist backend id (repeatable): ONLY these backends may run compute in this project (intersected with the node allowlist). Omit for no project allowlist |
 | `--forbid <FORBID>` | — | — | — | Forbid backend id (repeatable): these never run in this project (unioned with the node denylist) |
 | `--prefer <PREFER>` | — | — | — | Soft preferred backend among eligible ones (overrides the node `prefer`) |
+| `--priority-ceiling <PRIORITY_CEILING>` | — | — | — | The PRIORITY-CLASS ceiling this project may request (`system`/`standard`/`spot`) — the operator cap on `compute set --priority-class`. Omit to leave it at the node default (`standard`, so `system` is reserved). Raise it (e.g. to `system`) to let a trusted project request a higher class; a request above the ceiling is refused |
 
 #### `boatramp compute policy get`
 

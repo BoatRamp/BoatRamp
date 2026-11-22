@@ -187,6 +187,12 @@ impl KubernetesBackend {
             storage_class: self.storage_class.clone(),
             image_pull_secret: self.image_pull_secret.clone(),
             strict: self.strict,
+            // Map the workload's operator priority class to a native k8s PriorityClass,
+            // delegating preemption to the cluster scheduler.
+            priority_class_name: req
+                .priority_class
+                .as_deref()
+                .map(crate::plan::k8s_priority_class_name),
         }
     }
 
@@ -308,6 +314,10 @@ impl ComputeBackend for KubernetesBackend {
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
+            // A DELEGATED backend: the k8s scheduler owns capacity + eviction, so a k8s
+            // workload never enters boatramp's preemption pass. The operator priority TIER is
+            // instead mapped to a native k8s `PriorityClass` on the Deployment/StatefulSet.
+            preemptible: false,
         }
     }
 
@@ -969,6 +979,8 @@ impl KubernetesBackend {
             image_pull_secret: None,
             // A snapshot/restore object has no pod; the posture is irrelevant to it.
             strict: self.strict,
+            // A snapshot/restore object has no pod, so no PriorityClass applies.
+            priority_class_name: None,
         }
     }
 

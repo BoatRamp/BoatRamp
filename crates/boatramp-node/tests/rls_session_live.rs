@@ -289,6 +289,7 @@ async fn rls_session_guard_holds_live_postgres() {
                 active: spec_id,
                 replicas: 1,
                 placement: PlacementConstraints::default(),
+                priority: Default::default(),
             },
         )
         .await
@@ -301,6 +302,7 @@ async fn rls_session_guard_holds_live_postgres() {
         spec,
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let inst = backend
         .launch(&req)

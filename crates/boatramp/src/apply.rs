@@ -529,6 +529,11 @@ impl ApplyCompute {
             spec: self.spec.clone(),
             replicas: self.replicas,
             placement: self.placement.clone(),
+            // Manifest-declared priority is a thin follow-on. `None` ⇒ PRESERVE the stored
+            // workload's priority: a re-`apply` that does not carry priority never silently demotes
+            // a class/rank set out-of-band via `compute set --priority-class`; a brand-new
+            // workload defaults to `standard`/rank 0 server-side.
+            priority: None,
         }
     }
 }

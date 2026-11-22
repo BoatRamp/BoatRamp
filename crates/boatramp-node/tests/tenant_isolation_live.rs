@@ -270,6 +270,7 @@ async fn tenant_isolation_shared_postgres_denies_cross_tenant() {
                 active: spec_id,
                 replicas: 1,
                 placement: PlacementConstraints::default(),
+                priority: Default::default(),
             },
         )
         .await
@@ -282,6 +283,7 @@ async fn tenant_isolation_shared_postgres_denies_cross_tenant() {
         spec,
         artifact,
         redaction: Default::default(),
+        priority_class: None,
     };
     let inst = backend
         .launch(&req)
