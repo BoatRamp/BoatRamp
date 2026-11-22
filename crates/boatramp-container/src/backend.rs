@@ -19,10 +19,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_core::Storage;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, DataDirOwnership, Endpoint,
-    ExecOutput, ForeignOwnedEntry, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
-    RootSource, RootSourceKind, Scheme, Snapshot, SourceSupport, VolumeInfo, compute_instance_id,
-    compute_volume_scope,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, ContentStageLocks,
+    DataDirOwnership, Endpoint, ExecOutput, ForeignOwnedEntry, Health, Instance, InstanceHandle,
+    IsolationClass, LaunchRequest, RootSource, RootSourceKind, Scheme, Snapshot, SourceSupport,
+    VolumeInfo, compute_instance_id, compute_volume_scope,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
 use boatramp_core::registry_auth::RegistryAuth;
@@ -557,6 +557,11 @@ pub struct ContainerBackend {
     /// embedders) is unchanged; the node ALWAYS sets the real posture via
     /// [`with_antispoof`](Self::with_antispoof).
     antispoof: AntiSpoof,
+    /// Per-content staging locks: with the decoupled pull the reconcile loop stages
+    /// concurrently, so two workloads referencing the SAME image/tar now race on the shared
+    /// content-addressed staging paths. These serialize same-content stagers so exactly one
+    /// stages and the rest reuse the published rootfs (see [`ContentStageLocks`]).
+    stage_locks: ContentStageLocks,
 }
 
 impl ContainerBackend {
@@ -603,6 +608,7 @@ impl ContainerBackend {
             // Legacy no-filter behavior by default (tests/embedders); the node sets the real
             // posture from `probe_nft_bridge` × `strict` via `with_antispoof`.
             antispoof: AntiSpoof::DisabledSingleTenant,
+            stage_locks: ContentStageLocks::new(),
         })
     }
 
@@ -779,6 +785,17 @@ impl ContainerBackend {
             .join("rootfs")
             .join(format!("{hash}.b{base}"));
         let ready = dir.join(".boatramp-ready");
+        // Fast path: a completed stage is reused with no lock (the warm steady state).
+        if tokio::fs::try_exists(&ready).await.unwrap_or(false) {
+            return Ok(dir);
+        }
+        // Serialize same-content stagers (the decoupled pull stages concurrently). The download
+        // temp `.{hash}.tar.gz` is base-INDEPENDENT, so key the lock by HASH ONLY — two different
+        // bases of the same tar must not stream into the one shared temp at once.
+        let lock = self.stage_locks.lock_for(&format!("rootfs:{hash}"));
+        let _guard = lock.lock().await;
+        // Double-check under the lock: a peer may have published this base while we waited — then
+        // reuse its dir rather than re-staging (and never touch a dir a launch may be reading).
         if tokio::fs::try_exists(&ready).await.unwrap_or(false) {
             return Ok(dir);
         }
@@ -877,10 +894,18 @@ impl ContainerBackend {
         let key = boatramp_types::manifest::sha256_hex(image.as_bytes());
         let images = self.data_dir.join("compute").join("images");
         let dir = images.join(format!("{key}.b{base}"));
-        if tokio::fs::try_exists(dir.join(".boatramp-ready"))
-            .await
-            .unwrap_or(false)
-        {
+        let ready = dir.join(".boatramp-ready");
+        // Fast path: a completed pull is reused with no lock (the warm steady state).
+        if tokio::fs::try_exists(&ready).await.unwrap_or(false) {
+            return Ok(dir);
+        }
+        // Serialize same-content stagers (the decoupled pull stages concurrently, so two
+        // workloads referencing this image race the shared `.tmp` + final dir). Keyed by the
+        // image ref AND base (the `.tmp` is base-specific). The winner stages; the rest reuse.
+        let lock = self.stage_locks.lock_for(&format!("image:{key}.b{base}"));
+        let _guard = lock.lock().await;
+        // Double-check under the lock: a peer may have published while we waited — reuse its dir.
+        if tokio::fs::try_exists(&ready).await.unwrap_or(false) {
             return Ok(dir);
         }
         tokio::fs::create_dir_all(&images)
@@ -901,8 +926,13 @@ impl ContainerBackend {
                 tokio::fs::write(tmp.join(".boatramp-ready"), b"1")
                     .await
                     .map_err(|e| BackendError::Materialize(format!("mark ready: {e}")))?;
-                // Publish atomically; replace any stale directory at the final path.
-                let _ = tokio::fs::remove_dir_all(&dir).await;
+                // Publish atomically. Replace only a STALE (non-ready) dir at the final path —
+                // NEVER remove_dir_all a READY dir, which a launch may be reading (under the
+                // per-content lock no peer can publish one here, but guard the invariant locally;
+                // if a ready dir somehow exists the rename fails and we fail closed, not clobber).
+                if !tokio::fs::try_exists(&ready).await.unwrap_or(false) {
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                }
                 tokio::fs::rename(&tmp, &dir).await.map_err(|e| {
                     BackendError::Materialize(format!("publish rootfs {}: {e}", dir.display()))
                 })?;
@@ -4403,6 +4433,131 @@ mod tests {
             .expect("materialize 2");
         assert_eq!(art, art2);
 
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A `Storage` counting its `get` calls (for the concurrent-stage de-dupe assertion).
+    /// Only the Linux-gated concurrency test below uses it.
+    #[cfg(target_os = "linux")]
+    struct CountingBlob {
+        bytes: Vec<u8>,
+        gets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait]
+    impl Storage for CountingBlob {
+        async fn get(&self, _key: &str) -> Result<GetObject, StorageError> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let bytes = Bytes::from(self.bytes.clone());
+            let size = self.bytes.len() as u64;
+            // Stream in two chunks with a yield between — absent the per-content lock two
+            // concurrent stagers would both `get` and interleave into the shared `.tmp`.
+            let half = self.bytes.len() / 2;
+            let (a, b) = (bytes.slice(..half), bytes.slice(half..));
+            let body: boatramp_core::ByteStream =
+                Box::pin(futures::stream::unfold(0u8, move |s| {
+                    let (a, b) = (a.clone(), b.clone());
+                    async move {
+                        match s {
+                            0 => Some((Ok(a), 1u8)),
+                            1 => {
+                                tokio::task::yield_now().await;
+                                Some((Ok(b), 2u8))
+                            }
+                            _ => None,
+                        }
+                    }
+                }));
+            Ok(GetObject {
+                meta: ObjectMeta {
+                    key: String::new(),
+                    size: Some(size),
+                    content_type: None,
+                    etag: None,
+                },
+                body,
+            })
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            Err(StorageError::unsupported("range"))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: boatramp_core::ByteStream,
+            _: PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::unsupported("put"))
+        }
+        async fn head(&self, _: &str) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The decoupled pull stages concurrently, so two DIFFERENT workloads referencing the SAME
+    /// tar rootfs now `materialize` at once → two concurrent `stage_rootfs` on the shared
+    /// content-addressed paths. The per-content lock serializes them: the blob is staged ONCE
+    /// (the loser reuses the published dir), with no ENOENT-rename, no corruption, and the
+    /// final dir a launch may be reading is never torn down under it. (Linux-only: `stage_rootfs`
+    /// ownership-shifts the unpacked tree, which needs the Linux userns map.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_materialize_of_same_tar_stages_once_and_reuses() {
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let data_dir = unique_dir("concurrent");
+        let backend = Arc::new(
+            ContainerBackend::new(
+                Arc::new(CountingBlob {
+                    bytes: rootfs_tar_gz(),
+                    gets: gets.clone(),
+                }),
+                data_dir.clone(),
+                "br-boatramp".into(),
+                "10.0.0.0/24",
+                PathBuf::from("/proc/self/exe"),
+            )
+            .expect("backend"),
+        );
+        let hash = "e".repeat(64);
+        let spec = spec_for(&hash);
+
+        // Two different workloads, same tar content → one staging, one reuse.
+        let (b1, b2, s1, s2) = (backend.clone(), backend.clone(), spec.clone(), spec.clone());
+        let t1 = tokio::spawn(async move { b1.materialize("default", "wa", &s1, None).await });
+        let t2 = tokio::spawn(async move { b2.materialize("default", "wb", &s2, None).await });
+        let a1 = t1.await.unwrap().expect("materialize wa (no race failure)");
+        let a2 = t2.await.unwrap().expect("materialize wb (no race failure)");
+
+        assert_eq!(a1, a2, "both resolve to the SAME staged rootfs dir");
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tar was fetched + unpacked exactly ONCE (same-content de-dupe)",
+        );
+        let dir = match &a1 {
+            Artifact::Rootfs { dir } => PathBuf::from(dir),
+            other => panic!("expected Rootfs, got {other:?}"),
+        };
+        assert!(
+            dir.join("bin/hello").is_file(),
+            "the published rootfs is intact"
+        );
+        assert!(
+            dir.join(".boatramp-ready").is_file(),
+            "ready marker present"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

@@ -4047,6 +4047,65 @@ impl PullCoordinator {
     }
 }
 
+/// Per-content **staging serialization** for a compute backend.
+///
+/// The [`PullCoordinator`] de-dupes a pull per `(backend, project, workload, spec_id)` — correct
+/// for the auth model (each workload's `materialize` runs with its OWN `pull_auth`). But that key
+/// does NOT cover two DIFFERENT workloads/projects that reference the SAME content (a shared cold
+/// public base image, or — for the VM backends — the one kernel every microVM boots). Before the
+/// pull was decoupled, reconcile awaited each `materialize` INLINE, strictly serially, so a
+/// same-content collision was unreachable. Now the loop self-parallelizes, so two such workloads
+/// spawn two concurrent `materialize` → two concurrent stagers writing the SAME content-addressed
+/// staging paths (the shared `.tmp`, the shared final dir/file). That race can delete a peer's
+/// in-progress `.tmp` (ENOENT rename) or `remove_dir_all` a FINAL dir another task just published
+/// and a launch is reading — a new, churn-y failure the serial path never produced.
+///
+/// This holds a small map of per-**content-key** async locks ([`futures::lock::Mutex`], so it
+/// stays free of a hard async-runtime dependency — the same primitive the rest of the crate uses).
+/// A backend takes the lock for a content key around its stage sequence, re-checks the ready
+/// marker UNDER the lock, and REUSES the published artifact if a peer won — so same-content work
+/// happens exactly once and no task ever blows away a dir another is reading. The lock is per
+/// content key (NOT global), so different-content stagers still run fully in parallel. Idle keys
+/// (no stager holding the lock) are swept on the next acquisition, so the map stays bounded to the
+/// content actively being staged. It is NOT a cache and shares no artifact across tenants: each
+/// workload's `materialize` still runs with its own `pull_auth`; this only serializes who writes
+/// the shared on-disk paths (the content cache remains public-images-only).
+#[derive(Clone, Default)]
+pub struct ContentStageLocks {
+    locks: Arc<Mutex<BTreeMap<String, Arc<futures::lock::Mutex<()>>>>>,
+}
+
+impl ContentStageLocks {
+    /// A fresh, empty set of staging locks.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The async lock guarding stagers of content `key`. Hold the guard
+    /// (`let _g = locks.lock_for(k).lock().await;`) around the stage sequence; the second holder
+    /// then hits the ready-marker fast path and reuses the winner's published artifact. The key
+    /// must identify the exact on-disk content (e.g. `image:<sha256(ref)>.b<base>` or
+    /// `blob:<hash>`), so two stagers racing the SAME paths — and only those — serialize.
+    #[must_use]
+    pub fn lock_for(&self, key: &str) -> Arc<futures::lock::Mutex<()>> {
+        let mut map = self.locks.lock().expect("content stage locks mutex");
+        // Sweep keys no stager is holding (only the map's own ref remains), keeping the map
+        // bounded to content actively being staged. Runs before the insert, so a key handed out
+        // this call (strong_count ≥ 2 once cloned below) is never swept.
+        map.retain(|_, v| Arc::strong_count(v) > 1);
+        map.entry(key.to_string())
+            .or_insert_with(|| Arc::new(futures::lock::Mutex::new(())))
+            .clone()
+    }
+
+    /// Test-only: how many content keys are currently tracked (to assert the idle-key sweep).
+    #[cfg(test)]
+    fn tracked_keys(&self) -> usize {
+        self.locks.lock().expect("content stage locks mutex").len()
+    }
+}
+
 /// One binding resolver's contribution to the **unified managed-env render stage**
 /// (PLAN-compute-managed-resources Phase 3): the `{surface}.*` template variables it
 /// exposes (e.g. `kv.url`, `kv.token`, `blob.endpoint`, `sql.dsn`) and the default
@@ -9357,6 +9416,56 @@ mod tests {
         );
         let r4 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
         assert_eq!(r4.launched, 1, "launches cleanly once re-pulled: {:?}", r4);
+    }
+
+    // --- ContentStageLocks (the per-content staging serialization backing the fs-race fix) ---
+
+    #[test]
+    fn content_stage_locks_same_key_is_one_lock_different_keys_independent() {
+        let locks = ContentStageLocks::new();
+        let a1 = locks.lock_for("image:x.b0");
+        let a2 = locks.lock_for("image:x.b0");
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "same content key hands out the SAME lock (same-content stagers serialize)",
+        );
+        let b = locks.lock_for("image:y.b0");
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "different content keys are independent locks (different-content stays parallel)",
+        );
+    }
+
+    #[tokio::test]
+    async fn content_stage_locks_serialize_same_key_but_not_a_different_key() {
+        let locks = ContentStageLocks::new();
+        let a = locks.lock_for("k");
+        let _held = a.lock().await; // hold the "k" content lock (a stager is mid-stage)
+        // A second acquirer of the SAME content key is blocked — it cannot stage concurrently.
+        let a2 = locks.lock_for("k");
+        assert!(
+            a2.try_lock().is_none(),
+            "a same-content stager is serialized behind the holder",
+        );
+        // A DIFFERENT content key is NOT blocked — the lock is per content, never global.
+        let other = locks.lock_for("other");
+        assert!(
+            other.try_lock().is_some(),
+            "a different-content stager runs in parallel",
+        );
+    }
+
+    #[test]
+    fn content_stage_locks_sweeps_idle_keys() {
+        let locks = ContentStageLocks::new();
+        {
+            let _a = locks.lock_for("a");
+            assert_eq!(locks.tracked_keys(), 1);
+        }
+        // "a" is now idle (no holder). The next acquisition sweeps it, so the map stays bounded
+        // to content actively being staged rather than growing with every image ever staged.
+        let _b = locks.lock_for("b");
+        assert_eq!(locks.tracked_keys(), 1, "idle 'a' swept; only 'b' tracked");
     }
 
     /// A backend whose running replica's live endpoint DRIFTS out from under the stored
