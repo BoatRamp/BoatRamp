@@ -2791,6 +2791,19 @@ async fn serve_assembled(s: SharedServe<'_>) -> Result<()> {
         }
     }
 
+    // Stage-5 fail-closed footgun guard: `require_channel_bound_tokens` can only be
+    // satisfied on the mutual-RPK listener (`--tls rpk`), which requests a client
+    // raw-public-key cert to bind the token's `cnf` to the channel. On any other TLS
+    // mode there is no channel key, so EVERY control-plane token is refused (correct
+    // fail-closed, but a silent lockout if unintended). Warn loudly at startup.
+    if options.posture.require_channel_bound_tokens && !matches!(args.tls, TlsMode::Rpk) {
+        tracing::warn!(
+            tls = ?args.tls,
+            "require_channel_bound_tokens is on but this listener is not `--tls rpk`: no TLS \
+             client key is presented to bind, so every control-plane token will be refused \
+             (fail-closed). Serve with `--tls rpk`, or disable require_channel_bound_tokens."
+        );
+    }
     // TLS dispatch. Off/Custom/Acme/Rpk are identical on both paths; the AcmeDns arm is the ONE
     // unified `serve_acme_dns` driven by `cert_refresh` (filesystem vs replicated static set) +
     // `on_demand` (the per-SNI engine ingredients) — the Pair-1 consolidation, single by construction.
@@ -6294,14 +6307,34 @@ async fn serve_rpk(
         }
     }
 
-    // No client-auth trust set: the client authenticates with a bearer token, not
-    // a client cert (that is the mutual-`cnf` binding of a later stage).
+    // Stage 5 — mutual RPK / channel-bound tokens. When the resolved posture requires
+    // channel binding, the listener *requests* a client raw-public-key cert so a
+    // client can present its token's holder (`cnf`) key as the TLS client identity;
+    // the auth middleware then binds the bearer to that channel (presented client key
+    // == the token's `cnf`). Off (the default), the listener is server-authenticated
+    // only — the client authenticates with a bearer token and no client cert, exactly
+    // as stages 1–4 shipped (byte-for-byte unchanged). There is no client-auth trust
+    // set either way: the acceptable `cnf` keys are unknown until the bearer is read,
+    // so the handshake accepts any possession-proven client key and the real check is
+    // the app-layer binding.
+    let require_channel_bound = options.posture.require_channel_bound_tokens;
     let rpk =
         boatramp_rpktls::RpkTls::new(Arc::new(identity), boatramp_rpktls::TrustSet::default());
-    let mut config = rpk.server_auth()?;
+    let mut config = if require_channel_bound {
+        rpk.server_accept_any_client()?
+    } else {
+        rpk.server_auth()?
+    };
     config.alpn_protocols = boatramp_server::alpn_h1_h2();
 
-    tracing::info!(%addr, pubkey = %fingerprint, "serving HTTPS (RPK bootstrap TLS)");
+    if require_channel_bound {
+        tracing::info!(
+            %addr, pubkey = %fingerprint,
+            "serving HTTPS (RPK bootstrap TLS, mutual — channel-bound tokens required)"
+        );
+    } else {
+        tracing::info!(%addr, pubkey = %fingerprint, "serving HTTPS (RPK bootstrap TLS)");
+    }
     // The identity is public (not a secret); print it so the operator can copy it
     // to the client's `--server-pubkey`.
     println!(

@@ -94,3 +94,65 @@ attestation names the presented key — placing no trust in the server until the
 root signature checks out. Export the printed `BOATRAMP_SERVER_PUBKEY` and you're
 pinned. Rotating a node's TLS identity re-mints a fresh attestation, so the same
 root anchor keeps working with no client change.
+
+## Channel-bind your tokens (mutual RPK)
+
+So far the **channel** is pinned (you reach exactly the server you expect) and
+**you** are a bearer. A stolen bearer token is still usable by anyone who captures
+it. **Channel binding** closes that: present your token's holder (`cnf`) key as the
+TLS **client** identity, and the server binds the token to that channel — so a
+captured token is **inert off-channel** (an attacker can't present a channel bound
+to a key they don't hold; TLS 1.3 proves possession continuously).
+
+This is **mutual RPK**: both peers present a raw public key. It is opt-in and
+fail-closed.
+
+**1. Mint a channel-bindable token.** The holder key must be **Ed25519** (an RFC
+7250 client identity), so add `--channel-bind` to a PoP mint:
+
+```sh
+boatramp token create "ops laptop" --role admin --pop --channel-bind
+# prints the token AND an Ed25519 BOATRAMP_TOKEN_HOLDER_KEY=ed25519:…
+```
+
+**2. Present it from the client.** Set the holder key alongside the server pin; the
+CLI then offers it as the TLS client identity automatically:
+
+```sh
+export BOATRAMP_SERVER=https://cp.example.com:8443
+export BOATRAMP_SERVER_PUBKEY=302a300506032b6570032100db36…e28a
+export BOATRAMP_TOKEN=…                       # the channel-bound token
+export BOATRAMP_TOKEN_HOLDER_KEY=ed25519:…    # its holder (cnf) private key
+export BOATRAMP_POP_ORIGIN=https://cp.example.com:8443   # also PoP-binds (DPoP)
+
+boatramp token ls                              # …over mutual-RPK, channel-bound
+```
+
+**3. Require it on the server.** Turn the posture on and serve `--tls rpk`:
+
+```toml
+# boatramp.cfg
+[security.overrides]
+require_channel_bound_tokens = true
+```
+
+```sh
+boatramp serve --tls rpk --addr 0.0.0.0:8443 --data-dir /var/lib/boatramp
+# …serving HTTPS (RPK bootstrap TLS, mutual — channel-bound tokens required)
+```
+
+(Or set `BOATRAMP_SECURITY_REQUIRE_CHANNEL_BOUND_TOKENS=true`.)
+
+With the posture on, every control-plane request must present its token's `cnf` key
+as the TLS client key: a plain (non-`cnf`) token, or a token presented on a channel
+whose client key doesn't match its `cnf`, is refused — **no downgrade** to an
+unbound bearer. Channel binding is **additive** to per-request PoP (the `cnf` token
+still carries its `Boatramp-PoP` proof); together they also close the cross-node
+PoP-replay window, since a replayed proof arrives on a channel not bound to the key.
+
+**Trade-off:** a channel-binding listener is mutual RPK, so **only RPK-capable
+clients can connect** (a plain X.509 / no-client-auth probe is refused at the
+handshake). Point health checks and monitoring at an RPK client, a separate
+loopback listener, or keep the posture off on nodes that need plain probes. ES256
+`cnf` keys can't be presented as an RPK client identity — use `--channel-bind`
+(Ed25519) for channel-bound tokens.

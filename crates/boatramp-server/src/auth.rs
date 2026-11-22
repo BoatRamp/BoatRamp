@@ -22,7 +22,9 @@ use axum::response::{IntoResponse, Response};
 use boatramp_core::authz::{self, Action, AuthzPolicy, Resource, Right};
 use boatramp_core::cache_coherence::AuthzFence;
 use boatramp_core::cedar::CompiledCedar;
-use boatramp_core::cose::{self, POP_MAX_BODY_HASH_BYTES, PopClaims, TokenError, TokenPublicKey};
+use boatramp_core::cose::{
+    self, POP_MAX_BODY_HASH_BYTES, PopClaims, TokenAlg, TokenError, TokenPublicKey,
+};
 use boatramp_core::kv::{KvError, KvStore};
 use boatramp_core::tenancy::PrincipalKind;
 
@@ -107,6 +109,15 @@ struct AuthInner {
     /// token *always* requires a proof regardless of this knob; when `true`, a
     /// plain (non-`cnf`) token is additionally rejected.
     require_pop: bool,
+    /// Require **every** token to be **channel-bound** (Stage 5): presented over a
+    /// mutual-RPK TLS channel whose client key equals the token's terminal holder
+    /// (`cnf`). When `true`, a holder-bound token whose presented channel key ≠
+    /// `leaf_cnf` (or is absent) is rejected, and a plain (non-`cnf`) token — which
+    /// cannot be channel-bound — is rejected too (no downgrade to an unbound bearer).
+    /// Off by default; additive to the PoP checks (never replaces the per-request PoP
+    /// a `cnf` token already requires). Set from the `require_channel_bound_tokens`
+    /// posture knob via [`with_channel_binding`](Auth::with_channel_binding).
+    require_channel_bound: bool,
     /// Node-local replay guard for PoP proof `jti`s (window-bounded).
     replay: PopReplayCache,
     /// **Shared-mode (multi-writer) authz guard** (MF-3 stale-authz fence + MF-4 fail-closed).
@@ -215,6 +226,7 @@ impl Auth {
                 kv,
                 pop_origin: None,
                 require_pop: false,
+                require_channel_bound: false,
                 replay: PopReplayCache::new(),
                 shared: None,
                 policy_cache: Mutex::new(None),
@@ -236,6 +248,7 @@ impl Auth {
                     kv: inner.kv.clone(),
                     pop_origin: inner.pop_origin.clone(),
                     require_pop: inner.require_pop,
+                    require_channel_bound: inner.require_channel_bound,
                     replay: inner.replay.clone(),
                     shared: Some(SharedAuthz { backing, fence }),
                     policy_cache: Mutex::new(None),
@@ -258,7 +271,33 @@ impl Auth {
                     kv: inner.kv.clone(),
                     pop_origin,
                     require_pop,
+                    require_channel_bound: inner.require_channel_bound,
                     replay: PopReplayCache::new(),
+                    shared: inner.shared.clone(),
+                    policy_cache: Mutex::new(None),
+                })),
+            },
+            None => Self { inner: None },
+        }
+    }
+
+    /// Configure the **channel-binding** posture (Stage 5, `require_channel_bound_tokens`):
+    /// when `require` is on, every control-plane request must present its token's
+    /// holder (`cnf`) key as the mutual-RPK TLS client identity — the presented
+    /// channel key must equal the token's terminal `cnf`. A no-op when auth is
+    /// disabled. Additive to [`with_pop`](Self::with_pop) and order-independent — like
+    /// `with_shared_authz`, it reconstructs `AuthInner`, carrying every other field
+    /// forward (so calling it after `with_pop` keeps the PoP posture).
+    pub fn with_channel_binding(self, require: bool) -> Self {
+        match self.inner {
+            Some(inner) => Self {
+                inner: Some(Arc::new(AuthInner {
+                    public: inner.public.clone(),
+                    kv: inner.kv.clone(),
+                    pop_origin: inner.pop_origin.clone(),
+                    require_pop: inner.require_pop,
+                    require_channel_bound: require,
+                    replay: inner.replay.clone(),
                     shared: inner.shared.clone(),
                     policy_cache: Mutex::new(None),
                 })),
@@ -445,7 +484,7 @@ impl Auth {
         pop_proof: Option<&str>,
         body_hash: Option<String>,
     ) -> Result<(PrincipalKind, VerifiedPrincipal), Reject> {
-        self.authorize_with_query(bearer, method, path, None, pop_proof, body_hash)
+        self.authorize_with_query(bearer, method, path, None, pop_proof, body_hash, None)
             .await
     }
 
@@ -454,6 +493,7 @@ impl Auth {
     /// against a per-project `Project·Admin` on that exact target. `query` feeds ONLY the
     /// required-right derivation ([`Right::required_for`]); PoP binding stays on `path` (the query
     /// is never part of the DPoP `htp`), so holder-bound proofs are unaffected.
+    #[allow(clippy::too_many_arguments)] // one more per-request credential input (the channel key)
     async fn authorize_with_query(
         &self,
         bearer: &str,
@@ -462,6 +502,7 @@ impl Auth {
         query: Option<&str>,
         pop_proof: Option<&str>,
         body_hash: Option<String>,
+        channel_key: Option<&[u8]>,
     ) -> Result<(PrincipalKind, VerifiedPrincipal), Reject> {
         let inner = self
             .inner
@@ -523,6 +564,38 @@ impl Auth {
                 ));
             }
             None => {}
+        }
+        // Channel binding (Stage 5, `require_channel_bound_tokens`): when the posture
+        // requires it, the credential MUST be presented over a mutual-RPK TLS channel
+        // whose client key equals the token's terminal holder (`leaf_cnf`). The TLS 1.3
+        // handshake already proved possession of that key (rustls verified the client's
+        // `CertificateVerify` before this request existed), so asserting `channel_key ==
+        // leaf_cnf` binds the bearer to *this* channel: a token captured off-channel or
+        // replayed on a different channel presents a different (or no) client key and is
+        // rejected here. This is ADDITIVE to the PoP check above (it never substitutes
+        // for the per-request proof a `cnf` token already requires), and it closes the
+        // documented cross-node PoP-replay window — a proof replayed on another node
+        // arrives on a channel not bound to `leaf_cnf`. Fail-closed, no downgrade: a
+        // plain (non-`cnf`) token cannot be channel-bound, and a missing/mismatched
+        // channel key is refused — never fall through to an unbound bearer.
+        if inner.require_channel_bound {
+            match &verified.leaf_cnf {
+                Some(leaf_cnf) => {
+                    if !channel_key_matches_cnf(leaf_cnf, channel_key) {
+                        return Err(Reject::unauthorized(
+                            "channel binding required: present the token's holder (cnf) key as \
+                             the mutual-RPK TLS client identity (the presented channel key does \
+                             not match the token's cnf)\n",
+                        ));
+                    }
+                }
+                None => {
+                    return Err(Reject::unauthorized(
+                        "channel binding required: a plain (non-cnf) bearer cannot be \
+                         channel-bound; present a holder-bound (cnf) token over mutual-RPK TLS\n",
+                    ));
+                }
+            }
         }
         // Delegation caveats can only *subtract* from the root's authority: enforce
         // them before consulting the RBAC policy.
@@ -1035,6 +1108,15 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
     // (which consumes the request). NOT part of the PoP `htp` binding — see `authorize_with_query`.
     let query = request.uri().query().map(str::to_owned);
     let pop_proof = pop_header(&request);
+    // The client's presented TLS raw public key (RFC 7250), surfaced by the serving
+    // stack from this connection's `peer_certificates()` — the Stage-5 channel-binding
+    // material. Captured as an owned copy before the body is buffered (which rebuilds
+    // the request). Server-derived from the transport; absent on plaintext / server-
+    // auth-only / non-RPK connections, in which case a required binding fails closed.
+    let channel_key = request
+        .extensions()
+        .get::<ChannelPeerKey>()
+        .map(|k| k.0.clone());
 
     // On a write, bind the request body into the PoP proof: buffer it (up to a
     // bound) so a hash can be committed to, then hand the buffered bytes
@@ -1059,6 +1141,7 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
             query.as_deref(),
             pop_proof.as_deref(),
             body_hash,
+            channel_key.as_deref(),
         )
         .await
     {
@@ -1085,6 +1168,19 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
 /// client-settable. Absent when auth is disabled (dev), so a deploy then captures no class.
 #[derive(Debug, Clone, Copy)]
 pub struct VerifiedDeployClass(pub PrincipalKind);
+
+/// The raw public key (RFC 7250 `SubjectPublicKeyInfo` DER) the client presented as
+/// its TLS **client** certificate on this connection, for the Stage-5 channel
+/// binding of holder-bound (`cnf`) tokens. Inserted by the serving stack
+/// ([`crate::http_serve`]) from the TLS session's `peer_certificates()` after a
+/// successful handshake — so possession of the key's private half is already proven
+/// by rustls (the TLS 1.3 `CertificateVerify`). SERVER-DERIVED from the transport,
+/// never client-settable at the HTTP layer; absent on plaintext, on a server-auth-
+/// only RPK handshake, and on every non-RPK listener (ACME/custom), where channel
+/// binding is unavailable. The auth middleware asserts this equals the token's
+/// terminal `cnf` when `require_channel_bound_tokens` is on.
+#[derive(Debug, Clone)]
+pub struct ChannelPeerKey(pub Vec<u8>);
 
 /// The verified, RBAC-authorized API principal (overlay follow-up #3), derived in [`require_auth`]
 /// from the authorized token and carried as a request extension so the overlay dial/expose mint
@@ -1165,6 +1261,82 @@ async fn buffer_body_for_pop(request: Request) -> Result<(Request, Option<String
     Ok((Request::from_parts(parts, Body::from(bytes)), body_hash))
 }
 
+/// The fixed 12-byte algorithm prefix of a canonical Ed25519 `SubjectPublicKeyInfo`
+/// DER (RFC 8410: `SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING }`), followed
+/// by the 32-byte raw public key — the exact 44-byte DER rustls presents for an
+/// RFC 7250 Ed25519 raw-public-key cert. Ed25519 SPKI has no algorithm parameters,
+/// so this encoding is canonical (single-form).
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+/// The canonical Ed25519 `SubjectPublicKeyInfo` DER for an Ed25519 [`TokenPublicKey`]
+/// (the prefix above + the 32-byte raw key) — the exact bytes rustls presents as the
+/// client's RFC 7250 raw-public-key cert, so a presented client cert can be compared
+/// to a token's `cnf` byte-for-byte. `None` for a non-Ed25519 key or a malformed one.
+fn ed25519_spki_from_token_key(key: &TokenPublicKey) -> Option<Vec<u8>> {
+    let hex = key.to_hex();
+    let raw_hex = hex.strip_prefix("ed25519:")?;
+    let raw = hex::decode(raw_hex).ok()?;
+    if raw.len() != 32 {
+        return None;
+    }
+    let mut spki = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + raw.len());
+    spki.extend_from_slice(&ED25519_SPKI_PREFIX);
+    spki.extend_from_slice(&raw);
+    Some(spki)
+}
+
+/// Does the client's presented TLS raw public key (`channel_key`, a
+/// `SubjectPublicKeyInfo` DER from `peer_certificates()`) encode exactly the key
+/// named by the token's holder `cnf` (`"<alg>:<hex>"`)? The Stage-5 channel-binding
+/// comparison. Returns `false` when no client key was presented, when `cnf` is
+/// unparseable, or when the presented key is the wrong algorithm / not a valid point
+/// — fail-closed in every ambiguous case.
+///
+/// The comparison is **per the algorithm the `cnf` names**, never a length/prefix
+/// heuristic, so an Ed25519 `cnf` can only match a 44-byte Ed25519 SPKI and an ES256
+/// `cnf` only a P-256 SPKI — defeating cross-algorithm confusion. For Ed25519 the
+/// full canonical 44-byte SPKI (algorithm prefix **and** key) is rebuilt from the
+/// `cnf` and compared byte-for-byte; for ES256 the presented SPKI is parsed and
+/// compared as a P-256 key. The presented key reached this point only after rustls
+/// verified possession of its private half during the handshake (the TLS 1.3
+/// `CertificateVerify`), so a match is a genuine, possession-proven binding of the
+/// bearer to this channel. Public keys are not secret, but the compare is
+/// constant-time for hygiene.
+fn channel_key_matches_cnf(cnf: &str, channel_key: Option<&[u8]>) -> bool {
+    use subtle::ConstantTimeEq as _;
+    // No client cert on this channel → the token is not bound here → reject.
+    let Some(presented_spki) = channel_key else {
+        return false;
+    };
+    let Ok(expected) = TokenPublicKey::from_hex(cnf) else {
+        return false;
+    };
+    match expected.alg() {
+        TokenAlg::Ed25519 => {
+            // Rebuild the cnf key's canonical Ed25519 SPKI and compare ALL 44 bytes —
+            // both the algorithm prefix and the key must match (`ct_eq` on `[u8]`
+            // returns false for any length mismatch).
+            let Some(expected_spki) = ed25519_spki_from_token_key(&expected) else {
+                return false;
+            };
+            expected_spki.as_slice().ct_eq(presented_spki).into()
+        }
+        TokenAlg::Es256 => {
+            let Ok(presented) = TokenPublicKey::es256_from_spki_der(presented_spki) else {
+                return false;
+            };
+            // Two same-algorithm keys have equal canonical `to_hex` iff the keys are equal.
+            expected
+                .to_hex()
+                .as_bytes()
+                .ct_eq(presented.to_hex().as_bytes())
+                .into()
+        }
+    }
+}
+
 fn bearer_token(request: &Request) -> Option<String> {
     let value = request
         .headers()
@@ -1239,6 +1411,149 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    // ---- Stage 5: mutual-RPK / channel-bound tokens ---------------------------------
+
+    /// The pure binding comparison ([`channel_key_matches_cnf`]): an Ed25519 `cnf`
+    /// matches exactly its own canonical SPKI and nothing else, and a missing or
+    /// malformed channel key never matches (fail-closed).
+    #[test]
+    fn channel_binding_matches_only_the_exact_cnf_key() {
+        let holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let cnf = holder.public_key().to_hex();
+        let spki = ed25519_spki_from_token_key(&holder.public_key()).unwrap();
+        // The holder's own presented key matches.
+        assert!(channel_key_matches_cnf(&cnf, Some(&spki)));
+        // A different holder's key does not.
+        let other = LocalSigner::generate(TokenAlg::Ed25519);
+        let other_spki = ed25519_spki_from_token_key(&other.public_key()).unwrap();
+        assert!(!channel_key_matches_cnf(&cnf, Some(&other_spki)));
+        // No presented key never matches (the missing-binding case, fail-closed).
+        assert!(!channel_key_matches_cnf(&cnf, None));
+        // A truncated / wrong-length SPKI does not match.
+        assert!(!channel_key_matches_cnf(&cnf, Some(&spki[..43])));
+        assert!(!channel_key_matches_cnf(&cnf, Some(&[0u8; 44])));
+        // A tampered algorithm prefix (correct key tail) does not match — the full
+        // canonical SPKI, prefix included, is compared.
+        let mut bad_prefix = spki.clone();
+        bad_prefix[0] ^= 0xff;
+        assert!(!channel_key_matches_cnf(&cnf, Some(&bad_prefix)));
+    }
+
+    /// An `Auth` that requires channel binding (and has a PoP origin), plus an Ed25519
+    /// holder, a `cnf`-bound admin token, and the holder's canonical SPKI (the
+    /// "correct" channel key for that token). `root` signs the token; `now` is the mint
+    /// time.
+    async fn channel_fixture(root: &LocalSigner, now: u64) -> (Auth, LocalSigner, String, Vec<u8>) {
+        let auth = auth_with(root, false).with_channel_binding(true);
+        let cnf_holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let token = cose::mint_delegatable(&admin_claims(now), &cnf_holder.public_key(), root)
+            .await
+            .unwrap();
+        let spki = ed25519_spki_from_token_key(&cnf_holder.public_key()).unwrap();
+        (auth, cnf_holder, token, spki)
+    }
+
+    /// Happy path: a `cnf`-bound token presented over a channel whose client key
+    /// equals its `cnf`, with a valid per-request PoP, authenticates when channel
+    /// binding is required.
+    #[tokio::test]
+    async fn channel_bound_happy_path_authenticates() {
+        let root = holder();
+        let now = now_unix();
+        let (auth, cnf_holder, token, spki) = channel_fixture(&root, now).await;
+        let pop = proof(&cnf_holder, &token, "GET", PATH, ORIGIN, None, now).await;
+        assert!(
+            auth.authorize_with_query(&token, "GET", PATH, None, Some(&pop), None, Some(&spki))
+                .await
+                .is_ok(),
+            "a cnf token on a channel bound to its cnf (with a valid PoP) must authenticate"
+        );
+    }
+
+    /// Anti-replay: the same token + a valid PoP, replayed on a DIFFERENT channel
+    /// (an attacker's client key — they lack the `cnf` private half, so cannot present
+    /// the bound key), is rejected. This is the core off-channel-replay defense.
+    #[tokio::test]
+    async fn channel_bound_rejects_replay_on_a_different_channel() {
+        let root = holder();
+        let now = now_unix();
+        let (auth, cnf_holder, token, _spki) = channel_fixture(&root, now).await;
+        let pop = proof(&cnf_holder, &token, "GET", PATH, ORIGIN, None, now).await;
+        let attacker = LocalSigner::generate(TokenAlg::Ed25519);
+        let wrong = ed25519_spki_from_token_key(&attacker.public_key()).unwrap();
+        assert!(
+            auth.authorize_with_query(&token, "GET", PATH, None, Some(&pop), None, Some(&wrong))
+                .await
+                .is_err(),
+            "a token replayed on a channel whose key != cnf must be rejected"
+        );
+    }
+
+    /// Missing binding: a `cnf` token presented with NO channel key (plaintext /
+    /// server-auth-only / off-channel) is rejected when binding is required — never a
+    /// downgrade to an unbound bearer, even with a valid PoP.
+    #[tokio::test]
+    async fn channel_bound_rejects_a_missing_binding() {
+        let root = holder();
+        let now = now_unix();
+        let (auth, cnf_holder, token, _spki) = channel_fixture(&root, now).await;
+        let pop = proof(&cnf_holder, &token, "GET", PATH, ORIGIN, None, now).await;
+        assert!(
+            auth.authorize_with_query(&token, "GET", PATH, None, Some(&pop), None, None)
+                .await
+                .is_err(),
+            "a cnf token with no presented channel key must be rejected when binding is required"
+        );
+    }
+
+    /// Downgrade refused: a plain (non-`cnf`) bearer cannot be channel-bound, so it is
+    /// rejected when binding is required — even presenting some client key (there is no
+    /// `cnf` to bind it to). It still authorizes when the posture is off (unchanged).
+    #[tokio::test]
+    async fn channel_bound_rejects_a_plain_bearer_downgrade() {
+        let root = holder();
+        let now = now_unix();
+        let auth = auth_with(&root, false).with_channel_binding(true);
+        let token = cose::mint(&admin_claims(now), &root).await.unwrap();
+        let stranger = LocalSigner::generate(TokenAlg::Ed25519);
+        let spki = ed25519_spki_from_token_key(&stranger.public_key()).unwrap();
+        assert!(
+            auth.authorize_with_query(&token, "GET", PATH, None, None, None, Some(&spki))
+                .await
+                .is_err(),
+            "a plain bearer must be refused when channel binding is required (no downgrade)"
+        );
+        // With the posture OFF, the same plain bearer still authorizes (stages 1–4).
+        let off = auth_with(&root, false);
+        assert!(
+            off.authorize_with_query(&token, "GET", PATH, None, None, None, None)
+                .await
+                .is_ok(),
+            "a plain bearer still authorizes when channel binding is off"
+        );
+    }
+
+    /// Posture OFF (default): the presented channel key is not consulted — a `cnf`
+    /// token authenticates on its PoP alone (stages 1–4 behavior preserved), whether or
+    /// not a channel key is present.
+    #[tokio::test]
+    async fn channel_binding_off_ignores_the_channel_key() {
+        let root = holder();
+        let now = now_unix();
+        let auth = auth_with(&root, false); // channel binding OFF (default)
+        let cnf_holder = LocalSigner::generate(TokenAlg::Ed25519);
+        let token = cose::mint_delegatable(&admin_claims(now), &cnf_holder.public_key(), &root)
+            .await
+            .unwrap();
+        let pop = proof(&cnf_holder, &token, "GET", PATH, ORIGIN, None, now).await;
+        assert!(
+            auth.authorize_with_query(&token, "GET", PATH, None, Some(&pop), None, None)
+                .await
+                .is_ok(),
+            "with binding off, a cnf token authenticates on its PoP with no channel key"
+        );
     }
 
     /// `verify_overlay_enroll_token` accepts a valid invitation under the trust anchor (returning the
@@ -1531,6 +1846,7 @@ mod tests {
                     Some("project=acme&data_only=true"),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .is_ok(),
@@ -1544,13 +1860,14 @@ mod tests {
                     Some("project=globex"),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .is_err(),
                 "a Project·Admin on acme must be REFUSED to {path} globex (cross-tenant)",
             );
             assert!(
-                auth.authorize_with_query(&acme_admin, "POST", path, None, None, None)
+                auth.authorize_with_query(&acme_admin, "POST", path, None, None, None, None)
                     .await
                     .is_err(),
                 "a scoped project admin must be refused a target-less {path} (fail-closed)",

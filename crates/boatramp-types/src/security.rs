@@ -130,6 +130,7 @@ impl SecurityProfile {
                 ratelimit_fail_open: false,
                 allow_implicit_routing: false,
                 require_pop: false,
+                require_channel_bound_tokens: false,
                 require_domain_verification: true,
                 allow_env_secret_refs: false,
                 allow_guest_email: false,
@@ -176,6 +177,7 @@ impl SecurityProfile {
                 ratelimit_fail_open: false,
                 allow_implicit_routing: true,
                 require_pop: false,
+                require_channel_bound_tokens: false,
                 require_domain_verification: true,
                 allow_env_secret_refs: true,
                 allow_guest_email: true,
@@ -220,6 +222,7 @@ impl SecurityProfile {
                 ratelimit_fail_open: true,
                 allow_implicit_routing: true,
                 require_pop: false,
+                require_channel_bound_tokens: false,
                 // Dev serves arbitrary test hosts locally; the gate is off.
                 require_domain_verification: false,
                 allow_env_secret_refs: true,
@@ -383,6 +386,17 @@ pub struct PostureOverrides {
     /// (a `cnf` token *always* requires a proof regardless — this knob additionally
     /// bans plain bearer tokens fleet-wide, so a leaked bearer alone is inert).
     pub require_pop: Option<bool>,
+    /// Require **every** control-plane token to be **channel-bound**: presented over
+    /// a mutual-RPK TLS channel whose client key equals the token's terminal holder
+    /// (`cnf`). The TLS 1.3 handshake proves possession of that key continuously, and
+    /// the auth middleware asserts the presented client key == `cnf`, so a captured
+    /// token cannot be replayed on another channel or off-channel (a stolen bearer is
+    /// inert without the holder's private key). Off by default (bearer semantics
+    /// preserved); when on, a plain (non-`cnf`) token and a token presented without a
+    /// matching channel key are both refused — no downgrade to an unbound bearer.
+    /// Requires `--tls rpk` with channel binding on the listener (RFC 7250 client
+    /// auth); see the bootstrap-TLS how-to.
+    pub require_channel_bound_tokens: Option<bool>,
     /// Refuse to serve a non-local `Host` that isn't a verified, attached
     /// virtualhost (serve the pending page instead). On under multi-/single-tenant.
     /// Setting `false` here (file + restart) disables the gate fleet-wide; a single
@@ -638,6 +652,11 @@ impl SecurityConfig {
             o.require_pop.is_some(),
         );
         row(
+            "require_channel_bound_tokens",
+            p.require_channel_bound_tokens.to_string(),
+            o.require_channel_bound_tokens.is_some(),
+        );
+        row(
             "allow_env_secret_refs",
             p.allow_env_secret_refs.to_string(),
             o.allow_env_secret_refs.is_some(),
@@ -835,6 +854,13 @@ pub struct SecurityPosture {
     /// Require every control-plane token to be `cnf`-bound and PoP-proven
     /// (fleet-wide holder-key enforcement). Off by default.
     pub require_pop: bool,
+    /// Require every control-plane token to be **channel-bound** to its holder
+    /// (`cnf`) key over mutual-RPK TLS — the presented TLS client key must equal the
+    /// token's terminal `cnf`, binding the bearer to the channel (a captured token is
+    /// inert off-channel). Off by default; when on, a plain (non-`cnf`) token or a
+    /// missing/mismatched channel key is refused (no downgrade). Needs `--tls rpk`
+    /// with channel binding enabled on the listener.
+    pub require_channel_bound_tokens: bool,
     /// Refuse to serve a **non-local** `Host` that is not a verified, attached
     /// virtualhost — the request gets the "verification pending" holding page
     /// instead of any `default_site`/implicit fallback. On under multi-/single-
@@ -1021,6 +1047,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     if let Some(v) = o.require_pop {
         base.require_pop = v;
     }
+    if let Some(v) = o.require_channel_bound_tokens {
+        base.require_channel_bound_tokens = v;
+    }
     if let Some(v) = o.require_domain_verification {
         base.require_domain_verification = v;
     }
@@ -1134,6 +1163,7 @@ mod tests {
         assert!(!p.ratelimit_fail_open);
         assert!(!p.allow_implicit_routing);
         assert!(!p.require_pop);
+        assert!(!p.require_channel_bound_tokens);
         // Bare/`env:` secret refs read the operator namespace → off under multi-tenant.
         assert!(!p.allow_env_secret_refs);
         assert_eq!(p.max_upload_bytes, MT_MAX_UPLOAD);
@@ -1339,6 +1369,36 @@ mod tests {
                 .lines()
                 .any(|l| l.contains("require_pop") && l.contains("true") && l.contains("override"))
         );
+    }
+
+    #[test]
+    fn require_channel_bound_tokens_defaults_off_everywhere_and_overrides() {
+        // Off in every built-in preset (bearer semantics preserved unless opted in).
+        for profile in [
+            SecurityProfile::MultiTenant,
+            SecurityProfile::SingleTenant,
+            SecurityProfile::Dev,
+        ] {
+            assert!(
+                !profile.preset().require_channel_bound_tokens,
+                "{}",
+                profile.as_str()
+            );
+        }
+        // An explicit override turns fleet-wide channel binding on.
+        let cfg = SecurityConfig {
+            overrides: PostureOverrides {
+                require_channel_bound_tokens: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.resolve().unwrap().require_channel_bound_tokens);
+        assert!(cfg.explain().unwrap().lines().any(|l| {
+            l.contains("require_channel_bound_tokens")
+                && l.contains("true")
+                && l.contains("override")
+        }));
     }
 
     #[test]

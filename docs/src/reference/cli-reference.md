@@ -1371,6 +1371,7 @@ Mint a new token (printed once — not recoverable)
 | `--ttl-secs <TTL_SECS>` | — | — | — | Optional time-to-live in seconds (omit for no expiry) |
 | `--holder-pub <HOLDER_PUB>` | — | — | — | Make the token **delegatable**: embed this holder public key (`"<alg>:<hex>"`, from `boatramp auth init`) as the `cnf`, so the holder of the matching private key can `token attenuate` it offline |
 | `--pop` | — | — | — | Make the token **PoP-bound** (DPoP): generate a fresh holder keypair, mint the token against its public half (`cnf`), and print the holder **private** key as `BOATRAMP_TOKEN_HOLDER_KEY` so the client can sign a per-request proof. A leaked token alone is then inert without this key. Also set `BOATRAMP_POP_ORIGIN` to the server's `[serve] pop_origin` |
+| `--channel-bind` | — | — | — | Mint the `--pop` holder keypair as **Ed25519** instead of the default ES256, so the printed `BOATRAMP_TOKEN_HOLDER_KEY` can also be presented as the RFC 7250 TLS **client** identity for **channel binding** (Stage 5): the CLI offers it on an `--tls rpk` channel, and a server with `require_channel_bound_tokens` on binds the token to that channel. Requires `--pop` |
 
 ### `boatramp token bootstrap`
 

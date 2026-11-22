@@ -81,6 +81,13 @@ pub fn router_with_fast(
     // holder-bound (`require_pop`). A holder-bound (`cnf`) token always requires a
     // valid proof regardless of the knob (enforced in `Auth::authorize`).
     let auth = auth.with_pop(options.pop_origin.clone(), posture.require_pop);
+    // Bind the Stage-5 channel-binding posture (`require_channel_bound_tokens`): when
+    // on, a holder-bound token must be presented over a mutual-RPK TLS channel whose
+    // client key equals the token's `cnf`, and a plain bearer is refused (no
+    // downgrade). Additive to `with_pop`; order-independent (it carries the PoP
+    // posture forward). Enforced in `Auth::authorize` against the presented channel
+    // key the serving stack surfaces.
+    let auth = auth.with_channel_binding(posture.require_channel_bound_tokens);
     // The listener's own scheme, for deriving the request scheme when
     // `X-Forwarded-Proto` isn't from a trusted proxy.
     let served_over_tls = ServedOverTls(options.served_over_tls);
