@@ -100,6 +100,14 @@ pub mod project_bundle;
 /// of `boatramp_core::project_export::ProjectExport`, behind the `project-export` feature.
 #[cfg(feature = "project-export")]
 pub mod project_export;
+/// The `apply` reconcile core (node-library N3): the control-plane reconcile logic
+/// (`ensure_project`/`apply_site`/… driving config-before-activate) lifted out of the
+/// `boatramp` binary behind the [`ControlPlane`](reconcile::ControlPlane) +
+/// [`SiteBuilder`](reconcile::SiteBuilder) seams, so it is unit-testable in-process
+/// against a mock instead of only through `boatramp apply` (PLAN-node-library N3). The
+/// binary keeps manifest parsing, arg handling, output rendering, and the concrete
+/// HTTP/filesystem impls.
+pub mod reconcile;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod repair;
 /// Node-level base S3 credential sourcing from the `[secrets]` sealed store (#505).
