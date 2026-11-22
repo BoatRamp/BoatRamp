@@ -9430,6 +9430,7 @@ mod tests {
             None,
             Some(&store),
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9445,6 +9446,7 @@ mod tests {
             None,
             Some(&store),
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9475,6 +9477,7 @@ mod tests {
             None,
             Some(&store),
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9526,6 +9529,7 @@ mod tests {
             None,
             Some(&store),
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9551,6 +9555,7 @@ mod tests {
             None,
             Some(&store),
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9914,6 +9919,7 @@ mod tests {
             nodes,
             &BackendPolicy::default(),
             &FixedActivity(WorkloadActivity::Active),
+            None,
             None,
             None,
             None,
