@@ -2782,9 +2782,10 @@ mod tests {
         let other = LocalSigner::generate(TokenAlg::Es256);
         assert!(verify(&token, &other.public_key(), NOW).is_err());
 
-        // Flipping a byte in the token breaks it.
+        // Flipping a byte in the token breaks it. (Strip the cosmetic `brt_` mint
+        // prefix first so `raw` is the true COSE bytes, not prefix + COSE.)
         let mut raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&token)
+            .decode(boatramp_cwt::strip_token_prefix(&token))
             .unwrap();
         *raw.last_mut().unwrap() ^= 0x01;
         let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
@@ -2815,8 +2816,10 @@ mod tests {
         let signer = LocalSigner::generate(TokenAlg::Es256);
         let pubkey = signer.public_key();
         let token = mint(&claims(), &signer).await.unwrap();
+        // Strip the cosmetic `brt_` mint prefix so `raw` is exactly the COSE bytes
+        // (the byte-offset reasoning in (b) below depends on that).
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&token)
+            .decode(boatramp_cwt::strip_token_prefix(&token))
             .unwrap();
 
         // (a) Truncating the trailing ES256 signature → rejected (never silently accepted).
@@ -3722,8 +3725,9 @@ mod tests {
         let token = mint_s3_session(&s3_scope_key(), 300, NOW, &signer)
             .await
             .unwrap();
+        // Strip the cosmetic `brt_` mint prefix so `raw` is the true COSE bytes.
         let mut raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&token)
+            .decode(boatramp_cwt::strip_token_prefix(&token))
             .unwrap();
         let mid = raw.len() / 2;
         raw[mid] ^= 0x01;

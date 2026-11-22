@@ -60,6 +60,42 @@ pub const MAX_CHAIN_DEPTH: usize = 8;
 /// Max serialized bytes of a presented delegation chain — bounded before parsing.
 pub const MAX_CHAIN_BYTES: usize = 8 * 1024;
 
+/// The cosmetic textual prefix a freshly minted **plain token** carries:
+/// `brt_<base64url(COSE_Sign1)>`, à la GitHub's `ghp_`. It lets a human or a tool
+/// recognize a boatramp token at a glance.
+///
+/// **It is purely a transport affordance — never part of the signed/verified
+/// COSE bytes.** Mint ([`sign_claims`] / [`sign_claims_with_kid`]) stamps it;
+/// verify ([`verify_envelope`] / [`decode_credential`] and everything built on
+/// them) strips a leading `brt_` *if present* before base64url-decoding and
+/// **still accepts a token with no prefix**, so every already-minted prefix-less
+/// token keeps verifying unchanged — the prefix is non-breaking. Because it sits
+/// outside the base64url payload, adding or stripping it cannot change the COSE
+/// signature verification of the bytes that remain.
+pub const TOKEN_PREFIX: &str = "brt_";
+
+/// Strip the optional cosmetic [`TOKEN_PREFIX`] from a presented token, if it is
+/// present. Lenient by design: a token **without** the prefix is returned
+/// unchanged, so legacy prefix-less tokens still verify. Only a single, exact,
+/// leading `brt_` is removed — never looped — so a doubled or foreign prefix is
+/// left in place for the base64/COSE decode to reject on its own bytes.
+pub fn strip_token_prefix(token: &str) -> &str {
+    token.strip_prefix(TOKEN_PREFIX).unwrap_or(token)
+}
+
+/// Decode a presented token / credential string to its raw bytes: trim
+/// surrounding whitespace, strip the optional [`TOKEN_PREFIX`], then base64url
+/// (URL-safe, no-pad) decode. The single decode chokepoint shared by
+/// [`decode_credential`] and [`verify_envelope`], so both the plain-token and the
+/// delegation-chain verify paths accept a `brt_`-prefixed *and* a prefix-less
+/// token identically. The prefix is stripped from the transport string only; the
+/// decoded bytes (and thus the COSE verification over them) are unaffected.
+fn decode_token_b64(s: &str) -> Result<Vec<u8>, TokenError> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(strip_token_prefix(s.trim()))
+        .map_err(|e| TokenError::Invalid(format!("base64: {e}")))
+}
+
 /// The token signing algorithm. **ES256 is the portable default** (every HSM/KMS
 /// can sign it); Ed25519 is offered for AWS/Vault/local deployments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,12 +390,18 @@ pub fn random_cti() -> Result<Vec<u8>, TokenError> {
     Ok(cti.to_vec())
 }
 
-/// Wrap a CWT claim set in a signed `COSE_Sign1` and base64url-encode it. The
-/// protected header carries the signer's algorithm; the canonical `ToBeSigned`
-/// bytes are what gets signed (never hand-rolled).
+/// Wrap a CWT claim set in a signed `COSE_Sign1`, base64url-encode it, and stamp
+/// the cosmetic [`TOKEN_PREFIX`] (`brt_<base64url>`). The protected header carries
+/// the signer's algorithm; the canonical `ToBeSigned` bytes are what gets signed
+/// (never hand-rolled). The prefix is **not** part of the signed bytes — it is a
+/// human/tooling affordance that verify strips leniently — so a prefix-less token
+/// minted by an older build still verifies ([`verify_envelope`]).
 pub async fn sign_claims(claims: ClaimsSet, signer: &dyn Signer) -> Result<String, TokenError> {
     let bytes = sign_claims_bytes(claims, signer).await?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    Ok(format!(
+        "{TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    ))
 }
 
 /// Sign a claim set into the tagged `COSE_Sign1` bytes (the raw block form used
@@ -380,15 +422,22 @@ pub async fn sign_claims_bytes(
 ///
 /// **Wire note:** stamping a `kid` changes the signed bytes — a token minted with
 /// a `kid` differs from one minted without. This is **opt-in**; the plain
-/// [`sign_claims`] / [`sign_claims_bytes`] path (what boatramp mints today) is
-/// byte-for-byte unchanged, so existing tokens are unaffected.
+/// [`sign_claims_bytes`] path (the signed COSE bytes boatramp mints today) is
+/// byte-for-byte unchanged, so existing tokens verify unaffected. (The cosmetic
+/// [`TOKEN_PREFIX`] that [`sign_claims`] prepends to the base64url *string* is a
+/// separate, non-signed affordance that verify strips leniently.)
+///
+/// Like [`sign_claims`], the returned string carries the [`TOKEN_PREFIX`].
 pub async fn sign_claims_with_kid(
     claims: ClaimsSet,
     signer: &dyn Signer,
     kid: &[u8],
 ) -> Result<String, TokenError> {
     let bytes = sign_claims_bytes_with_kid(claims, signer, kid).await?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    Ok(format!(
+        "{TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    ))
 }
 
 /// [`sign_claims_bytes`] with a protected-header `kid` — see [`sign_claims_with_kid`].
@@ -462,9 +511,9 @@ pub fn peek_unverified_claims(token: &str) -> Result<ClaimsSet, TokenError> {
 /// is a CBOR array of byte strings. Enforces the size/depth bounds *before* any
 /// verification, so a hostile credential can't force unbounded work.
 pub fn decode_credential(credential: &str) -> Result<Vec<Vec<u8>>, TokenError> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(credential.trim())
-        .map_err(|e| TokenError::Invalid(format!("base64: {e}")))?;
+    // Strips the optional cosmetic `brt_` prefix (if present) before decoding, and
+    // still accepts a prefix-less credential — see [`decode_token_b64`].
+    let bytes = decode_token_b64(credential)?;
     if bytes.len() > MAX_CHAIN_BYTES {
         return Err(TokenError::Bounds("credential exceeds size bound".into()));
     }
@@ -521,9 +570,9 @@ pub fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 /// confusion. All failures here are authenticity/framing failures
 /// ([`TokenError::Invalid`]).
 pub fn verify_envelope(token: &str, public: &TokenPublicKey) -> Result<ClaimsSet, TokenError> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token.trim())
-        .map_err(|e| TokenError::Invalid(format!("base64: {e}")))?;
+    // Lenient prefix handling: a `brt_`-prefixed *and* a prefix-less token decode
+    // to the same COSE bytes — see [`decode_token_b64`].
+    let bytes = decode_token_b64(token)?;
     verify_envelope_bytes(&bytes, public)
 }
 
@@ -1652,5 +1701,153 @@ mod tests {
             _ => None,
         });
         assert_eq!(role.as_deref(), Some("publisher"));
+    }
+
+    // ---- v0.71.0: cosmetic `brt_` token prefix -----------------------------
+
+    /// A minimal claim set for the prefix tests: a `cti` (so two mints differ) + a
+    /// readable private-use claim.
+    fn prefix_test_claims() -> ClaimsSet {
+        ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(1_000))
+            .cwt_id(random_cti().unwrap())
+            .text_claim("role".to_string(), CborValue::Text("publisher".to_string()))
+            .build()
+    }
+
+    /// The prefix a verifier strips is exactly the constant mint stamps.
+    #[test]
+    fn token_prefix_is_brt() {
+        assert_eq!(TOKEN_PREFIX, "brt_");
+        // Stripping is a no-op on a string that does not carry it.
+        assert_eq!(strip_token_prefix("no-prefix-here"), "no-prefix-here");
+        // Exactly one leading prefix is removed, never looped.
+        assert_eq!(strip_token_prefix("brt_brt_x"), "brt_x");
+    }
+
+    /// A freshly minted plain token carries the `brt_` prefix AND verifies, and the
+    /// prefix is purely cosmetic: the base64url body under it is the *identical*
+    /// legacy wire form (`base64url(COSE_Sign1)`), so stripping it does not change
+    /// the COSE verification of the bytes that remain.
+    #[tokio::test]
+    async fn fresh_token_carries_prefix_and_prefix_is_outside_the_signed_bytes() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let claims = prefix_test_claims();
+
+        let token = sign_claims(claims, &signer).await.unwrap();
+        assert!(
+            token.starts_with(TOKEN_PREFIX),
+            "a freshly minted token must carry the `brt_` prefix"
+        );
+
+        // It verifies as-is.
+        let verified = verify_envelope(&token, &signer.public_key()).unwrap();
+
+        // The prefix is a pure string wrapper over the legacy `base64url(COSE_Sign1)`
+        // body: stripping it yields valid base64url that decodes to the signed COSE
+        // bytes, and re-wrapping those bytes reconstructs the token exactly — the
+        // prefix never touches the payload.
+        let body = strip_token_prefix(&token);
+        assert!(!body.starts_with(TOKEN_PREFIX));
+        let cose_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(body)
+            .unwrap();
+        assert_eq!(
+            format!(
+                "{TOKEN_PREFIX}{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cose_bytes)
+            ),
+            token,
+        );
+
+        // And the prefix-less body verifies to the SAME claim set as the prefixed
+        // form — adding/stripping the prefix cannot change the COSE verification.
+        let verified_body = verify_envelope(body, &signer.public_key()).unwrap();
+        assert_eq!(
+            claim_cti(&verified).unwrap(),
+            claim_cti(&verified_body).unwrap()
+        );
+        assert_eq!(verified.rest, verified_body.rest);
+    }
+
+    /// Back-compat: a token minted in the OLD prefix-less wire form
+    /// (`base64url(COSE_Sign1)`, exactly what builds before v0.71.0 emit) still
+    /// verifies unchanged — the feature is non-breaking.
+    #[tokio::test]
+    async fn legacy_prefixless_token_still_verifies() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let claims = prefix_test_claims();
+
+        // The pre-feature wire form: base64url of the signed COSE bytes, NO prefix.
+        let legacy = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sign_claims_bytes(claims, &signer).await.unwrap());
+        assert!(
+            !legacy.starts_with(TOKEN_PREFIX),
+            "fixture must be the legacy prefix-less form"
+        );
+
+        // Both the plain-token verify path and the credential/peek path accept it.
+        let verified = verify_envelope(&legacy, &signer.public_key()).unwrap();
+        assert_eq!(
+            claim_cti(&verified).unwrap(),
+            claim_cti(&peek_unverified_claims(&legacy).unwrap()).unwrap()
+        );
+    }
+
+    /// A wrong/garbage prefix is handled safely: stripping removes only a known,
+    /// exact `brt_`, so a foreign or doubled prefix survives into the decode and is
+    /// rejected on its own bytes (clean `Err`, never a panic, never an accept). This
+    /// is the key property for the lenient verify: leniency never bypasses the COSE
+    /// signature check.
+    #[tokio::test]
+    async fn wrong_prefix_is_rejected_cleanly() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let token = sign_claims(prefix_test_claims(), &signer).await.unwrap();
+        let body = strip_token_prefix(&token).to_string();
+        let pubkey = signer.public_key();
+
+        // A FOREIGN prefix (`ghp_…`) is not stripped; its chars decode to 3 leading
+        // bytes before the COSE tag → the COSE parse fails. Rejected, not accepted.
+        let foreign = format!("ghp_{body}");
+        assert!(strip_token_prefix(&foreign).starts_with("ghp_"));
+        assert!(verify_envelope(&foreign, &pubkey).is_err());
+
+        // A DOUBLED prefix: only one `brt_` is removed, the inner one corrupts the
+        // decoded bytes → rejected.
+        let doubled = format!("{TOKEN_PREFIX}{token}");
+        assert!(verify_envelope(&doubled, &pubkey).is_err());
+
+        // The known prefix over a GARBAGE body: strip-then-fail on the bytes
+        // (`!` is outside the base64url alphabet → a clean base64 `Err`).
+        assert!(matches!(
+            verify_envelope("brt_not!a!token", &pubkey),
+            Err(TokenError::Invalid(_))
+        ));
+
+        // And the honest token (same body, correct single prefix) DOES verify — the
+        // rejections above are about the bad prefixes, not a broken happy path.
+        assert!(verify_envelope(&token, &pubkey).is_ok());
+    }
+
+    /// The credential/chain path strips the prefix on its INPUT too: a prefixed
+    /// plain token can be attenuated, and the resulting delegation chain verifies.
+    #[tokio::test]
+    async fn prefixed_token_feeds_the_credential_path() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let h1 = LocalSigner::generate(TokenAlg::Ed25519);
+        let h1_pub = h1.public_key();
+
+        // `mint_root` mints via `sign_claims`, so `token` carries the `brt_` prefix.
+        let token = mint_root(&root, &h1_pub).await;
+        assert!(token.starts_with(TOKEN_PREFIX));
+
+        // `attenuate` decodes the prefixed input via `decode_credential` (prefix
+        // stripped there) and the narrowed chain verifies against the root.
+        let chain = attenuate(&token, &h1, &ReadOnly(true), None, 1_000)
+            .await
+            .unwrap();
+        let verified = verify_credential::<ReadOnly>(&chain, &root_pub, 1_000).unwrap();
+        assert_eq!(verified.caveats, ReadOnly(true));
     }
 }
