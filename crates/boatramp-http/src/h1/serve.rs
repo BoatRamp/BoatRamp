@@ -254,16 +254,47 @@ where
         *req.headers_mut() = head.headers;
 
         // Run { handler → write its response } concurrently with the body pump, so the
-        // response streams out while the request body is still coming in.
-        let respond = async {
-            let resp = handler.handle(req).await;
-            write_response(&mut wr, resp, &method, version, client_close).await
+        // response streams out while the request body is still coming in — then decide,
+        // once the response is written, whether to drain the rest of the body.
+        let (result, resp_close, pump_err) = {
+            let respond = async {
+                let resp = handler.handle(req).await;
+                write_response(&mut wr, resp, &method, version, client_close).await
+            };
+            let pump = pump_body(&mut rd, &mut buf, framing, tx, read_timeout, body_limit);
+            tokio::pin!(respond, pump);
+
+            let mut respond_out: Option<(std::io::Result<()>, bool)> = None;
+            let mut pump_out: Option<Result<(), ()>> = None;
+            loop {
+                // As soon as the response is written AND the connection will close, STOP:
+                // a closing connection has no next request to frame, so the remaining
+                // (abandoned) request body is NOT drained — an early `413`/`401` no longer
+                // reads a large rejected upload to its end (resource/DoS hardening). The
+                // close condition is `client_close || resp_close || write-error`: a bare
+                // keep-alive 200 is NOT closing, so we instead wait for the pump to consume
+                // the body in full — the bytes after it are the next pipelined request and
+                // the connection boundary must stay aligned.
+                if let Some((res, resp_close)) = respond_out.as_ref() {
+                    let will_close = client_close || *resp_close || res.is_err();
+                    if will_close || pump_out.is_some() {
+                        break;
+                    }
+                }
+                tokio::select! {
+                    r = respond.as_mut(), if respond_out.is_none() => respond_out = Some(r),
+                    p = pump.as_mut(), if pump_out.is_none() => pump_out = Some(p),
+                }
+            }
+            let (result, resp_close) =
+                respond_out.expect("the loop only breaks after the response is written");
+            // An abandoned pump (we stopped it on a closing connection) is not an error; a
+            // pump that actually ran and reported a bad/truncated body closes anyway.
+            let pump_err = matches!(pump_out, Some(Err(())));
+            (result, resp_close, pump_err)
         };
-        let ((result, resp_close), pump) = tokio::join!(
-            respond,
-            pump_body(&mut rd, &mut buf, framing, tx, read_timeout, body_limit)
-        );
-        // Reunite the halves so the next keep-alive request is served un-split again.
+        // Reunite the halves (both futures are dropped now) so a next keep-alive request
+        // is served un-split again.
         io = rd.unsplit(wr);
 
         if result.is_err() {
@@ -271,7 +302,7 @@ where
         }
         // Close after this request if either side asked, or the request body framing was
         // bad/truncated (the connection boundary can no longer be trusted).
-        if resp_close || pump.is_err() {
+        if client_close || resp_close || pump_err {
             break 'conn;
         }
     }
@@ -458,6 +489,9 @@ where
     let framing = match &body {
         Body::Bytes(v) => Framing::Fixed(v.len()),
         Body::File { len, .. } => Framing::Fixed(*len as usize),
+        // A declared-length streamed body is Content-Length-framed (not chunked), so a
+        // proxied known-length download keeps its length on the wire.
+        Body::StreamSized { len, .. } => Framing::Fixed(*len as usize),
         Body::Stream(_) => Framing::Chunked,
     };
 
@@ -527,6 +561,53 @@ where
                 // blob keyspace is content-addressed + immutable). Abort rather than frame
                 // a truncated body as complete.
                 Err(_) => return (Ok(()), true),
+            }
+        }
+        Body::StreamSized { mut stream, len } => {
+            // The head already committed `Content-Length: len` (Framing::Fixed); write
+            // exactly `len` body bytes with raw framing (no chunking). Be **defensive**: if
+            // the source over- or under-runs the declared length, force-close the connection
+            // rather than let a wrongly framed body desync it — the committed Content-Length can
+            // no longer be corrected, and bytes past it would be read as the next response.
+            let mut remaining = len;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) if chunk.is_empty() => {}
+                    Ok(chunk) => {
+                        let over = chunk.len() as u64 > remaining;
+                        let take = if over {
+                            remaining as usize
+                        } else {
+                            chunk.len()
+                        };
+                        if take > 0 {
+                            if let Err(e) = write_all(io, &chunk[..take]).await {
+                                return (Err(e), true);
+                            }
+                            // Flush each chunk so a streamed download reaches the client
+                            // promptly even over a buffering (TLS) transport — otherwise the
+                            // tail can sit in the record buffer with no later write to drain
+                            // it (the h2 FlushGatedIo corner, on the h1 keep-alive path).
+                            if let Err(e) = io.flush().await {
+                                return (Err(e), true);
+                            }
+                            remaining -= take as u64;
+                        }
+                        if over {
+                            // Body longer than its declared Content-Length: exactly `len`
+                            // bytes were written; force-close so the excess can't desync.
+                            return (Ok(()), true);
+                        }
+                    }
+                    // Source failed mid-stream: close WITHOUT the full `len` bytes, so the
+                    // client sees a truncated (error) body, never a clean short read.
+                    Err(_) => return (Ok(()), true),
+                }
+            }
+            if remaining != 0 {
+                // Body shorter than its declared Content-Length: committed to `len` but
+                // can't fill it. Force-close rather than desync the next request.
+                return (Ok(()), true);
             }
         }
         Body::Stream(mut stream) => {

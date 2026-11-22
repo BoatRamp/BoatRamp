@@ -150,7 +150,24 @@ impl Handler for RouterHandler {
                 Err(_) => Some(Err(BodyError)),
             })
         });
-        axum::http::Response::from_parts(parts, HttpBody::try_stream(chunks))
+        // Preserve a KNOWN body length: when the response carries a `Content-Length`, frame
+        // the streamed body with it (h1: Content-Length, not chunked; h2: a `content-length`
+        // header) so a proxied known-length download keeps progress + range instead of being
+        // forced to chunked. This is the LAST step before the codec, so the header reflects
+        // the final body — any body-transforming layer (e.g. on-the-fly compression) has
+        // already dropped `Content-Length` — and the h1 writer is defensive if a handler ever
+        // declares a length its body doesn't match (it force-closes rather than desyncs).
+        let content_length = parts
+            .headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        match content_length {
+            Some(len) => {
+                axum::http::Response::from_parts(parts, HttpBody::try_stream_sized(len, chunks))
+            }
+            None => axum::http::Response::from_parts(parts, HttpBody::try_stream(chunks)),
+        }
     }
 }
 

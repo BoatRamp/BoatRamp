@@ -8,9 +8,15 @@
 
 use std::sync::Arc;
 
-use boatramp_http::h2::{Handler, Request, Response, response, serve_connection_mux};
+use boatramp_http::h2::error::ErrorCode;
+use boatramp_http::h2::frame::{self, FrameHeader, FrameType};
+use boatramp_http::h2::hpack::Hpack;
+use boatramp_http::h2::{
+    CLIENT_PREFACE, Handler, Request, Response, response, serve_connection_mux,
+};
 use bytes::Bytes;
-use tokio::sync::Notify;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::sync::{Notify, mpsc};
 
 struct App;
 
@@ -22,6 +28,12 @@ impl Handler for App {
             "/echo" => response(
                 200,
                 req.into_body().collect().await.unwrap_or_default().to_vec(),
+            ),
+            // Forward the request body straight to the response, chunk by chunk, WITHOUT
+            // buffering it — so a chunk echoes back as soon as the handler receives it.
+            "/echo-stream" => response(
+                200,
+                boatramp_http::h2::Body::try_stream(req.into_body().into_data_stream()),
             ),
             p => response(200, format!("{} {}", req.method(), p).into_bytes()),
         }
@@ -109,6 +121,53 @@ async fn request_body_is_delivered_to_the_handler() {
     let response = response.await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(read_body(response.into_body()).await, b"hello body");
+}
+
+/// U27: the request body must stream to the handler incrementally — the handler sees a
+/// DATA chunk as soon as it arrives, NOT only after END_STREAM. Proven by echoing the
+/// request body straight to the response: the first chunk comes back *before* the client
+/// sends the rest of the body. With the old buffer-to-END_STREAM path the handler never
+/// runs until the whole body is in, so the first echoed chunk could not arrive first.
+#[tokio::test]
+async fn request_body_streams_incrementally_to_the_handler() {
+    use std::time::Duration;
+    let mut client = connect().await;
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://x/echo-stream")
+        .body(())
+        .unwrap();
+    // HEADERS without END_STREAM — the body follows in DATA frames.
+    let (response, mut send) = client.send_request(request, false).unwrap();
+    // Send ONLY the first chunk (not END_STREAM).
+    send.send_data(Bytes::from_static(b"first-"), false)
+        .unwrap();
+
+    // The response head + the first echoed chunk must arrive while the request body is
+    // still open — impossible if the server buffered the whole body first.
+    let response = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .expect("response head must arrive before the body completes")
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(5), body.data())
+        .await
+        .expect("first echoed chunk must arrive before the request body is complete")
+        .expect("a chunk")
+        .unwrap();
+    let _ = body.flow_control().release_capacity(first.len());
+    assert_eq!(&first[..], b"first-");
+
+    // Now finish the request; the rest echoes back and the stream ends.
+    send.send_data(Bytes::from_static(b"second"), true).unwrap();
+    let mut rest = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        let _ = body.flow_control().release_capacity(chunk.len());
+        rest.extend_from_slice(&chunk);
+    }
+    assert_eq!([&first[..], &rest[..]].concat(), b"first-second");
 }
 
 #[tokio::test]
@@ -707,4 +766,391 @@ async fn buffering_transport_body_tail_is_flushed_before_the_writer_idles() {
         .expect("response tail stranded in the transport buffer — writer idled without flushing");
     assert_eq!(body.len(), BODY, "the full body must reach the peer");
     assert!(body.iter().all(|&b| b == b'x'));
+}
+
+// ============================================================================
+// Request-body RECEIVE flow control (the HIGH): a fast uploader must be backpressured
+// into a slow/non-draining handler instead of buffering without bound in our process. The
+// fix bounds the per-stream body channel AND gates the stream-level WINDOW_UPDATE on the
+// handler *consuming* a chunk, so the peer's stream window closes when the handler stalls.
+// ============================================================================
+
+/// Constraint: a legitimate large upload (far bigger than the 64 KiB initial stream window)
+/// to a *consuming* handler must complete, NOT deadlock. Consume-gated replenishment means
+/// the window only reopens as the handler drains the body — so this round-trips only because
+/// the handler draining the request keeps reopening the window. (`/echo` collects the whole
+/// body and echoes it, so both the inbound window reopening and the response path are
+/// exercised.)
+#[tokio::test]
+async fn large_upload_to_a_consuming_handler_round_trips() {
+    let mut client = connect().await; // App: `/echo` collects + echoes the body
+    let body = vec![b'q'; 256 * 1024]; // 256 KiB >> the 65 535-byte initial stream window
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("https://x/echo")
+        .body(())
+        .unwrap();
+    let (resp_fut, mut send) = client.send_request(req, false).unwrap();
+    send.send_data(Bytes::from(body.clone()), true).unwrap();
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), resp_fut)
+        .await
+        .expect("a large upload to a draining handler must not deadlock")
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let got = read_body(resp.into_body()).await;
+    assert_eq!(
+        got.len(),
+        body.len(),
+        "the whole upload must reach the handler"
+    );
+    assert_eq!(got, body, "the echoed body must match the upload");
+}
+
+// ---- raw-frame helpers (a conforming h2 client won't withhold reads or malform a body, so
+// ---- these drive the frames directly — mirroring tests/h2_hardening.rs) ---------------
+
+const F_END_STREAM: u8 = 0x1;
+const F_END_HEADERS: u8 = 0x4;
+
+/// Spawn the mux over an in-memory duplex with `handler`; return the client half.
+fn raw_client<H: Handler>(handler: H) -> DuplexStream {
+    let (client, server) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        let _ = serve_connection_mux(server, handler).await;
+    });
+    client
+}
+
+/// Client preface + an (empty) client SETTINGS frame.
+async fn send_preface(c: &mut DuplexStream) {
+    c.write_all(CLIENT_PREFACE).await.unwrap();
+    let mut settings = Vec::new();
+    frame::write_frame(&mut settings, FrameType::Settings, 0, 0, &[]);
+    c.write_all(&settings).await.unwrap();
+}
+
+/// A `POST path` HPACK header block, optionally carrying a `content-length`.
+fn post_block(path: &str, content_length: Option<u64>) -> Vec<u8> {
+    let cl = content_length.map(|n| n.to_string());
+    let mut fields: Vec<(&[u8], &[u8])> = vec![
+        (b":method", b"POST"),
+        (b":scheme", b"https"),
+        (b":path", path.as_bytes()),
+        (b":authority", b"x"),
+    ];
+    if let Some(cl) = cl.as_deref() {
+        fields.push((b"content-length", cl.as_bytes()));
+    }
+    Hpack::new().encode(&fields)
+}
+
+/// Read one whole frame (header + payload), or `None` on EOF/error.
+async fn read_frame(c: &mut DuplexStream) -> Option<(FrameHeader, Vec<u8>)> {
+    let mut hdr = [0u8; 9];
+    c.read_exact(&mut hdr).await.ok()?;
+    let h = FrameHeader::parse(&hdr);
+    let mut payload = vec![0u8; h.length as usize];
+    if h.length > 0 {
+        c.read_exact(&mut payload).await.ok()?;
+    }
+    Some((h, payload))
+}
+
+/// Tally `(connection-level, stream-level)` WINDOW_UPDATE frames the server sends for `sid`
+/// over `dur` (the connection never closes on its own, so it is bounded by the timeout).
+async fn count_window_updates(
+    c: &mut DuplexStream,
+    sid: u32,
+    dur: std::time::Duration,
+) -> (u32, u32) {
+    let mut conn = 0u32;
+    let mut stream = 0u32;
+    let _ = tokio::time::timeout(dur, async {
+        while let Some((h, _)) = read_frame(c).await {
+            if h.kind == FrameType::WindowUpdate {
+                if h.stream_id == 0 {
+                    conn += 1;
+                } else if h.stream_id == sid {
+                    stream += 1;
+                }
+            }
+        }
+    })
+    .await;
+    (conn, stream)
+}
+
+/// Scan server frames up to `dur` for a `RST_STREAM` on `sid`, returning its error code.
+async fn wait_for_rst(
+    c: &mut DuplexStream,
+    sid: u32,
+    dur: std::time::Duration,
+) -> Option<ErrorCode> {
+    tokio::time::timeout(dur, async {
+        while let Some((h, payload)) = read_frame(c).await {
+            if h.kind == FrameType::RstStream && h.stream_id == sid {
+                return frame::parse_rst_stream(&payload).ok();
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// A handler that reads its whole request body and reports the outcome over a channel:
+/// `Ok(n)` for a clean end after `n` bytes, `Err(())` if the body source surfaced a
+/// `BodyError` (truncation / malformed framing). Lets a test assert the handler sees an
+/// error, never a clean (truncated / over-run) body.
+#[derive(Clone)]
+struct BodyProbe(mpsc::UnboundedSender<Result<usize, ()>>);
+impl Handler for BodyProbe {
+    async fn handle(&self, req: Request) -> Response {
+        use tokio_stream::StreamExt as _;
+        let mut body = req.into_body().into_data_stream();
+        let mut n = 0usize;
+        let report = loop {
+            match body.next().await {
+                Some(Ok(chunk)) => n += chunk.len(),
+                Some(Err(_)) => break Err(()),
+                None => break Ok(n),
+            }
+        };
+        let _ = self.0.send(report);
+        response(200, b"ok".to_vec())
+    }
+}
+
+/// A handler that never reads its request body and never drops it (parks forever) — so the
+/// ONLY thing that can throttle an uploader is the withheld stream WINDOW_UPDATE.
+struct NeverReads;
+impl Handler for NeverReads {
+    async fn handle(&self, _req: Request) -> Response {
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+}
+
+/// A handler that drains its whole request body (consuming every chunk).
+struct DrainAll;
+impl Handler for DrainAll {
+    async fn handle(&self, req: Request) -> Response {
+        let _ = req.into_body().collect().await;
+        response(200, b"ok".to_vec())
+    }
+}
+
+/// Backpressure proof: a handler that never drains its body must NOT get a stream-level
+/// WINDOW_UPDATE. The reader still replenishes the *connection* window eagerly (so a slow
+/// stream never head-of-line blocks its siblings), but the per-stream window stays closed —
+/// so a conforming uploader can send at most one initial window (64 KiB) before it is
+/// throttled at the protocol level, bounding what we buffer. (With the old eager-per-DATA
+/// replenishment the stream window reopened on every frame and nothing throttled the upload.)
+#[tokio::test]
+async fn non_draining_handler_withholds_the_stream_window_update() {
+    let mut c = raw_client(NeverReads);
+    send_preface(&mut c).await;
+    let block = post_block("/sink", None);
+    let mut buf = Vec::new();
+    frame::write_frame(&mut buf, FrameType::Headers, F_END_HEADERS, 1, &block); // no END_STREAM
+    // Three small DATA frames (fit the 4-deep body channel, so the reader does not even
+    // need to park): the handler consumes none of them.
+    for _ in 0..3 {
+        frame::write_frame(&mut buf, FrameType::Data, 0, 1, &[b'z'; 256]);
+    }
+    c.write_all(&buf).await.unwrap();
+
+    let (conn, stream) =
+        count_window_updates(&mut c, 1, std::time::Duration::from_millis(300)).await;
+    assert!(
+        conn >= 1,
+        "the connection window must still be replenished eagerly (got {conn})"
+    );
+    assert_eq!(
+        stream, 0,
+        "a non-draining handler must get NO stream WINDOW_UPDATE — the window stays closed so \
+         the uploader is backpressured (got {stream})"
+    );
+}
+
+/// The complement: a handler that DOES drain its body gets stream-level WINDOW_UPDATE frames —
+/// the window reopens as it consumes, so a legitimate upload is never deadlocked by the gate.
+#[tokio::test]
+async fn draining_handler_reopens_the_stream_window() {
+    let mut c = raw_client(DrainAll);
+    send_preface(&mut c).await;
+    let block = post_block("/drain", None);
+    let mut buf = Vec::new();
+    frame::write_frame(&mut buf, FrameType::Headers, F_END_HEADERS, 1, &block); // no END_STREAM
+    for _ in 0..3 {
+        frame::write_frame(&mut buf, FrameType::Data, 0, 1, &[b'z'; 256]);
+    }
+    c.write_all(&buf).await.unwrap();
+
+    let (_conn, stream) =
+        count_window_updates(&mut c, 1, std::time::Duration::from_millis(300)).await;
+    assert!(
+        stream >= 1,
+        "a draining handler must get stream WINDOW_UPDATE frames as it consumes (consume-driven \
+         replenishment) — else a large upload would deadlock (got {stream})"
+    );
+}
+
+/// Smuggling (a): a stream RST mid-body must surface to the handler as an ERROR, never a
+/// clean (truncated) end that a reverse-proxy handler would forward upstream as complete.
+#[tokio::test]
+async fn reset_midbody_surfaces_an_error_to_the_handler() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut c = raw_client(BodyProbe(tx));
+    send_preface(&mut c).await;
+    let block = post_block("/probe", None);
+    let mut buf = Vec::new();
+    frame::write_frame(&mut buf, FrameType::Headers, F_END_HEADERS, 1, &block); // no END_STREAM
+    frame::write_frame(&mut buf, FrameType::Data, 0, 1, b"partial-body"); // no END_STREAM
+    buf.extend_from_slice(&frame::rst_stream(1, ErrorCode::Cancel));
+    c.write_all(&buf).await.unwrap();
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the handler must observe the body ending")
+        .expect("the probe must report");
+    assert_eq!(
+        report,
+        Err(()),
+        "a mid-body RST must surface as a BodyError, never a clean short read"
+    );
+}
+
+/// Smuggling (b): DATA exceeding the declared `content-length` (§8.1.2.6) must reset the
+/// stream AND surface an error to the handler — never a clean body.
+#[tokio::test]
+async fn data_over_content_length_errors_and_resets() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut c = raw_client(BodyProbe(tx));
+    send_preface(&mut c).await;
+    let block = post_block("/probe", Some(4)); // declares 4 bytes
+    let mut buf = Vec::new();
+    frame::write_frame(&mut buf, FrameType::Headers, F_END_HEADERS, 1, &block); // no END_STREAM
+    frame::write_frame(&mut buf, FrameType::Data, 0, 1, b"six666"); // 6 > 4 — over-run
+    c.write_all(&buf).await.unwrap();
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the handler must observe the body ending")
+        .expect("the probe must report");
+    assert_eq!(
+        report,
+        Err(()),
+        "an over-declared-length body must surface as a BodyError, never a clean body"
+    );
+    let code = wait_for_rst(&mut c, 1, std::time::Duration::from_secs(5)).await;
+    assert_eq!(
+        code,
+        Some(ErrorCode::ProtocolError),
+        "the over-run stream must be RST_STREAM(PROTOCOL_ERROR)"
+    );
+}
+
+/// Smuggling (c): END_STREAM UNDER the declared `content-length` (§8.1.2.6) must reset the
+/// stream AND surface an error to the handler — never a clean (short) body.
+#[tokio::test]
+async fn end_stream_under_content_length_errors_and_resets() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut c = raw_client(BodyProbe(tx));
+    send_preface(&mut c).await;
+    let block = post_block("/probe", Some(10)); // declares 10 bytes
+    let mut buf = Vec::new();
+    frame::write_frame(&mut buf, FrameType::Headers, F_END_HEADERS, 1, &block); // no END_STREAM
+    frame::write_frame(&mut buf, FrameType::Data, F_END_STREAM, 1, b"four"); // 4 < 10 + END_STREAM
+    c.write_all(&buf).await.unwrap();
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the handler must observe the body ending")
+        .expect("the probe must report");
+    assert_eq!(
+        report,
+        Err(()),
+        "an under-declared-length body must surface as a BodyError, never a clean short read"
+    );
+    let code = wait_for_rst(&mut c, 1, std::time::Duration::from_secs(5)).await;
+    assert_eq!(
+        code,
+        Some(ErrorCode::ProtocolError),
+        "the under-run stream must be RST_STREAM(PROTOCOL_ERROR)"
+    );
+}
+
+/// A handler returning a declared-length (`StreamSized`) response whose body deliberately
+/// MISMATCHES the committed `content-length`: it produces `produce` bytes but declares
+/// `declared`.
+struct SizedMismatch {
+    declared: u64,
+    produce: usize,
+}
+impl Handler for SizedMismatch {
+    async fn handle(&self, _req: Request) -> Response {
+        let body = Bytes::from(vec![b'x'; self.produce]);
+        let chunks = tokio_stream::iter(std::iter::once(body));
+        response(
+            200,
+            boatramp_http::h2::Body::stream_sized(self.declared, chunks),
+        )
+    }
+}
+
+/// Defense-in-depth parity (optional): an h2 `StreamSized` response that OVER-runs its
+/// declared content-length must RST the stream, not frame bytes past the committed length.
+/// (The h1 writer force-closes; the client's own §8.1.2.6 check is the backstop.)
+#[tokio::test]
+async fn h2_response_over_declared_length_resets_the_stream() {
+    let mut c = raw_client(SizedMismatch {
+        declared: 4,
+        produce: 9,
+    });
+    send_preface(&mut c).await;
+    let block = post_block("/over", None);
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        FrameType::Headers,
+        F_END_HEADERS | F_END_STREAM,
+        1,
+        &block,
+    );
+    c.write_all(&buf).await.unwrap();
+    let code = wait_for_rst(&mut c, 1, std::time::Duration::from_secs(5)).await;
+    assert_eq!(
+        code,
+        Some(ErrorCode::InternalError),
+        "an over-declared-length response body must RST, never frame bytes past the length"
+    );
+}
+
+/// Parity (optional): an h2 `StreamSized` response that UNDER-runs its declared
+/// content-length must RST the stream, not frame a clean END_STREAM on a short body.
+#[tokio::test]
+async fn h2_response_under_declared_length_resets_the_stream() {
+    let mut c = raw_client(SizedMismatch {
+        declared: 12,
+        produce: 6,
+    });
+    send_preface(&mut c).await;
+    let block = post_block("/under", None);
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        FrameType::Headers,
+        F_END_HEADERS | F_END_STREAM,
+        1,
+        &block,
+    );
+    c.write_all(&buf).await.unwrap();
+    let code = wait_for_rst(&mut c, 1, std::time::Duration::from_secs(5)).await;
+    assert_eq!(
+        code,
+        Some(ErrorCode::InternalError),
+        "an under-declared-length response body must RST, never a clean END_STREAM short body"
+    );
 }

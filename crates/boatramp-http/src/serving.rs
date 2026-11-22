@@ -26,8 +26,9 @@ pub struct ReqBody(ReqBodyInner);
 enum ReqBodyInner {
     /// No body.
     Empty,
-    /// A single already-buffered chunk (an empty `Option` once yielded). Used by the h2
-    /// driver, which accumulates DATA frames before dispatch, and for unit tests.
+    /// A single already-buffered chunk (an empty `Option` once yielded). Used by the
+    /// serial h2 driver, which accumulates DATA frames before dispatch, and for unit tests.
+    /// (The concurrent h2 mux driver and the h1 loop both stream the body via `Stream`.)
     Full(Option<Bytes>),
     /// A pull stream of body chunks (the h1 loop feeds this from the connection).
     Stream(Pin<Box<dyn Stream<Item = Result<Bytes, BodyError>> + Send>>),
@@ -162,6 +163,19 @@ pub type BodyChunk = Result<Bytes, BodyError>;
 pub enum Body {
     Bytes(Vec<u8>),
     Stream(std::pin::Pin<Box<dyn tokio_stream::Stream<Item = BodyChunk> + Send>>),
+    /// A streamed body **with a declared length**: the chunks stream like [`Stream`], but
+    /// the codec frames it with a known `Content-Length` (h1: a fixed-length body, not
+    /// chunked; h2: a `content-length` response header) instead of chunked / open framing —
+    /// so a proxied known-length download keeps its length (clients get a progress bar and
+    /// range support). The producer is expected to yield exactly `len` bytes; the h1 writer
+    /// is **defensive** — a body that over- or under-runs `len` force-closes the connection
+    /// rather than desyncing it (the declared `Content-Length` is already committed on the
+    /// wire, so framing can no longer be corrected). A mid-stream [`BodyError`] aborts the
+    /// body, exactly like [`Body::Stream`].
+    StreamSized {
+        stream: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = BodyChunk> + Send>>,
+        len: u64,
+    },
     /// A `[offset, offset+len)` region of an open local file, for the zero-copy
     /// `sendfile` static path. Over a plaintext socket the h1 codec moves the bytes
     /// kernel-to-kernel (no userspace copy — what nginx/caddy do); any other
@@ -196,15 +210,43 @@ impl Body {
         Self::Stream(Box::pin(chunks))
     }
 
+    /// A streamed body carrying a declared `Content-Length` (see [`Body::StreamSized`]),
+    /// from an **infallible** stream. The stream MUST yield exactly `len` bytes in total.
+    pub fn stream_sized(
+        len: u64,
+        chunks: impl tokio_stream::Stream<Item = Bytes> + Send + 'static,
+    ) -> Self {
+        Self::StreamSized {
+            stream: Box::pin(chunks.map(Ok)),
+            len,
+        }
+    }
+
+    /// A streamed body carrying a declared `Content-Length` from a **fallible** stream — a
+    /// reverse-proxy bridge preserving an upstream's known length. A [`BodyError`] item
+    /// aborts the body (see [`BodyError`]). The stream is expected to yield exactly `len`
+    /// bytes; a mismatch force-closes the h1 connection rather than desyncing it.
+    pub fn try_stream_sized(
+        len: u64,
+        chunks: impl tokio_stream::Stream<Item = BodyChunk> + Send + 'static,
+    ) -> Self {
+        Self::StreamSized {
+            stream: Box::pin(chunks),
+            len,
+        }
+    }
+
     /// The body length if known ahead of time. A [`Body::Stream`] has no known length
     /// (`0`) — it is delimited by end-of-stream, so callers must use [`is_empty`]
-    /// rather than `len() == 0` to decide whether a body is present.
+    /// rather than `len() == 0` to decide whether a body is present. A
+    /// [`Body::StreamSized`] reports its declared length even though it streams.
     ///
     /// [`is_empty`]: Body::is_empty
     pub fn len(&self) -> usize {
         match self {
             Self::Bytes(b) => b.len(),
             Self::Stream(_) => 0,
+            Self::StreamSized { len, .. } => *len as usize,
             Self::File { len, .. } => *len as usize,
         }
     }
@@ -212,6 +254,7 @@ impl Body {
         match self {
             Self::Bytes(b) => b.is_empty(),
             Self::Stream(_) => false,
+            Self::StreamSized { len, .. } => *len == 0,
             Self::File { len, .. } => *len == 0,
         }
     }

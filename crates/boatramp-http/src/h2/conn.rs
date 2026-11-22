@@ -607,7 +607,9 @@ where
     // The serial driver can't interleave a streamed body, so drain it to bytes here
     // (the mux driver streams it natively). Done before content-length is derived.
     let body = match body {
-        http::Body::Stream(mut stream) => {
+        // The serial driver can't interleave, so drain any streamed body (sized or not) to
+        // bytes here; the resulting length becomes the content-length below.
+        http::Body::Stream(mut stream) | http::Body::StreamSized { mut stream, .. } => {
             let mut buf = Vec::new();
             while let Some(item) = stream.next().await {
                 match item {
@@ -712,10 +714,10 @@ where
                     .await
                     .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
             }
-            // `respond` drains a streamed body to `Bytes` — and materializes a file body
-            // to `Bytes` — before either is ever queued, so the serial driver never
-            // flushes a `Stream` or a `File`.
-            http::Body::Stream(_) => {
+            // `respond` drains a streamed body (sized or not) to `Bytes` — and materializes
+            // a file body to `Bytes` — before either is ever queued, so the serial driver
+            // never flushes a `Stream`, `StreamSized`, or `File`.
+            http::Body::Stream(_) | http::Body::StreamSized { .. } => {
                 unreachable!("serial driver buffers stream bodies in respond")
             }
             http::Body::File { .. } => {

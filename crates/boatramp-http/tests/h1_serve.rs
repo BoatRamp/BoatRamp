@@ -32,6 +32,36 @@ impl Handler for App {
                 let chunks = tokio_stream::iter((0..3u8).map(|i| Bytes::from(vec![b'a' + i; 4])));
                 response(200, Body::stream(chunks))
             }
+            // A declared-length streaming body (12 bytes across three 4-byte chunks) →
+            // Content-Length framing, not chunked.
+            ("GET", "/stream-sized") => {
+                let chunks = tokio_stream::iter((0..3u8).map(|i| Bytes::from(vec![b'a' + i; 4])));
+                response(200, Body::stream_sized(12, chunks))
+            }
+            // Declares 12 bytes but the stream yields only 8 — the writer must truncate at
+            // the committed length and force-close (never pad, never desync).
+            ("GET", "/stream-sized-short") => {
+                let chunks = tokio_stream::iter((0..2u8).map(|i| Bytes::from(vec![b'a' + i; 4])));
+                response(200, Body::stream_sized(12, chunks))
+            }
+            // Declares 12 bytes but the stream yields 16 — the writer must write exactly 12
+            // and force-close (the excess would be read as the next response).
+            ("GET", "/stream-sized-long") => {
+                let chunks = tokio_stream::iter((0..4u8).map(|i| Bytes::from(vec![b'a' + i; 4])));
+                response(200, Body::stream_sized(12, chunks))
+            }
+            // Reject WITHOUT reading the body, closing the connection (an early 413 shape).
+            ("POST", "/reject") => {
+                let mut r = response(413, b"too large".to_vec());
+                r.headers_mut().insert(
+                    http::header::CONNECTION,
+                    http::HeaderValue::from_static("close"),
+                );
+                r
+            }
+            // Answer 200 keep-alive WITHOUT reading the body (the body must still be drained
+            // so a pipelined next request stays framed).
+            ("POST", "/ignore") => response(200, b"ok".to_vec()),
             ("GET", "/stream-err") => {
                 // One good chunk, then a mid-stream source failure.
                 let chunks = tokio_stream::iter(vec![
@@ -146,6 +176,90 @@ async fn streamed_response_is_chunked_on_the_wire() {
 }
 
 #[tokio::test]
+async fn declared_length_stream_is_content_length_framed() {
+    // U29: a streaming body WITH a declared length is Content-Length-framed (not chunked),
+    // so a proxied known-length download keeps its length. (The plain streaming case staying
+    // chunked is covered by `streamed_response_is_chunked_on_the_wire`.)
+    let r = roundtrip_close(b"GET /stream-sized HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await;
+    let text = lower(&r);
+    assert!(text.contains("content-length: 12\r\n"), "{text}");
+    assert!(
+        !text.contains("transfer-encoding"),
+        "a declared-length stream must NOT be chunked: {text}"
+    );
+    // The body is the 12 raw bytes — no chunk-size lines.
+    let body_start = r.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    assert_eq!(&r[body_start..], b"aaaabbbbcccc", "raw (unchunked) body");
+}
+
+#[tokio::test]
+async fn declared_length_underrun_force_closes_even_on_keep_alive() {
+    // U29 safety: a declared-length body that under-runs its Content-Length must force-close
+    // the connection (the length is already committed on the wire and can't be fulfilled) —
+    // never pad it, and never let the next pipelined request desync. A keep-alive request
+    // (no `Connection: close`) is used so the force-close is the ONLY thing that can prevent
+    // the pipelined second request from being answered.
+    let mut c = spawn();
+    c.write_all(
+        b"GET /stream-sized-short HTTP/1.1\r\nHost: x\r\n\r\n\
+          GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).await.unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(
+        text.matches("HTTP/1.1 200 OK").count(),
+        1,
+        "the under-running body must force-close, not serve the pipelined request: {text}"
+    );
+    assert!(lower(&out).contains("content-length: 12\r\n"), "{text}");
+    // Only the 8 bytes the source produced are on the wire — truncated, not padded.
+    let body_start = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    assert_eq!(
+        &out[body_start..],
+        b"aaaabbbb",
+        "truncated body, not padded"
+    );
+}
+
+#[tokio::test]
+async fn declared_length_overrun_writes_exactly_len_and_force_closes_even_on_keep_alive() {
+    // U29 safety (the over-run counterpart to the under-run test above): a declared-length
+    // body that OVER-runs its Content-Length must write exactly `len` bytes and then
+    // force-close — the committed length is already on the wire, so the excess bytes would be
+    // read by the client as the start of the next response (a response-smuggling desync). A
+    // keep-alive request (no `Connection: close`) is used so the force-close is the ONLY thing
+    // that can stop the pipelined second request from being answered.
+    let mut c = spawn();
+    c.write_all(
+        b"GET /stream-sized-long HTTP/1.1\r\nHost: x\r\n\r\n\
+          GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).await.unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(
+        text.matches("HTTP/1.1 200 OK").count(),
+        1,
+        "the over-running body must force-close, not serve the pipelined request: {text}"
+    );
+    assert!(lower(&out).contains("content-length: 12\r\n"), "{text}");
+    // Exactly the committed 12 bytes are on the wire — the 13th..16th bytes are truncated,
+    // never written, so they can't be read as the next response.
+    let body_start = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    assert_eq!(
+        &out[body_start..],
+        b"aaaabbbbcccc",
+        "exactly `len` (12) bytes, the over-run excess dropped"
+    );
+}
+
+#[tokio::test]
 async fn streamed_body_error_truncates_without_a_clean_terminator() {
     // A source that fails mid-stream must NOT emit the terminating 0-chunk — the client
     // sees an incomplete chunked body (an error), never a clean end (silent truncation).
@@ -222,6 +336,56 @@ fn decode_chunked(mut buf: &[u8]) -> Vec<u8> {
         buf = &buf[size + 2..]; // skip data + CRLF
     }
     out
+}
+
+#[tokio::test]
+async fn closing_response_does_not_drain_the_abandoned_request_body() {
+    use tokio::time::{Duration, timeout};
+    // Declare a large body but send only a little of it, then stop. The handler answers
+    // 413 + Connection: close WITHOUT reading the body. The server must write the response
+    // and close PROMPTLY — it must NOT sit reading the ~1 MB we never send (U28). A drain
+    // would block on the stalled body until the 30 s read timeout, past this 3 s bound.
+    let mut c = spawn();
+    c.write_all(b"POST /reject HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\n\r\npartial")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    timeout(Duration::from_secs(3), c.read_to_end(&mut out))
+        .await
+        .expect("server drained the abandoned body instead of closing after the 413")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out).starts_with("HTTP/1.1 413"),
+        "{:?}",
+        lower(&out)
+    );
+}
+
+#[tokio::test]
+async fn keepalive_response_still_consumes_an_unread_body() {
+    // The flip side of U28: on a keep-alive response the body MUST still be consumed in
+    // full, so a pipelined next request is framed from the right offset. The first POST's
+    // handler ignores the body (no read), yet the body must be drained so the pipelined
+    // GET is parsed correctly rather than from the body bytes.
+    let mut c = spawn();
+    c.write_all(
+        b"POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello\
+          GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).await.unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(
+        text.matches("HTTP/1.1 200 OK").count(),
+        2,
+        "both the /ignore response and the pipelined GET must be answered: {text}"
+    );
+    assert!(
+        text.ends_with("hello"),
+        "the pipelined GET must be framed after the drained body: {text}"
+    );
 }
 
 #[tokio::test]
