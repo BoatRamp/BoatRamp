@@ -393,6 +393,229 @@ async fn redirect_and_custom_404() {
     assert_eq!(body, b"<h1>nope</h1>"); // custom error document
 }
 
+/// Seed a second site, "based", whose deploy is mounted at a `base_path` sub-path
+/// (`/myapp`) — for the opt-in sub-path-mount serving tests. Same shape as [`seed`];
+/// a distinct site name so one `DeployStore` carries both the default and based sites.
+async fn seed_based(deploy: &DeployStore) {
+    let put = |bytes: &'static [u8]| {
+        let deploy = deploy.clone();
+        async move {
+            let hash = sha256_hex(bytes);
+            let stream: ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            deploy.put_blob(&hash, stream).await.unwrap();
+            hash
+        }
+    };
+    let (_h, index_entry) = file(b"<h1>mounted-home</h1>", Some("text/html"));
+    let (_h, about_entry) = file(b"<h1>mounted-about</h1>", Some("text/html"));
+    let (_h, nf_entry) = file(b"<h1>mounted-404</h1>", Some("text/html"));
+    put(b"<h1>mounted-home</h1>").await;
+    put(b"<h1>mounted-about</h1>").await;
+    put(b"<h1>mounted-404</h1>").await;
+
+    let mut files = BTreeMap::new();
+    files.insert("index.html".to_string(), index_entry);
+    files.insert("about.html".to_string(), about_entry);
+    files.insert("404.html".to_string(), nf_entry);
+
+    let config = DeployConfig {
+        base_path: "/myapp".to_string(),
+        clean_urls: true,
+        error_documents: BTreeMap::from([(404, "/404.html".to_string())]),
+        redirects: vec![Redirect {
+            from: "/old".to_string(),
+            to: "/new".to_string(),
+            status: 301,
+            when: None,
+        }],
+        ..DeployConfig::default()
+    };
+    let manifest = Manifest {
+        files,
+        config,
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "based", &id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn base_path_mount_strips_and_serves_at_the_mount() {
+    let deploy = seed().await;
+    seed_based(&deploy).await;
+
+    // Under the mount, the base is stripped so the app's root index serves — proving
+    // the app sees a root-relative path, not the external `/myapp/...`.
+    let (status, _, body) = send(&deploy, get("/_sites/based/myapp/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>mounted-home</h1>");
+    // The bare mount (no trailing slash) also reaches the app root.
+    let (status, _, body) = send(&deploy, get("/_sites/based/myapp")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>mounted-home</h1>");
+    // A clean URL resolves against the STRIPPED path: /myapp/about -> app `/about` -> about.html.
+    let (status, _, body) = send(&deploy, get("/_sites/based/myapp/about")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>mounted-about</h1>");
+}
+
+#[tokio::test]
+async fn base_path_mount_re_adds_base_to_server_redirects() {
+    let deploy = seed().await;
+    seed_based(&deploy).await;
+    // A declared redirect matches the STRIPPED path (`/old`) — proving the strip — and
+    // its `Location` is re-rooted behind the mount (`/myapp/new`) — proving the re-add,
+    // so an app-internal link resolves correctly behind the mount.
+    let (status, headers, _) = send(&deploy, get("/_sites/based/myapp/old")).await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(headers[header::LOCATION], "/myapp/new");
+}
+
+#[tokio::test]
+async fn base_path_mount_rejects_prefix_confusion_and_traversal() {
+    let deploy = seed().await;
+    seed_based(&deploy).await;
+
+    // Nothing is served at the mount root or outside the mount (fail-closed).
+    let (status, _, _) = send(&deploy, get("/_sites/based/")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A prefix-only sibling must NOT be served as if it were `/` under the mount.
+    let (status, _, _) = send(&deploy, get("/_sites/based/myappX")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = send(&deploy, get("/_sites/based/myapp-evil/foo")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A `..`-traversal that climbs OUT of the mount collapses first, then 404s — it can
+    // never reach a path outside the mount…
+    let (status, _, _) = send(&deploy, get("/_sites/based/myapp/../secret")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // …while a `..` that stays WITHIN the mount still resolves (so the 404 above is the
+    // mount boundary being enforced, not dot-segments being blanket-rejected).
+    let (status, _, body) = send(&deploy, get("/_sites/based/myapp/sub/../about")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>mounted-about</h1>");
+}
+
+#[tokio::test]
+async fn base_path_mount_serves_custom_404_under_the_mount() {
+    let deploy = seed().await;
+    seed_based(&deploy).await;
+    // A miss *under* the mount serves the app's own (app-relative) custom 404 document.
+    let (status, _, body) = send(&deploy, get("/_sites/based/myapp/no-such-page")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"<h1>mounted-404</h1>");
+}
+
+#[tokio::test]
+async fn base_path_default_serving_is_byte_for_byte_unchanged() {
+    // With no base_path configured, serving is identical to before: the redirect
+    // `Location` is NOT prefixed, and a path is served verbatim (identity strip).
+    let deploy = seed().await;
+    let (status, headers, _) = send(&deploy, get("/_sites/test/old")).await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(headers[header::LOCATION], "/new"); // not re-rooted
+    let (status, _, body) = send(&deploy, get("/_sites/test/about")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>about</h1>");
+}
+
+/// Cross-tier routing-integrity (Security review MEDIUM): a tenant `base_path` must not shift the
+/// frame the OPERATOR gateway tier is judged in. The operator owns `/ops/**` in the root URL space;
+/// the tenant mounts its app at `base_path: "/ops"` with its OWN content at the app root (`/x`).
+/// External `/ops/x` must reach the OPERATOR upstream (its route is judged on the FULL external path),
+/// never the tenant's content — which a stripped-frame (`/x`) evaluation would wrongly serve. This is
+/// exactly the shadow the fix closes: without it, the operator route `/ops/**` is matched against the
+/// stripped `/x`, misses, and the tenant's `/x` captures `/ops/x`.
+#[tokio::test]
+async fn base_path_mount_cannot_shadow_an_operator_gateway_route() {
+    let port = spawn_mock_upstream().await;
+    let deploy = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+
+    // Tenant deploy: mounted at /ops, serving a static file at the APP root `/x`.
+    let put = |bytes: &'static [u8]| {
+        let deploy = deploy.clone();
+        async move {
+            let hash = sha256_hex(bytes);
+            let stream: ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            deploy.put_blob(&hash, stream).await.unwrap();
+            hash
+        }
+    };
+    let (_h, x_entry) = file(b"TENANT-X", Some("text/plain"));
+    put(b"TENANT-X").await;
+    let mut files = BTreeMap::new();
+    files.insert("x.html".to_string(), x_entry);
+    let config = DeployConfig {
+        base_path: "/ops".to_string(),
+        clean_urls: true,
+        ..DeployConfig::default()
+    };
+    let manifest = Manifest {
+        files,
+        config,
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "xt", &id)
+        .await
+        .unwrap();
+
+    // Operator (site) gateway: owns `/ops/**` in the ROOT URL space.
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "xt",
+            &SiteConfig {
+                domains: DomainConfig {
+                    primary: Some("xt.local".into()),
+                    ..Default::default()
+                },
+                gateway: Some(GatewayConfig {
+                    reserved_paths: vec!["/ops/**".into()],
+                    upstreams: BTreeMap::from([(
+                        "ops".to_string(),
+                        Upstream {
+                            target: format!("http://127.0.0.1:{port}"),
+                            ..Default::default()
+                        },
+                    )]),
+                    routes: vec![GatewayRoute {
+                        matches: "/ops/**".into(),
+                        upstream: "ops".into(),
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // External /ops/x → the OPERATOR upstream, which forwarded the FULL external path (`/ops/x`) —
+    // proving the operator tier was judged in the full frame. Without the fix, the tenant static
+    // `TENANT-X` (the app's `/x`, via the stripped frame) would serve instead.
+    let mut req = get("/ops/x");
+    req.headers_mut()
+        .insert(header::HOST, "xt.local".parse().unwrap());
+    let (status, headers, body) = send_gw(&deploy, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers["x-upstream"], "mock",
+        "the OPERATOR upstream must serve it, not the tenant's content"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        "UP:/ops/x",
+        "the operator tier forwarded the full external path"
+    );
+}
+
 #[tokio::test]
 async fn conditional_304() {
     let deploy = seed().await;

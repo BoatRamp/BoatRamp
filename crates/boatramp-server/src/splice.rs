@@ -430,6 +430,12 @@ async fn classify_site(
         .current_manifest(project_ref, &site)
         .await
         .ok()??;
+    // An opt-in `base_path` sub-path mount rewrites the request path before routing
+    // and re-roots redirect Locations — the splice forwarder does neither, so a based
+    // deploy falls back to the full `serve_resolved` pipeline (which handles the mount).
+    if !manifest.config.base_path.is_empty() {
+        return None;
+    }
     let ctx_default = boatramp_core::predicate::RequestContext::default();
     let resolved = route::resolve_ctx(&manifest.config, &manifest.files, path, &ctx_default);
     match resolved.outcome {

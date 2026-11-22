@@ -37,6 +37,7 @@ project.cfg: routing OK (2 redirects, 1 handler)
 | `crons` | list\<CronConfig\> | `[]` | Scheduled handler invocations. |
 | `streams` | list\<StreamConfig\> | `[]` | Host-level SSE / WebSocket endpoints fanning out topics. |
 | `sessions` | list\<SessionConfig\> | `[]` | Duplex, resumable session routes served by a guest `session-handler` — see [`sessions`](#sessions). |
+| `base_path` | string | `""` | Opt-in sub-path mount — serve the deploy under `/myapp` instead of at the site root. See [below](#base_path). |
 
 Pattern fields (`from`, `matches`, handler `route`) use the
 [path matcher](#patterns) syntax and are compiled at `validate`/`sync`, so a bad
@@ -188,6 +189,65 @@ proxying to any *public* host is allowed; private, loopback, and link-local
 addresses are always blocked as an SSRF guard, regardless of this list. To proxy
 to a private address, declare a [gateway upstream](./siteconfig.md#gateway)
 instead.
+
+## `base_path`
+
+An **opt-in sub-path mount**. By default a deploy is served at the site **root**
+(`/`). Set `base_path` to serve it under a sub-path instead:
+
+```ron
+(
+    base_path: "/myapp",
+)
+```
+
+With this set, a request to `https://site.example.com/myapp/foo` is routed to the
+app as `/foo` — the base is **stripped before** any redirect, rewrite, handler, or
+static lookup sees it — and the base is **re-added** to the `Location` of every
+server-generated redirect (trailing-slash normalization and `redirects` rules), so
+an app-internal link resolves correctly behind the mount. A request that is **not**
+under the mount — an unrelated path, the prefix-only `/myappX`, or a `..`-traversal
+that climbs out — is **not served** (`404`, fail-closed). The mount is applied
+identically on the Cloudflare edge path, so behavior is the same on every topology.
+
+> **This is for a site _built with a matching_ base path** — a framework's
+> `base` / `basePath` build option (Vite `base`, Next.js `basePath`, SvelteKit
+> `paths.base`, …) so the app's **own** asset and link references already carry the
+> `/myapp` prefix. It is **not** a rescue for hand-authored absolute URLs
+> (`<img src="/logo.png">`), `fetch('/api')`, CSS `url(/…)`, or service-worker
+> scope — the server cannot rewrite those. If your site was not built for a
+> sub-path, serve it at the root via [host routing](../explanation/addressing.md)
+> instead.
+
+Validation (`boatramp validate`) rejects a malformed mount at deploy time: it must
+be a clean absolute sub-path (`/myapp`, `/team/app`), not the bare root `/`, and it
+may not contain `//`, a `.`/`..` segment, a glob (`*`), a query/fragment, or
+whitespace. See [How a request reaches your site](../explanation/addressing.md) for
+how `base_path` fits alongside the other addressing modes.
+
+### Whole-site remount and operator routes
+
+`base_path` remounts the **entire** site under the prefix: the deploy answers only
+paths under the mount, and **every external path outside the mount returns `404`**
+(fail-closed — nothing of the site is served at the root any more).
+
+This interacts with an operator's [per-site gateway](./siteconfig.md#gateway)
+overlay (`routes` / `reserved_paths`):
+
+- An operator route (or reserved path) that **overlaps** the mount still **wins** —
+  it is judged against the **full external path**, so a tenant `base_path` can never
+  shadow or capture it. For `base_path: "/ops"`, an operator route `/ops/**` is
+  served by the operator upstream, not the tenant.
+- An operator route whose path falls **outside** the tenant's mount returns `404` on
+  that based deploy — fail-closed: the tenant can neither capture it nor reach
+  operator content; the route is simply **unreachable on that one deploy** (a direct
+  consequence of the whole-site remount, not a bug).
+
+So an operator path that must stay reachable **regardless** of a tenant's mount
+belongs at the node-global router layer — the paths matched before per-site routing
+(`/api/*`, `/healthz`, `/readyz`, `/mcp`, `/.well-known/*`) — not as a per-site
+gateway overlay. The per-site overlay is a routing convenience, not the place for
+mandatory operator enforcement.
 
 ## `handlers`
 
