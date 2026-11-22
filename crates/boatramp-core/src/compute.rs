@@ -11103,6 +11103,106 @@ mod priority_tests {
         }
     }
 
+    /// The anti-thrash cooldown's *held* branch inside [`reconcile_plan`]: a replica persisted
+    /// in the durable [`Readiness::Preempted`] drain marker is treated like a `starting` replica
+    /// while `now - since < `[`PREEMPTION_COOLDOWN_SECS`] (= 60s) — added to `starting`, excluded
+    /// from `need`, so it is NOT relaunched into the slot it was evicted from (the oscillation
+    /// guard at `reconcile_plan_in`'s `now.saturating_sub(since) < PREEMPTION_COOLDOWN_SECS`).
+    /// Once the stamp ages past the cooldown the ordinal RE-ENTERS `need` and is retried with a
+    /// fresh `Launch`, exactly like a `LaunchFailed` marker. The convergence test above only
+    /// exercises the EXPIRED side (an aged stamp through `plan_preemptions`); this drives the
+    /// WITHIN-60s held branch through the real `reconcile_plan`, then the release past 60s.
+    #[test]
+    fn cooldown_holds_a_just_preempted_replica_then_releases_after_60s() {
+        let nodes = vec![node_with(1, "r", 8, 8000, &["container"])];
+        let spec = sp(8, 8000);
+        let victim = wl("v", 1, pri(None, 0, None));
+        let policy = BackendPolicy::default();
+        let caps = caps();
+        let force = BTreeSet::new();
+        let now = 1_000u64;
+
+        // One in-range replica (ordinal 0) persisted in the durable PREEMPTED (drain) marker —
+        // built exactly like the convergence test's `vobs_after`; only the `since` stamp differs
+        // between the two passes below.
+        let preempted = |since: u64| {
+            vec![ObservedInstance {
+                healthy: false,
+                readiness: Readiness::Preempted {
+                    by: "projA/p (system, tier 100)".into(),
+                    preemptor_project: "projA".into(),
+                    since,
+                },
+                ..running("projB", "v", 0, 1, "container")
+            }]
+        };
+
+        // --- Within the 60s cooldown (evicted 20s ago): HELD, not relaunched. ---
+        let held_obs = preempted(now - 20); // now - since = 20 < 60
+        let held = reconcile_plan(
+            &victim,
+            &spec,
+            &nodes,
+            &policy,
+            &held_obs,
+            WorkloadActivity::Active,
+            &caps,
+            now,
+            &force,
+        );
+        assert!(
+            !held
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Launch { replica, .. } if *replica == 0)),
+            "within cooldown: ordinal 0 must NOT be relaunched into its evicted slot: {:?}",
+            held.actions
+        );
+        assert!(
+            held.actions.is_empty(),
+            "within cooldown: a held replica yields NO actions (no Stop, no Launch): {:?}",
+            held.actions
+        );
+        assert!(
+            held.unscheduled.is_empty(),
+            "within cooldown: a held replica is not a capacity shortfall: {:?}",
+            held.unscheduled
+        );
+
+        // --- Past the 60s cooldown (evicted 120s ago): RELEASED, retried with a Launch. ---
+        let expired_obs = preempted(now - 120); // now - since = 120 >= 60
+        let expired = reconcile_plan(
+            &victim,
+            &spec,
+            &nodes,
+            &policy,
+            &expired_obs,
+            WorkloadActivity::Active,
+            &caps,
+            now,
+            &force,
+        );
+        let launches: Vec<&Action> = expired
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Launch { replica, .. } if *replica == 0))
+            .collect();
+        assert_eq!(
+            launches.len(),
+            1,
+            "past cooldown: ordinal 0 re-enters `need` and is retried with exactly one Launch: {:?}",
+            expired.actions
+        );
+        assert!(
+            !expired
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Stop { .. })),
+            "past cooldown: the stale marker is retried (Launch), never Stopped: {:?}",
+            expired.actions
+        );
+    }
+
     #[test]
     fn mutation_guard_strict_improvement_prevents_flapping() {
         let cat = PriorityClassCatalog::builtin();
