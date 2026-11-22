@@ -1131,17 +1131,25 @@ async fn serve_resolved(
 ) -> Response {
     // Opt-in sub-path mount (`[routing] base_path`): strip the configured base so
     // every app-internal routing decision below — redirects, rewrites, handlers,
-    // gateway, streams/sessions, static lookup, and header-rule matching — sees a
-    // root-relative path (the app behind `/myapp` is authored for `/`). A request
-    // that is **not** under the mount (an unrelated path, the prefix-only `/myappX`,
-    // or a `..`-traversal that climbs out) is refused here — `404`, fail-closed —
-    // before any content is touched. The base is re-added to server-generated
-    // redirect `Location`s in the match below so app-internal links resolve behind
-    // the mount. This is upstream of the pure `route::resolve` core, so the
-    // Cloudflare edge mirrors it exactly (it strips/re-adds with the same helpers).
-    // An **identity no-op** when no `base_path` is set, so the default serving path
-    // is byte-for-byte unchanged.
+    // the PROJECT gateway tier, streams/sessions, static lookup, and header-rule
+    // matching — sees a root-relative path (the app behind `/myapp` is authored for
+    // `/`). A request that is **not** under the mount (an unrelated path, the
+    // prefix-only `/myappX`, or a `..`-traversal that climbs out) is refused here —
+    // `404`, fail-closed — before any content is touched. The base is re-added to
+    // server-generated redirect `Location`s in the match below so app-internal links
+    // resolve behind the mount. This is upstream of the pure `route::resolve` core,
+    // so the Cloudflare edge mirrors it exactly (it strips/re-adds with the same
+    // helpers). An **identity no-op** when no `base_path` is set, so the default
+    // serving path is byte-for-byte unchanged.
+    //
+    // `external_path` keeps the FULL pre-strip path: `base_path` is a tenant-controlled
+    // DeployConfig input, so the OPERATOR gateway tier (`site.routes` + `reserved_paths`,
+    // the higher tier) must be judged in the real root URL space it owns — otherwise a
+    // tenant could set `base_path: "/ops"` to strip an operator-reserved `/ops/**` down to
+    // `/x` and shadow it. Only the project tier + app-internal dispatch use the stripped
+    // path. (Cross-tier routing-integrity fix.)
     let base_path = manifest.config.base_path.as_str();
+    let external_path = request_path;
     let stripped_path: String;
     let request_path: &str = if base_path.is_empty() {
         request_path
@@ -1371,7 +1379,14 @@ async fn serve_resolved(
         if project_gw.is_enabled()
             || site_gw.is_some_and(boatramp_core::gateway::GatewayConfig::is_enabled)
         {
-            match boatramp_core::gateway::resolve_gateway(Some(project_gw), site_gw, request_path) {
+            // Operator tier judged in the full external frame (`external_path`); project tier in the
+            // base-stripped app frame (`request_path`). Equal when no base_path is set.
+            match boatramp_core::gateway::resolve_gateway(
+                Some(project_gw),
+                site_gw,
+                external_path,
+                request_path,
+            ) {
                 // No gateway route matched — fall through to the rest of the pipeline.
                 GatewayResolution::NoMatch => {}
                 // A route matched but its upstream didn't resolve (unknown name, or an ungranted
@@ -1461,6 +1476,16 @@ async fn serve_resolved(
                         }
                         None => (None, None),
                     };
+                    // Forward the path in the matched tier's frame: a genuine operator route
+                    // (`Operator` and not `via_reference`) owns the full external path and its
+                    // `forward_path`/strip-prefix is written against it; a project route — direct or a
+                    // `shared` reference (`via_reference`) — is authored in the base-stripped app frame.
+                    // Identical when no base_path is set.
+                    let dispatch_path = if m.tier == GatewayTier::Operator && !m.via_reference {
+                        external_path
+                    } else {
+                        request_path
+                    };
                     return apply_vary(
                         dispatch_gateway(
                             request,
@@ -1469,7 +1494,7 @@ async fn serve_resolved(
                             m.upstream_name,
                             upstream,
                             policy,
-                            request_path,
+                            dispatch_path,
                             client_ip,
                             compute_backends,
                             compute_regions,

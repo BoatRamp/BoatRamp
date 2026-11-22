@@ -205,27 +205,38 @@ pub enum GatewayResolution<'a> {
     Matched(GatewayMatch<'a>),
 }
 
-/// Resolve `path` against the merged project+site gateway with **operator precedence** (RESTRICTION
-/// 2), the **reserved-path hijack guard** (RESTRICTION 2), and **reference opacity** (RESTRICTION 3).
+/// Resolve a request against the merged project+site gateway with **operator precedence**
+/// (RESTRICTION 2), the **reserved-path hijack guard** (RESTRICTION 2), and **reference opacity**
+/// (RESTRICTION 3).
+///
+/// Two path frames are threaded in so a tenant-controlled `base_path` sub-path mount can never shift
+/// the frame the operator tier is judged in (the cross-tier routing-integrity fix): `operator_path`
+/// is the **full external** request path the operator's routes/reserved-paths own (the root URL
+/// space), and `project_path` is the **base-stripped** app-relative path the project/app-author tier
+/// and the rest of the pipeline serve. Without a mount the caller passes the same value for both, so
+/// behavior is byte-for-byte unchanged.
 ///
 /// Order:
-/// 1. **Operator routes first.** A matching `site` route wins (operator may serve any path, incl. a
-///    reserved one — the operator owns it). Its upstream resolves against `site.upstreams`.
-/// 2. **Reserved paths bar the project tier.** If no operator route matched and `path` falls under any
-///    `site.reserved_paths` glob, the project tier may not serve it → `NoMatch` (falls through to
-///    normal serving; a tenant route can never capture a reserved path).
-/// 3. **Project routes.** The first matching `project` route resolves its upstream name in the merged
-///    namespace: a `project`-declared upstream (→ [`GatewayTier::Project`]) first, else a `shared`
-///    `site` upstream (→ a reference: [`GatewayTier::Operator`], `via_reference = true`, the site
-///    struct returned opaquely). A name that is neither ⇒ `UnknownUpstream` (deny-by-default).
+/// 1. **Operator routes first.** A matching `site` route (against `operator_path`) wins — the
+///    operator may serve any path, incl. a reserved one, because the operator owns the root space and
+///    a tenant mount cannot shadow it. Its upstream resolves against `site.upstreams`.
+/// 2. **Reserved paths bar the project tier.** If no operator route matched and `operator_path` falls
+///    under any `site.reserved_paths` glob, the project tier may not serve it → `NoMatch` (falls
+///    through to normal serving; a tenant route can never capture a reserved path, mount or not).
+/// 3. **Project routes.** The first matching `project` route (against `project_path`) resolves its
+///    upstream name in the merged namespace: a `project`-declared upstream (→ [`GatewayTier::Project`])
+///    first, else a `shared` `site` upstream (→ a reference: [`GatewayTier::Operator`],
+///    `via_reference = true`, the site struct returned opaquely). A name that is neither ⇒
+///    `UnknownUpstream` (deny-by-default).
 pub fn resolve_gateway<'a>(
     project: Option<&'a GatewayConfig>,
     site: Option<&'a GatewayConfig>,
-    path: &str,
+    operator_path: &str,
+    project_path: &str,
 ) -> GatewayResolution<'a> {
-    // 1. Operator routes take precedence.
+    // 1. Operator routes take precedence — matched in the FULL external frame the operator owns.
     if let Some(site) = site
-        && let Some(route) = site.match_route(path)
+        && let Some(route) = site.match_route(operator_path)
     {
         return match site.upstreams.get(&route.upstream) {
             Some(up) => GatewayResolution::Matched(GatewayMatch {
@@ -245,10 +256,11 @@ pub fn resolve_gateway<'a>(
         return GatewayResolution::NoMatch;
     };
 
-    // 2. A reserved path is never served by a project route (operator territory) — structural, so a
-    //    bypassed declare-time check still cannot let a tenant capture it. MUTATION SEAM
-    //    (`skip_reserved`): neuter this guard ⇒ a project route captures a reserved path ⇒ the CI
-    //    gate's "reserved path not captured" assertion goes RED.
+    // 2. A reserved path is never served by a project route (operator territory) — checked in the
+    //    FULL external frame, so a tenant `base_path` mount can't strip a reserved path out from
+    //    under the guard. Structural, so a bypassed declare-time check still cannot let a tenant
+    //    capture it. MUTATION SEAM (`skip_reserved`): neuter this guard ⇒ a project route captures a
+    //    reserved path ⇒ the CI gate's "reserved path not captured" assertion goes RED.
     if gateway_mutation().as_deref() != Some("skip_reserved")
         && let Some(site) = site
         && site.reserved_paths.iter().any(|r| {
@@ -258,15 +270,15 @@ pub fn resolve_gateway<'a>(
             // by NOT routing — the safe direction there.) `validate_site_gateway` rejects a bad glob
             // at the config write; this is the serve-time backstop.
             Pattern::compile(r)
-                .map(|p| p.is_match(path))
+                .map(|p| p.is_match(operator_path))
                 .unwrap_or(true)
         })
     {
         return GatewayResolution::NoMatch;
     }
 
-    // 3. Project routes, resolved in the merged namespace.
-    if let Some(route) = project.match_route(path) {
+    // 3. Project routes, resolved in the merged namespace — matched in the base-stripped app frame.
+    if let Some(route) = project.match_route(project_path) {
         if let Some(up) = project.upstreams.get(&route.upstream) {
             return GatewayResolution::Matched(GatewayMatch {
                 tier: GatewayTier::Project,
@@ -1094,7 +1106,7 @@ mod tests {
         });
 
         // Operator route wins where it matches.
-        match resolve_gateway(Some(&project), Some(&site), "/admin/x") {
+        match resolve_gateway(Some(&project), Some(&site), "/admin/x", "/admin/x") {
             GatewayResolution::Matched(m) => {
                 assert_eq!(m.tier, GatewayTier::Operator);
                 assert_eq!(m.upstream_name, "ops");
@@ -1104,16 +1116,106 @@ mod tests {
         // Reserved path: the project route is structurally barred ⇒ falls through (NoMatch), NEVER
         // the project upstream — the anti-hijack guard.
         assert!(matches!(
-            resolve_gateway(Some(&project), Some(&site), "/.well-known/acme"),
+            resolve_gateway(
+                Some(&project),
+                Some(&site),
+                "/.well-known/acme",
+                "/.well-known/acme"
+            ),
             GatewayResolution::NoMatch
         ));
         // A normal path resolves to the project tier.
-        match resolve_gateway(Some(&project), Some(&site), "/hello") {
+        match resolve_gateway(Some(&project), Some(&site), "/hello", "/hello") {
             GatewayResolution::Matched(m) => {
                 assert_eq!(m.tier, GatewayTier::Project);
                 assert!(!m.via_reference);
             }
             _ => panic!("project route must serve a normal path"),
+        }
+    }
+
+    // Cross-tier routing-integrity (the base_path sub-path mount): the operator tier (routes +
+    // reserved_paths) is judged in the FULL external frame, the project tier in the base-stripped app
+    // frame. A tenant-controlled `base_path` must not be able to shift the frame the operator tier is
+    // evaluated in — e.g. `base_path: "/ops"` stripping an operator-reserved `/ops/**` down to `/x`.
+    #[test]
+    fn resolve_gateway_operator_tier_resists_a_base_path_frame_shift() {
+        // Operator routes AND reserves `/ops/**`; the tenant project route `/**` would grab anything
+        // in the STRIPPED frame.
+        let mut site = GatewayConfig::default();
+        site.upstreams
+            .insert("ops".into(), upstream("http://10.0.0.9:80", None));
+        site.routes.push(GatewayRoute {
+            matches: "/ops/**".into(),
+            upstream: "ops".into(),
+        });
+        site.reserved_paths.push("/ops/**".into());
+
+        let mut project = GatewayConfig::default();
+        project.upstreams.insert(
+            "app".into(),
+            Upstream {
+                compute: Some("app".into()),
+                ..Default::default()
+            },
+        );
+        project.routes.push(GatewayRoute {
+            matches: "/**".into(),
+            upstream: "app".into(),
+        });
+
+        // base_path "/ops": external `/ops/x` strips to `/x`. The operator ROUTE is judged in the full
+        // frame (`/ops/x`) and WINS — the tenant's `/**` can't shadow it, defeating the frame shift.
+        match resolve_gateway(Some(&project), Some(&site), "/ops/x", "/x") {
+            GatewayResolution::Matched(m) => {
+                assert_eq!(
+                    m.tier,
+                    GatewayTier::Operator,
+                    "operator route must win in the full frame"
+                );
+                assert_eq!(m.upstream_name, "ops");
+                assert!(!m.via_reference);
+            }
+            _ => panic!("operator route must win in the full external frame"),
+        }
+
+        // Reserved-only (no operator route): the reserved guard is ALSO judged in the full frame, so
+        // the project tier is barred from `/ops/x` even though the stripped `/x` doesn't look reserved.
+        let mut reserved_only = GatewayConfig::default();
+        reserved_only.reserved_paths.push("/ops/**".into());
+        assert!(
+            matches!(
+                resolve_gateway(Some(&project), Some(&reserved_only), "/ops/x", "/x"),
+                GatewayResolution::NoMatch
+            ),
+            "the reserved-path guard must bar the project tier in the FULL frame (no base_path shadow)"
+        );
+
+        // A genuinely app-internal path (not in the operator's space) still resolves to the PROJECT
+        // tier in the stripped frame: external `/myapp/foo` strips to `/foo`, no operator route.
+        let mut site_reserved = GatewayConfig::default();
+        site_reserved.reserved_paths.push("/ops/**".into());
+        match resolve_gateway(Some(&project), Some(&site_reserved), "/myapp/foo", "/foo") {
+            GatewayResolution::Matched(m) => {
+                assert_eq!(
+                    m.tier,
+                    GatewayTier::Project,
+                    "the app's own path serves in the stripped frame"
+                );
+                assert!(!m.via_reference);
+            }
+            _ => panic!("the app's own stripped path must resolve to the project tier"),
+        }
+
+        // Control: with NO base_path (both frames equal), behavior is byte-for-byte the original — the
+        // operator route still wins on `/ops/x` and the project tier still serves `/other`.
+        match resolve_gateway(Some(&project), Some(&site), "/ops/x", "/ops/x") {
+            GatewayResolution::Matched(m) => assert_eq!(m.tier, GatewayTier::Operator),
+            _ => panic!("operator route must win with no mount"),
+        }
+        match resolve_gateway(Some(&project), Some(&site), "/other", "/other") {
+            GatewayResolution::Matched(m) => assert_eq!(m.tier, GatewayTier::Project),
+            _ => panic!("project tier serves a non-operator path with no mount"),
         }
     }
 
@@ -1136,7 +1238,7 @@ mod tests {
         // A project route referencing a SHARED site upstream resolves as the operator tier (the
         // operator authorized the reach), via_reference, returning the SITE struct (opaque — the
         // project never copied it).
-        match resolve_gateway(Some(&project), Some(&site), "/db/x") {
+        match resolve_gateway(Some(&project), Some(&site), "/db/x", "/db/x") {
             GatewayResolution::Matched(m) => {
                 assert_eq!(m.tier, GatewayTier::Operator);
                 assert!(m.via_reference);
@@ -1150,7 +1252,7 @@ mod tests {
             .upstreams
             .insert("db".into(), upstream("http://10.0.0.5:5432", None));
         assert!(matches!(
-            resolve_gateway(Some(&project), Some(&site_unshared), "/db/x"),
+            resolve_gateway(Some(&project), Some(&site_unshared), "/db/x", "/db/x"),
             GatewayResolution::UnknownUpstream {
                 tier: GatewayTier::Project,
                 ..
@@ -1420,7 +1522,12 @@ mod tests {
         });
         assert!(
             matches!(
-                resolve_gateway(Some(&project), Some(&site), "/.well-known/acme-challenge/x"),
+                resolve_gateway(
+                    Some(&project),
+                    Some(&site),
+                    "/.well-known/acme-challenge/x",
+                    "/.well-known/acme-challenge/x"
+                ),
                 GatewayResolution::NoMatch
             ),
             "a project route must NOT capture a site reserved path (skip_reserved mutation flips this)"

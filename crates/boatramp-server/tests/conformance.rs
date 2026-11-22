@@ -524,6 +524,98 @@ async fn base_path_default_serving_is_byte_for_byte_unchanged() {
     assert_eq!(body, b"<h1>about</h1>");
 }
 
+/// Cross-tier routing-integrity (Security review MEDIUM): a tenant `base_path` must not shift the
+/// frame the OPERATOR gateway tier is judged in. The operator owns `/ops/**` in the root URL space;
+/// the tenant mounts its app at `base_path: "/ops"` with its OWN content at the app root (`/x`).
+/// External `/ops/x` must reach the OPERATOR upstream (its route is judged on the FULL external path),
+/// never the tenant's content — which a stripped-frame (`/x`) evaluation would wrongly serve. This is
+/// exactly the shadow the fix closes: without it, the operator route `/ops/**` is matched against the
+/// stripped `/x`, misses, and the tenant's `/x` captures `/ops/x`.
+#[tokio::test]
+async fn base_path_mount_cannot_shadow_an_operator_gateway_route() {
+    let port = spawn_mock_upstream().await;
+    let deploy = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+
+    // Tenant deploy: mounted at /ops, serving a static file at the APP root `/x`.
+    let put = |bytes: &'static [u8]| {
+        let deploy = deploy.clone();
+        async move {
+            let hash = sha256_hex(bytes);
+            let stream: ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            deploy.put_blob(&hash, stream).await.unwrap();
+            hash
+        }
+    };
+    let (_h, x_entry) = file(b"TENANT-X", Some("text/plain"));
+    put(b"TENANT-X").await;
+    let mut files = BTreeMap::new();
+    files.insert("x.html".to_string(), x_entry);
+    let config = DeployConfig {
+        base_path: "/ops".to_string(),
+        clean_urls: true,
+        ..DeployConfig::default()
+    };
+    let manifest = Manifest {
+        files,
+        config,
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "xt", &id)
+        .await
+        .unwrap();
+
+    // Operator (site) gateway: owns `/ops/**` in the ROOT URL space.
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "xt",
+            &SiteConfig {
+                domains: DomainConfig {
+                    primary: Some("xt.local".into()),
+                    ..Default::default()
+                },
+                gateway: Some(GatewayConfig {
+                    reserved_paths: vec!["/ops/**".into()],
+                    upstreams: BTreeMap::from([(
+                        "ops".to_string(),
+                        Upstream {
+                            target: format!("http://127.0.0.1:{port}"),
+                            ..Default::default()
+                        },
+                    )]),
+                    routes: vec![GatewayRoute {
+                        matches: "/ops/**".into(),
+                        upstream: "ops".into(),
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // External /ops/x → the OPERATOR upstream, which forwarded the FULL external path (`/ops/x`) —
+    // proving the operator tier was judged in the full frame. Without the fix, the tenant static
+    // `TENANT-X` (the app's `/x`, via the stripped frame) would serve instead.
+    let mut req = get("/ops/x");
+    req.headers_mut()
+        .insert(header::HOST, "xt.local".parse().unwrap());
+    let (status, headers, body) = send_gw(&deploy, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers["x-upstream"], "mock",
+        "the OPERATOR upstream must serve it, not the tenant's content"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        "UP:/ops/x",
+        "the operator tier forwarded the full external path"
+    );
+}
+
 #[tokio::test]
 async fn conditional_304() {
     let deploy = seed().await;
