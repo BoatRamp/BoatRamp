@@ -1431,6 +1431,19 @@ pub struct ComputeConfig {
     /// `BOATRAMP_COMPUTE_REDACT_GUEST_LOG_SECRETS`.
     #[serde(default = "default_redact_guest_log_secrets")]
     pub redact_guest_log_secrets: bool,
+    /// The node-global **admission gate** for a per-project guest-log redaction opt-out —
+    /// tier 2 of the two-tier opt-out (v0.70.0). Default **off**: a project's stored opt-out
+    /// (a System·Admin per-project setting, `PUT /api/compute/log-redaction/{project}`) is
+    /// IGNORED unless this is on — so an operator can't opt a project out of redaction unless
+    /// the node globally permits per-project overrides first. When on AND
+    /// [`redact_guest_log_secrets`](Self::redact_guest_log_secrets) is on, a project that
+    /// opted out has its guest logs forwarded unredacted (that project only; never another
+    /// tenant's). A per-project opt-out can only ever DISABLE redaction, never re-enable it
+    /// past a node-global off — the decision composes narrowing-only in
+    /// `boatramp_guestlog::should_redact`. System·Admin node config, never tenant-reachable.
+    /// Env: `BOATRAMP_COMPUTE_ALLOW_PER_PROJECT_REDACTION_OVERRIDE`.
+    #[serde(default = "default_allow_per_project_redaction_override")]
+    pub allow_per_project_redaction_override: bool,
     /// The upstream resolver the internal DNS forwards non-internal queries to
     /// (external names + non-`A`/`AAAA` types), so the resolver is the guest's single
     /// nameserver. `"host:port"`; default `1.1.1.1:53`.
@@ -1642,6 +1655,13 @@ fn default_redact_guest_log_secrets() -> bool {
     true
 }
 
+/// Default for [`ComputeConfig::allow_per_project_redaction_override`] — **off**. A node does
+/// not honor a per-project redaction opt-out until a node admin explicitly admits per-project
+/// overrides (so the on-by-default redaction can't be silently disabled per project).
+fn default_allow_per_project_redaction_override() -> bool {
+    false
+}
+
 /// Default for [`ComputeConfig::k8s_retain_pvc`] — retain a managed DB's PVC on stop.
 fn default_k8s_retain_pvc() -> bool {
     true
@@ -1768,6 +1788,7 @@ impl Default for ComputeConfig {
             managed_db_privilege: ManagedDbPrivilege::default(),
             internal_dns: default_internal_dns(),
             redact_guest_log_secrets: default_redact_guest_log_secrets(),
+            allow_per_project_redaction_override: default_allow_per_project_redaction_override(),
             dns_upstream: default_dns_upstream(),
             dns_domain: default_dns_domain(),
             client_image_rootfs: BTreeMap::new(),

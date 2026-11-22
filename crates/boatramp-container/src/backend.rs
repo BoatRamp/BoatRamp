@@ -533,15 +533,24 @@ pub struct ContainerBackend {
     /// `adopt_legacy_data_volume` designation; else `None`). Set by
     /// [`Self::with_legacy_data_claimant`].
     legacy_data_claimant: Option<(String, String)>,
-    /// Whether the guest-log forwarder **redacts secret-sourced env values** out of the
-    /// forwarded stream (the per-container log file + the `boatramp::guest` tracing
-    /// target). On by default; a node operator opts OUT via the node-global
-    /// `[compute].redact_guest_log_secrets = false` (System·Admin config — never a tenant
-    /// knob), wired by [`Self::with_guest_log_redaction`]. When off, logs forward
-    /// unredacted (the documented parity behavior). The redaction SET itself is per-launch
-    /// (carried in [`LaunchRequest::redaction`]); this flag only decides whether to apply
-    /// it.
+    /// The node-global **guest-log secret redaction default** — tier 1 of the two-tier
+    /// opt-out (v0.70.0). Whether the guest-log forwarder **redacts secret-sourced env
+    /// values** out of the forwarded stream (the per-container log file + the
+    /// `boatramp::guest` tracing target). On by default; a node operator opts OUT via the
+    /// node-global `[compute].redact_guest_log_secrets = false` (System·Admin config — never a
+    /// tenant knob), wired by [`Self::with_guest_log_redaction`]. When off, NOTHING on this
+    /// node is redacted and no per-project setting can re-enable it. The redaction SET itself
+    /// is per-launch (carried in [`LaunchRequest::redaction`]); this flag is the node default
+    /// in [`boatramp_guestlog::should_redact`].
     redact_guest_log_secrets: bool,
+    /// The node-global **admission gate** for a per-project redaction opt-out — tier 2 of the
+    /// two-tier opt-out (v0.70.0). Default `false`: a stored per-project opt-out
+    /// ([`LaunchRequest::redaction`]`.project_opt_out()`) is IGNORED unless this is on, so an
+    /// operator cannot opt a project out of redaction unless the node globally permits
+    /// per-project overrides first. Wired from `[compute].allow_per_project_redaction_override`
+    /// (System·Admin config) by [`Self::with_per_project_redaction_override`]. Composed with
+    /// the node default + the per-project preference in [`boatramp_guestlog::should_redact`].
+    allow_per_project_redaction_override: bool,
     /// The per-veth L2/L3 anti-spoof posture, decided at node start from nft usability ×
     /// isolation posture (see [`AntiSpoof`]). Default [`AntiSpoof::DisabledSingleTenant`] —
     /// the legacy, pre-anti-spoof launch path — so a bare [`new`](Self::new) (tests,
@@ -588,6 +597,9 @@ impl ContainerBackend {
             // Secret redaction of the guest-log stream is ON by default; a node operator
             // opts out via `with_guest_log_redaction(false)`.
             redact_guest_log_secrets: true,
+            // A per-project redaction opt-out is NOT admitted by default; a node operator
+            // admits it via `with_per_project_redaction_override(true)`.
+            allow_per_project_redaction_override: false,
             // Legacy no-filter behavior by default (tests/embedders); the node sets the real
             // posture from `probe_nft_bridge` × `strict` via `with_antispoof`.
             antispoof: AntiSpoof::DisabledSingleTenant,
@@ -655,13 +667,25 @@ impl ContainerBackend {
         self
     }
 
-    /// Enable/disable **guest-log secret redaction** (default enabled). The node wires this
-    /// from the node-global `[compute].redact_guest_log_secrets` (System·Admin config);
-    /// `false` forwards guest logs unredacted. See
+    /// Enable/disable **guest-log secret redaction** (tier-1 node default; default enabled).
+    /// The node wires this from the node-global `[compute].redact_guest_log_secrets`
+    /// (System·Admin config); `false` forwards guest logs unredacted. See
     /// [`redact_guest_log_secrets`](Self::redact_guest_log_secrets).
     #[must_use]
     pub fn with_guest_log_redaction(mut self, enabled: bool) -> Self {
         self.redact_guest_log_secrets = enabled;
+        self
+    }
+
+    /// Admit (or not) a **per-project redaction opt-out** (tier-2 node admission gate; default
+    /// NOT admitted). The node wires this from the node-global
+    /// `[compute].allow_per_project_redaction_override` (System·Admin config). When `false`, a
+    /// project's stored opt-out is ignored and redaction follows the node default; when
+    /// `true`, a project that opted out has its guest logs forwarded unredacted. See
+    /// [`allow_per_project_redaction_override`](Self::allow_per_project_redaction_override).
+    #[must_use]
+    pub fn with_per_project_redaction_override(mut self, admit: bool) -> Self {
+        self.allow_per_project_redaction_override = admit;
         self
     }
 
@@ -2169,12 +2193,20 @@ impl ContainerBackend {
         Ok(())
     }
 
-    /// Build this launch's guest-log redactor from the request's secret-sourced redaction
-    /// set — unless the node-global opt-out ([`Self::redact_guest_log_secrets`]) is off, or
-    /// the set is empty (no secret-sourced env), in which case there is no redactor and the
-    /// stream forwards unredacted.
+    /// Build this launch's guest-log redactor from the request's secret-sourced redaction set
+    /// under the **two-tier opt-out** (v0.70.0). There is no redactor (the stream forwards
+    /// unredacted) when the composed [`logsink::should_redact`] decision is off — the node
+    /// default is off, OR a per-project opt-out is both stored AND admitted by the node — or
+    /// when the set is empty (no secret-sourced env). The decision combines the two node-global
+    /// flags with the request's carried per-project opt-out preference, in ONE place shared
+    /// with the docker backend.
     fn build_log_redactor(&self, req: &LaunchRequest) -> Option<std::sync::Arc<logsink::Redactor>> {
-        if !self.redact_guest_log_secrets || req.redaction.is_empty() {
+        if !logsink::should_redact(
+            self.redact_guest_log_secrets,
+            self.allow_per_project_redaction_override,
+            req.redaction.project_opt_out(),
+        ) || req.redaction.is_empty()
+        {
             return None;
         }
         logsink::Redactor::build(req.redaction.values().iter().cloned())
@@ -3965,6 +3997,89 @@ mod tests {
         ComputeSpec::builder(RootSource::Tar(hash.into()), 1, 64, 8080)
             .entrypoint(vec!["/bin/hello".into()])
             .build()
+    }
+
+    /// A cheap backend for `build_log_redactor` wiring tests (no storage/network touched).
+    fn redaction_backend() -> ContainerBackend {
+        ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            unique_dir("redact"),
+            "br-boatramp".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/proc/self/exe"),
+        )
+        .expect("backend")
+    }
+
+    /// A launch request carrying one long secret-sourced value + a per-project opt-out flag,
+    /// for `build_log_redactor` (which only reads `req.redaction`).
+    fn redaction_req(project_opt_out: bool) -> LaunchRequest {
+        let mut redaction = boatramp_core::compute::RedactionSet::new();
+        redaction.push("postgres://u:P%40ss_UNIQ_9f3a@bramp-db.flycast:5432/app".into());
+        redaction.set_project_opt_out(project_opt_out);
+        LaunchRequest {
+            project: "proj".into(),
+            workload: "w".into(),
+            replica: 0,
+            spec: spec_for(&"d".repeat(64)),
+            artifact: Artifact::Rootfs {
+                dir: "/tmp/x".into(),
+            },
+            redaction,
+        }
+    }
+
+    /// The two-tier opt-out, wired through `build_log_redactor` (v0.70.0). This binds that the
+    /// per-project opt-out flag on the request + the two node-global flags reach
+    /// `boatramp_guestlog::should_redact` (whose full matrix is unit-tested in the guestlog
+    /// crate), proving the decision is CONNECTED — including that an admitted opt-out disables
+    /// redaction for only the opted-out request. Mutation-sensitive: dropping any input flips a
+    /// `Some`/`None`.
+    #[test]
+    fn build_log_redactor_honors_the_two_tier_opt_out() {
+        // Tier 1 node default ON, admission OFF (the default): a per-project opt-out is IGNORED
+        // → a redactor is still built whether or not the project opted out.
+        let on_no_admit = redaction_backend(); // defaults: redact on, admission off
+        assert!(
+            on_no_admit
+                .build_log_redactor(&redaction_req(false))
+                .is_some(),
+            "default posture redacts"
+        );
+        assert!(
+            on_no_admit
+                .build_log_redactor(&redaction_req(true))
+                .is_some(),
+            "opt-out ignored when the node does not admit per-project overrides"
+        );
+
+        // Tier 1 ON, admission ON: the per-project opt-out is now honored — and ONLY for the
+        // request that opted out (a non-opted-out request through the SAME backend still
+        // redacts), i.e. "for that project only".
+        let on_admit = redaction_backend().with_per_project_redaction_override(true);
+        assert!(
+            on_admit.build_log_redactor(&redaction_req(false)).is_some(),
+            "an admitting node still redacts a project that did not opt out"
+        );
+        assert!(
+            on_admit.build_log_redactor(&redaction_req(true)).is_none(),
+            "an admitted per-project opt-out disables redaction for that project"
+        );
+
+        // Tier 1 OFF: never redact, regardless of the per-project tiers.
+        let off = redaction_backend()
+            .with_guest_log_redaction(false)
+            .with_per_project_redaction_override(true);
+        assert!(off.build_log_redactor(&redaction_req(false)).is_none());
+        assert!(off.build_log_redactor(&redaction_req(true)).is_none());
+
+        // An EMPTY set (no secret-sourced env) builds no redactor even with redaction fully on.
+        let empty = {
+            let mut req = redaction_req(false);
+            req.redaction = boatramp_core::compute::RedactionSet::new();
+            req
+        };
+        assert!(redaction_backend().build_log_redactor(&empty).is_none());
     }
 
     #[test]

@@ -70,6 +70,40 @@ pub const MIN_SECRET_LEN: usize = 8;
 /// missing.
 pub const REDACTED_PLACEHOLDER: &str = "\u{2039}redacted\u{203a}";
 
+/// The **two-tier guest-log redaction decision** (owner-settled, v0.70.0): whether a
+/// workload's forwarded guest log should have its secret-sourced values redacted, given
+/// the node-global posture and the workload's per-project opt-out preference. The SINGLE
+/// source of truth for the policy — both the native `boatramp-container` backend and the
+/// remote `boatramp-docker` backend call THIS from their `build_log_redactor`, so the two
+/// can never drift.
+///
+/// The three inputs are the owner's three knobs:
+/// - `node_default` — the node-global `[compute].redact_guest_log_secrets` default (**on**).
+///   **Tier 1.** When off, nothing on the node is redacted, period — no per-project setting
+///   can re-enable it (a node admin who turned the whole control off meant it).
+/// - `allow_per_project_override` — the node-global
+///   `[compute].allow_per_project_redaction_override` **admission gate** (default **off**).
+///   **Tier 2.** A per-project opt-out is honored ONLY when this is on; otherwise a stored
+///   per-project opt-out is IGNORED and redaction stays on.
+/// - `project_opt_out` — this workload's PROJECT has a stored opt-out record (System·Admin
+///   per-project setting). **Tier 3.** Only ever *disables*, and only for a node that admits
+///   overrides, and only for that one project.
+///
+/// Redact ⟺ `node_default && !(allow_per_project_override && project_opt_out)`.
+///
+/// The composition is deliberately **narrowing-only**: a per-project opt-out can take
+/// redaction from on to off (within an admitting node) but never from off to on, so neither
+/// a tenant nor an operator can *weaken* another scope's stronger posture — mirroring the
+/// operator-first authority split the per-project backend policy already uses.
+#[must_use]
+pub fn should_redact(
+    node_default: bool,
+    allow_per_project_override: bool,
+    project_opt_out: bool,
+) -> bool {
+    node_default && !(allow_per_project_override && project_opt_out)
+}
+
 /// A per-workload secret redactor: an Aho-Corasick automaton over the workload's
 /// secret-sourced env VALUES, plus the zeroizing source buffer.
 ///
@@ -290,6 +324,43 @@ mod tests {
         let shown = format!("{r:?}");
         assert!(!shown.contains(DSN), "Debug leaked the secret: {shown}");
         assert!(shown.contains("redacted"));
+    }
+
+    /// The two-tier redaction DECISION, over the full input matrix (owner-settled, v0.70.0).
+    /// This is the single source of truth both backends gate `build_log_redactor` on, so the
+    /// matrix is pinned here once rather than re-asserted per backend. Mutation-sensitive:
+    /// any drift in the boolean combination (e.g. dropping the admission gate, so a stored
+    /// opt-out is honored even when the node does not admit overrides) flips one of these.
+    #[test]
+    fn two_tier_decision_matrix() {
+        // Tier 1 — node default OFF ⇒ never redact, regardless of the per-project tiers.
+        assert!(!should_redact(false, false, false));
+        assert!(!should_redact(false, false, true));
+        assert!(!should_redact(false, true, false));
+        assert!(
+            !should_redact(false, true, true),
+            "a node that turned redaction off is never re-enabled by a per-project setting"
+        );
+
+        // Tier 1 ON, admission OFF (the default posture) ⇒ a per-project opt-out is IGNORED;
+        // redaction stays ON whether or not the project opted out.
+        assert!(should_redact(true, false, false));
+        assert!(
+            should_redact(true, false, true),
+            "opt-out is ignored unless the node globally admits per-project overrides"
+        );
+
+        // Tier 1 ON, admission ON ⇒ the per-project opt-out is now HONORED: it, and only it,
+        // disables redaction (for that one project); a project that did NOT opt out still
+        // redacts.
+        assert!(
+            should_redact(true, true, false),
+            "an admitting node still redacts a project that did not opt out"
+        );
+        assert!(
+            !should_redact(true, true, true),
+            "an admitted per-project opt-out disables redaction for that project"
+        );
     }
 
     /// Aho-Corasick property: the per-line scan cost is **independent of the number of

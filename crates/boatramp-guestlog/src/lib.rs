@@ -36,7 +36,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 mod redact;
-pub use redact::{MIN_SECRET_LEN, REDACTED_PLACEHOLDER, Redactor};
+pub use redact::{MIN_SECRET_LEN, REDACTED_PLACEHOLDER, Redactor, should_redact};
 
 /// Max bytes buffered for a single logical (newline-delimited) line before it is
 /// truncated. Bounds the pump's per-line memory against a no-newline flood.
