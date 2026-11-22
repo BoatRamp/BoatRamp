@@ -87,6 +87,30 @@ want JSON) regenerate the JSON from the current-schema source. Don't hand-write 
 `version:` into JSON expecting a migration — regenerate current-schema JSON
 instead.
 
+### Convert an existing file between RON and JSON
+
+To move a config you already have from one surface syntax to the other, use
+`boatramp config convert`:
+
+```console
+$ boatramp config convert boatramp.cfg --to json > boatramp.json   # RON → JSON
+$ boatramp config convert apply.json --to ron > apply.cfg          # JSON → RON
+```
+
+It parses the file into the typed schema and re-serializes it in the target
+format, so the round-trip is **lossless at the typed level** — but it converts the
+config *value*, so source **comments and formatting are dropped**. The source
+format is auto-detected by extension (`.json` ⇒ JSON, else RON; override with
+`--from`) and the kind (node `boatramp.cfg` vs project `project.cfg`) is inferred
+from the filename/content (override with `--kind`). It is purely client-side and
+prints to stdout.
+
+To compare two config files **semantically** — ignoring a pure RON-vs-JSON format
+difference — use [`boatramp config diff`](../reference/cli.md#boatramp-config); its
+`--exit-code` makes it a fail-closed CI drift-lint, and `--topology` narrows the
+comparison to the deployment topology (routes, bindings, functions, consumer
+topics, capability grants) for a dev-vs-prod overlay check.
+
 ## Headline use case: generate configs from Nickel
 
 The reason JSON exists as an input: you can author your config in a typed

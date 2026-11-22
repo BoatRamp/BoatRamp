@@ -895,6 +895,12 @@ The opt-out is a **two-tier, admin-gated** control — never tenant-reachable at
    logs unredacted — never another tenant's. A per-project opt-out can only ever *disable*
    redaction, never re-enable it past a node-global off.
 
+The redaction decision is bound **at a replica's launch**. Changing a project's setting —
+clearing an opt-out to re-enable redaction, or setting one to disable it — therefore takes
+effect on each workload's **next (re)launch**, not retroactively: a replica already running
+keeps the redactor (or lack of one) it was launched with, and logs already forwarded are not
+re-processed. Stop and relaunch the project's workloads to apply the change immediately.
+
 All three are **System·Admin** (node config for tiers 1–2; a node-global operator endpoint for
 tier 3) — a tenant can never disable redaction of its own, or any other tenant's, logs.
 

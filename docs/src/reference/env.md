@@ -36,6 +36,9 @@ Read by `boatramp serve`. Each maps to a `serve.*` field in
 | `BOATRAMP_HTTP_REDIRECT_ADDR` | In a TLS mode, a second plain-HTTP listener that 308-redirects to HTTPS (e.g. `0.0.0.0:80`). |
 | `BOATRAMP_PROTECT_PREVIEWS` | Require a valid token to view deployment previews. |
 | `BOATRAMP_LOG_FORMAT` | `json` for structured logs (anything else = human-readable). |
+| `BOATRAMP_DRAIN_DELAY` | Graceful-drain hold (seconds) on `SIGTERM`/Ctrl-C before listeners close: `/readyz` flips to `503` (not `/healthz`), then the node keeps accepting for this long so an Anycast/ECMP load balancer health-gated on `/readyz` withdraws it first. Overrides `serve.drain_delay_secs`; default `5`, `0` disables the hold. Flag: `--drain-delay`. See [Anycast VIP](../how-to/anycast-vip.md). |
+| `BOATRAMP_ANYCAST_NODE_ID` | Per-node QUIC Connection-ID node id (`0`–`255`), encoded in byte 0 of every CID so an Anycast-aware L4 load balancer can steer each HTTP/3 connection back to its owning node. Overrides `serve.anycast_node_id`; unset ⇒ quinn's default random CIDs. Flag: `--anycast-node-id`. `http3` feature. See [Anycast VIP](../how-to/anycast-vip.md#http3-over-anycast-quic). |
+| `BOATRAMP_HTTP3_ADVERTISE` | Advertise HTTP/3 to clients via `Alt-Svc`. Overrides `serve.http3_advertise`; default `true`. Set `false` behind a plain Anycast VIP with no QUIC-aware CID steering so clients stay on HTTP/2 over TCP. Flag: `--http3-advertise`. `http3` feature. |
 
 ### Upload limits
 

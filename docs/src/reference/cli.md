@@ -1206,6 +1206,8 @@ fleet-wide without a restart. See the
 | `describe <key>` | A key's change class (`dynamic` vs `restart`). |
 | `dump [--file boatramp.cfg] [--explain]` | Print the resolved **static** daemon config (`boatramp.cfg` + `BOATRAMP_*` env) as JSON, secrets redacted. **Client-side only** — no server is contacted. |
 | `migrate <file> [--write]` | Upgrade an [`apply`](#boatramp-apply) manifest to the current schema. **Client-side only** — no server is contacted. |
+| `convert <file> --to <ron\|json>` | Convert a config file between RON and JSON (node or project kind); source format auto-detected (`--from`/`--kind` to force). Lossless at the typed level; comments/formatting are dropped. **Client-side only**, prints to stdout. |
+| `diff <a> <b>` | Semantic diff of two config files (values, not text) — a pure RON-vs-JSON format difference shows no diff. `--exit-code` for a CI drift-lint; `--topology` narrows to the deployment topology. **Client-side only.** |
 
 `config set` on a `restart`-class key (a trust anchor, posture, or listener
 setting) fails with a pointer to `boatramp.cfg` rather than silently doing

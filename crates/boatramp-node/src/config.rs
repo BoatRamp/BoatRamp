@@ -842,6 +842,7 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES",
     "BOATRAMP_COMPUTE_INTERNAL_DNS",
     "BOATRAMP_COMPUTE_REDACT_GUEST_LOG_SECRETS",
+    "BOATRAMP_COMPUTE_ALLOW_PER_PROJECT_REDACTION_OVERRIDE",
     "BOATRAMP_COMPUTE_DNS_UPSTREAM",
     "BOATRAMP_COMPUTE_DNS_DOMAIN",
     "BOATRAMP_COMPUTE_PG_CLIENT_IMAGE",
@@ -7631,11 +7632,19 @@ pub(crate) mod figment_resolve {
                 ),
                 ("BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE", "rootless"),
                 ("BOATRAMP_COMPUTE_INTERNAL_DNS", "on"),
+                (
+                    "BOATRAMP_COMPUTE_ALLOW_PER_PROJECT_REDACTION_OVERRIDE",
+                    "on",
+                ),
             ]))
             .expect("figment extract")
             .compute
             .expect("compute materialised from env");
             assert_eq!(c.vcpus, 4);
+            assert!(
+                c.allow_per_project_redaction_override,
+                "the per-project redaction-override admission gate resolves from its env var"
+            );
             assert_eq!(c.mem_mib, 2048);
             assert_eq!(c.region.as_deref(), Some("ams"));
             assert_eq!(
