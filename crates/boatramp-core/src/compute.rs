@@ -8,7 +8,7 @@
 //! implement [`ComputeBackend`]; a leader-gated loop drives [`reconcile_plan`].
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -3940,8 +3940,381 @@ pub struct ReconcileReport {
     /// Replicas **preempted** (parked or drained to free capacity for a higher-priority
     /// workload) this pass.
     pub preempted: usize,
+    /// Replicas whose launch was **deferred** this pass because their image pull is still in
+    /// flight (the [`PullCoordinator`] reported `NotStarted`/`InProgress`). A decoupling-only
+    /// signal: the launch happens on a later pass once the pull reports `Ready`, so this is the
+    /// number of launches held off the serial critical path by an in-progress pull — NOT a
+    /// failure (a failed pull is counted in `errors`). Zero when no coordinator is wired.
+    pub pulling: usize,
     /// Per-action failures (the pass continues past them; retried next tick).
     pub errors: Vec<String>,
+}
+
+/// The cooldown (seconds) before a **failed/timed-out image pull** is re-attempted by the
+/// [`PullCoordinator`]. Mirrors [`PREEMPTION_COOLDOWN_SECS`]: an anti-livelock guard so a
+/// permanently-bad image (a wrong digest, a deleted tag, a registry that always 403s) is not
+/// re-pulled every single reconcile tick, while a transient failure (a flaky registry) still
+/// recovers within a minute. While within the cooldown the failure is SURFACED on the workload
+/// (its durable `LaunchFailed` record) but the pull is not restarted.
+pub const PULL_RETRY_COOLDOWN_SECS: u64 = 60;
+
+/// The identity of one in-flight/cached image pull: a backend's materialization of a specific
+/// content-addressed spec for a specific tenant workload. The pull (and its backend staging
+/// directory) is scoped per `(backend, project, workload, spec_id)` — never shared across
+/// tenants — so the de-dupe/once-guard is tenant-safe and a spec change (new `spec_id`) is a
+/// fresh pull. `spec_id` is the workload's active spec hash ([`ComputeWorkload::active`]).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PullKey {
+    backend: String,
+    project: String,
+    workload: String,
+    spec_id: String,
+}
+
+/// A handle to one in-flight background pull task that can ABORT it. boatramp-core is
+/// runtime-AGNOSTIC (`tokio` is only a dev-dependency, and the crate even targets wasm32), so
+/// the coordinator never spawns a task itself — the runtime-bearing caller injects a
+/// [`PullSpawner`] whose spawned task is represented back here by this handle, which the
+/// coordinator calls on shutdown / workload-removal so a detached `materialize` can never leak.
+/// `abort` is idempotent (a no-op once the task has finished).
+pub trait PullTaskHandle: Send + Sync {
+    /// Cancel the background pull task (idempotent).
+    fn abort(&self);
+}
+
+/// Spawns a detached background image-pull task onto the ambient async runtime and returns an
+/// abortable [`PullTaskHandle`]. Injected into [`PullCoordinator::new`] by the runtime-bearing
+/// caller (the server's reconcile driver provides a tokio-backed one) so `boatramp-core` stays
+/// free of a hard async-runtime dependency — the same "the concurrency driver lives per-crate"
+/// pattern the rest of this crate uses.
+pub trait PullSpawner: Send + Sync {
+    /// Spawn `fut` (a workload's `materialize` + write-back) as a detached task.
+    fn spawn_pull(&self, fut: futures::future::BoxFuture<'static, ()>) -> Box<dyn PullTaskHandle>;
+}
+
+/// The lifecycle of one workload's image pull, as the reconcile pass observes it.
+enum PullSlot {
+    /// A background `materialize` task is running (its [`PullTaskHandle`] is held so the
+    /// coordinator can ABORT it on shutdown or when its workload disappears — so a detached pull
+    /// task can never leak). `generation` tags the task so its write-back can only land on the
+    /// slot it owns (never resurrecting a pruned key or clobbering a newer re-kick).
+    InProgress {
+        generation: u64,
+        task: Box<dyn PullTaskHandle>,
+    },
+    /// The pull completed and digest-verified inside `materialize`; the artifact is ready to
+    /// launch. Reused by every replica of the workload (and later passes) with no re-pull.
+    Ready { artifact: Artifact },
+    /// The pull failed or timed out at `at` (unix seconds) with `reason`. Surfaced on the
+    /// workload until [`PULL_RETRY_COOLDOWN_SECS`] elapses, then re-attempted.
+    Failed { reason: String, at: u64 },
+}
+
+/// What [`PullCoordinator::poll_or_start`] tells the reconcile pass to do for one replica.
+enum PullStatus {
+    /// A pull was just kicked off this pass (was `NotStarted`). Skip the launch this tick.
+    Started,
+    /// A pull is still running. Skip the launch this tick (do NOT block on it).
+    InProgress,
+    /// The image is materialized — launch with this artifact.
+    Ready(Artifact),
+    /// The pull failed (within its retry cooldown). Surface the reason on the workload and skip.
+    Failed(String),
+}
+
+/// Decouples a compute workload's OCI image pull (`materialize` — the `build_rootfs` /
+/// `fetch_layer` / `apply_image_layers` work) from the **serial reconcile critical path**.
+///
+/// Before this, [`reconcile_once`] awaited each replica's `materialize` INLINE inside its
+/// per-workload loop, so one tenant's big/slow (deadline-bounded, but up to minutes) pull held
+/// the whole pass — stalling the reconcile of every OTHER workload on the node. The coordinator
+/// instead runs each workload's pull as a BACKGROUND task and lets the reconcile pass POLL its
+/// status ([`poll_or_start`](Self::poll_or_start)): `NotStarted` kicks it off, `InProgress`
+/// skips-and-continues to the next workload, `Ready` proceeds to launch, `Failed` surfaces the
+/// error. A slow pull for workload A can no longer delay the reconcile of B/C.
+///
+/// Correctness invariants:
+/// * **No launch on a partial image** — a replica launches only on `Ready`, whose artifact is
+///   the fully pulled + digest-verified output of `materialize`; every existing pull bound
+///   (overall deadline, per-layer/image byte caps, zip-bomb + entry-count bounds, digest
+///   verification) still runs INSIDE the background task (`materialize` is unchanged).
+/// * **Once-guard / de-dupe** — at most one live pull task per `(backend, project, workload,
+///   spec_id)`: a key that is already `InProgress`/`Ready` is never re-pulled, so two replicas
+///   (or two passes, or a re-plan) never double-pull or race on one staging directory.
+/// * **Bounded retry** — a `Failed` pull is re-attempted only after [`PULL_RETRY_COOLDOWN_SECS`],
+///   so a permanently-bad image does not livelock the loop.
+/// * **Clean shutdown** — dropping the coordinator (or pruning a vanished workload via
+///   [`retain_live`](Self::retain_live)) ABORTS the in-flight task; the backend staging is itself
+///   abort-safe (it builds into a `.tmp` sibling and publishes with an atomic rename only after a
+///   `.boatramp-ready` marker, and clears any leftover partial on the next attempt), so an
+///   aborted pull leaves no half-written final rootfs.
+///
+/// Cheaply cloneable (an `Arc` handle); [`reconcile_once`] takes it by shared reference and the
+/// production reconcile driver owns one for the server's lifetime so pull state persists across
+/// passes. Tenant-scoping is intact: a key is per `(project, workload)`, never shared.
+#[derive(Clone)]
+pub struct PullCoordinator {
+    inner: Arc<PullCoordinatorInner>,
+    /// Injected runtime seam that spawns each background pull (see [`PullSpawner`]).
+    spawner: Arc<dyn PullSpawner>,
+}
+
+#[derive(Default)]
+struct PullCoordinatorInner {
+    slots: Mutex<BTreeMap<PullKey, PullSlot>>,
+    /// Monotonic generation stamp handed to each spawned task (see [`PullSlot::InProgress`]).
+    next_generation: std::sync::atomic::AtomicU64,
+}
+
+impl Drop for PullCoordinatorInner {
+    /// Abort every in-flight pull task on shutdown so no detached `materialize` task leaks past
+    /// the coordinator. Fires when the last [`PullCoordinator`] clone drops.
+    fn drop(&mut self) {
+        if let Ok(slots) = self.slots.lock() {
+            for slot in slots.values() {
+                if let PullSlot::InProgress { task, .. } = slot {
+                    task.abort();
+                }
+            }
+        }
+    }
+}
+
+impl PullCoordinator {
+    /// A fresh coordinator with no pulls tracked, spawning each background pull via `spawner`
+    /// (the server's reconcile driver passes a tokio-backed one).
+    #[must_use]
+    pub fn new(spawner: Arc<dyn PullSpawner>) -> Self {
+        Self {
+            inner: Arc::new(PullCoordinatorInner::default()),
+            spawner,
+        }
+    }
+
+    /// Check (and, if needed, start) the background image pull for one replica's workload, and
+    /// tell the caller whether it may launch yet. Never blocks on the pull.
+    ///
+    /// * `NotStarted` (no slot, or a `Failed` slot past its `retry_cooldown`) → spawn the
+    ///   background `materialize` task and return [`PullStatus::Started`].
+    /// * already `InProgress` → return [`PullStatus::InProgress`] (do NOT spawn a second task —
+    ///   the once-guard).
+    /// * `Ready` → return [`PullStatus::Ready`] with a clone of the materialized artifact.
+    /// * `Failed` within `retry_cooldown` → return [`PullStatus::Failed`] with the reason.
+    ///
+    /// Synchronous and lock-scoped: it only spawns (never awaits) under the lock, so it is safe
+    /// to call from the reconcile loop without holding a guard across an await.
+    #[allow(clippy::too_many_arguments)]
+    fn poll_or_start(
+        &self,
+        backend: Arc<dyn ComputeBackend>,
+        project: &str,
+        workload: &str,
+        spec: &ComputeSpec,
+        spec_id: &str,
+        pull_auth: Option<&RegistryAuth>,
+        now: u64,
+        retry_cooldown: u64,
+    ) -> PullStatus {
+        let key = PullKey {
+            backend: backend.id().to_string(),
+            project: project.to_string(),
+            workload: workload.to_string(),
+            spec_id: spec_id.to_string(),
+        };
+        let mut slots = self.inner.slots.lock().expect("pull coordinator mutex");
+        match slots.get(&key) {
+            Some(PullSlot::Ready { artifact }) => PullStatus::Ready(artifact.clone()),
+            Some(PullSlot::InProgress { .. }) => PullStatus::InProgress,
+            Some(PullSlot::Failed { reason, at }) if now.saturating_sub(*at) < retry_cooldown => {
+                PullStatus::Failed(reason.clone())
+            }
+            // NotStarted (no slot) or a Failed slot past its cooldown: (re)start the pull.
+            _ => {
+                let generation = self
+                    .inner
+                    .next_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // A WEAK handle to the shared state: the task must NOT keep the coordinator alive
+                // (else dropping the coordinator on shutdown could never run its `Drop` to abort
+                // this very task). On completion it upgrades the weak to write its result back; if
+                // the coordinator is already gone, it simply drops the result.
+                let inner = Arc::downgrade(&self.inner);
+                let key_for_task = key.clone();
+                let project = project.to_string();
+                let workload = workload.to_string();
+                let spec = spec.clone();
+                let pull_auth = pull_auth.cloned();
+                let task = self.spawner.spawn_pull(Box::pin(async move {
+                    // The heavy work — OCI pull + layer overlay / rootfs build, all its byte /
+                    // zip-bomb / deadline / digest bounds — runs HERE, off the reconcile loop.
+                    let result = backend
+                        .materialize(&project, &workload, &spec, pull_auth.as_ref())
+                        .await;
+                    let Some(inner) = inner.upgrade() else {
+                        return; // coordinator dropped while this pull ran — nothing to record
+                    };
+                    let mut slots = match inner.slots.lock() {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    // Only write back onto the slot THIS task owns: a `retain_live` prune (the
+                    // workload vanished) or a newer re-kick must not be clobbered/resurrected.
+                    let still_ours = matches!(
+                        slots.get(&key_for_task),
+                        Some(PullSlot::InProgress { generation: g, .. }) if *g == generation
+                    );
+                    if !still_ours {
+                        return;
+                    }
+                    let slot = match result {
+                        Ok(artifact) => PullSlot::Ready { artifact },
+                        Err(e) => PullSlot::Failed {
+                            reason: e.to_string(),
+                            at: crate::time::now_unix(),
+                        },
+                    };
+                    slots.insert(key_for_task, slot);
+                }));
+                slots.insert(key, PullSlot::InProgress { generation, task });
+                PullStatus::Started
+            }
+        }
+    }
+
+    /// Drop a pull's tracked slot so its NEXT poll re-materializes from scratch. Called when a
+    /// LAUNCH from a cached `Ready` artifact FAILED: the staged rootfs may have been GC'd or
+    /// corrupted out from under the cache, so the artifact must be re-pulled rather than
+    /// re-launched forever (this restores the self-heal the pre-decoupling inline path got for
+    /// free by calling `materialize` on every launch attempt — the fs-level ready-marker fast
+    /// path makes the re-materialize cheap when the staging dir is in fact still intact).
+    fn invalidate(&self, backend: &str, project: &str, workload: &str, spec_id: &str) {
+        let key = PullKey {
+            backend: backend.to_string(),
+            project: project.to_string(),
+            workload: workload.to_string(),
+            spec_id: spec_id.to_string(),
+        };
+        let mut slots = self.inner.slots.lock().expect("pull coordinator mutex");
+        if let Some(PullSlot::InProgress { task, .. }) = slots.get(&key) {
+            task.abort();
+        }
+        slots.remove(&key);
+    }
+
+    /// Prune every tracked pull whose workload is no longer live (its `(project, workload,
+    /// spec_id)` is absent from `live`), ABORTING any in-flight task for a pruned key. Called
+    /// once per reconcile pass so a deleted or respec'd workload neither leaks a cached artifact
+    /// nor a detached pull task. The `backend` dimension of the key is ignored here: a workload
+    /// is kept alive by matching `(project, workload, spec_id)`, so a same-pass backend choice
+    /// never prunes a still-valid pull.
+    fn retain_live(&self, live: &BTreeSet<(String, String, String)>) {
+        let mut slots = self.inner.slots.lock().expect("pull coordinator mutex");
+        slots.retain(|k, slot| {
+            let keep = live.contains(&(k.project.clone(), k.workload.clone(), k.spec_id.clone()));
+            if !keep && let PullSlot::InProgress { task, .. } = slot {
+                task.abort();
+            }
+            keep
+        });
+    }
+
+    /// Test-only: the number of tracked pull slots (any lifecycle), to assert the once-guard.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.inner
+            .slots
+            .lock()
+            .expect("pull coordinator mutex")
+            .len()
+    }
+
+    /// Test-only: count the slots in each lifecycle (in_flight, ready, failed).
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize, usize) {
+        let slots = self.inner.slots.lock().expect("pull coordinator mutex");
+        let mut c = (0usize, 0usize, 0usize);
+        for s in slots.values() {
+            match s {
+                PullSlot::InProgress { .. } => c.0 += 1,
+                PullSlot::Ready { .. } => c.1 += 1,
+                PullSlot::Failed { .. } => c.2 += 1,
+            }
+        }
+        c
+    }
+
+    /// Test-only: yield until at least `n` pulls have SETTLED (become `Ready`/`Failed`), so a
+    /// test can let an un-gated pull complete (and drive the two-phase "pass 1 starts the pull,
+    /// pass 2 launches" deterministically) without waiting on a gated sibling.
+    #[cfg(test)]
+    async fn wait_for_settled(&self, n: usize) {
+        loop {
+            let (_, ready, failed) = self.counts();
+            if ready + failed >= n {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// Per-content **staging serialization** for a compute backend.
+///
+/// The [`PullCoordinator`] de-dupes a pull per `(backend, project, workload, spec_id)` — correct
+/// for the auth model (each workload's `materialize` runs with its OWN `pull_auth`). But that key
+/// does NOT cover two DIFFERENT workloads/projects that reference the SAME content (a shared cold
+/// public base image, or — for the VM backends — the one kernel every microVM boots). Before the
+/// pull was decoupled, reconcile awaited each `materialize` INLINE, strictly serially, so a
+/// same-content collision was unreachable. Now the loop self-parallelizes, so two such workloads
+/// spawn two concurrent `materialize` → two concurrent stagers writing the SAME content-addressed
+/// staging paths (the shared `.tmp`, the shared final dir/file). That race can delete a peer's
+/// in-progress `.tmp` (ENOENT rename) or `remove_dir_all` a FINAL dir another task just published
+/// and a launch is reading — a new, churn-y failure the serial path never produced.
+///
+/// This holds a small map of per-**content-key** async locks ([`futures::lock::Mutex`], so it
+/// stays free of a hard async-runtime dependency — the same primitive the rest of the crate uses).
+/// A backend takes the lock for a content key around its stage sequence, re-checks the ready
+/// marker UNDER the lock, and REUSES the published artifact if a peer won — so same-content work
+/// happens exactly once and no task ever blows away a dir another is reading. The lock is per
+/// content key (NOT global), so different-content stagers still run fully in parallel. Idle keys
+/// (no stager holding the lock) are swept on the next acquisition, so the map stays bounded to the
+/// content actively being staged. It is NOT a cache and shares no artifact across tenants: each
+/// workload's `materialize` still runs with its own `pull_auth`; this only serializes who writes
+/// the shared on-disk paths (the content cache remains public-images-only).
+#[derive(Clone, Default)]
+pub struct ContentStageLocks {
+    locks: Arc<Mutex<BTreeMap<String, Arc<futures::lock::Mutex<()>>>>>,
+}
+
+impl ContentStageLocks {
+    /// A fresh, empty set of staging locks.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The async lock guarding stagers of content `key`. Hold the guard
+    /// (`let _g = locks.lock_for(k).lock().await;`) around the stage sequence; the second holder
+    /// then hits the ready-marker fast path and reuses the winner's published artifact. The key
+    /// must identify the exact on-disk content (e.g. `image:<sha256(ref)>.b<base>` or
+    /// `blob:<hash>`), so two stagers racing the SAME paths — and only those — serialize.
+    #[must_use]
+    pub fn lock_for(&self, key: &str) -> Arc<futures::lock::Mutex<()>> {
+        let mut map = self.locks.lock().expect("content stage locks mutex");
+        // Sweep keys no stager is holding (only the map's own ref remains), keeping the map
+        // bounded to content actively being staged. Runs before the insert, so a key handed out
+        // this call (strong_count ≥ 2 once cloned below) is never swept.
+        map.retain(|_, v| Arc::strong_count(v) > 1);
+        map.entry(key.to_string())
+            .or_insert_with(|| Arc::new(futures::lock::Mutex::new(())))
+            .clone()
+    }
+
+    /// Test-only: how many content keys are currently tracked (to assert the idle-key sweep).
+    #[cfg(test)]
+    fn tracked_keys(&self) -> usize {
+        self.locks.lock().expect("content stage locks mutex").len()
+    }
 }
 
 /// One binding resolver's contribution to the **unified managed-env render stage**
@@ -4709,6 +5082,13 @@ async fn persist_preempt_marker(
 ///
 /// For now the chosen backend is invoked locally (the leader also runs it).
 /// Cross-node dispatch via messaging is a later refinement.
+///
+/// `pull` decouples each workload's image pull from this serial pass: when a
+/// [`PullCoordinator`] is wired (the production reconcile driver owns one for the server's
+/// lifetime), a replica's `materialize` runs as a BACKGROUND task and this pass only POLLS its
+/// status — so one tenant's slow/large pull never stalls the reconcile of the others. With no
+/// coordinator (`None`), the pull is awaited INLINE as before (the deterministic path used by
+/// lean reconcilers and unit tests).
 #[allow(clippy::too_many_arguments)]
 pub async fn reconcile_once(
     deploy: &DeployStore,
@@ -4721,6 +5101,7 @@ pub async fn reconcile_once(
     registry_auth: Option<&dyn RegistryAuthResolver>,
     snapshot_store: Option<&dyn SnapshotStore>,
     tuning: BinPackTuning,
+    pull: Option<&PullCoordinator>,
 ) -> Result<ReconcileReport, crate::error::DeployError> {
     let mut report = ReconcileReport::default();
     // Per-backend capabilities (the planner gates scale-to-zero on them).
@@ -4815,6 +5196,24 @@ pub async fn reconcile_once(
         }
         v
     };
+
+    // DECOUPLED-PULL GC: prune any cached/in-flight image pull whose workload is no longer live
+    // (deleted, or respec'd to a new active spec), aborting its background task so a vanished
+    // workload leaks neither a cached artifact nor a detached pull. Keyed by the live
+    // `(project, workload, spec_id)` set this tick. A no-op when no coordinator is wired.
+    if let Some(pull) = pull {
+        let live: BTreeSet<(String, String, String)> = tick_inputs
+            .iter()
+            .map(|wi| {
+                (
+                    wi.project_name.clone(),
+                    wi.workload.name.clone(),
+                    wi.workload.active.clone(),
+                )
+            })
+            .collect();
+        pull.retain_live(&live);
+    }
 
     // BIN-PACKING PRE-PASS. Seed one shared remaining-capacity ledger for the whole pass:
     // each node's advertised free capacity MINUS the reservation of every currently-running
@@ -5347,56 +5746,15 @@ pub async fn reconcile_once(
                             .push(format!("{wl}/{replica}: no backend {backend:?}"));
                         continue;
                     };
-                    // Phase 2 (PLAN-compute-managed-db): mint this replica's DYNAMIC database
-                    // credential BEFORE binding resolution, so a DSN injector reads the
-                    // freshly-sealed per-replica credential. Fail CLOSED — a consumer must not
-                    // launch without its credential. A non-consumer workload is a no-op.
-                    if let Some(m) = managed_db
-                        && let Err(e) = m
-                            .mint_dynamic_db_cred(&project_name, &wl, &spec.bindings, replica)
-                            .await
-                    {
-                        report
-                            .errors
-                            .push(format!("{wl}/{replica}: mint dynamic db cred: {e}"));
-                        continue;
-                    }
                     let node_region = region_of_node(nodes, node);
-                    // Resolve declared bindings → env injected into the guest (registers
-                    // the shim token for this replica).
-                    let mut launch_env = match resolver {
-                        Some(r) if !spec.bindings.is_empty() => {
-                            r.resolve_with_env(
-                                &project_name,
-                                &wl,
-                                replica,
-                                &spec.bindings,
-                                &spec.env,
-                            )
-                            .await
-                        }
-                        _ => Vec::new(),
-                    };
-                    // If this workload is a managed database, inject its server-init
-                    // env (POSTGRES_*/MYSQL_*) from the sealed managed credential, so it
-                    // initializes on first boot with the user/password the handler will
-                    // connect as. Empty for a non-managed workload (idempotent).
-                    if let Some(m) = managed_db {
-                        launch_env.extend(m.managed_db_env(&project_name, &wl).await);
-                    }
-                    // A managed DB also gets a privilege strategy (rootless user or a
-                    // cap allowlist) so its stock image can init on a shared-kernel
-                    // backend; applied to the launch spec only, and only where the
-                    // operator has not set `user`/`cap_add` already.
-                    let privilege = match managed_db {
-                        Some(m) => m.managed_db_privilege(&project_name, &wl).await,
-                        None => None,
-                    };
                     // Resolve the registry pull credential for an image-sourced workload,
                     // HOST-SIDE, honoring the project `pull_secret` then the operator host
                     // map, else anonymous. A referenced-but-missing/unauthorized credential
                     // fails CLOSED here (the replica is not launched), never a silent
                     // anonymous pull. A non-image source needs no auth (resolver skipped).
+                    // Resolved BEFORE the pull (the background pull task authenticates with it);
+                    // it reads sealed state only — no per-replica side effect — so re-resolving
+                    // it every tick while the pull is still in flight is safe.
                     let pull_auth = match (registry_auth, &spec.root) {
                         (Some(ra), RootSource::Image(reference)) => {
                             match ra
@@ -5476,6 +5834,157 @@ pub async fn reconcile_once(
                         }
                         _ => None,
                     };
+                    // ACQUIRE THE MATERIALIZED ARTIFACT — the OCI image pull decoupled from this
+                    // serial reconcile pass. With a [`PullCoordinator`] wired, the pull runs as a
+                    // BACKGROUND task and we only POLL its status: NotStarted kicks it off and we
+                    // CONTINUE (skip the launch this tick); InProgress skips-and-continues too — so
+                    // a slow/large pull for THIS workload never stalls the reconcile of the others;
+                    // Ready hands back the fully pulled + digest-verified artifact (every pull bound
+                    // — deadline, byte/zip-bomb/entry caps, digest verify — ran inside the task);
+                    // Failed surfaces as this workload's durable `LaunchFailed` and is retried after
+                    // its cooldown. With no coordinator the pull is awaited INLINE as before (the
+                    // deterministic path). The launch's side effects (mint credential, resolve
+                    // bindings/env, privilege) are DEFERRED to Ready below, so an in-flight pull
+                    // never mints a credential or registers a shim token for a launch not happening.
+                    let artifact = match pull {
+                        Some(coord) => match coord.poll_or_start(
+                            b.clone(),
+                            &project_name,
+                            &wl,
+                            &spec,
+                            &workload.active,
+                            pull_auth.as_ref(),
+                            crate::time::now_unix(),
+                            PULL_RETRY_COOLDOWN_SECS,
+                        ) {
+                            PullStatus::Ready(artifact) => artifact,
+                            PullStatus::Started | PullStatus::InProgress => {
+                                // The image is still pulling — defer this launch off the critical
+                                // path and move on to the next workload. Re-planned + re-polled
+                                // next tick; no durable record yet (the pull is bounded by its
+                                // deadline, after which it surfaces as a Failed record below).
+                                report.pulling += 1;
+                                tracing::debug!(
+                                    project = %project_name,
+                                    workload = %wl,
+                                    replica,
+                                    image = %spec.root.as_str(),
+                                    "compute: image pull in flight — deferring launch off the \
+                                     reconcile critical path",
+                                );
+                                continue;
+                            }
+                            PullStatus::Failed(reason) => {
+                                tracing::warn!(
+                                    project = %project_name,
+                                    workload = %wl,
+                                    replica,
+                                    backend = %backend,
+                                    image = %spec.root.as_str(),
+                                    error = %reason,
+                                    "compute: replica image pull failed",
+                                );
+                                report
+                                    .errors
+                                    .push(format!("{wl}/{replica}: pull: {reason}"));
+                                persist_launch_failed(
+                                    deploy,
+                                    project,
+                                    &project_name,
+                                    &wl,
+                                    replica,
+                                    node,
+                                    &backend,
+                                    reason,
+                                    &workload.active,
+                                    &mut report,
+                                )
+                                .await;
+                                continue;
+                            }
+                        },
+                        // No coordinator: pull INLINE (pre-decoupling behavior). A materialize
+                        // error is surfaced + persisted exactly like a launch error below.
+                        None => match b
+                            .materialize(&project_name, &wl, &spec, pull_auth.as_ref())
+                            .await
+                        {
+                            Ok(artifact) => artifact,
+                            Err(e) => {
+                                let reason = e.to_string();
+                                tracing::warn!(
+                                    project = %project_name,
+                                    workload = %wl,
+                                    replica,
+                                    backend = %backend,
+                                    image = %spec.root.as_str(),
+                                    error = %reason,
+                                    "compute: replica launch failed",
+                                );
+                                report.errors.push(format!("{wl}/{replica}: launch: {e}"));
+                                persist_launch_failed(
+                                    deploy,
+                                    project,
+                                    &project_name,
+                                    &wl,
+                                    replica,
+                                    node,
+                                    &backend,
+                                    reason,
+                                    &workload.active,
+                                    &mut report,
+                                )
+                                .await;
+                                continue;
+                            }
+                        },
+                    };
+
+                    // The image is READY — run the launch's SIDE-EFFECTFUL prep only now.
+                    // Phase 2 (PLAN-compute-managed-db): mint this replica's DYNAMIC database
+                    // credential BEFORE binding resolution, so a DSN injector reads the
+                    // freshly-sealed per-replica credential. Fail CLOSED — a consumer must not
+                    // launch without its credential. A non-consumer workload is a no-op.
+                    if let Some(m) = managed_db
+                        && let Err(e) = m
+                            .mint_dynamic_db_cred(&project_name, &wl, &spec.bindings, replica)
+                            .await
+                    {
+                        report
+                            .errors
+                            .push(format!("{wl}/{replica}: mint dynamic db cred: {e}"));
+                        continue;
+                    }
+                    // Resolve declared bindings → env injected into the guest (registers
+                    // the shim token for this replica).
+                    let mut launch_env = match resolver {
+                        Some(r) if !spec.bindings.is_empty() => {
+                            r.resolve_with_env(
+                                &project_name,
+                                &wl,
+                                replica,
+                                &spec.bindings,
+                                &spec.env,
+                            )
+                            .await
+                        }
+                        _ => Vec::new(),
+                    };
+                    // If this workload is a managed database, inject its server-init
+                    // env (POSTGRES_*/MYSQL_*) from the sealed managed credential, so it
+                    // initializes on first boot with the user/password the handler will
+                    // connect as. Empty for a non-managed workload (idempotent).
+                    if let Some(m) = managed_db {
+                        launch_env.extend(m.managed_db_env(&project_name, &wl).await);
+                    }
+                    // A managed DB also gets a privilege strategy (rootless user or a
+                    // cap allowlist) so its stock image can init on a shared-kernel
+                    // backend; applied to the launch spec only, and only where the
+                    // operator has not set `user`/`cap_add` already.
+                    let privilege = match managed_db {
+                        Some(m) => m.managed_db_privilege(&project_name, &wl).await,
+                        None => None,
+                    };
                     // The workload's resolved priority class, threaded so a delegated backend
                     // (k8s) can map it to its native PriorityClass. CEILING-CLAMPED so a stored
                     // over-ceiling class cannot smuggle its over-ceiling authority onto the
@@ -5492,7 +6001,7 @@ pub async fn reconcile_once(
                             .0
                             .to_string(),
                     );
-                    match launch_one(
+                    match launch_with_artifact(
                         b.as_ref(),
                         &project_name,
                         &wl,
@@ -5501,9 +6010,9 @@ pub async fn reconcile_once(
                         node_region,
                         &spec,
                         &workload.active,
+                        artifact,
                         &launch_env,
                         privilege.as_ref(),
-                        pull_auth.as_ref(),
                         project_opt_out_redaction,
                         priority_class,
                     )
@@ -5514,24 +6023,14 @@ pub async fn reconcile_once(
                             Err(e) => report.errors.push(format!("{wl}/{replica}: persist: {e}")),
                         },
                         Err(e) => {
-                            // The backend `launch` ERRORED — no instance started (image-pull
-                            // denied, no node accepted the placement, a backend fault). Two
-                            // things make this visible instead of a silent gap:
-                            //
-                            //  1) a structured per-failure `warn!` AT the site (project /
-                            //     workload / replica / backend / image ref / error), not just
-                            //     the aggregated "partial" line; and
-                            //  2) a DURABLE `LaunchFailed` replica record carrying the reason,
-                            //     so `compute status` shows the ordinal with its failure and
-                            //     `db status` reports `launch_failed` + reason (instead of "no
-                            //     replicas" / a bare `pending`). The planner relaunches it next
-                            //     tick (the same retry a failed launch always got); a success
-                            //     overwrites this record with a fresh `Starting` one.
-                            //
-                            // The reason is the backend error verbatim — the registry-auth layer
-                            // already sanitizes its errors to name only secret REFS (never a
-                            // credential value), and image refs / registry messages are not
-                            // secret.
+                            // The backend `launch` ERRORED — no instance started (no node
+                            // accepted the placement, a backend fault). Make it visible instead
+                            // of a silent gap: a structured per-failure `warn!` AT the site AND a
+                            // DURABLE `LaunchFailed` replica record carrying the reason, so
+                            // `compute status` shows the ordinal with its failure and `db status`
+                            // reports `launch_failed` + reason. The planner relaunches it next tick
+                            // (the same retry a failed launch always got); a success overwrites
+                            // this record with a fresh `Starting` one.
                             let reason = e.to_string();
                             tracing::warn!(
                                 project = %project_name,
@@ -5542,34 +6041,27 @@ pub async fn reconcile_once(
                                 error = %reason,
                                 "compute: replica launch failed",
                             );
-                            let failed = ObservedInstance {
-                                handle: InstanceHandle {
-                                    project: project_name.clone(),
-                                    workload: wl.clone(),
-                                    replica,
-                                    backend_ref: String::new(),
-                                },
-                                node,
-                                backend: backend.clone(),
-                                endpoint: Endpoint {
-                                    scheme: Scheme::Http,
-                                    host: String::new(),
-                                    port: 0,
-                                },
-                                region: None,
-                                healthy: false,
-                                started_at: None,
-                                phase: ReplicaPhase::Running,
-                                readiness: Readiness::LaunchFailed { reason },
-                                data_dir: None,
-                                snapshot: None,
-                                active_spec: Some(workload.active.clone()),
-                            };
                             report.errors.push(format!("{wl}/{replica}: launch: {e}"));
-                            if let Err(pe) = deploy.set_replica_state(project, &failed).await {
-                                report
-                                    .errors
-                                    .push(format!("{wl}/{replica}: persist launch failure: {pe}"));
+                            persist_launch_failed(
+                                deploy,
+                                project,
+                                &project_name,
+                                &wl,
+                                replica,
+                                node,
+                                &backend,
+                                reason,
+                                &workload.active,
+                                &mut report,
+                            )
+                            .await;
+                            // A launch from a cached-Ready artifact failed — the staged rootfs may
+                            // be gone/corrupt, so DROP the cached pull and re-materialize next tick
+                            // (the inline path got this self-heal for free by re-running
+                            // `materialize`). No-op for the inline `None` path (it re-materializes
+                            // anyway) and cheap when the staging dir is in fact intact.
+                            if let Some(coord) = pull {
+                                coord.invalidate(&backend, &project_name, &wl, &workload.active);
                             }
                         }
                     }
@@ -6081,7 +6573,62 @@ async fn run_post_launch(
     Ok(())
 }
 
-/// Materialize + launch one replica, returning its observed state.
+/// Persist a DURABLE `LaunchFailed` replica record for an ordinal whose launch could not
+/// proceed — a failed/timed-out image pull, a backend `launch` error, or a materialize error.
+/// Keeps `compute status` / `db status` showing the ordinal WITH its reason (instead of a silent
+/// gap or a bare `pending`), and the planner relaunches it next tick (a success overwrites this
+/// with a fresh `Starting`). A persist error is itself surfaced into `report`. The reason is the
+/// backend/pull error verbatim — the registry-auth layer already sanitizes its errors to name
+/// only secret REFS, and image refs / registry messages are not secret.
+#[allow(clippy::too_many_arguments)]
+async fn persist_launch_failed(
+    deploy: &DeployStore,
+    project: ProjectRef<'_>,
+    project_name: &str,
+    workload: &str,
+    replica: u32,
+    node: u64,
+    backend: &str,
+    reason: String,
+    active_spec: &str,
+    report: &mut ReconcileReport,
+) {
+    let failed = ObservedInstance {
+        handle: InstanceHandle {
+            project: project_name.to_string(),
+            workload: workload.to_string(),
+            replica,
+            backend_ref: String::new(),
+        },
+        node,
+        backend: backend.to_string(),
+        endpoint: Endpoint {
+            scheme: Scheme::Http,
+            host: String::new(),
+            port: 0,
+        },
+        region: None,
+        healthy: false,
+        started_at: None,
+        phase: ReplicaPhase::Running,
+        readiness: Readiness::LaunchFailed { reason },
+        data_dir: None,
+        snapshot: None,
+        active_spec: Some(active_spec.to_string()),
+    };
+    if let Err(pe) = deploy.set_replica_state(project, &failed).await {
+        report.errors.push(format!(
+            "{workload}/{replica}: persist launch failure: {pe}"
+        ));
+    }
+}
+
+/// Materialize + launch one replica, returning its observed state. A thin wrapper that pulls the
+/// artifact INLINE (synchronously) then hands off to [`launch_with_artifact`]; the decoupled
+/// reconcile path instead acquires the artifact via the [`PullCoordinator`] and calls
+/// [`launch_with_artifact`] directly, so the two share one launch implementation. Only the
+/// direct-call launch tests still exercise the combined form (reconcile uses the split path).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn launch_one(
     backend: &dyn ComputeBackend,
@@ -6098,12 +6645,50 @@ async fn launch_one(
     project_opt_out_redaction: bool,
     priority_class: Option<String>,
 ) -> Result<ObservedInstance, BackendError> {
-    // The launch wall-clock time, so the next reconcile tick can grant this replica a
-    // startup grace before treating it as a broken launch (see `reconcile_plan`).
-    let started_at = crate::time::now_unix();
     let artifact = backend
         .materialize(project, workload, spec, pull_auth)
         .await?;
+    launch_with_artifact(
+        backend,
+        project,
+        workload,
+        replica,
+        node,
+        node_region,
+        spec,
+        active_spec,
+        artifact,
+        extra_env,
+        privilege,
+        project_opt_out_redaction,
+        priority_class,
+    )
+    .await
+}
+
+/// Launch one replica from an ALREADY-MATERIALIZED artifact, returning its observed state. This
+/// is the half of a launch that runs AFTER the (now decoupled) image pull: fold the resolved
+/// binding env into the spec, apply any managed-DB privilege, launch on the backend, and probe
+/// readiness. Shared by the inline [`launch_one`] and the decoupled reconcile path.
+#[allow(clippy::too_many_arguments)]
+async fn launch_with_artifact(
+    backend: &dyn ComputeBackend,
+    project: &str,
+    workload: &str,
+    replica: u32,
+    node: u64,
+    node_region: Option<String>,
+    spec: &ComputeSpec,
+    active_spec: &str,
+    artifact: Artifact,
+    extra_env: &[(String, String)],
+    privilege: Option<&PrivilegeDirective>,
+    project_opt_out_redaction: bool,
+    priority_class: Option<String>,
+) -> Result<ObservedInstance, BackendError> {
+    // The launch wall-clock time, so the next reconcile tick can grant this replica a
+    // startup grace before treating it as a broken launch (see `reconcile_plan`).
+    let started_at = crate::time::now_unix();
     // Fold the resolved binding env into the launched spec. A hand-set **literal** always
     // wins (never clobbered by a binding default) — EXCEPT a value that is an operator
     // **template** (contains a `{{…}}` placeholder): that is replaced by the resolver's
@@ -8555,6 +9140,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -8572,6 +9158,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -8597,6 +9184,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -8614,6 +9202,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9035,6 +9624,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9089,6 +9679,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9103,6 +9694,558 @@ mod tests {
             "the durable reason survives the observe-loop refresh: {:?}",
             states[0].readiness
         );
+    }
+
+    // =======================================================================================
+    // DECOUPLED-PULL (ROADMAP #11b): the image pull (`materialize`) runs as a background task
+    // OFF the serial reconcile pass; the pass POLLS its status instead of blocking.
+    // =======================================================================================
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A tokio-backed [`PullSpawner`] for the decoupling tests, counting aborts so a test can
+    /// assert that shutdown / workload-removal CANCELS an in-flight pull (no leaked task).
+    struct TokioTestSpawner {
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl PullSpawner for TokioTestSpawner {
+        fn spawn_pull(
+            &self,
+            fut: futures::future::BoxFuture<'static, ()>,
+        ) -> Box<dyn PullTaskHandle> {
+            Box::new(TestPullTask {
+                handle: tokio::spawn(fut),
+                aborts: self.aborts.clone(),
+            })
+        }
+    }
+
+    struct TestPullTask {
+        handle: tokio::task::JoinHandle<()>,
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl PullTaskHandle for TestPullTask {
+        fn abort(&self) {
+            self.handle.abort();
+            self.aborts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn test_coordinator() -> (PullCoordinator, Arc<AtomicUsize>) {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let coord = PullCoordinator::new(Arc::new(TokioTestSpawner {
+            aborts: aborts.clone(),
+        }));
+        (coord, aborts)
+    }
+
+    /// A backend whose `materialize` behavior is controllable PER WORKLOAD: a `gated` workload's
+    /// pull BLOCKS until `release` is set (a simulated slow/large pull); a `fail` workload's pull
+    /// ERRORS (a bad image); otherwise it returns instantly. It counts `materialize` invocations
+    /// per workload so a test can prove the once-guard (an in-flight image isn't pulled twice).
+    #[derive(Clone)]
+    struct GatedBackend {
+        gated: Arc<Mutex<std::collections::BTreeSet<String>>>,
+        fail: Arc<Mutex<std::collections::BTreeSet<String>>>,
+        /// Workloads whose `launch` ERRORS (the materialize succeeds, but the launch from the
+        /// staged artifact fails — exercising the cache-invalidation self-heal).
+        launch_fail: Arc<Mutex<std::collections::BTreeSet<String>>>,
+        release: Arc<AtomicBool>,
+        materialize_calls: Arc<Mutex<BTreeMap<String, usize>>>,
+    }
+
+    impl GatedBackend {
+        fn new() -> Self {
+            Self {
+                gated: Arc::new(Mutex::new(Default::default())),
+                fail: Arc::new(Mutex::new(Default::default())),
+                launch_fail: Arc::new(Mutex::new(Default::default())),
+                release: Arc::new(AtomicBool::new(false)),
+                materialize_calls: Arc::new(Mutex::new(BTreeMap::new())),
+            }
+        }
+        fn gate(self, workload: &str) -> Self {
+            self.gated.lock().unwrap().insert(workload.to_string());
+            self
+        }
+        fn fail_workload(self, workload: &str) -> Self {
+            self.fail.lock().unwrap().insert(workload.to_string());
+            self
+        }
+        fn fail_launch(self, workload: &str) -> Self {
+            self.launch_fail
+                .lock()
+                .unwrap()
+                .insert(workload.to_string());
+            self
+        }
+        fn heal_launch(&self, workload: &str) {
+            self.launch_fail.lock().unwrap().remove(workload);
+        }
+        fn release(&self) {
+            self.release.store(true, Ordering::Relaxed);
+        }
+        fn calls(&self, workload: &str) -> usize {
+            self.materialize_calls
+                .lock()
+                .unwrap()
+                .get(workload)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    #[async_trait]
+    impl ComputeBackend for GatedBackend {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: false,
+                persistent_volumes: false,
+                max_vcpus: None,
+                max_mem_mib: None,
+                preemptible: true,
+            }
+        }
+        async fn materialize(
+            &self,
+            _project: &str,
+            workload: &str,
+            _spec: &ComputeSpec,
+            _pull_auth: Option<&RegistryAuth>,
+        ) -> Result<Artifact, BackendError> {
+            *self
+                .materialize_calls
+                .lock()
+                .unwrap()
+                .entry(workload.to_string())
+                .or_default() += 1;
+            if self.fail.lock().unwrap().contains(workload) {
+                return Err(BackendError::Materialize(format!(
+                    "image pull denied for {workload}"
+                )));
+            }
+            // A gated workload BLOCKS here (off the reconcile pass) until released, standing in
+            // for a slow/large pull. The yield keeps the single-threaded test runtime live.
+            if self.gated.lock().unwrap().contains(workload) {
+                while !self.release.load(Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Ok(Artifact::Rootfs {
+                dir: format!("/fake/{workload}"),
+            })
+        }
+        async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
+            if self.launch_fail.lock().unwrap().contains(&req.workload) {
+                return Err(BackendError::Launch(format!(
+                    "staged rootfs missing for {}",
+                    req.workload
+                )));
+            }
+            Ok(Instance {
+                handle: InstanceHandle {
+                    project: req.project.clone(),
+                    workload: req.workload.clone(),
+                    replica: req.replica,
+                    backend_ref: format!("fake-{}-{}", req.workload, req.replica),
+                },
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                },
+            })
+        }
+        async fn stop(&self, _handle: &InstanceHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn health(&self, _handle: &InstanceHandle) -> Result<Health, BackendError> {
+            Ok(Health::Healthy)
+        }
+    }
+
+    async fn seed_workload(deploy: &DeployStore, name: &str, replicas: u32) {
+        let hash = deploy.put_compute_spec(&spec(1, 128)).await.unwrap();
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: name.into(),
+                    active: hash,
+                    replicas,
+                    placement: Default::default(),
+                    priority: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn reconcile_pull(
+        deploy: &DeployStore,
+        backends: &BackendRegistry,
+        nodes: &[Node],
+        pull: &PullCoordinator,
+    ) -> ReconcileReport {
+        reconcile_once(
+            deploy,
+            backends,
+            nodes,
+            &BackendPolicy::default(),
+            &FixedActivity(WorkloadActivity::Active),
+            None,
+            None,
+            None,
+            BinPackTuning::default(),
+            Some(pull),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// CORE #11b: a SLOW pull for workload `slow` does NOT block the reconcile of `fast` — `fast`
+    /// launches while `slow`'s pull is still in flight (the blast-radius decoupling).
+    #[tokio::test]
+    async fn slow_pull_does_not_block_a_siblings_reconcile() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        seed_workload(&deploy, "fast", 1).await;
+        seed_workload(&deploy, "slow", 1).await;
+        let gated = GatedBackend::new().gate("slow");
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(gated.clone()));
+        let nodes = vec![fake_node()];
+        let (pull, _aborts) = test_coordinator();
+
+        // Pass 1 kicks BOTH pulls off the critical path and launches neither this tick.
+        let r1 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(
+            r1.launched, 0,
+            "no launch while pulls are starting: {:?}",
+            r1
+        );
+        assert_eq!(r1.pulling, 2, "both pulls deferred off the pass");
+
+        // Let the UN-gated `fast` pull settle; `slow` stays blocked (never released).
+        pull.wait_for_settled(1).await;
+
+        // Pass 2: `fast` is Ready → launches; `slow` is still pulling → deferred. The decisive
+        // assertion: a running replica for `fast` exists WHILE `slow`'s pull is in flight.
+        let r2 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(
+            r2.launched, 1,
+            "fast launches while slow still pulls: {:?}",
+            r2
+        );
+        assert_eq!(r2.pulling, 1, "slow is still deferred");
+        let fast = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "fast")
+            .await
+            .unwrap();
+        assert_eq!(fast.len(), 1);
+        assert_eq!(fast[0].phase, ReplicaPhase::Running);
+        let slow = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "slow")
+            .await
+            .unwrap();
+        assert!(
+            slow.is_empty(),
+            "slow has NOT launched (its pull is in flight)"
+        );
+        let (in_flight, ready, failed) = pull.counts();
+        assert_eq!(
+            (in_flight, ready, failed),
+            (1, 1, 0),
+            "slow in-flight, fast ready",
+        );
+
+        // Release slow so the runtime has no blocked task lingering at test end.
+        gated.release();
+        pull.wait_for_settled(2).await;
+    }
+
+    /// CORE #11b: a replica launches ONLY after ITS OWN image is Ready — pass 1 (pull starting)
+    /// launches nothing and writes no replica row; the launch happens on a later pass.
+    #[tokio::test]
+    async fn launch_waits_for_its_own_pull_to_be_ready() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        seed_workload(&deploy, "w", 1).await;
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(GatedBackend::new()));
+        let nodes = vec![fake_node()];
+        let (pull, _aborts) = test_coordinator();
+
+        let r1 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(r1.launched, 0, "no launch before the pull is Ready");
+        assert_eq!(r1.pulling, 1);
+        assert!(
+            deploy
+                .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+                .await
+                .unwrap()
+                .is_empty(),
+            "no replica row while the pull is in flight (no launch on a partial image)",
+        );
+
+        pull.wait_for_settled(1).await;
+        let r2 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(r2.launched, 1, "launches once its image is Ready: {:?}", r2);
+        let states = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].phase, ReplicaPhase::Running);
+    }
+
+    /// CORE #11b: a FAILED pull surfaces as that workload's error + a durable `LaunchFailed`
+    /// record, and does NOT wedge the loop — a healthy sibling still launches.
+    #[tokio::test]
+    async fn failed_pull_surfaces_and_does_not_wedge_the_loop() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        seed_workload(&deploy, "bad", 1).await;
+        seed_workload(&deploy, "good", 1).await;
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert(
+            "fake".into(),
+            Arc::new(GatedBackend::new().fail_workload("bad")),
+        );
+        let nodes = vec![fake_node()];
+        let (pull, _aborts) = test_coordinator();
+
+        // Pass 1 kicks both pulls.
+        let _ = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        pull.wait_for_settled(2).await;
+
+        // Pass 2: `bad` surfaces its failure; `good` launches (the loop is NOT wedged).
+        let r2 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(
+            r2.launched, 1,
+            "the healthy sibling still launches: {:?}",
+            r2
+        );
+        assert!(
+            r2.errors
+                .iter()
+                .any(|e| e.contains("bad") && e.contains("pull:")),
+            "the failed pull is surfaced as a pull error: {:?}",
+            r2.errors
+        );
+        let bad = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "bad")
+            .await
+            .unwrap();
+        assert_eq!(bad.len(), 1, "a durable record for the failed ordinal");
+        match &bad[0].readiness {
+            Readiness::LaunchFailed { reason } => {
+                assert!(
+                    reason.contains("image pull denied"),
+                    "carries the reason: {reason}"
+                );
+            }
+            other => panic!("expected LaunchFailed, got {other:?}"),
+        }
+        let good = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "good")
+            .await
+            .unwrap();
+        assert_eq!(good.len(), 1);
+        assert_eq!(good[0].phase, ReplicaPhase::Running);
+    }
+
+    /// CORE #11b: an in-flight pull for an image is NOT started twice — the once-guard. A
+    /// workload with TWO replicas (same spec ⇒ same pull key) pulls exactly ONCE.
+    #[tokio::test]
+    async fn in_flight_pull_is_not_started_twice() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        seed_workload(&deploy, "w", 2).await;
+        let gated = GatedBackend::new();
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(gated.clone()));
+        let nodes = vec![fake_node()];
+        let (pull, _aborts) = test_coordinator();
+
+        // Pass 1 plans TWO launches (ordinals 0 + 1); both share one pull key, so the second
+        // sees the first's InProgress and does NOT spawn a second pull.
+        let r1 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(r1.pulling, 2, "both ordinals deferred this tick");
+        assert_eq!(pull.tracked(), 1, "exactly one pull slot for the workload");
+        pull.wait_for_settled(1).await;
+        assert_eq!(
+            gated.calls("w"),
+            1,
+            "materialize ran exactly ONCE for the two replicas (once-guard)",
+        );
+
+        // Both replicas then launch from the single shared, Ready artifact.
+        let r2 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(
+            r2.launched, 2,
+            "both replicas launch from the one pull: {:?}",
+            r2
+        );
+        assert_eq!(
+            gated.calls("w"),
+            1,
+            "still exactly one pull after the launches"
+        );
+    }
+
+    /// CORE #11b: dropping the coordinator (shutdown) ABORTS an in-flight pull task — it is not
+    /// leaked as a detached task.
+    #[tokio::test]
+    async fn shutdown_aborts_an_in_flight_pull() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        seed_workload(&deploy, "slow", 1).await;
+        let gated = GatedBackend::new().gate("slow");
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(gated));
+        let nodes = vec![fake_node()];
+        let (pull, aborts) = test_coordinator();
+
+        let r1 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(r1.pulling, 1, "the pull is in flight (blocked)");
+        assert_eq!(pull.counts().0, 1, "one in-flight slot");
+        assert_eq!(aborts.load(Ordering::Relaxed), 0, "not aborted yet");
+
+        // Drop the coordinator: its `Drop` aborts the in-flight pull task (the task holds only a
+        // Weak ref, so it never kept the coordinator alive). Yield so the abort takes effect.
+        drop(pull);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            aborts.load(Ordering::Relaxed),
+            1,
+            "the in-flight pull task was aborted on shutdown (no leak)",
+        );
+    }
+
+    /// CORE #11b: a cached pull whose workload is DELETED is pruned (and its in-flight task
+    /// aborted) by `retain_live`, so a vanished workload leaks neither artifact nor task.
+    #[tokio::test]
+    async fn retain_live_prunes_a_vanished_workloads_pull() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        seed_workload(&deploy, "w", 1).await;
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(GatedBackend::new()));
+        let nodes = vec![fake_node()];
+        let (pull, _aborts) = test_coordinator();
+
+        // Kick + settle the pull, then launch (so there's a Ready slot).
+        let _ = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        pull.wait_for_settled(1).await;
+        let _ = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(pull.tracked(), 1, "one cached pull");
+
+        // Delete the workload, then reconcile: the GC prunes the now-orphaned pull slot.
+        deploy
+            .delete_compute_workload(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        let _ = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(pull.tracked(), 0, "the vanished workload's pull was pruned");
+    }
+
+    /// CORE #11b: a launch from a cached `Ready` artifact that FAILS (the staged rootfs vanished)
+    /// INVALIDATES the cache, so the image is RE-pulled on a later pass rather than the stale
+    /// artifact being re-launched forever — the self-heal the inline path got from re-materialize.
+    #[tokio::test]
+    async fn launch_failure_invalidates_the_cached_pull_and_re_materializes() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        seed_workload(&deploy, "w", 1).await;
+        let gated = GatedBackend::new().fail_launch("w");
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(gated.clone()));
+        let nodes = vec![fake_node()];
+        let (pull, _aborts) = test_coordinator();
+
+        // Pass 1 kicks the pull; settle it to a cached Ready artifact.
+        let _ = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        pull.wait_for_settled(1).await;
+        assert_eq!(gated.calls("w"), 1);
+        assert_eq!(pull.tracked(), 1, "one cached Ready artifact");
+
+        // Pass 2: launch from the cached artifact FAILS → the slot is invalidated (dropped).
+        let r2 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(r2.launched, 0);
+        assert!(
+            r2.errors.iter().any(|e| e.contains("launch:")),
+            "{:?}",
+            r2.errors
+        );
+        assert_eq!(
+            pull.tracked(),
+            0,
+            "the cached pull was invalidated after the launch failure",
+        );
+
+        // Heal the backend. Pass 3 RE-pulls (materialize runs again — proof the cache was
+        // dropped, not re-launched stale); settle, then pass 4 launches.
+        gated.heal_launch("w");
+        let _ = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        pull.wait_for_settled(1).await;
+        assert_eq!(
+            gated.calls("w"),
+            2,
+            "the image was RE-materialized, not re-launched stale"
+        );
+        let r4 = reconcile_pull(&deploy, &backends, &nodes, &pull).await;
+        assert_eq!(r4.launched, 1, "launches cleanly once re-pulled: {:?}", r4);
+    }
+
+    // --- ContentStageLocks (the per-content staging serialization backing the fs-race fix) ---
+
+    #[test]
+    fn content_stage_locks_same_key_is_one_lock_different_keys_independent() {
+        let locks = ContentStageLocks::new();
+        let a1 = locks.lock_for("image:x.b0");
+        let a2 = locks.lock_for("image:x.b0");
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "same content key hands out the SAME lock (same-content stagers serialize)",
+        );
+        let b = locks.lock_for("image:y.b0");
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "different content keys are independent locks (different-content stays parallel)",
+        );
+    }
+
+    #[tokio::test]
+    async fn content_stage_locks_serialize_same_key_but_not_a_different_key() {
+        let locks = ContentStageLocks::new();
+        let a = locks.lock_for("k");
+        let _held = a.lock().await; // hold the "k" content lock (a stager is mid-stage)
+        // A second acquirer of the SAME content key is blocked — it cannot stage concurrently.
+        let a2 = locks.lock_for("k");
+        assert!(
+            a2.try_lock().is_none(),
+            "a same-content stager is serialized behind the holder",
+        );
+        // A DIFFERENT content key is NOT blocked — the lock is per content, never global.
+        let other = locks.lock_for("other");
+        assert!(
+            other.try_lock().is_some(),
+            "a different-content stager runs in parallel",
+        );
+    }
+
+    #[test]
+    fn content_stage_locks_sweeps_idle_keys() {
+        let locks = ContentStageLocks::new();
+        {
+            let _a = locks.lock_for("a");
+            assert_eq!(locks.tracked_keys(), 1);
+        }
+        // "a" is now idle (no holder). The next acquisition sweeps it, so the map stays bounded
+        // to content actively being staged rather than growing with every image ever staged.
+        let _b = locks.lock_for("b");
+        assert_eq!(locks.tracked_keys(), 1, "idle 'a' swept; only 'b' tracked");
     }
 
     /// A backend whose running replica's live endpoint DRIFTS out from under the stored
@@ -9218,6 +10361,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9247,6 +10391,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9308,6 +10453,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9336,6 +10482,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9367,6 +10514,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9439,6 +10587,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9556,6 +10705,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9623,6 +10773,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9689,6 +10840,7 @@ mod tests {
                 None,
                 None,
                 BinPackTuning::default(),
+                None,
             )
             .await
             .unwrap()
@@ -9800,6 +10952,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9865,6 +11018,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -9953,6 +11107,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -10051,6 +11206,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -10093,6 +11249,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -10131,6 +11288,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -10283,6 +11441,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -11084,6 +12243,7 @@ mod tests {
             None,
             None,
             BinPackTuning::default(),
+            None,
         )
         .await
         .unwrap();
@@ -11196,6 +12356,7 @@ mod tests {
                 None,
                 None,
                 tuning,
+                None,
             )
             .await
             .unwrap()

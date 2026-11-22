@@ -2288,6 +2288,7 @@ dependencies = [
  "block2",
  "boatramp-core",
  "boatramp-types",
+ "bytes",
  "dispatch2",
  "futures",
  "ipnet",

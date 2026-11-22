@@ -15,9 +15,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_core::Storage;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RootSource, RootSourceKind, Scheme, Snapshot,
-    SourceSupport, compute_instance_id,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, ContentStageLocks, Endpoint,
+    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, RootSourceKind,
+    Scheme, Snapshot, SourceSupport, compute_instance_id,
 };
 use boatramp_core::registry_auth::RegistryAuth;
 use futures::StreamExt;
@@ -72,6 +72,11 @@ pub struct VmmBackend {
     bridge: String,
     /// Per-node guest-IP pool.
     ipam: Mutex<IpPool>,
+    /// Per-content staging locks: with the decoupled pull the reconcile loop stages blobs
+    /// concurrently, so every microVM racing to stage the one shared kernel (or a shared rootfs)
+    /// would otherwise stream into the same `.tmp` at once. These serialize same-content stagers
+    /// so exactly one streams and the rest reuse the published blob (see [`ContentStageLocks`]).
+    stage_locks: ContentStageLocks,
 }
 
 impl VmmBackend {
@@ -92,6 +97,7 @@ impl VmmBackend {
             data_dir,
             bridge,
             ipam: Mutex::new(ipam),
+            stage_locks: ContentStageLocks::new(),
         })
     }
 
@@ -105,6 +111,18 @@ impl VmmBackend {
     ) -> Result<String, BackendError> {
         let dir = self.data_dir.join("compute").join(subdir);
         let dest = dir.join(format!("{hash}{ext}"));
+        // Fast path: an already-staged blob is reused with no lock.
+        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            return Ok(dest.display().to_string());
+        }
+        // Serialize same-content stagers (the decoupled pull stages concurrently): without this,
+        // N microVMs sharing a kernel/rootfs each `File::create` the same `.tmp` and interleave
+        // writes → a corrupt published blob. The winner streams + renames; the rest reuse it.
+        let lock = self
+            .stage_locks
+            .lock_for(&format!("blob:{subdir}:{hash}{ext}"));
+        let _guard = lock.lock().await;
+        // Double-check under the lock: a peer may have published while we waited.
         if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
             return Ok(dest.display().to_string());
         }

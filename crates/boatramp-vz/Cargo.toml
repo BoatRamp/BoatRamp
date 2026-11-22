@@ -104,6 +104,8 @@ tokio = { workspace = true, features = [
 boatramp-core.workspace = true
 boatramp-types.workspace = true
 serde_json.workspace = true
+# The staging-race test builds an in-memory `Storage` whose `get` streams `Bytes`.
+bytes.workspace = true
 
 [lints]
 workspace = true

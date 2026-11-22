@@ -1152,6 +1152,28 @@ pub(super) async fn await_warm(
     }
 }
 
+/// Production [`PullSpawner`](boatramp_core::compute::PullSpawner): runs each workload's
+/// background image pull on the tokio runtime, keeping the pull off the serial reconcile pass.
+struct TokioPullSpawner;
+
+impl boatramp_core::compute::PullSpawner for TokioPullSpawner {
+    fn spawn_pull(
+        &self,
+        fut: futures::future::BoxFuture<'static, ()>,
+    ) -> Box<dyn boatramp_core::compute::PullTaskHandle> {
+        Box::new(TokioPullTask(tokio::spawn(fut)))
+    }
+}
+
+/// A handle to a tokio-spawned pull task; `abort` cancels it (idempotent, a no-op once done).
+struct TokioPullTask(tokio::task::JoinHandle<()>);
+
+impl boatramp_core::compute::PullTaskHandle for TokioPullTask {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
 /// Spawn the leader-gated compute reconcile loop:
 /// every `tick`, while `is_leader()`, run one [`reconcile_once`] pass over the
 /// backend registry + node inventory to converge each workload's replicas. A
@@ -1176,6 +1198,13 @@ pub fn spawn_compute_reconcile(
         // drive scale-to-zero from the gateway's per-workload activity —
         // a workload idle for `idle_timeout` is slept, a requested one is woken.
         let activity = gateway::GatewayActivitySource::new(idle_timeout);
+        // Decouple each workload's OCI image pull (`materialize`) from the serial reconcile
+        // critical path: this coordinator — OWNED for the loop's lifetime so pull state (in
+        // flight / ready / failed) persists across ticks — runs each pull as a background task
+        // and lets `reconcile_once` POLL it, so one tenant's big/slow pull can't stall the
+        // reconcile of every other workload on the node.
+        let pull =
+            boatramp_core::compute::PullCoordinator::new(std::sync::Arc::new(TokioPullSpawner));
         let mut interval = tokio::time::interval(tick);
         loop {
             // Periodic convergence, or an immediate wake-from-zero nudge from the
@@ -1198,6 +1227,7 @@ pub fn spawn_compute_reconcile(
                 registry_auth.as_deref(),
                 snapshot_store.as_deref(),
                 tuning,
+                Some(&pull),
             )
             .await
             {

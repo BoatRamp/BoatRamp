@@ -29,9 +29,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_core::Storage;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RootSource, RootSourceKind, Scheme, Snapshot,
-    SourceSupport, VolumeRef, compute_instance_id,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, ContentStageLocks, Endpoint,
+    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, RootSourceKind,
+    Scheme, Snapshot, SourceSupport, VolumeRef, compute_instance_id,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
 use boatramp_core::registry_auth::RegistryAuth;
@@ -162,6 +162,11 @@ pub struct VzBackend {
     verifier: Arc<dyn KernelVerifier>,
     /// Whether a spec's `writable_root` is honored (single-tenant posture only).
     writable_root_allowed: bool,
+    /// Per-content staging locks: with the decoupled pull the reconcile loop stages blobs
+    /// concurrently, so every VM racing to stage the one shared kernel (or a shared rootfs) would
+    /// otherwise stream into the same `.tmp` at once. These serialize same-content stagers so
+    /// exactly one streams and the rest reuse the published blob (see [`ContentStageLocks`]).
+    stage_locks: ContentStageLocks,
 }
 
 impl VzBackend {
@@ -188,6 +193,7 @@ impl VzBackend {
             running: Mutex::new(HashMap::new()),
             verifier,
             writable_root_allowed: false,
+            stage_locks: ContentStageLocks::new(),
         })
     }
 
@@ -218,6 +224,18 @@ impl VzBackend {
     ) -> Result<String, BackendError> {
         let dir = self.data_dir.join("compute").join(subdir);
         let dest = dir.join(format!("{hash}{ext}"));
+        // Fast path: an already-staged blob is reused with no lock.
+        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            return Ok(dest.display().to_string());
+        }
+        // Serialize same-content stagers (the decoupled pull stages concurrently): without this,
+        // N VMs sharing a kernel/rootfs each `File::create` the same `.tmp` and interleave writes
+        // → a corrupt published blob. The winner streams + renames; the rest reuse it.
+        let lock = self
+            .stage_locks
+            .lock_for(&format!("blob:{subdir}:{hash}{ext}"));
+        let _guard = lock.lock().await;
+        // Double-check under the lock: a peer may have published while we waited.
         if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
             return Ok(dest.display().to_string());
         }
@@ -720,5 +738,204 @@ mod tests {
         // Round-trips as the single JSON argv element the worker parses.
         let json = serde_json::to_string(&cfg).unwrap();
         assert_eq!(serde_json::from_str::<WorkerConfig>(&json).unwrap(), cfg);
+    }
+
+    // --- staging-race fix: `stage_blob` serializes same-content stagers (the decoupled pull
+    //     reconcile loop now stages concurrently; every VM shares the one kernel) ---
+
+    use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, StorageError};
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `Storage` serving one in-memory blob for every `get`, COUNTING its `get` calls and
+    /// streaming it in two chunks with a yield between — so two concurrent stagers of the SAME
+    /// blob would, absent the per-content lock, both `get` and interleave writes to the shared
+    /// `.tmp` (a corrupt published blob). With the lock, `get` happens exactly once and the loser
+    /// reuses the winner's published blob.
+    #[derive(Clone)]
+    struct CountingStorage {
+        blob: Vec<u8>,
+        gets: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CountingStorage {
+        async fn get(&self, _key: &str) -> Result<GetObject, StorageError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            let half = self.blob.len() / 2;
+            let first = Bytes::copy_from_slice(&self.blob[..half]);
+            let second = Bytes::copy_from_slice(&self.blob[half..]);
+            let body: ByteStream = Box::pin(futures::stream::unfold(0u8, move |step| {
+                let (first, second) = (first.clone(), second.clone());
+                async move {
+                    match step {
+                        0 => Some((Ok(first), 1u8)),
+                        1 => {
+                            tokio::task::yield_now().await;
+                            Some((Ok(second), 2u8))
+                        }
+                        _ => None,
+                    }
+                }
+            }));
+            Ok(GetObject {
+                meta: ObjectMeta {
+                    key: String::new(),
+                    size: Some(self.blob.len() as u64),
+                    content_type: None,
+                    etag: None,
+                },
+                body,
+            })
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            Err(StorageError::unsupported("range"))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: ByteStream,
+            _: PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::unsupported("put"))
+        }
+        async fn head(&self, _: &str) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn stage_test_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "boatramp-vztest-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn stage_backend(storage: Arc<dyn Storage>, data_dir: PathBuf) -> Arc<VzBackend> {
+        Arc::new(
+            VzBackend::new(
+                storage,
+                PathBuf::from("/proc/self/exe"),
+                data_dir,
+                "192.168.64.0/24",
+                Arc::new(crate::AllowAnyKernel),
+            )
+            .expect("backend"),
+        )
+    }
+
+    /// Two concurrent stagers of the SAME blob stage it exactly ONCE and the other reuses the
+    /// published blob — no ENOENT-rename, no corruption, no spurious failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_stage_blob_of_same_content_stages_once_and_reuses() {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let blob = vec![7u8; 4096];
+        let storage = Arc::new(CountingStorage {
+            blob: blob.clone(),
+            gets: gets.clone(),
+        });
+        let data_dir = stage_test_dir("same");
+        let backend = stage_backend(storage, data_dir.clone());
+        let hash = "a".repeat(64);
+
+        let (b1, b2, h1, h2) = (backend.clone(), backend.clone(), hash.clone(), hash.clone());
+        let t1 = tokio::spawn(async move { b1.stage_blob(&h1, "rootfs", ".ext4").await });
+        let t2 = tokio::spawn(async move { b2.stage_blob(&h2, "rootfs", ".ext4").await });
+        let d1 = t1
+            .await
+            .unwrap()
+            .expect("stager 1 did not fail (no ENOENT race)");
+        let d2 = t2
+            .await
+            .unwrap()
+            .expect("stager 2 did not fail (no ENOENT race)");
+
+        assert_eq!(d1, d2, "both stagers resolve to the SAME published blob");
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "the blob was fetched + staged exactly ONCE (same-content de-dupe at the fs layer)",
+        );
+        assert_eq!(
+            std::fs::read(&d1).unwrap(),
+            blob,
+            "the published blob is intact (no interleaved concurrent writes)",
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Different-content stagers run in PARALLEL — the lock is per content key, never global —
+    /// so each stages its own blob (two fetches, two distinct published paths).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_stage_blob_of_different_content_runs_in_parallel() {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(CountingStorage {
+            blob: vec![3u8; 2048],
+            gets: gets.clone(),
+        });
+        let data_dir = stage_test_dir("diff");
+        let backend = stage_backend(storage, data_dir.clone());
+
+        let (b1, b2) = (backend.clone(), backend.clone());
+        let (h1, h2) = ("a".repeat(64), "b".repeat(64));
+        let t1 = tokio::spawn(async move { b1.stage_blob(&h1, "rootfs", ".ext4").await });
+        let t2 = tokio::spawn(async move { b2.stage_blob(&h2, "rootfs", ".ext4").await });
+        let d1 = t1.await.unwrap().expect("stage 1");
+        let d2 = t2.await.unwrap().expect("stage 2");
+
+        assert_ne!(d1, d2, "different content → different published paths");
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            2,
+            "different content keys stage independently (per-content lock, not a global one)",
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// An already-published blob is reused via the fast path with NO fetch (the warm steady
+    /// state and the no-remove-of-a-ready-artifact-in-use guarantee: a reader is never disrupted).
+    #[tokio::test]
+    async fn stage_blob_reuses_a_published_blob_without_refetching() {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let blob = vec![9u8; 1024];
+        let storage = Arc::new(CountingStorage {
+            blob: blob.clone(),
+            gets: gets.clone(),
+        });
+        let data_dir = stage_test_dir("reuse");
+        let backend = stage_backend(storage, data_dir.clone());
+        let hash = "c".repeat(64);
+
+        let first = backend.stage_blob(&hash, "rootfs", ".ext4").await.unwrap();
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+        // Second call: fast-path reuse, no refetch, no touch of the published file.
+        let second = backend.stage_blob(&hash, "rootfs", ".ext4").await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "reused — not refetched or re-published"
+        );
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            blob,
+            "published blob untouched"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
