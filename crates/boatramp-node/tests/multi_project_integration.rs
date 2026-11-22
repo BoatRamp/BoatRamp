@@ -330,6 +330,7 @@ impl ComputeBackend for FakeComputeBackend {
             workload: handle.workload.clone(),
             replica: handle.replica,
             data_ref: format!("snap|{}|{}", inst.ip, inst.port),
+            exported: false,
         }))
     }
 
@@ -534,6 +535,7 @@ async fn reconcile(
         &nodes(),
         &BackendPolicy::default(),
         &AlwaysActive,
+        None,
         None,
         None,
         None,

@@ -154,6 +154,7 @@ pub(super) async fn delete_project(
     State(deploy): State<DeployStore>,
     Extension(deprovisioner): Extension<Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>>>,
     Extension(volumes): Extension<Option<Arc<dyn boatramp_core::compute::ComputeVolumes>>>,
+    Extension(snapshot_store): Extension<Option<Arc<dyn boatramp_core::compute::SnapshotStore>>>,
     Path(proj): Path<String>,
     Query(q): Query<DeleteProjectQuery>,
 ) -> Response {
@@ -176,7 +177,7 @@ pub(super) async fn delete_project(
     }
 
     if q.force {
-        return force_delete_project(&deploy, deprovisioner, volumes, &proj).await;
+        return force_delete_project(&deploy, deprovisioner, volumes, snapshot_store, &proj).await;
     }
 
     // The failsafe path — unchanged: delete only an empty project.
@@ -206,6 +207,7 @@ async fn force_delete_project(
     deploy: &DeployStore,
     deprovisioner: Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>>,
     volumes: Option<Arc<dyn boatramp_core::compute::ComputeVolumes>>,
+    snapshot_store: Option<Arc<dyn boatramp_core::compute::SnapshotStore>>,
     proj: &str,
 ) -> Response {
     use boatramp_core::project::ProjectRef;
@@ -283,6 +285,28 @@ async fn force_delete_project(
                 project = proj,
                 volumes = ?orphaned,
                 "force-delete: no volume-capable backend wired; leaving compute volumes on disk"
+            ),
+        }
+    }
+
+    // 8a. U14 data-retention: sweep any parked cross-node snapshots the tenant's replicas
+    //     exported to Storage (`csnap/<project>/…` — raw guest RAM that may hold secrets/PII).
+    //     Must run BEFORE `purge_project` nukes the replica-state records, after which the
+    //     reconcile's own per-replica cleanup can never Stop them. Best-effort + logged: a
+    //     storage hiccup must not abort the cascade (a lingering snapshot is a lesser evil than a
+    //     half-deleted project, and the operator's Storage lifecycle still reclaims the orphan).
+    if let Some(snapshot_store) = &snapshot_store {
+        match snapshot_store.remove_project(proj).await {
+            Ok(n) if n > 0 => tracing::info!(
+                project = proj,
+                removed = n,
+                "force-delete: swept parked cross-node snapshots"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                project = proj,
+                error = %err,
+                "force-delete: sweeping parked snapshots failed (leaving them orphaned)"
             ),
         }
     }
@@ -378,6 +402,42 @@ mod tests {
         async fn remove(&self, name: &str, force: bool) -> Result<bool, VolumeError> {
             self.removed.lock().unwrap().push((name.to_string(), force));
             Ok(true)
+        }
+    }
+
+    /// Records which projects the force-delete cascade swept parked snapshots for (U14).
+    #[derive(Default)]
+    struct RecordingSnapshotStore {
+        swept: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl boatramp_core::compute::SnapshotStore for RecordingSnapshotStore {
+        async fn export(
+            &self,
+            _key: &boatramp_core::compute::SnapshotKey,
+            _art: &boatramp_core::compute::SnapshotArtifact,
+        ) -> Result<(), boatramp_core::compute::SnapshotStoreError> {
+            Ok(())
+        }
+        async fn import(
+            &self,
+            _key: &boatramp_core::compute::SnapshotKey,
+            _art: &boatramp_core::compute::SnapshotArtifact,
+        ) -> Result<bool, boatramp_core::compute::SnapshotStoreError> {
+            Ok(false)
+        }
+        async fn remove(
+            &self,
+            _key: &boatramp_core::compute::SnapshotKey,
+        ) -> Result<(), boatramp_core::compute::SnapshotStoreError> {
+            Ok(())
+        }
+        async fn remove_project(
+            &self,
+            project: &str,
+        ) -> Result<usize, boatramp_core::compute::SnapshotStoreError> {
+            self.swept.lock().unwrap().push(project.to_string());
+            Ok(0)
         }
     }
 
@@ -490,6 +550,7 @@ mod tests {
                 State(deploy.clone()),
                 Extension(None),
                 Extension(None),
+                Extension(None),
                 Path("acme".to_string()),
                 Query(DeleteProjectQuery {
                     force: false,
@@ -531,6 +592,7 @@ mod tests {
                 State(deploy.clone()),
                 Extension(Some(deprov.clone() as Arc<dyn TenantDeprovisioner>)),
                 Extension(Some(vols.clone() as Arc<dyn ComputeVolumes>)),
+                Extension(None),
                 Path("acme".to_string()),
                 Query(DeleteProjectQuery {
                     force: true,
@@ -590,6 +652,34 @@ mod tests {
         );
     }
 
+    /// U14 data-retention: the force-delete cascade sweeps the tenant's parked cross-node
+    /// snapshots (`csnap/<project>/`) so a purged tenant's guest-RAM never orphans in Storage.
+    #[tokio::test]
+    async fn force_delete_sweeps_parked_snapshots() {
+        let deploy = deploy();
+        seed_full_project(&deploy, "acme").await;
+        let snaps = Arc::new(RecordingSnapshotStore::default());
+
+        let resp = delete_project(
+            State(deploy.clone()),
+            Extension(None),
+            Extension(None),
+            Extension(Some(
+                snaps.clone() as Arc<dyn boatramp_core::compute::SnapshotStore>
+            )),
+            Path("acme".to_string()),
+            Query(DeleteProjectQuery {
+                force: true,
+                dry_run: false,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The cascade asked the snapshot store to purge exactly this project's parked snapshots.
+        assert_eq!(*snaps.swept.lock().unwrap(), vec!["acme".to_string()]);
+        assert!(deploy.get_project("acme").await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn non_force_nonempty_is_409_with_enumeration() {
         let deploy = deploy();
@@ -597,6 +687,7 @@ mod tests {
 
         let resp = delete_project(
             State(deploy.clone()),
+            Extension(None),
             Extension(None),
             Extension(None),
             Path("acme".to_string()),
@@ -626,6 +717,7 @@ mod tests {
         let deploy = deploy();
         let resp = delete_project(
             State(deploy.clone()),
+            Extension(None),
             Extension(None),
             Extension(None),
             Path(DEFAULT_PROJECT.to_string()),

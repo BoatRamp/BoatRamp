@@ -21,8 +21,8 @@ use boatramp_core::Storage;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, DataDirOwnership, Endpoint,
     ExecOutput, ForeignOwnedEntry, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
-    RootSource, RootSourceKind, Scheme, Snapshot, SourceSupport, VolumeInfo, compute_instance_id,
-    compute_volume_scope,
+    RootSource, RootSourceKind, Scheme, Snapshot, SnapshotArtifact, SourceSupport, VolumeInfo,
+    compute_instance_id, compute_volume_scope,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
 use boatramp_core::registry_auth::RegistryAuth;
@@ -1281,6 +1281,8 @@ impl ComputeBackend for ContainerBackend {
             workload: handle.workload.clone(),
             replica: handle.replica,
             data_ref: format!("{stem}|{ip}|{port}"),
+            // Set by the reconcile once the artifact is exported to tenant Storage (U14).
+            exported: false,
         }))
     }
 
@@ -1386,6 +1388,28 @@ impl ComputeBackend for ContainerBackend {
                 port,
             },
         })
+    }
+
+    /// U14 cross-node s2z — DEFERRED for the container (CRIU) backend: this returns `None`, so
+    /// a CRIU-parked workload stays strictly SAME-NODE (the snapshot never leaves the home
+    /// node and the planner never re-places a wake). A `None` here also means
+    /// [`snapshot_present`](ComputeBackend::snapshot_present) keeps its default `true`, so a
+    /// same-node wake restores from the local CRIU image directly, exactly as before U14.
+    ///
+    /// LIMITATION (why deferred): a CRIU **restore** needs the container's rootfs tree
+    /// materialized on the target node (`--root <rootfs>`), and that rootfs is derived from
+    /// the live mounts at park time — NOT reconstructable on a node that never ran the
+    /// container. Exporting the CRIU image to tenant Storage without that would upload/download
+    /// on every park/wake only to fail `restore` and cold-start anyway (wasted I/O + storage),
+    /// and the "criu dir non-empty ⇒ present" residue could make a later wake skip the fetch,
+    /// fail `restore`, and retry rather than cold-start. Container cross-node is deferred until
+    /// rootfs re-materialization on the resume node is wired; the microVM (embedded firecracker)
+    /// backend remains full cross-node. See `../boatramp-roadmap` for the follow-up.
+    async fn snapshot_artifact(
+        &self,
+        _snapshot: &Snapshot,
+    ) -> Result<Option<SnapshotArtifact>, BackendError> {
+        Ok(None)
     }
 
     /// **Exec** (docker-exec style): run `argv` inside the already-running

@@ -81,6 +81,9 @@ async-trait.workspace = true
 tar.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# `Bytes` for the streaming `ByteStream` chunks the compute-snapshot store (U14 cross-node
+# scale-to-zero) pushes to / pulls from tenant-scoped Storage. Tiny, always-present dep.
+bytes.workspace = true
 # `compat` adapters (tokio <-> futures AsyncRead/Write) for the project-export driver:
 # it streams a bundle member file (tokio) through `ComputeBackend::run_ephemeral`'s
 # std-agnostic `futures` stdin/stdout. Optional — pulled only by `project-export`.

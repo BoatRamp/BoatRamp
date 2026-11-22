@@ -3069,6 +3069,13 @@ pub struct ServerOptions {
     /// fail-closed (no desired workload + container gone) before any destroy. Wired by the
     /// node with the compute backends + store.
     pub compute_reaper: Option<Arc<dyn boatramp_core::compute::ComputeReaper>>,
+    /// U14 cross-node scale-to-zero snapshot store. Used by the project force-delete cascade to
+    /// sweep a purged tenant's parked snapshots (`csnap/<project>/`) — guest-RAM images that may
+    /// hold secrets/PII — so they never orphan in Storage after the tenant is gone (`purge_project`
+    /// nukes the replica-state records directly, so the reconcile's own per-replica cleanup never
+    /// Stops them). `None` ⇒ cross-node s2z off / no blob backend ⇒ nothing to orphan. Wired by
+    /// the node alongside the reconcile's snapshot store.
+    pub snapshot_store: Option<Arc<dyn boatramp_core::compute::SnapshotStore>>,
     /// The project-scoped internal secret store (sealed with the `[secrets]`
     /// envelope). Backs the admin secrets API (`/api/projects/{proj}/secrets{,/{name}}`,
     /// rewritten onto `/api/secrets{,/{name}}`) — set/list/delete of names + metadata,
@@ -5630,6 +5637,7 @@ mod tests {
                 workload: workload.into(),
                 replica: 0,
                 data_ref: "snap-0".into(),
+                exported: false,
             }),
             active_spec: None,
         }
