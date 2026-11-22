@@ -1457,12 +1457,41 @@ async fn compute_priority_dry_run(
     let mut same: Vec<PreviewVictim> = Vec::new();
     let mut cross = CrossProjectImpact::default();
     let mut cross_projects: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Per-project ceiling cache so the VICTIM resolve clamps exactly as reconcile's
+    // `plan_preemptions` does: a victim whose stored class now exceeds its project ceiling is
+    // weighed at the ceiling tier (= more preemptible). Without this the preview under-counts.
+    // Seeded with the viewer's own ceiling (already resolved by the handler).
+    let mut ceiling_cache: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+    ceiling_cache.insert(viewer_project.to_string(), ceiling.map(str::to_string));
     for (vproj, vwl) in &all {
         // Skip the proposed workload itself.
         if vproj == viewer_project && vwl.name == name {
             continue;
         }
-        if !catalog.may_preempt(priority, viewer_project, &vwl.priority, vproj) {
+        // The victim project's CURRENT ceiling (cached), fail-closed to the node default ceiling
+        // on an unreadable record — the same fetch reconcile's `project_ceilings` map uses.
+        let victim_ceiling = if let Some(c) = ceiling_cache.get(vproj) {
+            c.clone()
+        } else {
+            let c = match deploy
+                .get_project_backend_policy(boatramp_core::project::ProjectRef::new(vproj))
+                .await
+            {
+                Ok(p) => p.and_then(|pp| pp.priority_ceiling),
+                Err(_) => None,
+            };
+            ceiling_cache.insert(vproj.clone(), c.clone());
+            c
+        };
+        if !catalog.may_preempt_clamped(
+            priority,
+            viewer_project,
+            ceiling,
+            &vwl.priority,
+            vproj,
+            victim_ceiling.as_deref(),
+        ) {
             continue;
         }
         // The victim's per-replica sizing (for the freed-capacity aggregate).

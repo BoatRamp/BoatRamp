@@ -2690,6 +2690,7 @@ mod tests {
                     reference: "img:latest".into(),
                 },
                 redaction,
+                priority_class: None,
             }
         };
 

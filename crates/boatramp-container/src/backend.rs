@@ -4028,6 +4028,7 @@ mod tests {
                 dir: "/tmp/x".into(),
             },
             redaction,
+            priority_class: None,
         }
     }
 

@@ -1627,6 +1627,37 @@ impl PriorityClassCatalog {
             victim_project,
         )
     }
+
+    /// [`may_preempt`](Self::may_preempt) but with CEILING-CLAMPED resolves on BOTH sides, so a
+    /// preview weighs a stored over-ceiling class exactly as reconcile's [`plan_preemptions`]
+    /// does (which clamps both preemptor and victim via [`resolve_clamped`](Self::resolve_clamped)
+    /// against each project's current ceiling). The VICTIM clamp is the one that matters for
+    /// parity: without it a victim whose stored class exceeds its project ceiling reads at its
+    /// (higher) stored tier and wrongly appears un-preemptible, so a dry-run preview UNDER-COUNTS
+    /// relative to what reconcile would actually evict. `preemptor_ceiling` / `victim_ceiling` are
+    /// each project's current ceiling class name (`None` ⇒ the node default ceiling, fail-closed);
+    /// an all-at/under-ceiling fleet behaves identically to [`may_preempt`].
+    pub fn may_preempt_clamped(
+        &self,
+        preemptor: &Priority,
+        preemptor_project: &str,
+        preemptor_ceiling: Option<&str>,
+        victim: &Priority,
+        victim_project: &str,
+        victim_ceiling: Option<&str>,
+    ) -> bool {
+        let (_, pc) = self.resolve_clamped(preemptor, preemptor_ceiling);
+        let (_, vc) = self.resolve_clamped(victim, victim_ceiling);
+        can_preempt(
+            pc.tier,
+            preemptor.rank,
+            pc.preemption,
+            preemptor_project,
+            vc.tier,
+            victim.rank,
+            victim_project,
+        )
+    }
 }
 
 /// The neutral fallback class a totally-malformed catalog resolve lands on (tier 0, within-
