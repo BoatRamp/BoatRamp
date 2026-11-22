@@ -1721,11 +1721,38 @@ impl Reservation {
 /// surfaces the replica in the reconcile report. It is a last resort: a legacy record's
 /// `active_spec` is backfilled to the workload's active spec on observation, and a live
 /// workload's active spec resolves — so it bites only a genuinely orphaned replica whose
-/// spec blob is gone. Tunable should an operator's unresolved replicas run materially larger.
+/// spec blob is gone. Operator-tunable via [`BinPackTuning::unresolved_reservation`] should
+/// an operator's unresolved replicas run materially larger; this `const` is the back-compat
+/// DEFAULT ([`BinPackTuning::default`] reproduces it exactly).
 const UNRESOLVED_RESERVATION: Reservation = Reservation {
     vcpus: 1,
     mem_mib: 1024,
 };
+
+/// Operator-tunable knobs for one reconcile pass's cumulative bin-packing. Currently just the
+/// conservative reservation floor charged to a **running** replica whose reservation can't be
+/// resolved (see [`running_replica_reservation`]). [`Default`] reproduces the built-in
+/// [`UNRESOLVED_RESERVATION`] floor EXACTLY, so an operator who configures nothing keeps
+/// today's behavior — the floor is derived from the node's `[compute]` config at serve wiring
+/// and threaded into [`reconcile_once`]. It is an **operator** knob (System·Admin, node-side),
+/// never tenant-settable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinPackTuning {
+    /// The floor charged to an unresolvable running replica — [`UNRESOLVED_RESERVATION`] by
+    /// default. An operator raises it when their genuinely-orphaned replicas legitimately run
+    /// larger than the conservative 1 vCPU + 1 GiB default, so the floor still prevents the
+    /// over-subscription the bin-packing pre-pass exists to close. Charging **zero** would
+    /// re-open that gap, so an operator who sets it is responsible for keeping it non-trivial.
+    pub unresolved_reservation: Reservation,
+}
+
+impl Default for BinPackTuning {
+    fn default() -> Self {
+        Self {
+            unresolved_reservation: UNRESOLVED_RESERVATION,
+        }
+    }
+}
 
 /// Per-node **remaining** schedulable capacity for a single reconcile pass, threaded
 /// (mutable) across the pass's per-workload placement loop so that cumulative placements of
@@ -3293,6 +3320,7 @@ pub async fn reconcile_once(
     resolver: Option<&dyn ComputeBindingResolver>,
     managed_db: Option<&dyn ManagedDbEnvResolver>,
     registry_auth: Option<&dyn RegistryAuthResolver>,
+    tuning: BinPackTuning,
 ) -> Result<ReconcileReport, crate::error::DeployError> {
     let mut report = ReconcileReport::default();
     // Per-backend capabilities (the planner gates scale-to-zero on them).
@@ -3316,6 +3344,43 @@ pub async fn reconcile_once(
     // handed to the earliest such workload in this order.
     workloads.sort_by(|(pa, wa), (pb, wb)| pa.cmp(pb).then_with(|| wa.name.cmp(&wb.name)));
 
+    // Each workload's active spec + replica states, fetched exactly ONCE for this tick.
+    struct WorkloadTickInputs {
+        project_name: String,
+        workload: ComputeWorkload,
+        /// The workload's current active spec (`None` ⇒ its spec blob is missing — the main
+        /// loop surfaces that and skips the workload; the pre-pass uses it as the running-
+        /// replica fallback reservation).
+        active_spec: Option<ComputeSpec>,
+        /// The workload's observed replica states.
+        replica_states: Vec<ObservedInstance>,
+    }
+    // SINGLE per-workload KV read for this tick. The bin-packing pre-pass and the per-workload
+    // planning loop below both need each workload's active spec and replica states; read them
+    // ONCE here and thread the result through both passes, halving the spec + replica-state
+    // reads per workload per tick. This is OUTPUT-IDENTICAL, not merely cheaper: the pre-pass
+    // is read-only, and the planning loop writes only the CURRENT workload's own replica states
+    // (and launches/stops its own replicas) — never another workload's states, and never a spec
+    // blob (specs are immutable, content-addressed). So nothing mutates a workload's spec or
+    // states between the two reads this replaces, and a single read returns exactly what both
+    // reads did (the pre-pass fully precedes the planning loop, so the planning loop's own
+    // writes to a workload never predate that workload's cached read either).
+    let tick_inputs: Vec<WorkloadTickInputs> = {
+        let mut v = Vec::with_capacity(workloads.len());
+        for (project_name, workload) in workloads {
+            let project = ProjectRef::new(&project_name);
+            let active_spec = deploy.get_compute_spec(&workload.active).await?;
+            let replica_states = deploy.list_replica_states(project, &workload.name).await?;
+            v.push(WorkloadTickInputs {
+                project_name,
+                workload,
+                active_spec,
+                replica_states,
+            });
+        }
+        v
+    };
+
     // BIN-PACKING PRE-PASS. Seed one shared remaining-capacity ledger for the whole pass:
     // each node's advertised free capacity MINUS the reservation of every currently-running
     // replica (across all projects/workloads). Threaded (mutable) through every workload's
@@ -3328,12 +3393,10 @@ pub async fn reconcile_once(
         // Resolved reservation per spec content-hash (or confirmed-missing), cached across the
         // pre-pass so a workload's many replicas (same `active_spec`) don't each re-fetch.
         let mut spec_res_cache: BTreeMap<String, Option<Reservation>> = BTreeMap::new();
-        for (project_name, workload) in &workloads {
-            let project = ProjectRef::new(project_name);
-            // The workload's current active spec — the fallback reservation for a running
-            // replica whose OWN launched spec can't be resolved.
-            let workload_spec = deploy.get_compute_spec(&workload.active).await?;
-            for state in deploy.list_replica_states(project, &workload.name).await? {
+        for wi in &tick_inputs {
+            // The workload's current active spec (`wi.active_spec`) is the fallback reservation
+            // for a running replica whose OWN launched spec can't be resolved.
+            for state in &wi.replica_states {
                 // Only a RUNNING replica with a LIVE instance occupies vCPU/memory. Skip:
                 //  - a Zero (parked) or terminal replica (phase != Running) — it holds none
                 //    (its reserved IP is tracked separately via `parked_keys`); and
@@ -3355,8 +3418,9 @@ pub async fn reconcile_once(
                 let res = running_replica_reservation(
                     deploy,
                     &mut spec_res_cache,
-                    &state,
-                    workload_spec.as_ref(),
+                    state,
+                    wi.active_spec.as_ref(),
+                    tuning.unresolved_reservation,
                     &mut report,
                 )
                 .await?;
@@ -3365,10 +3429,18 @@ pub async fn reconcile_once(
         }
     }
 
-    // The owning project threads through every replica-state read/write below.
-    for (project_name, workload) in workloads {
+    // The owning project threads through every replica-state read/write below. Each workload's
+    // active spec + replica states were already fetched ONCE into `tick_inputs` above (shared
+    // with the pre-pass) — reuse them here rather than re-reading the store.
+    for wi in tick_inputs {
+        let WorkloadTickInputs {
+            project_name,
+            workload,
+            active_spec,
+            replica_states,
+        } = wi;
         let project = ProjectRef::new(&project_name);
-        let Some(spec) = deploy.get_compute_spec(&workload.active).await? else {
+        let Some(spec) = active_spec else {
             report
                 .errors
                 .push(format!("{}: active spec missing", workload.name));
@@ -3377,7 +3449,7 @@ pub async fn reconcile_once(
 
         // Observed replica state + a health refresh (skipping parked Zero
         // replicas — they're intentionally down).
-        let mut observed = deploy.list_replica_states(project, &workload.name).await?;
+        let mut observed = replica_states;
         // Ordinals the backend reports as running an OUTDATED deployment shape (the
         // `needs_redeploy` auto-heal — e.g. a docker container on the wrong primary
         // network): the planner recreates them like a spec-changed replica.
@@ -4021,8 +4093,8 @@ pub async fn reconcile_once(
 ///    (resolved or confirmed-missing) so a workload's many replicas don't each re-fetch;
 /// 2. the workload's current active spec — a same-workload proxy, and for a stale replica
 ///    about to be recreated, exactly the sizing it will take on;
-/// 3. the conservative [`UNRESOLVED_RESERVATION`] floor, with the replica surfaced in the
-///    report.
+/// 3. the conservative `floor` ([`BinPackTuning::unresolved_reservation`], defaulting to
+///    [`UNRESOLVED_RESERVATION`]), with the replica surfaced in the report.
 ///
 /// **Fail-safe:** an unresolvable replica is never charged ZERO — that would overstate the
 /// node's free capacity and re-open the over-subscription this pass exists to prevent. A
@@ -4034,6 +4106,7 @@ async fn running_replica_reservation(
     cache: &mut BTreeMap<String, Option<Reservation>>,
     state: &ObservedInstance,
     workload_spec: Option<&ComputeSpec>,
+    floor: Reservation,
     report: &mut ReconcileReport,
 ) -> Result<Reservation, crate::error::DeployError> {
     // 1) The replica's own launched spec, by content hash (cached: resolved or missing).
@@ -4057,17 +4130,17 @@ async fn running_replica_reservation(
     if let Some(spec) = workload_spec {
         return Ok(Reservation::of_spec(spec));
     }
-    // 3) FAIL-SAFE: neither resolves — charge a conservative floor, never zero, and surface it.
+    // 3) FAIL-SAFE: neither resolves — charge the conservative floor, never zero, and surface it.
     report.errors.push(format!(
         "{}/{}: bin-packing: cannot resolve reservation (launched spec {} and workload active \
          spec both missing); charging conservative {}MiB/{}vCPU floor to avoid over-subscription",
         state.handle.workload,
         state.handle.replica,
         state.active_spec.as_deref().unwrap_or("<none>"),
-        UNRESOLVED_RESERVATION.mem_mib,
-        UNRESOLVED_RESERVATION.vcpus,
+        floor.mem_mib,
+        floor.vcpus,
     ));
-    Ok(UNRESOLVED_RESERVATION)
+    Ok(floor)
 }
 
 /// Whether the reconcile should run the **read-only** data-dir-ownership diagnosis for a
@@ -6509,6 +6582,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6524,6 +6598,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6547,6 +6622,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6562,6 +6638,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6653,6 +6730,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6705,6 +6783,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6830,6 +6909,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6857,6 +6937,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6915,6 +6996,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6941,6 +7023,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -6969,6 +7052,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7037,6 +7121,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7151,6 +7236,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7216,6 +7302,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7280,6 +7367,7 @@ mod tests {
                 None,
                 None,
                 None,
+                BinPackTuning::default(),
             )
             .await
             .unwrap()
@@ -7387,6 +7475,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7450,6 +7539,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7535,6 +7625,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7630,6 +7721,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7669,6 +7761,7 @@ mod tests {
             None,
             Some(&failing),
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7705,6 +7798,7 @@ mod tests {
             None,
             Some(&ok),
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -7852,6 +7946,7 @@ mod tests {
             None,
             None,
             None,
+            BinPackTuning::default(),
         )
         .await
         .unwrap();
@@ -8541,6 +8636,259 @@ mod tests {
         assert!(
             r.contains("required backend `vmm` is not eligible"),
             "required-backend reason: {r}"
+        );
+    }
+
+    /// A counting [`KvStore`](crate::kv::KvStore) wrapper: delegates every operation to an inner
+    /// store but tallies the two reads `reconcile_once` must issue exactly ONCE per workload per
+    /// tick — the compute SPEC fetch (`get` on a `computever/<hash>` key) and the per-workload
+    /// REPLICA-STATE listing (`list_prefix` on a `.../compute_state/<workload>/` prefix).
+    struct CountingKv {
+        inner: Arc<dyn crate::kv::KvStore>,
+        spec_gets: std::sync::atomic::AtomicUsize,
+        replica_state_listings: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingKv {
+        fn new(inner: Arc<dyn crate::kv::KvStore>) -> Self {
+            Self {
+                inner,
+                spec_gets: std::sync::atomic::AtomicUsize::new(0),
+                replica_state_listings: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn reset(&self) {
+            self.spec_gets
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.replica_state_listings
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn spec_gets(&self) -> usize {
+            self.spec_gets.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn replica_state_listings(&self) -> usize {
+            self.replica_state_listings
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl crate::kv::KvStore for CountingKv {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            // Compute spec keys are `computever/<hash>` (`spec_key`).
+            if key.starts_with(&spec_key("")) {
+                self.spec_gets
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), crate::kv::KvError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            // A per-workload replica-state listing is `project/<p>/compute_state/<workload>/`;
+            // exclude the project-wide `.../compute_state/` form (which `reconcile_once` never
+            // uses) so only `list_replica_states` is tallied.
+            if prefix.contains("/compute_state/") && !prefix.ends_with("/compute_state/") {
+                self.replica_state_listings
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    /// 4c regression lock: `reconcile_once` fetches each workload's active spec AND its replica
+    /// states exactly ONCE per tick. The bin-packing pre-pass and the per-workload planning loop
+    /// now share a single read instead of each issuing its own (the former double-fetch), so N
+    /// workloads issue N spec gets + N replica-state listings (not 2N) — and placement is
+    /// unchanged (each workload still launches its replica through the deduped path).
+    #[tokio::test]
+    async fn reconcile_fetches_each_workloads_spec_and_states_once() {
+        const N: usize = 3;
+        let counting = Arc::new(CountingKv::new(Arc::new(crate::kv::MemoryKv::new())));
+        let deploy = DeployStore::new(Arc::new(NullStorage), counting.clone());
+
+        for i in 0..N {
+            let hash = deploy.put_compute_spec(&spec(1, 128)).await.unwrap();
+            deploy
+                .set_compute_workload(
+                    crate::project::ProjectRef::DEFAULT,
+                    &ComputeWorkload {
+                        version: 1,
+                        name: format!("w{i}"),
+                        active: hash,
+                        replicas: 1,
+                        placement: Default::default(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let nodes = vec![fake_node()];
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(FakeBackend));
+        let policy = BackendPolicy::default();
+
+        // Measure only the reconcile pass (setup writes above don't touch the tallied read
+        // paths, but reset to be unambiguous).
+        counting.reset();
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            None,
+            None,
+            BinPackTuning::default(),
+        )
+        .await
+        .unwrap();
+        // Capture the counters BEFORE the verification listings below (which would also count).
+        let spec_gets = counting.spec_gets();
+        let replica_state_listings = counting.replica_state_listings();
+
+        // Placement is unchanged: every workload launches its one replica with no errors.
+        assert_eq!(r.launched, N, "every workload launches: {:?}", r.errors);
+        assert!(r.errors.is_empty(), "no errors: {:?}", r.errors);
+
+        // THE DEDUP: exactly one active-spec fetch + one replica-states listing PER workload —
+        // N, not the 2N the pre-pass + planning loop issued before sharing a single read.
+        assert_eq!(
+            spec_gets, N,
+            "one active-spec fetch per workload (was 2N across pre-pass + planning loop)"
+        );
+        assert_eq!(
+            replica_state_listings, N,
+            "one replica-states listing per workload (was 2N)"
+        );
+
+        // Each workload really did place its replica (placement intact through the deduped path).
+        for i in 0..N {
+            let states = deploy
+                .list_replica_states(crate::project::ProjectRef::DEFAULT, &format!("w{i}"))
+                .await
+                .unwrap();
+            assert_eq!(states.len(), 1, "w{i} has exactly one running replica");
+        }
+    }
+
+    /// 4b: the conservative reservation floor the bin-packing pre-pass charges a RUNNING replica
+    /// whose reservation can't be resolved is OPERATOR-configurable via [`BinPackTuning`]. With
+    /// the floor omitted ([`BinPackTuning::default`]) it is the built-in 1 vCPU + 1 GiB; a larger
+    /// operator floor reserves more of the node, so a second workload that fits under the default
+    /// no longer does. The floor is a `reconcile_once` parameter (wired from node `[compute]`
+    /// config) — an operator knob, never derived from a tenant's workload spec.
+    #[tokio::test]
+    async fn unresolved_reservation_floor_is_operator_configurable() {
+        // A fresh world per run: a 4 vCPU / 4096 MiB node, a workload `orphan` with one RUNNING
+        // replica whose reservation is UNRESOLVABLE (its own launched spec AND its workload's
+        // active spec are both absent from the store, so the pre-pass charges the floor), and a
+        // second workload `fill` wanting one 3 vCPU / 3000 MiB replica.
+        async fn run(tuning: BinPackTuning) -> ReconcileReport {
+            let deploy =
+                DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+
+            // `orphan`: active pointer to a spec that was never stored ⇒ the workload spec (the
+            // reservation fallback) is unresolvable.
+            deploy
+                .set_compute_workload(
+                    crate::project::ProjectRef::DEFAULT,
+                    &ComputeWorkload {
+                        version: 1,
+                        name: "orphan".into(),
+                        active: "missing-active-hash".into(),
+                        replicas: 1,
+                        placement: Default::default(),
+                    },
+                )
+                .await
+                .unwrap();
+            // Its one RUNNING replica, whose OWN launched spec hash is also absent ⇒ neither spec
+            // resolves and the pre-pass charges the configurable floor against node 1.
+            let mut rep = observed("orphan", 0, 1, true);
+            rep.backend = "fake".into();
+            rep.active_spec = Some("missing-replica-hash".into());
+            deploy
+                .set_replica_state(crate::project::ProjectRef::DEFAULT, &rep)
+                .await
+                .unwrap();
+
+            // `fill`: a valid workload wanting one 3 vCPU / 3000 MiB replica.
+            let fill_hash = deploy.put_compute_spec(&spec(3, 3000)).await.unwrap();
+            deploy
+                .set_compute_workload(
+                    crate::project::ProjectRef::DEFAULT,
+                    &ComputeWorkload {
+                        version: 1,
+                        name: "fill".into(),
+                        active: fill_hash,
+                        replicas: 1,
+                        placement: Default::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let nodes = vec![node(
+                1,
+                "eu",
+                4,
+                4096,
+                &[("fake", IsolationClass::Namespace)],
+            )];
+            let mut backends: BackendRegistry = BTreeMap::new();
+            backends.insert("fake".into(), Arc::new(FakeBackend));
+            let policy = BackendPolicy::default();
+            reconcile_once(
+                &deploy,
+                &backends,
+                &nodes,
+                &policy,
+                &AlwaysActive,
+                None,
+                None,
+                None,
+                tuning,
+            )
+            .await
+            .unwrap()
+        }
+
+        // DEFAULT floor (1 vCPU / 1024 MiB): node 1 has (3 vCPU / 3072 MiB) left after charging
+        // the orphan ⇒ `fill` (3 / 3000) fits and launches.
+        let r_default = run(BinPackTuning::default()).await;
+        assert_eq!(
+            r_default.launched, 1,
+            "under the default floor `fill` fits and launches: {:?}",
+            r_default.errors
+        );
+
+        // A LARGER operator floor (4 vCPU / 4096 MiB) consumes the whole node, so `fill` no
+        // longer fits — same workloads, same node, only the operator knob changed.
+        let r_big = run(BinPackTuning {
+            unresolved_reservation: Reservation {
+                vcpus: 4,
+                mem_mib: 4096,
+            },
+        })
+        .await;
+        assert_eq!(
+            r_big.launched, 0,
+            "a larger operator floor reserves the node, so `fill` can't place: {:?}",
+            r_big.errors
+        );
+        assert!(
+            r_big
+                .errors
+                .iter()
+                .any(|e| e.contains("fill") && e.contains("not scheduled")),
+            "the held workload is surfaced as not scheduled: {:?}",
+            r_big.errors
         );
     }
 }

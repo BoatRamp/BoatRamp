@@ -1291,6 +1291,24 @@ pub struct ComputeConfig {
     /// detected total. A non-zero value reserves exactly that many MiB. Keeps a node
     /// from advertising RAM into host OOM. Env: `BOATRAMP_COMPUTE_MEM_RESERVE_MIB`.
     pub mem_reserve_mib: u32,
+    /// **vCPU** override for the bin-packing scheduler's *unresolved-reservation floor* — the
+    /// conservative amount the cumulative pre-pass charges a still-RUNNING replica whose own
+    /// launched spec AND its workload's active spec are both unresolvable (a genuinely orphaned
+    /// replica). Counting it as zero would overstate the node's free capacity and re-open the
+    /// over-subscription the pre-pass exists to prevent, so a non-trivial floor is charged
+    /// instead. `None` (the default) ⇒ the built-in **1 vCPU** floor. Raise it when your
+    /// genuinely-orphaned replicas legitimately run larger; a `0` is honored but defeats the
+    /// floor's purpose (over-subscription). **Operator-only** (node config / System·Admin),
+    /// never tenant-settable. Pairs with [`unresolved_reservation_mib`](Self::unresolved_reservation_mib).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_reservation_vcpus: Option<u32>,
+    /// **Memory (MiB)** override for the bin-packing *unresolved-reservation floor* — the
+    /// memory counterpart of [`unresolved_reservation_vcpus`](Self::unresolved_reservation_vcpus).
+    /// `None` (the default) ⇒ the built-in **1024 MiB (1 GiB)** floor. Each dimension overrides
+    /// independently (an unset one keeps its built-in default). **Operator-only**, never
+    /// tenant-settable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_reservation_mib: Option<u32>,
     /// **Static** kernel-signing public keys (`"<alg>:<hex>"`) — the trust anchor
     /// for the posture-scaled kernel bar. Under `multi-tenant`, a dynamically-
     /// selected default kernel must carry a signature verifying against one of
@@ -1733,6 +1751,8 @@ impl Default for ComputeConfig {
             vcpus: 0,
             mem_mib: 0,
             mem_reserve_mib: 0,
+            unresolved_reservation_vcpus: None,
+            unresolved_reservation_mib: None,
             kernel_signing_pubkeys: vec![BOATRAMP_KERNEL_SIGNING_PUBKEY.to_string()],
             kernel_allowed_hashes: default_allowed_kernel_hashes(),
             region: None,
