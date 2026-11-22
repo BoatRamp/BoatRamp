@@ -5,7 +5,7 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [Unreleased]
+## [0.71.0] — 2026-11-22
 
 ### Breaking
 
@@ -38,6 +38,78 @@ versions.
   (`authz::Action`/`Resource`, `cwt::TokenAlg`/`TokenPublicKey`/`LocalSigner`), which are
   intentionally left sealed-by-exhaustive-match as a compile-time safety control. See the audit in
   the PR for the per-type rationale.
+
+### Added
+
+- **Single-mode RLS opt-in.** `rls_session: true` is now honored for single/default-mode
+  managed-Postgres projects (previously only the Shared non-default cell): boatramp provisions a
+  stable **non-superuser app role that owns nothing** (the bootstrap superuser still owns the
+  schema, sidestepping PG ownership-orphaning) and serves guest connections as that role, so a plain
+  `ENABLE ROW LEVEL SECURITY` binds the guest. A broad fail-closed guard — a live
+  `rolsuper OR rolbypassrls` probe on the handler path, a static by-name backstop on the DSN
+  composition path — refuses to serve any `rls_session` Postgres posture as a superuser/BYPASSRLS
+  role. The migration/superuser identity stays off the default guest DSN. Default (un-opted) serving
+  is byte-for-byte unchanged; a mutation-proven cross-account live gate is wired into CI.
+- **Mutual-RPK TLS + channel-bound tokens (rpk-bootstrap-tls stage 5).** The control-plane RPK-TLS
+  listener can now require **mutual** raw-public-key auth and bind a holder (`cnf`) token to its TLS
+  channel: the client presents its token's `cnf` key as the RFC 7250 client identity and the server
+  asserts the presented key equals the token's `leaf_cnf`, so a stolen token replayed off its
+  channel — or a MITM — fails. Additive to the per-request DPoP proof (never replaces it); gated by
+  a new tighten-only `require_channel_bound_tokens` posture (off by default); closes the documented
+  cross-node DPoP replay window. Stages 1–4 are unchanged when the posture is off.
+- **Cross-node scale-to-zero (U14).** A parked compute replica's snapshot is now exported to
+  **tenant-scoped Storage** (sealed with an authenticated-integrity envelope over the archive
+  digest) so it can wake on a different node, not only the one that parked it: the planner prefers
+  the home node and re-places cross-node only when home is gone/full **and** the export succeeded,
+  with a clean cold-start fallback. Off by default (`[compute] cross_node_scale_to_zero`); microVM
+  workloads get full cross-node, container (CRIU) stays same-node until rootfs re-materialization
+  lands. The snapshot store is swept on project teardown and bounded by an import byte cap.
+- **Sub-path mounts (`base_path`).** An opt-in additive `base_path` on a deploy config serves an app
+  under a path prefix (e.g. `/myapp`) instead of only at the site root; the mount is stripped before
+  app-internal routing and re-added on server-generated redirects, mirrored on the Cloudflare edge.
+  The operator gateway tier (routes + reserved paths) is judged on the **full external path**, so a
+  tenant `base_path` can never shadow an operator-reserved route (an overlapping operator route
+  wins; a disjoint one 404s on that based deploy — fail-closed).
+- **`boatramp config set` refuses a posture-invalid write at set time.** A `config set` that would
+  loosen a tighten-only posture knob or exceed a posture-derived ceiling is now refused client-side
+  with an explanatory error **before** the request, instead of surfacing as a bare server `400`. The
+  posture ceilings are advertised by the admin-gated `GET /api/daemon/config`; the server remains
+  authoritative (validate-before-commit retained as defense in depth).
+- **`brt_` token prefix.** Freshly minted plain tokens now carry a `brt_` transport prefix (appended
+  after signing, outside the signed bytes); verification is lenient — the prefix is stripped before
+  decode — so legacy prefix-less tokens still verify unchanged.
+- **Testable control-plane library seam (node-library N3/N4).** The reconcile `trait ControlPlane`
+  and the apply driver (helper sequencing + dry-run plan assembly) moved out of the CLI binary into
+  `boatramp_node::reconcile`, so the ordering contract (config-before-activate; tenancy/databases
+  before sites; deferred compose after functions) is now covered by mock-driven library tests. CLI
+  behavior is byte-for-byte unchanged.
+- **Shared `KvStore` conformance for SlateDB + Cloudflare-KV, plus snapshot drift-guards.** The
+  SlateDB backend now runs the shared `KvStore` conformance suite at the merge gate (Cloudflare-KV
+  as a credentialed, `#[ignore]`-gated capability marker); new `insta` snapshot tests pin the MCP
+  tool-schema and the on-disk/API config serialization against silent drift.
+
+### Security
+
+- **OCI pull disk-fill bounds (#11a).** On top of v0.70.0's compressed-download caps, layer unpack
+  is now bounded against **decompressed** size (a gzip zip-bomb aborts fail-closed before filling
+  the node disk — per-layer and whole-rootfs ceilings), against **hard-link copy amplification** (the
+  `fs::copy` fallback's bytes are charged against the same decompressed budget), and against
+  **inode exhaustion** (a `max_tar_entries` cap). All operator-configurable under
+  `[compute].registry_pull_limits`.
+- **Image pull decoupled from the serial reconcile (#11b).** A slow or large image pull no longer
+  blocks the reconcile of every other workload on a node: each workload's pull runs as a background
+  task the reconcile polls, and the launch side-effects (dynamic DB credential mint, shim-token
+  registration, privilege) now run only **after** the pull is ready — which also removes a
+  pre-existing leak where the old inline path minted a fresh credential/token on every in-flight or
+  failed tick. Same-content stagers are serialized by a per-content lock (the content cache is
+  public-images-only; per-project pull-auth is unchanged).
+
+### Changed
+
+- **Default managed-compute kernel bumped to the signed v0.3.0 vmlinux (6.12 LTS, Landlock ABI
+  ≥5).** The built-in per-arch content-hash trust anchor now pins the 6.12 kernel (verified
+  end-to-end against the unchanged built-in signing pubkey); an operator pinning an older kernel can
+  extend `kernel_allowed_hashes` in their own config.
 
 ## [0.70.0] — 2026-11-22
 
