@@ -1844,7 +1844,11 @@ pub fn explain_backend(
 
 /// One candidate backend's placement verdict for a workload — the per-backend row
 /// `compute get` surfaces so an operator sees WHY each backend was or wasn't chosen.
+/// `#[non_exhaustive]`: a library OUTPUT (the engine builds it; downstream only reads its
+/// fields), so a future verdict field is additive — a consumer never constructs one, and a
+/// `#[non_exhaustive]` struct still permits the in-crate literal the engine builds it with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BackendCandidate {
     /// Backend id.
     pub backend: String,
@@ -1862,6 +1866,7 @@ pub struct BackendCandidate {
 /// in here (it is node-level and surfaced in the `not scheduled: …` reason); this answers
 /// "which backends may run this workload, and which would be picked".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PlacementExplain {
     /// Every distinct advertised backend (by id, across the node inventory), each with its
     /// verdict, sorted by id for a stable view.
@@ -5713,6 +5718,15 @@ async fn run_post_launch(
                     }
                     Err(e) => return Err(format!("post-launch exec {argv:?}: {e}")),
                 }
+            }
+            // `PostLaunchAction` is `#[non_exhaustive]`: a workload declaring an action kind
+            // this server version does not understand fails the action fail-closed (never a
+            // silent skip), so a newer-client spec on an older node surfaces as a provisioning
+            // failure rather than quietly running an under-provisioned replica.
+            other => {
+                return Err(format!(
+                    "post-launch action kind not supported by this server version: {other:?}"
+                ));
             }
         }
     }
@@ -10478,10 +10492,7 @@ mod priority_tests {
 
     fn wl_region(name: &str, replicas: u32, priority: Priority, region: &str) -> ComputeWorkload {
         let mut w = wl(name, replicas, priority);
-        w.placement = PlacementConstraints {
-            regions: vec![region.to_string()],
-            labels: BTreeMap::new(),
-        };
+        w.placement = PlacementConstraints::new().with_regions(vec![region.to_string()]);
         w
     }
 

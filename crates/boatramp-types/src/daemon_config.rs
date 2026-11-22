@@ -36,8 +36,13 @@ pub struct KernelRef {
 }
 
 /// Fleet-wide compute defaults (each `None` = defer to the file baseline).
+///
+/// `#[non_exhaustive]`: this operator-config record grows new fleet knobs over time, so
+/// downstream crates build it via [`ComputeDefaults::new`] + the `with_*` setters rather than
+/// a struct literal — a later knob is then an additive, non-breaking field.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ComputeDefaults {
     /// Kernel used when a workload's [`ComputeSpec`](crate::compute::ComputeSpec)
     /// omits its own. Changing this retargets the default for **new** microVMs and
@@ -50,6 +55,36 @@ pub struct ComputeDefaults {
     /// Advertised schedulable memory MiB (overrides `[compute].mem_mib`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_mib: Option<u32>,
+}
+
+impl ComputeDefaults {
+    /// The all-defer defaults (every field `None` ⇒ the file baseline). The supported
+    /// constructor now that `ComputeDefaults` is `#[non_exhaustive]`; set a field with the
+    /// chainable `with_*` setters.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the default microVM kernel (`None` ⇒ defer to the file baseline).
+    #[must_use]
+    pub fn with_default_kernel(mut self, default_kernel: Option<KernelRef>) -> Self {
+        self.default_kernel = default_kernel;
+        self
+    }
+
+    /// Set the advertised schedulable vCPUs (`None` ⇒ defer to `[compute].vcpus`).
+    #[must_use]
+    pub fn with_vcpus(mut self, vcpus: Option<u32>) -> Self {
+        self.vcpus = vcpus;
+        self
+    }
+
+    /// Set the advertised schedulable memory MiB (`None` ⇒ defer to `[compute].mem_mib`).
+    #[must_use]
+    pub fn with_mem_mib(mut self, mem_mib: Option<u32>) -> Self {
+        self.mem_mib = mem_mib;
+        self
+    }
 }
 
 /// Dynamic overrides for the embedded web console mount (`[serve.console]`). Each
@@ -433,6 +468,23 @@ mod tests {
             max_concurrent_uploads_ceiling: Some(8),
             posture: SecurityProfile::MultiTenant.preset(),
         }
+    }
+
+    #[test]
+    fn compute_defaults_builder_matches_the_literal() {
+        // The builder produces the same value a struct literal would (still legal in-crate;
+        // `#[non_exhaustive]` only blocks the literal in downstream crates).
+        let built = ComputeDefaults::new()
+            .with_vcpus(Some(8))
+            .with_mem_mib(Some(2048));
+        let literal = ComputeDefaults {
+            default_kernel: None,
+            vcpus: Some(8),
+            mem_mib: Some(2048),
+        };
+        assert_eq!(built, literal);
+        // The empty builder is the all-defer default.
+        assert_eq!(ComputeDefaults::new(), ComputeDefaults::default());
     }
 
     #[test]

@@ -5,6 +5,40 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Breaking
+
+- **`#[non_exhaustive]` audit of the published compute/config library types (U26 follow-through,
+  #12).** Continuing the v0.69.0 work that sealed `ComputeSpec` / `ComputeBinding` / `VolumeRef` /
+  `BackendKind`, the next tranche of growable public types in `boatramp-types` / `boatramp-core` /
+  `boatramp-cwt` are now `#[non_exhaustive]` with an additive constructor/builder, so a later
+  field/variant is a non-breaking change for the peers (uchron, luigi, mailroom) that build against
+  the published crates. **Downstream crates that constructed these with a struct literal, or matched
+  the enum exhaustively, must migrate** (pre-1.0, called out here per the format note above):
+  - `boatramp_types::compute::PlacementConstraints` — construct via
+    `PlacementConstraints::new().with_regions(..).with_labels(..)` instead of a struct literal.
+  - `boatramp_types::compute::PostLaunchAction` (enum) — a `match` on it now needs a `_` arm; the
+    runtime fails an action kind it does not understand, fail-closed (a newer-client spec on an older
+    node surfaces as a provisioning failure, never a silent skip).
+  - `boatramp_types::compute::ReadinessGate` — construct via
+    `ReadinessGate::new().with_answerability(..)/.with_routing(..)/.with_migration(..)`.
+  - `boatramp_types::daemon_config::ComputeDefaults` — construct via
+    `ComputeDefaults::new().with_vcpus(..)/.with_mem_mib(..)/.with_default_kernel(..)`.
+  - `boatramp_core::compute::PlacementExplain` / `BackendCandidate` and
+    `boatramp_cwt::CredentialChain` are library **outputs** (the engine builds them; consumers only
+    read their fields), so sealing them is additive — no constructor is needed and only a downstream
+    that *destructured* one exhaustively (none in-tree) is affected.
+
+  The genuinely wide-blast-radius surfaces are **deliberately deferred** to an owner-sequenced,
+  security-reviewed follow-up rather than forced here: the `ComputeBackend` return-struct family
+  (`Capabilities`, `SourceSupport`, `Instance`, `InstanceHandle`, `Endpoint`, `Snapshot`,
+  `ExecOutput`, `Artifact`, `LaunchRequest` — constructed by every backend impl, `Capabilities`
+  encoding isolation/preemption defaults), the `ApplyDatabase` wire family, and the authority enums
+  (`authz::Action`/`Resource`, `cwt::TokenAlg`/`TokenPublicKey`/`LocalSigner`), which are
+  intentionally left sealed-by-exhaustive-match as a compile-time safety control. See the audit in
+  the PR for the per-type rationale.
+
 ## [0.70.0] — 2026-11-22
 
 ### Added

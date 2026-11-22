@@ -713,7 +713,12 @@ pub trait NarrowingCaveats: Sized + Clone + Default {
 ///
 /// (U8–U10, #9) Derives [`Debug`] (when the caveat vocabulary `C` is `Debug`), so
 /// a consumer can log / `assert_eq!` a verified chain directly.
+///
+/// `#[non_exhaustive]`: the engine-owned result of a verification — a consumer reads its
+/// fields and never forges one, so a future verified attribute is an additive, non-breaking
+/// field (the only constructor is this crate's `verify_credential`).
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CredentialChain<C: NarrowingCaveats> {
     /// The verified **root** block's CWT claim set — the sole authority source.
     pub root_claims: ClaimsSet,
