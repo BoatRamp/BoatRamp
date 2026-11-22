@@ -3080,7 +3080,29 @@ mod tests {
         // but deserializes under another, or one that silently drops — makes the round-trip
         // fail to parse or fail equality. This is the guard for the "config field doesn't
         // round-trip" class (write a config, can't read it back).
-        let cfg = SiteConfig {
+        let cfg = representative_site_config();
+
+        // JSON is the API wire format (PUT/GET /api/sites/:site/config); `from_json` is the
+        // parser the server uses, so this exercises the exact path.
+        let json = serde_json::to_vec(&cfg).unwrap();
+        let from_json = SiteConfig::from_json(&json)
+            .unwrap_or_else(|e| panic!("SiteConfig JSON round-trip failed to parse: {e}"));
+        assert_eq!(
+            from_json, cfg,
+            "SiteConfig did not survive a JSON round-trip"
+        );
+
+        // And RON (via the derived Deserialize), the on-disk config format.
+        let ron = ron::ser::to_string(&cfg).unwrap();
+        let from_ron: SiteConfig = ron::from_str(&ron)
+            .unwrap_or_else(|e| panic!("SiteConfig RON round-trip failed to parse: {e}\n{ron}"));
+        assert_eq!(from_ron, cfg, "SiteConfig did not survive a RON round-trip");
+    }
+
+    /// A representative `SiteConfig` covering the handler/cache/graphql/cookie_auth sub-configs —
+    /// the fixture both the round-trip and the exact-shape snapshot drive.
+    fn representative_site_config() -> SiteConfig {
+        SiteConfig {
             handlers: Some(HandlersSiteConfig {
                 enabled: true,
                 allow_imports: vec!["sql".into(), "graphql".into()],
@@ -3103,23 +3125,27 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
-        };
+        }
+    }
 
-        // JSON is the API wire format (PUT/GET /api/sites/:site/config); `from_json` is the
-        // parser the server uses, so this exercises the exact path.
-        let json = serde_json::to_vec(&cfg).unwrap();
-        let from_json = SiteConfig::from_json(&json)
-            .unwrap_or_else(|e| panic!("SiteConfig JSON round-trip failed to parse: {e}"));
-        assert_eq!(
-            from_json, cfg,
-            "SiteConfig did not survive a JSON round-trip"
-        );
-
-        // And RON (via the derived Deserialize), the on-disk config format.
-        let ron = ron::ser::to_string(&cfg).unwrap();
-        let from_ron: SiteConfig = ron::from_str(&ron)
-            .unwrap_or_else(|e| panic!("SiteConfig RON round-trip failed to parse: {e}\n{ron}"));
-        assert_eq!(from_ron, cfg, "SiteConfig did not survive a RON round-trip");
+    /// Exact-snapshot drift guard (B10) for the serialized `SiteConfig` **wire shape**. The
+    /// round-trip test above proves the config survives serialize→deserialize (symmetry); it does
+    /// NOT pin the *exact* bytes, so a field rename, a reordered struct field, a flipped default, or
+    /// a `skip_serializing_if` change passes it silently as long as it stays symmetric. This pins
+    /// the JSON (the `/api/sites/:site/config` wire format) AND the RON (the on-disk config file
+    /// format) so any such change diffs loudly. On an intended change, review with
+    /// `cargo insta review` (or `INSTA_UPDATE=always`) and commit the updated `.snap`.
+    #[test]
+    fn site_config_serialized_shape_snapshot() {
+        let cfg = representative_site_config();
+        // Serialize into locals first so the snapshot's recorded `expression` metadata is the
+        // variable name, not the serializer call (whose `ron::ser` path otherwise trips the typos
+        // gate on the `ser` token inside the generated `.snap`).
+        let json = serde_json::to_string_pretty(&cfg).expect("SiteConfig serializes to JSON");
+        insta::assert_snapshot!("site_config_json", json);
+        let ron_pretty = ron::ser::to_string_pretty(&cfg, ron::ser::PrettyConfig::default())
+            .expect("SiteConfig serializes to RON");
+        insta::assert_snapshot!("site_config_ron", ron_pretty);
     }
 
     #[test]

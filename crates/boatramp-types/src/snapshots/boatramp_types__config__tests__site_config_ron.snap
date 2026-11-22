@@ -1,0 +1,47 @@
+---
+source: crates/boatramp-types/src/config.rs
+expression: ron_pretty
+---
+(
+    version: 1,
+    domains: (
+        primary: None,
+        aliases: [],
+        wildcards: [],
+        canonical_redirect: false,
+    ),
+    security: (
+        https_redirect: false,
+    ),
+    access: (
+        ip: (
+            allow: [],
+            deny: [],
+        ),
+        trusted_proxies: [],
+    ),
+    handlers: Some((
+        enabled: true,
+        allow_imports: [
+            "sql",
+            "graphql",
+        ],
+        cache: Some((
+            enabled: true,
+            max_entry_bytes: Some(262144),
+            max_ttl_secs: Some(600),
+        )),
+        graphql: Some((
+            enabled: true,
+            max_depth: Some(12),
+            enforce_safelist: true,
+            federated: true,
+        )),
+        cookie_auth: Some((
+            cookie_name: "__Host-session",
+            allowed_origins: [
+                "https://app.example.com",
+            ],
+        )),
+    )),
+)

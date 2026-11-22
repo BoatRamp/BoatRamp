@@ -1932,6 +1932,27 @@ mod tests {
         .await;
     }
 
+    /// GATE (B7) — the SlateDB backend satisfies the **IDENTICAL** shared `KvStore` conformance
+    /// suite every backend runs (`boatramp_core::kv::conformance::kv_conformance`), the same one
+    /// `MemoryKv`/`CachedKv`/`CheckpointKv`/`SqlKv`/`FsStorage` run — so SlateDB can't silently drift
+    /// from the contract (empty-vs-absent value, overwrite, `list_prefix`/`list_from` range
+    /// semantics, delete-of-missing idempotency, binary values, value-based `compare_and_swap`). Opens
+    /// a real local SlateDB over a temp dir with the compactor + GC disabled ([`test_settings`], which
+    /// removes the close/reopen drain stall — unrelated to the KV contract under test), drives the
+    /// shared suite, then closes. Runs at the merge gate: the lean per-push lane builds `slatedb`.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slatedb_satisfies_the_conformance_suite() {
+        with_fresh_slatedb_dir("conformance", |dir| async move {
+            let kv = SlateKv::open_local_settings(&dir, test_settings(None))
+                .await
+                .unwrap();
+            boatramp_core::kv::conformance::kv_conformance(&kv).await;
+            kv.close().await.unwrap();
+        })
+        .await;
+    }
+
     /// SlateKv's compare-and-swap (B10): the single-writer `cas_lock` makes it a linearizable CAS
     /// within the writer process — expected-absent create, exact-bytes match, stale-expected refusal,
     /// and a concurrent-racer set with exactly one winner (the property the async-lane claim needs).

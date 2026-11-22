@@ -1,0 +1,47 @@
+---
+source: crates/boatramp-types/src/config.rs
+expression: json
+---
+{
+  "version": 1,
+  "domains": {
+    "primary": null,
+    "aliases": [],
+    "wildcards": [],
+    "canonical_redirect": false
+  },
+  "security": {
+    "https_redirect": false
+  },
+  "access": {
+    "ip": {
+      "allow": [],
+      "deny": []
+    },
+    "trusted_proxies": []
+  },
+  "handlers": {
+    "enabled": true,
+    "allow_imports": [
+      "sql",
+      "graphql"
+    ],
+    "cache": {
+      "enabled": true,
+      "max_entry_bytes": 262144,
+      "max_ttl_secs": 600
+    },
+    "graphql": {
+      "enabled": true,
+      "max_depth": 12,
+      "enforce_safelist": true,
+      "federated": true
+    },
+    "cookie_auth": {
+      "cookie_name": "__Host-session",
+      "allowed_origins": [
+        "https://app.example.com"
+      ]
+    }
+  }
+}

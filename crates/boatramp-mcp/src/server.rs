@@ -1030,4 +1030,57 @@ mod tests {
             );
         }
     }
+
+    /// Recursively sort every JSON object's keys so the snapshot is **independent of
+    /// `serde_json`'s key order** — `cedar-policy` (pulled transitively via `boatramp-core/authz`)
+    /// flips on serde_json's `preserve_order`, so without this the schema's key order would depend
+    /// on the exact feature union the crate is built with. Sorting makes the `.snap` reproducible
+    /// across every build.
+    fn canonical_json(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let sorted: std::collections::BTreeMap<String, serde_json::Value> = map
+                    .iter()
+                    .map(|(k, val)| (k.clone(), canonical_json(val)))
+                    .collect();
+                serde_json::to_value(sorted).expect("a BTreeMap<String, Value> always serializes")
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(canonical_json).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Exact-snapshot drift guard (B9) for the FULL agent-facing tool surface: pins every tool's
+    /// name, description, AND JSON **input schema** as a reviewable `.snap`. The count/description
+    /// guard above catches a tool added, removed, or shipped undescribed; THIS catches the subtler,
+    /// equally-breaking drift it is blind to — a parameter renamed, dropped, retyped, made
+    /// optional, or a description reworded — any of which silently changes the contract an agent
+    /// reads to choose + call a tool. `tool_router()` is the macro-generated static (schemars emits
+    /// the schemas), so this needs no backend. On an intended change, review the diff with
+    /// `cargo insta review` (or `INSTA_UPDATE=always`) and commit the updated `.snap`.
+    #[test]
+    fn tool_surface_schema_snapshot() {
+        let router = BoatrampMcp::tool_router();
+        let mut tools = router.list_all();
+        // Deterministic order regardless of the router's internal storage order.
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let view: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name.as_ref(),
+                    "description": t.description.as_deref(),
+                    "input_schema": serde_json::Value::Object((*t.input_schema).clone()),
+                })
+            })
+            .collect();
+        let canonical = canonical_json(&serde_json::Value::Array(view));
+
+        insta::assert_snapshot!(
+            serde_json::to_string_pretty(&canonical).expect("canonical JSON serializes")
+        );
+    }
 }
