@@ -73,6 +73,12 @@ getrandom = { workspace = true, features = ["js"] }
 [dev-dependencies]
 # `domain_verify`'s tests use `#[tokio::test]`.
 tokio = { workspace = true }
+# Exact-snapshot drift guard for the serialized config wire shape (B10): pins the
+# JSON (API) and RON (on-disk) representation of a representative `SiteConfig` as a
+# reviewable `.snap`, so a field rename/reorder or a changed default is caught —
+# complementing the serde round-trip tests, which only check symmetry. String
+# snapshots only, so no extra insta features.
+insta = "1"
 
 [lints]
 workspace = true

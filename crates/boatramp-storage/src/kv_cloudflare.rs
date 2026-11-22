@@ -232,3 +232,53 @@ impl KvStore for CloudflareKv {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CAPABILITY MARKER (B7) — the Cloudflare-KV backend is held to the **IDENTICAL** shared
+    /// `KvStore` conformance suite every other backend runs
+    /// (`boatramp_core::kv::conformance::kv_conformance`), so it can't silently drift from the
+    /// contract (empty-vs-absent value, overwrite, `list_prefix`/`list_from` range semantics,
+    /// delete-of-missing idempotency, binary values, value-based `compare_and_swap`).
+    ///
+    /// **This is `#[ignore]`d on purpose — it is a capability marker, NOT a merge-gate test.**
+    /// Cloudflare KV has **no local emulator or fake**: the REST API against
+    /// `api.cloudflare.com` is the only implementation, so unlike SlateDB/`SqlKv` (which open a
+    /// real in-process store in a tempdir) this can only run against a **live, disposable** CF KV
+    /// namespace. Supply `CF_ACCOUNT_ID`, `CF_KV_NAMESPACE_ID`, and `CF_API_TOKEN` and run it on
+    /// the capability runner:
+    ///
+    /// ```text
+    /// cargo test -p boatramp-storage --features cloudflare-kv \
+    ///     cloudflare_kv_satisfies_the_conformance_suite -- --ignored --nocapture
+    /// ```
+    ///
+    /// It **mutates** the namespace (writes + deletes `k/*`, `cas/*`, `other/*` keys and wipes it
+    /// clean first), so point it ONLY at a throwaway namespace.
+    ///
+    /// CAVEAT — Cloudflare KV is **eventually consistent**: a `get` immediately after a `put` is not
+    /// guaranteed to observe the write (global propagation can lag up to ~60 s, and even
+    /// same-colo read-your-writes is best-effort). The shared suite asserts read-your-writes, so a
+    /// run of this marker against real CF-KV may surface *timing* flakiness that is NOT a contract
+    /// bug. A credentialed nightly that wants this green would need a settle/poll wrapper around the
+    /// reads; that is deliberately out of scope here (it must not weaken the shared suite the
+    /// strongly-consistent backends run). Wiring a CF-KV job into `capability.yml` additionally needs
+    /// the owner to provision the namespace + secrets — the cloud tiers (s3/gcs/azure/CF) are
+    /// "design-settled, not yet wired" and `capability.yml` is deliberately kept secret-free.
+    #[tokio::test]
+    #[ignore = "needs a live, disposable Cloudflare KV namespace (CF_ACCOUNT_ID / CF_KV_NAMESPACE_ID / CF_API_TOKEN); CF KV has no local fake — run on the capability runner with --ignored. CF is eventually consistent, so read-your-writes may need a settle wrapper."]
+    async fn cloudflare_kv_satisfies_the_conformance_suite() {
+        let kv = CloudflareKv::from_env()
+            .expect("set CF_ACCOUNT_ID / CF_KV_NAMESPACE_ID / CF_API_TOKEN for the live CF-KV run");
+
+        // Clean slate: the shared suite asserts EXACT `list_prefix` contents, so wipe the throwaway
+        // namespace first (a leftover key from a prior run would fail the list assertions).
+        for key in kv.list_prefix("").await.expect("list the namespace") {
+            kv.delete(&key).await.expect("clear a leftover key");
+        }
+
+        boatramp_core::kv::conformance::kv_conformance(&kv).await;
+    }
+}

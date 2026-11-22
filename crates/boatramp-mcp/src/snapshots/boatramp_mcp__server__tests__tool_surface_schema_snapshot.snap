@@ -1,0 +1,1193 @@
+---
+source: crates/boatramp-mcp/src/server.rs
+expression: "serde_json::to_string_pretty(&canonical).expect(\"canonical JSON serializes\")"
+---
+[
+  {
+    "description": "Make a specific deployment id the live one for a site (activate / roll forward or back).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "The deployment id to make live.",
+          "type": "string"
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site",
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "activate_deployment"
+  },
+  {
+    "description": "Show cluster-managed certificate status (domain + expiry).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "cert_status"
+  },
+  {
+    "description": "Run the ownership check for a pending host; on success the server attaches it to the site.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "host": {
+          "description": "The hostname (e.g. `www.example.com`; `*.example.com` for a wildcard).",
+          "type": "string"
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "default": null,
+          "description": "The verification method (`dns` or `http`); server default if omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site",
+        "host"
+      ],
+      "type": "object"
+    },
+    "name": "check_domain_verification"
+  },
+  {
+    "description": "List the cluster's Raft membership (voters, learners, leader).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "cluster_members"
+  },
+  {
+    "description": "Mint a single-use cluster join ticket (for a new node to join the mesh).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ttl_secs": {
+          "default": null,
+          "description": "Time-to-live in seconds for the minted join ticket (omit for the default).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "create_join_token"
+  },
+  {
+    "description": "Show a site's current live deployment (id, age, size).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site"
+      ],
+      "type": "object"
+    },
+    "name": "current_deployment"
+  },
+  {
+    "description": "Create or replace a workflow definition (the full spec object).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The workflow name.",
+          "type": "string"
+        },
+        "spec": {
+          "description": "The full workflow definition object (steps/inputs), per the workflow schema."
+        }
+      },
+      "required": [
+        "name",
+        "spec"
+      ],
+      "type": "object"
+    },
+    "name": "define_workflow"
+  },
+  {
+    "description": "Delete a site entirely (all deployments + config). DESTRUCTIVE and irreversible.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site"
+      ],
+      "type": "object"
+    },
+    "name": "delete_site"
+  },
+  {
+    "description": "Delete a workflow definition by name.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The resource name (e.g. a function name).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "delete_workflow"
+  },
+  {
+    "description": "Show a function's metered usage (invocations, compute).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The resource name (e.g. a function name).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "function_usage"
+  },
+  {
+    "description": "Read the live daemon configuration (operational knobs; no restart).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "get_daemon_config"
+  },
+  {
+    "description": "Fetch a specific deployment's manifest by id.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "The deployment id.",
+          "type": "string"
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site",
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "get_deployment"
+  },
+  {
+    "description": "Get a site's stored configuration (routing, access, handlers, domains).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site"
+      ],
+      "type": "object"
+    },
+    "name": "get_site_config"
+  },
+  {
+    "description": "Get a workflow's definition by name.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The resource name (e.g. a function name).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "get_workflow"
+  },
+  {
+    "description": "Show a site's handler invocation stats, consumer lag, and dead letters.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site"
+      ],
+      "type": "object"
+    },
+    "name": "handler_stats"
+  },
+  {
+    "description": "Invalidate cached responses: specific keys, or everything when keys is empty.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "keys": {
+          "default": [],
+          "description": "Specific cache keys to invalidate; omit or empty to invalidate everything.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "invalidate_cache"
+  },
+  {
+    "description": "Invoke a function synchronously with an optional JSON payload; returns its response.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The function name.",
+          "type": "string"
+        },
+        "payload": {
+          "default": null,
+          "description": "The JSON payload to pass to the invocation (optional)."
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "invoke_function"
+  },
+  {
+    "description": "List a site's named aliases (name → deployment id).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site"
+      ],
+      "type": "object"
+    },
+    "name": "list_aliases"
+  },
+  {
+    "description": "List the instance's compute workloads (containers/microVMs).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_compute"
+  },
+  {
+    "description": "List a site's deployment history (current + past deployments).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site"
+      ],
+      "type": "object"
+    },
+    "name": "list_deployments"
+  },
+  {
+    "description": "List a site's domain-attachment/verification records.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site"
+      ],
+      "type": "object"
+    },
+    "name": "list_domains"
+  },
+  {
+    "description": "List the functions the instance runs (handlers/consumers/crons as functions).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_functions"
+  },
+  {
+    "description": "List the registered boatramp instances (name + server URL). Call this first when unsure which instances exist; pass the 'instance' parameter on later calls when more than one is registered.",
+    "input_schema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_instances"
+  },
+  {
+    "description": "List all sites on the instance.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_sites"
+  },
+  {
+    "description": "List a function's triggers (crons, queue/blob event sources).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The resource name (e.g. a function name).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "list_triggers"
+  },
+  {
+    "description": "List the declarative function workflows defined on the instance.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_workflows"
+  },
+  {
+    "description": "Mint a control-plane API token with the given roles. Returned once — record it. DESTRUCTIVE in the sense that it grants standing access.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "holder_pubkey": {
+          "default": null,
+          "description": "A holder (`cnf`) public key to bind the token to (for DPoP); omit for a\nplain bearer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "A human label recorded in the token's metadata.",
+          "type": "string"
+        },
+        "roles": {
+          "description": "The roles to grant (e.g. `[\"admin\"]`, or scoped roles).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ttl_secs": {
+          "default": null,
+          "description": "Time-to-live in seconds (omit for the server default).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "roles"
+      ],
+      "type": "object"
+    },
+    "name": "mint_token"
+  },
+  {
+    "description": "Purge or redrive a consumer topic's dead-letter queue. action = 'purge' or 'redrive'.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "action": {
+          "description": "The action: `purge` or `redrive`.",
+          "type": "string"
+        },
+        "alias": {
+          "default": null,
+          "description": "An optional deployment alias to scope the operation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        },
+        "topic": {
+          "description": "The consumer topic whose dead-letter queue to operate on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site",
+        "topic",
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "operate_dlq"
+  },
+  {
+    "description": "Promote a caught-up learner node to a voting member. Fleet-admin; changes quorum.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "node_id": {
+          "description": "The Raft node id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "node_id"
+      ],
+      "type": "object"
+    },
+    "name": "promote_member"
+  },
+  {
+    "description": "Report orphan deployments and unreferenced blobs that a prune would remove (read-only report).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "prune_report"
+  },
+  {
+    "description": "Replace a site's stored configuration with the given object. DESTRUCTIVE: overwrites the current config — fetch it first with get_site_config and overlay your changes.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "config": {
+          "description": "The full site-config object to store (replaces the current config)."
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site",
+        "config"
+      ],
+      "type": "object"
+    },
+    "name": "put_site_config"
+  },
+  {
+    "description": "Remove a named alias from a site.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The alias name.",
+          "type": "string"
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site",
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "remove_alias"
+  },
+  {
+    "description": "Detach a host from a site (remove its verification/attachment).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "host": {
+          "description": "The hostname (e.g. `www.example.com`; `*.example.com` for a wildcard).",
+          "type": "string"
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "default": null,
+          "description": "The verification method (`dns` or `http`); server default if omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site",
+        "host"
+      ],
+      "type": "object"
+    },
+    "name": "remove_domain"
+  },
+  {
+    "description": "Remove a node from the cluster's Raft membership. Fleet-admin; DESTRUCTIVE.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "node_id": {
+          "description": "The Raft node id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "node_id"
+      ],
+      "type": "object"
+    },
+    "name": "revoke_member"
+  },
+  {
+    "description": "Revoke a control-plane token by its metadata id.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "The token id (metadata id) to revoke.",
+          "type": "string"
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "revoke_token"
+  },
+  {
+    "description": "Roll the daemon configuration back to the previous generation.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "rollback_daemon_config"
+  },
+  {
+    "description": "Roll a function back to a previous version.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The function name.",
+          "type": "string"
+        },
+        "to": {
+          "description": "The version to roll back to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "to"
+      ],
+      "type": "object"
+    },
+    "name": "rollback_function"
+  },
+  {
+    "description": "Rotate this node's mesh identity key. Fleet-admin.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "rotate_mesh_key"
+  },
+  {
+    "description": "Verify every stored blob still hashes to its key (integrity scrub).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "scrub_blobs"
+  },
+  {
+    "description": "Point a named alias (e.g. staging, preview) at a deployment id.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "The deployment id the alias should point at.",
+          "type": "string"
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The alias name (e.g. `staging`, `preview`).",
+          "type": "string"
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site",
+        "name",
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "set_alias"
+  },
+  {
+    "description": "Apply a new daemon configuration (converges live, no restart). Fetch the current one with get_daemon_config and overlay your changes.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "config": {
+          "description": "The full daemon-config object to apply (see get_daemon_config for the shape)."
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "config"
+      ],
+      "type": "object"
+    },
+    "name": "set_daemon_config"
+  },
+  {
+    "description": "Point a function alias label (e.g. stable, canary) at a function version.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "The alias label (e.g. `stable`, `canary`).",
+          "type": "string"
+        },
+        "name": {
+          "description": "The function name.",
+          "type": "string"
+        },
+        "version": {
+          "description": "The function version the alias points at.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "label",
+        "version"
+      ],
+      "type": "object"
+    },
+    "name": "set_function_alias"
+  },
+  {
+    "description": "Start domain-ownership verification for a host on a site (returns the DNS TXT / HTTP challenge to satisfy).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "host": {
+          "description": "The hostname (e.g. `www.example.com`; `*.example.com` for a wildcard).",
+          "type": "string"
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "default": null,
+          "description": "The verification method (`dns` or `http`); server default if omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site",
+        "host"
+      ],
+      "type": "object"
+    },
+    "name": "start_domain_verification"
+  },
+  {
+    "description": "Start a run of a workflow with an optional JSON input.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "input": {
+          "default": null,
+          "description": "The JSON input to start the run with (optional)."
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The workflow name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "start_workflow_run"
+  },
+  {
+    "description": "Tail a site's captured guest stdout/stderr logs.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "after": {
+          "default": null,
+          "description": "Return only lines after this cursor/sequence (for polling).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "instance": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Maximum number of log lines to return (default server-side).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The site name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "site"
+      ],
+      "type": "object"
+    },
+    "name": "tail_logs"
+  },
+  {
+    "description": "Report who the configured token authenticates as (roles + capabilities).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "instance": {
+          "default": null,
+          "description": "The registered instance name; omit when only one is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "whoami"
+  }
+]

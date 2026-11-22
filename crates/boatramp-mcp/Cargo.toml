@@ -48,6 +48,14 @@ http = "1"
 boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-rpktls = { workspace = true }
 
+[dev-dependencies]
+# Exact-snapshot drift guard for the agent-facing tool surface (B9): pins every
+# tool's name, description, and JSON input schema as a reviewable `.snap` so a
+# schema change (a dropped/renamed parameter, a type or description edit) diffs
+# loudly instead of silently shrinking an agent's capability. String snapshots
+# only, so no extra insta features.
+insta = "1"
+
 [features]
 # The HTTP streamable transport for the in-`serve` MCP endpoint. Behind a feature
 # so the stdio-only CLI path needn't compile rmcp's axum server stack.
