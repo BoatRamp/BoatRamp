@@ -7981,6 +7981,46 @@ async fn daemon_config_rejects_ceiling_violation() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn daemon_config_get_advertises_posture_ceilings() {
+    // The GET response carries the static `limits` (the posture-derived upload ceiling)
+    // so the CLI can run the SAME validation at set time and refuse an over-ceiling /
+    // loosening write cleanly and early — instead of surfacing a late apply-time 400.
+    let posture = boatramp_core::security::SecurityProfile::MultiTenant.preset();
+    let deploy = seed().await;
+    let options = ServerOptions {
+        posture,
+        ..Default::default()
+    };
+    let app = router_with(
+        deploy,
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        options,
+    );
+    let mut get = Request::builder()
+        .uri("/api/daemon/config")
+        .body(Body::empty())
+        .unwrap();
+    get.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let resp = app.oneshot(get).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // The advertised ceiling equals the file posture's upload cap — the value a client
+    // cannot otherwise know, and the one `validate_limits` checks a write against.
+    assert_eq!(
+        v["limits"]["max_upload_ceiling"].as_u64(),
+        Some(posture.max_upload_bytes),
+        "GET advertises the posture-derived upload ceiling: {v}"
+    );
+    // And it deserializes back into the shared ConfigLimits the CLI validates against.
+    let limits: boatramp_core::daemon_config::ConfigLimits =
+        serde_json::from_value(v["limits"].clone()).unwrap();
+    assert_eq!(limits.max_upload_ceiling, posture.max_upload_bytes);
+}
+
 // ---- configurable WAF ------------------------------------------------------
 
 #[tokio::test]
