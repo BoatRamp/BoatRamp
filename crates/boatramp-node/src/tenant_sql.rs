@@ -94,8 +94,9 @@ use boatramp_storage::sql_compute::{
 };
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use boatramp_storage::tenant_provision::{
-    RLS_ENABLE_NOT_FORCE_COUNT_SQL, force_rls_event_trigger_ddl, force_rls_sweep_ddl,
-    grant_app_role_ddl, provision_ddl, sanitize_ident, soft_deprovision_ddl, tenant_db_name,
+    RLS_ENABLE_NOT_FORCE_COUNT_SQL, RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL,
+    force_rls_event_trigger_ddl, force_rls_sweep_ddl, grant_app_role_ddl, provision_ddl,
+    sanitize_ident, single_app_role_name, soft_deprovision_ddl, tenant_db_name,
     tenant_owner_role_name, tenant_role_name,
 };
 
@@ -261,6 +262,18 @@ pub(crate) fn credential_workload_key(compute: &str, tenant_ident: &str) -> Stri
 /// path resolves this to connect as the owner role; it is never handed to the handler runtime.
 pub(crate) fn owner_credential_workload_key(compute: &str, tenant_ident: &str) -> String {
     format!("{compute}/{tenant_ident}/owner")
+}
+
+/// The KV workload segment for a `Single`-mode managed DB's **opt-in RLS app-role** sealed
+/// credential — the workload's own `(project, workload)` key (what the superuser credential uses)
+/// with a trailing `/rlsapp`, so the non-superuser app-role password is sealed under a key DISTINCT
+/// from the bootstrap superuser's (`<workload>` under the single-credential project). The serving
+/// path ([`NodeTenantSqlResolver::build_backend`] / [`connection_parts`](NodeTenantSqlResolver::connection_parts))
+/// and the post-ready provisioner ([`provision_single_app_role`](crate::managed_sql)) both derive
+/// this key from the SAME `workload` ([`TenantNames::workload`]), so the role is created with, and
+/// served by, one password. Never handed out as the superuser credential.
+pub(crate) fn single_app_credential_workload_key(workload: &str) -> String {
+    format!("{workload}/rlsapp")
 }
 
 /// The KV **project** segment for a `Single`-mode workload's sealed credential: the
@@ -3004,7 +3017,112 @@ fn owner_serving_without_force_error(user: &str) -> SqlError {
     ))
 }
 
+/// The `rls_session` **single-mode serve-as-superuser fail-open guard**, as a pure predicate. A
+/// `Single`/dedicated managed Postgres container is initialized with a bootstrap SUPERUSER
+/// (`POSTGRES_USER`, `rolsuper`/`rolbypassrls`); when the binding opts into `rls_session` the serving
+/// path MUST resolve the runtime to the provisioned STABLE non-superuser app role
+/// ([`single_app_role_name`]) instead. Returns `true` (⇒ refuse fail-closed) when the binding is
+/// `Single` + Postgres with `rls_session` on, yet the resolved runtime `serving_user` is STILL the
+/// bootstrap superuser (`self.user`) — the opt-in did not take effect (a provisioning gap or
+/// misconfiguration) — so an app can never silently believe it has RLS while served by a superuser.
+///
+/// This is the **static, by-NAME** backstop used on the DSN-composition path
+/// ([`connection_parts`](NodeTenantSqlResolver::connection_parts)), which cannot connect to probe.
+/// The live, connection-backed [`RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL`] probe
+/// ([`assert_runtime_role_unprivileged`]) in [`build_backend`](NodeTenantSqlResolver::build_backend)
+/// is the stronger, by-ATTRIBUTE form (it catches a role privileged by attribute, not just by name,
+/// across ALL postures), and is applied broadly there.
+fn single_runtime_serving_superuser(
+    rls_session: bool,
+    kind: ExternalSqlKind,
+    isolation: TenantIsolation,
+    serving_user: &str,
+    superuser: &str,
+) -> bool {
+    rls_session
+        && kind == ExternalSqlKind::Postgres
+        && isolation == TenantIsolation::Single
+        && serving_user == superuser
+}
+
+/// The fail-closed error for the single-mode serve-as-superuser guard (both the static name check
+/// and — reworded — the live probe).
+fn single_runtime_serving_superuser_error(user: &str) -> SqlError {
+    SqlError::other(format!(
+        "rls_session tenancy invariant: this single-mode managed-Postgres binding opted into \
+         rls_session, but the resolved RUNTIME serving role ({user}) is the bootstrap SUPERUSER — a \
+         superuser silently bypasses the app's row-level security, so serving here would \
+         un-enforce it; refusing (fail-closed). The non-superuser app role should have been \
+         provisioned post-launch (is the replica `Provisioned`?); disable rls_session to serve as \
+         the superuser deliberately."
+    ))
+}
+
+/// Fail-closed **runtime-role non-privilege** assertion (the BROAD rls_session serving guard): run
+/// [`RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL`] on the LIVE serving `backend` (as the resolved runtime
+/// role) and REFUSE unless it proves the role is NOT a superuser / BYPASSRLS. Either attribute
+/// silently bypasses EVERY table's row-level security, so an app served by such a role believes its
+/// RLS holds while it does not. Applied to every `rls_session` + Postgres posture (single-mode
+/// serve-as-app-role, Shared non-owner, Shared owner) — the by-ATTRIBUTE superuser check the task
+/// drops the Shared/!is_default scoping for. A probe ERROR (or an unexpected/missing cell) is itself
+/// a refusal: the guard must be able to PROVE the role unprivileged, never assume it.
+async fn assert_runtime_role_unprivileged(
+    backend: &ComputeResolvedSqlBackend,
+) -> Result<(), SqlError> {
+    let rows = backend
+        .run_query(RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL)
+        .await
+        .map_err(|e| {
+            SqlError::other(format!(
+                "rls_session runtime-role non-privilege probe failed — refusing fail-closed (cannot \
+                 prove the serving role is not a superuser/BYPASSRLS): {e}"
+            ))
+        })?;
+    match rows.rows.into_iter().flatten().next() {
+        Some(SqlValue::Integer(0)) => Ok(()),
+        Some(SqlValue::Integer(n)) => Err(SqlError::other(format!(
+            "rls_session tenancy invariant: the resolved RUNTIME serving role is a SUPERUSER or has \
+             BYPASSRLS (probe={n}) — it silently bypasses the app's row-level security; refusing to \
+             serve (fail-closed). Serve as a non-superuser/non-BYPASSRLS role, or disable \
+             rls_session."
+        ))),
+        other => Err(SqlError::other(format!(
+            "rls_session runtime-role non-privilege probe returned an unexpected result {other:?}; \
+             refusing fail-closed"
+        ))),
+    }
+}
+
 impl NodeTenantSqlResolver {
+    /// The `Single`-isolation **serving identity** `(cred_project, cred_workload, user)`. With the
+    /// single-mode `rls_session` opt-in on Postgres (and `app_role_ok` — true on the runtime serving
+    /// path, false for a `ConnRole::Migration` DSN, which keeps the superuser), this is the STABLE
+    /// non-superuser app role ([`single_app_role_name`]) + its DISTINCT sealed credential
+    /// ([`single_app_credential_workload_key`]). Otherwise (un-opted, MySQL, or the migration
+    /// identity) it is the bootstrap superuser (`self.user`) + the workload's own credential —
+    /// byte-identical to the pre-feature path. The SAME selection drives
+    /// [`build_backend`](Self::build_backend) and
+    /// [`connection_parts`](Self::connection_parts)'s `Runtime` role, so a handler's `sql.open()` DSN
+    /// and a sibling container's `{{sql.dsn}}` serve as the IDENTICAL role.
+    fn single_serving_identity(
+        &self,
+        project: &str,
+        is_default: bool,
+        names: &TenantNames,
+        app_role_ok: bool,
+    ) -> (String, String, String) {
+        let cred_project = single_credential_project(project, is_default);
+        if app_role_ok && self.rls_session && self.kind == ExternalSqlKind::Postgres {
+            (
+                cred_project,
+                single_app_credential_workload_key(&names.workload),
+                single_app_role_name(&names.database),
+            )
+        } else {
+            (cred_project, names.workload.clone(), self.user.clone())
+        }
+    }
+
     /// The Shared, non-default **serving identity** `(cred_workload, user)` for the declared posture:
     /// [`ServeAs::Owner`] (Postgres only) → the per-tenant **owner** role + its sealed owner
     /// credential (operate-as-owner, FORCE-bound); otherwise (the default `non-owner`, or any MySQL
@@ -3068,12 +3186,13 @@ impl NodeTenantSqlResolver {
             // keyed by the workload's OWN `(project, workload)` — the bare `<compute>`
             // for the DEFAULT tenant (matching the server-init env key of a
             // single-tenant install), else `<compute>-<ident>` under the tenant's
-            // project (matching that per-tenant workload's server-init key).
-            TenantIsolation::Single => (
-                single_credential_project(project, is_default),
-                names.workload.clone(),
-                self.user.clone(),
-            ),
+            // project (matching that per-tenant workload's server-init key). With the
+            // single-mode `rls_session` opt-in (Postgres), the runtime instead serves as the
+            // STABLE non-superuser app role + its distinct credential (see
+            // `single_serving_identity`); un-opted ⇒ the superuser, exactly as today.
+            TenantIsolation::Single => {
+                self.single_serving_identity(project, is_default, &names, true)
+            }
         };
 
         // TENANCY INVARIANT (fail-closed) — the `rls_session` **owner-serving** contract. With
@@ -3131,6 +3250,23 @@ impl NodeTenantSqlResolver {
             self.connect_timeout,
         )
         .with_pool_min(self.pool_min);
+        // TENANCY INVARIANT (fail-closed, BROAD). With `rls_session` on, the app's row-level security
+        // is enforced against the resolved RUNTIME role ONLY if that role is NOT a superuser /
+        // BYPASSRLS (either bypasses RLS silently). Probe the LIVE role and refuse fail-closed if it
+        // is privileged — or if the probe cannot prove it unprivileged — so an app can never believe
+        // it has RLS while served by a superuser. This is the by-ATTRIBUTE superuser check the task
+        // drops the Shared/!is_default scoping for: it fires across the single-mode serve-as-app-role
+        // path (the fail-open this feature closes), the Shared NON-OWNER posture, and the Shared OWNER
+        // posture (both provably non-superuser — a harmless confirmation). The ONE exclusion is the
+        // reserved **Shared + default** tenant: that cell is the install's own superuser-owned DB and
+        // DOCUMENTED to serve as the plain configured user with `rls_session` as a non-load-bearing
+        // in-DB convenience (see `ExternalDatabaseConfig::rls_session` / `RlsFencing`); this task
+        // changes SINGLE mode, not that documented behavior, so refusing it would be an out-of-scope
+        // regression. Runs on the BARE backend (before any session-context GUC injection).
+        let shared_default = self.isolation == TenantIsolation::Shared && is_default;
+        if self.rls_session && self.kind == ExternalSqlKind::Postgres && !shared_default {
+            assert_runtime_role_unprivileged(&backend).await?;
+        }
         if self.rls_session {
             backend = backend.with_session_context(vec![
                 (SESSION_KEY_PROJECT, project.to_string()),
@@ -3275,11 +3411,14 @@ impl NodeTenantSqlResolver {
                 let (cred_workload, user) = self.shared_serving_identity(&ident, &names);
                 (project.to_string(), cred_workload, user)
             }
-            TenantIsolation::Single => (
-                single_credential_project(project, is_default),
-                names.workload.clone(),
-                self.user.clone(),
-            ),
+            // Single: the RUNTIME DSN follows the SAME single-mode identity selection as
+            // `build_backend` — with the `rls_session` opt-in (Postgres) the non-superuser app role +
+            // its distinct credential, else the superuser. The MIGRATION identity (a Migration call
+            // that fell through here) keeps the SUPERUSER (`app_role_ok = false`), so a single-mode
+            // schema migration still runs privileged while the guest runtime is RLS-subject.
+            TenantIsolation::Single => {
+                self.single_serving_identity(project, is_default, &names, role == ConnRole::Runtime)
+            }
         };
 
         // TENANCY INVARIANT (fail-closed) — the SAME owner-serving guard `build_backend` applies,
@@ -3302,6 +3441,25 @@ impl NodeTenantSqlResolver {
             )
         {
             return Err(owner_serving_without_force_error(&user));
+        }
+
+        // TENANCY INVARIANT (fail-closed) — the single-mode serve-as-superuser guard, the DSN-path
+        // counterpart to `build_backend`'s live `assert_runtime_role_unprivileged` probe (which
+        // cannot run here: `connection_parts` composes a DSN without connecting). Static, by-NAME:
+        // if the single-mode `rls_session` opt-in is on but the resolved RUNTIME role is STILL the
+        // bootstrap superuser, the opt-in did not take effect — refuse rather than hand a sibling a
+        // DSN that silently bypasses the app's RLS. `ConnRole::Runtime` only (a single-mode Migration
+        // DSN deliberately serves as the superuser and must not be refused).
+        if role == ConnRole::Runtime
+            && single_runtime_serving_superuser(
+                self.rls_session,
+                self.kind,
+                self.isolation,
+                &user,
+                &self.user,
+            )
+        {
+            return Err(single_runtime_serving_superuser_error(&user));
         }
 
         let password = creds
@@ -4746,11 +4904,19 @@ mod tests {
             "non-owner posture serves the runtime _role"
         );
         assert_ne!(parts.user, tenant_owner_role_name("pg", &ident));
-        // The handler path agrees + is permitted (no guard trip under non-owner posture).
-        resolver
-            .build_backend("acme", "web")
-            .await
-            .expect("non-owner serving is permitted");
+        // The handler path agrees + the posture guard PERMITS it: build_backend now additionally runs
+        // the live runtime-role non-privilege probe (the BROAD rls_session guard). With no live DB in
+        // this unit test the probe cannot connect, so build_backend returns the PROBE error — NOT the
+        // `owner_serving_without_force` refusal — which proves the posture guard permitted this role
+        // and handed off to the probe (full confinement is proven live in the sqlx gates).
+        let err = match resolver.build_backend("acme", "web").await {
+            Ok(_) => panic!("no live DB ⇒ the live non-privilege probe cannot connect"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !err.contains("serve_as: owner"),
+            "the guard must PERMIT the non-owner posture (the error is the probe's no-connection, not a guard refusal): {err}"
+        );
     }
 
     /// `serve_as: owner` — BOTH paths serve the per-tenant OWNER role, sealed under the OWNER
@@ -4779,10 +4945,144 @@ mod tests {
             kv.get(&owner_key).await.unwrap().is_some(),
             "owner posture seals + serves the owner credential"
         );
-        // The handler path serves the owner too and is PERMITTED (the guard allows under this posture).
-        resolver
-            .build_backend("acme", "web")
+        // The handler path serves the owner too and the guard PERMITS it (serve_as: owner). As above,
+        // build_backend now also runs the live non-privilege probe, which cannot connect here — so the
+        // error is the PROBE's, not the `owner_serving_without_force` refusal, proving the guard
+        // permitted the owner role under this posture.
+        let err = match resolver.build_backend("acme", "web").await {
+            Ok(_) => panic!("no live DB ⇒ the live non-privilege probe cannot connect"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !err.contains("did not declare `serve_as: owner`"),
+            "the owner posture must PERMIT owner-serving (the error is the probe's no-connection, not a guard refusal): {err}"
+        );
+    }
+
+    // ---- single-mode rls_session opt-in: the serving identity + guards ----
+
+    /// Build a `Single`-isolation managed Postgres binding with the single-mode `rls_session`
+    /// opt-in ON (`user` = the bootstrap superuser `app`).
+    fn single_rls_binding() -> ExternalDatabaseConfig {
+        ExternalDatabaseConfig {
+            rls_session: true,
+            ..single_pg_binding()
+        }
+    }
+
+    /// DEFAULT-UNCHANGED proof: an UN-OPTED single-mode binding (`rls_session = false`) resolves the
+    /// RUNTIME identity to the bootstrap SUPERUSER + the plain workload credential key — byte-identical
+    /// to the pre-feature path — and its Migration identity is the same superuser (no owner/runtime
+    /// split). (The positive side is `connection_parts_single_pg_default_tenant`.)
+    #[tokio::test]
+    async fn single_unopted_serves_superuser_unchanged() {
+        let binding = single_pg_binding(); // rls_session = false (default)
+        let (_kv, resolver) = build_resolver(&binding);
+        let parts = resolver
+            .connection_parts("acme", "web", ConnRole::Runtime)
             .await
-            .expect("owner serving is permitted under serve_as: owner");
+            .unwrap();
+        // Still the configured superuser `app` on the per-tenant `pg-<ident>` workload — unchanged.
+        assert_eq!(parts.user, "app", "un-opted single serves as the superuser");
+        let mig = resolver
+            .connection_parts("acme", "web", ConnRole::Migration)
+            .await
+            .unwrap();
+        assert_eq!(mig.user, parts.user, "no owner/runtime split when un-opted");
+    }
+
+    /// OPTED-IN single-mode: the RUNTIME DSN serves as the STABLE non-superuser APP ROLE
+    /// (`single_app_role_name`), sealed under its DISTINCT `…/rlsapp` credential key — never the
+    /// bootstrap superuser. The MIGRATION identity stays the SUPERUSER (the runtime/migration split):
+    /// a guest is RLS-subject while migrations stay privileged.
+    #[tokio::test]
+    async fn single_opted_in_serves_app_role_and_splits_migration() {
+        let binding = single_rls_binding();
+        let (kv, resolver) = build_resolver(&binding);
+        let runtime = resolver
+            .connection_parts("acme", "web", ConnRole::Runtime)
+            .await
+            .unwrap();
+        let app_role = single_app_role_name("appdb");
+        assert_eq!(
+            runtime.user, app_role,
+            "opted-in single serves the non-superuser app role, NOT the superuser"
+        );
+        assert_ne!(
+            runtime.user, "app",
+            "the runtime must NOT be the bootstrap superuser"
+        );
+        // The app-role credential is sealed under the DISTINCT `…/rlsapp` key under the tenant project
+        // (the per-tenant `pg-<ident>` workload), never the superuser key.
+        let ident = sanitize_ident("acme");
+        let app_key = format!(
+            "managed-sql-cred/acme/{}",
+            single_app_credential_workload_key(&format!("pg-{ident}"))
+        );
+        assert!(
+            kv.get(&app_key).await.unwrap().is_some(),
+            "the app-role credential is sealed under its own /rlsapp key"
+        );
+        // MIGRATION keeps the SUPERUSER (privileged DDL) — the runtime/migration split.
+        let mig = resolver
+            .connection_parts("acme", "web", ConnRole::Migration)
+            .await
+            .unwrap();
+        assert_eq!(
+            mig.user, "app",
+            "a single-mode migration stays the superuser even when the runtime is the app role"
+        );
+        assert_ne!(
+            mig.user, runtime.user,
+            "runtime (app role) ≠ migration (superuser)"
+        );
+    }
+
+    /// The single-mode serve-as-superuser guard predicate: fires (⇒ refuse) ONLY for a Postgres
+    /// `Single` binding with `rls_session` on whose resolved runtime role is STILL the superuser; it
+    /// is inert for the app role, for un-opted bindings, for MySQL, and for Shared.
+    #[test]
+    fn single_runtime_serving_superuser_predicate() {
+        let k = ExternalSqlKind::Postgres;
+        let su = "app";
+        let app = single_app_role_name("appdb");
+        // Fires: opted-in single still resolving the superuser (the fail-open).
+        assert!(single_runtime_serving_superuser(
+            true,
+            k,
+            TenantIsolation::Single,
+            su,
+            su
+        ));
+        // Inert: the app role is not the superuser (opt-in took effect).
+        assert!(!single_runtime_serving_superuser(
+            true,
+            k,
+            TenantIsolation::Single,
+            &app,
+            su
+        ));
+        // Inert off-cell: un-opted, MySQL, Shared.
+        assert!(!single_runtime_serving_superuser(
+            false,
+            k,
+            TenantIsolation::Single,
+            su,
+            su
+        ));
+        assert!(!single_runtime_serving_superuser(
+            true,
+            ExternalSqlKind::Mysql,
+            TenantIsolation::Single,
+            su,
+            su
+        ));
+        assert!(!single_runtime_serving_superuser(
+            true,
+            k,
+            TenantIsolation::Shared,
+            su,
+            su
+        ));
     }
 }

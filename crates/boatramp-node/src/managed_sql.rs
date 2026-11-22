@@ -257,6 +257,13 @@ struct ManagedDbSpec {
     /// extension NOT on the allowlist is skipped (owner-gated — the operator must permit
     /// it), never silently created.
     extensions: Vec<String>,
+    /// The binding's `rls_session` opt-in. For a `Single`/dedicated managed **Postgres** DB this
+    /// drives the post-ready provisioning of a STABLE non-superuser app login role
+    /// ([`single_app_role_name`](boatramp_storage::tenant_provision::single_app_role_name)) the
+    /// runtime is served as instead of the bootstrap superuser, so the app's own
+    /// `FORCE ROW LEVEL SECURITY` actually binds (capability parity with the `Shared` non-owner
+    /// posture). `false` (the default) ⇒ no role, serve-as-superuser — byte-identical to today.
+    rls_session: bool,
 }
 
 /// The node's [`ManagedDbEnvResolver`]: the set of managed databases (from the
@@ -348,6 +355,7 @@ impl ManagedDbEnv {
                     // A node-static `[databases]` binding has no `extensions` field; only an
                     // applied declaration declares extensions (populated in `resolve_applied`).
                     extensions: Vec::new(),
+                    rls_session: db.rls_session,
                 },
             );
         }
@@ -478,6 +486,90 @@ impl ManagedDbEnv {
         Ok(())
     }
 
+    /// OPT-IN **single-mode RLS** provisioning (Postgres only): create the STABLE non-superuser app
+    /// login role for a `Single`/dedicated managed DB that set `rls_session`, so the runtime serves
+    /// as a role SUBJECT to the app's row-level security instead of the bootstrap superuser
+    /// (`POSTGRES_USER`, which bypasses RLS). A no-op (returns `Ok(())`) unless the binding opts in
+    /// AND the engine is Postgres — so an un-opted single-mode DB, and every MySQL single-mode DB,
+    /// provisions exactly as before.
+    ///
+    /// # The role OWNS NOTHING (the stable-role design)
+    ///
+    /// The bootstrap **superuser owns the schema** (initdb / migrations run as it); this role gets
+    /// only `grant_app_role_ddl` (`GRANT` + `ALTER DEFAULT PRIVILEGES`) — no `CREATE` on schema
+    /// `public`, so it can never own an object. Owning nothing is what lets it be a single STABLE
+    /// role (not a per-replica dynamic one): it sidesteps the PG object-ownership-orphaning
+    /// constraint entirely, and because it is a NON-OWNER a plain `ENABLE ROW LEVEL SECURITY` table
+    /// already binds it (FORCE is defense-in-depth, installed to match the `Shared` machinery).
+    ///
+    /// Its sealed credential is keyed under a **distinct** key
+    /// (`single_app_credential_workload_key`), never the superuser's; `password()` get-or-mints it,
+    /// and the serving path reads the SAME key, so the role is created with exactly the password the
+    /// runtime later connects with regardless of which side touches the key first. All DDL runs on the
+    /// TENANT-database superuser connection (role create is cluster-level; the schema grants + the
+    /// per-database FORCE event trigger are database-local and belong there). Idempotent: this pass
+    /// re-runs every reconcile, refreshing the grants so a table a later migration creates is covered.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    async fn provision_single_app_role(
+        &self,
+        project: &str,
+        workload: &str,
+        db: &ManagedDbSpec,
+        superuser_password: String,
+    ) -> Result<(), String> {
+        use boatramp_storage::tenant_provision::{
+            ensure_login_role_ddl, force_rls_event_trigger_ddl, grant_app_role_ddl,
+            single_app_role_name,
+        };
+        // Opt-in + Postgres-only. MySQL single-mode has no RLS (and no owner/runtime split); an
+        // un-opted single-mode DB keeps serving as the superuser exactly as today.
+        if !db.rls_session || !matches!(db.kind, ExternalSqlKind::Postgres) {
+            return Ok(());
+        }
+        let app_role = single_app_role_name(&db.database);
+        // The app-role password under its OWN sealed key (distinct from the superuser's). For a
+        // `Single` workload the reconcile's `project` IS the credential project
+        // (`single_credential_project`), and `workload` IS `names.workload`, so this key matches the
+        // one the serving path (`build_backend` / `connection_parts`) derives.
+        let app_cred_workload = crate::tenant_sql::single_app_credential_workload_key(workload);
+        let app_password = self
+            .creds
+            .password(project, &app_cred_workload)
+            .await
+            .map_err(|e| format!("single-mode app-role credential ({app_role}): {e}"))?;
+
+        // Connect to the TENANT database as the bootstrap SUPERUSER: the role create is cluster-wide,
+        // and the schema grants + the per-database FORCE-on-ENABLE event trigger are database-local,
+        // so running them all on the tenant-DB superuser connection is correct and one round-trip.
+        let admin = self.admin_backend(
+            project,
+            workload,
+            db.kind,
+            &db.database,
+            &db.user,
+            superuser_password,
+        );
+        let mut stmts = ensure_login_role_ddl(db.kind, &app_role, &app_password, &db.database);
+        // The app role gets only GRANT + DEFAULT PRIVILEGES (owner = the schema-owning superuser),
+        // never ownership — it OWNS NOTHING.
+        stmts.extend(grant_app_role_ddl(db.kind, &app_role, &db.user));
+        // Defense-in-depth FORCE-on-ENABLE trigger (owned by the schema-owning superuser so its
+        // SECURITY DEFINER body may FORCE the tenant tables). The app role is a non-owner that ENABLE
+        // already binds, so FORCE is belt-and-suspenders here — installed to match the Shared path.
+        stmts.extend(force_rls_event_trigger_ddl(db.kind, &db.user));
+        for stmt in stmts {
+            admin.run_script(&stmt).await.map_err(|e| {
+                format!("single-mode RLS app-role provision on {}: {e}", db.database)
+            })?;
+        }
+        tracing::info!(
+            database = %db.database,
+            app_role = %app_role,
+            "single-mode RLS: provisioned a STABLE non-superuser app role (serve-as-non-superuser)"
+        );
+        Ok(())
+    }
+
     /// Resolve the launched `(project, workload)` to the [`ManagedDbSpec`] whose
     /// server-init env it needs, consulting BOTH the node-static config and — for an
     /// APPLIED (deploy-store) managed db — the per-project declaration store.
@@ -602,6 +694,7 @@ impl ManagedDbEnv {
                 // Carry the DECLARED extensions through so the post-ready provisioning pass
                 // can create the allowlisted ones (cap-req #28 B3).
                 extensions: apply_db.extensions.clone(),
+                rls_session: lowered.rls_session,
             });
         }
         None
@@ -744,7 +837,16 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
                     return Err(format!("provision {}: {e}", db.database));
                 }
                 // The database now exists → create its declared, allowlisted extensions.
-                self.create_declared_extensions(project, workload, &db, password)
+                self.create_declared_extensions(project, workload, &db, password.clone())
+                    .await?;
+                // OPT-IN single-mode RLS (capability parity): when the binding sets
+                // `rls_session` on a dedicated-container managed Postgres, provision the STABLE
+                // non-superuser app login role the runtime is served as instead of the bootstrap
+                // superuser, so the app's own `FORCE ROW LEVEL SECURITY` actually binds. Default
+                // off ⇒ no role, serve-as-superuser (byte-identical to today). Runs HERE (the
+                // post-ready pass that produces `Provisioned`, which the serving resolver gates on),
+                // so the role exists before the serving path ever routes to the replica.
+                self.provision_single_app_role(project, workload, &db, password)
                     .await
             }
         }
@@ -3955,6 +4057,7 @@ mod tests {
             user: "app".into(),
             tenant: crate::config::TenantIsolation::Single,
             extensions: extensions.iter().map(|s| (*s).to_string()).collect(),
+            rls_session: false,
         }
     }
 
@@ -3998,6 +4101,7 @@ mod tests {
             user: "app".into(),
             tenant: crate::config::TenantIsolation::Single,
             extensions: vec!["vector".to_string()],
+            rls_session: false,
         };
         assert!(
             env.create_declared_extensions("default", "bramp-db-x", &spec, "pw".into())

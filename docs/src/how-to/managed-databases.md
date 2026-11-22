@@ -62,7 +62,7 @@ additive — an absent `databases:` still parses (no version bump, no migration)
 | `tenant` | `single` (dedicated) or `shared` (one server, per-tenant isolation). |
 | `tenant_scope` | `project` or `site` — the granularity a shared server isolates by. |
 | `read_only` | Provision a read-only binding. |
-| `rls_session` / `tenant_guc` / `session_guc` / `tenant_all_marker` | Row-level-security / session knobs for tenant isolation. |
+| `rls_session` / `tenant_guc` / `session_guc` / `tenant_all_marker` | Row-level-security / session knobs for tenant isolation. On a **`tenant: single`** Postgres binding, `rls_session: true` also opts into serving the runtime as a **non-superuser app role** (instead of the container's bootstrap superuser, which bypasses RLS) — see [the SQL binding how-to](./handler-binding-sql.md#single-mode-rls--rls_session-on-a-tenant-single-postgres-binding). |
 | `pool_max` / `connect_timeout_secs` / `startup_grace_secs` | Connection knobs — each **capped** to an operator ceiling. |
 | `delta_capture` | Opt a **dedicated** Postgres/MySQL database into true **row-delta export** (logical WAL / binlog). Default `false`. Flips a start-only server setting, so it takes effect only after a restart (below). See [Incremental & true-delta export](./delta-export.md). |
 | `restart_policy` | How a restart-requiring config change (e.g. flipping `delta_capture`) is applied: `manual` (default — stage it, mark the DB **pending restart**) or `auto` (apply + restart on the next `apply`). |
