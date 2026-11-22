@@ -3488,6 +3488,8 @@ pub enum DnsProviderKind {
     Akamai,
     /// Gandi LiveDNS.
     Gandi,
+    /// RFC 2136 dynamic DNS UPDATE with TSIG (self-hosted BIND / PowerDNS / Knot).
+    Rfc2136,
 }
 
 impl DnsProviderKind {
@@ -3506,6 +3508,7 @@ impl DnsProviderKind {
             Self::AzureDns => "azure-dns",
             Self::Akamai => "akamai",
             Self::Gandi => "gandi",
+            Self::Rfc2136 => "rfc2136",
         }
     }
 
@@ -3525,6 +3528,7 @@ impl DnsProviderKind {
             "azure-dns" | "azure" | "azuredns" => Some(Self::AzureDns),
             "akamai" => Some(Self::Akamai),
             "gandi" => Some(Self::Gandi),
+            "rfc2136" | "rfc-2136" => Some(Self::Rfc2136),
             _ => None,
         }
     }
@@ -3542,7 +3546,8 @@ impl<'de> Deserialize<'de> for DnsProviderKind {
         Self::from_token(&s).ok_or_else(|| {
             serde::de::Error::custom(format!(
                 "unknown DNS provider kind {s:?} (expected manual | cloudflare | route53 | oci | \
-                 digitalocean | hetzner | ns1 | dnsimple | gcp-dns | azure-dns | akamai | gandi)"
+                 digitalocean | hetzner | ns1 | dnsimple | gcp-dns | azure-dns | akamai | gandi | \
+                 rfc2136)"
             ))
         })
     }
@@ -3629,6 +3634,19 @@ pub struct DnsProviderConfig {
     pub client_token: Option<String>,
     /// Akamai EdgeGrid client secret — **secret**.
     pub client_secret: Option<String>,
+    // ---- RFC 2136 (dynamic DNS UPDATE + TSIG) -----------------------------------------------------
+    /// RFC 2136 authoritative server to send the UPDATE to, `host[:port]` (default
+    /// port 53). Non-secret. The `zone` field (above) is the zone apex it targets.
+    pub server: Option<String>,
+    /// RFC 2136 TSIG key name (non-secret identifier — must match the server's
+    /// `key` statement name).
+    pub tsig_key_name: Option<String>,
+    /// RFC 2136 TSIG algorithm (`hmac-sha256` | `hmac-sha384` | `hmac-sha512`;
+    /// default `hmac-sha256`). Non-secret.
+    pub tsig_algorithm: Option<String>,
+    /// RFC 2136 TSIG shared secret, base64 — **secret** (like every other
+    /// provider credential: an `env:`/`boatramp:` ref, never a plaintext literal).
+    pub tsig_secret: Option<String>,
 }
 
 /// `[serve.blob_fallback]` — a **read-only SECONDARY blob backend** for a zero-downtime backend switch

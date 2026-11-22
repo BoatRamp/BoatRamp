@@ -329,7 +329,7 @@ only — are env-settable too, so wildcard DNS-01 can be configured with no conf
 | --- | --- | --- |
 | `BOATRAMP_TLS` | `--tls` | Listener TLS mode: `off` (default), `custom`, `acme`, `acme-dns`, `rpk`. Use `acme-dns` for wildcard certs. |
 | `BOATRAMP_ACME_DOMAINS` | `--acme-domain` | Comma-separated domains to certify. An explicit wildcard (`*.example.com`) is issued via DNS-01. |
-| `BOATRAMP_ACME_DNS_PROVIDER` | `--acme-dns-provider` | DNS-01 provider: `manual`, `cloudflare`, `route53`, `oci`, `digitalocean`, `hetzner`, `ns1`, `dnsimple`, `gcp`, `azure`, `akamai`. |
+| `BOATRAMP_ACME_DNS_PROVIDER` | `--acme-dns-provider` | DNS-01 provider: `manual`, `cloudflare`, `route53`, `oci`, `digitalocean`, `hetzner`, `ns1`, `dnsimple`, `gcp`, `azure`, `akamai`, `gandi`, `rfc2136`. |
 | `BOATRAMP_ACME_CONTACT` | `--acme-contact` | Contact email for the ACME account. |
 | `BOATRAMP_ACME_DIRECTORY` | `--acme-directory` | ACME directory URL (default Let's Encrypt production). |
 | `BOATRAMP_ACME_CACHE` | `--acme-cache` | Certificate cache directory (default `./data/acme`). |

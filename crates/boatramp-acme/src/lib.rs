@@ -57,6 +57,9 @@ pub mod azure_dns;
 #[cfg(feature = "akamai")]
 pub mod akamai;
 
+#[cfg(feature = "rfc2136")]
+pub mod rfc2136;
+
 /// Shared OAuth2 token exchange + caching for the adapters that take a LONG-LIVED credential and mint a
 /// short-lived bearer (GCP service-account JWT-bearer, Azure service-principal client-credentials).
 #[cfg(any(feature = "gcp-dns", feature = "azure-dns"))]
@@ -74,7 +77,12 @@ pub use routing::{RoutingBuildError, RoutingDnsProvider};
 /// Akamai DNS providers stamp into their auth headers. (This crate is standalone,
 /// so it keeps its own tiny clock read rather than depend on `boatramp-core` for
 /// it.) Gated to the providers that use it so a lean build warns on neither.
-#[cfg(any(feature = "oci", feature = "akamai", feature = "gcp-dns"))]
+#[cfg(any(
+    feature = "oci",
+    feature = "akamai",
+    feature = "gcp-dns",
+    feature = "rfc2136"
+))]
 pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
