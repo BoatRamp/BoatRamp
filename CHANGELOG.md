@@ -30,6 +30,116 @@ versions.
   dropping the dev/prod expected-to-differ set — the per-route `tenancy`/`token_claims` block,
   domains, and the project's publish target (`PLAN-dev-prod-manifest-overlay`). Both renderings honor
   `--output-format` (human text or JSON).
+- **Compute workload scheduling priority + a tenancy-safe preemption engine.** A two-axis
+  `Priority { class, rank, min_available }` on the MUTABLE `ComputeWorkload` (never the
+  content-addressed spec, so a reprioritize is a pointer update) with an operator class catalog
+  (`system`/`standard`/`spot`, tiers + preemption modes) and a per-project `priority_ceiling`
+  (default `standard`) enforced fail-closed at `compute set`. The reconcile placement sort becomes
+  the global comparator `operator_tier DESC → project → rank DESC → name` (because `project`
+  outranks `rank`, a tenant's rank can never leapfrog another project), and a pure
+  `plan_preemptions` engine evicts lower-priority replicas under real contention — same-project
+  higher-rank, or cross-project only for a `CrossTenantOptIn` strictly-higher tier (two `standard`
+  tenants never preempt) — with dry-run-before-evict strict improvement, Park (snapshot→zero) vs
+  Drain dispositions, `min_available` floors (hard same-tier, advisory to a higher tier) and an
+  anti-thrash cooldown. A reconcile-time ceiling CLAMP neutralizes a stored over-ceiling class at
+  placement + preemption time, completing the revocation the write-time gate alone cannot. Scoped
+  by a new `Capabilities::preemptible` gate (vmm/container/docker/vz true; cloudflare/kubernetes
+  delegated — for k8s the tier maps to a native `PriorityClass`). Surfaced via `compute status`
+  (PRI/REASON columns, tenant-redacted preemptor attribution), `compute events`, `compute get`, and
+  a `compute set --dry-run` blast-radius preview. Defaults omit from the wire, so existing workloads
+  deserialize to `standard`/rank-0 with zero churn/eviction on upgrade (schema stays v1).
+- **Anycast-VIP support (PLAN-anycast).** Drain-aware `/readyz` (flips to 503 on SIGTERM/Ctrl-C for
+  a configurable `drain_delay`, default 5s, `--drain-delay` / `[serve] drain_delay_secs`, while
+  `/healthz` stays 200) so an Anycast/ECMP load balancer withdraws a node before it stops accepting
+  — closing the rolling-restart connection blip; routable QUIC Connection IDs (`--anycast-node-id`
+  encodes the node id in byte 0 of every CID for a CID-steering L4 LB; `--http3-advertise false`
+  keeps clients on H2/TCP behind a plain VIP; a node with no id keeps quinn's random CIDs,
+  unchanged); a startup self-check warning on Anycast-unsafe config (node-local fs blobs, per-node
+  rate limiting, H3 advertised without a node id); and an "Expose a cluster behind an Anycast VIP"
+  how-to.
+- **Two-tier System-Admin opt-out for guest-log secret redaction (PLAN-guest-log-secret-redaction).**
+  On top of v0.64.0's on-by-default redaction: a node-global `[compute].redact_guest_log_secrets`
+  (default on), a node-global admission gate `[compute].allow_per_project_redaction_override`
+  (default off), and a System-Admin per-project opt-out
+  (`/api/compute/log-redaction/{project}`, set/get/clear) honored ONLY when the node admits
+  overrides. A per-project opt-out can only ever DISABLE redaction (never re-enable past a
+  node-global off) and only for that one project's workloads. The decision composes in ONE place
+  (`boatramp_guestlog::should_redact`), which both the native-container and docker backends gate
+  `build_log_redactor` on. Fail-secure: the admission gate defaults off, and a per-project read
+  error leaves redaction on and never holds placement.
+- **ACME capability requests U19–U22 (`boatramp-acme`).** U19: a caller-selectable rustls crypto
+  provider (`CryptoProviderChoice` + `install_crypto_provider`) installed before instant-acme's
+  no-arg `ClientConfig::builder()` runs, fixing the panic when a process links both `ring` and
+  `aws-lc-rs`. U20: multiple TXT records per name (`DnsProvider::upsert_txt_set`) so a wildcard+apex
+  order's two `_acme-challenge` values coexist instead of racing one to `invalid` (Cloudflare +
+  manual providers converge the RRset; multi-value refused with a typed error, never a silent
+  drop). U21: a typed `AcmeError::RateLimited { retry_after, detail }` parsed from the ACME
+  `rateLimited` problem. U22: the propagation self-check resolver no longer caches
+  (`cache_size = 0`), so a freshly-published TXT is never masked by a cached negative.
+- **RFC 2136 dynamic-DNS provider for self-hosted authoritative nameservers (BIND/PowerDNS/Knot).**
+  An 11th `DnsProvider` speaking the DNS-wire dynamic-UPDATE protocol with RFC 8945 TSIG signing
+  over `hickory-proto` (already in-tree — adds NO new crate, only its `dnssec-ring` feature; the
+  UDP/TCP transport is hand-rolled over tokio, no async-client/rustls stack). Additive TXT upsert
+  (coexisting wildcard+apex values; a duplicate add is a protocol no-op, so retries are idempotent),
+  atomic A/AAAA/CNAME replace, idempotent delete. The TSIG secret is a credential (env
+  `RFC2136_TSIG_SECRET` or a sealed/`env:` ref, never a manifest literal, never logged); an owner
+  outside the configured zone is refused before any packet leaves the host. Wired into
+  `dns --provider rfc2136`, `serve --acme-dns-provider rfc2136`, and the `[serve.dns_providers]`
+  multi-zone registry.
+- **HTTP body streaming (U27–U29, `boatramp-http`).** U27: h2 request bodies stream to the handler
+  as DATA frames arrive (the concurrent mux no longer buffers to END_STREAM), mirroring h1/h3 —
+  receive flow control, the request-body cap and content-length validation preserved and now
+  feeding a `BodyError` on a truncated/malformed body. U28: the h1 loop stops draining an abandoned
+  request body once a closing response is written (e.g. an early 413) instead of reading a large
+  rejected upload in full (a keep-alive response still drains to keep the pipeline framed). U29: a
+  declared-length streaming body (`Body::StreamSized`) framed with `Content-Length` (h1 raw, not
+  chunked, force-closing on over/under-run; h2 via header), and the proxy stops stripping an
+  upstream `Content-Length` — so a proxied known-length download keeps its length (client progress +
+  range) instead of being forced to chunked.
+- **OCI registry-pull bounds (U30/U31).** U30: operator-tunable `[compute].registry_pull_timeouts`
+  (`connect_secs`/`read_secs`/`response_secs`, node config, never guest-influenced) so a registry
+  that accepts the connection then never answers can no longer hold a pull — and, because reconcile
+  is serial across all projects, every tenant's launches behind it — open forever. U31: a hostname
+  registry resolving to a non-global address now surfaces a typed `ScreenRefusal` carrying the
+  `[compute].allow_private_registries` hint instead of reqwest's opaque transport error (the
+  node-resolved IP is withheld from the tenant-facing message to deny a DNS→IP reconnaissance
+  oracle; it is persisted to `LaunchFailed.reason` for `compute status`).
+- **Operator-configurable bin-packing reservation floor.** `[compute].unresolved_reservation_vcpus`
+  / `_mib` override the conservative reservation the cumulative pre-pass charges a still-running
+  replica whose own launched spec AND its workload's active spec are both unresolvable (was a
+  hardcoded 1 vCPU + 1 GiB); unset keeps the built-in default exactly. Operator-scope (System-Admin,
+  node-side), never tenant-settable.
+- **Per-call `Limits` override on the world-lane `call_export` (authz follow-up).** A handler
+  invocation can carry a per-call resource-limit override, with the load-bearing per-request Cedar
+  schema check locked by a regression test.
+
+### Changed
+
+- **Single per-workload reconcile fetch (bin-packing follow-up).** The bin-packing pre-pass, the
+  per-workload planning loop, and the new preemption pass share ONE `get_compute_spec` +
+  `list_replica_states` read per workload per tick instead of two — output-identical (the pre-pass
+  is read-only and the planning loop only ever writes the CURRENT workload's own replica states;
+  specs are immutable, content-addressed), proven by a counting-store test (N reads, not 2N).
+
+### Security
+
+- **h2 receive backpressure for the mux request-body path** (Security HIGH, folds into U27): the
+  streaming request-body reader honors receive flow control so a client cannot force unbounded
+  buffering while uploading.
+- **OCI pull slow-drip + unbounded-allocation hardening** (Security HIGH + LOW×2): an overall
+  per-pull wall-clock deadline (`[compute].registry_pull_timeouts.overall_pull_secs`, default 600s)
+  bounds a slow-drip that beats the per-chunk idle timeout, and each layer streams to disk with a
+  byte cap enforced DURING the read (`[compute].registry_pull_limits` `max_layer_bytes` 10 GiB /
+  `max_image_bytes` 20 GiB defaults, config/manifest reads capped the same way) so node memory is
+  O(one chunk) instead of the whole blob + all layers — both vectors amplified because the pull
+  runs on the serial reconcile critical path.
+- **Anycast cluster TLS + Connection-ID hardening** (Security review): TLS-ALPN-01 (`--tls acme`)
+  is refused in a clustered posture at startup (the validation connection can land on any node;
+  steer to `--tls acme-dns` / the cluster cert store), and QUIC Connection-ID generation is
+  fail-closed on a CSPRNG.
+- **ACME Cloudflare TXT converge scoped to own-created records** (+ empty-set and `Retry-After`
+  absolute-year handling), and **RFC 2136 UPDATE replies are TSIG-authenticated**, not just the
+  request (reply-auth F1).
 
 ## [0.69.1] — 2026-11-21
 
