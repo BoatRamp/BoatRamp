@@ -61,6 +61,9 @@ pub fn router_with_fast(
     let project_export_cap = options.project_export.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
     let compute_control_cap = options.compute_control.clone();
+    // U14: the cross-node snapshot store — the project force-delete cascade uses it to sweep a
+    // purged tenant's parked snapshots (`csnap/<project>/`). `None` ⇒ no sweep (nothing parked).
+    let snapshot_store_cap = options.snapshot_store.clone();
     // The orphaned-replica reaper (node-health-alerting Stage 2) — `None` ⇒ the reap
     // endpoint fails closed with a 501. Backs `POST /api/compute/maintenance/reap`.
     let compute_reaper_cap = options.compute_reaper.clone();
@@ -877,6 +880,7 @@ pub fn router_with_fast(
         .layer(Extension(project_export_cap))
         .layer(Extension(compute_volumes_cap))
         .layer(Extension(compute_control_cap))
+        .layer(Extension(snapshot_store_cap))
         .layer(Extension(compute_reaper_cap))
         .layer(Extension(secret_store_cap))
         .layer(Extension(tenant_secret_store_cap))

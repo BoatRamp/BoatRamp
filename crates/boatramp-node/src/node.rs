@@ -782,6 +782,11 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // moves the original.
     #[cfg(feature = "project-export")]
     let export_envelope = secrets_envelope.clone();
+    // U14: a clone for the cross-node snapshot store's seal envelope, captured BEFORE
+    // `secrets_envelope` is moved into the managed-DB resolver below. Used in the
+    // handlers-gated snapshot-store wiring further down.
+    #[cfg(feature = "handlers")]
+    let snapshot_envelope = secrets_envelope.clone();
     // Build the managed-DB server-init credential injector whenever a secrets envelope is
     // present — NOT only when the node-static `[databases]` map is non-empty. A turnkey,
     // ENV-configured node with EMPTY node-static `[databases]` still has APPLIED managed dbs
@@ -1155,9 +1160,15 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             {
                 match handlers.blob_backends() {
                     Some(blob_backends) => {
-                        let store: Arc<dyn boatramp_core::compute::SnapshotStore> = Arc::new(
-                            crate::compute_snapshot_store::BlobSnapshotStore::new(blob_backends),
-                        );
+                        // Seal exported snapshots under the node's secrets envelope (the
+                        // cluster-shared key — the same one that seals portable tenant secrets,
+                        // so a resume node can verify). `None` ⇒ unsealed (prefix-confinement
+                        // only), warned per import.
+                        let store: Arc<dyn boatramp_core::compute::SnapshotStore> =
+                            Arc::new(crate::compute_snapshot_store::BlobSnapshotStore::new(
+                                blob_backends,
+                                snapshot_envelope.clone(),
+                            ));
                         Some(store)
                     }
                     None => {
@@ -1192,7 +1203,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         binding_resolver,
         managed_db_resolver,
         registry_auth_resolver,
-        snapshot_store,
+        snapshot_store.clone(),
         compute_binpack_tuning,
     );
 
@@ -1388,6 +1399,10 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     options.dev_messaging_bind = dev_messaging_bind_resolver;
     options.compute_volumes = compute_volumes;
     options.compute_control = compute_control;
+    // U14: the project force-delete cascade sweeps parked snapshots (csnap/<project>/) through
+    // this so a purged tenant's exported guest-RAM never orphans in Storage. `None` ⇒ no sweep
+    // (cross-node s2z off, or no blob backend) — there is then nothing to orphan.
+    options.snapshot_store = snapshot_store;
     // The orphaned-replica reaper backs `POST /api/compute/maintenance/reap` (System·Admin).
     options.compute_reaper = Some(compute_reaper);
     // The internal secret store backs the admin secrets API (set/list/delete). Not

@@ -1390,72 +1390,26 @@ impl ComputeBackend for ContainerBackend {
         })
     }
 
-    /// U14 cross-node s2z: the CRIU snapshot is a DIRECTORY of image files under
-    /// `<data-dir>/compute/criu/<id>/`. Export streams that directory to tenant Storage so a
-    /// parked replica's in-RAM state survives the loss of a single node's local disk.
+    /// U14 cross-node s2z — DEFERRED for the container (CRIU) backend: this returns `None`, so
+    /// a CRIU-parked workload stays strictly SAME-NODE (the snapshot never leaves the home
+    /// node and the planner never re-places a wake). A `None` here also means
+    /// [`snapshot_present`](ComputeBackend::snapshot_present) keeps its default `true`, so a
+    /// same-node wake restores from the local CRIU image directly, exactly as before U14.
     ///
-    /// LIMITATION (surfaced for the owner): a CRIU **restore** needs the container's rootfs
-    /// tree materialized on the target node (`--root <rootfs>`), and that rootfs is derived
-    /// from the live mounts at park time — it is NOT reconstructable on a node that never ran
-    /// the container. So a cross-node wake of a container workload FETCHES the snapshot but,
-    /// absent the rootfs, `restore` fails and the reconcile's clean COLD-START fallback runs
-    /// (the workload serves, losing only the preserved RAM). Full cross-node CRIU restore
-    /// (re-`materialize` the rootfs on the resume node first) is a follow-up. On the HOME node
-    /// (rootfs intact) the exported artifact still enables a same-node restore after a restart.
+    /// LIMITATION (why deferred): a CRIU **restore** needs the container's rootfs tree
+    /// materialized on the target node (`--root <rootfs>`), and that rootfs is derived from
+    /// the live mounts at park time — NOT reconstructable on a node that never ran the
+    /// container. Exporting the CRIU image to tenant Storage without that would upload/download
+    /// on every park/wake only to fail `restore` and cold-start anyway (wasted I/O + storage),
+    /// and the "criu dir non-empty ⇒ present" residue could make a later wake skip the fetch,
+    /// fail `restore`, and retry rather than cold-start. Container cross-node is deferred until
+    /// rootfs re-materialization on the resume node is wired; the microVM (embedded firecracker)
+    /// backend remains full cross-node. See `../boatramp-roadmap` for the follow-up.
     async fn snapshot_artifact(
         &self,
-        snapshot: &Snapshot,
+        _snapshot: &Snapshot,
     ) -> Result<Option<SnapshotArtifact>, BackendError> {
-        if self.criu.is_none() {
-            return Ok(None); // no CRIU → not a parkable/exportable backend here
-        }
-        let (image_dir, rootfs, ip, port) = decode_snap(&snapshot.data_ref).ok_or_else(|| {
-            BackendError::Other(format!("bad snapshot ref {:?}", snapshot.data_ref))
-        })?;
-        let id = container_id(&snapshot.project, &snapshot.workload, snapshot.replica);
-        let local_dir = self.data_dir.join("compute").join("criu").join(&id);
-        // EXPORT: the current image files under the artifact directory. Read from the ORIGINAL
-        // (home) image_dir — on the home node this equals `local_dir`; `snapshot_artifact` is
-        // only called for export on the home node (the files exist there).
-        let mut files = Vec::new();
-        if let Ok(mut rd) = tokio::fs::read_dir(&image_dir).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                if entry
-                    .file_type()
-                    .await
-                    .map(|t| t.is_file())
-                    .unwrap_or(false)
-                    && let Some(name) = entry.file_name().to_str()
-                {
-                    files.push(name.to_string());
-                }
-            }
-        }
-        let local_data_ref = format!(
-            "{}|{ip}|{port}",
-            encode_snap(&local_dir.display().to_string(), &rootfs)
-        );
-        Ok(Some(SnapshotArtifact {
-            dir: local_dir,
-            files,
-            local_data_ref,
-        }))
-    }
-
-    /// Whether this node holds the CRIU image directory locally (non-empty) ⇒ no fetch needed.
-    /// Derived from this node's own `data_dir` + identity, so a resume node that lacks the
-    /// images reports `false` and the reconcile fetches them from tenant Storage.
-    async fn snapshot_present(&self, snapshot: &Snapshot) -> Result<bool, BackendError> {
-        if self.criu.is_none() {
-            return Ok(true); // no cross-node support here; never consult the store
-        }
-        let id = container_id(&snapshot.project, &snapshot.workload, snapshot.replica);
-        let dir = self.data_dir.join("compute").join("criu").join(&id);
-        let present = match tokio::fs::read_dir(&dir).await {
-            Ok(mut rd) => matches!(rd.next_entry().await, Ok(Some(_))),
-            Err(_) => false,
-        };
-        Ok(present)
+        Ok(None)
     }
 
     /// **Exec** (docker-exec style): run `argv` inside the already-running

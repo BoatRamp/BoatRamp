@@ -642,6 +642,13 @@ pub trait SnapshotStore: Send + Sync {
     /// Remove the tenant-scoped archive for `key` (lifecycle: on stop / scale-down / forget).
     /// Removing a missing object is not an error.
     async fn remove(&self, key: &SnapshotKey) -> Result<(), SnapshotStoreError>;
+
+    /// Remove **every** parked snapshot belonging to `project` (data-retention on teardown):
+    /// a project purge nukes its replica-state records directly, so the reconcile never Stops
+    /// those parked replicas — their exported guest-RAM snapshots (which may hold secrets/PII)
+    /// would otherwise ORPHAN in Storage after the tenant is gone. Sweeps the whole
+    /// project-scoped snapshot subtree. Returns the number of objects removed.
+    async fn remove_project(&self, project: &str) -> Result<usize, SnapshotStoreError>;
 }
 
 /// Why a backend operation failed.
@@ -5844,19 +5851,33 @@ pub async fn reconcile_once(
                             // ordinal retrying a restore that won't converge here — drop the
                             // Zero record so the next tick cold-starts it. A same-node restore
                             // failure keeps its retry behavior (the artifact is intact locally).
-                            if !present
-                                && let Err(de) = deploy
+                            if !present {
+                                // The imported-then-unrestorable snapshot is now unreferenced
+                                // (the record is going away): delete it from tenant Storage so it
+                                // doesn't orphan (U14 data-retention — this is the "import
+                                // succeeds then restore fails" orphan case). Best-effort.
+                                if let Some(store) = snapshot_store
+                                    && let Err(re) =
+                                        store.remove(&SnapshotKey::of_snapshot(&snapshot)).await
+                                {
+                                    report.errors.push(format!(
+                                        "{}/{}: cold-start snapshot cleanup: {re}",
+                                        snapshot.workload, snapshot.replica
+                                    ));
+                                }
+                                if let Err(de) = deploy
                                     .delete_replica_state(
                                         project,
                                         &snapshot.workload,
                                         snapshot.replica,
                                     )
                                     .await
-                            {
-                                report.errors.push(format!(
-                                    "{}/{}: cold-start fallback (drop zero): {de}",
-                                    snapshot.workload, snapshot.replica
-                                ));
+                                {
+                                    report.errors.push(format!(
+                                        "{}/{}: cold-start fallback (drop zero): {de}",
+                                        snapshot.workload, snapshot.replica
+                                    ));
+                                }
                             }
                         }
                     }
@@ -8746,6 +8767,19 @@ mod tests {
         async fn remove(&self, key: &SnapshotKey) -> Result<(), SnapshotStoreError> {
             self.keys.lock().unwrap().remove(&Self::k(key));
             Ok(())
+        }
+        async fn remove_project(&self, project: &str) -> Result<usize, SnapshotStoreError> {
+            let prefix = format!("{project}/");
+            let mut keys = self.keys.lock().unwrap();
+            let doomed: Vec<String> = keys
+                .iter()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for k in &doomed {
+                keys.remove(k);
+            }
+            Ok(doomed.len())
         }
     }
 
