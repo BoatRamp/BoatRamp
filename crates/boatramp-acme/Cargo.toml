@@ -20,7 +20,13 @@ default = []
 # hickory-resolver for the DNS-01 propagation pre-check (resolve the
 # `_acme-challenge` TXT and confirm it is live BEFORE telling the CA to validate
 # — see `acme::wait_for_propagation`).
-acme = ["dep:instant-acme", "dep:rcgen", "dep:tokio", "dep:hickory-resolver"]
+acme = [
+  "dep:instant-acme",
+  "dep:rcgen",
+  "dep:tokio",
+  "dep:hickory-resolver",
+  "dep:rustls",
+]
 # DNS providers, each behind its own feature so its client deps are optional.
 cloudflare = ["dep:reqwest", "dep:serde_json"]
 route53 = ["dep:aws-config", "dep:aws-sdk-route53"]
@@ -74,6 +80,17 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-route53 = { version = "1", features = [
   "behavior-version-latest",
 ], optional = true }
+# U19 (caller-selectable rustls crypto provider). instant-acme's own TLS client
+# is built with the no-argument `rustls::ClientConfig::builder()`, which reads
+# the PROCESS-DEFAULT `CryptoProvider`; when a build links BOTH the `ring` and
+# `aws-lc-rs` providers (common once several TLS crates are present) rustls
+# cannot infer a default and that builder PANICS. We depend on rustls directly
+# (same 0.23 line instant-acme uses — must match so `install_default` sets the
+# default the SAME rustls static reads) to install the provider explicitly, and
+# enable BOTH provider features so an embedder can select either (`aws_lc_rs`
+# arrives via rustls's default features; `ring` is added here). See
+# `acme::install_crypto_provider`.
+rustls = { workspace = true, features = ["ring"], optional = true }
 ring = { version = "0.17", optional = true }
 rsa = { version = "0.9", optional = true, features = ["sha2"] }
 pkcs8 = { version = "0.10", optional = true, features = ["pem"] }
@@ -98,7 +115,10 @@ serde_json.workspace = true
 reqwest = { workspace = true }
 rcgen = "0.13"
 tempfile = "3"
-# Install a process crypto provider for instant-acme's hyper-rustls client.
+# The `acme` feature already pulls rustls (with `ring`) as a normal dependency
+# for `acme::install_crypto_provider`; this dev-dependency only guarantees the
+# type is available to the Pebble integration test's manual provider install
+# regardless of how features unify.
 rustls = { workspace = true }
 
 [lints]

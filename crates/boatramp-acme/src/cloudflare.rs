@@ -6,6 +6,9 @@
 //! send/parse round-trip is exercised against a live zone (the documented
 //! integration seam — no Cloudflare account in CI).
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -45,6 +48,16 @@ pub struct CloudflareDns {
     /// provider instance, so it is set per-invocation (e.g. `dns
     /// configure-domain --proxied`) — never globally; TXT is never proxied.
     proxied: bool,
+    /// The Cloudflare record ids THIS instance created via
+    /// [`create_txt_record`](Self::create_txt_record) while converging a TXT
+    /// challenge set (U20). The converge's delete step is scoped to exactly these
+    /// ids (F1): it may remove only a record this solver instance itself wrote, so
+    /// a concurrent ACME order's challenge value — or any unrelated TXT — at the
+    /// same `_acme-challenge.<name>` is never clobbered (that was a
+    /// denial-of-issuance). In-memory per instance: after a process restart a new
+    /// instance simply never deletes a record it has no record of creating (it
+    /// lingers harmlessly), which is the safe failure — never deleting foreign.
+    own_created: Mutex<HashSet<String>>,
 }
 
 impl CloudflareDns {
@@ -57,6 +70,7 @@ impl CloudflareDns {
             token: token.into(),
             zone_id: zone_id.into(),
             proxied: false,
+            own_created: Mutex::new(HashSet::new()),
         }
     }
 
@@ -289,6 +303,64 @@ impl CloudflareDns {
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(body.result.into_iter().next().map(|r| r.id))
     }
+
+    /// Every `(id, content)` TXT record at `name` — the current RRset, for
+    /// converging a TXT challenge set (U20).
+    async fn list_txt_records(&self, name: &str) -> Result<Vec<(String, String)>, DnsError> {
+        let resp = self
+            .client
+            .get(self.records_url())
+            .bearer_auth(&self.token)
+            .query(&[("type", "TXT"), ("name", name)])
+            .send()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        let body: ListResponse = resp
+            .error_for_status()
+            .map_err(|e| DnsError::Backend(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        Ok(body.result.into_iter().map(|r| (r.id, r.content)).collect())
+    }
+
+    /// Delete one record by its Cloudflare id.
+    async fn delete_record_by_id(&self, id: &str) -> Result<(), DnsError> {
+        self.client
+            .delete(format!("{}/{}", self.records_url(), id))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Create one TXT record `value` at `name` (POST, never replacing a sibling) —
+    /// used to add a value to a TXT challenge set (U20). Records the new
+    /// Cloudflare id in [`own_created`](Self::own_created) so the converge's delete
+    /// step can be scoped to only records this instance itself wrote (F1).
+    async fn create_txt_record(&self, name: &str, value: &str, ttl: u32) -> Result<(), DnsError> {
+        let body = self.record_body(&crate::dns::txt_record(name, value, ttl));
+        let created: CreateResponse = self
+            .client
+            .post(self.records_url())
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| DnsError::Backend(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        if let Ok(mut own) = self.own_created.lock() {
+            own.insert(created.result.id);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -296,9 +368,63 @@ struct ListResponse {
     result: Vec<ListRecord>,
 }
 
+/// Cloudflare's single-object `result` from a `POST /dns_records` — we read only
+/// the new record's `id`, to remember which records this instance created (F1).
+#[derive(Deserialize)]
+struct CreateResponse {
+    result: CreatedRecord,
+}
+
+#[derive(Deserialize)]
+struct CreatedRecord {
+    id: String,
+}
+
 #[derive(Deserialize)]
 struct ListRecord {
     id: String,
+    /// The record's rdata (for TXT, the value) — used to converge a TXT challenge
+    /// set (U20). `default` so a list of record types without a `content` field
+    /// still deserializes.
+    #[serde(default)]
+    content: String,
+}
+
+/// Pure converge plan for a Cloudflare TXT RRset at one name toward the exact set
+/// `desired` (U20): the ids to DELETE and the values to CREATE. Idempotent — a
+/// set already equal to `desired` yields no deletes and no creates.
+///
+/// **F1 — never delete a foreign record.** The delete step is scoped to
+/// `own_created`: the Cloudflare ids THIS solver instance itself wrote. A record
+/// is deleted only when it is own-created AND its content is no longer in
+/// `desired` (a value this issuance withdrew). Records this instance did not
+/// create — a concurrent ACME order's challenge value at the same
+/// `_acme-challenge.<name>` (overlapping renew, blue/green, boatramp alongside an
+/// external certbot), Cloudflare's Universal-SSL managed token, or any unrelated
+/// TXT — are never touched; clobbering them was a denial-of-issuance. The
+/// create side is unchanged (every `desired` value absent by content is created),
+/// so our full set, including wildcard+apex, is always made present and
+/// re-converge stays idempotent.
+///
+/// Pure (no network), so the converge logic is unit-tested; the list/delete/create
+/// round-trip is the documented live seam.
+fn txt_set_plan(
+    existing: &[(String, String)],
+    desired: &[String],
+    own_created: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let want: HashSet<&str> = desired.iter().map(String::as_str).collect();
+    let to_delete: Vec<String> = existing
+        .iter()
+        .filter(|(id, content)| own_created.contains(id) && !want.contains(content.as_str()))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let to_create: Vec<String> = desired
+        .iter()
+        .filter(|v| !existing.iter().any(|(_, c)| c == *v))
+        .cloned()
+        .collect();
+    (to_delete, to_create)
 }
 
 #[derive(Deserialize)]
@@ -334,6 +460,47 @@ impl DnsProvider for CloudflareDns {
             .map_err(|e| DnsError::Backend(e.to_string()))?
             .error_for_status()
             .map_err(|e| DnsError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Converge the TXT RRset at `name` to EXACTLY `values` (U20): a wildcard+apex
+    /// order's two authorizations publish different values at the SAME
+    /// `_acme-challenge.<base>`, and both must coexist — the plain `upsert`
+    /// (replace-first-match) would drop one. Lists the current TXT records,
+    /// computes the pure [`txt_set_plan`], then deletes the ids this instance
+    /// created that are no longer desired (F1 — never a foreign record) and
+    /// creates the missing values. Idempotent across retries.
+    async fn upsert_txt_set(
+        &self,
+        name: &str,
+        values: &[String],
+        ttl: u32,
+    ) -> Result<(), DnsError> {
+        // F2: honor the `[] = no-op` trait contract. An empty desired set is a
+        // teardown (that is `delete`'s job), never "wipe the whole RRset" — so a
+        // future caller passing `&[]` can't delete anything here. (The default
+        // trait impl already special-cases empty; this override must too.)
+        if values.is_empty() {
+            return Ok(());
+        }
+        let existing = self.list_txt_records(name).await?;
+        // Snapshot the own-created ids (no lock held across an await), plan, then
+        // delete only this instance's now-unwanted records.
+        let own_snapshot: HashSet<String> = self
+            .own_created
+            .lock()
+            .map(|own| own.clone())
+            .unwrap_or_default();
+        let (to_delete, to_create) = txt_set_plan(&existing, values, &own_snapshot);
+        for id in to_delete {
+            self.delete_record_by_id(&id).await?;
+            if let Ok(mut own) = self.own_created.lock() {
+                own.remove(&id);
+            }
+        }
+        for value in to_create {
+            self.create_txt_record(name, &value, ttl).await?;
+        }
         Ok(())
     }
 
@@ -664,6 +831,153 @@ mod tests {
                 3600
             )),
             serde_json::json!({"type": "HTTPS", "name": "example.com", "data": {"priority": 1, "target": ".", "value": "alpn=\"h3,h2\" ipv4hint=\"127.0.0.1\" ipv6hint=\"::1\""}, "ttl": 3600})
+        );
+    }
+
+    // ---- U20: TXT challenge-set converge plan (pure) ---------------------------
+
+    fn ids(v: Vec<String>) -> Vec<String> {
+        let mut v = v;
+        v.sort();
+        v
+    }
+
+    /// The set of Cloudflare ids this instance "created" (F1 ownership scope).
+    fn owned(ids: &[&str]) -> HashSet<String> {
+        ids.iter().copied().map(String::from).collect()
+    }
+
+    /// The converge plan from the empty set: create every desired value, delete
+    /// nothing. This is the wildcard+apex first publish.
+    #[test]
+    fn txt_set_plan_creates_all_from_empty() {
+        let (del, create) = txt_set_plan(&[], &["a".to_string(), "b".to_string()], &owned(&[]));
+        assert!(del.is_empty());
+        assert_eq!(ids(create), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Adding a second value keeps the first (no churn on the already-present one):
+    /// exactly the apex value staying live while the wildcard value is added (U20).
+    #[test]
+    fn txt_set_plan_adds_second_value_without_touching_first() {
+        let existing = vec![("id-a".to_string(), "a".to_string())];
+        let (del, create) = txt_set_plan(
+            &existing,
+            &["a".to_string(), "b".to_string()],
+            &owned(&["id-a"]),
+        );
+        assert!(
+            del.is_empty(),
+            "the already-present value must not be deleted"
+        );
+        assert_eq!(
+            create,
+            vec!["b".to_string()],
+            "only the missing value is created"
+        );
+    }
+
+    /// An already-converged set is a no-op (idempotent across issuance retries).
+    #[test]
+    fn txt_set_plan_is_idempotent_when_converged() {
+        let existing = vec![
+            ("id-a".to_string(), "a".to_string()),
+            ("id-b".to_string(), "b".to_string()),
+        ];
+        let (del, create) = txt_set_plan(
+            &existing,
+            &["a".to_string(), "b".to_string()],
+            &owned(&["id-a", "id-b"]),
+        );
+        assert!(del.is_empty() && create.is_empty());
+    }
+
+    /// An own-created value this issuance no longer wants is deleted, and a
+    /// genuinely missing value is created — a reconcile scoped to our own records.
+    #[test]
+    fn txt_set_plan_deletes_own_unwanted_and_creates_missing() {
+        let existing = vec![
+            ("id-a".to_string(), "a".to_string()),
+            ("id-stale".to_string(), "stale".to_string()), // own-created, no longer wanted
+        ];
+        let (del, create) = txt_set_plan(
+            &existing,
+            &["a".to_string(), "b".to_string()],
+            &owned(&["id-a", "id-stale"]),
+        );
+        assert_eq!(del, vec!["id-stale".to_string()]);
+        assert_eq!(create, vec!["b".to_string()]);
+    }
+
+    /// F1 — THE denial-of-issuance gate: the converge must NEVER delete a TXT
+    /// record this solver instance did not itself create. A foreign/unrelated TXT
+    /// at the same `_acme-challenge` name (an unrelated record, Cloudflare's
+    /// Universal-SSL token) AND a concurrent ACME order's live challenge value both
+    /// survive the converge — only our own missing value is created. If a reviewer
+    /// drops the own-created scoping (deleting every non-desired content), both
+    /// foreign records land in `del` and this goes RED.
+    #[test]
+    fn txt_set_plan_never_deletes_a_foreign_record() {
+        let existing = vec![
+            (
+                "id-foreign".to_string(),
+                "unrelated-verification".to_string(),
+            ),
+            // A concurrent order's DNS-01 challenge value (43-char base64url), live
+            // at the SAME name — must not be swept.
+            (
+                "id-concurrent".to_string(),
+                "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk".to_string(),
+            ),
+            ("id-ours".to_string(), "ours-apex".to_string()), // this issuance's record
+        ];
+        let (del, create) = txt_set_plan(
+            &existing,
+            &["ours-apex".to_string(), "ours-wild".to_string()],
+            &owned(&["id-ours"]),
+        );
+        assert!(
+            del.is_empty(),
+            "neither the foreign record nor the concurrent order's value may be deleted, got {del:?}"
+        );
+        assert_eq!(
+            create,
+            vec!["ours-wild".to_string()],
+            "only our own missing value is created; foreign content is left untouched"
+        );
+    }
+
+    /// Reducing to a single value (one authorization's teardown) deletes exactly
+    /// the withdrawn value's OWN record and leaves the survivor — and a foreign
+    /// record present at the name is still never touched.
+    #[test]
+    fn txt_set_plan_reduces_to_the_surviving_value() {
+        let existing = vec![
+            ("id-a".to_string(), "a".to_string()),
+            ("id-b".to_string(), "b".to_string()),
+            ("id-foreign".to_string(), "foreign".to_string()),
+        ];
+        let (del, create) = txt_set_plan(&existing, &["b".to_string()], &owned(&["id-a", "id-b"]));
+        assert_eq!(del, vec!["id-a".to_string()]);
+        assert!(create.is_empty());
+    }
+
+    /// F2 — the override must honor the `[] = no-op` trait contract: an empty
+    /// desired set does NOTHING (teardown is `delete`'s job), so a future caller
+    /// passing `&[]` can't wipe the whole RRset. The provider points at an
+    /// unreachable base, yet the empty converge returns `Ok(())` WITHOUT any
+    /// network call — if the early return were dropped, `list_txt_records` would
+    /// hit that base and this would be an `Err`.
+    #[tokio::test]
+    async fn upsert_txt_set_empty_is_a_no_op_without_network() {
+        // Port 1 ⇒ connection refused fast, so a leaked request fails loudly
+        // rather than hanging.
+        let cf = CloudflareDns::new("zone123", "tok").with_api_base("http://127.0.0.1:1/v4");
+        assert!(
+            cf.upsert_txt_set("_acme-challenge.example.com", &[], 60)
+                .await
+                .is_ok(),
+            "an empty desired set must be a no-op (delete nothing, no network)"
         );
     }
 }

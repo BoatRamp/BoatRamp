@@ -35,8 +35,33 @@ pub use crate::authoritative::AuthoritativeTxtResolver;
 #[derive(Debug, thiserror::Error)]
 pub enum AcmeError {
     /// An error from the ACME protocol client.
+    ///
+    /// A `rateLimited` problem is classified out of this variant into the typed
+    /// [`AcmeError::RateLimited`] (see the `From<instant_acme::Error>` impl) so a
+    /// caller can back off correctly rather than string-matching an opaque error.
     #[error("ACME protocol error: {0}")]
-    Acme(#[from] instant_acme::Error),
+    Acme(instant_acme::Error),
+    /// The CA refused the request with an ACME `rateLimited` problem (RFC 8555
+    /// §6.7, `urn:ietf:params:acme:error:rateLimited`, HTTP 429) — e.g. the
+    /// per-account `newOrder` limit, or the certificates-per-exact-name limit.
+    ///
+    /// `retry_after` is the backoff hint when the CA supplied one, parsed from
+    /// the problem detail's `retry after <RFC 3339 timestamp | delay-seconds>`
+    /// (the shape Let's Encrypt uses); `None` ⇒ the CA gave no parseable hint and
+    /// the caller should apply its own backoff. `detail` is the CA's
+    /// human-readable message (usually naming the exact limit and reset time).
+    ///
+    /// Surfaced as a distinct variant — rather than an opaque protocol error — so
+    /// a caller can distinguish "slow down, retry later" from a hard failure and
+    /// schedule a retry after `retry_after` instead of hammering the CA (which
+    /// only deepens the limit).
+    #[error("ACME rate limited by the CA (retry_after: {retry_after:?}): {detail:?}")]
+    RateLimited {
+        /// How long to wait before retrying, when the CA provided a parseable hint.
+        retry_after: Option<Duration>,
+        /// The CA's human-readable rate-limit message, verbatim.
+        detail: Option<String>,
+    },
     /// Key or CSR generation failed.
     #[error("certificate key/CSR generation: {0}")]
     Rcgen(#[from] rcgen::Error),
@@ -64,6 +89,197 @@ pub enum AcmeError {
     /// TLS-ALPN-01 challenge certificate).
     #[error("challenge solver: {0}")]
     Solver(String),
+}
+
+impl From<instant_acme::Error> for AcmeError {
+    /// Classify the `rateLimited` ACME problem (U21) out of the opaque protocol
+    /// error into the typed [`AcmeError::RateLimited`], carrying the parsed
+    /// `Retry-After` hint; every other error falls through to [`AcmeError::Acme`].
+    /// This is the `#[from]` the `?` operator uses throughout the driver, so a
+    /// rate-limit raised by `newAccount` / `newOrder` / `finalize` arrives typed.
+    fn from(err: instant_acme::Error) -> Self {
+        if let instant_acme::Error::Api(problem) = &err
+            && is_acme_rate_limited(problem)
+        {
+            return Self::RateLimited {
+                retry_after: parse_retry_after_from_detail(
+                    problem.detail.as_deref().unwrap_or(""),
+                    std::time::SystemTime::now(),
+                ),
+                detail: problem.detail.clone(),
+            };
+        }
+        Self::Acme(err)
+    }
+}
+
+/// Whether an ACME problem document is a `rateLimited` error. Matches the RFC 8555
+/// §6.7 problem URN `urn:ietf:params:acme:error:rateLimited` by its `:ratelimited`
+/// suffix (case-insensitively, so a CA that namespaces the URN prefix differently
+/// still classifies), and also treats a bare HTTP 429 as rate limiting.
+fn is_acme_rate_limited(problem: &instant_acme::Problem) -> bool {
+    problem
+        .r#type
+        .as_deref()
+        .is_some_and(|t| t.to_ascii_lowercase().ends_with(":ratelimited"))
+        || problem.status == Some(429)
+}
+
+/// Best-effort extraction of a `Retry-After` backoff from an ACME problem detail.
+///
+/// instant-acme surfaces a `rateLimited` problem as its parsed JSON document and
+/// does not expose the HTTP `Retry-After` header, but the CA's human-readable
+/// `detail` carries the same information — Let's Encrypt writes
+/// `… retry after 2026-11-22T00:00:00Z: see https://…`. We parse the token after
+/// `retry after` as either RFC 3339 UTC (absolute ⇒ duration from `now`, clamped
+/// to zero if already past) or a bare `delay-seconds` integer. `None` when the
+/// detail carries no parseable hint (the caller then uses its own backoff).
+fn parse_retry_after_from_detail(detail: &str, now: std::time::SystemTime) -> Option<Duration> {
+    const MARKER: &str = "retry after ";
+    let lower = detail.to_ascii_lowercase();
+    let start = lower.find(MARKER)? + MARKER.len();
+    // Take the first whitespace-delimited token after the marker (the detail
+    // often continues with `: see https://…`), then trim trailing punctuation.
+    let token = detail[start..]
+        .split_whitespace()
+        .next()?
+        .trim_end_matches([':', ',', '.', ';', ')']);
+    // `delay-seconds` form (RFC 9110): a bare count of seconds.
+    if let Ok(secs) = token.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // Absolute RFC 3339 UTC timestamp form.
+    let target = parse_rfc3339_utc(token)?;
+    Some(target.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+/// Parse an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) into a
+/// [`SystemTime`](std::time::SystemTime), dependency-free (the crate pulls no
+/// date library). Only the `Z` (UTC) zone is accepted — an ACME `Retry-After`
+/// problem detail always uses it — and fractional seconds are discarded. `None`
+/// for anything malformed, including an out-of-range (`>9999`) year, which would
+/// otherwise overflow the civil-days arithmetic. Uses Howard Hinnant's
+/// days-from-civil algorithm.
+fn parse_rfc3339_utc(s: &str) -> Option<std::time::SystemTime> {
+    let s = s.strip_suffix('Z').or_else(|| s.strip_suffix('z'))?;
+    let (date, time) = s.split_once('T').or_else(|| s.split_once('t'))?;
+
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    if d.next().is_some() {
+        return None;
+    }
+
+    // Drop any fractional-seconds suffix before splitting the clock.
+    let mut t = time.split('.').next()?.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let min: i64 = t.next()?.parse().ok()?;
+    let sec: i64 = t.next()?.parse().ok()?;
+    if t.next().is_some() {
+        return None;
+    }
+
+    // RFC 3339 `date-fullyear` is 4 digits, so a valid year is `0000..=9999`.
+    // Bounding it here ALSO keeps the civil-days arithmetic below well inside
+    // `i64` — an absurd year from a malicious/garbled CA problem detail (the only
+    // reachable input, via `parse_retry_after_from_detail`) would otherwise
+    // overflow `days * 86400` (a debug panic, a release wrap). Reject it instead.
+    if !(0..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&min)
+        || !(0..=60).contains(&sec)
+    {
+        return None;
+    }
+
+    // days-from-civil: days since 1970-01-01 (Howard Hinnant, public domain).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if month > 2 { month - 3 } else { month + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146097 + doe - 719468;
+
+    let secs = days * 86400 + hour * 3600 + min * 60 + sec;
+    if secs < 0 {
+        return None;
+    }
+    Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64))
+}
+
+/// Selects the rustls [`CryptoProvider`](rustls::crypto::CryptoProvider) that
+/// backs the ACME client's TLS (U19) — see [`install_crypto_provider`].
+#[derive(Clone, Debug)]
+pub enum CryptoProviderChoice {
+    /// Keep whatever process-default provider is already installed; install
+    /// `aws-lc-rs` (instant-acme's own provider, always linked) only if none is.
+    /// Never panics, never overrides a provider an embedder installed first —
+    /// this is what the account builders install automatically, so a caller that
+    /// does nothing is already protected from the ambiguous-default panic.
+    Default,
+    /// Force the `aws-lc-rs` provider.
+    AwsLcRs,
+    /// Force the `ring` provider.
+    Ring,
+    /// Install a caller-supplied provider (e.g. a FIPS-validated build).
+    Custom(std::sync::Arc<rustls::crypto::CryptoProvider>),
+}
+
+/// The rustls [`CryptoProvider`](rustls::crypto::CryptoProvider) a
+/// [`CryptoProviderChoice`] names (a fresh value, not the process default).
+/// Pure; useful to a caller wiring the provider into its own rustls config.
+pub fn resolve_crypto_provider(choice: &CryptoProviderChoice) -> rustls::crypto::CryptoProvider {
+    match choice {
+        CryptoProviderChoice::Default | CryptoProviderChoice::AwsLcRs => {
+            rustls::crypto::aws_lc_rs::default_provider()
+        }
+        CryptoProviderChoice::Ring => rustls::crypto::ring::default_provider(),
+        CryptoProviderChoice::Custom(provider) => (**provider).clone(),
+    }
+}
+
+/// Install `choice` as the **process-wide default** rustls `CryptoProvider`,
+/// unless one is already installed (U19).
+///
+/// WHY THIS EXISTS: rustls requires a process-default `CryptoProvider`. When a
+/// build links BOTH the `ring` and `aws-lc-rs` providers — which happens as soon
+/// as a few TLS-using crates share the process — rustls can no longer infer a
+/// default, and the no-argument `rustls::ClientConfig::builder()` that
+/// instant-acme's `Account::builder()` / `builder_with_root()` call **panics**
+/// with *"Could not automatically determine the process-level CryptoProvider"*.
+/// Installing a provider explicitly, before the first account is built,
+/// side-steps that panic.
+///
+/// Returns `true` if THIS call installed the provider, `false` if a provider was
+/// already installed (left untouched — the process default is one-shot, so an
+/// explicit [`AwsLcRs`](CryptoProviderChoice::AwsLcRs) /
+/// [`Ring`](CryptoProviderChoice::Ring) / [`Custom`](CryptoProviderChoice::Custom)
+/// choice only takes effect when nothing has installed one yet). Idempotent and
+/// safe to call from any number of issuance paths / threads.
+///
+/// The account builders ([`create_account`], [`restore_account`],
+/// [`obtain_certificate`]) call this with [`CryptoProviderChoice::Default`]
+/// automatically, so the panic is fixed even for a caller that never touches
+/// this API. To force a specific provider instead, call this once at startup
+/// with that choice **before** creating any account.
+pub fn install_crypto_provider(choice: CryptoProviderChoice) -> bool {
+    // Fast path: a default is already installed, so there is nothing to do (and
+    // `install_default` below would just fail). Checked first so the common
+    // auto-install from `account_builder` is a cheap no-op after the first call.
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return false;
+    }
+    match resolve_crypto_provider(&choice).install_default() {
+        Ok(()) => true,
+        // Another thread installed one between our check and this call: a default
+        // now exists (the goal), so this is success for the no-panic guarantee.
+        Err(_already_installed) => false,
+    }
 }
 
 /// What to request and how to talk to the CA.
@@ -398,10 +614,22 @@ impl HickoryTxtResolver {
     }
 }
 
-/// Resolver options tuned for a "just published, poll until live" lookup: a small negative-cache
-/// floor so a record that was absent moments ago is re-queried quickly, and a modest positive cap.
+/// Resolver options tuned for a "just published, poll until live" lookup (U22):
+/// the resolver cache is **disabled** so a freshly-written `_acme-challenge` TXT
+/// is never masked by a stale cached answer.
+///
+/// The whole purpose of the DNS-01 self-check is to observe records that were
+/// published *seconds* ago, so any caching is actively harmful: a negative answer
+/// cached while the record was still absent would keep the pre-check reading "not
+/// live" past the point the authoritative servers started serving it, burning the
+/// propagation budget. Setting `cache_size = 0` makes every lookup hit the wire
+/// and honor the authoritative TTL fresh (strictly stronger than merely capping
+/// the negative TTL, which the long-lived fallback resolver would otherwise hold
+/// for several seconds). The TTL caps below are kept as defense-in-depth for any
+/// hickory layer that consults them independently of the response cache.
 pub(crate) fn resolver_opts() -> hickory_resolver::config::ResolverOpts {
     let mut opts = hickory_resolver::config::ResolverOpts::default();
+    opts.cache_size = 0;
     opts.negative_min_ttl = Some(Duration::from_secs(1));
     opts.negative_max_ttl = Some(Duration::from_secs(5));
     opts.positive_max_ttl = Some(Duration::from_secs(30));
@@ -602,16 +830,10 @@ impl ChallengeSolver for Dns01Solver<'_> {
         identifier: &str,
         key_auth: &KeyAuthorization,
     ) -> Result<(), AcmeError> {
-        let record = DnsRecord {
-            kind: RecordKind::Txt(vec![key_auth.dns_value()]),
-            name: acme_challenge_name(identifier),
-            ttl: self.ttl,
-        };
-        self.provider.upsert(&record).await?;
-        if let Ok(mut w) = self.written.lock() {
-            w.insert(identifier.to_string(), record);
-        }
-        Ok(())
+        // `KeyAuthorization` is opaque; the aggregation logic lives in
+        // `present_value` (which takes the raw TXT value) so it is unit-testable
+        // without a live `instant_acme::Order`.
+        self.present_value(identifier, key_auth.dns_value()).await
     }
     async fn poll_presented(&self, identifier: &str) -> Result<Propagation, AcmeError> {
         // No resolver wired ⇒ no pre-check: the driver blind-waits `propagation_wait` (pre-fix).
@@ -637,10 +859,69 @@ impl ChallengeSolver for Dns01Solver<'_> {
             .lock()
             .ok()
             .and_then(|mut w| w.remove(identifier));
-        if let Some(record) = record {
+        let Some(record) = record else {
+            return Ok(());
+        };
+        // After removing this identifier's value, is another authorization still
+        // using the same challenge name (the wildcard+apex case, U20)? If so,
+        // re-publish the reduced set so only THIS value is withdrawn; otherwise it
+        // was the last value and the record is deleted outright (by content, as
+        // before).
+        let remaining = self.values_at(&record.name);
+        if remaining.is_empty() {
             self.provider.delete(&record).await?;
+        } else {
+            self.provider
+                .upsert_txt_set(&record.name, &remaining, self.ttl)
+                .await?;
         }
         Ok(())
+    }
+}
+
+impl Dns01Solver<'_> {
+    /// The testable core of [`present`](ChallengeSolver::present): remember THIS
+    /// identifier's record, then publish the FULL coexisting TXT set at its
+    /// challenge name. A wildcard (`*.x`) and the apex (`x`) both validate at
+    /// `_acme-challenge.x` with DIFFERENT values; writing one with the plain
+    /// replace-`upsert` drops the other and races it to `invalid` (U20).
+    /// Aggregating by name and publishing the whole set via
+    /// [`DnsProvider::upsert_txt_set`] keeps every presented value live together.
+    /// The lock is released before the await.
+    async fn present_value(&self, identifier: &str, value: String) -> Result<(), AcmeError> {
+        let record = DnsRecord {
+            kind: RecordKind::Txt(vec![value]),
+            name: acme_challenge_name(identifier),
+            ttl: self.ttl,
+        };
+        if let Ok(mut w) = self.written.lock() {
+            w.insert(identifier.to_string(), record.clone());
+        }
+        let values = self.values_at(&record.name);
+        self.provider
+            .upsert_txt_set(&record.name, &values, self.ttl)
+            .await?;
+        Ok(())
+    }
+
+    /// The distinct TXT values currently presented at challenge `name`, across all
+    /// identifiers (the coexisting DNS-01 challenge set — U20). Sorted + deduped so
+    /// the published set is deterministic. The lock is never held across an await.
+    fn values_at(&self, name: &str) -> Vec<String> {
+        let mut values: Vec<String> = self
+            .written
+            .lock()
+            .ok()
+            .map(|w| {
+                w.values()
+                    .filter(|r| r.name == name)
+                    .map(|r| r.kind.flat_value())
+                    .collect()
+            })
+            .unwrap_or_default();
+        values.sort();
+        values.dedup();
+        values
     }
 }
 
@@ -737,6 +1018,13 @@ pub async fn restore_account(
 fn account_builder(
     extra_root_ca: Option<&Path>,
 ) -> Result<instant_acme::AccountBuilder, AcmeError> {
+    // U19: ensure a rustls CryptoProvider is installed before instant-acme's
+    // `ClientConfig::builder()` runs, so a build that links both `ring` and
+    // `aws-lc-rs` cannot panic on an ambiguous process default. This only
+    // installs `aws-lc-rs` as a fallback when nothing is installed yet — an
+    // embedder that wants a specific provider calls `install_crypto_provider`
+    // with its choice first, and this then leaves that provider untouched.
+    install_crypto_provider(CryptoProviderChoice::Default);
     Ok(match extra_root_ca {
         Some(ca) => Account::builder_with_root(ca)?,
         None => Account::builder()?,
@@ -1151,5 +1439,348 @@ mod tests {
             solver.poll_presented("deploy.test").await.unwrap(),
             Propagation::Unchecked
         );
+    }
+
+    // ---- U20: multi-TXT challenge set (wildcard + apex share a name) -----------
+
+    /// A provider that records the LAST TXT set published at each name (via
+    /// `upsert_txt_set`) and the names torn down via `delete`, so a test can prove
+    /// the solver keeps both a wildcard's and the apex's values live together.
+    #[derive(Default)]
+    struct CapturingProvider {
+        sets: std::sync::Mutex<HashMap<String, Vec<String>>>,
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl DnsProvider for CapturingProvider {
+        async fn upsert(&self, r: &DnsRecord) -> Result<(), crate::dns::DnsError> {
+            // A direct single-value upsert reduces to a one-element set.
+            self.sets
+                .lock()
+                .unwrap()
+                .insert(r.name.clone(), vec![r.kind.flat_value()]);
+            Ok(())
+        }
+        async fn delete(&self, r: &DnsRecord) -> Result<(), crate::dns::DnsError> {
+            self.sets.lock().unwrap().remove(&r.name);
+            self.deletes.lock().unwrap().push(r.name.clone());
+            Ok(())
+        }
+        async fn upsert_txt_set(
+            &self,
+            name: &str,
+            values: &[String],
+            _ttl: u32,
+        ) -> Result<(), crate::dns::DnsError> {
+            self.sets
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), values.to_vec());
+            Ok(())
+        }
+    }
+    impl CapturingProvider {
+        fn set_at(&self, name: &str) -> Option<Vec<String>> {
+            self.sets.lock().unwrap().get(name).cloned()
+        }
+    }
+
+    /// THE U20 gate (mutation-sensitive): a wildcard (`*.x`) and the apex (`x`)
+    /// both present at `_acme-challenge.x` with DIFFERENT values, and BOTH values
+    /// must be live together — the second `present` must not overwrite the first.
+    /// If a reviewer reverts `present` to a single-record `upsert`, the set holds
+    /// only the last value and this goes RED.
+    #[tokio::test]
+    async fn solver_keeps_wildcard_and_apex_values_coexisting() {
+        const NAME: &str = "_acme-challenge.example.com";
+        let provider = CapturingProvider::default();
+        let solver = Dns01Solver::new(&provider, 60);
+
+        solver
+            .present_value("example.com", "value-apex".into())
+            .await
+            .unwrap();
+        solver
+            .present_value("*.example.com", "value-wild".into())
+            .await
+            .unwrap();
+
+        // Both values coexist at the one challenge name (sorted, deduped).
+        assert_eq!(
+            provider.set_at(NAME),
+            Some(vec!["value-apex".to_string(), "value-wild".to_string()]),
+            "a wildcard+apex order must publish BOTH TXT values at the shared name"
+        );
+
+        // Tearing down the apex keeps the wildcard's value live (re-publish the
+        // reduced set), not a blanket delete.
+        solver.cleanup("example.com").await.unwrap();
+        assert_eq!(
+            provider.set_at(NAME),
+            Some(vec!["value-wild".to_string()]),
+            "cleaning up one authorization must not drop the other's value"
+        );
+        assert!(
+            provider.deletes.lock().unwrap().is_empty(),
+            "a shared name with a value still live must not be deleted"
+        );
+
+        // Tearing down the last one removes the record outright.
+        solver.cleanup("*.example.com").await.unwrap();
+        assert_eq!(provider.set_at(NAME), None, "the last value is deleted");
+        assert_eq!(
+            *provider.deletes.lock().unwrap(),
+            vec![NAME.to_string()],
+            "the final teardown deletes the record"
+        );
+    }
+
+    /// The read/validate side (U20): with BOTH values live at the shared name, each
+    /// identifier's `poll_presented` observes ITS OWN value among the set as Ready
+    /// (the resolver returns every TXT record; `txt_record_visible` matches any).
+    #[tokio::test]
+    async fn poll_presented_sees_its_value_among_a_multi_txt_set() {
+        /// Returns the full challenge set at any name, as a real resolver would.
+        struct BothValues;
+        #[async_trait]
+        impl TxtResolver for BothValues {
+            async fn lookup_txt(&self, _n: &str) -> Result<Vec<String>, crate::dns::DnsError> {
+                Ok(vec!["value-apex".into(), "value-wild".into()])
+            }
+        }
+        let provider = CapturingProvider::default();
+        let resolver = BothValues;
+        let solver = Dns01Solver::with_resolver(&provider, 60, &resolver);
+        solver
+            .present_value("example.com", "value-apex".into())
+            .await
+            .unwrap();
+        solver
+            .present_value("*.example.com", "value-wild".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            solver.poll_presented("example.com").await.unwrap(),
+            Propagation::Ready,
+            "the apex value resolves among the multi-TXT set"
+        );
+        assert_eq!(
+            solver.poll_presented("*.example.com").await.unwrap(),
+            Propagation::Ready,
+            "the wildcard value resolves among the multi-TXT set"
+        );
+    }
+
+    // ---- U19: caller-selectable rustls crypto provider -------------------------
+
+    /// Both named providers are linked and selectable (the `ring` + `aws-lc-rs`
+    /// coexistence that makes the no-arg `ClientConfig::builder()` panic). Building
+    /// each yields a non-empty cipher-suite list — proof the backend is present.
+    #[test]
+    fn resolve_crypto_provider_yields_both_backends() {
+        let aws = resolve_crypto_provider(&CryptoProviderChoice::AwsLcRs);
+        let ring = resolve_crypto_provider(&CryptoProviderChoice::Ring);
+        assert!(
+            !aws.cipher_suites.is_empty(),
+            "aws-lc-rs provider is selectable"
+        );
+        assert!(
+            !ring.cipher_suites.is_empty(),
+            "ring provider is selectable"
+        );
+        // `Default` resolves to a concrete provider too (never panics).
+        assert!(
+            !resolve_crypto_provider(&CryptoProviderChoice::Default)
+                .cipher_suites
+                .is_empty()
+        );
+    }
+
+    /// Installing the process default is idempotent and leaves a default present —
+    /// which is exactly what stops instant-acme's `ClientConfig::builder()` from
+    /// panicking on an ambiguous default. (Process-global; so this asserts the
+    /// POST-condition and idempotency, not which call won the one-shot install.)
+    #[test]
+    fn install_crypto_provider_sets_a_default_idempotently() {
+        install_crypto_provider(CryptoProviderChoice::Default);
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "a process-default CryptoProvider must be installed after the call"
+        );
+        // Now that one is definitely installed, a further install is a no-op.
+        assert!(
+            !install_crypto_provider(CryptoProviderChoice::Ring),
+            "a second install must not replace the one-shot process default"
+        );
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    // ---- U21: typed rate-limit / Retry-After -----------------------------------
+
+    #[test]
+    fn parse_rfc3339_utc_known_vectors() {
+        use std::time::{Duration as D, SystemTime, UNIX_EPOCH};
+        let at = |s| parse_rfc3339_utc(s).unwrap();
+        assert_eq!(at("1970-01-01T00:00:00Z"), UNIX_EPOCH);
+        assert_eq!(
+            at("2000-01-01T00:00:00Z"),
+            UNIX_EPOCH + D::from_secs(946_684_800)
+        );
+        // 2021-01-01T00:00:00Z is the well-known epoch 1_609_459_200.
+        assert_eq!(
+            at("2021-01-01T00:00:00Z"),
+            UNIX_EPOCH + D::from_secs(1_609_459_200)
+        );
+        // Fractional seconds + lowercase `t`/`z` tolerated; a non-UTC / malformed
+        // stamp is rejected.
+        assert_eq!(
+            at("2000-01-01T00:00:00.123Z"),
+            UNIX_EPOCH + D::from_secs(946_684_800)
+        );
+        assert!(parse_rfc3339_utc("2000-01-01T00:00:00+01:00").is_none());
+        assert!(parse_rfc3339_utc("not-a-date").is_none());
+        assert!(parse_rfc3339_utc("2000-13-01T00:00:00Z").is_none());
+        // The far edge of the 4-digit year range still parses (no overflow).
+        assert!(parse_rfc3339_utc("9999-12-31T23:59:59Z").is_some());
+        let _ = SystemTime::now();
+    }
+
+    /// F3 (security hardening): an absurd year from a garbled/hostile CA problem
+    /// detail must be rejected, not overflow the civil-days arithmetic (a debug
+    /// panic / a release wrap). `None`, no panic — and a sane date still parses.
+    #[test]
+    fn parse_rfc3339_utc_rejects_overflowing_year_without_panic() {
+        // Would overflow `days * 86400` in `i64` if the year were not bounded.
+        assert!(parse_rfc3339_utc("999999999999-01-01T00:00:00Z").is_none());
+        // A 5-digit year is already out of RFC 3339 range.
+        assert!(parse_rfc3339_utc("10000-01-01T00:00:00Z").is_none());
+        // i64::MAX + 1 worth of digits fails the integer parse outright.
+        assert!(parse_rfc3339_utc("99999999999999999999-01-01T00:00:00Z").is_none());
+        // Reached through the real extraction path (the only reachable input).
+        assert_eq!(
+            parse_retry_after_from_detail(
+                "rate limited, retry after 999999999999-01-01T00:00:00Z: see https://…",
+                std::time::UNIX_EPOCH,
+            ),
+            None,
+            "an unparseable absolute hint falls through to the caller's own backoff"
+        );
+        // A valid stamp through the same path still yields a duration.
+        assert_eq!(
+            parse_retry_after_from_detail(
+                "retry after 2021-01-01T00:01:00Z",
+                std::time::UNIX_EPOCH + Duration::from_secs(1_609_459_200),
+            ),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_from_detail_forms() {
+        use std::time::{Duration as D, SystemTime, UNIX_EPOCH};
+        let now = UNIX_EPOCH + D::from_secs(1_609_459_200); // == 2021-01-01T00:00:00Z
+        // Absolute RFC 3339 form (Let's Encrypt's shape), one hour out.
+        assert_eq!(
+            parse_retry_after_from_detail(
+                "too many certificates already issued, retry after 2021-01-01T01:00:00Z: see https://…",
+                now,
+            ),
+            Some(D::from_secs(3600))
+        );
+        // delay-seconds form.
+        assert_eq!(
+            parse_retry_after_from_detail("rate limited; retry after 120 seconds", now),
+            Some(D::from_secs(120))
+        );
+        // A timestamp already in the past clamps to zero (retry now), not None.
+        assert_eq!(
+            parse_retry_after_from_detail("retry after 1970-01-01T00:00:00Z", now),
+            Some(D::ZERO)
+        );
+        // No hint present ⇒ None (caller applies its own backoff).
+        assert_eq!(
+            parse_retry_after_from_detail("too many certificates already issued", now),
+            None
+        );
+        let _ = SystemTime::now();
+    }
+
+    #[test]
+    fn rate_limited_problem_maps_to_typed_error_with_retry_after() {
+        // Build a real `instant_acme::Error::Api(Problem)` via the public
+        // `From<Problem>` impl (the enum is `#[non_exhaustive]`, so the variant
+        // can't be named directly, but `.into()` constructs it).
+        let problem = instant_acme::Problem {
+            r#type: Some("urn:ietf:params:acme:error:rateLimited".to_string()),
+            detail: Some("too many certificates, retry after 120".to_string()),
+            status: Some(429),
+            subproblems: Vec::new(),
+        };
+        let err: instant_acme::Error = problem.into();
+        match AcmeError::from(err) {
+            AcmeError::RateLimited {
+                retry_after,
+                detail,
+            } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(120)));
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("too many certificates, retry after 120")
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+
+        // A NON-rate-limit problem stays an opaque protocol error (not RateLimited).
+        let other = instant_acme::Problem {
+            r#type: Some("urn:ietf:params:acme:error:malformed".to_string()),
+            detail: Some("bad request".to_string()),
+            status: Some(400),
+            subproblems: Vec::new(),
+        };
+        let err: instant_acme::Error = other.into();
+        assert!(
+            matches!(AcmeError::from(err), AcmeError::Acme(_)),
+            "a non-rateLimited problem must not be classified as RateLimited"
+        );
+    }
+
+    #[test]
+    fn is_acme_rate_limited_matches_urn_or_429() {
+        let p = |ty: Option<&str>, status: Option<u16>| instant_acme::Problem {
+            r#type: ty.map(str::to_string),
+            detail: None,
+            status,
+            subproblems: Vec::new(),
+        };
+        assert!(is_acme_rate_limited(&p(
+            Some("urn:ietf:params:acme:error:rateLimited"),
+            None
+        )));
+        // Case-insensitive on the URN suffix.
+        assert!(is_acme_rate_limited(&p(
+            Some("urn:ietf:params:acme:error:RATELIMITED"),
+            None
+        )));
+        // A bare 429 (no URN) still classifies.
+        assert!(is_acme_rate_limited(&p(None, Some(429))));
+        // Unrelated problems do not.
+        assert!(!is_acme_rate_limited(&p(
+            Some("urn:ietf:params:acme:error:malformed"),
+            Some(400)
+        )));
+    }
+
+    // ---- U22: the propagation self-check resolver must not cache ---------------
+
+    /// The DNS-01 self-check resolvers are built to OBSERVE freshly-published
+    /// records, so caching is actively harmful: a cached negative answer would
+    /// make a just-written TXT keep reading as absent. `resolver_opts` disables the
+    /// cache (`cache_size == 0`) so every lookup is fresh / honors the low TTL. If a
+    /// reviewer drops that line, this goes RED.
+    #[test]
+    fn resolver_opts_disables_caching() {
+        let opts = resolver_opts();
+        assert_eq!(opts.cache_size, 0, "the self-check resolver must not cache");
     }
 }
