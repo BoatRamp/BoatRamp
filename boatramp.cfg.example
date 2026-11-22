@@ -30,6 +30,24 @@
         // Require a control-plane token to view deployment previews.
         // protect_previews: true,
 
+        // Graceful-drain hold (seconds) on SIGTERM/Ctrl-C before listeners close:
+        // `/readyz` flips to 503 (while `/healthz` stays 200), then the node keeps
+        // accepting for this long so an Anycast/ECMP load balancer health-gated on
+        // `/readyz` withdraws this node BEFORE it stops accepting connections — no
+        // rolling-restart blip. Default 5; `0` closes immediately. See the Anycast
+        // VIP how-to. Flag/env: --drain-delay / BOATRAMP_DRAIN_DELAY.
+        // drain_delay_secs: 5,
+
+        // ANYCAST / HTTP-3 steering (only behind an Anycast VIP). Encode this node's
+        // id (0-255, DISTINCT per node) in byte 0 of every QUIC Connection ID so an
+        // Anycast-aware L4 load balancer can steer each H3 connection back to its
+        // owning node. Absent ⇒ default random CIDs (correct for a single node).
+        // Requires the `http3` feature + `http3: true`. See the Anycast VIP how-to.
+        // anycast_node_id: 1,
+        // Advertise HTTP/3 via Alt-Svc (default true). Set false behind a plain
+        // Anycast VIP with no QUIC-CID steering so clients stay on HTTP/2 over TCP.
+        // http3_advertise: false,
+
         // Node/system-health ALERTING (node-health-alerting Stage 2). Off unless
         // `enabled`. A leader-gated loop evaluates health signals on a cadence and
         // emits an alert when a threshold is crossed + a RESOLVE when it clears,

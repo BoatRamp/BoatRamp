@@ -282,7 +282,7 @@ compression = ["dep:async-compression"]
 # HTTP/3 (QUIC) serving: a third listener transport feeding
 # the same router. Pulls quinn + h3; off by default. The QUIC handshake is
 # exercised only in live testing (no in-process round-trip).
-http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:tower"]
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:tower", "dep:rand_chacha"]
 
 # External token signer backends: the control-plane root key
 # lives outside the process (KMS/HSM/Vault). The backends themselves live in the
@@ -421,6 +421,13 @@ tokio-util = { workspace = true, features = ["io", "compat"] }
 quinn = { version = "0.11", optional = true }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
+# Per-node routable QUIC Connection-ID generator (PLAN-anycast AC-3, security-review F2): a
+# ChaCha20 CSPRNG seeded ONCE (from `getrandom`) at generator construction fills the 7 random
+# CID bytes, so there is no per-CID `getrandom` syscall and never an all-zero fallback tail (which
+# would collide CIDs and corrupt Anycast routing). Default features only (`std`) — we seed via the
+# crate's existing `getrandom` and `from_seed`, so the `os_rng` feature is unneeded. Already in the
+# tree (resolved to 0.9.0 via `rand`/proptest); `http3`-gated, so a non-H3 build pulls nothing.
+rand_chacha = { version = "0.9", optional = true }
 # rustls is a base dep (the gateway's `wss` upstream upgrade needs a TLS client, HS-2);
 # it is already compiled in the base build via reqwest, so this adds negligible weight.
 # The `http3` feature reuses it for the QUIC crypto config.

@@ -134,6 +134,7 @@ to deploy your *handler or function*, see [Functions, handlers & workflows](#fun
 
 - [Deploy a single node in production](./deploy-single-node.md)
 - [Deploy a self-hosted cluster](./deploy-cluster.md)
+- [Expose a cluster behind an Anycast VIP](./anycast-vip.md)
 - [Bring up a cluster on Hetzner](./cluster-on-hetzner.md)
 - [Run on Kubernetes (the in-binary operator)](./kubernetes.md)
 - [Deploy on Cloudflare Containers](./deploy-cloudflare.md)

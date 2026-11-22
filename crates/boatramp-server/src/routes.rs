@@ -44,6 +44,9 @@ pub fn router_with_fast(
     // The resolved security posture rides as an extension for the gateway /
     // proxy / domain-verify / upload paths (the hardening knobs).
     let posture = options.posture;
+    // Process readiness/drain flag (PLAN-anycast AC-1): `/readyz` reads it via
+    // `Extension` and returns 503 once draining. Cloned before `options` is consumed.
+    let readiness = options.readiness.clone();
     // Operator capabilities the node wires (managed-DB SQL + workload exec). Cheap
     // `Option<Arc>` clones; they ride as `api` extensions read by the admin handlers.
     // (`_cap` suffix so they don't shadow the `sql_exec`/`compute_exec` handler fns.)
@@ -935,6 +938,9 @@ pub fn router_with_fast(
         .fallback(serve_by_host)
         .with_state(deploy)
         .layer(Extension(BootstrapAttestation(bootstrap_attestation)))
+        // Readiness/drain flag read by `/readyz` (AC-1); layered on the public `app`
+        // so the probe sees it without going through the authed `api` sub-router.
+        .layer(Extension(readiness))
         .layer(Extension(rate_limiter))
         .merge(api)
         // The handler runtime (engine + per-site binding backends) rides as an
@@ -1324,5 +1330,74 @@ mod secrets_api_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+}
+
+#[cfg(test)]
+mod readyz_drain_tests {
+    //! AC-1 (PLAN-anycast): `/readyz` reflects the drain flag. On graceful
+    //! drain the probe flips to `503` (so an Anycast/ECMP LB withdraws the node)
+    //! while `/healthz` stays `200` (so a liveness probe does NOT restart it).
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::kv::MemoryKv;
+    use tower::ServiceExt as _;
+
+    use crate::{Auth, HandlerRuntime, Readiness, ServerOptions};
+
+    fn router_with_readiness(readiness: Readiness) -> axum::Router {
+        let deploy = DeployStore::new(
+            Arc::new(boatramp_storage::FsStorage::new(std::env::temp_dir())),
+            Arc::new(MemoryKv::new()),
+        );
+        let options = ServerOptions {
+            readiness,
+            ..Default::default()
+        };
+        crate::router_with_fast(
+            deploy,
+            Auth::disabled(),
+            HandlerRuntime::disabled(),
+            options,
+        )
+        .0
+    }
+
+    async fn status(app: &axum::Router, path: &str) -> StatusCode {
+        app.clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn readyz_flips_to_503_on_drain_while_healthz_stays_200() {
+        let readiness = Readiness::new();
+        let app = router_with_readiness(readiness.clone());
+
+        // Not draining: ready (the KV backend answers) and healthy.
+        assert_eq!(status(&app, "/readyz").await, StatusCode::OK);
+        assert_eq!(status(&app, "/healthz").await, StatusCode::OK);
+
+        // Drain begins (what `drain_aware_shutdown` does on SIGTERM).
+        readiness.begin_drain();
+        assert!(readiness.is_draining());
+
+        // `/readyz` now fails (503) so the LB withdraws the route; `/healthz`
+        // stays 200 so a liveness probe does not restart the draining node.
+        assert_eq!(
+            status(&app, "/readyz").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a draining node must fail readiness (AC-1)"
+        );
+        assert_eq!(
+            status(&app, "/healthz").await,
+            StatusCode::OK,
+            "liveness must stay green while draining (AC-1)"
+        );
     }
 }

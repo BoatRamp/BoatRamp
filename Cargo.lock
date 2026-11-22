@@ -2171,6 +2171,7 @@ dependencies = [
  "lru 0.18.5",
  "proptest",
  "quinn",
+ "rand_chacha 0.9.0",
  "rcgen 0.13.2",
  "reqwest 0.12.28",
  "rmcp",
