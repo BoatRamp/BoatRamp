@@ -21,14 +21,25 @@
 //! deliberately no `--prune` that would make the manifest the sole source of
 //! truth and reap unmanaged resources.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use boatramp_core::config::{DeployConfig, HandlerLimits, SiteConfig};
+use boatramp_core::config::SiteConfig;
+use boatramp_core::deploy::Manifest;
 use serde::Deserialize;
-use serde_json::json;
+
+// The reconcile core (node-library N3) lives in `boatramp-node`; the binary keeps
+// manifest parsing, arg handling, output rendering, and the concrete seam impls, and
+// re-exports the per-resource manifest types so `crate::apply::{ApplySite, …}` call
+// sites (e.g. `apply_migrate`) are unchanged.
+use boatramp_node::reconcile::{
+    self, BlobSource, ControlPlane, CpError, CpResult, CreatedDeployment, ReconcileError,
+    SiteBuilder,
+};
+pub use boatramp_node::reconcile::{ApplyCompute, ApplyFunction, ApplyPlan, ApplySite};
 
 use crate::client;
-use crate::config::{BuildConfig, ProjectConfig};
+use crate::config::ProjectConfig;
 
 /// A failure in the `apply` subcommand.
 #[derive(Debug, thiserror::Error)]
@@ -106,22 +117,6 @@ pub enum Error {
         name: String,
         reason: &'static str,
     },
-    /// A site's `[handlers.graphql]` set BOTH `safelisted_ops` and
-    /// `safelisted_ops_path` — they are mutually exclusive (pick one source).
-    #[error(
-        "site {site}: `[handlers.graphql]` sets both `safelisted_ops` (inline) and \
-         `safelisted_ops_path` (file) — they are mutually exclusive; use one source of \
-         safelisted operations"
-    )]
-    SafelistConflict { site: String },
-    /// Reading a site's `safelisted_ops_path` file failed (client-side).
-    #[error("site {site}: reading safelisted_ops_path {path}: {source}")]
-    SafelistFile {
-        site: String,
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
     /// A site's `routing` failed its compile-check (a bad route/cron pattern).
     #[error("site {site}: routing: {source}")]
     Routing {
@@ -149,124 +144,40 @@ pub enum Error {
     /// A control-plane request failed (the `connect`/resolve path).
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
-    /// A control-plane request from the reconcile core failed, carrying the
-    /// 404/409 classification the core acts on (see [`CpError`]).
-    #[error(transparent)]
-    Cp(#[from] CpError),
     /// Loading/parsing the project config (`project.cfg`) failed.
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
-    /// The optional pre-deploy build step failed.
-    #[error(transparent)]
-    Build(#[from] crate::build::Error),
-    /// Building a site's manifest / uploading blobs failed.
-    #[error(transparent)]
-    Sync(#[from] crate::sync::Error),
     /// A local filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    /// Encoding a request body failed.
+    /// Decoding a JSON document failed (the version-peek on a JSON manifest).
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// The reconcile core (node-library N3) failed. Wraps
+    /// [`boatramp_node::reconcile::ReconcileError`] transparently, so the control-plane,
+    /// build, blob-hashing, safelist, and encoding failures the reconcile surfaces keep
+    /// their exact user-facing text — the apply error is identical whether the reconcile
+    /// ran in-process or against the live client.
+    #[error(transparent)]
+    Reconcile(#[from] ReconcileError),
 }
 
 /// `apply` module result; `Err` is [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The control-plane operations the `apply` reconcile core performs — a seam over
-/// the concrete HTTP [`client::ControlPlane`] so the reconcile logic (create-or-
-/// update, config-before-activate, create-on-404 / ignore-on-409) is
-/// unit-testable against a mock without a live server. Static-dispatched: the
-/// reconcile fns are generic over `C: ControlPlane`, so no `async-trait` / boxing.
-#[allow(async_fn_in_trait)] // crate-internal trait; never used as `dyn`
-trait ControlPlane {
-    /// Read a project; a missing one is [`CpError::NotFound`].
-    async fn get_project(&self, name: &str) -> CpResult<serde_json::Value>;
-    /// Create a project; a concurrent create is [`CpError::Conflict`].
-    async fn create_project(&self, body: &serde_json::Value) -> CpResult<serde_json::Value>;
-    /// Negotiate a deployment; the reply lists the blob hashes still missing.
-    async fn create_deployment(
-        &self,
-        site: &str,
-        manifest: &boatramp_core::deploy::Manifest,
-    ) -> CpResult<crate::client::CreateDeploymentResponse>;
-    /// Upload one missing blob by content-address.
-    async fn upload_blob_source(
-        &self,
-        hash: &str,
-        source: &crate::sync::BlobSource,
-    ) -> CpResult<()>;
-    /// PUT a site's mutable config (applied before activation).
-    async fn put_site_config(&self, site: &str, config: &SiteConfig) -> CpResult<()>;
-    /// Flip a site live to a deployment id.
-    async fn activate(&self, site: &str, id: &str) -> CpResult<()>;
-    /// Stage a local file as a content-addressed blob, returning its hash.
-    async fn put_file_blob(&self, path: &Path) -> CpResult<String>;
-    /// Create/replace a top-level function record. Drives the async (`?wait=false`) +
-    /// deferred-compose (`?compose=defer`) deploy and polls to a terminal outcome (bug #499), so
-    /// the slow server-side compile/compose never blocks the control-plane request worker.
-    async fn deploy_function(&self, name: &str, body: &serde_json::Value) -> CpResult<()>;
-    /// Promote the project's staged subgraphs in one composition — the `?compose=defer`
-    /// counterpart. Called once after all function deploys (bug #499). A no-op when nothing staged.
-    async fn compose_subgraphs(&self) -> CpResult<()>;
-    /// Create/replace a compute workload spec.
-    async fn put_compute(
-        &self,
-        name: &str,
-        body: &serde_json::Value,
-    ) -> CpResult<serde_json::Value>;
-    /// Replace the project's tenancy schema (the per-table tenant-key map).
-    async fn put_project_tenancy(
-        &self,
-        schema: &boatramp_core::tenancy::TenancySchema,
-    ) -> CpResult<()>;
-    /// Register one trusted operation in the project's GraphQL safelist
-    /// (register-only; the server validates + stores it, idempotently). `site` is the site the op
-    /// is declared for, so the server can validate it against that site's per-site subgraph subset.
-    async fn register_graphql_safelist(&self, query: &str, site: &str) -> CpResult<()>;
-    /// Declare (persist + eagerly provision) one managed database from the manifest
-    /// `databases:` block (`PUT /api/{seg}/databases/{name}`, `Project·Admin`). The
-    /// server enforces daemon-config-wins, identity-change refusal, and caller's-project
-    /// binding; a refusal (409/…) surfaces as [`CpError::Client`] with the reason.
-    async fn declare_database(
-        &self,
-        name: &str,
-        db: &boatramp_core::compute::ApplyDatabase,
-    ) -> CpResult<()>;
-}
-
-/// A control-plane call outcome classified for the reconcile core: `NotFound`
-/// (HTTP 404) and `Conflict` (409) are surfaced explicitly so `ensure_project`'s
-/// create-on-404 / ignore-conflict-on-409 works against a mock; every other
-/// failure carries the original [`client::ClientError`] verbatim.
-#[derive(Debug, thiserror::Error)]
-pub enum CpError {
-    /// The resource is absent (HTTP 404).
-    #[error("control-plane resource not found (HTTP 404)")]
-    NotFound,
-    /// The resource already exists (HTTP 409).
-    #[error("control-plane resource already exists (HTTP 409)")]
-    Conflict,
-    /// Any other control-plane failure, preserved verbatim.
-    #[error(transparent)]
-    Client(#[from] crate::client::ClientError),
-}
-
-/// Reconcile-core control-plane result; `Err` is [`CpError`].
-type CpResult<T> = std::result::Result<T, CpError>;
-
-/// The real seam: the concrete HTTP client. Each method forwards to the same-named
-/// inherent method (inherent methods take precedence over trait methods, so `self.`
-/// resolves to the HTTP call, not this trait). Only `get_project`/`create_project`
-/// classify their error (the sole errors the reconcile core inspects); every other
-/// method preserves the original `ClientError` unchanged, so no error text shifts.
+/// The real [`ControlPlane`] seam: the concrete HTTP client. Each method forwards to
+/// the same-named inherent method (inherent methods take precedence over trait methods,
+/// so `self.` resolves to the HTTP call, not this trait). Only `get_project`/
+/// `create_project` classify their error (the sole errors the reconcile core inspects);
+/// every other method boxes the original `ClientError`, whose `Display` is carried
+/// through [`CpError::Client`] unchanged, so no error text shifts.
 impl ControlPlane for client::ControlPlane {
     async fn get_project(&self, name: &str) -> CpResult<serde_json::Value> {
         self.get_project(name).await.map_err(|e| {
             if is_not_found(&e) {
                 CpError::NotFound
             } else {
-                CpError::Client(e)
+                CpError::Client(Box::new(e))
             }
         })
     }
@@ -275,53 +186,62 @@ impl ControlPlane for client::ControlPlane {
             if is_conflict(&e) {
                 CpError::Conflict
             } else {
-                CpError::Client(e)
+                CpError::Client(Box::new(e))
             }
         })
     }
     async fn create_deployment(
         &self,
         site: &str,
-        manifest: &boatramp_core::deploy::Manifest,
-    ) -> CpResult<crate::client::CreateDeploymentResponse> {
-        self.create_deployment(site, manifest, &[])
+        manifest: &Manifest,
+    ) -> CpResult<CreatedDeployment> {
+        let resp = self
+            .create_deployment(site, manifest, &[])
             .await
-            .map_err(CpError::Client)
+            .map_err(|e| CpError::Client(Box::new(e)))?;
+        Ok(CreatedDeployment {
+            id: resp.id,
+            missing: resp.missing,
+        })
     }
-    async fn upload_blob_source(
-        &self,
-        hash: &str,
-        source: &crate::sync::BlobSource,
-    ) -> CpResult<()> {
+    async fn upload_blob_source(&self, hash: &str, source: &BlobSource) -> CpResult<()> {
         self.upload_blob_source(hash, source)
             .await
-            .map_err(CpError::Client)
+            .map_err(|e| CpError::Client(Box::new(e)))
     }
     async fn put_site_config(&self, site: &str, config: &SiteConfig) -> CpResult<()> {
         self.put_site_config(site, config)
             .await
-            .map_err(CpError::Client)
+            .map_err(|e| CpError::Client(Box::new(e)))
     }
     async fn activate(&self, site: &str, id: &str) -> CpResult<()> {
-        self.activate(site, id).await.map_err(CpError::Client)
+        self.activate(site, id)
+            .await
+            .map_err(|e| CpError::Client(Box::new(e)))
     }
     async fn put_file_blob(&self, path: &Path) -> CpResult<String> {
-        self.put_file_blob(path).await.map_err(CpError::Client)
+        self.put_file_blob(path)
+            .await
+            .map_err(|e| CpError::Client(Box::new(e)))
     }
     async fn deploy_function(&self, name: &str, body: &serde_json::Value) -> CpResult<()> {
         self.deploy_function(name, body)
             .await
-            .map_err(CpError::Client)
+            .map_err(|e| CpError::Client(Box::new(e)))
     }
     async fn compose_subgraphs(&self) -> CpResult<()> {
-        self.compose_subgraphs().await.map_err(CpError::Client)
+        self.compose_subgraphs()
+            .await
+            .map_err(|e| CpError::Client(Box::new(e)))
     }
     async fn put_compute(
         &self,
         name: &str,
         body: &serde_json::Value,
     ) -> CpResult<serde_json::Value> {
-        self.put_compute(name, body).await.map_err(CpError::Client)
+        self.put_compute(name, body)
+            .await
+            .map_err(|e| CpError::Client(Box::new(e)))
     }
     async fn put_project_tenancy(
         &self,
@@ -329,12 +249,12 @@ impl ControlPlane for client::ControlPlane {
     ) -> CpResult<()> {
         self.put_project_tenancy(schema)
             .await
-            .map_err(CpError::Client)
+            .map_err(|e| CpError::Client(Box::new(e)))
     }
     async fn register_graphql_safelist(&self, query: &str, site: &str) -> CpResult<()> {
         self.register_graphql_safelist(query, Some(site))
             .await
-            .map_err(CpError::Client)
+            .map_err(|e| CpError::Client(Box::new(e)))
     }
     async fn declare_database(
         &self,
@@ -343,7 +263,52 @@ impl ControlPlane for client::ControlPlane {
     ) -> CpResult<()> {
         self.declare_database(name, db)
             .await
-            .map_err(CpError::Client)
+            .map_err(|e| CpError::Client(Box::new(e)))
+    }
+}
+
+/// The real [`SiteBuilder`] seam: the CLI runs the external build command (`sh -c …`)
+/// and does the content-addressed directory walk ([`crate::sync::build_manifest`]) that
+/// the reconcile core delegates. Build/hash failures are boxed into the transparent
+/// [`ReconcileError`] variants, so their `Display` (the original `build::Error` /
+/// `sync::Error`) is unchanged. Holds the resolved project config so the `--build`
+/// default command is reachable.
+struct CliSiteBuilder<'a> {
+    config: &'a ProjectConfig,
+}
+
+impl SiteBuilder for CliSiteBuilder<'_> {
+    async fn build_site(
+        &self,
+        site: &ApplySite,
+        build_flag: bool,
+    ) -> std::result::Result<(), ReconcileError> {
+        // Build first when the site declares a build (or `--build` was passed).
+        if let Some(build) = &site.build {
+            crate::build::run_command(&build.command)
+                .await
+                .map_err(|e| ReconcileError::Build(Box::new(e)))?;
+        } else if build_flag {
+            let command = crate::build::resolve_command(None, self.config)
+                .map_err(|e| ReconcileError::Build(Box::new(e)))?;
+            crate::build::run_command(&command)
+                .await
+                .map_err(|e| ReconcileError::Build(Box::new(e)))?;
+        }
+        Ok(())
+    }
+
+    async fn hash_site(
+        &self,
+        dir: &Path,
+    ) -> std::result::Result<(Manifest, HashMap<String, BlobSource>), ReconcileError> {
+        if !dir.is_dir() {
+            return Err(ReconcileError::NotADirectory(dir.display().to_string()));
+        }
+        // Content-addressed manifest of the tree (identity + precompressed variants).
+        crate::sync::build_manifest(dir)
+            .await
+            .map_err(|e| ReconcileError::Hash(Box::new(e)))
     }
 }
 
@@ -407,135 +372,6 @@ pub struct ApplyManifest {
     /// imperative verb).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub databases: Vec<boatramp_core::compute::ApplyDatabase>,
-}
-
-/// One site in the manifest: a slug plus its content dir and folded-in config.
-#[derive(Debug, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApplySite {
-    /// Site slug within the project.
-    pub name: String,
-    /// Content directory to publish. Default: `build.output`, then `.`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    /// Optional per-site build step, run before publishing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build: Option<BuildConfig>,
-    /// Deploy-scoped routing, folded into the deployment manifest (atomic with the
-    /// content, rolls back with it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing: Option<DeployConfig>,
-    /// Site-scoped mutable config (domains/access/…), PUT after the deploy activates.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<SiteConfig>,
-}
-
-/// One top-level function in the manifest.
-#[derive(Debug, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApplyFunction {
-    /// Function name.
-    pub name: String,
-    /// Path to the component `.wasm` (uploaded as a content-addressed blob).
-    pub component: String,
-    /// Execution substrate: `wasm` (default), `microvm`, or `container`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<String>,
-    /// Enable a signed webhook: the host env var holding the HMAC-SHA256 secret
-    /// (never the secret itself).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub webhook_secret_env: Option<String>,
-    /// Make the webhook an ingress: a verified request publishes its body onto the
-    /// project bus at this topic (`bus:<topic>` for consumers) and returns 202, with
-    /// no component run. Requires `webhook_secret_env`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub webhook_publish: Option<String>,
-    /// Requested host capabilities (`sql`, `wasi:keyvalue`, `invoke`, …), gated by
-    /// the function import policy — parity with a site handler's `imports`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub imports: Vec<String>,
-    /// Static, non-secret environment variables passed to the function.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub env: std::collections::BTreeMap<String, String>,
-    /// Secret env-var references (`ENV_VAR` → `HOST_ENV`), resolved server-side
-    /// from the serve env at instantiation — the value is a reference, never
-    /// stored in the manifest or the control-plane store (mirrors a site
-    /// handler's `[handlers].secrets`), so the manifest stays committable.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub secrets: std::collections::BTreeMap<String, String>,
-    /// Function-to-function invoke allowlist (deny-by-default; `*` wildcards). Only
-    /// consulted when `imports` contains `invoke`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub invoke_targets: Vec<String>,
-    /// Optional resource limits (memory / timeout / fuel).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limits: Option<HandlerLimits>,
-    /// In-site tenancy decision (Dimension 0) for this function's `sql`/`orm` — maps straight to
-    /// the internal `FunctionConfig.tenancy`. Absent ⇒ *undeclared* (refused under `multi-tenant`,
-    /// `Disabled` under single-tenant/dev). E.g. `(mode: "scoped", column: "tenant_id", sources:
-    /// [(kind: "token", claim: "tid")], read: "own", write: "own")`, `(mode: "disabled")`, or an
-    /// async worker's `(mode: "scoped", sources: [(kind: "signed_context")], read: "own", write:
-    /// "own")`. Parsed via the [`boatramp_core::tenancy::de_opt_tenancy`] bridge (RON can't parse
-    /// the internally-tagged enum directly — see that fn).
-    #[serde(
-        default,
-        deserialize_with = "boatramp_core::tenancy::de_opt_tenancy",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub tenancy: Option<boatramp_core::tenancy::Tenancy>,
-    /// JWKS/issuer config verifying the app bearer when this function's tenancy names a `token`
-    /// source (the function analogue of a site's `[handlers.graphql.data].claims_from_token`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_claims: Option<boatramp_core::config::HandlerGraphqlTokenClaims>,
-}
-
-/// One compute workload in the manifest.
-///
-/// The workload body is **typed** (v0.6.0, breaking): its `spec` / `replicas` /
-/// `placement` fields mirror [`boatramp_core::compute::PutComputeRequest`]
-/// EXPLICITLY (not `#[serde(flatten)]`, which would defeat `deny_unknown_fields`
-/// on the manifest path). Deserializing the manifest now parses the compute spec
-/// against the real [`boatramp_core::compute::ComputeSpec`] schema, so a malformed
-/// or pre-v0.6.0 raw-JSON spec fails fast at parse time — an additive client gate
-/// on top of the server's own semantic validation.
-#[derive(Debug, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApplyCompute {
-    /// Workload name.
-    pub name: String,
-    /// The immutable workload spec (rootfs/kernel source + sizing) — the typed
-    /// [`boatramp_core::compute::ComputeSpec`].
-    pub spec: boatramp_core::compute::ComputeSpec,
-    /// Desired replica count (default 1).
-    #[serde(default = "boatramp_core::compute::default_replicas")]
-    pub replicas: u32,
-    /// Placement constraints (regions / node labels).
-    #[serde(default, skip_serializing_if = "placement_is_default")]
-    pub placement: boatramp_core::compute::PlacementConstraints,
-}
-
-/// Whether a workload's placement is the default (no regions, no labels), so it is
-/// omitted from a serialized (migrated) manifest for clean output.
-fn placement_is_default(p: &boatramp_core::compute::PlacementConstraints) -> bool {
-    p.regions.is_empty() && p.labels.is_empty()
-}
-
-impl ApplyCompute {
-    /// The typed [`boatramp_core::compute::PutComputeRequest`] this workload
-    /// declares — the exact body the server's `put_compute` handler deserializes,
-    /// so the manifest and the wire share one schema.
-    fn to_request(&self) -> boatramp_core::compute::PutComputeRequest {
-        boatramp_core::compute::PutComputeRequest {
-            spec: self.spec.clone(),
-            replicas: self.replicas,
-            placement: self.placement.clone(),
-            // Manifest-declared priority is a thin follow-on. `None` ⇒ PRESERVE the stored
-            // workload's priority: a re-`apply` that does not carry priority never silently demotes
-            // a class/rank set out-of-band via `compute set --priority-class`; a brand-new
-            // workload defaults to `standard`/rank 0 server-side.
-            priority: None,
-        }
-    }
 }
 
 impl ApplyManifest {
@@ -810,65 +646,6 @@ pub enum ApplyOutput {
     },
 }
 
-/// The structured `--dry-run` plan — each field is a resource that *would* be
-/// reconciled, carrying the same facts the human plan lines show.
-#[derive(Debug, Default, serde::Serialize)]
-pub struct ApplyPlan {
-    /// The non-`default` project that would be ensured to exist.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ensure_project: Option<String>,
-    /// The tenancy schema's table count, when one would be set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tenancy_tables: Option<usize>,
-    /// Managed databases that would be declared + provisioned.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    databases: Vec<PlanDatabase>,
-    /// Sites that would be deployed.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    sites: Vec<PlanSite>,
-    /// Top-level functions that would be deployed.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    functions: Vec<PlanFunction>,
-    /// Compute workloads that would be applied.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    compute: Vec<PlanCompute>,
-}
-
-/// A planned managed-database declaration.
-#[derive(Debug, serde::Serialize)]
-struct PlanDatabase {
-    name: String,
-    kind: boatramp_core::compute::ApplyDatabaseKind,
-    tenant: boatramp_core::compute::ApplyDatabaseTenant,
-    size: boatramp_core::compute::ApplyDatabaseSize,
-}
-
-/// A planned site deployment.
-#[derive(Debug, serde::Serialize)]
-struct PlanSite {
-    name: String,
-    dir: String,
-    build: bool,
-    routing: bool,
-    config: bool,
-    /// How many safelisted GraphQL operations would be registered (register-only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    safelist_ops: Option<usize>,
-}
-
-/// A planned function deployment.
-#[derive(Debug, serde::Serialize)]
-struct PlanFunction {
-    name: String,
-    component: String,
-}
-
-/// A planned compute workload.
-#[derive(Debug, serde::Serialize)]
-struct PlanCompute {
-    name: String,
-}
-
 impl crate::output::Rendered for ApplyOutput {
     fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         match self {
@@ -908,55 +685,6 @@ impl crate::output::Rendered for ApplyOutput {
     }
 }
 
-impl ApplyPlan {
-    /// Render the plan's human lines (byte-for-byte the former `--dry-run` stdout, minus
-    /// the header + the ceiling-exception warnings, which now ride `tracing`).
-    fn render(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        if let Some(project) = &self.ensure_project {
-            writeln!(w, "  project `{project}`: ensure exists")?;
-        }
-        if let Some(tables) = self.tenancy_tables {
-            writeln!(w, "  tenancy: would set schema ({tables} table(s))")?;
-        }
-        for db in &self.databases {
-            writeln!(
-                w,
-                "  database `{}`: would declare + provision ({:?}, {:?}, size {:?})",
-                db.name, db.kind, db.tenant, db.size
-            )?;
-        }
-        for site in &self.sites {
-            writeln!(
-                w,
-                "  site `{}`: would deploy {} (build: {}, routing: {}, config: {})",
-                site.name,
-                site.dir,
-                yes_no(site.build),
-                yes_no(site.routing),
-                yes_no(site.config),
-            )?;
-            if let Some(ops) = site.safelist_ops {
-                writeln!(
-                    w,
-                    "  site `{}`: would register {} safelisted operation(s) (register-only)",
-                    site.name, ops,
-                )?;
-            }
-        }
-        for f in &self.functions {
-            writeln!(
-                w,
-                "  function `{}`: would deploy from {}",
-                f.name, f.component
-            )?;
-        }
-        for c in &self.compute {
-            writeln!(w, "  compute `{}`: would apply spec", c.name)?;
-        }
-        Ok(())
-    }
-}
-
 pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<ApplyOutput> {
     let manifest = ApplyManifest::load(&args.file, args.format)?;
 
@@ -975,6 +703,9 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<ApplyOutput>
 
     let (server, http) = client::connect(args.server.clone(), config)?;
     let cp = client::ControlPlane::new(server, http, project.clone());
+    // The local-infra seam (node-library N3): the CLI runs the real build command + the
+    // content-addressed directory walk the reconcile core delegates via `SiteBuilder`.
+    let builder = CliSiteBuilder { config };
 
     // The header summary (declared counts) is the first line of the typed result's
     // human rendering (for both modes); the per-resource progress below rides `tracing`.
@@ -983,26 +714,6 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<ApplyOutput>
     let functions = manifest.functions.len();
     let compute = manifest.compute.len();
     let databases = manifest.databases.len();
-
-    // Assemble the dry-run plan as the helpers run; in a real apply the helpers reconcile
-    // (emitting progress via `tracing`) and contribute nothing to the plan.
-    // Ensure the project exists (best-effort; `default` always does).
-    let mut plan = ApplyPlan {
-        ensure_project: ensure_project(&cp, &project, args.dry_run).await?,
-        ..Default::default()
-    };
-
-    // Reconcile the tenancy schema *before* any site/function, so a handler shipped in
-    // this same apply already runs under the declared isolation boundary.
-    if let Some(schema) = &manifest.tenancy {
-        plan.tenancy_tables = reconcile_tenancy(&cp, schema, args.dry_run).await?;
-    }
-
-    // Reconcile declared managed databases *before* sites/functions/compute (#501 Stage B),
-    // so a handler shipped in the same apply binds an already-provisioned DB. Each is
-    // `PUT`-only (create-or-replace + eager provision); removing an entry never
-    // deprovisions (the server keeps the DB/volume/credential).
-    plan.databases = apply_databases(&cp, &manifest.databases, args.dry_run).await?;
 
     // `safelisted_ops_path` is resolved relative to the manifest's own directory
     // (client-side); the manifest file itself lives at `args.file`.
@@ -1013,28 +724,30 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<ApplyOutput>
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    for site in &manifest.sites {
-        if let Some(planned) =
-            apply_site(&cp, site, config, &manifest_dir, args.build, args.dry_run).await?
-        {
-            plan.sites.push(planned);
-        }
-    }
-    for function in &manifest.functions {
-        if let Some(planned) = apply_function(&cp, function, args.dry_run).await? {
-            plan.functions.push(planned);
-        }
-    }
-    // Bug #499: each function deploy staged (not composed) its subgraph SDL via `?compose=defer`,
-    // keeping the slow introspect/compose off the per-deploy request critical path. Promote the
-    // whole staged set in ONE composition here (O(N) instead of O(N²) recomposes). A no-op when
-    // no function staged a subgraph. Skipped on dry-run (no deploys happened).
-    apply_deferred_compose(&cp, !manifest.functions.is_empty(), args.dry_run).await?;
-    for workload in &manifest.compute {
-        if let Some(planned) = apply_compute(&cp, workload, args.dry_run).await? {
-            plan.compute.push(planned);
-        }
-    }
+    // Drive the manifest to desired state (node-library N4): the reconcile *driver* —
+    // the ordering contract (ensure project → tenancy → databases → sites → functions →
+    // deferred compose → compute) plus the dry-run plan assembly — lives in the library
+    // behind the `ControlPlane`/`SiteBuilder` seams, so the end-to-end sequence is
+    // unit-testable in-process. The binary supplies the resolved inputs + the concrete
+    // seams and renders the result. Under `--dry-run` the returned plan is the whole
+    // plan; a real apply reconciles (emitting progress via `tracing`) and returns an
+    // empty plan.
+    let plan = reconcile::reconcile_project(
+        &cp,
+        &builder,
+        &reconcile::ReconcileRequest {
+            project: &project,
+            tenancy: manifest.tenancy.as_ref(),
+            databases: &manifest.databases,
+            sites: &manifest.sites,
+            functions: &manifest.functions,
+            compute: &manifest.compute,
+            manifest_dir: &manifest_dir,
+            build: args.build,
+            dry_run: args.dry_run,
+        },
+    )
+    .await?;
 
     if args.dry_run {
         Ok(ApplyOutput::Plan {
@@ -1058,412 +771,6 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<ApplyOutput>
     }
 }
 
-/// Ensure the target project exists: `GET` it, and on a 404 `create` it. A
-/// concurrent create (409/conflict) is ignored. The reserved `default` project
-/// always exists, so it is skipped.
-/// Returns `Some(project)` as a dry-run plan entry when a non-`default` project would
-/// be ensured; otherwise `None` (default project, or a real apply).
-async fn ensure_project<C: ControlPlane>(
-    cp: &C,
-    project: &str,
-    dry_run: bool,
-) -> Result<Option<String>> {
-    if project == boatramp_core::project::DEFAULT_PROJECT {
-        return Ok(None);
-    }
-    if dry_run {
-        return Ok(Some(project.to_string()));
-    }
-    match cp.get_project(project).await {
-        Ok(_) => Ok(None),
-        Err(CpError::NotFound) => match cp.create_project(&json!({ "name": project })).await {
-            Ok(_) => {
-                tracing::info!(project, "created project");
-                Ok(None)
-            }
-            // A concurrent create is fine — the project ends up existing either way.
-            Err(CpError::Conflict) => Ok(None),
-            Err(err) => Err(err.into()),
-        },
-        Err(err) => Err(err.into()),
-    }
-}
-
-/// Reconcile the project's tenancy schema: unconditionally PUT the declared schema
-/// (idempotent replace). Runs before the sites/functions so the isolation boundary is
-/// in place before any handler can serve a request.
-/// Returns `Some(table_count)` as a dry-run plan entry; `None` in a real apply (the
-/// set is reported via `tracing`).
-async fn reconcile_tenancy<C: ControlPlane>(
-    cp: &C,
-    schema: &boatramp_core::tenancy::TenancySchema,
-    dry_run: bool,
-) -> Result<Option<usize>> {
-    if dry_run {
-        return Ok(Some(schema.tables.len()));
-    }
-    cp.put_project_tenancy(schema).await?;
-    tracing::info!(tables = schema.tables.len(), "set tenancy schema");
-    Ok(None)
-}
-
-/// Reconcile the declared managed databases (#501 Stage B): `PUT` each — a create-or-replace
-/// that eagerly provisions — and NEVER prune. Runs BEFORE sites/functions/compute so a
-/// handler shipped in the same apply binds an already-provisioned DB. Upsert-only (matching
-/// the module's upsert-never-prune contract): an entry dropped from a later manifest is left
-/// untouched server-side (its DB/volume/credential are kept). The server enforces the security
-/// invariants (daemon-config-wins, identity-change refusal, caller's-project binding); a
-/// refusal surfaces as a client error here.
-/// Returns the dry-run plan entries (one per declared DB); an empty vec in a real
-/// apply (each declare is reported via `tracing`).
-async fn apply_databases<C: ControlPlane>(
-    cp: &C,
-    databases: &[boatramp_core::compute::ApplyDatabase],
-    dry_run: bool,
-) -> Result<Vec<PlanDatabase>> {
-    let mut plan = Vec::new();
-    for db in databases {
-        if dry_run {
-            plan.push(PlanDatabase {
-                name: db.name.clone(),
-                kind: db.kind,
-                tenant: db.tenant,
-                size: db.size,
-            });
-            continue;
-        }
-        cp.declare_database(&db.name, db).await?;
-        tracing::info!(database = %db.name, "declared + provisioned database");
-    }
-    Ok(plan)
-}
-
-/// Reconcile one site: (optionally build), hash the content dir, negotiate the
-/// deployment, upload the missing blobs, PUT its site config, then activate (config
-/// before activate — the activation precheck gates handlers on the stored config).
-/// Returns `Some(PlanSite)` as a dry-run plan entry; `None` in a real apply (progress
-/// is reported via `tracing`).
-async fn apply_site<C: ControlPlane>(
-    cp: &C,
-    site: &ApplySite,
-    config: &ProjectConfig,
-    manifest_dir: &Path,
-    build_flag: bool,
-    dry_run: bool,
-) -> Result<Option<PlanSite>> {
-    let dir = site_content_dir(site);
-
-    if dry_run {
-        // #470 legibility: surface any route that deliberately EXCEEDS the site tenancy ceiling, so an
-        // authorized exception is visible at plan time (never hidden behind a function indirection —
-        // the whole point of the inline model). When this apply also carries the site config, flag the
-        // definite misconfig where a route asks for an exception the site does not permit (the server
-        // precheck refuses it at activation; we warn early). Not a hard failure — the site config may
-        // be managed out-of-band, so the server remains the authoritative gate.
-        let site_allows = site
-            .config
-            .as_ref()
-            .and_then(|c| c.handlers.as_ref())
-            .map(|h| h.allow_ceiling_exceptions);
-        if let Some(routing) = &site.routing {
-            for h in &routing.handlers {
-                if matches!(
-                    &h.tenancy,
-                    Some(boatramp_core::tenancy::Tenancy::Scoped {
-                        exceed_site_ceiling: true,
-                        ..
-                    })
-                ) {
-                    let methods = h.methods.join(",");
-                    match site_allows {
-                        Some(false) => tracing::warn!(
-                            route = ?h.route,
-                            methods = %methods,
-                            "route declares `exceed_site_ceiling` but this apply's site config does \
-                             NOT set `allow_ceiling_exceptions` — it will be REFUSED at activation. \
-                             Set it, or narrow the route."
-                        ),
-                        _ => tracing::warn!(
-                            route = ?h.route,
-                            methods = %methods,
-                            "route exceeds the site tenancy ceiling (authorized via \
-                             `exceed_site_ceiling`; the site must set `allow_ceiling_exceptions`, and \
-                             an `all` grant also needs the operator posture `allow_cross_tenant_db`)."
-                        ),
-                    }
-                }
-            }
-        }
-        // Surface (and validate) the declared safelisted ops at plan time, so a
-        // misconfig (both sources set, or an unreadable file) fails the dry-run early.
-        let safelist_ops = apply_safelists(cp, site, manifest_dir, true).await?;
-        return Ok(Some(PlanSite {
-            name: site.name.clone(),
-            dir: dir.display().to_string(),
-            build: site.build.is_some() || build_flag,
-            routing: site.routing.is_some(),
-            config: site.config.is_some(),
-            safelist_ops,
-        }));
-    }
-
-    // Build first when the site declares a build (or `--build` was passed).
-    if let Some(build) = &site.build {
-        crate::build::run_command(&build.command).await?;
-    } else if build_flag {
-        let command = crate::build::resolve_command(None, config)?;
-        crate::build::run_command(&command).await?;
-    }
-
-    if !dir.is_dir() {
-        return Err(Error::Sync(crate::sync::Error::NotADirectory(
-            dir.display().to_string(),
-        )));
-    }
-
-    // Content-addressed manifest of the tree; fold the site's routing in.
-    let (mut manifest, blobs_by_hash) = crate::sync::build_manifest(&dir).await?;
-    if let Some(routing) = &site.routing {
-        manifest.config = routing.clone();
-    }
-
-    let created = cp.create_deployment(&site.name, &manifest).await?;
-    tracing::info!(
-        site = %site.name,
-        deployment = %created.id,
-        missing = created.missing.len(),
-        "negotiated site deployment; uploading new blobs"
-    );
-
-    for hash in &created.missing {
-        let source = blobs_by_hash
-            .get(hash)
-            .ok_or_else(|| Error::Sync(crate::sync::Error::NoLocalSource(hash.clone())))?;
-        cp.upload_blob_source(hash, source).await?;
-    }
-
-    // Apply the site config BEFORE activating: activation prechecks a deployment's
-    // handlers against the site's stored config (allow_imports / handler enablement),
-    // so a handler-shipping deployment is refused (422) if its config has not landed
-    // yet. Configure the site, then flip it live.
-    if let Some(site_config) = &site.config {
-        cp.put_site_config(&site.name, site_config).await?;
-        tracing::info!(site = %site.name, "applied site config");
-    }
-
-    cp.activate(&site.name, &created.id).await?;
-    tracing::info!(site = %site.name, deployment = %created.id, "activated site");
-
-    // Register the site's declaratively-safelisted GraphQL operations (register-only).
-    apply_safelists(cp, site, manifest_dir, false).await?;
-
-    Ok(None)
-}
-
-/// Register a site's declaratively-safelisted GraphQL operations (v0.6.0) — the
-/// `[handlers.graphql].safelisted_ops` (inline) OR `safelisted_ops_path` (a file,
-/// resolved client-side relative to `manifest_dir`). Every collected operation is
-/// registered through the existing control-plane `POST .../graphql/safelist` endpoint,
-/// which runs the server-side `guard_query`→`register` validation.
-///
-/// **REGISTER-ONLY (union).** This never deletes or prunes: re-applying only ever ADDS
-/// operations to the allowlist. Pruning a deny-by-default allowlist on apply would be a
-/// self-inflicted DoS (and a silent boundary narrowing), so removal stays the explicit
-/// `boatramp graphql safelist rm`. The two sources are mutually exclusive (a config
-/// error if both are set). On `dry_run` the ops are collected + validated (so a misconfig
-/// fails early) but nothing is registered.
-/// Returns `Some(op_count)` as a dry-run plan entry when ops would be registered;
-/// `None` otherwise (nothing to register, or a real apply — where the registration is
-/// reported via `tracing`).
-async fn apply_safelists<C: ControlPlane>(
-    cp: &C,
-    site: &ApplySite,
-    manifest_dir: &Path,
-    dry_run: bool,
-) -> Result<Option<usize>> {
-    let Some(gql) = site
-        .config
-        .as_ref()
-        .and_then(|c| c.handlers.as_ref())
-        .and_then(|h| h.graphql.as_ref())
-    else {
-        return Ok(None);
-    };
-
-    // Mutual exclusion: pick one source of safelisted operations.
-    if !gql.safelisted_ops.is_empty() && gql.safelisted_ops_path.is_some() {
-        return Err(Error::SafelistConflict {
-            site: site.name.clone(),
-        });
-    }
-
-    // Collect the operation texts from whichever source is declared.
-    let ops: Vec<String> = if let Some(rel) = &gql.safelisted_ops_path {
-        // Resolve the path client-side relative to the manifest dir; only op TEXT
-        // (never the path) ever leaves this host.
-        let path = manifest_dir.join(rel);
-        let text = std::fs::read_to_string(&path).map_err(|source| Error::SafelistFile {
-            site: site.name.clone(),
-            path: path.display().to_string(),
-            source,
-        })?;
-        parse_ops_file(&text)
-    } else {
-        gql.safelisted_ops.clone()
-    };
-
-    if ops.is_empty() {
-        return Ok(None);
-    }
-
-    if dry_run {
-        return Ok(Some(ops.len()));
-    }
-
-    for op in &ops {
-        cp.register_graphql_safelist(op, &site.name).await?;
-    }
-    tracing::info!(
-        site = %site.name,
-        ops = ops.len(),
-        "registered safelisted operations (register-only)"
-    );
-    Ok(None)
-}
-
-/// Parse a `safelisted_ops_path` file into individual operation texts. The file is
-/// either a **JSON array of operation strings** (`["query A {…}", "mutation B {…}"]`)
-/// — the explicit multi-operation form — or, if it is not such an array, the WHOLE
-/// file content is taken as a **single** operation (matching the existing
-/// `boatramp graphql safelist add --file` semantics). Empty/whitespace-only entries
-/// are dropped.
-fn parse_ops_file(text: &str) -> Vec<String> {
-    if let Ok(arr) = serde_json::from_str::<Vec<String>>(text) {
-        return arr.into_iter().filter(|op| !op.trim().is_empty()).collect();
-    }
-    let single = text.trim();
-    if single.is_empty() {
-        Vec::new()
-    } else {
-        vec![single.to_string()]
-    }
-}
-
-/// Reconcile one top-level function: stage its component blob, then PUT the
-/// function record (`{ component, config, lifecycle }`).
-/// Returns `Some(PlanFunction)` as a dry-run plan entry; `None` in a real apply (the
-/// deploy is reported via `tracing`).
-async fn apply_function<C: ControlPlane>(
-    cp: &C,
-    function: &ApplyFunction,
-    dry_run: bool,
-) -> Result<Option<PlanFunction>> {
-    if dry_run {
-        return Ok(Some(PlanFunction {
-            name: function.name.clone(),
-            component: function.component.clone(),
-        }));
-    }
-
-    let hash = cp.put_file_blob(Path::new(&function.component)).await?;
-    let mut cfg = serde_json::Map::new();
-    if let Some(runtime) = &function.runtime {
-        cfg.insert("runtime".to_string(), json!(runtime));
-    }
-    if let Some(secret_env) = &function.webhook_secret_env {
-        let mut webhook = serde_json::Map::new();
-        webhook.insert("secret_env".to_string(), json!(secret_env));
-        if let Some(topic) = &function.webhook_publish {
-            webhook.insert("publish".to_string(), json!(topic));
-        }
-        cfg.insert("webhook".to_string(), serde_json::Value::Object(webhook));
-    }
-    if !function.imports.is_empty() {
-        cfg.insert("imports".to_string(), json!(function.imports));
-    }
-    if !function.env.is_empty() {
-        cfg.insert("env".to_string(), json!(function.env));
-    }
-    // Secret *references* only (`ENV_VAR` → `HOST_ENV`); the server resolves them
-    // from its own env at instantiation, so no secret value is ever transmitted or
-    // stored — just the reference, keeping the manifest committable.
-    if !function.secrets.is_empty() {
-        cfg.insert("secrets".to_string(), json!(function.secrets));
-    }
-    if !function.invoke_targets.is_empty() {
-        cfg.insert("invoke_targets".to_string(), json!(function.invoke_targets));
-    }
-    if let Some(limits) = &function.limits {
-        cfg.insert("limits".to_string(), json!(limits));
-    }
-    // In-site tenancy + token-verification config map straight onto the internal FunctionConfig
-    // (`tenancy`/`token_claims`); the server enforces them at instantiation (Dimension 0).
-    if let Some(tenancy) = &function.tenancy {
-        cfg.insert("tenancy".to_string(), json!(tenancy));
-    }
-    if let Some(token_claims) = &function.token_claims {
-        cfg.insert("token_claims".to_string(), json!(token_claims));
-    }
-    // Top-level functions carry their own independent version line.
-    let body = json!({
-        "component": hash,
-        "config": serde_json::Value::Object(cfg),
-        "lifecycle": "independent",
-    });
-    cp.deploy_function(&function.name, &body).await?;
-    tracing::info!(function = %function.name, "deployed function");
-    Ok(None)
-}
-
-/// Promote the staged subgraphs once, after all functions have been deployed (bug #499). Each
-/// function deploy used `?compose=defer`, so its subgraph SDL was staged (not composed) — keeping
-/// the O(N) introspect/compose off each individual deploy's request critical path. This calls
-/// `POST .../graphql/compose` ONCE to validate + promote the whole staged set. A no-op when the
-/// manifest declares no functions (nothing could have staged), and skipped entirely on a dry-run
-/// (no deploys happened). Generic over the [`ControlPlane`] seam so the mock records the call.
-async fn apply_deferred_compose<C: ControlPlane>(
-    cp: &C,
-    any_functions: bool,
-    dry_run: bool,
-) -> Result<()> {
-    if dry_run || !any_functions {
-        return Ok(());
-    }
-    cp.compose_subgraphs().await?;
-    Ok(())
-}
-
-/// Reconcile one compute workload: PUT its spec straight to the server.
-/// Returns `Some(PlanCompute)` as a dry-run plan entry; `None` in a real apply (the
-/// apply is reported via `tracing`).
-async fn apply_compute<C: ControlPlane>(
-    cp: &C,
-    compute: &ApplyCompute,
-    dry_run: bool,
-) -> Result<Option<PlanCompute>> {
-    if dry_run {
-        return Ok(Some(PlanCompute {
-            name: compute.name.clone(),
-        }));
-    }
-    // The typed request round-trips to the exact `PutComputeRequest` JSON the server
-    // deserializes — the manifest and the wire share one schema.
-    let body = serde_json::to_value(compute.to_request())?;
-    cp.put_compute(&compute.name, &body).await?;
-    tracing::info!(compute = %compute.name, "applied compute workload");
-    Ok(None)
-}
-
-/// The content dir for a site: an explicit `path`, else the site build's
-/// `output`, else `.`.
-fn site_content_dir(site: &ApplySite) -> PathBuf {
-    site.path
-        .clone()
-        .or_else(|| site.build.as_ref().and_then(|b| b.output.clone()))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 /// Whether a control-plane error is an HTTP 404 (the resource is absent).
 fn is_not_found(err: &client::ClientError) -> bool {
     matches!(
@@ -1480,272 +787,9 @@ fn is_conflict(err: &client::ClientError) -> bool {
     )
 }
 
-/// `"yes"`/`"no"` for a dry-run plan line.
-fn yes_no(b: bool) -> &'static str {
-    if b { "yes" } else { "no" }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// A recording [`ControlPlane`] double: every call appends a line to `calls`,
-    /// so a reconcile test asserts *which* control-plane operations ran and *in
-    /// what order* — without a live server. `project_exists` toggles `get_project`
-    /// between `Ok` and [`CpError::NotFound`].
-    #[derive(Default)]
-    struct MockCp {
-        calls: Mutex<Vec<String>>,
-        project_exists: bool,
-    }
-
-    impl MockCp {
-        fn rec(&self, line: impl Into<String>) {
-            self.calls.lock().unwrap().push(line.into());
-        }
-        fn calls(&self) -> Vec<String> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl ControlPlane for MockCp {
-        async fn get_project(&self, name: &str) -> CpResult<serde_json::Value> {
-            self.rec(format!("get_project {name}"));
-            if self.project_exists {
-                Ok(json!({ "name": name }))
-            } else {
-                Err(CpError::NotFound)
-            }
-        }
-        async fn create_project(&self, body: &serde_json::Value) -> CpResult<serde_json::Value> {
-            self.rec(format!(
-                "create_project {}",
-                body["name"].as_str().unwrap_or_default()
-            ));
-            Ok(body.clone())
-        }
-        async fn create_deployment(
-            &self,
-            site: &str,
-            _manifest: &boatramp_core::deploy::Manifest,
-        ) -> CpResult<crate::client::CreateDeploymentResponse> {
-            self.rec(format!("create_deployment {site}"));
-            // No missing blobs ⇒ the upload loop is skipped, isolating the
-            // config-before-activate ordering under test.
-            Ok(crate::client::CreateDeploymentResponse {
-                id: "dep-1".into(),
-                missing: vec![],
-            })
-        }
-        async fn upload_blob_source(
-            &self,
-            hash: &str,
-            _source: &crate::sync::BlobSource,
-        ) -> CpResult<()> {
-            self.rec(format!("upload_blob_source {hash}"));
-            Ok(())
-        }
-        async fn put_site_config(&self, site: &str, _config: &SiteConfig) -> CpResult<()> {
-            self.rec(format!("put_site_config {site}"));
-            Ok(())
-        }
-        async fn activate(&self, site: &str, id: &str) -> CpResult<()> {
-            self.rec(format!("activate {site} {id}"));
-            Ok(())
-        }
-        async fn put_file_blob(&self, path: &Path) -> CpResult<String> {
-            self.rec(format!("put_file_blob {}", path.display()));
-            Ok("deadbeef".into())
-        }
-        async fn deploy_function(&self, name: &str, _body: &serde_json::Value) -> CpResult<()> {
-            self.rec(format!("deploy_function {name}"));
-            Ok(())
-        }
-        async fn compose_subgraphs(&self) -> CpResult<()> {
-            self.rec("compose_subgraphs".to_string());
-            Ok(())
-        }
-        async fn put_compute(
-            &self,
-            name: &str,
-            _body: &serde_json::Value,
-        ) -> CpResult<serde_json::Value> {
-            self.rec(format!("put_compute {name}"));
-            Ok(json!({}))
-        }
-        async fn put_project_tenancy(
-            &self,
-            schema: &boatramp_core::tenancy::TenancySchema,
-        ) -> CpResult<()> {
-            self.rec(format!("put_project_tenancy {}", schema.tables.len()));
-            Ok(())
-        }
-        async fn register_graphql_safelist(&self, query: &str, _site: &str) -> CpResult<()> {
-            // Record the op text so a test can assert POST-per-op (and that no DELETE
-            // is ever issued — the mock has no delete method at all).
-            self.rec(format!("register_graphql_safelist {query}"));
-            Ok(())
-        }
-        async fn declare_database(
-            &self,
-            name: &str,
-            db: &boatramp_core::compute::ApplyDatabase,
-        ) -> CpResult<()> {
-            // Record the declare so a test can assert PUT-per-db (and that no deprovision
-            // is ever issued — the mock has no delete/deprovision method at all).
-            self.rec(format!("declare_database {name} kind={:?}", db.kind));
-            Ok(())
-        }
-    }
-
-    fn a_function() -> ApplyFunction {
-        ApplyFunction {
-            name: "resize".into(),
-            component: "resize.wasm".into(),
-            runtime: None,
-            webhook_secret_env: None,
-            webhook_publish: None,
-            imports: vec![],
-            env: Default::default(),
-            secrets: Default::default(),
-            invoke_targets: vec![],
-            limits: None,
-            tenancy: None,
-            token_claims: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn ensure_project_creates_on_404() {
-        let mock = MockCp::default(); // project_exists: false
-        ensure_project(&mock, "acme", false).await.unwrap();
-        assert_eq!(mock.calls(), ["get_project acme", "create_project acme"]);
-    }
-
-    #[tokio::test]
-    async fn ensure_project_existing_does_not_create() {
-        let mock = MockCp {
-            project_exists: true,
-            ..Default::default()
-        };
-        ensure_project(&mock, "acme", false).await.unwrap();
-        assert_eq!(mock.calls(), ["get_project acme"]);
-    }
-
-    #[tokio::test]
-    async fn ensure_project_skips_the_reserved_default() {
-        let mock = MockCp::default();
-        ensure_project(&mock, boatramp_core::project::DEFAULT_PROJECT, false)
-            .await
-            .unwrap();
-        assert!(mock.calls().is_empty(), "default is never created");
-    }
-
-    #[tokio::test]
-    async fn ensure_project_dry_run_mutates_nothing() {
-        let mock = MockCp::default();
-        ensure_project(&mock, "acme", true).await.unwrap();
-        assert!(mock.calls().is_empty(), "dry-run issues no requests");
-    }
-
-    #[tokio::test]
-    async fn apply_function_stages_blob_then_deploys() {
-        let mock = MockCp::default();
-        apply_function(&mock, &a_function(), false).await.unwrap();
-        assert_eq!(
-            mock.calls(),
-            ["put_file_blob resize.wasm", "deploy_function resize"]
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_function_dry_run_mutates_nothing() {
-        let mock = MockCp::default();
-        apply_function(&mock, &a_function(), true).await.unwrap();
-        assert!(mock.calls().is_empty());
-    }
-
-    #[tokio::test]
-    async fn apply_deferred_compose_promotes_once_after_functions() {
-        // Bug #499: with functions present (each deployed `?compose=defer`), the staged subgraphs
-        // are promoted by exactly ONE `compose_subgraphs` call after the deploys.
-        let mock = MockCp::default();
-        apply_deferred_compose(&mock, true, false).await.unwrap();
-        assert_eq!(mock.calls(), ["compose_subgraphs"]);
-    }
-
-    #[tokio::test]
-    async fn apply_deferred_compose_noop_without_functions_or_on_dry_run() {
-        // No functions in the manifest ⇒ nothing staged ⇒ no compose call.
-        let mock = MockCp::default();
-        apply_deferred_compose(&mock, false, false).await.unwrap();
-        assert!(mock.calls().is_empty(), "no functions ⇒ no compose");
-        // Dry-run ⇒ no deploys happened ⇒ no compose call.
-        let mock = MockCp::default();
-        apply_deferred_compose(&mock, true, true).await.unwrap();
-        assert!(mock.calls().is_empty(), "dry-run ⇒ no compose");
-    }
-
-    /// A minimal typed image-workload spec for the compute-apply tests.
-    fn an_image_spec() -> boatramp_core::compute::ComputeSpec {
-        boatramp_core::compute::ComputeSpec::builder(
-            boatramp_core::compute::RootSource::Image("nginx:latest".into()),
-            1,
-            256,
-            8080,
-        )
-        .build()
-    }
-
-    #[tokio::test]
-    async fn apply_compute_puts_the_spec() {
-        let mock = MockCp::default();
-        let compute = ApplyCompute {
-            name: "api".into(),
-            spec: an_image_spec(),
-            replicas: 2,
-            placement: Default::default(),
-        };
-        apply_compute(&mock, &compute, false).await.unwrap();
-        assert_eq!(mock.calls(), ["put_compute api"]);
-    }
-
-    #[tokio::test]
-    async fn apply_compute_dry_run_mutates_nothing() {
-        let mock = MockCp::default();
-        let compute = ApplyCompute {
-            name: "api".into(),
-            spec: an_image_spec(),
-            replicas: boatramp_core::compute::default_replicas(),
-            placement: Default::default(),
-        };
-        apply_compute(&mock, &compute, true).await.unwrap();
-        assert!(mock.calls().is_empty());
-    }
-
-    #[tokio::test]
-    async fn reconcile_tenancy_puts_the_schema() {
-        use boatramp_core::tenancy::{TableScope, TenancySchema};
-        let mock = MockCp::default();
-        let mut schema = TenancySchema::default();
-        schema.tables.insert("orders".into(), TableScope::Tenant);
-        schema.tables.insert(
-            "tenant".into(),
-            TableScope::TenantKeyed { key: "id".into() },
-        );
-        reconcile_tenancy(&mock, &schema, false).await.unwrap();
-        assert_eq!(mock.calls(), ["put_project_tenancy 2"]);
-    }
-
-    #[tokio::test]
-    async fn reconcile_tenancy_dry_run_mutates_nothing() {
-        let mock = MockCp::default();
-        reconcile_tenancy(&mock, &Default::default(), true)
-            .await
-            .unwrap();
-        assert!(mock.calls().is_empty());
-    }
 
     /// The tenancy schema round-trips through the RON manifest surface — proving the
     /// internally-tagged `TableScope` enum (`kind: "tenant" | "tenant_keyed" | "unscoped"`)
@@ -1927,49 +971,6 @@ mod tests {
         assert!(
             matches!(err, Error::TokenClaims { .. }),
             "the mix is reported as a token_claims error, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_site_applies_config_before_activate() {
-        // `build_manifest` hashes a real tree, so stage a one-file content dir.
-        let dir = std::env::temp_dir().join(format!(
-            "boatramp-apply-site-{}-{}",
-            std::process::id(),
-            "www"
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("index.html"), b"<h1>hi</h1>").unwrap();
-
-        let mock = MockCp::default();
-        let site = ApplySite {
-            name: "www".into(),
-            path: Some(dir.display().to_string()),
-            build: None,
-            routing: None,
-            config: Some(SiteConfig::default()),
-        };
-        let result = apply_site(
-            &mock,
-            &site,
-            &ProjectConfig::default(),
-            Path::new("."),
-            false,
-            false,
-        )
-        .await;
-        let _ = std::fs::remove_dir_all(&dir);
-        result.unwrap();
-
-        // The invariant this module exists to guarantee (see `apply_site`'s doc):
-        // the site config lands BEFORE the deployment is activated.
-        assert_eq!(
-            mock.calls(),
-            [
-                "create_deployment www",
-                "put_site_config www",
-                "activate www dep-1"
-            ]
         );
     }
 
@@ -2348,34 +1349,6 @@ mod tests {
     // Part 4 — graphql safelist (rename + register-only apply)
     // -----------------------------------------------------------------------
 
-    /// Build an `ApplySite` whose site config declares a graphql handler, mutating it
-    /// with `f` (to set the safelist fields under test).
-    fn site_with_graphql(
-        name: &str,
-        f: impl FnOnce(&mut boatramp_core::config::HandlerGraphqlConfig),
-    ) -> ApplySite {
-        let mut gql = boatramp_core::config::HandlerGraphqlConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        f(&mut gql);
-        let site_config = SiteConfig {
-            handlers: Some(boatramp_core::config::HandlersSiteConfig {
-                enabled: true,
-                graphql: Some(gql),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        ApplySite {
-            name: name.into(),
-            path: None,
-            build: None,
-            routing: None,
-            config: Some(site_config),
-        }
-    }
-
     #[test]
     fn enforce_safelist_rename_parses_from_config() {
         // The renamed field parses under its new name (the old `safelist` name is gone).
@@ -2398,98 +1371,6 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(gql.enforce_safelist);
-    }
-
-    #[tokio::test]
-    async fn apply_safelists_registers_each_op_register_only() {
-        let mock = MockCp::default();
-        let site = site_with_graphql("gw", |g| {
-            g.safelisted_ops = vec!["query A { a }".into(), "query B { b }".into()];
-        });
-        apply_safelists(&mock, &site, Path::new("."), false)
-            .await
-            .unwrap();
-        let calls = mock.calls();
-        // Exactly one register per op, in order — and NO delete/prune (register-only).
-        assert_eq!(
-            calls,
-            [
-                "register_graphql_safelist query A { a }",
-                "register_graphql_safelist query B { b }",
-            ]
-        );
-        assert!(
-            !calls.iter().any(|c| c.to_lowercase().contains("delete")
-                || c.to_lowercase().contains("remove")
-                || c.to_lowercase().contains("prune")),
-            "register-only: never deletes/prunes"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_safelists_dry_run_registers_nothing() {
-        let mock = MockCp::default();
-        let site = site_with_graphql("gw", |g| {
-            g.safelisted_ops = vec!["query A { a }".into()];
-        });
-        apply_safelists(&mock, &site, Path::new("."), true)
-            .await
-            .unwrap();
-        assert!(mock.calls().is_empty(), "dry-run registers nothing");
-    }
-
-    #[tokio::test]
-    async fn apply_safelists_mutual_exclusion_is_an_error() {
-        let mock = MockCp::default();
-        let site = site_with_graphql("gw", |g| {
-            g.safelisted_ops = vec!["query A { a }".into()];
-            g.safelisted_ops_path = Some("ops.json".into());
-        });
-        let err = apply_safelists(&mock, &site, Path::new("."), false)
-            .await
-            .expect_err("both sources set is refused");
-        assert!(matches!(err, Error::SafelistConflict { .. }), "got {err:?}");
-        assert!(mock.calls().is_empty(), "no registration on a conflict");
-    }
-
-    #[tokio::test]
-    async fn apply_safelists_reads_ops_from_a_file_client_side() {
-        // The file is read relative to the manifest dir; each op is registered.
-        let dir = std::env::temp_dir().join(format!("boatramp-safelist-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("ops.json"),
-            br#"["query A { a }", "query B { b }"]"#,
-        )
-        .unwrap();
-
-        let mock = MockCp::default();
-        let site = site_with_graphql("gw", |g| {
-            g.safelisted_ops_path = Some("ops.json".into());
-        });
-        let res = apply_safelists(&mock, &site, &dir, false).await;
-        let _ = std::fs::remove_dir_all(&dir);
-        res.unwrap();
-        assert_eq!(
-            mock.calls(),
-            [
-                "register_graphql_safelist query A { a }",
-                "register_graphql_safelist query B { b }",
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_ops_file_handles_array_and_single_forms() {
-        // A JSON array of operation strings → each element is one op.
-        assert_eq!(
-            parse_ops_file(r#"["query A { a }", "query B { b }"]"#),
-            ["query A { a }", "query B { b }"]
-        );
-        // A non-array file → the whole content is a single op.
-        assert_eq!(parse_ops_file("query Single { s }"), ["query Single { s }"]);
-        // Empty → no ops.
-        assert!(parse_ops_file("   ").is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -2551,94 +1432,6 @@ mod tests {
                 "a manifest smuggling an excluded field must fail to parse: {excluded}"
             );
         }
-    }
-
-    /// `apply_databases` PUTs each declared DB (create-or-replace + eager provision) and
-    /// NEVER issues a deprovision — the mock has no delete/deprovision method at all, so an
-    /// upsert-only reconcile is structural. Confirms the eager-declare wiring + the
-    /// inert-on-removal contract at the CLI seam.
-    #[tokio::test]
-    async fn apply_databases_puts_each_and_never_deprovisions() {
-        let mock = MockCp::default();
-        let dbs = vec![
-            boatramp_core::compute::ApplyDatabase {
-                name: "app".into(),
-                kind: boatramp_core::compute::ApplyDatabaseKind::Postgres,
-                version: None,
-                extensions: vec![],
-                size: Default::default(),
-                tenant: Default::default(),
-                tenant_scope: Default::default(),
-                read_only: false,
-                rls_session: false,
-                tenant_guc: None,
-                session_guc: None,
-                tenant_all_marker: None,
-                pool_max: None,
-                connect_timeout_secs: None,
-                startup_grace_secs: None,
-                readiness_gate: Default::default(),
-                delta_capture: false,
-                restart_policy: Default::default(),
-            },
-            boatramp_core::compute::ApplyDatabase {
-                name: "metrics".into(),
-                kind: boatramp_core::compute::ApplyDatabaseKind::Mysql,
-                version: None,
-                extensions: vec![],
-                size: Default::default(),
-                tenant: Default::default(),
-                tenant_scope: Default::default(),
-                read_only: false,
-                rls_session: false,
-                tenant_guc: None,
-                session_guc: None,
-                tenant_all_marker: None,
-                pool_max: None,
-                connect_timeout_secs: None,
-                startup_grace_secs: None,
-                readiness_gate: Default::default(),
-                delta_capture: false,
-                restart_policy: Default::default(),
-            },
-        ];
-        apply_databases(&mock, &dbs, false).await.unwrap();
-        assert_eq!(
-            mock.calls(),
-            [
-                "declare_database app kind=Postgres",
-                "declare_database metrics kind=Mysql",
-            ],
-            "each declared DB is PUT once; no deprovision is ever issued"
-        );
-    }
-
-    /// A `--dry-run` apply declares NOTHING (mutates no state).
-    #[tokio::test]
-    async fn apply_databases_dry_run_declares_nothing() {
-        let mock = MockCp::default();
-        let dbs = vec![boatramp_core::compute::ApplyDatabase {
-            name: "app".into(),
-            kind: boatramp_core::compute::ApplyDatabaseKind::Postgres,
-            version: None,
-            extensions: vec![],
-            size: Default::default(),
-            tenant: Default::default(),
-            tenant_scope: Default::default(),
-            read_only: false,
-            rls_session: false,
-            tenant_guc: None,
-            session_guc: None,
-            tenant_all_marker: None,
-            pool_max: None,
-            connect_timeout_secs: None,
-            startup_grace_secs: None,
-            readiness_gate: Default::default(),
-            delta_capture: false,
-            restart_policy: Default::default(),
-        }];
-        apply_databases(&mock, &dbs, true).await.unwrap();
-        assert!(mock.calls().is_empty(), "dry-run declares nothing");
     }
 
     // =======================================================================

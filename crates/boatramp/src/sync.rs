@@ -417,11 +417,10 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
 }
 
 /// Where a blob's bytes come from when uploading: streamed from disk (identity
-/// content) or held in memory (a precompressed variant produced at sync).
-pub(crate) enum BlobSource {
-    File(PathBuf),
-    Memory(Vec<u8>),
-}
+/// content) or held in memory (a precompressed variant produced at sync). Defined in
+/// `boatramp-node` (node-library N3) so the reconcile core's `ControlPlane` seam can
+/// name it; re-exported here for `build_manifest` + the `sync`/`apply` upload paths.
+pub(crate) use boatramp_node::reconcile::BlobSource;
 
 /// Walk `dir`, hashing each file into a manifest (with precompressed `br`/`gzip`
 /// variants for compressible types) and recording where each unique blob — both
