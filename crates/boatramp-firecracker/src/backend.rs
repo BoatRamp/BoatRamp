@@ -343,6 +343,9 @@ impl ComputeBackend for VmmBackend {
             workload: handle.workload.clone(),
             replica: handle.replica,
             data_ref: encode_snap(&snap_path, &mem_path, &ip, port),
+            // Same-node only on the external-firecracker backend (no cross-node artifact
+            // descriptor wired here yet); the reconcile never sets this for it (U14).
+            exported: false,
         }))
     }
 

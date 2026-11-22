@@ -1139,6 +1139,48 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         }
     };
 
+    // U14 cross-node scale-to-zero: when the operator opts in (`[compute]
+    // cross_node_scale_to_zero`), wire a tenant-scoped snapshot store over the SAME
+    // per-project blob backends the handler `blobstore` binding resolves through, so a
+    // parked replica's snapshot is exported to the project's OWN backend under a
+    // project-scoped key and can be fetched + restored on a different node. `None` (default)
+    // keeps scale-to-zero strictly same-node (the snapshot never leaves the home node).
+    let snapshot_store: Option<Arc<dyn boatramp_core::compute::SnapshotStore>> = {
+        #[cfg(feature = "handlers")]
+        {
+            if config
+                .compute
+                .as_ref()
+                .is_some_and(|c| c.cross_node_scale_to_zero)
+            {
+                match handlers.blob_backends() {
+                    Some(blob_backends) => {
+                        let store: Arc<dyn boatramp_core::compute::SnapshotStore> = Arc::new(
+                            crate::compute_snapshot_store::BlobSnapshotStore::new(blob_backends),
+                        );
+                        Some(store)
+                    }
+                    None => {
+                        tracing::warn!(
+                            "compute.cross_node_scale_to_zero is set but no blob backend is \
+                             configured; cross-node scale-to-zero is DISABLED (snapshots stay \
+                             same-node)"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        // Without the handler runtime there is no per-project blob backend to store snapshots
+        // in, so cross-node scale-to-zero is unavailable (strictly same-node).
+        #[cfg(not(feature = "handlers"))]
+        {
+            None
+        }
+    };
+
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -1150,6 +1192,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         binding_resolver,
         managed_db_resolver,
         registry_auth_resolver,
+        snapshot_store,
         compute_binpack_tuning,
     );
 

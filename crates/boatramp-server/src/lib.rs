@@ -5630,6 +5630,7 @@ mod tests {
                 workload: workload.into(),
                 replica: 0,
                 data_ref: "snap-0".into(),
+                exported: false,
             }),
             active_spec: None,
         }

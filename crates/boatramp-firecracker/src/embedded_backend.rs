@@ -36,7 +36,7 @@ use boatramp_core::Storage;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
     InstanceHandle, IsolationClass, LaunchRequest, RootSource, RootSourceKind, Scheme, Snapshot,
-    SourceSupport, VolumeRef, compute_instance_id,
+    SnapshotArtifact, SourceSupport, VolumeRef, compute_instance_id,
 };
 use boatramp_core::ipam::{IpAuthority, IpPool};
 use boatramp_core::registry_auth::RegistryAuth;
@@ -1149,6 +1149,8 @@ impl ComputeBackend for EmbeddedVmmBackend {
             workload: handle.workload.clone(),
             replica: handle.replica,
             data_ref: encode_snap(&stem, &ip.to_string(), port),
+            // Set by the reconcile once the artifact is exported to tenant Storage (U14).
+            exported: false,
         }))
     }
 
@@ -1225,6 +1227,52 @@ impl ComputeBackend for EmbeddedVmmBackend {
                 port,
             },
         })
+    }
+
+    /// U14 cross-node s2z: the microVM snapshot is two local files under
+    /// `<data-dir>/compute/snapshots/` — `<id>.snap` (raw guest RAM) and `<id>.cfg` (the
+    /// worker config: kernel/rootfs refs + the per-binding env). Both are self-contained
+    /// (the kernel/rootfs blobs are content-addressed and re-`materialize`d on any node), so
+    /// the pair is all a resume node needs. The `data_ref` is rewritten to THIS node's paths
+    /// on import (ip/port preserved) so `restore` reads the fetched files here.
+    async fn snapshot_artifact(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<Option<SnapshotArtifact>, BackendError> {
+        let (_stem, ip, port) = decode_snap(&snapshot.data_ref).ok_or_else(|| {
+            BackendError::Other(format!("bad snapshot ref {:?}", snapshot.data_ref))
+        })?;
+        let id = vm_id(&snapshot.project, &snapshot.workload, snapshot.replica);
+        let dir = self.data_dir.join("compute").join("snapshots");
+        let local_stem = dir.join(&id).display().to_string();
+        Ok(Some(SnapshotArtifact {
+            files: vec![format!("{id}.snap"), format!("{id}.cfg")],
+            dir,
+            local_data_ref: encode_snap(&local_stem, &ip, port),
+        }))
+    }
+
+    /// Both snapshot files present on this node's local disk ⇒ no cross-node fetch needed.
+    /// Checks THIS node's own stem (derived from the identity + local `data_dir`), not the
+    /// path baked into `data_ref` — which, on a resume node, still names the node that parked
+    /// it. So on a node that doesn't hold the artifact this returns `false` and the reconcile
+    /// fetches it from tenant Storage before `restore`.
+    async fn snapshot_present(&self, snapshot: &Snapshot) -> Result<bool, BackendError> {
+        let id = vm_id(&snapshot.project, &snapshot.workload, snapshot.replica);
+        let stem = self
+            .data_dir
+            .join("compute")
+            .join("snapshots")
+            .join(&id)
+            .display()
+            .to_string();
+        let snap = tokio::fs::try_exists(format!("{stem}.snap"))
+            .await
+            .unwrap_or(false);
+        let cfg = tokio::fs::try_exists(format!("{stem}.cfg"))
+            .await
+            .unwrap_or(false);
+        Ok(snap && cfg)
     }
 }
 

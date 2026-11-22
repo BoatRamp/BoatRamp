@@ -541,6 +541,9 @@ impl ComputeBackend for VzBackend {
             workload: handle.workload.clone(),
             replica: handle.replica,
             data_ref: encode_snap(&stem, &ip.to_string(), port),
+            // Same-node only on the macOS VZ backend (no cross-node artifact wired); the
+            // reconcile never sets this for it (U14).
+            exported: false,
         }))
     }
 

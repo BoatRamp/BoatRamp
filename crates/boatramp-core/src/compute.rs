@@ -527,6 +527,121 @@ pub struct Snapshot {
     pub replica: u32,
     /// Backend-specific reference to the stored snapshot.
     pub data_ref: String,
+    /// Whether this snapshot's artifact has been **exported to tenant-scoped Storage**
+    /// (U14 cross-node scale-to-zero). `true` only once the export actually succeeded, so
+    /// the planner may re-place a wake onto a node OTHER than the one that holds the
+    /// snapshot locally (the resume node fetches it from Storage before `restore`). `false`
+    /// (the default) ⇒ the snapshot lives only on its home node's local disk, so a wake is
+    /// confined to that node exactly as before. `#[serde(default)]` keeps pre-U14 parked
+    /// records deserializing (as `false` = home-node-only); schema stays v1.
+    #[serde(default)]
+    pub exported: bool,
+}
+
+/// The tenant-scoped identity of a snapshot in Storage — the key under which a parked
+/// replica's artifact is exported/imported/removed (U14 cross-node scale-to-zero). The
+/// `project` segment is the **tenant boundary**: a resume node derives the Storage key
+/// from the snapshot's OWN `(project, workload, replica)`, so one tenant's key can never
+/// collide with or resolve to another's. Built from a [`Snapshot`] or an [`InstanceHandle`]
+/// (both carry the same identity triple).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotKey {
+    /// Owning project (the tenant boundary).
+    pub project: String,
+    /// Workload name.
+    pub workload: String,
+    /// Replica ordinal.
+    pub replica: u32,
+}
+
+impl SnapshotKey {
+    /// The key for a parked snapshot.
+    pub fn of_snapshot(snap: &Snapshot) -> Self {
+        Self {
+            project: snap.project.clone(),
+            workload: snap.workload.clone(),
+            replica: snap.replica,
+        }
+    }
+
+    /// The key for a running/parked replica (for lifecycle removal on stop).
+    pub fn of_handle(handle: &InstanceHandle) -> Self {
+        Self {
+            project: handle.project.clone(),
+            workload: handle.workload.clone(),
+            replica: handle.replica,
+        }
+    }
+}
+
+/// The on-disk layout of a backend's snapshot artifact, for cross-node transfer (U14).
+///
+/// A backend's [`snapshot_artifact`](ComputeBackend::snapshot_artifact) returns this so the
+/// orchestration (the tenant-scoped [`SnapshotStore`]) can archive the local files to
+/// Storage on park and restore them on a resume node — without the orchestration knowing a
+/// backend's private artifact shape (microVM RAM+config files vs. a CRIU image directory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotArtifact {
+    /// The local directory that holds the artifact's files (import: the directory the files
+    /// are unpacked into). Created on import if absent.
+    pub dir: std::path::PathBuf,
+    /// EXPORT: the exact file names under [`dir`](Self::dir) that make up this artifact —
+    /// each a single safe path component (no `/`, `..`, or absolute path). Archived by name.
+    /// IMPORT ignores this (the archive is self-describing); it is only the export selection,
+    /// so a backend that shares one directory across replicas (e.g. the microVM backend's
+    /// `snapshots/` dir) names exactly its own files and never captures a sibling's.
+    pub files: Vec<String>,
+    /// The snapshot `data_ref` as it reads on THIS node (its local paths), with the ip/port
+    /// preserved. After an import on a resume node, the restored snapshot's `data_ref` is
+    /// rewritten to this before [`restore`](ComputeBackend::restore). On the home node it
+    /// equals the snapshot's existing `data_ref`.
+    pub local_data_ref: String,
+}
+
+/// Why a [`SnapshotStore`] operation failed.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotStoreError {
+    /// The underlying tenant Storage read/write failed.
+    #[error("snapshot storage: {0}")]
+    Storage(String),
+    /// Packing/unpacking the artifact (local file I/O) failed.
+    #[error("snapshot archive: {0}")]
+    Archive(String),
+}
+
+/// Exports/imports a parked replica's snapshot artifact to/from **tenant-scoped Storage**,
+/// so a scale-to-zero workload can wake on a node OTHER than the one that parked it (U14).
+///
+/// Injected into [`reconcile_once`] (optional — `None` keeps the pre-U14 same-node-only
+/// behavior). The concrete impl lives server-side, over the per-project
+/// [`BlobBackends`](crate::blob_backends::BlobBackends) provider, so the snapshot (which is
+/// raw guest memory — tenant data, possibly secrets) is stored under a **project-scoped
+/// key on the project's own backend**, reusing the exact credential path and isolation
+/// every other tenant-Storage access uses. A node can only ever address a snapshot by its
+/// own `(project, workload, replica)`, so it can never fetch another tenant's.
+#[async_trait]
+pub trait SnapshotStore: Send + Sync {
+    /// Archive the local artifact `art` and upload it to tenant-scoped Storage under `key`.
+    /// MUST stream (never buffer the whole artifact in memory — a microVM RAM snapshot can
+    /// be gigabytes). Overwrites any prior object for `key`.
+    async fn export(
+        &self,
+        key: &SnapshotKey,
+        art: &SnapshotArtifact,
+    ) -> Result<(), SnapshotStoreError>;
+
+    /// Download the tenant-scoped archive for `key` and unpack it into `art.dir` (streaming),
+    /// readying the resume node for [`restore`](ComputeBackend::restore). `Ok(false)` when no
+    /// object exists for `key` (the caller then cold-starts); `Ok(true)` on a successful import.
+    async fn import(
+        &self,
+        key: &SnapshotKey,
+        art: &SnapshotArtifact,
+    ) -> Result<bool, SnapshotStoreError>;
+
+    /// Remove the tenant-scoped archive for `key` (lifecycle: on stop / scale-down / forget).
+    /// Removing a missing object is not an error.
+    async fn remove(&self, key: &SnapshotKey) -> Result<(), SnapshotStoreError>;
 }
 
 /// Why a backend operation failed.
@@ -935,6 +1050,29 @@ pub trait ComputeBackend: Send + Sync {
     /// Restore a snapshotted replica.
     async fn restore(&self, _snapshot: &Snapshot) -> Result<Instance, BackendError> {
         Err(BackendError::Unsupported)
+    }
+
+    /// Describe a snapshot's on-disk artifact for **cross-node** transfer (U14): the local
+    /// files to archive on park and the directory to unpack them into on a resume node, plus
+    /// the node-local `data_ref`. `Ok(None)` ⇒ this backend has no cross-node scale-to-zero
+    /// support (or the snapshot isn't backed by local files), so its snapshots stay
+    /// same-node. Pure: derives everything from `snapshot`'s identity + `data_ref` (a
+    /// directory-style artifact lists its directory). Never the fetch/restore itself — the
+    /// orchestration's [`SnapshotStore`] does the Storage I/O, this only names the layout.
+    async fn snapshot_artifact(
+        &self,
+        _snapshot: &Snapshot,
+    ) -> Result<Option<SnapshotArtifact>, BackendError> {
+        Ok(None)
+    }
+
+    /// Whether `snapshot`'s artifact is present on THIS node's local disk, so a `restore`
+    /// needs no cross-node fetch. Defaults to `true` ("assume local") so a backend without
+    /// cross-node support behaves exactly as before — a wake restores from the local
+    /// artifact and never consults the [`SnapshotStore`]. A cross-node-capable backend
+    /// overrides it to check the [`snapshot_artifact`](Self::snapshot_artifact) files exist.
+    async fn snapshot_present(&self, _snapshot: &Snapshot) -> Result<bool, BackendError> {
+        Ok(true)
     }
 
     /// Run a one-shot command **inside** a running replica (docker-exec style) and
@@ -2387,6 +2525,43 @@ pub fn place_replicas_in(
     placements
 }
 
+/// Pick ONE node to resume a cross-node scale-to-zero snapshot (U14): worst-fit among the
+/// nodes that satisfy the workload's `placement` constraints, currently fit the spec, AND
+/// offer the snapshot's SPECIFIC `backend` as a policy-eligible choice — because a snapshot
+/// is backend-specific (a microVM RAM image can only be restored by that microVM backend, a
+/// CRIU image by the container backend). Returns the chosen node id, or `None` when no
+/// eligible node has room right now (the caller leaves the replica parked for a later tick).
+/// Does NOT debit `capacity` — the caller reserves the returned node, mirroring the home-node
+/// wake path. Reuses the same worst-fit spread + lowest-id tie-break as [`place_replicas_in`].
+fn place_one_for_backend(
+    backend: &str,
+    placement: &PlacementConstraints,
+    spec: &ComputeSpec,
+    nodes: &[Node],
+    policy: &BackendPolicy,
+    capacity: &NodeCapacities,
+) -> Option<u64> {
+    let need = Reservation::of_spec(spec);
+    nodes
+        .iter()
+        .filter(|n| placement.allows(n.region.as_deref(), &n.labels))
+        // The node must currently fit the spec AND select exactly this backend under the
+        // composed policy — so the resume lands on a node that can actually restore the
+        // backend-specific artifact, never one that would merely cold-launch a sibling backend.
+        .filter(|n| {
+            capacity.fits(n.id, need) && n.pick_backend(spec, policy).as_deref() == Some(backend)
+        })
+        .max_by(|a, b| {
+            let (ra, rb) = (capacity.get(a.id), capacity.get(b.id));
+            ra.vcpus
+                .cmp(&rb.vcpus)
+                .then(ra.mem_mib.cmp(&rb.mem_mib))
+                // Lower id wins the tie: make it compare as the greater element.
+                .then(b.id.cmp(&a.id))
+        })
+        .map(|n| n.id)
+}
+
 // ---------------------------------------------------------------------------
 // Reconcile planner (pure)
 // ---------------------------------------------------------------------------
@@ -3081,20 +3256,49 @@ pub fn reconcile_plan_in(
             // already took this pass. A normal parked replica's own slot is free (the pre-pass
             // never charged a Zero replica), so it still wakes immediately on activity.
             if matches!(activity, WorkloadActivity::Active)
-                && capacity.fits(inst.node, Reservation::of_spec(spec))
                 && let Some(snapshot) = inst.snapshot.clone()
             {
-                // A wake restores the replica to Running (same node that holds its
-                // snapshot), so it reclaims the node's CPU/mem the pre-pass did NOT charge
-                // for a parked Zero replica. Debit the shared ledger here — exactly as a
-                // Launch does — so a later-ordered workload this pass sees the slot as taken
-                // and can't be placed on top of the waking replica (residual over-subscription).
-                capacity.reserve(inst.node, Reservation::of_spec(spec));
-                actions.push(Action::Restore {
-                    snapshot,
-                    node: inst.node,
-                    backend: inst.backend.clone(),
-                });
+                let res = Reservation::of_spec(spec);
+                if capacity.fits(inst.node, res) {
+                    // HOME node viable — restore where the snapshot lives (no cross-node
+                    // fetch). A wake restores the replica to Running, so it reclaims the
+                    // node's CPU/mem the pre-pass did NOT charge for a parked Zero replica.
+                    // Debit the shared ledger here — exactly as a Launch does — so a
+                    // later-ordered workload this pass sees the slot as taken and can't be
+                    // placed on top of the waking replica (residual over-subscription).
+                    capacity.reserve(inst.node, res);
+                    actions.push(Action::Restore {
+                        snapshot,
+                        node: inst.node,
+                        backend: inst.backend.clone(),
+                    });
+                } else if snapshot.exported {
+                    // U14 CROSS-NODE wake: the home node can't host the wake (it left the
+                    // inventory, or has no capacity), but the snapshot was exported to
+                    // tenant-scoped Storage — so re-place the wake on another node that
+                    // offers the SAME backend (a snapshot is backend-specific) and fits. The
+                    // resume node fetches + unpacks the artifact before `restore`. If no such
+                    // node has room right now, the replica simply stays parked and wakes on a
+                    // later tick — the same "home full" outcome as before, just no longer
+                    // pinned to the home node. Home-node affinity is preserved (this branch
+                    // is only reached when the home node is NOT viable).
+                    if let Some(place) = place_one_for_backend(
+                        &inst.backend,
+                        &workload.placement,
+                        spec,
+                        nodes,
+                        policy,
+                        capacity,
+                    ) {
+                        capacity.reserve(place, res);
+                        actions.push(Action::Restore {
+                            snapshot,
+                            node: place,
+                            backend: inst.backend.clone(),
+                        });
+                    }
+                }
+                // else (home full/gone AND not exported): stays parked, exactly as pre-U14.
             }
         } else if inst.healthy && !stale_spec {
             healthy.insert(ord);
@@ -4508,6 +4712,7 @@ pub async fn reconcile_once(
     resolver: Option<&dyn ComputeBindingResolver>,
     managed_db: Option<&dyn ManagedDbEnvResolver>,
     registry_auth: Option<&dyn RegistryAuthResolver>,
+    snapshot_store: Option<&dyn SnapshotStore>,
     tuning: BinPackTuning,
 ) -> Result<ReconcileReport, crate::error::DeployError> {
     let mut report = ReconcileReport::default();
@@ -5413,6 +5618,20 @@ pub async fn reconcile_once(
                         // Keep the replica record so the next pass retries; do NOT forget it.
                         continue;
                     }
+                    // U14 cross-node s2z: a stopped replica keeps no parked snapshot, so
+                    // delete any artifact it exported to tenant-scoped Storage (lifecycle:
+                    // scale-down, redeploy, out-of-range Zero discard all route through Stop).
+                    // Best-effort + idempotent (removing a missing object is not an error); a
+                    // missed delete is an unreferenced object the operator's Storage lifecycle
+                    // reclaims, never a cross-tenant exposure (the key is project-scoped).
+                    if let Some(store) = snapshot_store
+                        && let Err(e) = store.remove(&SnapshotKey::of_handle(&handle)).await
+                    {
+                        report.errors.push(format!(
+                            "{}/{}: snapshot storage cleanup: {e}",
+                            handle.workload, handle.replica
+                        ));
+                    }
                     // Credential is gone (or there was none) — now it is safe to forget the
                     // replica. A delete failure is surfaced but still terminal for this pass.
                     match deploy
@@ -5445,6 +5664,34 @@ pub async fn reconcile_once(
                             // `restore` derives the same project-qualified identity/IPAM
                             // key the launch used (independent of the backend).
                             snapshot.project = project_name.clone();
+                            // U14 cross-node s2z: EXPORT the snapshot artifact to
+                            // tenant-scoped Storage so a later wake can resume on a
+                            // DIFFERENT node. Best-effort: on any failure the snapshot
+                            // still lives on this node's local disk, so it keeps the
+                            // pre-U14 same-node wake behavior (`exported` stays false, and
+                            // the planner then never re-places it). The raw guest memory is
+                            // stored under the project's OWN backend + a project-scoped key
+                            // (the `SnapshotStore` impl), never cross-tenant.
+                            if let Some(store) = snapshot_store {
+                                match b.snapshot_artifact(&snapshot).await {
+                                    Ok(Some(art)) => {
+                                        let key = SnapshotKey::of_snapshot(&snapshot);
+                                        match store.export(&key, &art).await {
+                                            Ok(()) => snapshot.exported = true,
+                                            Err(e) => report.errors.push(format!(
+                                                "{}/{}: snapshot export (kept local): {e}",
+                                                handle.workload, handle.replica
+                                            )),
+                                        }
+                                    }
+                                    // Backend has no cross-node support — same-node only.
+                                    Ok(None) => {}
+                                    Err(e) => report.errors.push(format!(
+                                        "{}/{}: snapshot artifact (kept local): {e}",
+                                        handle.workload, handle.replica
+                                    )),
+                                }
+                            }
                             let parked = ObservedInstance {
                                 healthy: false,
                                 phase: ReplicaPhase::Zero,
@@ -5468,7 +5715,7 @@ pub async fn reconcile_once(
                     }
                 }
                 Action::Restore {
-                    snapshot,
+                    mut snapshot,
                     node,
                     backend,
                 } => {
@@ -5479,6 +5726,79 @@ pub async fn reconcile_once(
                         ));
                         continue;
                     };
+                    // U14 cross-node s2z: if the snapshot's artifact is NOT on this resume
+                    // node's local disk (the planner placed the wake on a node other than the
+                    // one that parked it), FETCH it from tenant-scoped Storage and unpack it
+                    // here before restoring, rewriting the `data_ref` to this node's local
+                    // paths. If the object is gone (or any step fails) we fall back to a COLD
+                    // START: the Zero record is dropped so the next tick relaunches the
+                    // ordinal fresh — never a wedged retry loop against a missing snapshot.
+                    let present = match b.snapshot_present(&snapshot).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            report.errors.push(format!(
+                                "{}/{}: snapshot present check: {e}",
+                                snapshot.workload, snapshot.replica
+                            ));
+                            true // assume local (try the restore directly)
+                        }
+                    };
+                    if !present {
+                        let imported =
+                            if let Some(store) = snapshot_store.filter(|_| snapshot.exported) {
+                                match b.snapshot_artifact(&snapshot).await {
+                                    Ok(Some(art)) => {
+                                        let key = SnapshotKey::of_snapshot(&snapshot);
+                                        match store.import(&key, &art).await {
+                                            Ok(true) => {
+                                                // Point the restore at this node's local artifact.
+                                                snapshot.data_ref = art.local_data_ref;
+                                                true
+                                            }
+                                            Ok(false) => false, // no object → cold start
+                                            Err(e) => {
+                                                report.errors.push(format!(
+                                                    "{}/{}: snapshot import: {e}",
+                                                    snapshot.workload, snapshot.replica
+                                                ));
+                                                false
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => false,
+                                    Err(e) => {
+                                        report.errors.push(format!(
+                                            "{}/{}: snapshot artifact: {e}",
+                                            snapshot.workload, snapshot.replica
+                                        ));
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            };
+                        if !imported {
+                            // Cold-start fallback: the snapshot can't be restored on this
+                            // node (not local, and not fetchable from Storage). Drop the Zero
+                            // record so the next reconcile relaunches the ordinal cold.
+                            match deploy
+                                .delete_replica_state(project, &snapshot.workload, snapshot.replica)
+                                .await
+                            {
+                                Ok(()) => tracing::info!(
+                                    project = %project_name,
+                                    workload = %snapshot.workload,
+                                    replica = snapshot.replica,
+                                    "compute: parked snapshot unavailable on resume node; cold-starting",
+                                ),
+                                Err(e) => report.errors.push(format!(
+                                    "{}/{}: cold-start fallback (drop zero): {e}",
+                                    snapshot.workload, snapshot.replica
+                                )),
+                            }
+                            continue;
+                        }
+                    }
                     match b.restore(&snapshot).await {
                         Ok(instance) => {
                             // Stamp the owning project on the restored handle so the
@@ -5514,10 +5834,31 @@ pub async fn reconcile_once(
                                 )),
                             }
                         }
-                        Err(e) => report.errors.push(format!(
-                            "{}/{}: restore: {e}",
-                            snapshot.workload, snapshot.replica
-                        )),
+                        Err(e) => {
+                            report.errors.push(format!(
+                                "{}/{}: restore: {e}",
+                                snapshot.workload, snapshot.replica
+                            ));
+                            // If this was a CROSS-NODE wake (we imported the artifact onto a
+                            // fresh resume node) and the restore still failed, don't wedge the
+                            // ordinal retrying a restore that won't converge here — drop the
+                            // Zero record so the next tick cold-starts it. A same-node restore
+                            // failure keeps its retry behavior (the artifact is intact locally).
+                            if !present
+                                && let Err(de) = deploy
+                                    .delete_replica_state(
+                                        project,
+                                        &snapshot.workload,
+                                        snapshot.replica,
+                                    )
+                                    .await
+                            {
+                                report.errors.push(format!(
+                                    "{}/{}: cold-start fallback (drop zero): {de}",
+                                    snapshot.workload, snapshot.replica
+                                ));
+                            }
+                        }
                     }
                 }
                 // Preemptions are planned + executed in the dedicated global pass BEFORE this
@@ -6846,6 +7187,7 @@ mod tests {
             workload: workload.into(),
             replica,
             data_ref: format!("snap-{replica}"),
+            exported: false,
         });
         o
     }
@@ -7025,6 +7367,90 @@ mod tests {
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Restore { .. })),
             "out-of-range parked replica is stopped, not restored"
+        );
+    }
+
+    /// A parked replica whose snapshot was EXPORTED to tenant Storage (U14).
+    fn zeroed_exported(workload: &str, replica: u32, node: u64) -> ObservedInstance {
+        let mut o = zeroed(workload, replica, node);
+        if let Some(s) = o.snapshot.as_mut() {
+            s.exported = true;
+        }
+        o
+    }
+
+    #[test]
+    fn cross_node_wake_replaces_onto_another_node_when_home_is_gone() {
+        // Parked on node 99 (no longer in the inventory), snapshot exported. A wake must
+        // re-place onto the surviving node that offers the same backend — cross-node s2z.
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        let obs = vec![zeroed_exported("w", 0, 99)];
+        let actions = reconcile_plan(
+            &workload(1, Default::default()),
+            &s2z_spec(),
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+            WorkloadActivity::Active,
+            &s2z_caps(),
+            u64::MAX,
+            &BTreeSet::new(),
+        )
+        .actions;
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(
+            matches!(&actions[0], Action::Restore { snapshot, node, .. } if snapshot.replica == 0 && *node == 1),
+            "wakes on the surviving node, not the gone home node: {actions:?}",
+        );
+    }
+
+    #[test]
+    fn cross_node_wake_is_blocked_when_snapshot_not_exported() {
+        // Same topology, but the snapshot was NEVER exported (same-node only). The home node
+        // is gone, so the replica has nowhere local to wake — it stays parked (pre-U14
+        // behavior), NEVER re-placed onto a node that lacks the snapshot.
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        let obs = vec![zeroed("w", 0, 99)]; // exported == false
+        let actions = reconcile_plan(
+            &workload(1, Default::default()),
+            &s2z_spec(),
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+            WorkloadActivity::Active,
+            &s2z_caps(),
+            u64::MAX,
+            &BTreeSet::new(),
+        )
+        .actions;
+        assert!(
+            actions.is_empty(),
+            "a non-exported parked replica never cross-node-wakes: {actions:?}",
+        );
+    }
+
+    #[test]
+    fn cross_node_wake_prefers_the_home_node_when_viable() {
+        // The home node is present with capacity: even an exported snapshot wakes THERE
+        // (snapshot locality = no fetch), not spread elsewhere. Two nodes, home = 1.
+        let nodes = vec![vmm(1, "eu", 8, 8192), vmm(2, "eu", 8, 8192)];
+        let obs = vec![zeroed_exported("w", 0, 1)];
+        let actions = reconcile_plan(
+            &workload(1, Default::default()),
+            &s2z_spec(),
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+            WorkloadActivity::Active,
+            &s2z_caps(),
+            u64::MAX,
+            &BTreeSet::new(),
+        )
+        .actions;
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(
+            matches!(&actions[0], Action::Restore { node, .. } if *node == 1),
+            "home-node affinity: wakes on node 1, not re-placed: {actions:?}",
         );
     }
 
@@ -8041,6 +8467,7 @@ mod tests {
                 workload: handle.workload.clone(),
                 replica: handle.replica,
                 data_ref: format!("snap-{}", handle.replica),
+                exported: false,
             }))
         }
         async fn restore(&self, snapshot: &Snapshot) -> Result<Instance, BackendError> {
@@ -8105,6 +8532,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -8118,6 +8546,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Idle),
+            None,
             None,
             None,
             None,
@@ -8145,6 +8574,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -8161,6 +8591,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -8174,6 +8605,319 @@ mod tests {
         assert_eq!(woken[0].phase, ReplicaPhase::Running);
         assert!(woken[0].snapshot.is_none());
         assert!(woken[0].healthy);
+    }
+
+    /// A CROSS-NODE-capable scale-to-zero backend (U14): like [`S2zBackend`], but it exposes a
+    /// [`snapshot_artifact`](ComputeBackend::snapshot_artifact) and reports its artifact as NOT
+    /// locally present (`snapshot_present == false`), so the reconcile fetches it from the
+    /// injected [`SnapshotStore`] before `restore` — the exact wake-on-a-different-node path.
+    struct XnodeBackend;
+
+    #[async_trait]
+    impl ComputeBackend for XnodeBackend {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: true,
+                persistent_volumes: false,
+                max_vcpus: None,
+                max_mem_mib: None,
+                preemptible: true,
+            }
+        }
+        async fn materialize(
+            &self,
+            _project: &str,
+            _workload: &str,
+            _spec: &ComputeSpec,
+            _pull_auth: Option<&RegistryAuth>,
+        ) -> Result<Artifact, BackendError> {
+            Ok(Artifact::Image {
+                reference: "img:latest".into(),
+            })
+        }
+        async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
+            Ok(Instance {
+                handle: InstanceHandle {
+                    project: req.project.clone(),
+                    workload: req.workload.clone(),
+                    replica: req.replica,
+                    backend_ref: format!("fake-{}", req.replica),
+                },
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                },
+            })
+        }
+        async fn stop(&self, _handle: &InstanceHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn health(&self, _handle: &InstanceHandle) -> Result<Health, BackendError> {
+            Ok(Health::Healthy)
+        }
+        async fn snapshot(
+            &self,
+            handle: &InstanceHandle,
+        ) -> Result<Option<Snapshot>, BackendError> {
+            Ok(Some(Snapshot {
+                project: handle.project.clone(),
+                workload: handle.workload.clone(),
+                replica: handle.replica,
+                data_ref: format!("home-snap-{}", handle.replica),
+                exported: false,
+            }))
+        }
+        async fn snapshot_artifact(
+            &self,
+            snapshot: &Snapshot,
+        ) -> Result<Option<SnapshotArtifact>, BackendError> {
+            Ok(Some(SnapshotArtifact {
+                dir: std::path::PathBuf::from("/tmp/xnode"),
+                files: vec![format!("{}.snap", snapshot.replica)],
+                local_data_ref: format!("local-snap-{}", snapshot.replica),
+            }))
+        }
+        async fn snapshot_present(&self, _snapshot: &Snapshot) -> Result<bool, BackendError> {
+            Ok(false) // never local here → always fetch from the store
+        }
+        async fn restore(&self, snapshot: &Snapshot) -> Result<Instance, BackendError> {
+            // A woken replica must run off the IMPORTED (rewritten) data_ref, proving the
+            // reconcile fetched + repointed it before restoring.
+            assert_eq!(
+                snapshot.data_ref,
+                format!("local-snap-{}", snapshot.replica),
+                "restore must run off the node-local (imported) data_ref, not the home one",
+            );
+            Ok(Instance {
+                handle: InstanceHandle {
+                    project: snapshot.project.clone(),
+                    workload: snapshot.workload.clone(),
+                    replica: snapshot.replica,
+                    backend_ref: format!("restored-{}", snapshot.replica),
+                },
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                },
+            })
+        }
+    }
+
+    /// An in-memory [`SnapshotStore`] recording which keys were exported — enough to drive the
+    /// reconcile's export-on-park / import-on-wake / cold-start-on-miss paths.
+    #[derive(Default)]
+    struct FakeSnapStore {
+        keys: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+    impl FakeSnapStore {
+        fn k(key: &SnapshotKey) -> String {
+            format!("{}/{}/{}", key.project, key.workload, key.replica)
+        }
+        fn has(&self, project: &str, workload: &str, replica: u32) -> bool {
+            self.keys
+                .lock()
+                .unwrap()
+                .contains(&format!("{project}/{workload}/{replica}"))
+        }
+    }
+    #[async_trait]
+    impl SnapshotStore for FakeSnapStore {
+        async fn export(
+            &self,
+            key: &SnapshotKey,
+            _art: &SnapshotArtifact,
+        ) -> Result<(), SnapshotStoreError> {
+            self.keys.lock().unwrap().insert(Self::k(key));
+            Ok(())
+        }
+        async fn import(
+            &self,
+            key: &SnapshotKey,
+            _art: &SnapshotArtifact,
+        ) -> Result<bool, SnapshotStoreError> {
+            Ok(self.keys.lock().unwrap().contains(&Self::k(key)))
+        }
+        async fn remove(&self, key: &SnapshotKey) -> Result<(), SnapshotStoreError> {
+            self.keys.lock().unwrap().remove(&Self::k(key));
+            Ok(())
+        }
+    }
+
+    async fn s2z_workload(deploy: &DeployStore) {
+        let mut s = spec(1, 128);
+        s.scale_to_zero = true;
+        let hash = deploy.put_compute_spec(&s).await.unwrap();
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash,
+                    replicas: 1,
+                    placement: Default::default(),
+                    priority: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_node_park_exports_then_wake_imports_and_restores() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        s2z_workload(&deploy).await;
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(XnodeBackend));
+        let nodes = vec![fake_node()];
+        let policy = BackendPolicy::default();
+        let store = FakeSnapStore::default();
+        let active = FixedActivity(WorkloadActivity::Active);
+        let idle = FixedActivity(WorkloadActivity::Idle);
+
+        // launch
+        reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &active,
+            None,
+            None,
+            None,
+            Some(&store),
+            BinPackTuning::default(),
+        )
+        .await
+        .unwrap();
+        // park + export
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &idle,
+            None,
+            None,
+            None,
+            Some(&store),
+            BinPackTuning::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.slept, 1, "{:?}", r.errors);
+        let parked = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        assert!(
+            parked[0].snapshot.as_ref().is_some_and(|s| s.exported),
+            "a successful export marks the parked snapshot exported",
+        );
+        assert!(
+            store.has("default", "w", 0),
+            "artifact is in tenant Storage"
+        );
+
+        // Wake: the artifact is NOT local (snapshot_present == false), so the reconcile fetches
+        // it from the store and restores off the rewritten data_ref (asserted in `restore`).
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &active,
+            None,
+            None,
+            None,
+            Some(&store),
+            BinPackTuning::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.woke, 1, "{:?}", r.errors);
+        let running = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        assert_eq!(running[0].phase, ReplicaPhase::Running);
+    }
+
+    #[tokio::test]
+    async fn cross_node_missing_snapshot_falls_back_to_cold_start() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        s2z_workload(&deploy).await;
+        let mut backends: BackendRegistry = BTreeMap::new();
+        backends.insert("fake".into(), Arc::new(XnodeBackend));
+        let nodes = vec![fake_node()];
+        let policy = BackendPolicy::default();
+        let store = FakeSnapStore::default(); // EMPTY — the snapshot object is gone
+
+        // Seed a parked Zero replica claiming it was exported, but the store has nothing.
+        let mut parked = observed("w", 0, fake_node().id, false);
+        parked.backend = "fake".into();
+        parked.phase = ReplicaPhase::Zero;
+        parked.healthy = false;
+        parked.snapshot = Some(Snapshot {
+            project: "default".into(),
+            workload: "w".into(),
+            replica: 0,
+            data_ref: "home-snap-0".into(),
+            exported: true,
+        });
+        deploy
+            .set_replica_state(crate::project::ProjectRef::DEFAULT, &parked)
+            .await
+            .unwrap();
+
+        // Wake attempt: present == false → import from store → MISS → cold-start fallback
+        // drops the Zero record so the next tick relaunches the ordinal fresh.
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &FixedActivity(WorkloadActivity::Active),
+            None,
+            None,
+            None,
+            Some(&store),
+            BinPackTuning::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.woke, 0, "a missing snapshot does not wake");
+        let states = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
+        assert!(
+            states.is_empty(),
+            "the unrestorable Zero record is dropped (cold-start fallback): {states:?}",
+        );
+
+        // The next tick cold-launches the ordinal from scratch.
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &FixedActivity(WorkloadActivity::Active),
+            None,
+            None,
+            None,
+            Some(&store),
+            BinPackTuning::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.launched, 1, "cold start relaunches: {:?}", r.errors);
     }
 
     /// A backend that PLACES fine but whose `launch` always ERRORS (an image-pull denial),
@@ -8255,6 +8999,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -8305,6 +9050,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Active),
+            None,
             None,
             None,
             None,
@@ -8436,6 +9182,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -8461,6 +9208,7 @@ mod tests {
             &nodes,
             &policy,
             &AlwaysActive,
+            None,
             None,
             None,
             None,
@@ -8524,6 +9272,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -8548,6 +9297,7 @@ mod tests {
             &nodes,
             &policy,
             &AlwaysActive,
+            None,
             None,
             None,
             None,
@@ -8578,6 +9328,7 @@ mod tests {
             &nodes,
             &policy,
             &AlwaysActive,
+            None,
             None,
             None,
             None,
@@ -8649,6 +9400,7 @@ mod tests {
             &nodes,
             &BackendPolicy::default(),
             &AlwaysActive,
+            None,
             None,
             None,
             None,
@@ -8768,6 +9520,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -8834,6 +9587,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -8896,6 +9650,7 @@ mod tests {
                 &nodes,
                 &policy,
                 &AlwaysActive,
+                None,
                 None,
                 None,
                 None,
@@ -9009,6 +9764,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -9070,6 +9826,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Active),
+            None,
             None,
             None,
             None,
@@ -9157,6 +9914,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Active),
+            None,
             None,
             None,
             None,
@@ -9257,6 +10015,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -9298,6 +10057,7 @@ mod tests {
             None,
             Some(&failing),
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -9334,6 +10094,7 @@ mod tests {
             &AlwaysActive,
             None,
             Some(&ok),
+            None,
             None,
             BinPackTuning::default(),
         )
@@ -9460,6 +10221,7 @@ mod tests {
                 workload: "w".into(),
                 replica: 0,
                 data_ref: "snap".into(),
+                exported: false,
             }),
             active_spec: None,
         };
@@ -9482,6 +10244,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Idle), // idle → the Zero replica stays parked
+            None,
             None,
             None,
             None,
@@ -10285,6 +11048,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             BinPackTuning::default(),
         )
         .await
@@ -10393,6 +11157,7 @@ mod tests {
                 &nodes,
                 &policy,
                 &AlwaysActive,
+                None,
                 None,
                 None,
                 None,

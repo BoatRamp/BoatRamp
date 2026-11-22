@@ -828,6 +828,7 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_VCPUS",
     "BOATRAMP_COMPUTE_MEM_MIB",
     "BOATRAMP_COMPUTE_MEM_RESERVE_MIB",
+    "BOATRAMP_COMPUTE_CROSS_NODE_SCALE_TO_ZERO",
     "BOATRAMP_COMPUTE_REGION",
     "BOATRAMP_COMPUTE_SQL_SHIM_URL",
     "BOATRAMP_COMPUTE_BLOB_SHIM_URL",
@@ -1310,6 +1311,18 @@ pub struct ComputeConfig {
     /// tenant-settable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unresolved_reservation_mib: Option<u32>,
+    /// **Cross-node scale-to-zero** (U14). When `true`, a scale-to-zero replica's snapshot
+    /// artifact (microVM RAM image / CRIU checkpoint — tenant data) is EXPORTED to the
+    /// project's own blob Storage on park, so the workload can wake on a node OTHER than the
+    /// one that parked it (the resume node fetches + restores it; a missing/failed restore
+    /// falls back cleanly to a cold start). `false` (the default) keeps scale-to-zero
+    /// strictly SAME-NODE (the snapshot never leaves the home node's local disk), the exact
+    /// pre-U14 behavior. Requires a configured blob backend (the snapshot is stored under a
+    /// project-scoped key on the project's own backend, reusing the existing credential
+    /// path). **Operator-only** (node config / System·Admin), never tenant-settable. Env:
+    /// `BOATRAMP_COMPUTE_CROSS_NODE_SCALE_TO_ZERO`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cross_node_scale_to_zero: bool,
     /// **Static** kernel-signing public keys (`"<alg>:<hex>"`) — the trust anchor
     /// for the posture-scaled kernel bar. Under `multi-tenant`, a dynamically-
     /// selected default kernel must carry a signature verifying against one of
@@ -1774,6 +1787,7 @@ impl Default for ComputeConfig {
             mem_reserve_mib: 0,
             unresolved_reservation_vcpus: None,
             unresolved_reservation_mib: None,
+            cross_node_scale_to_zero: false,
             kernel_signing_pubkeys: vec![BOATRAMP_KERNEL_SIGNING_PUBKEY.to_string()],
             kernel_allowed_hashes: default_allowed_kernel_hashes(),
             region: None,

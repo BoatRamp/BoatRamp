@@ -43,6 +43,9 @@ pub use boatramp_storage::blob_migrate;
 pub mod blobs;
 
 pub mod compute;
+/// Tenant-scoped snapshot store for cross-node scale-to-zero (U14): exports/imports a parked
+/// replica's snapshot artifact to/from the project's own blob backend under a project-scoped key.
+pub mod compute_snapshot_store;
 pub mod config;
 /// Substrate-complete default-scope readiness detectors (v0.31.0 Finding 8): observe whether the
 /// default project's BLOB + LIBSQL data is still un-re-homed, so the serve guard + `boatramp migrate
