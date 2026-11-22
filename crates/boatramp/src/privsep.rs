@@ -280,7 +280,8 @@ impl RootPlan {
 /// The P5-2 read-plane runs data-holders only on the lightweight, shared-net substrates
 /// (`os-process` / `container`); the VM data-holder stays refused (see
 /// [`PrivsepError::NodeSelfHostVmDataHolder`]).
-pub const NODE_SELF_HOST_VM_DATA_HOLDER_MARKER: &str = "PRIVSEP_NODE_SELF_HOST_VM_DATA_HOLDER_REFUSED";
+pub const NODE_SELF_HOST_VM_DATA_HOLDER_MARKER: &str =
+    "PRIVSEP_NODE_SELF_HOST_VM_DATA_HOLDER_REFUSED";
 
 /// The root's NODE SELF-HOSTING gate (design §Phase-5). A `None` / [`NodeServeMode::GuestWorkloads`]
 /// composition (every pre-Phase-5 node) is a NO-OP, so no running composition changes. Mirrors
@@ -354,10 +355,7 @@ fn check_node_self_host_read_plane(privsep: &PrivsepConfig) -> Result<(), Privse
 /// This REPLACES the P5-1 constructor-input reachability map with one derived from the live link
 /// topology (the FLAGGED P5-1 → P5-2 sub-decision). Pure (host-testable): derived entirely from the
 /// resolved [`ServerConfig`].
-fn derive_node_reachability(
-    config: &ServerConfig,
-    label: &str,
-) -> BTreeMap<HostAuthority, String> {
+fn derive_node_reachability(config: &ServerConfig, label: &str) -> BTreeMap<HostAuthority, String> {
     let mut reachable: BTreeMap<HostAuthority, String> = BTreeMap::new();
     let Some(privsep) = config.privsep.as_ref() else {
         return reachable;
@@ -4495,7 +4493,8 @@ mod instance_serve {
     fn fail_closed_response(reason: &str) -> boatramp_http::Response {
         boatramp_http::response(
             503,
-            format!("boatramp privsep node-self-host: refused fail-closed — {reason}\n").into_bytes(),
+            format!("boatramp privsep node-self-host: refused fail-closed — {reason}\n")
+                .into_bytes(),
         )
     }
 
@@ -4538,9 +4537,9 @@ mod instance_serve {
                     Ok(None) => ReadOutcome::NotFound,
                     Err(e) => ReadOutcome::Unavailable(format!("control-plane deploy read: {e}")),
                 },
-                Self::Refusing => {
-                    ReadOutcome::Unavailable("this instance holds no backend.kv read authority".into())
-                }
+                Self::Refusing => ReadOutcome::Unavailable(
+                    "this instance holds no backend.kv read authority".into(),
+                ),
             }
         }
     }
@@ -4551,9 +4550,7 @@ mod instance_serve {
     /// surface, which the router then routes (and the handler fail-closes under P5-2). Deliberately
     /// coarse — the full method/path → surface map is a P5-3+ follow-on; P5-2 needs only the read vs.
     /// not-read split. Pure (host-testable).
-    pub(super) fn classify_request_surface(
-        req: &boatramp_http::Request,
-    ) -> (HostAuthority, bool) {
+    pub(super) fn classify_request_surface(req: &boatramp_http::Request) -> (HostAuthority, bool) {
         let method = req.method().as_str();
         let is_read = matches!(method, "GET" | "HEAD");
         if is_read {
@@ -5570,12 +5567,8 @@ mod tests {
         // VM-secret-blindness scope lint (step 2b-vm, `VmInstanceOutsideApprovedScope`) fires BEFORE
         // the P5-2 gate (step 2d) — defence in depth — so either refusal is acceptable; what matters
         // is that NO spawn plan is produced for a VM data-holder.
-        let err = plan_root(
-            &cfg_with(Some(vm)),
-            Path::new("boatramp.cfg"),
-            fake_env(),
-        )
-        .expect_err("plan_root must refuse a VM data-holder before any spawn");
+        let err = plan_root(&cfg_with(Some(vm)), Path::new("boatramp.cfg"), fake_env())
+            .expect_err("plan_root must refuse a VM data-holder before any spawn");
         assert!(
             matches!(
                 err,
@@ -7049,8 +7042,14 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         // From the frontend: the data-holder's backends are reachable over `l`; its own listener is not
         // in the map (nothing peers it with a holder of it).
         let from_frontend = super::derive_node_reachability(&cfg, "frontend");
-        assert_eq!(from_frontend.get(&HostAuthority::BackendKv), Some(&"l".to_string()));
-        assert_eq!(from_frontend.get(&HostAuthority::BackendBlob), Some(&"l".to_string()));
+        assert_eq!(
+            from_frontend.get(&HostAuthority::BackendKv),
+            Some(&"l".to_string())
+        );
+        assert_eq!(
+            from_frontend.get(&HostAuthority::BackendBlob),
+            Some(&"l".to_string())
+        );
         assert!(!from_frontend.contains_key(&HostAuthority::ListenHttpParse));
 
         // From the data-holder: it HOLDS the backends (excluded); the frontend's listener is reachable.

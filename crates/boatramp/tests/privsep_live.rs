@@ -1793,8 +1793,10 @@ const NODE_SELF_HOST_VM_DATA_HOLDER_MARKER: &str = "PRIVSEP_NODE_SELF_HOST_VM_DA
             `live gate (privsep)` job"]
 fn privsep_node_self_host_vm_data_holder_refused_end_to_end() {
     let bin = env!("CARGO_BIN_EXE_boatramp");
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("boatramp-privsep-selfhost-vm-{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "boatramp-privsep-selfhost-vm-{}",
+        std::process::id()
+    ));
     let data_dir = tmp.join("data");
     std::fs::create_dir_all(&data_dir).expect("create the node data dir");
     let port = free_port();
@@ -1943,8 +1945,10 @@ fn privsep_node_self_host_vm_data_holder_refused_end_to_end() {
             `live gate (privsep)` job"]
 fn privsep_node_self_host_read_plane_serves_end_to_end() {
     let bin = env!("CARGO_BIN_EXE_boatramp");
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("boatramp-privsep-selfhost-serve-{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "boatramp-privsep-selfhost-serve-{}",
+        std::process::id()
+    ));
     let data_dir = tmp.join("data");
     std::fs::create_dir_all(&data_dir).expect("create the node data dir");
     let port = free_port();
