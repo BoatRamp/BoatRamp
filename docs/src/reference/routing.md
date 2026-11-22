@@ -225,6 +225,30 @@ may not contain `//`, a `.`/`..` segment, a glob (`*`), a query/fragment, or
 whitespace. See [How a request reaches your site](../explanation/addressing.md) for
 how `base_path` fits alongside the other addressing modes.
 
+### Whole-site remount and operator routes
+
+`base_path` remounts the **entire** site under the prefix: the deploy answers only
+paths under the mount, and **every external path outside the mount returns `404`**
+(fail-closed — nothing of the site is served at the root any more).
+
+This interacts with an operator's [per-site gateway](./siteconfig.md#gateway)
+overlay (`routes` / `reserved_paths`):
+
+- An operator route (or reserved path) that **overlaps** the mount still **wins** —
+  it is judged against the **full external path**, so a tenant `base_path` can never
+  shadow or capture it. For `base_path: "/ops"`, an operator route `/ops/**` is
+  served by the operator upstream, not the tenant.
+- An operator route whose path falls **outside** the tenant's mount returns `404` on
+  that based deploy — fail-closed: the tenant can neither capture it nor reach
+  operator content; the route is simply **unreachable on that one deploy** (a direct
+  consequence of the whole-site remount, not a bug).
+
+So an operator path that must stay reachable **regardless** of a tenant's mount
+belongs at the node-global router layer — the paths matched before per-site routing
+(`/api/*`, `/healthz`, `/readyz`, `/mcp`, `/.well-known/*`) — not as a per-site
+gateway overlay. The per-site overlay is a routing convenience, not the place for
+mandatory operator enforcement.
+
 ## `handlers`
 
 A [WebAssembly handler](../explanation/compute-model.md) bound to a route.

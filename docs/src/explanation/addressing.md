@@ -116,6 +116,16 @@ absolute URLs, `fetch('/…')`, CSS `url(/…)`, or service-worker scope: the se
 cannot rewrite those. If a site was authored for root, serve it at the root via
 host routing rather than reaching for `base_path`.
 
+`base_path` remounts the **whole** site: the deploy answers only paths under the
+prefix, and everything outside the mount `404`s. An operator
+[per-site gateway](../reference/siteconfig.md#gateway) route that **overlaps** the
+mount still wins (it is matched on the full external path, so a tenant mount can
+never shadow it); one whose path falls **outside** the mount becomes unreachable
+(`404`) on that based deploy — fail-closed, neither captured nor served. An
+operator path that must stay reachable regardless of a tenant's mount therefore
+belongs at the node-global router layer (`/api/*`, `/healthz`, `/readyz`, `/mcp`,
+`/.well-known/*` — matched before per-site routing), not in a per-site overlay.
+
 ## Choosing
 
 | You want | Use |
