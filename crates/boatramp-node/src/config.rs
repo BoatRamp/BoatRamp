@@ -1586,13 +1586,18 @@ pub struct ComputeConfig {
     /// as it is overlaid onto the rootfs: gzip is unbounded-ratio, so a layer under the compressed
     /// caps can still expand to terabytes (a zip-bomb) and fill the node disk. The overlay tracks
     /// the running decompressed byte count and ABORTS mid-inflation (over-cap bytes are never
-    /// written), per layer and across the whole rootfs — so the bomb is never fully expanded. Node
-    /// operator config only (System·Admin), NEVER guest-influenced. Any field `0` disables that
-    /// ceiling — with `max_manifest_bytes = 0` the config's own declared size still caps it, but a
-    /// size-undeclared manifest/config is then uncapped in memory (bounded only by the pull
-    /// timeouts/deadline). Omitted ⇒ the built-in defaults (10 GiB per blob / 20 GiB per image /
-    /// 32 MiB per manifest-or-config / 32 GiB decompressed per layer / 64 GiB decompressed per
-    /// rootfs), generous enough that no real image is ever refused. Example (RON):
+    /// written), per layer and across the whole rootfs — so the bomb is never fully expanded. The
+    /// same decompressed budget also charges the hard-link `fs::copy` fallback (which reads its
+    /// target from disk, invisible to the gunzip stream — a copy-amplification disk-fill), and
+    /// `max_tar_entries` caps the number of tar entries across all layers, bounding an
+    /// inode-exhaustion bomb (millions of tiny entries that sit under every byte cap yet exhaust
+    /// the staging filesystem's inodes). Node operator config only (System·Admin), NEVER
+    /// guest-influenced. Any field `0` disables that ceiling — with `max_manifest_bytes = 0` the
+    /// config's own declared size still caps it, but a size-undeclared manifest/config is then
+    /// uncapped in memory (bounded only by the pull timeouts/deadline). Omitted ⇒ the built-in
+    /// defaults (10 GiB per blob / 20 GiB per image / 32 MiB per manifest-or-config / 32 GiB
+    /// decompressed per layer / 64 GiB decompressed per rootfs / 500 000 tar entries per image),
+    /// generous enough that no real image is ever refused. Example (RON):
     ///
     /// ```ron
     /// registry_pull_limits: (
@@ -1601,6 +1606,7 @@ pub struct ComputeConfig {
     ///     max_manifest_bytes: 33554432,
     ///     max_decompressed_layer_bytes: 34359738368,
     ///     max_rootfs_bytes: 68719476736,
+    ///     max_tar_entries: 500000,
     /// )
     /// ```
     #[serde(default, skip_serializing_if = "is_default_registry_pull_limits")]

@@ -11,8 +11,13 @@
 //! The *compressed* size cap does not bound how large a layer **inflates** to, so
 //! the overlay bounds the **decompressed** byte count too — a gzip zip-bomb (small
 //! compressed, huge decompressed) is aborted DURING inflation, per layer and across
-//! the whole rootfs, before it can fill the node disk.
+//! the whole rootfs, before it can fill the node disk. The same decompressed budget
+//! also charges the hard-link `fs::copy` fallback (which reads the target **from
+//! disk**, invisible to the gunzip stream, so a copy-amplification bomb would
+//! otherwise be uncounted), and a per-image **tar-entry count** cap bounds an
+//! inode-exhaustion bomb (millions of tiny entries).
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
@@ -270,38 +275,112 @@ fn clear_dir(dir: &Path) -> Result<(), OciError> {
 /// The layer's **decompressed** size is bounded during inflation by the installed
 /// [`RegistryPullLimits`] (`max_decompressed_layer_bytes`): a gzip zip-bomb (small compressed,
 /// huge decompressed) is aborted the instant it exceeds the cap, so it is never fully inflated.
-/// (The whole-rootfs cross-layer cap is threaded by [`apply_image_layers_in`] via
+/// The same budget also charges the hard-link `fs::copy` fallback (invisible to the gunzip
+/// stream), and the per-image `max_tar_entries` cap bounds an inode-exhaustion bomb. (The
+/// whole-rootfs / whole-image running totals are threaded by [`apply_image_layers_in`] via
 /// [`apply_layer_gz_bounded`]; a standalone call here bounds only this one layer.)
 pub fn apply_layer_gz(root: &Path, reader: impl Read) -> Result<(), OciError> {
     let lim = registry_pull_limits();
-    let mut rootfs_total: u64 = 0;
-    apply_layer_gz_bounded(
-        root,
-        reader,
-        RegistryPullLimits::cap(lim.max_decompressed_layer_bytes),
-        RegistryPullLimits::cap(lim.max_rootfs_bytes),
-        &mut rootfs_total,
-    )
+    let rootfs_total = Cell::new(0u64);
+    let entries_total = Cell::new(0u64);
+    let budget = DecompBudget {
+        layer_read: Cell::new(0),
+        layer_cap: RegistryPullLimits::cap(lim.max_decompressed_layer_bytes),
+        rootfs_total: &rootfs_total,
+        rootfs_cap: RegistryPullLimits::cap(lim.max_rootfs_bytes),
+        entries_total: &entries_total,
+        entries_cap: RegistryPullLimits::cap(lim.max_tar_entries),
+    };
+    apply_layer_gz_bounded(root, reader, &budget)
 }
 
-/// A `Read` adapter wrapped around a layer's **decompressed** (gunzip output) stream that bounds
-/// how many bytes may inflate through it, aborting FAIL-CLOSED the instant a running total exceeds
-/// a ceiling. The tar extractor pulls bytes from this reader incrementally as it unpacks each
-/// entry, so an over-cap read errors MID-INFLATION — the zip-bomb is never fully expanded and the
-/// bytes that would cross the cap are never delivered to (written by) the extractor, so disk usage
-/// stays bounded by the cap. Enforces TWO ceilings at once: a per-layer cap (`layer_read` resets
-/// per layer) and a whole-rootfs cap (`rootfs_total`, threaded ACROSS layers by the caller).
-struct DecompressionGuard<'a, R: Read> {
-    inner: R,
-    /// Bytes decompressed so far in THIS layer (reset per layer — a fresh guard per layer).
-    layer_read: u64,
+/// The running decompressed-byte + tar-entry budget for one image's overlay, charged FAIL-CLOSED
+/// by BOTH the gunzip [`DecompressionGuard`] (inflated bytes) and the tar extractor's hard-link
+/// `fs::copy` fallback (bytes copied FROM DISK, invisible to the gunzip stream — a
+/// copy-amplification bomb). `Cell` interior mutability because the guard is moved into the tar
+/// archive while the extract loop charges copy-fallback bytes and counts entries against the
+/// SAME counters. One budget is built per layer, so `layer_read` starts at 0 each time, while the
+/// whole-rootfs / whole-image totals are owned by the caller and borrowed in, so their ceilings
+/// span every layer.
+struct DecompBudget<'a> {
+    /// Decompressed + copy-fallback bytes charged so far in THIS layer (a fresh budget per layer).
+    layer_read: Cell<u64>,
     /// Per-layer decompressed ceiling; `None` ⇒ disabled.
     layer_cap: Option<u64>,
-    /// Running total of decompressed bytes across ALL layers of this rootfs; threaded by the
-    /// caller so the whole-rootfs ceiling spans the layers, not just one.
-    rootfs_total: &'a mut u64,
+    /// Running total of decompressed + copy-fallback bytes across ALL layers of this rootfs;
+    /// threaded by the caller so the whole-rootfs ceiling spans the layers, not just one.
+    rootfs_total: &'a Cell<u64>,
     /// Whole-rootfs decompressed ceiling; `None` ⇒ disabled.
     rootfs_cap: Option<u64>,
+    /// Running count of tar entries unpacked across ALL layers of this image.
+    entries_total: &'a Cell<u64>,
+    /// Per-image tar-entry ceiling (`max_tar_entries`); `None` ⇒ disabled.
+    entries_cap: Option<u64>,
+}
+
+impl DecompBudget<'_> {
+    /// Charge `n` bytes against the per-layer AND whole-rootfs decompressed counters, erroring
+    /// FAIL-CLOSED the instant either ceiling is crossed. Charges the inflated gunzip bytes (via
+    /// [`DecompressionGuard`]) AND the hard-link `fs::copy` fallback's copied bytes (read from
+    /// disk, never through the gunzip stream, so otherwise uncounted) against the same budget — so
+    /// a copy-amplification disk-fill is bounded exactly like a decompressed-byte zip-bomb.
+    fn charge(&self, n: u64) -> std::io::Result<()> {
+        let layer = self.layer_read.get().saturating_add(n);
+        self.layer_read.set(layer);
+        let rootfs = self.rootfs_total.get().saturating_add(n);
+        self.rootfs_total.set(rootfs);
+        if let Some(cap) = self.layer_cap
+            && layer > cap
+        {
+            return Err(std::io::Error::other(format!(
+                "decompressed layer exceeded the {cap}-byte per-layer ceiling and was aborted \
+                 (possible gzip zip-bomb or hard-link copy-amplification; refusing to fill the \
+                 node disk)"
+            )));
+        }
+        if let Some(cap) = self.rootfs_cap
+            && rootfs > cap
+        {
+            return Err(std::io::Error::other(format!(
+                "decompressed rootfs exceeded the {cap}-byte whole-rootfs ceiling across layers \
+                 and was aborted (possible gzip zip-bomb or hard-link copy-amplification; refusing \
+                 to fill the node disk)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Count one tar entry against the per-image entry ceiling (`max_tar_entries`), erroring
+    /// FAIL-CLOSED the instant it is crossed. Bounds an inode-exhaustion bomb — millions of tiny
+    /// entries that each sit far under every BYTE ceiling yet together exhaust the staging
+    /// filesystem's inodes. The running total spans ALL layers (whole image).
+    fn count_entry(&self) -> std::io::Result<()> {
+        let n = self.entries_total.get().saturating_add(1);
+        self.entries_total.set(n);
+        if let Some(cap) = self.entries_cap
+            && n > cap
+        {
+            return Err(std::io::Error::other(format!(
+                "image exceeded the {cap}-entry tar-entry ceiling and was aborted (possible \
+                 inode-exhaustion bomb; refusing to exhaust the staging filesystem inodes)"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A `Read` adapter wrapped around a layer's **decompressed** (gunzip output) stream that charges
+/// each inflated chunk against the shared [`DecompBudget`], aborting FAIL-CLOSED the instant a
+/// running total exceeds a ceiling. The tar extractor pulls bytes from this reader incrementally
+/// as it unpacks each entry, so an over-cap read errors MID-INFLATION — the zip-bomb is never
+/// fully expanded and the bytes that would cross the cap are never delivered to (written by) the
+/// extractor, so disk usage stays bounded by the cap.
+struct DecompressionGuard<'a, R: Read> {
+    inner: R,
+    /// Shared budget — also charged by the extractor's hard-link `fs::copy` fallback and its
+    /// per-entry counter, so all three enforce the same per-layer / whole-rootfs / whole-image
+    /// ceilings.
+    budget: &'a DecompBudget<'a>,
 }
 
 impl<R: Read> Read for DecompressionGuard<'_, R> {
@@ -310,64 +389,87 @@ impl<R: Read> Read for DecompressionGuard<'_, R> {
         if n == 0 {
             return Ok(0);
         }
-        let n64 = n as u64;
-        self.layer_read = self.layer_read.saturating_add(n64);
-        *self.rootfs_total = self.rootfs_total.saturating_add(n64);
-        // Check AFTER counting but BEFORE handing the bytes back: an over-cap read returns an
+        // Charge AFTER reading but BEFORE handing the bytes back: an over-cap read returns an
         // error and the just-read buffer is discarded (never written to disk), so the extractor
         // only ever persists bytes up to the cap.
-        if let Some(cap) = self.layer_cap
-            && self.layer_read > cap
-        {
-            return Err(std::io::Error::other(format!(
-                "decompressed layer exceeded the {cap}-byte per-layer ceiling mid-inflation and \
-                 was aborted (possible gzip zip-bomb; refusing to fill the node disk)"
-            )));
-        }
-        if let Some(cap) = self.rootfs_cap
-            && *self.rootfs_total > cap
-        {
-            return Err(std::io::Error::other(format!(
-                "decompressed rootfs exceeded the {cap}-byte whole-rootfs ceiling mid-inflation \
-                 and was aborted (possible gzip zip-bomb across layers; refusing to fill the node \
-                 disk)"
-            )));
-        }
+        self.budget.charge(n as u64)?;
         Ok(n)
     }
 }
 
-/// As [`apply_layer_gz`] but with the decompressed-size ceilings passed in explicitly and the
-/// whole-rootfs running total threaded by the caller (`rootfs_total`, carried ACROSS layers). The
-/// gunzip output is wrapped in a [`DecompressionGuard`] so the tar extractor inflates through the
-/// bound — an over-cap layer aborts DURING decompression, never after the whole bomb is expanded.
+/// As [`apply_layer_gz`] but with the shared [`DecompBudget`] (per-layer + whole-rootfs byte
+/// ceilings and the whole-image entry ceiling, each running total threaded by the caller ACROSS
+/// layers) passed in. The gunzip output is wrapped in a [`DecompressionGuard`] so the tar
+/// extractor inflates through the bound — an over-cap layer aborts DURING decompression, never
+/// after the whole bomb is expanded. The caller builds a fresh per-layer [`DecompBudget`] (so
+/// `layer_read` starts at 0) whose whole-rootfs / whole-image running totals carry across layers.
 fn apply_layer_gz_bounded(
     root: &Path,
     reader: impl Read,
-    layer_cap: Option<u64>,
-    rootfs_cap: Option<u64>,
-    rootfs_total: &mut u64,
+    budget: &DecompBudget,
 ) -> Result<(), OciError> {
     let gz = flate2::read::GzDecoder::new(reader);
-    let guarded = DecompressionGuard {
-        inner: gz,
-        layer_read: 0,
-        layer_cap,
-        rootfs_total,
-        rootfs_cap,
-    };
-    apply_layer_tar(root, guarded)
+    let guarded = DecompressionGuard { inner: gz, budget };
+    apply_layer_tar_bounded(root, guarded, budget)
 }
 
-/// As [`apply_layer_gz`] but over an already-decompressed tar stream (the
-/// testable core).
+/// As [`apply_layer_gz`] but over an already-decompressed tar stream (the testable core). Every
+/// ceiling is disabled and no gunzip guard feeds the decompressed counters, so behavior matches a
+/// plain extract; the production overlay instead runs through [`apply_layer_gz_bounded`], which
+/// installs the real per-layer / whole-rootfs / whole-image budget.
 pub fn apply_layer_tar(root: &Path, reader: impl Read) -> Result<(), OciError> {
+    let rootfs_total = Cell::new(0u64);
+    let entries_total = Cell::new(0u64);
+    let budget = DecompBudget {
+        layer_read: Cell::new(0),
+        layer_cap: None,
+        rootfs_total: &rootfs_total,
+        rootfs_cap: None,
+        entries_total: &entries_total,
+        entries_cap: None,
+    };
+    apply_layer_tar_bounded(root, reader, &budget)
+}
+
+/// Should the hard-link step skip straight to the `fs::copy` fallback? Always `false` in
+/// production (link first, copy only when linking can't); a `#[cfg(test)]` seam drives it so a
+/// test can exercise the copy-amplification budget charge without fabricating a real
+/// cross-`EXT4_LINK_MAX` (65 000 links/inode) ceiling.
+#[cfg(not(test))]
+#[inline]
+fn force_copy_fallback() -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_COPY_FALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_copy_fallback() -> bool {
+    FORCE_COPY_FALLBACK.with(Cell::get)
+}
+
+/// The tar-extract core, bounded by the shared [`DecompBudget`]: counts every entry against the
+/// whole-image entry ceiling and charges the hard-link `fs::copy` fallback's copied bytes against
+/// the decompressed budget (the gunzip guard, wrapped around `reader` by the caller, charges the
+/// inflated bytes). Whiteouts/symlinks/paths are handled exactly as before.
+fn apply_layer_tar_bounded(
+    root: &Path,
+    reader: impl Read,
+    budget: &DecompBudget,
+) -> Result<(), OciError> {
     fs::create_dir_all(root)?;
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_unpack_xattrs(false);
     for entry in archive.entries()? {
         let mut entry = entry?;
+        // Count EVERY entry pulled from the stream (files, dirs, symlinks, whiteouts) against the
+        // whole-image ceiling BEFORE touching the filesystem — a flood of tiny entries is aborted
+        // before it can exhaust the staging filesystem's inodes.
+        budget.count_entry().map_err(OciError::Io)?;
         let raw = entry.path()?.into_owned();
         let rel = safe_relative(&raw)?;
         let Some(file_name) = rel.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
@@ -424,7 +526,17 @@ pub fn apply_layer_tar(root: &Path, reader: impl Read) -> Result<(), OciError> {
                 .link_name()?
                 .ok_or_else(|| OciError::Io(std::io::Error::other("hard link without target")))?;
             let target = link_target_under_root(root, &link)?;
-            if fs::hard_link(&target, &dest).is_err() {
+            // A hard link shares the target's inode → NO new data bytes, so a successful link is
+            // free and uncounted. When linking can't — cross-filesystem, or past ext4's
+            // EXT4_LINK_MAX (65 000 links/inode) ceiling — we fall back to `fs::copy`, which reads
+            // the target FROM DISK, not through the gunzip `DecompressionGuard`, so a Link entry
+            // (zero data payload, ~0 decompressed bytes counted) would let N links → one file
+            // write N fresh S-byte duplicates INVISIBLE to the decompressed budget. Charge the
+            // copy's bytes against the SAME per-layer + whole-rootfs budget and abort fail-closed
+            // BEFORE copying, so a copy-amplification disk-fill is bounded exactly like a zip-bomb.
+            if force_copy_fallback() || fs::hard_link(&target, &dest).is_err() {
+                let copied = fs::metadata(&target)?.len();
+                budget.charge(copied).map_err(OciError::Io)?;
                 fs::copy(&target, &dest)?;
             }
             continue;
@@ -959,6 +1071,14 @@ impl reqwest::dns::Resolve for ScreeningResolver {
 // the instant it exceeds a ceiling (the over-cap bytes are never written), per layer
 // (`max_decompressed_layer_bytes`) and across the whole rootfs (`max_rootfs_bytes`, running total
 // over all layers) — so a bomb is aborted mid-inflation, never fully expanded.
+//
+// The SAME decompressed budget also charges the hard-link `fs::copy` fallback (a Link entry has no
+// data payload, so the gunzip guard counts ~0 bytes for it, but once the ext4 EXT4_LINK_MAX link
+// ceiling is hit each further link is copied — reading the target FROM DISK, invisible to the
+// gunzip stream): N links → one file would otherwise write unbounded duplicates. ENTRY-COUNT
+// ceiling (`max_tar_entries`) — the byte caps bound size but not entry count, so a tar of millions
+// of tiny entries exhausts the staging filesystem's inodes; the overlay counts every entry across
+// all layers and aborts fail-closed past the cap.
 
 /// Default connect (TCP + TLS handshake) timeout for a registry pull, seconds.
 const DEFAULT_PULL_CONNECT_SECS: u64 = 10;
@@ -1013,6 +1133,17 @@ const DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// the 20 GiB `max_image_bytes` ceiling could inflate to, while still aborting a bomb that would
 /// expand to hundreds of GiB or more. `0` ⇒ no whole-rootfs decompressed ceiling.
 const DEFAULT_PULL_MAX_ROOTFS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Default per-image TAR-ENTRY ceiling: the running count of tar entries (files, dirs, symlinks,
+/// hard links, whiteouts) unpacked across ALL layers. The byte ceilings above bound how much a
+/// layer downloads/inflates, but NOT how many entries it carries: a tar of millions of tiny
+/// (even empty) entries sits far under every byte cap yet creates one inode per entry, exhausting
+/// the staging filesystem's inodes — a disk-fill the byte caps miss (an inode-exhaustion bomb; the
+/// sibling of the hard-link copy-amplification one). 500 000 is well above any real image (a large
+/// image — a full OS with every locale, a TeX distribution, a node_modules-heavy build — runs to
+/// tens, at most low hundreds of thousands of entries across all its layers) yet aborts a bomb
+/// long before it exhausts a node disk's inodes (a 100 GB ext4 at the default ~16 KiB/inode holds
+/// ~6M). `0` ⇒ no per-image entry ceiling.
+const DEFAULT_PULL_MAX_TAR_ENTRIES: u64 = 500_000;
 
 /// Operator-tunable timeouts bounding a registry pull (U30) — the value of
 /// `[compute].registry_pull_timeouts`. Node operator config (System·Admin), NEVER
@@ -1133,8 +1264,10 @@ where
 /// the value of `[compute].registry_pull_limits`. Node operator config (System·Admin), NEVER
 /// guest-influenced; mirrors the wiring of [`RegistryPullTimeouts`]. Each blob is also capped at
 /// its manifest-declared size; these are the operator backstops, enforced DURING the download
-/// (an oversize body is aborted mid-stream, never buffered whole → no OOM). Each field in
-/// **bytes**; `0` disables that particular ceiling.
+/// (an oversize body is aborted mid-stream, never buffered whole → no OOM). Two further ceilings
+/// bound the OVERLAY (not the download): the decompressed-byte caps (a gzip zip-bomb / hard-link
+/// copy-amplification disk-fill) and `max_tar_entries` (an inode-exhaustion bomb). Each field is a
+/// **byte** count except `max_tar_entries` (an **entry** count); `0` disables that ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RegistryPullLimits {
@@ -1167,6 +1300,13 @@ pub struct RegistryPullLimits {
     /// Enforced DURING decompression, same as the per-layer cap. `0` ⇒ no whole-rootfs
     /// decompressed ceiling. Default 64 GiB.
     pub max_rootfs_bytes: u64,
+    /// Per-image TAR-ENTRY ceiling — the max number of tar entries (files, dirs, symlinks, hard
+    /// links, whiteouts) unpacked across ALL layers. The byte ceilings bound download/inflation
+    /// size but NOT entry count: a tar of millions of tiny entries sits under every byte cap yet
+    /// creates one inode each, exhausting the staging filesystem's inodes (an inode-exhaustion
+    /// bomb). Aborted FAIL-CLOSED the instant the running count exceeds this. `0` ⇒ no entry
+    /// ceiling. Default 500 000 (generous — far above any real image).
+    pub max_tar_entries: u64,
 }
 
 impl RegistryPullLimits {
@@ -1177,6 +1317,7 @@ impl RegistryPullLimits {
         max_manifest_bytes: DEFAULT_PULL_MAX_MANIFEST_BYTES,
         max_decompressed_layer_bytes: DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES,
         max_rootfs_bytes: DEFAULT_PULL_MAX_ROOTFS_BYTES,
+        max_tar_entries: DEFAULT_PULL_MAX_TAR_ENTRIES,
     };
 
     /// `v` bytes as a ceiling, or `None` when `v == 0` (ceiling disabled).
@@ -1762,13 +1903,22 @@ async fn apply_image_layers_in(
     let descriptors = layer_descriptors(&r.manifest)?;
     let lim = registry_pull_limits();
     let max_total = RegistryPullLimits::cap(lim.max_image_bytes);
-    // DECOMPRESSED ceilings — the compressed caps above bound the download, NOT how large a layer
-    // inflates to; these bound the inflation (zip-bomb guard). `rootfs_decompressed` carries the
-    // running decompressed total ACROSS layers so `max_rootfs_bytes` spans the whole rootfs.
-    let layer_decompressed_cap = RegistryPullLimits::cap(lim.max_decompressed_layer_bytes);
-    let rootfs_decompressed_cap = RegistryPullLimits::cap(lim.max_rootfs_bytes);
+    // DECOMPRESSED + ENTRY ceilings — the compressed caps above bound the download, NOT how large
+    // a layer inflates to, nor how many entries (inodes) it carries. The per-layer `budget` bounds
+    // the inflation (zip-bomb guard) AND the hard-link `fs::copy` fallback's copied bytes
+    // (copy-amplification guard) AND the tar-entry count (inode-exhaustion guard). The running
+    // totals (`rootfs_decompressed`, `entries_total`) are owned `Cell`s that carry ACROSS layers so
+    // `max_rootfs_bytes` and `max_tar_entries` span the whole rootfs/image, not just one layer.
+    // They are the only budget state held across the per-layer `.await` below (`Cell<u64>` is
+    // `Send`); the `DecompBudget` itself — which borrows them as `&Cell` (`!Send`, since `Cell` is
+    // `!Sync`) — is built fresh AFTER the await and dropped before the next one, so the pull future
+    // stays `Send` (required by the container backend's boxed `run_ephemeral`).
+    let layer_cap = RegistryPullLimits::cap(lim.max_decompressed_layer_bytes);
+    let rootfs_cap = RegistryPullLimits::cap(lim.max_rootfs_bytes);
+    let entries_cap = RegistryPullLimits::cap(lim.max_tar_entries);
+    let rootfs_decompressed = Cell::new(0u64);
+    let entries_total = Cell::new(0u64);
     let mut total: u64 = 0;
-    let mut rootfs_decompressed: u64 = 0;
     for (i, (digest, size)) in descriptors.iter().enumerate() {
         let path = layers_dir.join(format!("layer-{i}.tar.gz"));
         let n = fetch_layer_to_file(&r.client, &r.base, digest, &mut r.token, *size, &path).await?;
@@ -1781,16 +1931,20 @@ async fn apply_image_layers_in(
             )));
         }
         // Overlay this layer from disk (streaming gunzip), bounding its DECOMPRESSED size per-layer
-        // AND the running total across all layers (so a zip-bomb is aborted mid-inflation, never
-        // fully expanded onto disk), then drop its tarball.
+        // AND the running total across all layers (so a zip-bomb or copy-amplification bomb is
+        // aborted mid-inflation, never fully expanded onto disk) AND the per-image entry count,
+        // then drop its tarball. A fresh per-layer budget starts `layer_read` at 0 while the owned
+        // `Cell` totals (borrowed here, never held across an await) carry forward.
+        let budget = DecompBudget {
+            layer_read: Cell::new(0),
+            layer_cap,
+            rootfs_total: &rootfs_decompressed,
+            rootfs_cap,
+            entries_total: &entries_total,
+            entries_cap,
+        };
         let f = fs::File::open(&path)?;
-        apply_layer_gz_bounded(
-            target,
-            std::io::BufReader::new(f),
-            layer_decompressed_cap,
-            rootfs_decompressed_cap,
-            &mut rootfs_decompressed,
-        )?;
+        apply_layer_gz_bounded(target, std::io::BufReader::new(f), &budget)?;
         let _ = fs::remove_file(&path);
     }
     Ok(())
@@ -3271,6 +3425,7 @@ mod tests {
         assert_eq!(def.max_manifest_bytes, 32 * 1024 * 1024);
         assert_eq!(def.max_decompressed_layer_bytes, 32 * 1024 * 1024 * 1024);
         assert_eq!(def.max_rootfs_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(def.max_tar_entries, 500_000);
         // `cap` maps a byte count → ceiling; `0` disables it.
         assert_eq!(RegistryPullLimits::cap(123), Some(123));
         assert_eq!(RegistryPullLimits::cap(0), None);
@@ -3284,6 +3439,7 @@ mod tests {
             max_manifest_bytes: 2048,
             max_decompressed_layer_bytes: 0, // decompressed ceilings irrelevant to blob/manifest_cap
             max_rootfs_bytes: 0,
+            max_tar_entries: 0,
         });
         assert_eq!(
             blob_cap(None),
@@ -3334,6 +3490,7 @@ mod tests {
             max_manifest_bytes: 0,
             max_decompressed_layer_bytes: 0,
             max_rootfs_bytes: 0,
+            max_tar_entries: 0,
         });
         assert_eq!(
             blob_cap(None),
@@ -3400,6 +3557,26 @@ mod tests {
         false
     }
 
+    /// Build a per-layer [`DecompBudget`] over caller-owned cross-layer counters, for the bounded
+    /// overlay tests. Caps are `None` ⇒ disabled. Build a fresh one per layer (as production does),
+    /// reusing the same `rootfs_total`/`entries_total` cells so their ceilings span layers.
+    fn test_budget<'a>(
+        layer_cap: Option<u64>,
+        rootfs_cap: Option<u64>,
+        entries_cap: Option<u64>,
+        rootfs_total: &'a Cell<u64>,
+        entries_total: &'a Cell<u64>,
+    ) -> DecompBudget<'a> {
+        DecompBudget {
+            layer_read: Cell::new(0),
+            layer_cap,
+            rootfs_total,
+            rootfs_cap,
+            entries_total,
+            entries_cap,
+        }
+    }
+
     #[test]
     fn zip_bomb_layer_aborted_during_inflation_without_filling_disk() {
         let _guard = pull_globals_lock();
@@ -3420,6 +3597,7 @@ mod tests {
             max_manifest_bytes: 0,
             max_decompressed_layer_bytes: CAP,
             max_rootfs_bytes: 0,
+            max_tar_entries: 0,
         });
         let root = tmpdir("zipbomb");
         // The public `apply_layer_gz` path, which consults the installed global — proves the wiring.
@@ -3455,30 +3633,23 @@ mod tests {
         let l2 = gz_bomb_layer("b.bin", 4 * 1024 * 1024); // 4 MiB inflated
         let layer_cap = 16 * 1024 * 1024; // generous per-layer (neither layer trips it)
         let rootfs_cap = 6 * 1024 * 1024; // whole-rootfs: l1 fits, l1+l2 does not
-        let mut total: u64 = 0;
+        let rootfs = Cell::new(0u64);
+        let entries = Cell::new(0u64);
 
-        // Layer 1 fits under the whole-rootfs cap.
-        apply_layer_gz_bounded(
-            &root,
-            &l1[..],
-            Some(layer_cap),
-            Some(rootfs_cap),
-            &mut total,
-        )
-        .expect("layer 1 is under the whole-rootfs cap");
+        // Layer 1 fits under the whole-rootfs cap. A fresh per-layer budget shares the cross-layer
+        // `rootfs`/`entries` totals, exactly as the production overlay builds one budget per layer.
+        let budget1 = test_budget(Some(layer_cap), Some(rootfs_cap), None, &rootfs, &entries);
+        apply_layer_gz_bounded(&root, &l1[..], &budget1)
+            .expect("layer 1 is under the whole-rootfs cap");
+        let total = rootfs.get();
         assert!(
             total >= 4 * 1024 * 1024 && total <= rootfs_cap,
             "after layer 1 the running total ({total}) sits between 4 MiB and the 6 MiB rootfs cap"
         );
 
-        // Layer 2 pushes the running total over the whole-rootfs cap → aborted mid-inflation.
-        let res = apply_layer_gz_bounded(
-            &root,
-            &l2[..],
-            Some(layer_cap),
-            Some(rootfs_cap),
-            &mut total,
-        );
+        // Layer 2 pushes the shared running total over the whole-rootfs cap → aborted mid-inflation.
+        let budget2 = test_budget(Some(layer_cap), Some(rootfs_cap), None, &rootfs, &entries);
+        let res = apply_layer_gz_bounded(&root, &l2[..], &budget2);
         let err = res.expect_err("the cross-layer running total must abort layer 2");
         let OciError::Io(e) = &err else {
             panic!("expected OciError::Io from the whole-rootfs abort, got {err:?}");
@@ -3506,20 +3677,28 @@ mod tests {
             &[("app/run", b"#!/bin/sh\n"), ("etc/conf", b"x")],
             &["app", "etc"],
         ));
-        let mut total: u64 = 0;
-        apply_layer_gz_bounded(
-            &root,
-            &gz[..],
+        let rootfs = Cell::new(0u64);
+        let entries = Cell::new(0u64);
+        let budget = test_budget(
             Some(DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES),
             Some(DEFAULT_PULL_MAX_ROOTFS_BYTES),
-            &mut total,
-        )
-        .expect("a normal layer must unpack under the generous default decompressed caps");
+            Some(DEFAULT_PULL_MAX_TAR_ENTRIES),
+            &rootfs,
+            &entries,
+        );
+        apply_layer_gz_bounded(&root, &gz[..], &budget)
+            .expect("a normal layer must unpack under the generous default decompressed caps");
         assert_eq!(fs::read(root.join("app/run")).unwrap(), b"#!/bin/sh\n");
         assert!(root.join("etc/conf").exists());
+        let total = rootfs.get();
         assert!(
             total > 0 && total < DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES,
             "a normal layer's decompressed total ({total}) is well under the cap"
+        );
+        assert!(
+            entries.get() > 0 && entries.get() < DEFAULT_PULL_MAX_TAR_ENTRIES,
+            "a normal layer's entry count ({}) is well under the cap",
+            entries.get()
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -3545,15 +3724,17 @@ mod tests {
         // (the operator opt-out). This is the knob's documented escape hatch.
         let bomb = gz_bomb_layer("z.bin", 8 * 1024 * 1024); // 8 MiB inflated
         let root = tmpdir("zero-disables");
-        let mut total: u64 = 0;
-        apply_layer_gz_bounded(
-            &root,
-            &bomb[..],
+        let rootfs = Cell::new(0u64);
+        let entries = Cell::new(0u64);
+        let budget = test_budget(
             RegistryPullLimits::cap(0), // per-layer cap disabled
             RegistryPullLimits::cap(0), // whole-rootfs cap disabled
-            &mut total,
-        )
-        .expect("disabled (0 → None) decompressed caps must not abort inflation");
+            RegistryPullLimits::cap(0), // entry cap disabled
+            &rootfs,
+            &entries,
+        );
+        apply_layer_gz_bounded(&root, &bomb[..], &budget)
+            .expect("disabled (0 → None) decompressed caps must not abort inflation");
         assert_eq!(
             fs::metadata(root.join("z.bin")).unwrap().len(),
             8 * 1024 * 1024,
@@ -3562,22 +3743,193 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // ---- HIGH follow-up: hard-link copy-amplification + entry-count bounding ----
+
+    #[test]
+    fn hard_link_copy_amplification_bomb_aborted_and_disk_bounded() {
+        // The copy-fallback disk-fill the DECOMPRESSED-byte guard can't see: a Link entry carries
+        // NO data payload, so the gunzip guard counts ~0 bytes for it. Once `hard_link` can't (past
+        // ext4's EXT4_LINK_MAX ceiling) each further link falls back to `fs::copy`, which reads the
+        // target FROM DISK — invisible to the guard. N links → one file `F` would write N fresh
+        // F-sized duplicates uncharged. Charging the copied bytes against the SAME per-layer budget
+        // must abort once the copies cross the ceiling, with bytes on disk bounded by the cap, NOT
+        // the full N×S expansion.
+        use tar::{Builder, EntryType, Header};
+        const S: u64 = 1024 * 1024; // the single real file F: 1 MiB
+        const LINKS: usize = 64; // 64 links → F: would copy 64 MiB if uncharged
+        const CAP: u64 = 4 * 1024 * 1024; // per-layer ceiling: only a few copies fit
+
+        let mut builder = Builder::new(Vec::new());
+        let content = vec![7u8; S as usize];
+        let mut fh = Header::new_gnu();
+        fh.set_mode(0o644);
+        fh.set_size(S);
+        builder.append_data(&mut fh, "F", &content[..]).unwrap();
+        for i in 0..LINKS {
+            let mut lh = Header::new_gnu();
+            lh.set_entry_type(EntryType::Link);
+            lh.set_mode(0o644);
+            lh.set_size(0);
+            builder
+                .append_link(&mut lh, format!("link-{i}"), "F")
+                .unwrap();
+        }
+        let gz = gz_of(&builder.into_inner().unwrap());
+
+        let root = tmpdir("copy-amp");
+        let rootfs = Cell::new(0u64);
+        let entries = Cell::new(0u64);
+        let budget = test_budget(Some(CAP), None, None, &rootfs, &entries);
+
+        // Force the copy fallback for THIS thread so every link copies, without fabricating a real
+        // 65 000-link ext4 ceiling; production still links first and copies only when it can't.
+        FORCE_COPY_FALLBACK.with(|c| c.set(true));
+        let res = apply_layer_gz_bounded(&root, &gz[..], &budget);
+        FORCE_COPY_FALLBACK.with(|c| c.set(false));
+
+        let err =
+            res.expect_err("a copy-amplification bomb must abort once the copies cross the cap");
+        let OciError::Io(e) = &err else {
+            panic!("expected OciError::Io from the copy-amplification abort, got {err:?}");
+        };
+        assert!(
+            io_err_chain_contains(e, "per-layer ceiling"),
+            "must carry the per-layer decompressed-ceiling abort, got: {e}"
+        );
+        // Disk is bounded: F plus at most ~the cap of copied duplicates — NOT the full 64 MiB.
+        let mut on_disk = fs::metadata(root.join("F")).map(|m| m.len()).unwrap_or(0);
+        for i in 0..LINKS {
+            on_disk += fs::metadata(root.join(format!("link-{i}")))
+                .map(|m| m.len())
+                .unwrap_or(0);
+        }
+        assert!(
+            on_disk <= 2 * S + CAP,
+            "copy-amplification must stay bounded (~F+cap), not the full {}-byte expansion \
+             (on disk {on_disk})",
+            (LINKS as u64) * S
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn entry_count_bomb_aborted_by_max_tar_entries() {
+        // The inode-exhaustion sibling: thousands of tiny (empty) entries, each far under every
+        // BYTE ceiling, must abort once the running entry count crosses `max_tar_entries`, with
+        // only up to the cap's worth of inodes materialized.
+        const ENTRIES: usize = 1000;
+        const CAP: u64 = 100;
+        let mut builder = tar::Builder::new(Vec::new());
+        for i in 0..ENTRIES {
+            let mut h = tar::Header::new_gnu();
+            h.set_mode(0o644);
+            h.set_size(0);
+            builder
+                .append_data(&mut h, format!("f{i}"), std::io::empty())
+                .unwrap();
+        }
+        let gz = gz_of(&builder.into_inner().unwrap());
+
+        let root = tmpdir("entry-bomb");
+        let rootfs = Cell::new(0u64);
+        let entries = Cell::new(0u64);
+        let budget = test_budget(None, None, Some(CAP), &rootfs, &entries);
+        let res = apply_layer_gz_bounded(&root, &gz[..], &budget);
+        let err = res.expect_err("an entry-count bomb must be aborted by max_tar_entries");
+        let OciError::Io(e) = &err else {
+            panic!("expected OciError::Io from the entry-count abort, got {err:?}");
+        };
+        assert!(
+            io_err_chain_contains(e, "tar-entry ceiling"),
+            "must carry the tar-entry ceiling abort, got: {e}"
+        );
+        // Bounded: the overlay stopped creating inodes at ~the cap, not all 1000.
+        let created = fs::read_dir(&root).map(|rd| rd.count()).unwrap_or(0);
+        assert!(
+            (created as u64) <= CAP + 1,
+            "only up to the cap's worth of entries materialized (created {created})"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn real_hard_links_unpack_under_bounded_overlay_and_are_not_charged() {
+        // A legit busybox-style layer (one binary + applet hard links) overlays fine through the
+        // bounded path, and a SUCCESSFUL hard link shares the inode → charges NO bytes, so the
+        // decompressed total reflects only the real file content, never phantom link duplicates.
+        use tar::{Builder, EntryType, Header};
+        let mut builder = Builder::new(Vec::new());
+        let mut dh = Header::new_gnu();
+        dh.set_entry_type(EntryType::Directory);
+        dh.set_mode(0o755);
+        dh.set_size(0);
+        builder
+            .append_data(&mut dh, "bin", std::io::empty())
+            .unwrap();
+        let content = b"#!busybox\n";
+        let mut fh = Header::new_gnu();
+        fh.set_mode(0o755);
+        fh.set_size(content.len() as u64);
+        builder
+            .append_data(&mut fh, "bin/busybox", &content[..])
+            .unwrap();
+        for applet in ["ls", "sh", "cat"] {
+            let mut lh = Header::new_gnu();
+            lh.set_entry_type(EntryType::Link);
+            lh.set_mode(0o755);
+            lh.set_size(0);
+            builder
+                .append_link(&mut lh, format!("bin/{applet}"), "bin/busybox")
+                .unwrap();
+        }
+        let gz = gz_of(&builder.into_inner().unwrap());
+
+        let root = tmpdir("real-links");
+        let rootfs = Cell::new(0u64);
+        let entries = Cell::new(0u64);
+        let budget = test_budget(
+            Some(DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES),
+            Some(DEFAULT_PULL_MAX_ROOTFS_BYTES),
+            Some(DEFAULT_PULL_MAX_TAR_ENTRIES),
+            &rootfs,
+            &entries,
+        );
+        apply_layer_gz_bounded(&root, &gz[..], &budget)
+            .expect("a normal layer with real hard links must unpack under generous caps");
+        for applet in ["ls", "sh", "cat"] {
+            assert_eq!(
+                fs::read(root.join(format!("bin/{applet}"))).unwrap(),
+                content,
+                "applet hard link resolves to the busybox content"
+            );
+        }
+        // The hard links shared busybox's inode → NOT copied, so only the real tar content was
+        // charged (a few hundred bytes), nowhere near a per-link duplication.
+        assert!(
+            rootfs.get() < 64 * 1024,
+            "only the real file content was charged ({} bytes), not link copies",
+            rootfs.get()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn registry_pull_limits_serde_round_trips_new_fields_and_partial_default() {
-        // A full round-trip preserves the two new decompressed ceilings.
+        // A full round-trip preserves the decompressed ceilings AND the new entry-count ceiling.
         let custom = RegistryPullLimits {
             max_layer_bytes: 1,
             max_image_bytes: 2,
             max_manifest_bytes: 3,
             max_decompressed_layer_bytes: 4,
             max_rootfs_bytes: 5,
+            max_tar_entries: 6,
         };
         let json = serde_json::to_string(&custom).unwrap();
         let back: RegistryPullLimits = serde_json::from_str(&json).unwrap();
         assert_eq!(back, custom);
 
-        // Backward compat: a config written BEFORE the decompressed caps existed still loads — the
-        // two new fields fall back to their generous defaults (`#[serde(default)]`).
+        // Backward compat: a config written BEFORE the decompressed/entry caps existed still loads —
+        // the newer fields fall back to their generous defaults (`#[serde(default)]`).
         let old = r#"{"max_layer_bytes":10,"max_image_bytes":20,"max_manifest_bytes":30}"#;
         let back: RegistryPullLimits = serde_json::from_str(old).unwrap();
         assert_eq!(back.max_layer_bytes, 10);
@@ -3586,15 +3938,22 @@ mod tests {
             DEFAULT_PULL_MAX_DECOMPRESSED_LAYER_BYTES
         );
         assert_eq!(back.max_rootfs_bytes, DEFAULT_PULL_MAX_ROOTFS_BYTES);
+        assert_eq!(back.max_tar_entries, DEFAULT_PULL_MAX_TAR_ENTRIES);
 
-        // `0` round-trips and reads back as "disabled".
-        let zero = r#"{"max_decompressed_layer_bytes":0,"max_rootfs_bytes":0}"#;
+        // A config that sets the decompressed caps but PREDATES the entry cap still fills it in.
+        let no_entries = r#"{"max_decompressed_layer_bytes":4,"max_rootfs_bytes":5}"#;
+        let back: RegistryPullLimits = serde_json::from_str(no_entries).unwrap();
+        assert_eq!(back.max_tar_entries, DEFAULT_PULL_MAX_TAR_ENTRIES);
+
+        // `0` round-trips and reads back as "disabled" for every overlay ceiling.
+        let zero = r#"{"max_decompressed_layer_bytes":0,"max_rootfs_bytes":0,"max_tar_entries":0}"#;
         let back: RegistryPullLimits = serde_json::from_str(zero).unwrap();
         assert_eq!(
             RegistryPullLimits::cap(back.max_decompressed_layer_bytes),
             None
         );
         assert_eq!(RegistryPullLimits::cap(back.max_rootfs_bytes), None);
+        assert_eq!(RegistryPullLimits::cap(back.max_tar_entries), None);
     }
 
     #[tokio::test]
@@ -3638,6 +3997,7 @@ mod tests {
             max_manifest_bytes: 0,
             max_decompressed_layer_bytes: 0,
             max_rootfs_bytes: 0,
+            max_tar_entries: 0,
         });
         install_registry_pull_timeouts(RegistryPullTimeouts {
             connect_secs: 5,
@@ -3719,6 +4079,7 @@ mod tests {
             max_manifest_bytes: 0,
             max_decompressed_layer_bytes: 0,
             max_rootfs_bytes: 0,
+            max_tar_entries: 0,
         });
         let client = screening_client().unwrap();
         let base = format!("http://{addr}");
@@ -3838,6 +4199,7 @@ mod tests {
             max_manifest_bytes: 64 * 1024,
             max_decompressed_layer_bytes: 0,
             max_rootfs_bytes: 0,
+            max_tar_entries: 0,
         });
         install_registry_pull_timeouts(RegistryPullTimeouts {
             connect_secs: 5,
