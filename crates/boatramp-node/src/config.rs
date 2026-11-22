@@ -1720,36 +1720,39 @@ fn default_allowed_kernel_hashes() -> Vec<String> {
     #[cfg(target_arch = "x86_64")]
     {
         vec![
-            // v0.2.0 minimal Firecracker 6.1-config kernel: boots under the
-            // firecracker-*binary* backend (ACPI device discovery) but NOT the
-            // in-process embedded VMM. Kept trusted so operators on the currently
-            // published release don't fail strict verification.
-            "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974".to_string(),
-            // Same kernel + CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y (flake `#vmlinux`),
-            // so the embedded VMM binds its virtio-block root over the cmdline
-            // transport. Reproducible build output (deterministic nix build,
-            // verified on KVM); the next signed boatramp-vmlinux release — which
-            // reuses this flake — publishes + signs it, gated by
-            // `vmlinux-release-boot.yml`.
-            "d0dc2098ab2a2a3c1bc72ab61dc85d9e464d798d7e55b6b80525db5ca2f00c5a".to_string(),
+            // `boatramp-vmlinux-x86_64` v0.3.0 — the 6.12 LTS kernel (Landlock
+            // ABI ≥5). The 6.12 bump is the whole point of this release: Landlock
+            // V5 is only available from 6.12 on, and it is what the privsep VM +
+            // the compute microVM need. Built with CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+            // (flake `#vmlinux`) so the in-process embedded VMM binds its virtio-block
+            // root over the cmdline transport (it also boots the firecracker-*binary*
+            // backend via ACPI discovery). Reproducible build output (deterministic
+            // nix build, verified on KVM). This is the hash of the **published,
+            // ES256-signed** release asset — signed by BOATRAMP_KERNEL_SIGNING_PUBKEY,
+            // which is UNCHANGED across the v0.2.x→v0.3.0 bump (same KERNEL_SIGNING_KEY
+            // Actions secret) — gated by `vmlinux-release-boot.yml`, so a selected
+            // `compute.default_kernel` clears the strict bar out of the box.
+            "9714d5794ce76a1d267074686568dc2e460d3eecf39f97a1af017aa8cbc792ff".to_string(),
         ]
     }
     #[cfg(target_arch = "aarch64")]
     {
         vec![
-            // `boatramp-vmlinux-aarch64` v0.2.3 (the Virtualization.framework guest
-            // kernel, flake `#vmlinux` on aarch64-linux — a raw arm64 `Image`). This
-            // release enables the generic PCIe host + virtio-pci so the guest actually
-            // discovers VZ's virtio disk/net/console (the earlier v0.2.2 `be95fb0d…`
-            // built with `CONFIG_PCI` off never booted under VZ and is dropped). This
-            // is the hash of the **published, ES256-signed** release asset (signed by
-            // BOATRAMP_KERNEL_SIGNING_PUBKEY), so a selected `compute.default_kernel`
-            // clears the strict bar out of the box; the boot + scale-to-zero round-trip
-            // was validated against this exact published kernel. NOTE: unlike x86_64,
-            // the aarch64 build is not currently bit-reproducible across build hosts
-            // (same config + size, different build metadata), so pin/verify against the
-            // published `.sha256`/`.sig`, not a local rebuild. Bump on each new release.
-            "d785a48d754e65a4630443301f1fb84cb69cf882336d3cf37055e437b3d8e21f".to_string(),
+            // `boatramp-vmlinux-aarch64` v0.3.0 — the 6.12 LTS Virtualization.framework
+            // guest kernel (flake `#vmlinux` on aarch64-linux, a raw arm64 `Image`),
+            // Landlock ABI ≥5. The 6.12 bump is the whole point of this release:
+            // Landlock V5 lands in 6.12, and it is what the privsep VM + the compute
+            // microVM need. The build enables the generic PCIe host + virtio-pci so the
+            // guest discovers VZ's virtio disk/net/console (the earlier v0.2.2
+            // `be95fb0d…` built with `CONFIG_PCI` off never booted under VZ and is gone).
+            // This is the hash of the **published, ES256-signed** release asset — signed
+            // by BOATRAMP_KERNEL_SIGNING_PUBKEY, which is UNCHANGED across the
+            // v0.2.x→v0.3.0 bump (same KERNEL_SIGNING_KEY Actions secret) — so a selected
+            // `compute.default_kernel` clears the strict bar out of the box. NOTE: unlike
+            // x86_64, the aarch64 build is not currently bit-reproducible across build
+            // hosts (same config + size, different build metadata), so pin/verify against
+            // the published `.sha256`/`.sig`, not a local rebuild. Bump on each new release.
+            "087236f3d22e41fb862e9ba612c610afc539a61b39be5d4eeec9a0eb8f124a26".to_string(),
         ]
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
