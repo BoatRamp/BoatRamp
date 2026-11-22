@@ -4,8 +4,10 @@
 //! the result into an ext4 image.
 //!
 //! The **layer overlay** ([`apply_layer_gz`]) is pure and unit-tested. The
-//! registry pull ([`pull_layers`], network) and the ext4 build ([`build_ext4`],
-//! the `e2fsprogs` `mke2fs` tool) are host seams.
+//! registry pull + overlay ([`build_rootfs_dir`], network) and the ext4 build
+//! ([`build_ext4`], the `e2fsprogs` `mke2fs` tool) are host seams. Each layer is
+//! **streamed to disk** as it downloads (bounded memory + a size cap enforced
+//! mid-stream), and the whole pull is bounded by an overall wall-clock deadline.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -13,6 +15,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
+use std::time::Duration;
 
 use ipnet::IpNet;
 
@@ -789,17 +792,438 @@ impl reqwest::dns::Resolve for ScreeningResolver {
                 // `hosts` entry permits this name, a CIDR entry permits the address, and a
                 // cloud-metadata endpoint is refused regardless.
                 if address_is_refused(Some(&host), sa.ip()) {
-                    return Err(format!(
-                        "refusing to connect to {host}: resolves to non-global address {} \
-                         (not on the `[compute].allow_private_registries` operator allow-list)",
-                        sa.ip()
-                    )
-                    .into());
+                    // Typed (U31) so the actionable message — the refused host + the
+                    // `[compute].allow_private_registries` hint — survives reqwest's error
+                    // wrapping and reaches the operator, instead of being flattened to a
+                    // generic "error sending request for url …". Recovered by `reqwest_err`.
+                    //
+                    // SECURITY: this message is persisted into a replica's `LaunchFailed`
+                    // reason and surfaced to the TENANT (`compute status`). The tenant supplied
+                    // the HOST, so naming it discloses nothing new — but the NODE-resolved IP
+                    // would, so it is deliberately OMITTED here (unlike the literal-IP screen,
+                    // whose address the tenant typed). This denies a tenant an internal
+                    // DNS→IP reconnaissance oracle while still pointing the operator at the
+                    // allow-list. The connect is refused regardless of what is logged.
+                    return Err(Box::new(ScreenRefusal(format!(
+                        "refusing to connect to {host}: it resolves to a non-global \
+                         (private/internal) address not on the \
+                         `[compute].allow_private_registries` operator allow-list"
+                    )))
+                        as Box<dyn std::error::Error + Send + Sync>);
                 }
             }
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// U30: bound the OCI registry pull with timeouts
+// ---------------------------------------------------------------------------
+//
+// The pull client previously had NO connect/read/overall timeout, so a registry that
+// accepts the TCP connection and then never answers held the pull FOREVER — and for an
+// embedder awaiting several launches together, one such image stalled everything behind it.
+// These bounds make a dead/stalling registry fail the pull in bounded time with a clear
+// error. Operator-tunable (`[compute].registry_pull_timeouts`), NEVER guest-influenced —
+// the values come from node config only, mirroring `[compute].allow_private_registries`.
+//
+// Design (four time knobs + two byte ceilings, layered so a legitimate large/slow pull always
+// completes while a malicious registry cannot stall the node or exhaust its memory):
+//   * `connect_secs` bounds the TCP+TLS handshake (a registry that never completes connect).
+//   * `read_secs` is the IDLE/read timeout — the max gap with NO bytes flowing on a response
+//     before the pull fails. This is what catches "accepts the connection and never answers"
+//     (connect succeeds, then silence). Because reqwest's read timeout resets on every chunk,
+//     it bounds a STALL without capping a legitimately large-but-progressing blob download.
+//   * `response_secs` is an overall per-request cap applied ONLY to the small control-plane
+//     requests (token exchange + manifest GET), whose bodies are tiny. It is deliberately NOT
+//     applied to a blob GET, so a genuinely large/slow layer stream is bounded by the idle
+//     `read_secs` alone and is never severed mid-request-progress.
+//   * `overall_pull_secs` (Security HIGH follow-up) is an overall WALL-CLOCK deadline spanning
+//     the WHOLE image pull (manifest + config + every layer). The per-chunk idle `read_secs`
+//     resets on each byte, so a registry trickling one byte just under that gap forever keeps a
+//     blob — and thus the SERIAL reconcile loop that awaits the pull — open indefinitely
+//     (a tenant-triggerable cross-tenant DoS: the image ref picks the registry host). This
+//     deadline bounds that slow-drip; it is generous (a multi-GB pull over a slow link still
+//     finishes) because the idle + byte bounds already catch the common cases.
+//
+// Byte ceilings ([`RegistryPullLimits`], enforced DURING the read, never after — so an oversize
+// body is aborted mid-stream, never buffered whole):
+//   * each LAYER blob is capped at `min(its manifest-declared size, max_layer_bytes)` — a layer
+//     that streams past its own declared size is malformed and aborted; the operator ceiling
+//     backstops a registry that declares (or omits) an implausible size.
+//   * `max_image_bytes` caps the running total across all layers (the whole image).
+//   * each MANIFEST/CONFIG read ([`manifest_cap`]) is capped by the much tighter `max_manifest_bytes`
+//     (default 32 MiB), not the generous layer ceiling: these are KB-scale JSON documents held in
+//     MEMORY, and a manifest declares no size of its own, so without this they would be bounded only
+//     by `max_layer_bytes` (10 GiB).
+// Layers are STREAMED to a temp file as they download (and the tarball dropped right after it is
+// overlaid), so node memory stays O(one chunk) instead of buffering every layer in a `Vec<Vec<u8>>`.
+
+/// Default connect (TCP + TLS handshake) timeout for a registry pull, seconds.
+const DEFAULT_PULL_CONNECT_SECS: u64 = 10;
+/// Default read/idle timeout, seconds — the max no-bytes-flowing gap on a registry response
+/// before the pull fails. Resets per chunk, so it bounds a stall (incl. "accepts then never
+/// answers") WITHOUT capping a legitimately large blob stream.
+const DEFAULT_PULL_READ_SECS: u64 = 30;
+/// Default overall per-request cap, seconds, for the SMALL token + manifest requests only
+/// (never the blob stream). Keeps a never-answering control request from stalling the pull
+/// even past the idle budget, while leaving large blob downloads to `DEFAULT_PULL_READ_SECS`.
+const DEFAULT_PULL_RESPONSE_SECS: u64 = 120;
+/// Default overall WALL-CLOCK deadline, seconds, for the WHOLE image pull (manifest + config +
+/// every layer). The idle `read_secs` resets per chunk and so does NOT bound a slow-drip
+/// (one byte just under the idle gap forever), which would hold a blob — and the serial reconcile
+/// loop awaiting it — open indefinitely (tenant-triggerable cross-tenant DoS). `600` (10 min) is
+/// generous: a ~2 GiB compressed image over a 30 Mbit/s link is ≈ 9 min of transfer, so a real
+/// large/slow pull completes, while an otherwise-unbounded drip is cut off. `0` disables.
+const DEFAULT_PULL_OVERALL_SECS: u64 = 600;
+/// Default per-blob byte ceiling (operator backstop). A well-formed registry declares each
+/// layer's compressed `size` in the manifest, which is the tight per-blob cap; this ceiling
+/// backstops a registry that declares an implausible size or omits it. 10 GiB is far above any
+/// real single compressed layer. `0` ⇒ no operator per-blob ceiling (the declared size still
+/// caps each blob).
+const DEFAULT_PULL_MAX_LAYER_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Default whole-image byte ceiling: the running total across ALL layers. Backstops a many-layer
+/// image whose individual layers each sit under the per-blob cap. 20 GiB is above any realistic
+/// compressed image. `0` ⇒ no whole-image ceiling.
+const DEFAULT_PULL_MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Default byte ceiling for a MANIFEST or CONFIG read — both small JSON documents buffered in
+/// MEMORY (not streamed to disk like a layer). A manifest declares no `size` of its own, so
+/// without a dedicated ceiling it is bounded only by the generous per-layer `max_layer_bytes`
+/// (10 GiB) — far too loose for a KB-scale document. 32 MiB is generous (no real manifest/config
+/// — a fat multi-arch index, an attestation/SBOM manifest, a config with a long `history` — comes
+/// anywhere near it) yet ~320× tighter than the layer ceiling. `0` ⇒ no manifest/config ceiling
+/// (the config's own declared size still caps it; a size-undeclared manifest is then bounded only
+/// by the pull timeouts/deadline).
+const DEFAULT_PULL_MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Operator-tunable timeouts bounding a registry pull (U30) — the value of
+/// `[compute].registry_pull_timeouts`. Node operator config (System·Admin), NEVER
+/// guest-influenced; mirrors the wiring of `[compute].allow_private_registries`. A
+/// dead/stalling registry fails the pull in bounded time instead of hanging forever. Each
+/// field is in **seconds**; `0` disables that particular bound (an explicit operator opt-out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RegistryPullTimeouts {
+    /// Connect (TCP + TLS handshake) timeout, seconds. `0` ⇒ no connect bound. Default 10.
+    pub connect_secs: u64,
+    /// Read/idle timeout, seconds — the max no-bytes-flowing gap on a response before the pull
+    /// fails. Resets per chunk, so it bounds a stall without capping a legitimately large blob.
+    /// `0` ⇒ no idle bound. Default 30.
+    pub read_secs: u64,
+    /// Overall cap, seconds, for the SMALL token + manifest requests only (NEVER the blob
+    /// stream, which is bounded by `read_secs`). `0` ⇒ no overall cap. Default 120.
+    pub response_secs: u64,
+    /// Overall WALL-CLOCK deadline, seconds, for the WHOLE image pull (manifest + config +
+    /// every layer) — distinct from `response_secs` (per small control-plane request) and
+    /// `read_secs` (per-chunk idle). Bounds a registry that drip-feeds bytes just under the
+    /// idle gap forever, which would otherwise hold the pull — and the serial reconcile loop
+    /// awaiting it — open indefinitely. Generous so a legitimately large/slow pull completes.
+    /// `0` ⇒ no overall deadline. Default 600 (10 min).
+    pub overall_pull_secs: u64,
+}
+
+impl RegistryPullTimeouts {
+    /// The default bounds, as a `const` so it can seed the process-global static (where
+    /// `Default::default()` is not callable).
+    const DEFAULT: Self = Self {
+        connect_secs: DEFAULT_PULL_CONNECT_SECS,
+        read_secs: DEFAULT_PULL_READ_SECS,
+        response_secs: DEFAULT_PULL_RESPONSE_SECS,
+        overall_pull_secs: DEFAULT_PULL_OVERALL_SECS,
+    };
+
+    /// `d` seconds as a `Duration`, or `None` when `d == 0` (bound disabled).
+    fn dur(d: u64) -> Option<Duration> {
+        (d > 0).then(|| Duration::from_secs(d))
+    }
+}
+
+impl Default for RegistryPullTimeouts {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The process-global registry-pull timeouts the OCI client builder consults. Installed ONCE
+/// at node serve wiring from `[compute].registry_pull_timeouts`
+/// ([`install_registry_pull_timeouts`]); default = the built-in bounds above. Node operator
+/// config, never guest-influenced. Read (not threaded) by the client builder so the many pull
+/// entry points + callers need no signature change (mirrors the allow-list global).
+static REGISTRY_PULL_TIMEOUTS: RwLock<RegistryPullTimeouts> =
+    RwLock::new(RegistryPullTimeouts::DEFAULT);
+
+/// Install the operator's registry-pull timeouts (U30) into the process-global the OCI pull
+/// client reads. Called at node serve wiring; idempotent (a later call replaces the installed
+/// values — config reload). Infallible: every field is a plain duration-in-seconds (`0`
+/// disables a bound), so there is nothing to reject.
+pub fn install_registry_pull_timeouts(cfg: RegistryPullTimeouts) {
+    // Poison-tolerant: a panic elsewhere while the lock was held must not wedge the pull —
+    // recover the guard and install over it. The data is a plain config snapshot.
+    *REGISTRY_PULL_TIMEOUTS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = cfg;
+}
+
+/// Snapshot the installed [`RegistryPullTimeouts`] (default when unset).
+fn registry_pull_timeouts() -> RegistryPullTimeouts {
+    *REGISTRY_PULL_TIMEOUTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The overall per-request cap for the SMALL control-plane requests (token exchange + manifest
+/// GET), from the installed timeouts. `None` ⇒ no cap. Deliberately NOT used for a blob GET,
+/// whose legitimately-large body is bounded by the idle read timeout + the byte ceiling
+/// ([`blob_cap`]) + the whole-pull deadline ([`overall_pull_timeout`]) instead of a hard
+/// per-request cap, so a slow-but-progressing layer is never severed mid-request.
+fn small_request_overall_timeout() -> Option<Duration> {
+    RegistryPullTimeouts::dur(registry_pull_timeouts().response_secs)
+}
+
+/// The overall WALL-CLOCK deadline for the WHOLE image pull (manifest + config + every layer),
+/// from the installed timeouts. `None` ⇒ no deadline. Applied by [`with_pull_deadline`] around
+/// the whole pull so a registry drip-feeding bytes under the idle timeout cannot hold the pull —
+/// and the serial reconcile loop awaiting it — open indefinitely (Security HIGH: cross-tenant
+/// DoS). Distinct from the per-request `response_secs` and the per-chunk idle `read_secs`.
+fn overall_pull_timeout() -> Option<Duration> {
+    RegistryPullTimeouts::dur(registry_pull_timeouts().overall_pull_secs)
+}
+
+/// Run a network-bound pull future under the operator's overall per-pull wall-clock deadline
+/// ([`overall_pull_timeout`]). On timeout the future is dropped (cancelling the in-flight
+/// request) and a typed registry error is returned, so a slow-drip registry cannot hold the
+/// serial reconcile loop open past the budget. `None` deadline ⇒ the future runs unbounded
+/// (operator opt-out).
+async fn with_pull_deadline<F, T>(fut: F) -> Result<T, OciError>
+where
+    F: std::future::Future<Output = Result<T, OciError>>,
+{
+    match overall_pull_timeout() {
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(OciError::Registry(format!(
+                "image pull exceeded the overall {}s wall-clock deadline and was aborted \
+                 (a registry drip-feeding bytes under the idle timeout cannot hold the pull open)",
+                d.as_secs()
+            ))),
+        },
+        None => fut.await,
+    }
+}
+
+/// Operator-tunable BYTE ceilings bounding a registry pull (Security HIGH follow-up to U30) —
+/// the value of `[compute].registry_pull_limits`. Node operator config (System·Admin), NEVER
+/// guest-influenced; mirrors the wiring of [`RegistryPullTimeouts`]. Each blob is also capped at
+/// its manifest-declared size; these are the operator backstops, enforced DURING the download
+/// (an oversize body is aborted mid-stream, never buffered whole → no OOM). Each field in
+/// **bytes**; `0` disables that particular ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RegistryPullLimits {
+    /// Per-blob ceiling, bytes — the max any single layer/config blob may download. A blob that
+    /// streams past `min(this, its declared size)` is aborted mid-download. `0` ⇒ no operator
+    /// per-blob ceiling (the manifest-declared size still caps each blob). Default 10 GiB.
+    pub max_layer_bytes: u64,
+    /// Whole-image ceiling, bytes — the max running total across ALL layers. Aborts a
+    /// many-layer image that would exceed it even though each layer is individually under the
+    /// per-blob cap. `0` ⇒ no whole-image ceiling. Default 20 GiB.
+    pub max_image_bytes: u64,
+    /// Manifest/config ceiling, bytes — the max a single MANIFEST or CONFIG read may download.
+    /// Unlike a layer these are small JSON documents buffered in MEMORY, so this is a far tighter
+    /// cap than `max_layer_bytes`: a manifest declares no `size`, so without it the manifest read
+    /// is bounded only by the generous 10 GiB layer ceiling. A read past `min(this, the config's
+    /// declared size)` is aborted mid-download. `0` ⇒ no manifest/config ceiling (the config's
+    /// declared size still caps it; a size-undeclared manifest is then bounded only by the pull
+    /// timeouts/deadline). Default 32 MiB.
+    pub max_manifest_bytes: u64,
+}
+
+impl RegistryPullLimits {
+    /// The default ceilings, as a `const` so it can seed the process-global static.
+    const DEFAULT: Self = Self {
+        max_layer_bytes: DEFAULT_PULL_MAX_LAYER_BYTES,
+        max_image_bytes: DEFAULT_PULL_MAX_IMAGE_BYTES,
+        max_manifest_bytes: DEFAULT_PULL_MAX_MANIFEST_BYTES,
+    };
+
+    /// `v` bytes as a ceiling, or `None` when `v == 0` (ceiling disabled).
+    fn cap(v: u64) -> Option<u64> {
+        (v > 0).then_some(v)
+    }
+}
+
+impl Default for RegistryPullLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The process-global registry-pull byte ceilings the blob fetchers consult. Installed ONCE at
+/// node serve wiring from `[compute].registry_pull_limits` ([`install_registry_pull_limits`]);
+/// default = the built-in ceilings above. Node operator config, never guest-influenced (mirrors
+/// the timeouts global).
+static REGISTRY_PULL_LIMITS: RwLock<RegistryPullLimits> = RwLock::new(RegistryPullLimits::DEFAULT);
+
+/// Install the operator's registry-pull byte ceilings into the process-global the OCI blob
+/// fetchers read. Called at node serve wiring; idempotent (a later call replaces the installed
+/// values — config reload). Infallible: every field is a plain byte count (`0` disables a
+/// ceiling), so there is nothing to reject.
+pub fn install_registry_pull_limits(cfg: RegistryPullLimits) {
+    *REGISTRY_PULL_LIMITS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = cfg;
+}
+
+/// Snapshot the installed [`RegistryPullLimits`] (default when unset).
+fn registry_pull_limits() -> RegistryPullLimits {
+    *REGISTRY_PULL_LIMITS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The effective per-blob byte ceiling: the tighter of the manifest-declared blob `size` (when
+/// present and non-zero) and the operator `max_layer_bytes` ceiling. `None` ⇒ neither bound is
+/// set (download uncapped at the per-blob level — the whole-image ceiling + deadline still
+/// apply). A blob whose running byte count exceeds this is aborted DURING the read.
+fn blob_cap(declared_size: Option<u64>) -> Option<u64> {
+    let operator = RegistryPullLimits::cap(registry_pull_limits().max_layer_bytes);
+    match (declared_size.filter(|&s| s > 0), operator) {
+        (Some(declared), Some(op)) => Some(declared.min(op)),
+        (declared, op) => declared.or(op),
+    }
+}
+
+/// The effective byte cap for a MANIFEST or CONFIG read — both small JSON documents buffered in
+/// memory (not streamed to disk like a layer), so bounded by the TIGHT `max_manifest_bytes`
+/// ceiling rather than the generous per-layer `max_layer_bytes`, tightened further by the blob's
+/// own manifest-declared `size` when it has one (a manifest declares none). `None` ⇒
+/// `max_manifest_bytes` is disabled AND the blob declares no size ⇒ the read is uncapped in
+/// memory (bounded then only by the pull timeouts/deadline). A read whose running byte count
+/// exceeds this is aborted DURING the read, same as [`blob_cap`]. Mirrors [`blob_cap`] but reads
+/// the manifest/config ceiling instead of the layer ceiling.
+fn manifest_cap(declared_size: Option<u64>) -> Option<u64> {
+    let operator = RegistryPullLimits::cap(registry_pull_limits().max_manifest_bytes);
+    match (declared_size.filter(|&s| s > 0), operator) {
+        (Some(declared), Some(op)) => Some(declared.min(op)),
+        (declared, op) => declared.or(op),
+    }
+}
+
+/// An incremental content-digest hasher, created FAIL-CLOSED: an unknown/unsupported algorithm
+/// is rejected BEFORE any bytes are streamed (so a `@sha512:`/future-algo pin is verified, never
+/// waved through, and we never download gigabytes only to reject the algo afterwards). A
+/// concrete enum (not a `dyn DynDigest`) so the pull future stays `Send`.
+enum BlobHasher {
+    Sha256(sha2::Sha256),
+    Sha512(sha2::Sha512),
+}
+
+impl BlobHasher {
+    /// The hasher for a `<algo>:<hex>` content digest, plus the wanted lowercase hex. Fails
+    /// closed on a malformed digest or an unsupported algorithm (matching [`verify_digest`]).
+    fn new(digest: &str) -> Result<(Self, String), OciError> {
+        use sha2::Digest as _;
+        let (algo, hex_want) = digest
+            .split_once(':')
+            .ok_or_else(|| OciError::Registry(format!("malformed content digest {digest}")))?;
+        let hasher = match algo {
+            "sha256" => Self::Sha256(sha2::Sha256::new()),
+            "sha512" => Self::Sha512(sha2::Sha512::new()),
+            other => {
+                return Err(OciError::Registry(format!(
+                    "unsupported digest algorithm {other:?}: refusing to trust unverifiable content"
+                )));
+            }
+        };
+        Ok((hasher, hex_want.to_string()))
+    }
+
+    /// Feed a chunk to the running hash.
+    fn update(&mut self, data: &[u8]) {
+        use sha2::Digest as _;
+        match self {
+            Self::Sha256(h) => h.update(data),
+            Self::Sha512(h) => h.update(data),
+        }
+    }
+
+    /// Finalize to lowercase hex.
+    fn finalize_hex(self) -> String {
+        use sha2::Digest as _;
+        match self {
+            Self::Sha256(h) => hex::encode(h.finalize()),
+            Self::Sha512(h) => hex::encode(h.finalize()),
+        }
+    }
+}
+
+/// Stream `resp`'s body into `sink` in chunks, aborting DURING the read the moment the running
+/// byte count exceeds `cap` — so an oversize body is cut off mid-stream and never buffered whole
+/// (closes the unbounded-allocation / OOM vector). Each chunk is fed to `hasher` (when present)
+/// so a to-disk blob's digest is verified incrementally without re-reading the file. `what`
+/// names the resource for the cap-exceeded error. Returns the total bytes written. `sink` is a
+/// concrete `W: Write` (not `&mut dyn Write`) so the future stays `Send` — a `dyn Write` trait
+/// object is `!Send`, and this future is held across `.await` on pull paths that must be `Send`.
+async fn stream_body<W: std::io::Write>(
+    mut resp: reqwest::Response,
+    cap: Option<u64>,
+    mut hasher: Option<&mut BlobHasher>,
+    what: &str,
+    sink: &mut W,
+) -> Result<u64, OciError> {
+    let mut total: u64 = 0;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| reqwest_err(&e))? {
+        total = total.saturating_add(chunk.len() as u64);
+        if let Some(limit) = cap
+            && total > limit
+        {
+            return Err(OciError::Registry(format!(
+                "{what} exceeded its {limit}-byte size cap mid-download and was aborted \
+                 (refusing to buffer an oversize registry body)"
+            )));
+        }
+        if let Some(h) = hasher.as_deref_mut() {
+            h.update(&chunk);
+        }
+        sink.write_all(&chunk).map_err(OciError::Io)?;
+    }
+    Ok(total)
+}
+
+/// A typed SSRF-screen refusal carried OUT of the custom DNS resolver / redirect screen so its
+/// actionable message (the refused host + the `[compute].allow_private_registries` hint)
+/// survives reqwest's error wrapping (U31). On the HOSTNAME path the screen fails inside
+/// [`ScreeningResolver`] (reqwest never calls it for a literal IP), and reqwest would otherwise
+/// surface only its own generic transport Display ("error sending request for url …"), hiding
+/// the operator-facing allow-list hint. Boxed as the resolver's error, it rides reqwest's
+/// `source()` chain and is recovered by [`reqwest_err`].
+#[derive(Debug, Clone)]
+struct ScreenRefusal(String);
+
+impl std::fmt::Display for ScreenRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScreenRefusal {}
+
+/// Convert a `reqwest` error into an [`OciError`], PRESERVING a [`ScreenRefusal`] message when
+/// the SSRF screen is what rejected the request (U31). Walks the error's `source()` chain; the
+/// first `ScreenRefusal` found wins (its message names the refused host + points at
+/// `[compute].allow_private_registries`), so a hostname-named internal/metadata registry yields
+/// the actionable error instead of reqwest's generic transport string. Falls back to reqwest's
+/// own Display when the failure was an ordinary transport error.
+fn reqwest_err(e: &reqwest::Error) -> OciError {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(refusal) = err.downcast_ref::<ScreenRefusal>() {
+            return OciError::Registry(refusal.0.clone());
+        }
+        cur = err.source();
+    }
+    OciError::Registry(e.to_string())
 }
 
 /// Build the SSRF-screened pull client, shared across registry + blob + token
@@ -808,6 +1232,10 @@ impl reqwest::dns::Resolve for ScreeningResolver {
 /// and rejects a hop to a literal non-global IP (which the resolver never sees).
 /// Redirects are FOLLOWED — a registry blob GET legitimately `307`s to a CDN — but
 /// an SSRF redirect to cloud metadata / an internal host is refused, not chased.
+///
+/// The client carries the operator's connect + read/idle timeouts (U30) so a
+/// dead/stalling registry fails the pull in bounded time; the overall per-request cap is
+/// applied per-call to the small control-plane requests only (see [`get_authed`]).
 fn screening_client() -> Result<reqwest::Client, OciError> {
     let redirect = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= 8 {
@@ -823,43 +1251,67 @@ fn screening_client() -> Result<reqwest::Client, OciError> {
         let literal_bad = screen_url_host(attempt.url()).is_err();
         let shown = attempt.url().to_string();
         if !is_https {
-            attempt.error(std::io::Error::other(format!(
+            attempt.error(ScreenRefusal(format!(
                 "refusing non-https redirect to {shown}"
             )))
         } else if literal_bad {
-            attempt.error(std::io::Error::other(format!(
-                "refusing redirect to non-global host {shown}"
+            // Typed so the refusal message survives reqwest's wrapping (U31), same as the
+            // resolver (hostname) path — a redirect to a non-global host is the same SSRF class,
+            // and carries the SAME actionable `[compute].allow_private_registries` hint (an
+            // operator who wants a redirect to an internal CDN allowed adds it to the allow-list).
+            attempt.error(ScreenRefusal(format!(
+                "refusing redirect to non-global host {shown}: it is not on the \
+                 `[compute].allow_private_registries` operator allow-list"
             )))
         } else {
             attempt.follow()
         }
     });
-    reqwest::Client::builder()
+    let t = registry_pull_timeouts();
+    let mut builder = reqwest::Client::builder()
         .user_agent("boatramp-compute")
         .dns_resolver(std::sync::Arc::new(ScreeningResolver))
-        .redirect(redirect)
+        .redirect(redirect);
+    // Bound the pull (U30): a connect timeout (TCP+TLS handshake) and a read/idle timeout
+    // (the max no-bytes-flowing gap, which catches "accepts the connection and never
+    // answers" without capping a legitimately large blob — it resets per chunk). The overall
+    // cap is applied per-request to the small control-plane GETs only (see `get_authed`).
+    if let Some(d) = RegistryPullTimeouts::dur(t.connect_secs) {
+        builder = builder.connect_timeout(d);
+    }
+    if let Some(d) = RegistryPullTimeouts::dur(t.read_secs) {
+        builder = builder.read_timeout(d);
+    }
+    builder
         .build()
         .map_err(|e| OciError::Registry(e.to_string()))
 }
 
 /// GET `url` with the manifest Accept header, performing a one-shot
 /// `WWW-Authenticate: Bearer` token exchange on `401` (anonymous pull).
+///
+/// `overall` is the per-request total-time cap (U30): `Some(_)` for the small control-plane
+/// GETs (manifest), `None` for a blob GET whose legitimately-large body is bounded by the
+/// client's idle read timeout instead of a hard overall cap. The connect + read/idle bounds
+/// live on the shared `client` ([`screening_client`]).
 async fn get_authed(
     client: &reqwest::Client,
     url: &str,
     accept: &str,
     token: &mut Option<String>,
+    overall: Option<Duration>,
 ) -> Result<reqwest::Response, OciError> {
     let send = |bearer: &Option<String>| {
         let mut req = client.get(url).header(reqwest::header::ACCEPT, accept);
+        if let Some(d) = overall {
+            req = req.timeout(d);
+        }
         if let Some(t) = bearer {
             req = req.bearer_auth(t);
         }
         req.send()
     };
-    let resp = send(token)
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    let resp = send(token).await.map_err(|e| reqwest_err(&e))?;
     if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
         return Ok(resp);
     }
@@ -872,9 +1324,7 @@ async fn get_authed(
         .to_string();
     let new_token = fetch_token(client, &challenge).await?;
     *token = Some(new_token);
-    send(token)
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))
+    send(token).await.map_err(|e| reqwest_err(&e))
 }
 
 /// Resolve a `Bearer realm="…",service="…",scope="…"` challenge into a token.
@@ -910,16 +1360,14 @@ async fn fetch_token(client: &reqwest::Client, challenge: &str) -> Result<String
     // lexical screen but be decoded + dialed by reqwest without the resolver (Security HIGH).
     parse_realm(&realm)?;
     screen_pull_url(&realm)?;
-    let resp = client
-        .get(&realm)
-        .query(&query)
-        .send()
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    // The token exchange is a small control-plane request → bound it with the overall cap (U30)
+    // so a never-answering realm host can't stall the pull past the budget.
+    let mut req = client.get(&realm).query(&query);
+    if let Some(d) = small_request_overall_timeout() {
+        req = req.timeout(d);
+    }
+    let resp = req.send().await.map_err(|e| reqwest_err(&e))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| reqwest_err(&e))?;
     json.get("token")
         .or_else(|| json.get("access_token"))
         .and_then(|t| t.as_str())
@@ -1050,82 +1498,155 @@ async fn fetch_manifest(
     token: &mut Option<String>,
     expect: Option<&str>,
 ) -> Result<serde_json::Value, OciError> {
-    let resp = get_authed(client, url, MANIFEST_ACCEPT, token).await?;
+    // A manifest is small → cap it with the overall per-request timeout (U30) AND stream it under
+    // the TIGHT manifest/config byte ceiling, so a malicious registry cannot OOM the node by
+    // streaming an unbounded body in place of a manifest (a manifest declares no size of its own,
+    // so `max_manifest_bytes` — not the generous 10 GiB layer ceiling — is what bounds it).
+    let resp = get_authed(
+        client,
+        url,
+        MANIFEST_ACCEPT,
+        token,
+        small_request_overall_timeout(),
+    )
+    .await?;
     if !resp.status().is_success() {
         return Err(OciError::Registry(format!(
             "manifest GET {}",
             resp.status()
         )));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    let mut bytes: Vec<u8> = Vec::new();
+    stream_body(resp, manifest_cap(None), None, "manifest", &mut bytes).await?;
     if let Some(d) = expect {
         verify_digest(&bytes, d)?;
     }
     serde_json::from_slice(&bytes).map_err(|e| OciError::Registry(e.to_string()))
 }
 
-/// Fetch + verify a blob by `digest` from `base`. The blob bytes are verified
-/// against `digest` via [`verify_digest`], which fails closed on an unknown
-/// algorithm (so a `sha512:` config/layer digest is verified, not waved through).
+/// Fetch + verify a SMALL blob (the image config) by `digest` from `base`, into memory. The
+/// body is streamed under `manifest_cap(declared_size)` — the TIGHT manifest/config ceiling, not
+/// the generous per-layer one (a config is a KB-scale JSON document) — aborted mid-read if it
+/// exceeds the cap, so a registry cannot OOM the node by streaming an unbounded body under a tiny
+/// declared size, and verified against `digest` via [`verify_digest`], which fails closed on an
+/// unknown algorithm. Used only for the config blob; layer blobs stream to disk via
+/// [`fetch_layer_to_file`].
 async fn fetch_blob(
     client: &reqwest::Client,
     base: &str,
     digest: &str,
     token: &mut Option<String>,
+    declared_size: Option<u64>,
 ) -> Result<Vec<u8>, OciError> {
     let url = format!("{base}/blobs/{digest}");
-    let resp = get_authed(client, &url, "*/*", token).await?;
+    // No per-request overall cap on a blob (U30): a layer may legitimately be large/slow, so it
+    // is bounded by the idle read timeout (resets per chunk) + the byte cap + the whole-pull
+    // deadline — never severed mid-request-progress.
+    let resp = get_authed(client, &url, "*/*", token, None).await?;
     if !resp.status().is_success() {
         return Err(OciError::Registry(format!("blob GET {}", resp.status())));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    let mut bytes: Vec<u8> = Vec::new();
+    stream_body(
+        resp,
+        manifest_cap(declared_size),
+        None,
+        "config blob",
+        &mut bytes,
+    )
+    .await?;
     verify_digest(&bytes, digest)?;
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
-/// Fetch all of a resolved manifest's layer blobs (lowest first).
-async fn fetch_layers(r: &mut ResolvedManifest) -> Result<Vec<Vec<u8>>, OciError> {
-    let digests: Vec<String> = r.manifest["layers"]
+/// A resolved manifest's layer descriptors in apply order (lowest first): each layer's content
+/// `digest` and its manifest-declared compressed `size` (`None` when absent/non-integer — then
+/// only the operator per-blob ceiling caps that blob).
+fn layer_descriptors(manifest: &serde_json::Value) -> Result<Vec<(String, Option<u64>)>, OciError> {
+    manifest["layers"]
         .as_array()
         .ok_or_else(|| OciError::Registry("manifest has no layers".into()))?
         .iter()
         .map(|l| {
-            l["digest"]
+            let digest = l["digest"]
                 .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| OciError::Registry("layer missing digest".into()))
+                .ok_or_else(|| OciError::Registry("layer missing digest".into()))?
+                .to_string();
+            Ok((digest, l["size"].as_u64()))
         })
-        .collect::<Result<_, _>>()?;
-    let mut out = Vec::with_capacity(digests.len());
-    for digest in &digests {
-        out.push(fetch_blob(&r.client, &r.base, digest, &mut r.token).await?);
+        .collect()
+}
+
+/// Stream a layer blob to `out` on disk, verifying it as it downloads: the body is read in
+/// chunks (memory stays O(one chunk), never the whole blob), the running byte count is checked
+/// against `blob_cap(declared_size)` and the download ABORTED mid-stream if it is exceeded (a
+/// layer past its own declared size is malformed; the operator ceiling backstops), and the
+/// content digest is verified incrementally at the end. Returns the bytes written. Fails closed
+/// on an unknown digest algorithm BEFORE streaming a single byte.
+async fn fetch_layer_to_file(
+    client: &reqwest::Client,
+    base: &str,
+    digest: &str,
+    token: &mut Option<String>,
+    declared_size: Option<u64>,
+    out: &Path,
+) -> Result<u64, OciError> {
+    // Fail closed on the algorithm up front — never download a blob we cannot verify.
+    let (mut hasher, hex_want) = BlobHasher::new(digest)?;
+    let url = format!("{base}/blobs/{digest}");
+    let resp = get_authed(client, &url, "*/*", token, None).await?;
+    if !resp.status().is_success() {
+        return Err(OciError::Registry(format!("blob GET {}", resp.status())));
     }
-    Ok(out)
+    let mut file = std::io::BufWriter::new(fs::File::create(out)?);
+    let n = stream_body(
+        resp,
+        blob_cap(declared_size),
+        Some(&mut hasher),
+        "layer blob",
+        &mut file,
+    )
+    .await?;
+    use std::io::Write as _;
+    file.flush().map_err(OciError::Io)?;
+    let got = hasher.finalize_hex();
+    if !got.eq_ignore_ascii_case(&hex_want) {
+        return Err(OciError::Registry(format!("digest mismatch for {digest}")));
+    }
+    Ok(n)
 }
 
-/// Pull an image's layer blobs (gzip'd tar, lowest first) over the registry HTTP
-/// API — anonymous pull with the Bearer-token dance. A multi-arch index resolves
-/// to `linux/<guest-arch>` (see [`oci_arch`]). Each blob is verified against its
-/// `sha256:` digest. Network seam (not unit-tested). Assumes gzip layers.
-pub async fn pull_layers(image: &str) -> Result<Vec<Vec<u8>>, OciError> {
-    let mut r = resolve_manifest(image).await?;
-    fetch_layers(&mut r).await
-}
-
-/// Pull an image's runtime [`ImageConfig`] + its layer blobs. The config blob (a
-/// JSON object referenced by `manifest.config.digest`) carries the process to run
-/// — `Entrypoint`/`Cmd`/`Env`/`WorkingDir` — which the baked init needs.
-pub async fn pull_image(image: &str) -> Result<(ImageConfig, Vec<Vec<u8>>), OciError> {
-    let mut r = resolve_manifest(image).await?;
-    let config = parse_image_config(&mut r).await?;
-    let layers = fetch_layers(&mut r).await?;
-    Ok((config, layers))
+/// Download the resolved manifest's layers (each STREAMED to a temp file in `layers_dir` under
+/// its byte cap + digest verification) and overlay them, lowest first, onto `target`. Each
+/// layer's tarball is dropped as soon as it is overlaid, so peak scratch disk stays ~one layer
+/// and node memory stays O(one chunk) — no `Vec<Vec<u8>>` of whole layers. The running total
+/// across all layers is bounded by the operator whole-image ceiling. The caller owns
+/// `layers_dir`'s lifetime (removes it) so the cleanup survives an overall-deadline cancellation.
+async fn apply_image_layers_in(
+    r: &mut ResolvedManifest,
+    target: &Path,
+    layers_dir: &Path,
+) -> Result<(), OciError> {
+    let descriptors = layer_descriptors(&r.manifest)?;
+    let max_total = RegistryPullLimits::cap(registry_pull_limits().max_image_bytes);
+    let mut total: u64 = 0;
+    for (i, (digest, size)) in descriptors.iter().enumerate() {
+        let path = layers_dir.join(format!("layer-{i}.tar.gz"));
+        let n = fetch_layer_to_file(&r.client, &r.base, digest, &mut r.token, *size, &path).await?;
+        total = total.saturating_add(n);
+        if let Some(max) = max_total
+            && total > max
+        {
+            return Err(OciError::Registry(format!(
+                "image layers exceeded the {max}-byte whole-image pull ceiling; aborting"
+            )));
+        }
+        // Overlay this layer from disk (streaming gunzip), then drop its tarball.
+        let f = fs::File::open(&path)?;
+        apply_layer_gz(target, std::io::BufReader::new(f))?;
+        let _ = fs::remove_file(&path);
+    }
+    Ok(())
 }
 
 /// Pull ONLY an image's runtime [`ImageConfig`] — the manifest resolve + the (small)
@@ -1134,17 +1655,28 @@ pub async fn pull_image(image: &str) -> Result<(ImageConfig, Vec<Vec<u8>>), OciE
 /// is already staged (layers cached), so a bare `pg_dump`/`pg_restore`/`psql` resolves
 /// against the image's own `PATH` instead of failing with `127`. Network seam.
 pub async fn pull_image_config(image: &str) -> Result<ImageConfig, OciError> {
-    let mut r = resolve_manifest(image).await?;
-    parse_image_config(&mut r).await
+    // Bound the WHOLE config-only network fetch (manifest resolve + the small config blob) by the
+    // operator overall wall-clock deadline, exactly as `build_rootfs`/`build_rootfs_dir` bound the
+    // layer pulls. Without this, a registry drip-feeding bytes just under the idle `read_secs` on
+    // the manifest or config response holds THIS path — and the serial reconcile loop awaiting it —
+    // open indefinitely, the same cross-tenant DoS the layer deadline closes. It downloads no
+    // layers, so the wrap is a plain span around the two small fetches.
+    with_pull_deadline(async {
+        let mut r = resolve_manifest(image).await?;
+        parse_image_config(&mut r).await
+    })
+    .await
 }
 
 /// Fetch + parse the image config blob into an [`ImageConfig`].
 async fn parse_image_config(r: &mut ResolvedManifest) -> Result<ImageConfig, OciError> {
-    let digest = r.manifest["config"]["digest"]
+    let config_desc = &r.manifest["config"];
+    let digest = config_desc["digest"]
         .as_str()
         .ok_or_else(|| OciError::Registry("manifest has no config digest".into()))?
         .to_string();
-    let bytes = fetch_blob(&r.client, &r.base, &digest, &mut r.token).await?;
+    let declared_size = config_desc["size"].as_u64();
+    let bytes = fetch_blob(&r.client, &r.base, &digest, &mut r.token, declared_size).await?;
     let json: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| OciError::Registry(e.to_string()))?;
     let cfg = &json["config"];
@@ -1280,11 +1812,12 @@ fn make_staging_dir(tag: &str) -> Result<PathBuf, OciError> {
     )))
 }
 
-/// Build an ext4 rootfs at `out` from an OCI `image`: pull the image (config +
-/// layers) → overlay the layers → inject a `/sbin/init` that execs the workload
-/// (the `entrypoint` override, else the image's `Entrypoint`+`Cmd`; with `env`
-/// merged over the image env) + a default `/etc/resolv.conf` → `mke2fs -d`.
-/// Orchestrates the network + host-tool seams.
+/// Build an ext4 rootfs at `out` from an OCI `image`: resolve the manifest → fetch the config →
+/// **stream** each layer to disk and overlay it → inject a `/sbin/init` that execs the workload
+/// (the `entrypoint` override, else the image's `Entrypoint`+`Cmd`; with `env` merged over the
+/// image env) + a default `/etc/resolv.conf` → `mke2fs -d`. Orchestrates the network + host-tool
+/// seams. The whole network pull is bounded by the operator wall-clock deadline; layers never
+/// buffer whole in memory.
 pub async fn build_rootfs(
     image: &str,
     entrypoint: &[String],
@@ -1293,17 +1826,28 @@ pub async fn build_rootfs(
     size_mib: u64,
     volume_mounts: &[String],
 ) -> Result<(), OciError> {
-    let (config, layers) = pull_image(image).await?;
-    let argv = effective_argv(&config, entrypoint)?;
     let tag = out.file_name().and_then(|n| n.to_str()).unwrap_or("vm");
     let work = make_staging_dir(tag)?;
-    let result = (|| {
-        for layer in &layers {
-            apply_layer_gz(&work, &layer[..])?;
-        }
+    // A SEPARATE scratch dir for the downloaded layer tarballs (never inside `work`, which is
+    // overlaid into the rootfs). Both dirs are removed below regardless of how the pull ends —
+    // including an overall-deadline cancellation that drops the pull future mid-flight.
+    let layers_dir = make_staging_dir(&format!("{tag}-layers"))?;
+    let result = async {
+        // The network-bound pull (manifest + config + every layer overlaid into `work`) runs
+        // under the overall wall-clock deadline; the local `write_init` + `mke2fs` do not.
+        let config = with_pull_deadline(async {
+            let mut r = resolve_manifest(image).await?;
+            let config = parse_image_config(&mut r).await?;
+            apply_image_layers_in(&mut r, &work, &layers_dir).await?;
+            Ok::<_, OciError>(config)
+        })
+        .await?;
+        let argv = effective_argv(&config, entrypoint)?;
         write_init(&work, &argv, &config, env, volume_mounts)?;
         build_ext4(&work, out, size_mib)
-    })();
+    }
+    .await;
+    let _ = fs::remove_dir_all(&layers_dir);
     let _ = fs::remove_dir_all(&work);
     result
 }
@@ -1408,18 +1952,25 @@ fn resolv_conf_body(ns_override: Option<&str>) -> String {
 }
 
 /// Materialize an OCI `image` into an unpacked rootfs **directory** at `out`
-/// (pull → overlay its layers, honoring whiteouts) — the same overlay as
-/// [`build_rootfs`] but stopping before `mke2fs`. The native **container**
-/// backend boots from this directory directly (`pivot_root`); no ext4 image,
-/// so it needs no `e2fsprogs`. Idempotent: `out` is recreated.
+/// (pull → **stream** each layer to disk → overlay it, honoring whiteouts) — the
+/// same overlay as [`build_rootfs`] but stopping before `mke2fs`. The native
+/// **container** backend boots from this directory directly (`pivot_root`); no
+/// ext4 image, so it needs no `e2fsprogs`. Idempotent: `out` is recreated. The
+/// pull is bounded by the operator wall-clock deadline + byte ceilings; layers
+/// never buffer whole in memory.
 pub async fn build_rootfs_dir(image: &str, out: &Path) -> Result<(), OciError> {
-    let layers = pull_layers(image).await?;
     let _ = fs::remove_dir_all(out);
     fs::create_dir_all(out)?;
-    for layer in &layers {
-        apply_layer_gz(out, &layer[..])?;
-    }
-    Ok(())
+    // Scratch dir for the downloaded layer tarballs; removed below regardless of how the pull
+    // ends (including an overall-deadline cancellation that drops the pull future mid-flight).
+    let layers_dir = make_staging_dir("oci-dir-layers")?;
+    let result = with_pull_deadline(async {
+        let mut r = resolve_manifest(image).await?;
+        apply_image_layers_in(&mut r, out, &layers_dir).await
+    })
+    .await;
+    let _ = fs::remove_dir_all(&layers_dir);
+    result
 }
 
 #[cfg(test)]
@@ -2370,5 +2921,646 @@ mod tests {
             resolv_conf_body(Some("6.6.6.6\nnameserver 7.7.7.7")),
             "nameserver 1.1.1.1\n"
         );
+    }
+
+    // ---- U30: bound the registry pull with timeouts ----
+
+    /// Serialize the tests that mutate the process-global pull timeouts/limits, so the suite's
+    /// default parallelism can't let one test observe another's installed values. Poison-tolerant
+    /// (a panicking test must not wedge the rest). Held across awaits — the `#[tokio::test]`
+    /// current-thread runtime does not require the guard to be `Send`.
+    fn pull_globals_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Read an HTTP request's bytes off a loopback test socket (enough to let the client finish
+    /// sending before the server responds). A single read captures the small GET on loopback.
+    fn drain_http_request(stream: &mut std::net::TcpStream) {
+        use std::io::Read as _;
+        let mut buf = [0u8; 2048];
+        let _ = stream.read(&mut buf);
+    }
+
+    #[test]
+    fn registry_pull_timeouts_default_and_install_round_trip() {
+        let _guard = pull_globals_lock();
+        // The built-in defaults are the documented, defensible bounds.
+        let def = RegistryPullTimeouts::default();
+        assert_eq!(def.connect_secs, 10);
+        assert_eq!(def.read_secs, 30);
+        assert_eq!(def.response_secs, 120);
+        assert_eq!(def.overall_pull_secs, 600);
+        // `dur` maps seconds → Duration, and `0` disables a bound.
+        assert_eq!(RegistryPullTimeouts::dur(10), Some(Duration::from_secs(10)));
+        assert_eq!(RegistryPullTimeouts::dur(0), None);
+
+        // Installing a config is honored by the process-globals the pull reads.
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 3,
+            read_secs: 4,
+            response_secs: 0,     // disables the per-request overall cap
+            overall_pull_secs: 0, // disables the whole-pull deadline
+        });
+        let got = registry_pull_timeouts();
+        assert_eq!(
+            (
+                got.connect_secs,
+                got.read_secs,
+                got.response_secs,
+                got.overall_pull_secs
+            ),
+            (3, 4, 0, 0)
+        );
+        assert_eq!(small_request_overall_timeout(), None, "0 ⇒ no overall cap");
+        assert_eq!(overall_pull_timeout(), None, "0 ⇒ no whole-pull deadline");
+        // Restore the defaults so no other test observes the mutated global.
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+        assert_eq!(
+            small_request_overall_timeout(),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(overall_pull_timeout(), Some(Duration::from_secs(600)));
+    }
+
+    #[tokio::test]
+    // The serialization guard is deliberately held across `.await`: each `#[tokio::test]` runs on
+    // its OWN current-thread runtime, so holding a std mutex over an await serializes the
+    // process-global pull config across the parallel TEST THREADS without any deadlock risk.
+    #[allow(clippy::await_holding_lock)]
+    async fn pull_client_fails_in_bounded_time_against_a_dead_endpoint() {
+        let _guard = pull_globals_lock();
+        // A registry that ACCEPTS the connection and then NEVER answers must not hang the pull
+        // forever — the connect+read/idle bounds (and the per-request overall cap) make it fail
+        // in bounded time. Hermetic: a loopback listener that accepts + holds the socket without
+        // ever writing a response byte. (The SSRF screen does not fire here — reqwest connects to
+        // a literal-IP host without consulting `ScreeningResolver`, exactly the surface we test.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Accept connections and HOLD them open (never respond) for the test's lifetime.
+            let mut held = Vec::new();
+            while held.len() < 16 {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => break,
+                }
+            }
+            std::thread::sleep(Duration::from_secs(30));
+            drop(held);
+        });
+
+        // Install tight bounds so a bounded failure is quick + unambiguous.
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 2,
+            read_secs: 1,
+            response_secs: 2,
+            overall_pull_secs: 5,
+        });
+        let client = screening_client().unwrap();
+        let url = format!("http://{addr}/v2/");
+
+        // (a) The shared client's read/idle timeout bounds a never-answering endpoint — no
+        // per-request overall cap applied, so this exercises `read_timeout` specifically.
+        let start = std::time::Instant::now();
+        let res = client.get(&url).send().await;
+        let elapsed = start.elapsed();
+        assert!(res.is_err(), "a dead endpoint must fail, not hang");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "read/idle timeout must bound the failure (took {elapsed:?})"
+        );
+
+        // (b) The overall per-request cap (`.timeout(...)`) also bounds it — the explicit
+        // control-plane cap used for token + manifest GETs.
+        let start = std::time::Instant::now();
+        let res = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await;
+        let elapsed = start.elapsed();
+        assert!(
+            res.is_err(),
+            "the overall request cap must fail a dead endpoint"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "overall timeout must bound the failure (took {elapsed:?})"
+        );
+
+        // Restore the defaults so no other test observes the mutated global.
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+    }
+
+    // ---- U31: typed, message-preserving SSRF refusal on the hostname path ----
+
+    #[tokio::test]
+    async fn hostname_ssrf_refusal_carries_the_allowlist_hint() {
+        // The HOSTNAME path: a registry named by host that resolves to a non-global address is
+        // refused INSIDE the DNS resolver. The refusal must reach the caller as a TYPED,
+        // message-preserving error that names the refused host AND points at
+        // `[compute].allow_private_registries` — not the generic reqwest transport string that
+        // swallowed the hint before (U31). Hermetic: `localhost` resolves to loopback via
+        // /etc/hosts with no network.
+        let client = screening_client().unwrap();
+        let err = client
+            .get("http://localhost:9/v2/")
+            .send()
+            .await
+            .expect_err("a loopback-resolving hostname must be refused by the SSRF screen");
+        let mapped = reqwest_err(&err);
+        let OciError::Registry(msg) = mapped else {
+            panic!("expected OciError::Registry, got {mapped:?}");
+        };
+        assert!(
+            msg.contains("localhost"),
+            "the typed refusal must name the refused host, got: {msg}"
+        );
+        assert!(
+            msg.contains("allow_private_registries"),
+            "the typed refusal must carry the actionable allow-list hint, got: {msg}"
+        );
+        // It must NOT be the generic reqwest transport string (which would have hidden the hint).
+        assert!(
+            !msg.starts_with("error sending request"),
+            "the generic transport message leaked instead of the typed refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn reqwest_err_without_a_screen_refusal_falls_back_to_transport_message() {
+        // When the failure is an ordinary transport error (no SSRF refusal in the chain),
+        // `reqwest_err` falls back to reqwest's own message — it never fabricates a hint.
+        let client = reqwest::Client::new();
+        // A syntactically bad URL yields a reqwest builder error with no `ScreenRefusal` source.
+        let err = client.get("http://[::bad url").build().unwrap_err();
+        let OciError::Registry(msg) = reqwest_err(&err) else {
+            panic!("expected OciError::Registry");
+        };
+        assert!(
+            !msg.contains("allow_private_registries"),
+            "a non-screen error must not gain an allow-list hint, got: {msg}"
+        );
+    }
+
+    // ---- Security HIGH follow-up: overall deadline + byte ceilings (anti-DoS / anti-OOM) ----
+
+    #[test]
+    fn registry_pull_limits_default_install_round_trip_and_blob_cap() {
+        let _guard = pull_globals_lock();
+        // The built-in ceilings are generous (no real image refused) but finite.
+        let def = RegistryPullLimits::default();
+        assert_eq!(def.max_layer_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(def.max_image_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(def.max_manifest_bytes, 32 * 1024 * 1024);
+        // `cap` maps a byte count → ceiling; `0` disables it.
+        assert_eq!(RegistryPullLimits::cap(123), Some(123));
+        assert_eq!(RegistryPullLimits::cap(0), None);
+
+        // With a 1 KiB per-LAYER ceiling and a distinct 2 KiB per-MANIFEST ceiling installed,
+        // `blob_cap` reads the layer knob and `manifest_cap` reads the manifest knob — each is the
+        // TIGHTER of the declared size and its own operator ceiling (the two paths are decoupled).
+        install_registry_pull_limits(RegistryPullLimits {
+            max_layer_bytes: 1024,
+            max_image_bytes: 0, // whole-image ceiling disabled
+            max_manifest_bytes: 2048,
+        });
+        assert_eq!(
+            blob_cap(None),
+            Some(1024),
+            "layer ceiling with no declared size"
+        );
+        assert_eq!(
+            blob_cap(Some(512)),
+            Some(512),
+            "declared size is tighter → wins"
+        );
+        assert_eq!(
+            blob_cap(Some(4096)),
+            Some(1024),
+            "layer ceiling is tighter → wins"
+        );
+        assert_eq!(
+            blob_cap(Some(0)),
+            Some(1024),
+            "a 0 declared size is ignored"
+        );
+        // `manifest_cap` is governed by `max_manifest_bytes`, NOT `max_layer_bytes` (decoupled).
+        assert_eq!(
+            manifest_cap(None),
+            Some(2048),
+            "manifest ceiling with no declared size (not the 1 KiB layer ceiling)"
+        );
+        assert_eq!(
+            manifest_cap(Some(512)),
+            Some(512),
+            "declared config size is tighter → wins"
+        );
+        assert_eq!(
+            manifest_cap(Some(4096)),
+            Some(2048),
+            "manifest ceiling is tighter → wins"
+        );
+        assert_eq!(
+            manifest_cap(Some(0)),
+            Some(2048),
+            "a 0 declared size is ignored"
+        );
+
+        // Disabling both operator ceilings leaves only the declared size on each path.
+        install_registry_pull_limits(RegistryPullLimits {
+            max_layer_bytes: 0,
+            max_image_bytes: 0,
+            max_manifest_bytes: 0,
+        });
+        assert_eq!(
+            blob_cap(None),
+            None,
+            "no layer ceiling + no declared size ⇒ uncapped"
+        );
+        assert_eq!(blob_cap(Some(777)), Some(777), "declared size still caps");
+        assert_eq!(
+            manifest_cap(None),
+            None,
+            "max_manifest_bytes = 0 + no declared size ⇒ uncapped in memory (time-bounded only)"
+        );
+        assert_eq!(
+            manifest_cap(Some(777)),
+            Some(777),
+            "the config's declared size still caps even with max_manifest_bytes = 0"
+        );
+
+        // Restore the defaults so no other test observes the mutated global.
+        install_registry_pull_limits(RegistryPullLimits::default());
+        assert_eq!(blob_cap(None), Some(10 * 1024 * 1024 * 1024));
+        assert_eq!(manifest_cap(None), Some(32 * 1024 * 1024));
+    }
+
+    #[tokio::test]
+    // See `pull_client_fails_…`: the guard is deliberately held across await to serialize the
+    // process-global pull config across parallel test threads (per-test current-thread runtimes).
+    #[allow(clippy::await_holding_lock)]
+    async fn oversize_blob_is_aborted_during_download_not_buffered_whole() {
+        let _guard = pull_globals_lock();
+        // A malicious registry that streams FAR more than the cap must be cut off MID-DOWNLOAD —
+        // never buffered whole (the OOM vector). Hermetic loopback server: declares a huge body
+        // and streams it; the client must abort after ~the cap with the cap error, and the
+        // on-disk file must hold nowhere near the full body.
+        const BODY: usize = 8 * 1024 * 1024; // 8 MiB streamed
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_http_request(&mut stream);
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {BODY}\r\n\r\n");
+                if stream.write_all(header.as_bytes()).is_err() {
+                    return;
+                }
+                let block = vec![b'A'; 64 * 1024];
+                let mut sent = 0;
+                while sent < BODY {
+                    // The client hangs up after the cap → the write errors; stop.
+                    if stream.write_all(&block).is_err() {
+                        break;
+                    }
+                    sent += block.len();
+                }
+            }
+        });
+
+        // A 64 KiB operator per-blob ceiling; no declared size; no deadline/idle interference.
+        // (The layer path reads `max_layer_bytes`; `max_manifest_bytes` is irrelevant here.)
+        install_registry_pull_limits(RegistryPullLimits {
+            max_layer_bytes: 64 * 1024,
+            max_image_bytes: 0,
+            max_manifest_bytes: 0,
+        });
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 5,
+            read_secs: 5,
+            response_secs: 0,
+            overall_pull_secs: 0,
+        });
+        let client = screening_client().unwrap();
+        let base = format!("http://{addr}");
+        let out = std::env::temp_dir().join(format!("br-oversize-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let mut token = None;
+        let res = fetch_layer_to_file(&client, &base, digest, &mut token, None, &out).await;
+
+        let err = res.expect_err("an oversize blob must be aborted, not accepted");
+        let OciError::Registry(msg) = err else {
+            panic!("expected OciError::Registry, got {err:?}");
+        };
+        assert!(
+            msg.contains("size cap"),
+            "must be the mid-download cap abort (not a post-download digest check), got: {msg}"
+        );
+        // Proof it aborted DURING the read: the file holds nowhere near the 8 MiB body.
+        let written = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            written < 1024 * 1024,
+            "must abort mid-stream, not buffer the whole oversize body (wrote {written} bytes)"
+        );
+        let _ = std::fs::remove_file(&out);
+
+        install_registry_pull_limits(RegistryPullLimits::default());
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+    }
+
+    #[tokio::test]
+    // See `pull_client_fails_…`: the guard is deliberately held across await to serialize the
+    // process-global pull config across parallel test threads (per-test current-thread runtimes).
+    #[allow(clippy::await_holding_lock)]
+    async fn slow_drip_blob_is_bounded_by_the_overall_deadline() {
+        let _guard = pull_globals_lock();
+        // A registry that trickles bytes just UNDER the idle timeout forever would hold a blob —
+        // and the serial reconcile loop awaiting it — open indefinitely (the per-chunk idle
+        // timeout resets on every byte). The overall WALL-CLOCK deadline must bound it. Hermetic
+        // loopback server: drips one byte every 50 ms (well under the 5 s idle timeout), far
+        // longer than the 1 s deadline.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_http_request(&mut stream);
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+                    .is_err()
+                {
+                    return;
+                }
+                for _ in 0..400 {
+                    if stream.write_all(b"A").is_err() {
+                        break;
+                    }
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        });
+
+        // Idle timeout 5 s (won't fire — bytes flow every 50 ms); no byte cap; deadline 1 s.
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 5,
+            read_secs: 5,
+            response_secs: 0,
+            overall_pull_secs: 1,
+        });
+        install_registry_pull_limits(RegistryPullLimits {
+            max_layer_bytes: 0,
+            max_image_bytes: 0,
+            max_manifest_bytes: 0,
+        });
+        let client = screening_client().unwrap();
+        let base = format!("http://{addr}");
+        let out = std::env::temp_dir().join(format!("br-slowdrip-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let mut token = None;
+
+        let start = std::time::Instant::now();
+        let res = with_pull_deadline(fetch_layer_to_file(
+            &client, &base, digest, &mut token, None, &out,
+        ))
+        .await;
+        let elapsed = start.elapsed();
+
+        let err = res.expect_err("a slow-drip blob must be aborted by the overall deadline");
+        let OciError::Registry(msg) = err else {
+            panic!("expected OciError::Registry, got {err:?}");
+        };
+        assert!(
+            msg.contains("deadline"),
+            "the abort must be the overall deadline (not the idle timeout), got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the overall deadline must bound the slow-drip (took {elapsed:?})"
+        );
+        let _ = std::fs::remove_file(&out);
+
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+        install_registry_pull_limits(RegistryPullLimits::default());
+    }
+
+    #[tokio::test]
+    async fn redirect_ssrf_refusal_round_trips_with_the_allowlist_hint() {
+        // The REDIRECT path (reviewer gap): a registry that 307s to a non-global literal IP is
+        // refused inside the redirect screen. Like the resolver (hostname) path, that refusal
+        // must reach the caller as a TYPED, message-preserving error carrying the
+        // `[compute].allow_private_registries` hint — not reqwest's generic transport string.
+        // Hermetic loopback server replies with the redirect; the client follows it into the
+        // screen. (No global mutation, so no lock needed.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_http_request(&mut stream);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\n\
+                      Location: https://127.0.0.1:1/blob\r\n\
+                      Content-Length: 0\r\n\r\n",
+                );
+            }
+        });
+
+        let client = screening_client().unwrap();
+        let url = format!("http://{addr}/v2/");
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("a redirect to a non-global literal IP must be refused by the screen");
+        let OciError::Registry(msg) = reqwest_err(&err) else {
+            panic!("expected OciError::Registry");
+        };
+        assert!(
+            msg.contains("allow_private_registries"),
+            "the redirect refusal must carry the actionable allow-list hint, got: {msg}"
+        );
+        assert!(
+            !msg.starts_with("error sending request"),
+            "the generic transport message leaked instead of the typed redirect refusal: {msg}"
+        );
+    }
+
+    // ---- Security LOW follow-ups: config-only deadline (a) + tight manifest/config cap (b) ----
+
+    #[tokio::test]
+    // See `pull_client_fails_…`: the guard is deliberately held across await to serialize the
+    // process-global pull config across parallel test threads (per-test current-thread runtimes).
+    #[allow(clippy::await_holding_lock)]
+    async fn oversize_manifest_is_aborted_during_the_read_by_the_manifest_cap() {
+        let _guard = pull_globals_lock();
+        // A malicious registry that streams FAR more than a KB-scale manifest must be cut off
+        // MID-READ by `max_manifest_bytes` — NOT by the generous `max_layer_bytes` (left at 10 GiB
+        // here, which would never abort an 8 MiB body: the two caps are decoupled). The manifest
+        // read is in memory, so the proof is the mid-download cap error naming "manifest" (a wrongly
+        // layer-capped read would instead buffer the 8 MiB whole and then fail to parse it as JSON).
+        const BODY: usize = 8 * 1024 * 1024; // 8 MiB streamed as a "manifest"
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_http_request(&mut stream);
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {BODY}\r\n\r\n");
+                if stream.write_all(header.as_bytes()).is_err() {
+                    return;
+                }
+                let block = vec![b'A'; 64 * 1024];
+                let mut sent = 0;
+                while sent < BODY {
+                    // The client hangs up after the cap → the write errors; stop.
+                    if stream.write_all(&block).is_err() {
+                        break;
+                    }
+                    sent += block.len();
+                }
+            }
+        });
+
+        // Tight 64 KiB manifest ceiling; the LAYER ceiling left generous (10 GiB) to prove the
+        // manifest path is governed by `max_manifest_bytes`, not `max_layer_bytes`.
+        install_registry_pull_limits(RegistryPullLimits {
+            max_layer_bytes: 10 * 1024 * 1024 * 1024,
+            max_image_bytes: 0,
+            max_manifest_bytes: 64 * 1024,
+        });
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 5,
+            read_secs: 5,
+            response_secs: 0,
+            overall_pull_secs: 0,
+        });
+        let client = screening_client().unwrap();
+        let url = format!("http://{addr}/v2/repo/manifests/latest");
+        let mut token = None;
+        let res = fetch_manifest(&client, &url, &mut token, None).await;
+
+        let err = res.expect_err("an oversize manifest must be aborted, not accepted");
+        let OciError::Registry(msg) = err else {
+            panic!("expected OciError::Registry, got {err:?}");
+        };
+        assert!(
+            msg.contains("manifest") && msg.contains("size cap"),
+            "must be the mid-read manifest cap abort (not a parse error from buffering it whole), got: {msg}"
+        );
+
+        install_registry_pull_limits(RegistryPullLimits::default());
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+    }
+
+    #[tokio::test]
+    // See `pull_client_fails_…`: the guard is deliberately held across await to serialize the
+    // process-global pull config across parallel test threads (per-test current-thread runtimes).
+    #[allow(clippy::await_holding_lock)]
+    async fn normal_manifest_is_unaffected_by_the_manifest_cap() {
+        let _guard = pull_globals_lock();
+        // A normal KB-scale manifest streams well under the generous default 32 MiB ceiling and
+        // parses unchanged — the tight cap refuses no real manifest.
+        let manifest_body: &[u8] =
+            br#"{"schemaVersion":2,"config":{"digest":"sha256:abc","size":7},"layers":[]}"#;
+        let len = manifest_body.len();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_http_request(&mut stream);
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n");
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(manifest_body);
+            }
+        });
+
+        install_registry_pull_limits(RegistryPullLimits::default());
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+        let client = screening_client().unwrap();
+        let url = format!("http://{addr}/v2/repo/manifests/latest");
+        let mut token = None;
+        let manifest = fetch_manifest(&client, &url, &mut token, None)
+            .await
+            .expect("a normal manifest under the default ceiling must parse");
+        assert_eq!(manifest["schemaVersion"].as_u64(), Some(2));
+
+        install_registry_pull_limits(RegistryPullLimits::default());
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+    }
+
+    #[tokio::test]
+    // See `pull_client_fails_…`: the guard is deliberately held across await to serialize the
+    // process-global pull config across parallel test threads (per-test current-thread runtimes).
+    #[allow(clippy::await_holding_lock)]
+    async fn config_only_fetch_is_bounded_by_the_overall_deadline() {
+        let _guard = pull_globals_lock();
+        // The config-only path (`pull_image_config`, the ephemeral pg_dump/config helper) downloads
+        // no layers — only the manifest + the small config blob — but a registry can still drip-feed
+        // bytes just under the idle `read_secs` on THOSE responses forever, holding the path (and the
+        // serial reconcile loop awaiting it) open. `pull_image_config` now wraps its fetch in
+        // `with_pull_deadline`; this proves that wrapper bounds a slow-drip MANIFEST/config fetch by
+        // the wall-clock, not just the idle gap. Hermetic loopback: one byte every 50 ms (well under
+        // the 5 s idle timeout), far longer than the 1 s deadline.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                drain_http_request(&mut stream);
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+                    .is_err()
+                {
+                    return;
+                }
+                for _ in 0..400 {
+                    if stream.write_all(b"A").is_err() {
+                        break;
+                    }
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        });
+
+        // Idle timeout 5 s (won't fire — a byte flows every 50 ms); deadline 1 s bounds the drip.
+        install_registry_pull_timeouts(RegistryPullTimeouts {
+            connect_secs: 5,
+            read_secs: 5,
+            response_secs: 0,
+            overall_pull_secs: 1,
+        });
+        install_registry_pull_limits(RegistryPullLimits::default());
+        let client = screening_client().unwrap();
+        let url = format!("http://{addr}/v2/repo/manifests/latest");
+        let mut token = None;
+
+        let start = std::time::Instant::now();
+        let res = with_pull_deadline(fetch_manifest(&client, &url, &mut token, None)).await;
+        let elapsed = start.elapsed();
+
+        let err =
+            res.expect_err("a slow-drip manifest fetch must be aborted by the overall deadline");
+        let OciError::Registry(msg) = err else {
+            panic!("expected OciError::Registry, got {err:?}");
+        };
+        assert!(
+            msg.contains("deadline"),
+            "the abort must be the overall wall-clock deadline (not the idle timeout), got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the overall deadline must bound the config-only fetch's slow-drip (took {elapsed:?})"
+        );
+
+        install_registry_pull_timeouts(RegistryPullTimeouts::default());
+        install_registry_pull_limits(RegistryPullLimits::default());
     }
 }

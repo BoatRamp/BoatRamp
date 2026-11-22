@@ -1512,6 +1512,60 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "is_default_allow_private_registries")]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub allow_private_registries: boatramp_firecracker::oci::PrivateRegistryAllowlist,
+    /// **Registry-pull timeouts** (U30) bounding the OCI image pull. The pull runs HTTP
+    /// requests (token exchange + manifest + blob GETs) against a tenant-named registry; a
+    /// registry that accepts the connection and never answers would otherwise hold the pull
+    /// forever (and stall every launch queued behind it). These bounds make a dead/stalling
+    /// registry fail the pull in bounded time with a clear error. Node operator config only
+    /// (System·Admin), NEVER guest-influenced. `connect_secs` bounds the TCP+TLS handshake;
+    /// `read_secs` is the idle/read timeout (the max no-bytes-flowing gap on a response — it
+    /// catches "accepts then never answers" and, resetting per chunk, bounds a stall WITHOUT
+    /// capping a legitimately large blob); `response_secs` is an overall cap for the small
+    /// token + manifest requests only (never the blob stream); `overall_pull_secs` is an
+    /// overall WALL-CLOCK deadline for the WHOLE image pull (manifest + config + every layer) —
+    /// it bounds a registry that drip-feeds bytes just under the idle gap forever (which the
+    /// per-chunk `read_secs` cannot catch), closing a tenant-triggerable cross-tenant DoS where
+    /// one slow pull freezes the node's serial reconcile loop. It is generous so a legitimately
+    /// large/slow pull still completes. Any field `0` disables that bound. Omitted ⇒ the
+    /// built-in defaults (10/30/120/600s). Example (RON):
+    ///
+    /// ```ron
+    /// registry_pull_timeouts: (
+    ///     connect_secs: 10,
+    ///     read_secs: 30,
+    ///     response_secs: 120,
+    ///     overall_pull_secs: 600,
+    /// )
+    /// ```
+    #[serde(default, skip_serializing_if = "is_default_registry_pull_timeouts")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub registry_pull_timeouts: boatramp_firecracker::oci::RegistryPullTimeouts,
+    /// **Registry-pull byte ceilings** bounding the OCI image pull's download size (Security
+    /// HIGH follow-up to U30). Each layer blob is streamed to disk as it downloads and ABORTED
+    /// the moment its running byte count exceeds `min(its manifest-declared size, max_layer_bytes)`
+    /// — so a malicious registry cannot exhaust node memory/disk by streaming an unbounded body
+    /// (the digest is only knowable after a full download, so the cap, not the digest check, is
+    /// what bounds the allocation). `max_image_bytes` caps the running total across all layers
+    /// (the whole image). `max_manifest_bytes` is a much tighter ceiling for the MANIFEST + CONFIG
+    /// reads (KB-scale JSON documents held in memory, not streamed to disk; a manifest declares no
+    /// size of its own, so without it the manifest read would be bounded only by the generous
+    /// 10 GiB `max_layer_bytes`). Node operator config only (System·Admin), NEVER guest-influenced.
+    /// Any field `0` disables that ceiling — with `max_manifest_bytes = 0` the config's own declared
+    /// size still caps it, but a size-undeclared manifest/config is then uncapped in memory (bounded
+    /// only by the pull timeouts/deadline). Omitted ⇒ the built-in defaults (10 GiB per blob /
+    /// 20 GiB per image / 32 MiB per manifest-or-config), generous enough that no real image is ever
+    /// refused. Example (RON):
+    ///
+    /// ```ron
+    /// registry_pull_limits: (
+    ///     max_layer_bytes: 10737418240,
+    ///     max_image_bytes: 21474836480,
+    ///     max_manifest_bytes: 33554432,
+    /// )
+    /// ```
+    #[serde(default, skip_serializing_if = "is_default_registry_pull_limits")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub registry_pull_limits: boatramp_firecracker::oci::RegistryPullLimits,
     /// **Node-scope operator backend-selection policy** (v0.67.0 `[compute.policy]`):
     /// `allow` / `forbid` / `prefer` over backend ids, the OUTER hard bound on this node's
     /// placement (on top of the capability floor + isolation posture). `None` (default) ⇒ no
@@ -1581,6 +1635,18 @@ fn is_default_allow_private_registries(
     a: &boatramp_firecracker::oci::PrivateRegistryAllowlist,
 ) -> bool {
     a == &boatramp_firecracker::oci::PrivateRegistryAllowlist::default()
+}
+
+/// Whether [`ComputeConfig::registry_pull_timeouts`] is at its (built-in default) value, so it
+/// is omitted from the serialized config when unset.
+fn is_default_registry_pull_timeouts(t: &boatramp_firecracker::oci::RegistryPullTimeouts) -> bool {
+    t == &boatramp_firecracker::oci::RegistryPullTimeouts::default()
+}
+
+/// Whether [`ComputeConfig::registry_pull_limits`] is at its (built-in default) value, so it is
+/// omitted from the serialized config when unset.
+fn is_default_registry_pull_limits(l: &boatramp_firecracker::oci::RegistryPullLimits) -> bool {
+    l == &boatramp_firecracker::oci::RegistryPullLimits::default()
 }
 
 /// Default upstream resolver for [`ComputeConfig::dns_upstream`].
@@ -1690,6 +1756,8 @@ impl Default for ComputeConfig {
             registry_auth: BTreeMap::new(),
             allow_private_registries: boatramp_firecracker::oci::PrivateRegistryAllowlist::default(
             ),
+            registry_pull_timeouts: boatramp_firecracker::oci::RegistryPullTimeouts::default(),
+            registry_pull_limits: boatramp_firecracker::oci::RegistryPullLimits::default(),
             policy: None,
         }
     }
