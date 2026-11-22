@@ -72,6 +72,7 @@ mod sql;
 // binary's `crate::config` so existing call sites are unchanged.
 pub use boatramp_node::config;
 mod config_cmd;
+mod config_file;
 mod dlq;
 #[cfg(feature = "acme-dns")]
 mod dns;
@@ -730,7 +731,15 @@ async fn async_main() -> Result<(), CliError> {
         Command::Sql(args) => output::emit(mode, &sql::run(args, &config).await?)?,
         Command::Db(args) => output::emit(mode, &db::run(args, &config).await?)?,
         Command::Blob(args) => output::emit(mode, &blob::run(args, &config).await?)?,
-        Command::Config(args) => output::emit(mode, &config_cmd::run(args, &config).await?)?,
+        Command::Config(args) => {
+            // `config diff --exit-code` renders the diff first, then exits non-zero on drift
+            // (the CI drift-lint contract — the diff is still printed, like `git diff --exit-code`).
+            let out = config_cmd::run(args, &config).await?;
+            output::emit(mode, &out)?;
+            if out.drift_exit() {
+                std::process::exit(1);
+            }
+        }
         #[cfg(feature = "acme-dns")]
         Command::Dns(args) => output::emit(mode, &dns::run(args, &config).await?)?,
         Command::Logs(args) => output::emit(mode, &logs::run(args, &config).await?)?,

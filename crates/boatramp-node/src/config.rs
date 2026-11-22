@@ -164,7 +164,13 @@ pub enum ConfigError {
 ///
 /// Read by the client commands (`sync`, `build`, `bundle`, `validate`).
 /// Everything is optional; a missing file is the default.
-#[derive(Debug, Default, Deserialize)]
+///
+/// `Serialize` is derived (alongside `Deserialize`) so the config-tooling commands
+/// (`config convert` / `config diff`) can **re-serialize** a parsed project config
+/// back out in either format: convert = parse-in-source-format → re-serialize, and
+/// diff canonicalises both inputs to the same typed JSON value. It is a pure
+/// projection of the same typed value, never a second parser.
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProjectConfig {
     /// Where and how to publish this project.
@@ -3899,7 +3905,7 @@ pub struct ConsoleConfig {
 }
 
 /// `publish` section — where and what to deploy (the `sync` target).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PublishConfig {
     /// Base URL of the boatramp server (e.g. `https://pad.example.com`).
@@ -3923,7 +3929,7 @@ pub struct BuildConfig {
 }
 
 /// `bundle` section — the in-process Rust bundler (`bundler` feature).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BundleConfig {
     /// Output directory for bundled assets (e.g. `dist`).
