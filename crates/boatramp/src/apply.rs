@@ -33,10 +33,10 @@ use serde::Deserialize;
 // re-exports the per-resource manifest types so `crate::apply::{ApplySite, …}` call
 // sites (e.g. `apply_migrate`) are unchanged.
 use boatramp_node::reconcile::{
-    self, BlobSource, ControlPlane, CpError, CpResult, CreatedDeployment, PlanCompute,
-    PlanDatabase, PlanFunction, PlanSite, ReconcileError, SiteBuilder,
+    self, BlobSource, ControlPlane, CpError, CpResult, CreatedDeployment, ReconcileError,
+    SiteBuilder,
 };
-pub use boatramp_node::reconcile::{ApplyCompute, ApplyFunction, ApplySite};
+pub use boatramp_node::reconcile::{ApplyCompute, ApplyFunction, ApplyPlan, ApplySite};
 
 use crate::client;
 use crate::config::ProjectConfig;
@@ -646,30 +646,6 @@ pub enum ApplyOutput {
     },
 }
 
-/// The structured `--dry-run` plan — each field is a resource that *would* be
-/// reconciled, carrying the same facts the human plan lines show.
-#[derive(Debug, Default, serde::Serialize)]
-pub struct ApplyPlan {
-    /// The non-`default` project that would be ensured to exist.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ensure_project: Option<String>,
-    /// The tenancy schema's table count, when one would be set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tenancy_tables: Option<usize>,
-    /// Managed databases that would be declared + provisioned.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    databases: Vec<PlanDatabase>,
-    /// Sites that would be deployed.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    sites: Vec<PlanSite>,
-    /// Top-level functions that would be deployed.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    functions: Vec<PlanFunction>,
-    /// Compute workloads that would be applied.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    compute: Vec<PlanCompute>,
-}
-
 impl crate::output::Rendered for ApplyOutput {
     fn render_human(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         match self {
@@ -709,55 +685,6 @@ impl crate::output::Rendered for ApplyOutput {
     }
 }
 
-impl ApplyPlan {
-    /// Render the plan's human lines (byte-for-byte the former `--dry-run` stdout, minus
-    /// the header + the ceiling-exception warnings, which now ride `tracing`).
-    fn render(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        if let Some(project) = &self.ensure_project {
-            writeln!(w, "  project `{project}`: ensure exists")?;
-        }
-        if let Some(tables) = self.tenancy_tables {
-            writeln!(w, "  tenancy: would set schema ({tables} table(s))")?;
-        }
-        for db in &self.databases {
-            writeln!(
-                w,
-                "  database `{}`: would declare + provision ({:?}, {:?}, size {:?})",
-                db.name, db.kind, db.tenant, db.size
-            )?;
-        }
-        for site in &self.sites {
-            writeln!(
-                w,
-                "  site `{}`: would deploy {} (build: {}, routing: {}, config: {})",
-                site.name,
-                site.dir,
-                yes_no(site.build),
-                yes_no(site.routing),
-                yes_no(site.config),
-            )?;
-            if let Some(ops) = site.safelist_ops {
-                writeln!(
-                    w,
-                    "  site `{}`: would register {} safelisted operation(s) (register-only)",
-                    site.name, ops,
-                )?;
-            }
-        }
-        for f in &self.functions {
-            writeln!(
-                w,
-                "  function `{}`: would deploy from {}",
-                f.name, f.component
-            )?;
-        }
-        for c in &self.compute {
-            writeln!(w, "  compute `{}`: would apply spec", c.name)?;
-        }
-        Ok(())
-    }
-}
-
 pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<ApplyOutput> {
     let manifest = ApplyManifest::load(&args.file, args.format)?;
 
@@ -788,26 +715,6 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<ApplyOutput>
     let compute = manifest.compute.len();
     let databases = manifest.databases.len();
 
-    // Assemble the dry-run plan as the helpers run; in a real apply the helpers reconcile
-    // (emitting progress via `tracing`) and contribute nothing to the plan.
-    // Ensure the project exists (best-effort; `default` always does).
-    let mut plan = ApplyPlan {
-        ensure_project: reconcile::ensure_project(&cp, &project, args.dry_run).await?,
-        ..Default::default()
-    };
-
-    // Reconcile the tenancy schema *before* any site/function, so a handler shipped in
-    // this same apply already runs under the declared isolation boundary.
-    if let Some(schema) = &manifest.tenancy {
-        plan.tenancy_tables = reconcile::reconcile_tenancy(&cp, schema, args.dry_run).await?;
-    }
-
-    // Reconcile declared managed databases *before* sites/functions/compute (#501 Stage B),
-    // so a handler shipped in the same apply binds an already-provisioned DB. Each is
-    // `PUT`-only (create-or-replace + eager provision); removing an entry never
-    // deprovisions (the server keeps the DB/volume/credential).
-    plan.databases = reconcile::apply_databases(&cp, &manifest.databases, args.dry_run).await?;
-
     // `safelisted_ops_path` is resolved relative to the manifest's own directory
     // (client-side); the manifest file itself lives at `args.file`.
     let manifest_dir = args
@@ -817,29 +724,30 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<ApplyOutput>
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    for site in &manifest.sites {
-        if let Some(planned) =
-            reconcile::apply_site(&cp, &builder, site, &manifest_dir, args.build, args.dry_run)
-                .await?
-        {
-            plan.sites.push(planned);
-        }
-    }
-    for function in &manifest.functions {
-        if let Some(planned) = reconcile::apply_function(&cp, function, args.dry_run).await? {
-            plan.functions.push(planned);
-        }
-    }
-    // Bug #499: each function deploy staged (not composed) its subgraph SDL via `?compose=defer`,
-    // keeping the slow introspect/compose off the per-deploy request critical path. Promote the
-    // whole staged set in ONE composition here (O(N) instead of O(N²) recomposes). A no-op when
-    // no function staged a subgraph. Skipped on dry-run (no deploys happened).
-    reconcile::apply_deferred_compose(&cp, !manifest.functions.is_empty(), args.dry_run).await?;
-    for workload in &manifest.compute {
-        if let Some(planned) = reconcile::apply_compute(&cp, workload, args.dry_run).await? {
-            plan.compute.push(planned);
-        }
-    }
+    // Drive the manifest to desired state (node-library N4): the reconcile *driver* —
+    // the ordering contract (ensure project → tenancy → databases → sites → functions →
+    // deferred compose → compute) plus the dry-run plan assembly — lives in the library
+    // behind the `ControlPlane`/`SiteBuilder` seams, so the end-to-end sequence is
+    // unit-testable in-process. The binary supplies the resolved inputs + the concrete
+    // seams and renders the result. Under `--dry-run` the returned plan is the whole
+    // plan; a real apply reconciles (emitting progress via `tracing`) and returns an
+    // empty plan.
+    let plan = reconcile::reconcile_project(
+        &cp,
+        &builder,
+        &reconcile::ReconcileRequest {
+            project: &project,
+            tenancy: manifest.tenancy.as_ref(),
+            databases: &manifest.databases,
+            sites: &manifest.sites,
+            functions: &manifest.functions,
+            compute: &manifest.compute,
+            manifest_dir: &manifest_dir,
+            build: args.build,
+            dry_run: args.dry_run,
+        },
+    )
+    .await?;
 
     if args.dry_run {
         Ok(ApplyOutput::Plan {
@@ -877,11 +785,6 @@ fn is_conflict(err: &client::ClientError) -> bool {
         err,
         client::ClientError::Http(e) if e.status() == Some(reqwest::StatusCode::CONFLICT)
     )
-}
-
-/// `"yes"`/`"no"` for a dry-run plan line.
-fn yes_no(b: bool) -> &'static str {
-    if b { "yes" } else { "no" }
 }
 
 #[cfg(test)]

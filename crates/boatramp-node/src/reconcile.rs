@@ -365,6 +365,92 @@ pub struct PlanCompute {
     pub name: String,
 }
 
+/// The structured `--dry-run` plan — each field is a resource that *would* be
+/// reconciled, carrying the same facts the human plan lines show. Assembled by
+/// [`reconcile_project`] as it walks the manifest (every helper contributes its
+/// dry-run entry; a real apply leaves the plan empty and reconciles instead).
+///
+/// The binary's `ApplyOutput::Plan` carries this verbatim and renders it via
+/// [`ApplyPlan::render`] (node-library N4 lifted the plan type + its rendering out of
+/// the binary alongside the driver, so the `--dry-run` output is locked by a library
+/// test, not only the CLI).
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ApplyPlan {
+    /// The non-`default` project that would be ensured to exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ensure_project: Option<String>,
+    /// The tenancy schema's table count, when one would be set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenancy_tables: Option<usize>,
+    /// Managed databases that would be declared + provisioned.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub databases: Vec<PlanDatabase>,
+    /// Sites that would be deployed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<PlanSite>,
+    /// Top-level functions that would be deployed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub functions: Vec<PlanFunction>,
+    /// Compute workloads that would be applied.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub compute: Vec<PlanCompute>,
+}
+
+impl ApplyPlan {
+    /// Render the plan's human lines (byte-for-byte the former `--dry-run` stdout, minus
+    /// the header + the ceiling-exception warnings, which ride `tracing`). Public so the
+    /// binary's `ApplyOutput::render_human` delegates to it.
+    pub fn render(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        if let Some(project) = &self.ensure_project {
+            writeln!(w, "  project `{project}`: ensure exists")?;
+        }
+        if let Some(tables) = self.tenancy_tables {
+            writeln!(w, "  tenancy: would set schema ({tables} table(s))")?;
+        }
+        for db in &self.databases {
+            writeln!(
+                w,
+                "  database `{}`: would declare + provision ({:?}, {:?}, size {:?})",
+                db.name, db.kind, db.tenant, db.size
+            )?;
+        }
+        for site in &self.sites {
+            writeln!(
+                w,
+                "  site `{}`: would deploy {} (build: {}, routing: {}, config: {})",
+                site.name,
+                site.dir,
+                yes_no(site.build),
+                yes_no(site.routing),
+                yes_no(site.config),
+            )?;
+            if let Some(ops) = site.safelist_ops {
+                writeln!(
+                    w,
+                    "  site `{}`: would register {} safelisted operation(s) (register-only)",
+                    site.name, ops,
+                )?;
+            }
+        }
+        for f in &self.functions {
+            writeln!(
+                w,
+                "  function `{}`: would deploy from {}",
+                f.name, f.component
+            )?;
+        }
+        for c in &self.compute {
+            writeln!(w, "  compute `{}`: would apply spec", c.name)?;
+        }
+        Ok(())
+    }
+}
+
+/// `"yes"`/`"no"` for a dry-run plan line.
+fn yes_no(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
 /// Ensure the target project exists: `GET` it, and on a 404 `create` it. A
 /// concurrent create (409/conflict) is ignored. The reserved `default` project
 /// always exists, so it is skipped.
@@ -762,6 +848,106 @@ fn site_content_dir(site: &ApplySite) -> PathBuf {
         .or_else(|| site.build.as_ref().and_then(|b| b.output.clone()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The desired-state inputs the reconcile driver walks: the already-resolved target
+/// project plus the manifest's per-resource sections, each borrowed. A plain
+/// value/borrow bundle — the binary keeps manifest *parsing* (`ApplyManifest`),
+/// project resolution, and name validation; the driver takes the resolved pieces.
+///
+/// `manifest_dir` is the directory a site's `safelisted_ops_path` resolves against
+/// (the manifest file's own directory); the binary computes it from the `-f` path.
+pub struct ReconcileRequest<'a> {
+    /// The resolved target project (an explicit manifest `project:` or the
+    /// config-resolved value). `default` is never created.
+    pub project: &'a str,
+    /// The project tenancy schema to set before any site/function, if declared.
+    pub tenancy: Option<&'a boatramp_core::tenancy::TenancySchema>,
+    /// Declared managed databases, reconciled before sites/functions/compute.
+    pub databases: &'a [boatramp_core::compute::ApplyDatabase],
+    /// Sites to deploy (content-addressed, config-before-activate).
+    pub sites: &'a [ApplySite],
+    /// Top-level functions to deploy (each staging its subgraph via `?compose=defer`).
+    pub functions: &'a [ApplyFunction],
+    /// Compute workloads to create-or-replace.
+    pub compute: &'a [ApplyCompute],
+    /// The directory a site's `safelisted_ops_path` is resolved against.
+    pub manifest_dir: &'a Path,
+    /// Run each site's configured build command before publishing it (`--build`).
+    pub build: bool,
+    /// Print the plan and mutate nothing (`--dry-run`).
+    pub dry_run: bool,
+}
+
+/// Drive a whole project manifest to its desired state (node-library N4): the
+/// reconcile **driver** that sequences the per-resource helpers under the ordering
+/// contract, lifted out of the binary's `apply::run` so the end-to-end sequence — not
+/// only each helper in isolation — is unit-testable in-process against a mock.
+///
+/// The ordering is the contract (a handler shipped in the same apply must already run
+/// under the isolation boundary and bind a provisioned DB), preserved byte-for-byte
+/// from the former in-binary driver:
+///
+/// 1. **ensure the project** exists (create-on-404; `default` is skipped);
+/// 2. **tenancy** schema — before any site/function;
+/// 3. **databases** (#501 Stage B) — before sites/functions/compute;
+/// 4. **sites** — each content-addressed, config-before-activate;
+/// 5. **functions** — each staging its subgraph (`?compose=defer`);
+/// 6. **deferred compose** — one promotion after the functions (bug #499), skipped
+///    when no function was declared or on a dry-run;
+/// 7. **compute** workloads.
+///
+/// Under `--dry-run` nothing is mutated: each helper contributes its plan entry and no
+/// control-plane write is issued, so the returned [`ApplyPlan`] is the whole plan. In a
+/// real apply the helpers reconcile (reporting progress via `tracing`) and the returned
+/// plan is empty.
+pub async fn reconcile_project<C: ControlPlane, B: SiteBuilder>(
+    cp: &C,
+    builder: &B,
+    req: &ReconcileRequest<'_>,
+) -> ReconcileResult<ApplyPlan> {
+    // Ensure the project exists (best-effort; `default` always does).
+    let mut plan = ApplyPlan {
+        ensure_project: ensure_project(cp, req.project, req.dry_run).await?,
+        ..Default::default()
+    };
+
+    // Reconcile the tenancy schema *before* any site/function, so a handler shipped in
+    // this same apply already runs under the declared isolation boundary.
+    if let Some(schema) = req.tenancy {
+        plan.tenancy_tables = reconcile_tenancy(cp, schema, req.dry_run).await?;
+    }
+
+    // Reconcile declared managed databases *before* sites/functions/compute (#501 Stage B),
+    // so a handler shipped in the same apply binds an already-provisioned DB. Each is
+    // `PUT`-only (create-or-replace + eager provision); removing an entry never
+    // deprovisions (the server keeps the DB/volume/credential).
+    plan.databases = apply_databases(cp, req.databases, req.dry_run).await?;
+
+    for site in req.sites {
+        if let Some(planned) =
+            apply_site(cp, builder, site, req.manifest_dir, req.build, req.dry_run).await?
+        {
+            plan.sites.push(planned);
+        }
+    }
+    for function in req.functions {
+        if let Some(planned) = apply_function(cp, function, req.dry_run).await? {
+            plan.functions.push(planned);
+        }
+    }
+    // Bug #499: each function deploy staged (not composed) its subgraph SDL via `?compose=defer`,
+    // keeping the slow introspect/compose off the per-deploy request critical path. Promote the
+    // whole staged set in ONE composition here (O(N) instead of O(N²) recomposes). A no-op when
+    // no function staged a subgraph. Skipped on dry-run (no deploys happened).
+    apply_deferred_compose(cp, !req.functions.is_empty(), req.dry_run).await?;
+    for workload in req.compute {
+        if let Some(planned) = apply_compute(cp, workload, req.dry_run).await? {
+            plan.compute.push(planned);
+        }
+    }
+
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -1401,5 +1587,241 @@ mod tests {
             delta_capture: false,
             restart_policy: Default::default(),
         }
+    }
+
+    // --- node-library N4: the reconcile DRIVER (`reconcile_project`) --------------------
+    //
+    // These drive the whole manifest sequence through the recording mock, locking the
+    // end-to-end ORDERING CONTRACT and the dry-run plan assembly — the behaviour that
+    // previously lived in the binary's `apply::run` and was only reachable through the
+    // CLI. The per-resource helpers above are each tested in isolation; these test the
+    // driver that sequences them.
+
+    /// A plain site shipping an (empty) config, so the config-before-activate path runs
+    /// (`put_site_config` lands before `activate`). No graphql handler ⇒ no safelist.
+    fn a_plain_site(name: &str) -> ApplySite {
+        ApplySite {
+            name: name.into(),
+            path: Some("dist".into()),
+            build: None,
+            routing: None,
+            config: Some(SiteConfig::default()),
+        }
+    }
+
+    /// A minimal image compute workload for the driver tests.
+    fn an_api_compute() -> ApplyCompute {
+        ApplyCompute {
+            name: "api".into(),
+            spec: an_image_spec(),
+            replicas: 1,
+            placement: Default::default(),
+        }
+    }
+
+    /// The headline N4 test: a full manifest (project + tenancy + one database + one site
+    /// + one function + one compute) drives through `reconcile_project` in the exact
+    /// control-plane ORDER the contract requires — ensure-project, tenancy, databases,
+    /// the site (config BEFORE activate), the function, exactly ONE deferred compose, then
+    /// compute. The ordering is the contract (a handler shipped in the same apply must run
+    /// under the declared isolation + bind a provisioned DB), so locking the whole order
+    /// end-to-end — not only each helper in isolation — is the point of the driver seam.
+    #[tokio::test]
+    async fn reconcile_project_drives_the_full_sequence_in_contract_order() {
+        use boatramp_core::tenancy::{TableScope, TenancySchema};
+        let cp = MockCp::default(); // project_exists: false → get + create
+        let builder = MockBuilder;
+
+        let mut schema = TenancySchema::default();
+        schema.tables.insert("orders".into(), TableScope::Tenant);
+
+        let sites = vec![a_plain_site("www")];
+        let functions = vec![a_function()];
+        let databases = vec![sample_db(
+            "app",
+            boatramp_core::compute::ApplyDatabaseKind::Postgres,
+        )];
+        let compute = vec![an_api_compute()];
+
+        let req = ReconcileRequest {
+            project: "acme",
+            tenancy: Some(&schema),
+            databases: &databases,
+            sites: &sites,
+            functions: &functions,
+            compute: &compute,
+            manifest_dir: Path::new("."),
+            build: false,
+            dry_run: false,
+        };
+        let plan = reconcile_project(&cp, &builder, &req).await.unwrap();
+
+        assert_eq!(
+            cp.calls(),
+            [
+                "get_project acme",
+                "create_project acme",
+                "put_project_tenancy 1",
+                "declare_database app kind=Postgres",
+                "create_deployment www",
+                "put_site_config www",
+                "activate www dep-1",
+                "put_file_blob resize.wasm",
+                "deploy_function resize",
+                "compose_subgraphs",
+                "put_compute api",
+            ],
+            "the driver sequences the helpers under the ordering contract"
+        );
+        // A real apply reconciles (progress rides `tracing`); the returned plan is empty.
+        assert!(plan.ensure_project.is_none());
+        assert!(plan.tenancy_tables.is_none());
+        assert!(
+            plan.databases.is_empty()
+                && plan.sites.is_empty()
+                && plan.functions.is_empty()
+                && plan.compute.is_empty(),
+            "a real apply returns no dry-run plan entries"
+        );
+    }
+
+    /// A `--dry-run` through the driver mutates NOTHING (no control-plane write at all,
+    /// across every resource kind) and returns the whole assembled plan — one entry per
+    /// declared resource. The inverse of the ordering test: same manifest, zero calls.
+    #[tokio::test]
+    async fn reconcile_project_dry_run_assembles_the_plan_and_mutates_nothing() {
+        use boatramp_core::tenancy::{TableScope, TenancySchema};
+        let cp = MockCp::default();
+        let builder = MockBuilder;
+
+        let mut schema = TenancySchema::default();
+        schema.tables.insert("orders".into(), TableScope::Tenant);
+        schema.tables.insert(
+            "tenant".into(),
+            TableScope::TenantKeyed { key: "id".into() },
+        );
+
+        let sites = vec![a_plain_site("www")];
+        let functions = vec![a_function()];
+        let databases = vec![sample_db(
+            "app",
+            boatramp_core::compute::ApplyDatabaseKind::Postgres,
+        )];
+        let compute = vec![an_api_compute()];
+
+        let req = ReconcileRequest {
+            project: "acme",
+            tenancy: Some(&schema),
+            databases: &databases,
+            sites: &sites,
+            functions: &functions,
+            compute: &compute,
+            manifest_dir: Path::new("."),
+            build: false,
+            dry_run: true,
+        };
+        let plan = reconcile_project(&cp, &builder, &req).await.unwrap();
+
+        assert!(
+            cp.calls().is_empty(),
+            "dry-run issues no control-plane write, got {:?}",
+            cp.calls()
+        );
+        assert_eq!(plan.ensure_project.as_deref(), Some("acme"));
+        assert_eq!(plan.tenancy_tables, Some(2));
+        assert_eq!(plan.databases.len(), 1);
+        assert_eq!(plan.sites.len(), 1, "one planned site");
+        assert_eq!(plan.functions.len(), 1, "one planned function");
+        assert_eq!(plan.compute.len(), 1, "one planned compute workload");
+        assert_eq!(plan.sites[0].name, "www");
+        assert_eq!(plan.functions[0].name, "resize");
+        assert_eq!(plan.compute[0].name, "api");
+    }
+
+    /// The deferred compose (bug #499) fires only when a function was declared: a manifest
+    /// with sites + compute but NO functions issues NO `compose_subgraphs`, even though the
+    /// other resources reconcile. Guards the "once, and only with functions" promotion rule
+    /// at the driver level.
+    #[tokio::test]
+    async fn reconcile_project_skips_deferred_compose_without_functions() {
+        let cp = MockCp {
+            project_exists: true,
+            ..Default::default()
+        };
+        let builder = MockBuilder;
+        let sites = vec![a_plain_site("www")];
+        let compute = vec![an_api_compute()];
+
+        let req = ReconcileRequest {
+            project: "acme",
+            tenancy: None,
+            databases: &[],
+            sites: &sites,
+            functions: &[],
+            compute: &compute,
+            manifest_dir: Path::new("."),
+            build: false,
+            dry_run: false,
+        };
+        reconcile_project(&cp, &builder, &req).await.unwrap();
+
+        let calls = cp.calls();
+        assert!(
+            !calls.iter().any(|c| c == "compose_subgraphs"),
+            "no functions ⇒ no deferred compose, got {calls:?}"
+        );
+        // The project already exists ⇒ a single GET, then the site + compute reconcile.
+        assert_eq!(
+            calls,
+            [
+                "get_project acme",
+                "create_deployment www",
+                "put_site_config www",
+                "activate www dep-1",
+                "put_compute api",
+            ]
+        );
+    }
+
+    /// Lock the `--dry-run` human rendering now that `ApplyPlan` + `render` live in the
+    /// library (N4 lifted them out of the binary alongside the driver). Databases are
+    /// omitted so only the deterministic line types (project / tenancy / site / function /
+    /// compute) are asserted byte-for-byte — the former `boatramp apply --dry-run` stdout
+    /// (minus the header, which the binary's `ApplyOutput` still renders).
+    #[tokio::test]
+    async fn reconcile_project_dry_run_plan_renders_byte_for_byte() {
+        use boatramp_core::tenancy::{TableScope, TenancySchema};
+        let cp = MockCp::default();
+        let builder = MockBuilder;
+        let mut schema = TenancySchema::default();
+        schema.tables.insert("orders".into(), TableScope::Tenant);
+
+        let sites = vec![a_plain_site("www")];
+        let functions = vec![a_function()];
+        let compute = vec![an_api_compute()];
+
+        let req = ReconcileRequest {
+            project: "acme",
+            tenancy: Some(&schema),
+            databases: &[],
+            sites: &sites,
+            functions: &functions,
+            compute: &compute,
+            manifest_dir: Path::new("."),
+            build: false,
+            dry_run: true,
+        };
+        let plan = reconcile_project(&cp, &builder, &req).await.unwrap();
+
+        let mut buf = Vec::new();
+        plan.render(&mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "  project `acme`: ensure exists\n\
+             \x20 tenancy: would set schema (1 table(s))\n\
+             \x20 site `www`: would deploy dist (build: no, routing: no, config: yes)\n\
+             \x20 function `resize`: would deploy from resize.wasm\n\
+             \x20 compute `api`: would apply spec\n",
+        );
     }
 }
