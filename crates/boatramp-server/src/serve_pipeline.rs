@@ -1129,6 +1129,31 @@ async fn serve_resolved(
     // preview-scoped identity; `None` for live serving.
     preview: Option<&str>,
 ) -> Response {
+    // Opt-in sub-path mount (`[routing] base_path`): strip the configured base so
+    // every app-internal routing decision below — redirects, rewrites, handlers,
+    // gateway, streams/sessions, static lookup, and header-rule matching — sees a
+    // root-relative path (the app behind `/myapp` is authored for `/`). A request
+    // that is **not** under the mount (an unrelated path, the prefix-only `/myappX`,
+    // or a `..`-traversal that climbs out) is refused here — `404`, fail-closed —
+    // before any content is touched. The base is re-added to server-generated
+    // redirect `Location`s in the match below so app-internal links resolve behind
+    // the mount. This is upstream of the pure `route::resolve` core, so the
+    // Cloudflare edge mirrors it exactly (it strips/re-adds with the same helpers).
+    // An **identity no-op** when no `base_path` is set, so the default serving path
+    // is byte-for-byte unchanged.
+    let base_path = manifest.config.base_path.as_str();
+    let stripped_path: String;
+    let request_path: &str = if base_path.is_empty() {
+        request_path
+    } else {
+        match route::strip_base_path(base_path, request_path) {
+            Some(p) => {
+                stripped_path = p;
+                &stripped_path
+            }
+            None => return not_found(),
+        }
+    };
     // Evaluate conditional (`when`) routing against the request. The request
     // context is built only when the deploy has conditional rules, and `vary`
     // carries the request dimensions those conditions read (applied to the
@@ -1466,7 +1491,13 @@ async fn serve_resolved(
         .map(|s| s.0)
         .unwrap_or(false);
     let response = match outcome {
-        Outcome::Redirect { location, status } => redirect(status, &location),
+        // A server-generated redirect (trailing-slash normalization or a declared
+        // `redirects` rule) carries an app-internal, root-relative `Location`; re-add
+        // the mount base so the browser lands back under `/myapp` (a no-op when no
+        // base_path is set, and absolute/scheme-relative targets are left untouched).
+        Outcome::Redirect { location, status } => {
+            redirect(status, &route::prefix_base_path(base_path, &location))
+        }
         Outcome::Proxy { url } => proxy(request, &url, &manifest.config, client_ip).await,
         Outcome::File {
             path: served,

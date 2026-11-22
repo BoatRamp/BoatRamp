@@ -394,6 +394,79 @@ fn is_absolute_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
+/// Canonicalize a configured [`DeployConfig::base_path`](crate::config::DeployConfig::base_path)
+/// sub-path mount to the form the strip/prefix helpers compare against: a
+/// leading-slash, dot-segment-collapsed path with **no** trailing slash. An empty,
+/// whitespace-only, or bare-root (`/`) mount canonicalizes to the empty string —
+/// "no mount" (serve at root). Runs on every based request and, defense-in-depth,
+/// tolerates a value [`validate_base_path`](crate::config) would have rejected,
+/// always reducing it to a safe canonical form.
+pub fn normalize_base_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let rooted = if trimmed.starts_with('/') {
+        std::borrow::Cow::Borrowed(trimmed)
+    } else {
+        std::borrow::Cow::Owned(format!("/{trimmed}"))
+    };
+    normalize_dot_segments(&rooted)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Strip a `base_path` mount prefix from an incoming request path, returning the
+/// app-relative remainder (always rooted at `/`), or `None` when the request is
+/// **not under the mount** — the caller must then refuse (`404`, fail-closed).
+/// With an empty `base_path` the path is returned unchanged (identity — no mount).
+///
+/// Security — the two prefix-confusion / traversal defenses:
+/// 1. the request path is **dot-segment-normalized before** the comparison, so a
+///    `/myapp/../other` request collapses to `/other` and is rejected — it can
+///    never climb out of the mount to a sibling;
+/// 2. the match is on a **segment boundary**: the normalized path must equal the
+///    base or begin with `base + '/'`, so a prefix-only sibling (`/myappX`,
+///    `/myapp-evil`) is rejected, never served as if under the mount.
+pub fn strip_base_path(base_path: &str, request_path: &str) -> Option<String> {
+    let base = normalize_base_path(base_path);
+    if base.is_empty() {
+        return Some(request_path.to_string());
+    }
+    let rooted = if request_path.starts_with('/') {
+        std::borrow::Cow::Borrowed(request_path)
+    } else {
+        std::borrow::Cow::Owned(format!("/{request_path}"))
+    };
+    let normalized = normalize_dot_segments(&rooted);
+    if normalized == base {
+        return Some("/".to_string());
+    }
+    let prefix = format!("{base}/");
+    normalized
+        .strip_prefix(&prefix)
+        .map(|rest| format!("/{rest}"))
+}
+
+/// Re-add a `base_path` mount prefix to a **server-generated** redirect
+/// `location`, so an app-internal redirect resolves behind the mount (an app
+/// mounted at `/myapp` whose config redirects `/old` → `/new` sends the browser to
+/// `/myapp/new`). Only an app-internal, root-relative location is re-rooted; an
+/// absolute URL (`scheme://…`), a scheme-relative (`//host/…`) location, and any
+/// non-root-relative value are returned untouched. With an empty `base_path` the
+/// location is returned unchanged (identity).
+pub fn prefix_base_path(base_path: &str, location: &str) -> String {
+    let base = normalize_base_path(base_path);
+    if base.is_empty() {
+        return location.to_string();
+    }
+    if location.starts_with('/') && !location.starts_with("//") && !is_absolute_url(location) {
+        format!("{base}{location}")
+    } else {
+        location.to_string()
+    }
+}
+
 /// A smart default `Cache-Control` for a served file, applied only
 /// when the deploy config sets no blanket `cache.default` — explicit config and
 /// header rules always win. Two heuristics:
@@ -468,6 +541,99 @@ mod tests {
         assert_eq!(normalize_dot_segments("/a/b/"), "/a/b/");
         assert_eq!(normalize_dot_segments("/a/.."), "/");
         assert_eq!(normalize_dot_segments("/"), "/");
+    }
+
+    #[test]
+    fn base_path_normalizes_to_canonical_form() {
+        // Roots, collapses dot-segments, strips a trailing slash.
+        assert_eq!(normalize_base_path("/myapp"), "/myapp");
+        assert_eq!(normalize_base_path("/myapp/"), "/myapp");
+        assert_eq!(normalize_base_path("myapp"), "/myapp");
+        assert_eq!(normalize_base_path("  /myapp  "), "/myapp");
+        assert_eq!(normalize_base_path("/a//b/./c"), "/a/b/c");
+        // Empty / whitespace / bare-root all mean "no mount".
+        assert_eq!(normalize_base_path(""), "");
+        assert_eq!(normalize_base_path("   "), "");
+        assert_eq!(normalize_base_path("/"), "");
+    }
+
+    #[test]
+    fn strip_base_path_is_identity_without_a_mount() {
+        // Empty base_path => the serving path is byte-for-byte the request path.
+        assert_eq!(
+            strip_base_path("", "/foo/bar"),
+            Some("/foo/bar".to_string())
+        );
+        assert_eq!(strip_base_path("", "/"), Some("/".to_string()));
+        assert_eq!(strip_base_path("/", "/foo"), Some("/foo".to_string()));
+    }
+
+    #[test]
+    fn strip_base_path_serves_under_the_mount() {
+        // The base itself (with or without a trailing slash) maps to the app root.
+        assert_eq!(strip_base_path("/myapp", "/myapp"), Some("/".to_string()));
+        assert_eq!(strip_base_path("/myapp", "/myapp/"), Some("/".to_string()));
+        // A path under the mount maps to the app-relative remainder.
+        assert_eq!(
+            strip_base_path("/myapp", "/myapp/foo"),
+            Some("/foo".to_string())
+        );
+        assert_eq!(
+            strip_base_path("/myapp", "/myapp/assets/app.js"),
+            Some("/assets/app.js".to_string())
+        );
+        // A trailing-slash request under the mount keeps its trailing slash (so the
+        // directory-index / trailing-slash policy still applies after stripping).
+        assert_eq!(
+            strip_base_path("/myapp", "/myapp/dir/"),
+            Some("/dir/".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_base_path_rejects_prefix_confusion_and_traversal() {
+        // Prefix-only siblings are NOT under the mount — they must be refused, never
+        // served as if `/foo` under the mount.
+        assert_eq!(strip_base_path("/myapp", "/myappX"), None);
+        assert_eq!(strip_base_path("/myapp", "/myapp-evil"), None);
+        assert_eq!(strip_base_path("/myapp", "/myappX/foo"), None);
+        // An unrelated path is not under the mount.
+        assert_eq!(strip_base_path("/myapp", "/other"), None);
+        assert_eq!(strip_base_path("/myapp", "/"), None);
+        // A `..`-traversal that climbs OUT of the mount collapses first, then fails
+        // the under-mount check — it can never reach a sibling.
+        assert_eq!(strip_base_path("/myapp", "/myapp/../secret"), None);
+        assert_eq!(strip_base_path("/myapp", "/myapp/../../etc/passwd"), None);
+        // …but a `..` that stays within the mount is fine (and still can't escape).
+        assert_eq!(
+            strip_base_path("/myapp", "/myapp/sub/../foo"),
+            Some("/foo".to_string())
+        );
+        assert_eq!(
+            strip_base_path("/myapp", "/myapp/./foo"),
+            Some("/foo".to_string())
+        );
+    }
+
+    #[test]
+    fn prefix_base_path_re_roots_only_internal_locations() {
+        // No mount => unchanged.
+        assert_eq!(prefix_base_path("", "/new"), "/new");
+        // An app-internal, root-relative location is re-rooted behind the mount.
+        assert_eq!(prefix_base_path("/myapp", "/new"), "/myapp/new");
+        assert_eq!(prefix_base_path("/myapp", "/"), "/myapp/");
+        assert_eq!(prefix_base_path("/myapp", "/blog/"), "/myapp/blog/");
+        // An absolute or scheme-relative URL escapes the mount deliberately — leave it.
+        assert_eq!(
+            prefix_base_path("/myapp", "https://example.com/x"),
+            "https://example.com/x"
+        );
+        assert_eq!(
+            prefix_base_path("/myapp", "//evil.example/x"),
+            "//evil.example/x"
+        );
+        // A non-root-relative value is left alone.
+        assert_eq!(prefix_base_path("/myapp", "mailto:a@b.c"), "mailto:a@b.c");
     }
 
     #[test]

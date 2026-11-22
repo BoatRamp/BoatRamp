@@ -78,6 +78,22 @@ pub struct DeployConfig {
         skip_serializing_if = "crate::gateway::GatewayConfig::is_empty"
     )]
     pub gateway: crate::gateway::GatewayConfig,
+    /// **Opt-in sub-path mount.** When set (e.g. `"/myapp"`), the deploy is served
+    /// under that base path instead of at the site root: an incoming request to
+    /// `/myapp/foo` is routed to the app as `/foo` (the base is stripped before any
+    /// redirect/rewrite/handler/static lookup sees it), and the base is re-added to
+    /// the `Location` of every *server-generated* redirect so app-internal links
+    /// resolve behind the mount. A request **not** under the base (`/other`, the
+    /// prefix-only `/myappX`, or a `..`-traversal that climbs out) is **not served**
+    /// — `404`, fail-closed. Default empty (served at root, unchanged).
+    ///
+    /// This is for a site **built with a matching** framework `base`/`basePath` (so
+    /// its own asset/URL references already carry the prefix). It is **not** a rescue
+    /// for hand-authored absolute URLs, `fetch('/…')`, or service-worker scope — the
+    /// server cannot rewrite those. Mirrored on the Cloudflare edge path so the mount
+    /// behaves identically on every topology. See the addressing explanation.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_path: String,
 }
 
 impl Default for DeployConfig {
@@ -101,6 +117,7 @@ impl Default for DeployConfig {
             streams: Vec::new(),
             sessions: Vec::new(),
             gateway: crate::gateway::GatewayConfig::default(),
+            base_path: String::new(),
         }
     }
 }
@@ -139,6 +156,7 @@ impl DeployConfig {
     /// Verify every route/header pattern compiles. Used by `from_ron` and the
     /// `validate` subcommand so bad patterns fail fast at deploy time.
     pub fn compile_check(&self) -> Result<(), ConfigError> {
+        validate_base_path(&self.base_path)?;
         for redirect in &self.redirects {
             Pattern::compile(&redirect.from)?;
             if let Some(when) = &redirect.when {
@@ -777,6 +795,54 @@ fn check_http_method(method: &str) -> Result<(), ConfigError> {
              valid RFC 7230 token (an extension verb such as PROPFIND)"
         )))
     }
+}
+
+/// Validate an opt-in `base_path` sub-path mount at `validate`/`sync`, so a
+/// malformed mount fails loud at deploy time rather than silently never-matching
+/// (or, worse, letting a prefix-confusion value through) at request time. An empty
+/// value is the default (serve at root) and always valid.
+///
+/// A non-empty mount must be a clean, literal, absolute path: it starts with `/`,
+/// is not the bare root `/`, has no empty (`//`) / `.` / `..` segments, and
+/// carries no query (`?`), fragment (`#`), glob (`*`) — it is a *literal* prefix,
+/// not a pattern — whitespace, control, or backslash characters. A single trailing
+/// slash is tolerated (the serving path canonicalizes it away via
+/// [`crate::route::normalize_base_path`]).
+fn validate_base_path(base_path: &str) -> Result<(), ConfigError> {
+    if base_path.is_empty() {
+        return Ok(());
+    }
+    let bad = |why: &str| {
+        Err(ConfigError::parse(format!(
+            "invalid base_path {base_path:?}: {why} (expected a clean absolute sub-path like \
+             \"/myapp\", or empty to serve at the site root)"
+        )))
+    };
+    if !base_path.starts_with('/') {
+        return bad("must start with '/'");
+    }
+    if base_path == "/" {
+        return bad("the bare root \"/\" is the site root — omit base_path to serve at root");
+    }
+    if base_path
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '?' | '#' | '*' | '\\'))
+    {
+        return bad("must not contain whitespace, control, or any of `?` `#` `*` `\\` characters");
+    }
+    // Segment hygiene: no empty segment (`//` or a trailing `//`), no `.`/`..`
+    // segment that could climb or alias the mount. A single trailing slash yields
+    // one trailing empty segment, which is allowed.
+    let core = base_path.strip_suffix('/').unwrap_or(base_path);
+    for segment in core.trim_start_matches('/').split('/') {
+        if segment.is_empty() {
+            return bad("must not contain an empty path segment (`//`)");
+        }
+        if segment == "." || segment == ".." {
+            return bad("must not contain a `.` or `..` path segment");
+        }
+    }
+    Ok(())
 }
 
 // Defense-in-depth: the ext-method routing anti-hollow seam is for `cargo test` only. Fail the build
@@ -3243,6 +3309,50 @@ mod tests {
         assert_eq!(SiteConfig::default().version, 1);
         // A version-less stored SiteConfig still reads as v1.
         assert_eq!(SiteConfig::from_json(b"{}").unwrap().version, 1);
+    }
+
+    #[test]
+    fn base_path_defaults_empty_and_is_omitted_when_empty() {
+        // Default is "no mount" (serve at root), and an empty base_path is not
+        // serialized (so existing manifests are byte-for-byte unchanged).
+        let cfg = DeployConfig::from_ron("()").unwrap();
+        assert_eq!(cfg.base_path, "");
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("base_path"));
+        // A configured mount round-trips.
+        let cfg = DeployConfig::from_ron(r#"(base_path: "/myapp")"#).unwrap();
+        assert_eq!(cfg.base_path, "/myapp");
+        assert!(serde_json::to_string(&cfg).unwrap().contains("base_path"));
+    }
+
+    #[test]
+    fn base_path_validation_accepts_clean_mounts_and_rejects_malformed() {
+        // Clean absolute sub-paths validate (a single trailing slash is tolerated).
+        for ok in ["/myapp", "/myapp/", "/a/b", "/team-1/app"] {
+            assert!(
+                DeployConfig::from_ron(&format!("(base_path: {ok:?})")).is_ok(),
+                "base_path {ok:?} should validate"
+            );
+        }
+        // Malformed mounts fail loud at validate/sync — a prefix-confusion or
+        // traversal-shaped value must never reach request time.
+        for bad in [
+            "myapp",     // no leading slash
+            "/",         // bare root — omit base_path instead
+            "/a//b",     // empty segment
+            "/a/../b",   // dot-segment
+            "/a/./b",    // dot-segment
+            "/app*",     // glob — base_path is a literal prefix, not a pattern
+            "/app?x=1",  // query
+            "/app#frag", // fragment
+            "/ap p",     // whitespace
+            "/app\\x",   // backslash
+        ] {
+            assert!(
+                DeployConfig::from_ron(&format!("(base_path: {bad:?})")).is_err(),
+                "base_path {bad:?} should be rejected"
+            );
+        }
     }
 
     #[test]

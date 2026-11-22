@@ -287,7 +287,7 @@ fn render_worker_rs() -> String {
 use std::collections::BTreeMap;
 
 use boatramp_types::manifest::Manifest;
-use boatramp_types::route::{resolve, Outcome};
+use boatramp_types::route::{self, resolve, Outcome};
 use worker::*;
 
 #[event(fetch)]
@@ -309,9 +309,19 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Err(_) => return forward(req, &env).await,
     };
 
+    // Opt-in `base_path` sub-path mount: strip it before routing and re-add it to a
+    // redirect Location, with the SAME `boatramp_types::route` helpers the origin
+    // Container uses — so the mount behaves identically at the edge. A request not
+    // under the mount is handed to the origin (which 404s it).
+    let path = match route::strip_base_path(&manifest.config.base_path, url.path()) {
+        Some(path) => path,
+        None => return forward(req, &env).await,
+    };
+
     // The exact routing the Container runs — shared code, never re-implemented.
-    match resolve(&manifest.config, &manifest.files, url.path()) {
+    match resolve(&manifest.config, &manifest.files, &path) {
         Outcome::Redirect { location, status } => {
+            let location = route::prefix_base_path(&manifest.config.base_path, &location);
             let mut headers = Headers::new();
             headers.set("location", &location)?;
             Ok(Response::empty()?.with_status(status).with_headers(headers))
@@ -1035,10 +1045,15 @@ mod tests {
         let lib = render_worker_rs();
         // The edge runs the SAME routing as the Container, not a reimplementation,
         // via the lean wasm-clean `boatramp-types` (not full `boatramp-core`).
-        assert!(lib.contains("use boatramp_types::route::{resolve, Outcome};"));
+        assert!(lib.contains("use boatramp_types::route::{self, resolve, Outcome};"));
         assert!(lib.contains("use boatramp_types::manifest::Manifest;"));
         assert!(!lib.contains("boatramp_core"));
-        assert!(lib.contains("resolve(&manifest.config, &manifest.files, url.path())"));
+        assert!(lib.contains("resolve(&manifest.config, &manifest.files, &path)"));
+        // The opt-in base_path sub-path mount is mirrored at the edge with the SAME
+        // shared `boatramp_types::route` helpers the origin uses (strip before routing,
+        // re-add on a redirect Location) — so the mount behaves identically everywhere.
+        assert!(lib.contains("route::strip_base_path(&manifest.config.base_path, url.path())"));
+        assert!(lib.contains("route::prefix_base_path(&manifest.config.base_path, &location)"));
         // All four routing outcomes are handled.
         assert!(lib.contains("Outcome::Redirect"));
         assert!(lib.contains("Outcome::File"));

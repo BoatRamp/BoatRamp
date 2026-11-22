@@ -90,13 +90,31 @@ or `fetch('/api')` — breaks here: those URLs resolve against the origin root, 
 the `/_sites/blog/` prefix. Use host routing (or the single-site default) to serve
 such a site; reach for `/_sites/<name>` only for by-name inspection.
 
-## Sub-path mounts
+## Sub-path mounts (`base_path`, opt-in)
 
-Serving a site under a deliberate sub-path (for a site *built* with a matching
-base path, e.g. a framework's `base` / `basePath`) is not available yet. Absolute
-URLs authored for root cannot be rewritten server-side in the general case, so the
-supported model is a root mountpoint via host routing. See
-[Maturity, validation & support](./maturity.md) for status.
+A site can be mounted under a deliberate **sub-path** instead of at the host root,
+with the opt-in [`base_path`](../reference/routing.md#base_path) routing field:
+
+```ron
+(
+    base_path: "/myapp",
+)
+```
+
+Now `https://site.example.com/myapp/foo` routes to the app as `/foo` — the base is
+stripped before the app sees the path — and every server-generated redirect's
+`Location` is prefixed with `/myapp`, so app-internal links resolve behind the
+mount. A request that is **not** under the mount (an unrelated path, the prefix-only
+`/myappX`, or a `..`-traversal that climbs out) is **not served** — `404`,
+fail-closed, never leaking to a sibling path. The same stripping is applied on the
+Cloudflare edge, so the mount behaves identically on every topology.
+
+This works **only for a site built with a matching base path** — a framework's
+`base` / `basePath` build option — so the app's own asset and URL references
+already carry the `/myapp` prefix. It is **not** a rescue for hand-authored
+absolute URLs, `fetch('/…')`, CSS `url(/…)`, or service-worker scope: the server
+cannot rewrite those. If a site was authored for root, serve it at the root via
+host routing rather than reaching for `base_path`.
 
 ## Choosing
 
@@ -106,3 +124,4 @@ supported model is a root mountpoint via host routing. See
 | Several sites locally, no DNS | `<site>.localhost` (first-label routing). |
 | Production on your own hostname | [Attach a domain](../how-to/custom-domain.md); the site answers at its host's root. |
 | To inspect a specific site by name | `/_sites/<name>/` (admin/testing). |
+| To mount a framework-built site under a sub-path | [`base_path`](../reference/routing.md#base_path) (opt-in). |
