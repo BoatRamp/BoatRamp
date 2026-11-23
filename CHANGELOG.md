@@ -82,6 +82,13 @@ versions.
   composition path — refuses to serve any `rls_session` Postgres posture as a superuser/BYPASSRLS
   role. The migration/superuser identity stays off the default guest DSN. Default (un-opted) serving
   is byte-for-byte unchanged; a mutation-proven cross-account live gate is wired into CI.
+- **`rls_session` enforcement extended to the Shared+default cell (closes the last silent
+  fail-open).** The same non-superuser app-role machinery now covers the Shared+default
+  managed-Postgres cell, and the broad fail-closed `rolsuper OR rolbypassrls` guard no longer
+  excludes it — so an operator's `rls_session: true` is enforced (or fail-closed refused), never
+  silently un-enforced, in **every** posture (single/default, single/non-default, Shared/non-default,
+  Shared/default). The internal `single_*` serving/provisioning helpers were renamed to the
+  posture-neutral `rls_*`/`rls_cell_*`. Lighthouse-verified live gate.
 - **Mutual-RPK TLS + channel-bound tokens (rpk-bootstrap-tls stage 5).** The control-plane RPK-TLS
   listener can now require **mutual** raw-public-key auth and bind a holder (`cnf`) token to its TLS
   channel: the client presents its token's `cnf` key as the RFC 7250 client identity and the server
