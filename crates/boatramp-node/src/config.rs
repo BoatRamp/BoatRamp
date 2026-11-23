@@ -2457,21 +2457,26 @@ pub struct ExternalDatabaseConfig {
     ///   connector's row-level policy), which derives the tenant from the verified
     ///   request, not from anything the handler's SQL can influence.
     ///
-    /// # Single-mode (dedicated-container) opt-in — the non-superuser serving role
+    /// # Superuser-owned-cell opt-in — the non-superuser serving role
     ///
-    /// On a `tenant = single` managed-**Postgres** binding (a dedicated container per tenant,
-    /// including the reserved `default` install), setting `rls_session` ALSO switches the runtime to
-    /// serve as a **STABLE non-superuser app role** boatramp provisions
-    /// ([`single_app_role_name`](boatramp_storage::tenant_provision::single_app_role_name)) instead of
-    /// the container's bootstrap **superuser** (`POSTGRES_USER`, which bypasses RLS). This is
-    /// capability parity with the `Shared` non-owner posture: isolation is not gated on isolation
-    /// mechanism. The superuser still owns the schema and runs migrations (the app role **owns
-    /// nothing** — only `GRANT` + `ALTER DEFAULT PRIVILEGES`), so the app's own
-    /// `FORCE ROW LEVEL SECURITY` now actually binds the guest. **Default off** (`false`): an un-opted
-    /// single-mode binding keeps serving as the superuser exactly as before (no app role, no RLS
-    /// enforcement). When it is on, the serving path refuses fail-closed if the resolved runtime role
-    /// is still a superuser / BYPASSRLS, so an app can never silently believe it has RLS while served
-    /// by a superuser.
+    /// Some managed-**Postgres** cells have a database owned by the configured **bootstrap superuser**
+    /// (`POSTGRES_USER`, which bypasses RLS) with no per-tenant owner/runtime role split: a
+    /// `tenant = single` dedicated container (any tenant, including the reserved `default` install),
+    /// AND the reserved **`Shared` + default** tenant (the shared server's own init database). On such
+    /// a cell, setting `rls_session` ALSO switches the runtime to serve as a **STABLE non-superuser app
+    /// role** boatramp provisions
+    /// ([`rls_app_role_name`](boatramp_storage::tenant_provision::rls_app_role_name)) instead of the
+    /// superuser. This is capability parity with the `Shared` non-owner posture: isolation is not gated
+    /// on isolation mechanism. The superuser still owns the schema and runs migrations (the app role
+    /// **owns nothing** — only `GRANT` + `ALTER DEFAULT PRIVILEGES`), so the app's own
+    /// `FORCE ROW LEVEL SECURITY` now actually binds the guest. On a `Shared` server this is additive
+    /// to the structural cross-tenant predicate (injected by the query layer, independent of the PG
+    /// role), which is unchanged. **Default off** (`false`): an un-opted binding keeps serving as the
+    /// superuser exactly as before (no app role, no RLS enforcement). When it is on, the serving path
+    /// refuses fail-closed if the resolved runtime role is still a superuser / BYPASSRLS, so an app can
+    /// never silently believe it has RLS while served by a superuser. (A `Shared` NON-default tenant is
+    /// a different cell — it already serves a per-tenant non-owner role, where `rls_session` has always
+    /// been load-bearing.)
     pub rls_session: bool,
     /// The Postgres session GUC name an app's RLS policies read for the host-resolved **tenant**
     /// (e.g. `app.tenant_id`), set per request/write on the `rls_session` path so RLS mirrors
@@ -2515,11 +2520,11 @@ pub struct ExternalDatabaseConfig {
     /// trigger is non-retroactive — the owner-posture **provision** additionally FORCE-sweeps every
     /// pre-existing `ENABLE`-only table and hard-asserts none remain un-`FORCE`d (fail-closed), so
     /// `FORCE` is actually live before the owner is ever served. **Ignored** outside the
-    /// `Shared` + `rls_session` + Postgres cell: `serve_as` has NO owner/non-owner choice for a
-    /// `Single`/dedicated binding — its single-mode `rls_session` opt-in always serves as a STABLE
-    /// non-superuser app role that **owns nothing** (the superuser owns the schema), so there is no
-    /// operate-as-owner variant to select; an un-opted single-mode binding (and the reserved `default`
-    /// tenant on a shared server) serves as its plain configured user with no RLS; MySQL has no
+    /// `Shared` + non-default + `rls_session` + Postgres cell: `serve_as` has NO owner/non-owner choice
+    /// for a **superuser-owned cell** (a `Single`/dedicated binding, or the reserved `Shared` + default
+    /// tenant) — its `rls_session` opt-in always serves as a STABLE non-superuser app role that **owns
+    /// nothing** (the superuser owns the schema), so there is no operate-as-owner variant to select; an
+    /// un-opted such binding serves as its plain configured superuser with no RLS; MySQL has no
     /// owner/runtime RLS split.
     ///
     /// [`tenant_role_name`]: boatramp_storage::tenant_provision::tenant_role_name

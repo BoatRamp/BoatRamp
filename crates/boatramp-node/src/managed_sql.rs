@@ -259,7 +259,7 @@ struct ManagedDbSpec {
     extensions: Vec<String>,
     /// The binding's `rls_session` opt-in. For a `Single`/dedicated managed **Postgres** DB this
     /// drives the post-ready provisioning of a STABLE non-superuser app login role
-    /// ([`single_app_role_name`](boatramp_storage::tenant_provision::single_app_role_name)) the
+    /// ([`rls_app_role_name`](boatramp_storage::tenant_provision::rls_app_role_name)) the
     /// runtime is served as instead of the bootstrap superuser, so the app's own
     /// `FORCE ROW LEVEL SECURITY` actually binds (capability parity with the `Shared` non-owner
     /// posture). `false` (the default) ⇒ no role, serve-as-superuser — byte-identical to today.
@@ -486,11 +486,14 @@ impl ManagedDbEnv {
         Ok(())
     }
 
-    /// OPT-IN **single-mode RLS** provisioning (Postgres only): create the STABLE non-superuser app
-    /// login role for a `Single`/dedicated managed DB that set `rls_session`, so the runtime serves
-    /// as a role SUBJECT to the app's row-level security instead of the bootstrap superuser
-    /// (`POSTGRES_USER`, which bypasses RLS). A no-op (returns `Ok(())`) unless the binding opts in
-    /// AND the engine is Postgres — so an un-opted single-mode DB, and every MySQL single-mode DB,
+    /// OPT-IN **RLS app-role** provisioning (Postgres only) for a **superuser-owned cell**: create the
+    /// STABLE non-superuser app login role for a managed DB that set `rls_session`, so the runtime
+    /// serves as a role SUBJECT to the app's row-level security instead of the bootstrap superuser
+    /// (`POSTGRES_USER`, which bypasses RLS). Called from BOTH the `Single`/dedicated arm (the
+    /// container's own DB) AND the `Shared` arm (the shared server's OWN init database — the reserved
+    /// default-tenant cell); per-tenant NON-default Shared databases are NOT provisioned here (they get
+    /// a per-tenant non-owner runtime role via `provision_shared`). A no-op (returns `Ok(())`) unless
+    /// the binding opts in AND the engine is Postgres — so an un-opted cell, and every MySQL cell,
     /// provisions exactly as before.
     ///
     /// # The role OWNS NOTHING (the stable-role design)
@@ -500,17 +503,20 @@ impl ManagedDbEnv {
     /// `public`, so it can never own an object. Owning nothing is what lets it be a single STABLE
     /// role (not a per-replica dynamic one): it sidesteps the PG object-ownership-orphaning
     /// constraint entirely, and because it is a NON-OWNER a plain `ENABLE ROW LEVEL SECURITY` table
-    /// already binds it (FORCE is defense-in-depth, installed to match the `Shared` machinery).
+    /// already binds it (FORCE is defense-in-depth, installed to match the `Shared` machinery). On a
+    /// shared server the role is a cluster role confined to its own (default-tenant) database by the
+    /// `CONNECT` grant + the non-superuser attribute — other tenants' databases `REVOKE CONNECT FROM
+    /// PUBLIC`, so it cannot reach them.
     ///
     /// Its sealed credential is keyed under a **distinct** key
-    /// (`single_app_credential_workload_key`), never the superuser's; `password()` get-or-mints it,
+    /// (`rls_app_credential_workload_key`), never the superuser's; `password()` get-or-mints it,
     /// and the serving path reads the SAME key, so the role is created with exactly the password the
     /// runtime later connects with regardless of which side touches the key first. All DDL runs on the
-    /// TENANT-database superuser connection (role create is cluster-level; the schema grants + the
-    /// per-database FORCE event trigger are database-local and belong there). Idempotent: this pass
-    /// re-runs every reconcile, refreshing the grants so a table a later migration creates is covered.
+    /// DB's superuser connection (role create is cluster-level; the schema grants + the per-database
+    /// FORCE event trigger are database-local and belong there). Idempotent: this pass re-runs every
+    /// reconcile, refreshing the grants so a table a later migration creates is covered.
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
-    async fn provision_single_app_role(
+    async fn provision_rls_app_role(
         &self,
         project: &str,
         workload: &str,
@@ -519,24 +525,26 @@ impl ManagedDbEnv {
     ) -> Result<(), String> {
         use boatramp_storage::tenant_provision::{
             ensure_login_role_ddl, force_rls_event_trigger_ddl, grant_app_role_ddl,
-            single_app_role_name,
+            rls_app_role_name,
         };
         // Opt-in + Postgres-only. MySQL single-mode has no RLS (and no owner/runtime split); an
         // un-opted single-mode DB keeps serving as the superuser exactly as today.
         if !db.rls_session || !matches!(db.kind, ExternalSqlKind::Postgres) {
             return Ok(());
         }
-        let app_role = single_app_role_name(&db.database);
-        // The app-role password under its OWN sealed key (distinct from the superuser's). For a
-        // `Single` workload the reconcile's `project` IS the credential project
-        // (`single_credential_project`), and `workload` IS `names.workload`, so this key matches the
-        // one the serving path (`build_backend` / `connection_parts`) derives.
-        let app_cred_workload = crate::tenant_sql::single_app_credential_workload_key(workload);
+        let app_role = rls_app_role_name(&db.database);
+        // The app-role password under its OWN sealed key (distinct from the superuser's). The
+        // reconcile's `(project, workload)` IS the credential project + workload the serving path
+        // derives: a `Single` workload keys under `single_credential_project` + `names.workload`
+        // (the per-tenant `pg-<ident>` or the bare `pg` for the default install); the `Shared` server
+        // keys under the reserved default project + the bare `<compute>`. Either way this `/rlsapp`
+        // key matches `build_backend` / `connection_parts`.
+        let app_cred_workload = crate::tenant_sql::rls_app_credential_workload_key(workload);
         let app_password = self
             .creds
             .password(project, &app_cred_workload)
             .await
-            .map_err(|e| format!("single-mode app-role credential ({app_role}): {e}"))?;
+            .map_err(|e| format!("rls app-role credential ({app_role}): {e}"))?;
 
         // Connect to the TENANT database as the bootstrap SUPERUSER: the role create is cluster-wide,
         // and the schema grants + the per-database FORCE-on-ENABLE event trigger are database-local,
@@ -558,14 +566,15 @@ impl ManagedDbEnv {
         // already binds, so FORCE is belt-and-suspenders here — installed to match the Shared path.
         stmts.extend(force_rls_event_trigger_ddl(db.kind, &db.user));
         for stmt in stmts {
-            admin.run_script(&stmt).await.map_err(|e| {
-                format!("single-mode RLS app-role provision on {}: {e}", db.database)
-            })?;
+            admin
+                .run_script(&stmt)
+                .await
+                .map_err(|e| format!("rls app-role provision on {}: {e}", db.database))?;
         }
         tracing::info!(
             database = %db.database,
             app_role = %app_role,
-            "single-mode RLS: provisioned a STABLE non-superuser app role (serve-as-non-superuser)"
+            "rls_session: provisioned a STABLE non-superuser app role (serve-as-non-superuser)"
         );
         Ok(())
     }
@@ -804,7 +813,18 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
             // here, but a declared extension on the server's OWN (default) database is still
             // created (cap-req #28 B3).
             crate::config::TenantIsolation::Shared => {
-                self.create_declared_extensions(project, workload, &db, password)
+                self.create_declared_extensions(project, workload, &db, password.clone())
+                    .await?;
+                // OPT-IN RLS for the Shared server's OWN (default-tenant) database — the reserved
+                // `default` cell. That DB is the server's init DB, owned by the bootstrap superuser
+                // with NO per-tenant owner/runtime split, so it is the SAME superuser-owned cell as a
+                // `Single` install: when `rls_session` is set, provision the STABLE non-superuser app
+                // role the default tenant's runtime is served as instead of the superuser (which
+                // bypasses RLS). Per-tenant NON-default Shared databases are NOT provisioned here —
+                // they get their own non-owner runtime role via `provision_shared` (lazy, on first
+                // resolve), and `rls_session` there is already load-bearing via that non-owner role.
+                // Default off ⇒ no role, serve-as-superuser (byte-identical to today).
+                self.provision_rls_app_role(project, workload, &db, password)
                     .await
             }
             // A dedicated per-tenant (or single-install) container: ensure its declared
@@ -846,7 +866,7 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
                 // off ⇒ no role, serve-as-superuser (byte-identical to today). Runs HERE (the
                 // post-ready pass that produces `Provisioned`, which the serving resolver gates on),
                 // so the role exists before the serving path ever routes to the replica.
-                self.provision_single_app_role(project, workload, &db, password)
+                self.provision_rls_app_role(project, workload, &db, password)
                     .await
             }
         }

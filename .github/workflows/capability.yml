@@ -426,25 +426,25 @@ jobs:
           grep -q 'RLS SESSION GUARD OK (mysql)' rls-mysql.log \
             || { echo "::error::mysql rls_session guard never reached the success marker (silent skip or guard bypass?)" >&2; exit 1; }
 
-      - name: single-mode rls_session non-superuser app-role tenancy invariant holds live (hard gate — the single-mode RLS fail-open closed)
+      - name: rls_session non-superuser app-role tenancy invariant holds live (hard gate — single-mode + Shared+default RLS fail-opens closed)
         run: |
           set -o pipefail
-          # The load-bearing proof of the single-mode (dedicated-container) `rls_session` opt-in: a
-          # `tenant = single` managed Postgres is initialized with a bootstrap SUPERUSER
-          # (rolsuper/rolbypassrls) that silently BYPASSES RLS, so an un-opted single-mode runtime
-          # served on that superuser DSN has its FORCE RLS un-enforced (the fail-open). The opt-in
-          # provisions a STABLE non-superuser app role (ensure_login_role_ddl + grant_app_role_ddl +
+          # The load-bearing proof of the `rls_session` non-superuser-app-role opt-in for the two
+          # SUPERUSER-OWNED cells: a `tenant = single` dedicated container, AND the reserved `Shared` +
+          # default tenant (the shared server's own init DB). Both init a bootstrap SUPERUSER
+          # (rolsuper/rolbypassrls) that silently BYPASSES RLS, so an un-opted runtime served on that
+          # superuser DSN has its RLS un-enforced (the fail-open). The opt-in provisions a STABLE
+          # non-superuser app role (ensure_login_role_ddl + grant_app_role_ddl +
           # force_rls_event_trigger_ddl) that OWNS NOTHING and serves the runtime AS it. Start a stock
           # pgvector on the docker default bridge (NO sudo — the storage sqlx gate drives the pg wire
           # protocol directly as the runner user, not the native container backend), reach it by its
           # container IP as the SUPERUSER (needs CREATE DATABASE/ROLE + CREATE EVENT TRIGGER), and run
-          # the gate: with TWO app-level accounts in one ENABLE-RLS table keyed on app.account_id it
-          # proves (1) the non-superuser app role (pinned to account A) sees ONLY account A's rows
-          # (ZERO account-B bytes) + the runtime-role non-privilege probe reads 0 (serving guard
-          # PERMITS); and (2) MUTATION — served AS the bootstrap SUPERUSER (same account) it LEAKS BOTH
-          # accounts' rows + the probe reads 1 (serving guard REFUSES fail-closed). A silent skip
-          # (pg/docker absent) still prints `test result: ok`, so gate on the marker, which prints ONLY
-          # after BOTH arms held — a skip or a cross-account breach fails the job.
+          # the TWO gates — each a confined-app-role invariant + a superuser-flip MUTATION leak + the
+          # probe classification: (single) 2 app accounts keyed on app.account_id; (Shared+default) 2
+          # tenants × 2 accounts keyed on BOTH the injected tenant GUC AND the app's own account GUC
+          # (the structural tenant scoping + the app's own RLS COEXIST under the non-superuser role). A
+          # silent skip (pg/docker absent) still prints `test result: ok`, so gate on BOTH markers,
+          # which print ONLY after every arm held — a skip or a cross-tenant/account breach fails the job.
           docker rm -f rls-single-pg >/dev/null 2>&1 || true
           docker run -d --name rls-single-pg -e POSTGRES_PASSWORD=postgres \
             pgvector/pgvector:pg16 >/dev/null
@@ -460,9 +460,11 @@ jobs:
             -- --ignored --test-threads=1 --nocapture 2>&1 | tee rls-single.log
           docker rm -f rls-single-pg >/dev/null 2>&1 || true
           grep -qE 'test result: ok' rls-single.log \
-            || { echo "::error::single-mode rls_session gate did not pass" >&2; exit 1; }
+            || { echo "::error::rls_session superuser-owned-cell gates did not pass" >&2; exit 1; }
           grep -q 'MANAGED RLS SINGLE-MODE OK \[postgres\]' rls-single.log \
             || { echo "::error::single-mode rls_session invariant never reached the success marker (silent skip — pg/docker absent — or the non-superuser app role leaked cross-account / the superuser-serving mutation did not leak)" >&2; exit 1; }
+          grep -q 'MANAGED RLS SHARED-DEFAULT OK \[postgres\]' rls-single.log \
+            || { echo "::error::Shared+default rls_session invariant never reached the success marker (silent skip — pg/docker absent — or the tenant+account RLS did not coexist under the non-superuser app role / the superuser mutation did not leak)" >&2; exit 1; }
 
       - name: Single-mode per-tenant volume isolation holds live (hard gate — the v0.3.11 fix)
         run: |
