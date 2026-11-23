@@ -142,19 +142,15 @@ async fn wire(
         .set_replica_state(
             ProjectRef::new("default"),
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: "default".to_string(),
-                    workload: "pg".to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    "default".to_string(),
+                    "pg".to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.to_string(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.to_string(), port),
                 region: None,
                 healthy: true,
                 started_at: None,

@@ -1567,26 +1567,8 @@ mod tests {
         name: &str,
         kind: boatramp_core::compute::ApplyDatabaseKind,
     ) -> boatramp_core::compute::ApplyDatabase {
-        boatramp_core::compute::ApplyDatabase {
-            name: name.into(),
-            kind,
-            version: None,
-            extensions: vec![],
-            size: Default::default(),
-            tenant: Default::default(),
-            tenant_scope: Default::default(),
-            read_only: false,
-            rls_session: false,
-            tenant_guc: None,
-            session_guc: None,
-            tenant_all_marker: None,
-            pool_max: None,
-            connect_timeout_secs: None,
-            startup_grace_secs: None,
-            readiness_gate: Default::default(),
-            delta_capture: false,
-            restart_policy: Default::default(),
-        }
+        // Every optional knob at its default, so this is exactly `new(name, kind)`.
+        boatramp_core::compute::ApplyDatabase::new(name.into(), kind)
     }
 
     // --- node-library N4: the reconcile DRIVER (`reconcile_project`) --------------------

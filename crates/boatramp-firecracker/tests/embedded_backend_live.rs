@@ -125,18 +125,18 @@ async fn launches_pings_and_stops_a_microvm() {
     )
     .expect("build backend");
 
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "web".to_string(),
-        replica: 0,
-        spec: sample_spec(),
-        artifact: Artifact::VmImages {
+    let req = LaunchRequest::new(
+        "default".into(),
+        "web".to_string(),
+        0,
+        sample_spec(),
+        Artifact::VmImages {
             rootfs_path: rootfs,
             kernel_path: kernel,
         },
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    )
+    .with_redaction(Default::default())
+    .with_priority_class(None);
 
     let instance = backend.launch(&req).await.expect("launch replica");
     assert_eq!(
@@ -267,18 +267,18 @@ async fn serves_an_oci_workload_end_to_end() {
     let mut spec = sample_spec();
     spec.kernel_cmdline = None;
     spec.port = APP_PORT;
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "srv".to_string(),
-        replica: 0,
+    let req = LaunchRequest::new(
+        "default".into(),
+        "srv".to_string(),
+        0,
         spec,
-        artifact: Artifact::VmImages {
+        Artifact::VmImages {
             rootfs_path: rootfs_path.display().to_string(),
             kernel_path: kernel,
         },
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    )
+    .with_redaction(Default::default())
+    .with_priority_class(None);
 
     let instance = backend.launch(&req).await.expect("launch replica");
     assert_eq!(instance.endpoint.host, GUEST2);
@@ -386,18 +386,18 @@ async fn serves_a_shell_less_scratch_image() {
     let mut spec = sample_spec();
     spec.kernel_cmdline = None;
     spec.port = APP_PORT;
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "echo".to_string(),
-        replica: 0,
+    let req = LaunchRequest::new(
+        "default".into(),
+        "echo".to_string(),
+        0,
         spec,
-        artifact: Artifact::VmImages {
+        Artifact::VmImages {
             rootfs_path: rootfs_path.display().to_string(),
             kernel_path: kernel,
         },
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    )
+    .with_redaction(Default::default())
+    .with_priority_class(None);
 
     let instance = backend.launch(&req).await.expect("launch replica");
     assert_eq!(instance.endpoint.host, GUEST3);
@@ -507,18 +507,18 @@ async fn snapshots_and_restores_a_serving_workload() {
     spec.kernel_cmdline = None;
     spec.port = APP_PORT;
     spec.mem_mib = 256;
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "snap".to_string(),
-        replica: 0,
+    let req = LaunchRequest::new(
+        "default".into(),
+        "snap".to_string(),
+        0,
         spec,
-        artifact: Artifact::VmImages {
+        Artifact::VmImages {
             rootfs_path: rootfs_path.display().to_string(),
             kernel_path: kernel,
         },
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    )
+    .with_redaction(Default::default())
+    .with_priority_class(None);
 
     let cleanup = || {
         let _ = ip(&["link", "del", BRIDGE4]);
@@ -670,18 +670,18 @@ async fn persistent_volume_survives_a_restart() {
     spec.port = APP_PORT;
     spec.mem_mib = 256;
     spec.volumes = vec![VolumeRef::new("/data", "persist", 16)];
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "vol".to_string(),
-        replica: 0,
+    let req = LaunchRequest::new(
+        "default".into(),
+        "vol".to_string(),
+        0,
         spec,
-        artifact: Artifact::VmImages {
+        Artifact::VmImages {
             rootfs_path: rootfs_path.display().to_string(),
             kernel_path: kernel,
         },
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    )
+    .with_redaction(Default::default())
+    .with_priority_class(None);
 
     let cleanup = || {
         let _ = ip(&["link", "del", BRIDGE5]);

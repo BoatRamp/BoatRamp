@@ -148,7 +148,11 @@ impl std::fmt::Display for Action {
 /// to a `target` (a site name for [`Resource::Site`]). A `target` of `None` on a
 /// *granted* right is a wildcard ("all targets"); a required right for a site
 /// always carries `Some(site)`.
+///
+/// `#[non_exhaustive]`: construct via [`Right::new`] so a future right field stays a
+/// non-breaking change for downstream crates (uchron / luigi build against these types).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Right {
     /// The resource class this right governs.
     pub resource: Resource,
@@ -1191,7 +1195,11 @@ pub enum TargetKind {
 /// A role granted to a principal: a role `name` from the [`AuthzPolicy`], plus an
 /// optional `target` for target-scoped roles — a `"<project>/<site>"` for a site
 /// role, or a bare `"<project>"` for a project role.
+///
+/// `#[non_exhaustive]`: construct via [`GrantedRole::global`] / [`GrantedRole::scoped`] /
+/// [`GrantedRole::parse`] so a future field stays a non-breaking change downstream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GrantedRole {
     /// The role name (a key in [`AuthzPolicy::roles`]).
     pub name: String,
@@ -1254,7 +1262,11 @@ impl TargetScope {
 }
 
 /// One right a role grants, before binding to a concrete target.
+///
+/// `#[non_exhaustive]`: construct via [`RightTemplate::any`] / [`RightTemplate::scoped`] /
+/// [`RightTemplate::project_wildcard`] so a future field stays a non-breaking change downstream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RightTemplate {
     /// The resource the right governs.
     pub resource: Resource,

@@ -1286,30 +1286,10 @@ mod tests {
     /// credential), so resolving it seals a credential without a live replica — the
     /// observable we use below to tell "reached the MANAGED backend" from "fell to libsql".
     fn declared_default() -> boatramp_core::compute::ApplyDatabase {
-        use boatramp_core::compute::{
-            ApplyDatabase, ApplyDatabaseKind, ApplyDatabaseScope, ApplyDatabaseSize,
-            ApplyDatabaseTenant,
-        };
-        ApplyDatabase {
-            name: "default".to_string(),
-            kind: ApplyDatabaseKind::Postgres,
-            version: None,
-            extensions: vec![],
-            size: ApplyDatabaseSize::Small,
-            tenant: ApplyDatabaseTenant::Single,
-            tenant_scope: ApplyDatabaseScope::Project,
-            read_only: false,
-            rls_session: false,
-            tenant_guc: None,
-            session_guc: None,
-            tenant_all_marker: None,
-            pool_max: None,
-            connect_timeout_secs: None,
-            startup_grace_secs: None,
-            readiness_gate: Default::default(),
-            delta_capture: false,
-            restart_policy: Default::default(),
-        }
+        use boatramp_core::compute::{ApplyDatabase, ApplyDatabaseKind};
+        // Every optional knob at its default (small / single / project / …), so this is
+        // exactly `new(name, kind)`.
+        ApplyDatabase::new("default".to_string(), ApplyDatabaseKind::Postgres)
     }
 
     #[tokio::test]

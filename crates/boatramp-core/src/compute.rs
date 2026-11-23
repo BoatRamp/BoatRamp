@@ -55,7 +55,15 @@ impl IsolationClass {
 }
 
 /// What a backend can do in the current environment (for scheduling + policy).
+///
+/// `#[non_exhaustive]`: a backend-capability axis is an additive field (the sibling
+/// `preemptible` was one such growth), so construct via [`Capabilities::new`] + the
+/// chainable `with_*` setters rather than a struct literal — a future axis then stays a
+/// non-breaking change for an out-of-tree backend. `isolation` is genuinely required (a
+/// backend MUST declare the isolation it provides — there is no safe default), so it is a
+/// constructor argument, never hidden behind a defaulted setter.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// The isolation class this backend provides.
     pub isolation: IsolationClass,
@@ -80,6 +88,60 @@ pub struct Capabilities {
     pub preemptible: bool,
 }
 
+impl Capabilities {
+    /// A capability set for a backend providing `isolation`, every optional axis at its
+    /// conservative default (no scale-to-zero, no persistent volumes, unbounded vcpus/mem,
+    /// NOT preemptible — the pre-field behavior). The supported constructor now that
+    /// `Capabilities` is `#[non_exhaustive]`; set an axis with the chainable `with_*` setters.
+    #[must_use]
+    pub fn new(isolation: IsolationClass) -> Self {
+        Self {
+            isolation,
+            scale_to_zero: false,
+            persistent_volumes: false,
+            max_vcpus: None,
+            max_mem_mib: None,
+            preemptible: false,
+        }
+    }
+
+    /// Advertise snapshot/restore (scale-to-zero) support.
+    #[must_use]
+    pub fn with_scale_to_zero(mut self, v: bool) -> Self {
+        self.scale_to_zero = v;
+        self
+    }
+
+    /// Advertise persistent-volume support.
+    #[must_use]
+    pub fn with_persistent_volumes(mut self, v: bool) -> Self {
+        self.persistent_volumes = v;
+        self
+    }
+
+    /// Bound the vCPUs per replica (`None` ⇒ unbounded).
+    #[must_use]
+    pub fn with_max_vcpus(mut self, v: Option<u32>) -> Self {
+        self.max_vcpus = v;
+        self
+    }
+
+    /// Bound the memory (MiB) per replica (`None` ⇒ unbounded).
+    #[must_use]
+    pub fn with_max_mem_mib(mut self, v: Option<u32>) -> Self {
+        self.max_mem_mib = v;
+        self
+    }
+
+    /// Whether boatramp directly schedules + can preempt this backend's replicas (`false`
+    /// ⇒ a delegated backend that never enters the preemption pass — the safe default).
+    #[must_use]
+    pub fn with_preemptible(mut self, v: bool) -> Self {
+        self.preemptible = v;
+        self
+    }
+}
+
 /// Which [`RootSource`] kinds a backend can actually run, plus whether it can apply a
 /// per-project registry pull credential ([`ComputeSpec::pull_secret`]) to a private-image
 /// pull. The scheduler gates placement on this (see [`Node::pick_backend`]) so a workload
@@ -87,7 +149,13 @@ pub struct Capabilities {
 /// private image, on a backend that cannot apply the credential and would crash-loop.
 /// Sourced from the backend itself ([`ComputeBackend::source_support`]) so the scheduler's
 /// view cannot drift from the backend's real `materialize` contract.
+///
+/// `#[non_exhaustive]`: a future placement axis on the source gate is an additive field, so
+/// construct via [`SourceSupport::new`] + the chainable `with_*` setters rather than a struct
+/// literal. `accepted_sources` is genuinely required (an empty set would mean "runs nothing",
+/// never a safe default), so it is a constructor argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SourceSupport {
     /// The [`RootSource`] kinds this backend's `materialize` accepts. A spec whose
     /// `root` kind is absent here is rejected at `materialize` (a guaranteed crash), so
@@ -121,20 +189,54 @@ impl SourceSupport {
     /// tests build their [`BackendKind`]s directly), so they keep behaving exactly as
     /// before.
     pub fn any() -> Self {
+        Self::new(vec![
+            RootSourceKind::Image,
+            RootSourceKind::Tar,
+            RootSourceKind::Rootfs,
+        ])
+        .with_private_registry_credential(true)
+    }
+
+    /// A source gate accepting exactly `accepted_sources`, with the conservative defaults
+    /// for the optional axes: cannot apply a per-project registry credential (fail-closed)
+    /// and no primary-source affinity. The supported constructor now that `SourceSupport`
+    /// is `#[non_exhaustive]`; refine with the chainable `with_*` setters.
+    #[must_use]
+    pub fn new(accepted_sources: Vec<RootSourceKind>) -> Self {
         Self {
-            accepted_sources: vec![
-                RootSourceKind::Image,
-                RootSourceKind::Tar,
-                RootSourceKind::Rootfs,
-            ],
-            private_registry_credential: true,
+            accepted_sources,
+            private_registry_credential: false,
             primary_source: None,
         }
+    }
+
+    /// Whether this backend can apply a per-project registry pull credential to a
+    /// private-image pull (`false` ⇒ an `Image` + `pull_secret` workload is never placed
+    /// here — the fail-closed default).
+    #[must_use]
+    pub fn with_private_registry_credential(mut self, v: bool) -> Self {
+        self.private_registry_credential = v;
+        self
+    }
+
+    /// This backend's PRIMARY (native) source kind — a placement tie-break, not an
+    /// eligibility exclusion (`None` ⇒ no affinity, the permissive default).
+    #[must_use]
+    pub fn with_primary_source(mut self, v: Option<RootSourceKind>) -> Self {
+        self.primary_source = v;
+        self
     }
 }
 
 /// A backend-specific, materialized artifact for a spec (what the backend boots).
+///
+/// `#[non_exhaustive]`: a future artifact shape (a new source/substrate kind) is an additive
+/// variant, so an out-of-tree consumer matching on it keeps a `_` arm. Existing variants are
+/// still constructed directly (the attribute only forces the wildcard arm on a match, never
+/// blocks a variant literal); every in-tree `materialize` match on this enum already carries a
+/// fail-closed catch-all, so the seal is behavior-neutral here.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Artifact {
     /// A microVM: an `ext4` rootfs + a guest kernel, as host paths.
     VmImages {
@@ -258,7 +360,15 @@ impl std::fmt::Debug for RedactionSet {
 }
 
 /// The request to launch one replica.
+///
+/// `#[non_exhaustive]`: a per-launch input field is additive (the `redaction` set and the
+/// `priority_class` were two such growths), so construct via [`LaunchRequest::new`] + the
+/// chainable `with_*` setters rather than a struct literal. The identity + payload fields
+/// (`project`, `workload`, `replica`, `spec`, `artifact`) are genuinely required (no safe
+/// default), so they are constructor arguments; the growable `redaction`/`priority_class`
+/// default to the pre-field behavior (an empty redaction set, no explicit priority class).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LaunchRequest {
     /// The owning project — the first dimension of the replica identity, so two
     /// projects each with a same-named workload can't collide on the backend's
@@ -291,8 +401,54 @@ pub struct LaunchRequest {
     pub priority_class: Option<String>,
 }
 
+impl LaunchRequest {
+    /// A launch request for replica `replica` of `(project, workload)` running `spec` from
+    /// the materialized `artifact`, with the growable fields at their pre-field behavior: an
+    /// empty redaction set (nothing to redact) and no explicit priority class. The supported
+    /// constructor now that `LaunchRequest` is `#[non_exhaustive]`; attach the optional
+    /// fields with the chainable `with_*` setters.
+    #[must_use]
+    pub fn new(
+        project: String,
+        workload: String,
+        replica: u32,
+        spec: ComputeSpec,
+        artifact: Artifact,
+    ) -> Self {
+        Self {
+            project,
+            workload,
+            replica,
+            spec,
+            artifact,
+            redaction: RedactionSet::new(),
+            priority_class: None,
+        }
+    }
+
+    /// Attach the secret-sourced guest-log redaction set (default: empty — nothing redacted).
+    #[must_use]
+    pub fn with_redaction(mut self, redaction: RedactionSet) -> Self {
+        self.redaction = redaction;
+        self
+    }
+
+    /// Attach the resolved priority-class name a delegated backend maps to its own priority
+    /// primitive (`None` ⇒ the operator default class — the pre-field behavior).
+    #[must_use]
+    pub fn with_priority_class(mut self, priority_class: Option<String>) -> Self {
+        self.priority_class = priority_class;
+        self
+    }
+}
+
 /// An opaque handle to a launched replica (for `stop`/`health`).
+///
+/// `#[non_exhaustive]`: a future identity/reference field is additive, so construct via
+/// [`InstanceHandle::new`] rather than a struct literal. All current fields identify the
+/// replica (no safe default), so they are constructor arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InstanceHandle {
     /// The owning project — the first dimension of the replica identity, closing
     /// the cross-tenant collision where two projects' same-named workloads derived
@@ -308,6 +464,21 @@ pub struct InstanceHandle {
     pub replica: u32,
     /// Backend-specific reference (pid / container id / CF instance id / …).
     pub backend_ref: String,
+}
+
+impl InstanceHandle {
+    /// A handle to replica `replica` of `(project, workload)` with backend reference
+    /// `backend_ref`. The supported constructor now that `InstanceHandle` is
+    /// `#[non_exhaustive]`.
+    #[must_use]
+    pub fn new(project: String, workload: String, replica: u32, backend_ref: String) -> Self {
+        Self {
+            project,
+            workload,
+            replica,
+            backend_ref,
+        }
+    }
 }
 
 /// The backend-derived identity stem for a replica, unique across projects:
@@ -474,7 +645,12 @@ impl std::fmt::Display for Scheme {
 }
 
 /// Where the gateway routes to reach a replica.
+///
+/// `#[non_exhaustive]`: a future routing field is additive, so construct via
+/// [`Endpoint::new`] rather than a struct literal. All current fields are required to route
+/// (no safe default), so they are constructor arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Endpoint {
     /// Scheme to reach the replica with.
     pub scheme: Scheme,
@@ -485,6 +661,13 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// An endpoint reaching `host:port` over `scheme`. The supported constructor now that
+    /// `Endpoint` is `#[non_exhaustive]`.
+    #[must_use]
+    pub fn new(scheme: Scheme, host: String, port: u16) -> Self {
+        Self { scheme, host, port }
+    }
+
     /// The endpoint as a base URL (`scheme://host:port`).
     pub fn url(&self) -> String {
         format!("{}://{}:{}", self.scheme, self.host, self.port)
@@ -492,12 +675,26 @@ impl Endpoint {
 }
 
 /// A launched replica: its handle + the endpoint the gateway routes to.
+///
+/// `#[non_exhaustive]`: a future launched-replica field is additive, so construct via
+/// [`Instance::new`] rather than a struct literal. Both current fields are required (no safe
+/// default), so they are constructor arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Instance {
     /// Handle for later `stop`/`health`.
     pub handle: InstanceHandle,
     /// The endpoint to route ingress to.
     pub endpoint: Endpoint,
+}
+
+impl Instance {
+    /// A launched replica reachable at `endpoint`, addressed later by `handle`. The
+    /// supported constructor now that `Instance` is `#[non_exhaustive]`.
+    #[must_use]
+    pub fn new(handle: InstanceHandle, endpoint: Endpoint) -> Self {
+        Self { handle, endpoint }
+    }
 }
 
 /// Liveness/readiness of a running replica.
@@ -513,7 +710,14 @@ pub enum Health {
 
 /// An opaque snapshot for scale-to-zero (persisted inside [`ObservedInstance`]
 /// while a replica is parked in the [`Zero`](ReplicaPhase::Zero) phase).
+///
+/// `#[non_exhaustive]`: a future park/restore field is additive (the U14 `exported` flag was
+/// one such growth), so construct via [`Snapshot::new`] + the chainable `with_*` setters
+/// rather than a struct literal. The identity + backend reference are required (no safe
+/// default), so they are constructor arguments; `exported` defaults to `false` — the pre-U14
+/// home-node-only behavior, so a consumer that omits it gets exactly the old confinement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Snapshot {
     /// The owning project, carried so a `restore` derives the same project-qualified
     /// identity ([`compute_instance_id`]) / IPAM key the launch used. `#[serde(default)]`
@@ -536,6 +740,32 @@ pub struct Snapshot {
     /// records deserializing (as `false` = home-node-only); schema stays v1.
     #[serde(default)]
     pub exported: bool,
+}
+
+impl Snapshot {
+    /// A snapshot for replica `replica` of `(project, workload)` with backend reference
+    /// `data_ref`, NOT yet exported to Storage (`exported == false` — the pre-U14
+    /// home-node-only default). The supported constructor now that `Snapshot` is
+    /// `#[non_exhaustive]`; mark it exported with [`with_exported`](Self::with_exported).
+    #[must_use]
+    pub fn new(project: String, workload: String, replica: u32, data_ref: String) -> Self {
+        Self {
+            project,
+            workload,
+            replica,
+            data_ref,
+            exported: false,
+        }
+    }
+
+    /// Mark whether this snapshot's artifact has been exported to tenant-scoped Storage
+    /// (U14 cross-node scale-to-zero). `false` (the default) ⇒ home-node-only — the wake is
+    /// confined to the node that holds the local artifact, exactly as before U14.
+    #[must_use]
+    pub fn with_exported(mut self, exported: bool) -> Self {
+        self.exported = exported;
+        self
+    }
 }
 
 /// The tenant-scoped identity of a snapshot in Storage — the key under which a parked
@@ -580,7 +810,13 @@ impl SnapshotKey {
 /// orchestration (the tenant-scoped [`SnapshotStore`]) can archive the local files to
 /// Storage on park and restore them on a resume node — without the orchestration knowing a
 /// backend's private artifact shape (microVM RAM+config files vs. a CRIU image directory).
+///
+/// `#[non_exhaustive]`: a future cross-node transfer field is additive, so construct via
+/// [`SnapshotArtifact::new`] rather than a struct literal. All current fields describe the
+/// layout a backend must supply (no safe default), so they are constructor arguments. The
+/// direct sibling of the sealed [`Snapshot`], constructed by the same backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SnapshotArtifact {
     /// The local directory that holds the artifact's files (import: the directory the files
     /// are unpacked into). Created on import if absent.
@@ -596,6 +832,20 @@ pub struct SnapshotArtifact {
     /// rewritten to this before [`restore`](ComputeBackend::restore). On the home node it
     /// equals the snapshot's existing `data_ref`.
     pub local_data_ref: String,
+}
+
+impl SnapshotArtifact {
+    /// The on-disk layout of a backend's snapshot artifact: the `files` under `dir` to
+    /// archive, and the node-local `local_data_ref`. The supported constructor now that
+    /// `SnapshotArtifact` is `#[non_exhaustive]`.
+    #[must_use]
+    pub fn new(dir: std::path::PathBuf, files: Vec<String>, local_data_ref: String) -> Self {
+        Self {
+            dir,
+            files,
+            local_data_ref,
+        }
+    }
 }
 
 /// Why a [`SnapshotStore`] operation failed.
@@ -679,7 +929,12 @@ pub enum BackendError {
 /// The buffered result of running a one-shot command inside a running workload
 /// replica (`ComputeBackend::exec`). Non-streaming: stdout/stderr are captured to
 /// completion. `exit_code` is the command's status (128+signal if it was killed).
+///
+/// `#[non_exhaustive]`: a future captured-result field is additive, so construct via
+/// [`ExecOutput::new`] rather than a struct literal. All current fields are the captured
+/// result (no safe default), so they are constructor arguments.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ExecOutput {
     /// The command's exit status (128 + signal number if terminated by a signal).
     pub exit_code: i32,
@@ -687,6 +942,19 @@ pub struct ExecOutput {
     pub stdout: Vec<u8>,
     /// Captured standard error.
     pub stderr: Vec<u8>,
+}
+
+impl ExecOutput {
+    /// The buffered result of a one-shot exec: its `exit_code` plus the captured `stdout`
+    /// and `stderr`. The supported constructor now that `ExecOutput` is `#[non_exhaustive]`.
+    #[must_use]
+    pub fn new(exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+        Self {
+            exit_code,
+            stdout,
+            stderr,
+        }
+    }
 }
 
 /// Why an operator [`ComputeExec::exec`] failed (distinct from a backend launch
@@ -13410,5 +13678,151 @@ mod priority_tests {
             "within-ceiling preemption is unaffected"
         );
         assert_eq!(plan.victims[0].handle.workload, "v");
+    }
+}
+
+#[cfg(test)]
+mod seal_builder_tests {
+    //! Prove each newly-sealed (`#[non_exhaustive]`) compute-backend value type's
+    //! constructor/builder (a) reproduces the exact value a struct literal would (the literal
+    //! stays legal IN-crate; `#[non_exhaustive]` only blocks it downstream) and (b) defaults
+    //! every omitted field to PRIOR BEHAVIOR, so an out-of-tree backend that omits a new field
+    //! gets exactly the pre-field semantics.
+    use super::*;
+
+    #[test]
+    fn capabilities_builder_matches_literal_and_defaults() {
+        let built = Capabilities::new(IsolationClass::Container)
+            .with_persistent_volumes(true)
+            .with_preemptible(true);
+        let literal = Capabilities {
+            isolation: IsolationClass::Container,
+            scale_to_zero: false,
+            persistent_volumes: true,
+            max_vcpus: None,
+            max_mem_mib: None,
+            preemptible: true,
+        };
+        assert_eq!(built, literal);
+        // The bare constructor is the conservative default: no scale-to-zero, no volumes,
+        // unbounded, NOT preemptible (the pre-preemption behavior).
+        let def = Capabilities::new(IsolationClass::VmKvm);
+        assert!(!def.scale_to_zero);
+        assert!(!def.persistent_volumes);
+        assert_eq!(def.max_vcpus, None);
+        assert_eq!(def.max_mem_mib, None);
+        assert!(!def.preemptible);
+    }
+
+    #[test]
+    fn source_support_any_and_new_defaults() {
+        // `any()` is unchanged by the reseat onto the builder.
+        let any = SourceSupport::any();
+        assert_eq!(
+            any.accepted_sources,
+            vec![
+                RootSourceKind::Image,
+                RootSourceKind::Tar,
+                RootSourceKind::Rootfs
+            ]
+        );
+        assert!(any.private_registry_credential);
+        assert_eq!(any.primary_source, None);
+        // The bare constructor is fail-closed: cannot apply a credential, no primary affinity.
+        let def = SourceSupport::new(vec![RootSourceKind::Rootfs]);
+        assert!(!def.private_registry_credential);
+        assert_eq!(def.primary_source, None);
+        assert_eq!(
+            SourceSupport::new(vec![RootSourceKind::Image])
+                .with_private_registry_credential(true)
+                .with_primary_source(Some(RootSourceKind::Image)),
+            SourceSupport {
+                accepted_sources: vec![RootSourceKind::Image],
+                private_registry_credential: true,
+                primary_source: Some(RootSourceKind::Image),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_defaults_to_home_node_only() {
+        // The discipline case: a snapshot built without `with_exported` is NOT exported —
+        // exactly the pre-U14 home-node-only confinement.
+        let s = Snapshot::new("acme".into(), "web".into(), 0, "ref".into());
+        assert!(
+            !s.exported,
+            "omitting the U14 field preserves pre-U14 behavior"
+        );
+        assert_eq!(
+            s,
+            Snapshot {
+                project: "acme".into(),
+                workload: "web".into(),
+                replica: 0,
+                data_ref: "ref".into(),
+                exported: false,
+            }
+        );
+        assert!(s.with_exported(true).exported);
+    }
+
+    #[test]
+    fn launch_request_defaults_preserve_prior_behavior() {
+        let spec = ComputeSpec::builder(RootSource::Image("img:1".into()), 1, 128, 0).build();
+        let req = LaunchRequest::new(
+            "p".into(),
+            "w".into(),
+            0,
+            spec,
+            Artifact::Image {
+                reference: "img:1".into(),
+            },
+        );
+        // Omitting the growable fields yields the pre-field behavior: nothing to redact,
+        // no explicit priority class.
+        assert!(req.redaction.is_empty());
+        assert_eq!(req.priority_class, None);
+    }
+
+    #[test]
+    fn simple_value_constructors_match_literals() {
+        assert_eq!(
+            InstanceHandle::new("p".into(), "w".into(), 3, "ref".into()),
+            InstanceHandle {
+                project: "p".into(),
+                workload: "w".into(),
+                replica: 3,
+                backend_ref: "ref".into(),
+            }
+        );
+        assert_eq!(
+            Endpoint::new(Scheme::Http, "h".into(), 80),
+            Endpoint {
+                scheme: Scheme::Http,
+                host: "h".into(),
+                port: 80,
+            }
+        );
+        let h = InstanceHandle::new("p".into(), "w".into(), 0, "r".into());
+        let e = Endpoint::new(Scheme::Https, "h".into(), 443);
+        assert_eq!(
+            Instance::new(h.clone(), e.clone()),
+            Instance {
+                handle: h,
+                endpoint: e,
+            }
+        );
+        let out = ExecOutput::new(0, b"o".to_vec(), b"e".to_vec());
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.stdout, b"o");
+        assert_eq!(out.stderr, b"e");
+        assert_eq!(
+            SnapshotArtifact::new("/d".into(), vec!["a".into()], "ref".into()),
+            SnapshotArtifact {
+                dir: "/d".into(),
+                files: vec!["a".into()],
+                local_data_ref: "ref".into(),
+            }
+        );
     }
 }

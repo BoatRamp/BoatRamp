@@ -208,18 +208,13 @@ impl ComputeBackend for CloudflareBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            // A managed platform: strong (multi-tenant safe), idle-scaling, but no
-            // mountable persistent volumes through this path.
-            isolation: IsolationClass::Platform,
-            scale_to_zero: true,
-            persistent_volumes: false,
-            max_vcpus: None,
-            max_mem_mib: Some(InstanceType::Standard.mem_mib()),
-            // A DELEGATED managed platform: boatramp owns neither its capacity nor its
-            // eviction, so a cloudflare workload is never a preemptor and never a victim.
-            preemptible: false,
-        }
+        // A managed platform: strong (multi-tenant safe), idle-scaling, but no mountable
+        // persistent volumes through this path (default). A DELEGATED managed platform:
+        // boatramp owns neither its capacity nor its eviction, so a cloudflare workload is
+        // never a preemptor and never a victim (default-non-preemptible).
+        Capabilities::new(IsolationClass::Platform)
+            .with_scale_to_zero(true)
+            .with_max_mem_mib(Some(InstanceType::Standard.mem_mib()))
     }
 
     fn source_support(&self) -> SourceSupport {
@@ -228,11 +223,9 @@ impl ComputeBackend for CloudflareBackend {
         // emitter from `spec.pull_secret` (carried on `CfContainer::pull_secret`) — the CF
         // backend performs no in-process pull, so it ignores the resolved `pull_auth` but
         // IS able to run a private image. Image-only, credential-capable.
-        SourceSupport {
-            accepted_sources: vec![RootSourceKind::Image],
-            private_registry_credential: true,
-            primary_source: Some(RootSourceKind::Image),
-        }
+        SourceSupport::new(vec![RootSourceKind::Image])
+            .with_private_registry_credential(true)
+            .with_primary_source(Some(RootSourceKind::Image))
     }
 
     async fn materialize(
@@ -366,12 +359,7 @@ mod tests {
     #[test]
     fn health_url_prefers_ref_then_domain() {
         let b = CloudflareBackend::new("app.example.com");
-        let h = |r: &str| InstanceHandle {
-            project: "default".into(),
-            workload: "w".into(),
-            replica: 0,
-            backend_ref: r.into(),
-        };
+        let h = |r: &str| InstanceHandle::new("default".into(), "w".into(), 0, r.into());
         assert_eq!(
             b.health_url(&h("r0.example.com")),
             "https://r0.example.com/"
@@ -407,17 +395,15 @@ mod tests {
         assert_eq!(plan.instance_type, InstanceType::Standard);
 
         let err = b
-            .launch(&LaunchRequest {
-                project: "default".into(),
-                workload: "web".into(),
-                replica: 2,
-                spec: s,
-                artifact: Artifact::Image {
+            .launch(&LaunchRequest::new(
+                "default".into(),
+                "web".into(),
+                2,
+                s,
+                Artifact::Image {
                     reference: "registry/app:1".into(),
                 },
-                redaction: Default::default(),
-                priority_class: None,
-            })
+            ))
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -426,12 +412,12 @@ mod tests {
         assert!(msg.contains("standard"), "{msg}");
 
         // stop owns nothing → idempotent Ok.
-        b.stop(&InstanceHandle {
-            project: "default".into(),
-            workload: "web".into(),
-            replica: 2,
-            backend_ref: String::new(),
-        })
+        b.stop(&InstanceHandle::new(
+            "default".into(),
+            "web".into(),
+            2,
+            String::new(),
+        ))
         .await
         .unwrap();
     }

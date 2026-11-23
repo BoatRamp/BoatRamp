@@ -259,10 +259,7 @@ impl DeclaredDbResolver for NodeDeclaredDbResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boatramp_core::compute::{
-        ApplyDatabase, ApplyDatabaseKind, ApplyDatabaseScope, ApplyDatabaseSize,
-        ApplyDatabaseTenant,
-    };
+    use boatramp_core::compute::{ApplyDatabase, ApplyDatabaseKind};
     use boatramp_core::envelope::EnvelopeError;
     use boatramp_core::kv::MemoryKv;
     use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
@@ -333,26 +330,9 @@ mod tests {
     // only to KV (spec + workload + sealed credential), so the resolver's positive path
     // runs without a live server up to the endpoint-connect step.
     fn single_default() -> ApplyDatabase {
-        ApplyDatabase {
-            name: "default".to_string(),
-            kind: ApplyDatabaseKind::Postgres,
-            version: None,
-            extensions: vec![],
-            size: ApplyDatabaseSize::Small,
-            tenant: ApplyDatabaseTenant::Single,
-            tenant_scope: ApplyDatabaseScope::Project,
-            read_only: false,
-            rls_session: false,
-            tenant_guc: None,
-            session_guc: None,
-            tenant_all_marker: None,
-            pool_max: None,
-            connect_timeout_secs: None,
-            startup_grace_secs: None,
-            readiness_gate: Default::default(),
-            delta_capture: false,
-            restart_policy: Default::default(),
-        }
+        // Every optional knob at its default (small / single / project / …), so this is
+        // exactly `new(name, kind)`.
+        ApplyDatabase::new("default".to_string(), ApplyDatabaseKind::Postgres)
     }
 
     #[tokio::test]

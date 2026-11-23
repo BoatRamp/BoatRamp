@@ -327,10 +327,10 @@ impl ComputeBackend for VzBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
+        Capabilities::new(IsolationClass::VmKvm)
             // A per-container hypervisor VM — the same strong isolation as the KVM
             // backend (satisfies untrusted / multi-tenant workloads).
-            isolation: IsolationClass::VmKvm,
+            //
             // Scale-to-zero: park an idle replica (pause + `saveMachineStateToURL:` +
             // stop) and later wake it (recreate the VM with the SAME stable machine
             // identity + `restoreMachineStateFromURL:` + resume). The resumed guest
@@ -338,25 +338,20 @@ impl ComputeBackend for VzBackend {
             // `snapshot`/`restore` and `tests/vz_live.rs`). The stable
             // `VZGenericMachineIdentifier` is the key: VZ rejects a restore whose
             // identifier differs from the saved VM's.
-            scale_to_zero: true,
+            .with_scale_to_zero(true)
             // Persistent volumes as writable virtio-block images.
-            persistent_volumes: true,
-            max_vcpus: None,
-            max_mem_mib: None,
+            .with_persistent_volumes(true)
             // Directly scheduled against the node ledger — a preemption participant.
-            preemptible: true,
-        }
+            .with_preemptible(true)
     }
 
     fn source_support(&self) -> SourceSupport {
         // A Virtualization.framework micro-VM boots a prebuilt **rootfs** block image
         // (`RootSource::Rootfs`); `materialize` rejects an image/tar source and never
         // pulls from a registry. Rootfs-only, not credential-capable.
-        SourceSupport {
-            accepted_sources: vec![RootSourceKind::Rootfs],
-            private_registry_credential: false,
-            primary_source: Some(RootSourceKind::Rootfs),
-        }
+        SourceSupport::new(vec![RootSourceKind::Rootfs])
+            .with_private_registry_credential(false)
+            .with_primary_source(Some(RootSourceKind::Rootfs))
     }
 
     async fn materialize(
@@ -445,19 +440,15 @@ impl ComputeBackend for VzBackend {
             .expect("running mutex")
             .insert(id, RunningVm { child, ip, cfg });
 
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: req.project.clone(),
-                workload: req.workload.clone(),
-                replica: req.replica,
-                backend_ref: encode_ref(&ip.to_string(), port),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: ip.to_string(),
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                req.project.clone(),
+                req.workload.clone(),
+                req.replica,
+                encode_ref(&ip.to_string(), port),
+            ),
+            Endpoint::new(Scheme::Http, ip.to_string(), port),
+        ))
     }
 
     async fn stop(&self, handle: &InstanceHandle) -> Result<(), BackendError> {
@@ -554,15 +545,14 @@ impl ComputeBackend for VzBackend {
                 "worker exited {status} during snapshot"
             )));
         }
-        Ok(Some(Snapshot {
-            project: handle.project.clone(),
-            workload: handle.workload.clone(),
-            replica: handle.replica,
-            data_ref: encode_snap(&stem, &ip.to_string(), port),
-            // Same-node only on the macOS VZ backend (no cross-node artifact wired); the
-            // reconcile never sets this for it (U14).
-            exported: false,
-        }))
+        // Same-node only on the macOS VZ backend (no cross-node artifact wired):
+        // `exported` stays at its `false` default — the reconcile never flips it (U14).
+        Ok(Some(Snapshot::new(
+            handle.project.clone(),
+            handle.workload.clone(),
+            handle.replica,
+            encode_snap(&stem, &ip.to_string(), port),
+        )))
     }
 
     /// **Restore** (scale-to-zero wake): read the persisted config, re-reserve the
@@ -611,19 +601,15 @@ impl ComputeBackend for VzBackend {
             },
         );
 
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: snapshot.project.clone(),
-                workload: snapshot.workload.clone(),
-                replica: snapshot.replica,
-                backend_ref: encode_ref(&ip, port),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: ip,
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                snapshot.project.clone(),
+                snapshot.workload.clone(),
+                snapshot.replica,
+                encode_ref(&ip, port),
+            ),
+            Endpoint::new(Scheme::Http, ip, port),
+        ))
     }
 }
 
@@ -682,14 +668,10 @@ mod tests {
         // Strong per-VM isolation + persistent volumes + scale-to-zero (the VZ
         // save/restore round-trip is validated live — see `capabilities` and
         // `tests/vz_live.rs`).
-        let caps = Capabilities {
-            isolation: IsolationClass::VmKvm,
-            scale_to_zero: true,
-            persistent_volumes: true,
-            max_vcpus: None,
-            max_mem_mib: None,
-            preemptible: true,
-        };
+        let caps = Capabilities::new(IsolationClass::VmKvm)
+            .with_scale_to_zero(true)
+            .with_persistent_volumes(true)
+            .with_preemptible(true);
         assert!(caps.isolation.is_strong());
         assert!(caps.scale_to_zero);
         assert!(caps.persistent_volumes);

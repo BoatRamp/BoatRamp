@@ -3951,14 +3951,11 @@ mod tests {
             "fake"
         }
         fn capabilities(&self) -> boatramp_core::compute::Capabilities {
-            boatramp_core::compute::Capabilities {
-                isolation: boatramp_core::compute::IsolationClass::Container,
-                scale_to_zero: false,
-                persistent_volumes: true,
-                max_vcpus: None,
-                max_mem_mib: None,
-                preemptible: true,
-            }
+            boatramp_core::compute::Capabilities::new(
+                boatramp_core::compute::IsolationClass::Container,
+            )
+            .with_persistent_volumes(true)
+            .with_preemptible(true)
         }
         async fn materialize(
             &self,

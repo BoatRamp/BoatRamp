@@ -137,26 +137,23 @@ impl KeyEnvelope for RevEnvelope {
 /// default tenancy). The lowering derives the server workload + managed credential; the
 /// manifest carries NO image/secret/compute (the security contract).
 fn applied_pg() -> ApplyDatabase {
-    ApplyDatabase {
-        name: DB_NAME.to_string(),
-        kind: ApplyDatabaseKind::Postgres,
-        version: None,
-        extensions: vec![],
-        size: ApplyDatabaseSize::Small,
-        tenant: ApplyDatabaseTenant::Single,
-        tenant_scope: ApplyDatabaseScope::Project,
-        read_only: false,
-        rls_session: false,
-        tenant_guc: None,
-        session_guc: None,
-        tenant_all_marker: None,
-        pool_max: None,
-        connect_timeout_secs: Some(10),
-        startup_grace_secs: Some(120),
-        readiness_gate: Default::default(),
-        delta_capture: false,
-        restart_policy: Default::default(),
-    }
+    ApplyDatabase::new(DB_NAME.to_string(), ApplyDatabaseKind::Postgres)
+        .with_version(None)
+        .with_extensions(vec![])
+        .with_size(ApplyDatabaseSize::Small)
+        .with_tenant(ApplyDatabaseTenant::Single)
+        .with_tenant_scope(ApplyDatabaseScope::Project)
+        .with_read_only(false)
+        .with_rls_session(false)
+        .with_tenant_guc(None)
+        .with_session_guc(None)
+        .with_tenant_all_marker(None)
+        .with_pool_max(None)
+        .with_connect_timeout_secs(Some(10))
+        .with_startup_grace_secs(Some(120))
+        .with_readiness_gate(Default::default())
+        .with_delta_capture(false)
+        .with_restart_policy(Default::default())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -448,15 +445,9 @@ async fn launch_with_env(
         .await
         .map_err(|e| format!("store staged spec: {e}"))?;
 
-    let req = LaunchRequest {
-        project: PROJECT.into(),
-        workload: workload.name.clone(),
-        replica: 0,
-        spec,
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new(PROJECT.into(), workload.name.clone(), 0, spec, artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     let inst = backend
         .launch(&req)
         .await

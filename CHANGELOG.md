@@ -30,14 +30,46 @@ versions.
     read their fields), so sealing them is additive — no constructor is needed and only a downstream
     that *destructured* one exhaustively (none in-tree) is affected.
 
-  The genuinely wide-blast-radius surfaces are **deliberately deferred** to an owner-sequenced,
-  security-reviewed follow-up rather than forced here: the `ComputeBackend` return-struct family
-  (`Capabilities`, `SourceSupport`, `Instance`, `InstanceHandle`, `Endpoint`, `Snapshot`,
-  `ExecOutput`, `Artifact`, `LaunchRequest` — constructed by every backend impl, `Capabilities`
-  encoding isolation/preemption defaults), the `ApplyDatabase` wire family, and the authority enums
-  (`authz::Action`/`Resource`, `cwt::TokenAlg`/`TokenPublicKey`/`LocalSigner`), which are
-  intentionally left sealed-by-exhaustive-match as a compile-time safety control. See the audit in
-  the PR for the per-type rationale.
+- **`#[non_exhaustive]` + builder seal of the compute-backend return/input family and the client DB
+  struct (owner-approved follow-up to the audit above).** The wide-blast-radius surfaces the audit
+  deferred are now sealed, each with an additive constructor/builder whose defaults preserve PRIOR
+  behavior (a consumer that omits a new field gets exactly the pre-field semantics). **Every backend
+  impl and in-tree construction site migrated to the constructors/builders** (pre-1.0; downstream
+  `uchron` / `luigi` that construct these — or match `Artifact` exhaustively — must migrate the same
+  way):
+  - `boatramp_core::compute::Capabilities` — `Capabilities::new(isolation)` + `with_scale_to_zero` /
+    `with_persistent_volumes` / `with_max_vcpus` / `with_max_mem_mib` / `with_preemptible`. Every
+    optional axis defaults to the conservative pre-field value (not preemptible, no
+    scale-to-zero/volumes, unbounded); `isolation` is a required constructor arg (no safe default).
+  - `boatramp_core::compute::SourceSupport` — `SourceSupport::new(accepted_sources)` +
+    `with_private_registry_credential` (default `false`, fail-closed) / `with_primary_source`
+    (default `None`). `SourceSupport::any()` is unchanged (reseated onto the builder).
+  - `boatramp_core::compute::LaunchRequest` — `LaunchRequest::new(project, workload, replica, spec,
+    artifact)` + `with_redaction` (default empty set) / `with_priority_class` (default `None`).
+  - `boatramp_core::compute::Snapshot` — `Snapshot::new(project, workload, replica, data_ref)` +
+    `with_exported` (default `false` = the pre-U14 home-node-only confinement).
+  - `boatramp_core::compute::InstanceHandle` / `Endpoint` / `Instance` / `ExecOutput` /
+    `SnapshotArtifact` — `::new(..)` over the current (all-required) fields.
+  - `boatramp_core::compute::Artifact` (enum) — a `match` on it now needs a `_` arm; every in-tree
+    `materialize`/launch match already carries a fail-closed catch-all, so the seal is
+    behavior-neutral in-tree.
+  - `boatramp_types::compute::ApplyDatabase` — `ApplyDatabase::new(name, kind)` + a `with_*` setter
+    per optional knob; `new(name, kind)` equals deserializing a minimal `{name, kind}` manifest
+    (every knob at its serde default = prior behavior).
+  - `boatramp_types::authz::Right` / `GrantedRole` / `RightTemplate` — already had constructors
+    (`Right::new`; `GrantedRole::global`/`scoped`/`parse`; `RightTemplate::any`/`scoped`/
+    `project_wildcard`); now `#[non_exhaustive]` so a future field stays additive (no in-tree site
+    used a struct literal, so nothing migrated).
+
+  Deliberately **kept exhaustive (NOT sealed)**, matching the audit's own reasoning: the growable
+  enums heavily exhaustively-matched in-tree (`BindingKind`, `RootSource`/`RootSourceKind`,
+  `RestartPolicy`, `IsolationRequirement`, `PullPolicy`) and the small closed DB-projection enums
+  (`ApplyDatabaseKind`/`Tenant`/`Scope`/`Size`, `ReadinessLevel`, `DbRestartPolicy`) — sealing these
+  would force `_` arms across many in-tree matches and erode the compile-time exhaustiveness we rely
+  on, for low external payoff (peers construct, rarely match them). The security-control enums
+  (`authz::Action`/`Resource`/`TargetKind`/`TargetScope`, `cwt::TokenAlg`/`TokenPublicKey`/
+  `LocalSigner`) stay sealed-by-exhaustive-match as a deliberate control (an endpoint can't go
+  unclassified, a crypto alg unhandled).
 
 ### Added
 

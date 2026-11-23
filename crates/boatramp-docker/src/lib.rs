@@ -1143,26 +1143,19 @@ impl ComputeBackend for DockerBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            isolation: IsolationClass::Container,
-            scale_to_zero: false,
-            persistent_volumes: true,
-            max_vcpus: None,
-            max_mem_mib: None,
-            // Directly scheduled against the node ledger — a preemption participant.
-            preemptible: true,
-        }
+        // Directly scheduled against the node ledger — a preemption participant.
+        Capabilities::new(IsolationClass::Container)
+            .with_persistent_volumes(true)
+            .with_preemptible(true)
     }
 
     fn source_support(&self) -> SourceSupport {
         // The docker backend pulls an OCI **image** reference (`materialize` rejects a
         // tar/rootfs source) and authenticates the pull with the host-resolved registry
         // credential (`pull_image(…, pull_auth)`): image-only, private-registry-capable.
-        SourceSupport {
-            accepted_sources: vec![RootSourceKind::Image],
-            private_registry_credential: true,
-            primary_source: Some(RootSourceKind::Image),
-        }
+        SourceSupport::new(vec![RootSourceKind::Image])
+            .with_private_registry_credential(true)
+            .with_primary_source(Some(RootSourceKind::Image))
     }
 
     async fn materialize(
@@ -1405,19 +1398,15 @@ impl ComputeBackend for DockerBackend {
             ),
             DockerEndpoint::Bridge => (self.container_ip(&created.id).await?, port),
         };
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: req.project.clone(),
-                workload: req.workload.clone(),
-                replica: req.replica,
-                backend_ref: encode_ref(&name, &host, endpoint_port),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host,
-                port: endpoint_port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                req.project.clone(),
+                req.workload.clone(),
+                req.replica,
+                encode_ref(&name, &host, endpoint_port),
+            ),
+            Endpoint::new(Scheme::Http, host, endpoint_port),
+        ))
     }
 
     async fn stop(&self, handle: &InstanceHandle) -> Result<(), BackendError> {
@@ -1550,11 +1539,7 @@ impl ComputeBackend for DockerBackend {
                     .flatten() // Vec<PortBinding> → each PortBinding
                     .find_map(|b| b.host_port.as_ref().and_then(|hp| hp.parse::<u16>().ok()))
             })?;
-        Some(Endpoint {
-            scheme: Scheme::Http,
-            host: "127.0.0.1".to_string(),
-            port,
-        })
+        Some(Endpoint::new(Scheme::Http, "127.0.0.1".to_string(), port))
     }
 
     /// List this backend's persistent volumes (the host-side backing for a spec's
@@ -1780,11 +1765,7 @@ impl ComputeBackend for DockerBackend {
             .map_err(|e| BackendError::Other(format!("exec inspect on {name}: {e}")))?;
         let exit_code = inspected.exit_code.unwrap_or(0) as i32;
 
-        Ok(ExecOutput {
-            exit_code,
-            stdout,
-            stderr,
-        })
+        Ok(ExecOutput::new(exit_code, stdout, stderr))
     }
 
     async fn run_ephemeral(
@@ -2680,18 +2661,16 @@ mod tests {
             let mut redaction = boatramp_core::compute::RedactionSet::new();
             redaction.push("postgres://u:P%40ss_FWD_UNIQ_dd11@bramp-db.flycast:5432/app".into());
             redaction.set_project_opt_out(project_opt_out);
-            LaunchRequest {
-                project: "proj".into(),
-                workload: "w".into(),
-                replica: 0,
-                spec: ComputeSpec::builder(RootSource::Image("img:latest".into()), 1, 128, 0)
-                    .build(),
-                artifact: Artifact::Image {
+            LaunchRequest::new(
+                "proj".into(),
+                "w".into(),
+                0,
+                ComputeSpec::builder(RootSource::Image("img:latest".into()), 1, 128, 0).build(),
+                Artifact::Image {
                     reference: "img:latest".into(),
                 },
-                redaction,
-                priority_class: None,
-            }
+            )
+            .with_redaction(redaction)
         };
 
         // Default posture (redact on, admission off): opt-out IGNORED → redactor built either way.
