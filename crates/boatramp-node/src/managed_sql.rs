@@ -3834,30 +3834,10 @@ mod tests {
     /// Build a minimal `Single`/`Project` managed-pg [`ApplyDatabase`] (what `boatramp
     /// apply`'s `databases:` block lowers to) for the applied-db resolve tests.
     fn applied_pg(name: &str) -> boatramp_core::compute::ApplyDatabase {
-        use boatramp_core::compute::{
-            ApplyDatabase, ApplyDatabaseKind, ApplyDatabaseScope, ApplyDatabaseSize,
-            ApplyDatabaseTenant,
-        };
-        ApplyDatabase {
-            name: name.to_string(),
-            kind: ApplyDatabaseKind::Postgres,
-            version: None,
-            extensions: vec![],
-            size: ApplyDatabaseSize::Small,
-            tenant: ApplyDatabaseTenant::Single,
-            tenant_scope: ApplyDatabaseScope::Project,
-            read_only: false,
-            rls_session: false,
-            tenant_guc: None,
-            session_guc: None,
-            tenant_all_marker: None,
-            pool_max: None,
-            connect_timeout_secs: None,
-            startup_grace_secs: None,
-            readiness_gate: Default::default(),
-            delta_capture: false,
-            restart_policy: Default::default(),
-        }
+        use boatramp_core::compute::{ApplyDatabase, ApplyDatabaseKind};
+        // A minimal `Single`/`Project` managed-pg DB — every optional knob at its default,
+        // so this is exactly `new(name, kind)`.
+        ApplyDatabase::new(name.to_string(), ApplyDatabaseKind::Postgres)
     }
 
     /// THE TURNKEY RECOVERY GATE — `APPLIED-DB SERVER-INIT ENV RESOLVED`.
@@ -4156,19 +4136,10 @@ mod tests {
     ) -> boatramp_core::compute::ObservedInstance {
         use boatramp_core::compute::{Endpoint, InstanceHandle, Scheme};
         boatramp_core::compute::ObservedInstance {
-            handle: InstanceHandle {
-                project: "default".into(),
-                workload: workload.into(),
-                replica,
-                backend_ref: String::new(),
-            },
+            handle: InstanceHandle::new("default".into(), workload.into(), replica, String::new()),
             node: 0,
             backend: "fake".into(),
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: host.into(),
-                port,
-            },
+            endpoint: Endpoint::new(Scheme::Http, host.into(), port),
             region: None,
             healthy,
             started_at: None,

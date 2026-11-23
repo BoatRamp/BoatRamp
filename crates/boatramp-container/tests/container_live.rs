@@ -135,15 +135,9 @@ async fn container_live_launch_and_hold() {
         .expect("materialize rootfs");
     assert!(matches!(artifact, Artifact::Rootfs { .. }));
 
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "clive".into(),
-        replica: 0,
-        spec,
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new("default".into(), "clive".into(), 0, spec, artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     let inst = backend.launch(&req).await.expect("launch container");
     let id = format!("{}-{}", inst.handle.workload, inst.handle.replica);
     let cgroup = format!("/sys/fs/cgroup/boatramp/{id}");
@@ -256,15 +250,9 @@ async fn run_pg_e2e(host_root: bool) {
         .expect("materialize (pull) pgvector image");
     assert!(matches!(artifact, Artifact::Rootfs { .. }));
 
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: format!("cpg{tag}"),
-        replica: 0,
-        spec,
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new("default".into(), format!("cpg{tag}"), 0, spec, artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     let inst = backend
         .launch(&req)
         .await
@@ -385,15 +373,9 @@ async fn launch_managed_pg(
         .materialize("default", wl, spec, None)
         .await
         .expect("materialize (pull) pgvector image");
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: wl.into(),
-        replica: 0,
-        spec: spec.clone(),
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new("default".into(), wl.into(), 0, spec.clone(), artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     backend
         .launch(&req)
         .await
@@ -1183,15 +1165,9 @@ async fn container_criu_roundtrip() {
         .materialize("default", "ccriu", &spec, None)
         .await
         .expect("materialize");
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "ccriu".into(),
-        replica: 0,
-        spec,
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new("default".into(), "ccriu".into(), 0, spec, artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     let inst = backend.launch(&req).await.expect("launch");
     let nonce1 = probe_nonce(&inst.endpoint.host, inst.endpoint.port);
     assert!(
@@ -1264,15 +1240,9 @@ async fn container_exec_runs_command_and_round_trips_stdin() {
         .materialize("default", "cexec", &spec, None)
         .await
         .expect("materialize");
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "cexec".into(),
-        replica: 0,
-        spec,
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new("default".into(), "cexec".into(), 0, spec, artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     let inst = backend.launch(&req).await.expect("launch container");
 
     // The container serves the nonce over HTTP — wait for it so we know the jail is

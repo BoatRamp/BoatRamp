@@ -6900,19 +6900,15 @@ mod tests {
             Endpoint, InstanceHandle, ObservedInstance, ReplicaPhase, Scheme,
         };
         ObservedInstance {
-            handle: InstanceHandle {
-                project: project.to_string(),
-                workload: workload.to_string(),
+            handle: InstanceHandle::new(
+                project.to_string(),
+                workload.to_string(),
                 replica,
-                backend_ref: format!("pid-{replica}"),
-            },
+                format!("pid-{replica}"),
+            ),
             node: 1,
             backend: "container".to_string(),
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: ip.to_string(),
-                port: 5432,
-            },
+            endpoint: Endpoint::new(Scheme::Http, ip.to_string(), 5432),
             region: None,
             healthy,
             started_at,
@@ -7886,34 +7882,13 @@ mod tests {
     #[cfg(feature = "sql-postgres")]
     #[tokio::test]
     async fn database_status_readiness_agrees_with_sql_status() {
-        use boatramp_core::compute::{
-            ApplyDatabase, ApplyDatabaseKind, ApplyDatabaseScope, ApplyDatabaseSize,
-            ApplyDatabaseTenant, Readiness,
-        };
+        use boatramp_core::compute::{ApplyDatabase, ApplyDatabaseKind, Readiness};
         use boatramp_core::project::ProjectRef;
         use boatramp_core::sql::SqlReadiness;
 
         let project = "exampleorg";
-        let declared = ApplyDatabase {
-            name: "default".to_string(),
-            kind: ApplyDatabaseKind::Postgres,
-            version: None,
-            extensions: vec![],
-            size: ApplyDatabaseSize::Small,
-            tenant: ApplyDatabaseTenant::Single,
-            tenant_scope: ApplyDatabaseScope::Project,
-            read_only: false,
-            rls_session: false,
-            tenant_guc: None,
-            session_guc: None,
-            tenant_all_marker: None,
-            pool_max: None,
-            connect_timeout_secs: None,
-            startup_grace_secs: None,
-            readiness_gate: Default::default(),
-            delta_capture: false,
-            restart_policy: Default::default(),
-        };
+        // Every optional knob at its default, so this is exactly `new(name, kind)`.
+        let declared = ApplyDatabase::new("default".to_string(), ApplyDatabaseKind::Postgres);
         let deploy = store();
         deploy
             .set_project_database(ProjectRef::new(project), &declared)

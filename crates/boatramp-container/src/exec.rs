@@ -327,11 +327,7 @@ fn parent_pump_and_reap(
         Err(e) => return Err(BackendError::Other(format!("exec: waitpid: {e}"))),
     };
 
-    Ok(ExecOutput {
-        exit_code,
-        stdout,
-        stderr,
-    })
+    Ok(ExecOutput::new(exit_code, stdout, stderr))
 }
 
 /// Read an owned fd to EOF, taking ownership so it's closed on return.

@@ -169,19 +169,15 @@ async fn construens_selfheal_preserves_live_until_swap_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: p.host.clone(),
-                    port: p.port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, p.host.clone(), p.port),
                 region: None,
                 healthy: true,
                 started_at: None,

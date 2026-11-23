@@ -8894,19 +8894,15 @@ mod tests {
             .set_replica_state(
                 ProjectRef::new("beta"),
                 &crate::compute::ObservedInstance {
-                    handle: crate::compute::InstanceHandle {
-                        project: "beta".into(),
-                        workload: "web".into(),
-                        replica: 0,
-                        backend_ref: "10.0.0.6:8080".into(),
-                    },
+                    handle: crate::compute::InstanceHandle::new(
+                        "beta".into(),
+                        "web".into(),
+                        0,
+                        "10.0.0.6:8080".into(),
+                    ),
                     node: 1,
                     backend: "container".into(),
-                    endpoint: Endpoint {
-                        scheme: Scheme::Http,
-                        host: "10.0.0.6".into(),
-                        port: 8080,
-                    },
+                    endpoint: Endpoint::new(Scheme::Http, "10.0.0.6".into(), 8080),
                     region: None,
                     healthy: true,
                     started_at: None,

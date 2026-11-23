@@ -180,16 +180,12 @@ impl ComputeBackend for FakeComputeBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            // A shared-kernel namespace container, volume- and snapshot-capable so a
-            // managed DB (volume) + a scale-to-zero workload can place.
-            isolation: IsolationClass::Namespace,
-            scale_to_zero: true,
-            persistent_volumes: true,
-            max_vcpus: None,
-            max_mem_mib: None,
-            preemptible: true,
-        }
+        Capabilities::new(IsolationClass::Namespace)
+            .with_scale_to_zero(true)
+            .with_persistent_volumes(true)
+            .with_max_vcpus(None)
+            .with_max_mem_mib(None)
+            .with_preemptible(true)
     }
 
     async fn materialize(
@@ -267,19 +263,15 @@ impl ComputeBackend for FakeComputeBackend {
                 port,
             },
         );
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: req.project.clone(),
-                workload: req.workload.clone(),
-                replica: req.replica,
-                backend_ref: format!("{ip}:{port}"),
-            },
-            endpoint: Endpoint {
-                scheme: self.scheme,
-                host: ip.to_string(),
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                req.project.clone(),
+                req.workload.clone(),
+                req.replica,
+                format!("{ip}:{port}"),
+            ),
+            Endpoint::new(self.scheme, ip.to_string(), port),
+        ))
     }
 
     async fn stop(&self, handle: &InstanceHandle) -> Result<(), BackendError> {
@@ -325,13 +317,15 @@ impl ComputeBackend for FakeComputeBackend {
         let Some(inst) = instances.get(&key) else {
             return Ok(None);
         };
-        Ok(Some(Snapshot {
-            project: handle.project.clone(),
-            workload: handle.workload.clone(),
-            replica: handle.replica,
-            data_ref: format!("snap|{}|{}", inst.ip, inst.port),
-            exported: false,
-        }))
+        Ok(Some(
+            Snapshot::new(
+                handle.project.clone(),
+                handle.workload.clone(),
+                handle.replica,
+                format!("snap|{}|{}", inst.ip, inst.port),
+            )
+            .with_exported(false),
+        ))
     }
 
     async fn restore(&self, snapshot: &Snapshot) -> Result<Instance, BackendError> {
@@ -360,19 +354,15 @@ impl ComputeBackend for FakeComputeBackend {
                 port,
             },
         );
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: snapshot.project.clone(),
-                workload: snapshot.workload.clone(),
-                replica: snapshot.replica,
-                backend_ref: format!("{ip}:{port}"),
-            },
-            endpoint: Endpoint {
-                scheme: self.scheme,
-                host: ip.to_string(),
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                snapshot.project.clone(),
+                snapshot.workload.clone(),
+                snapshot.replica,
+                format!("{ip}:{port}"),
+            ),
+            Endpoint::new(self.scheme, ip.to_string(), port),
+        ))
     }
 }
 

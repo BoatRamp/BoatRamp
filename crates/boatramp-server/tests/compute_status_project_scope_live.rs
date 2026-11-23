@@ -66,19 +66,15 @@ fn project(name: &str) -> Project {
 /// A healthy + running observed replica for `(project, workload)`.
 fn healthy_running(project: &str, workload: &str, ip: &str) -> ObservedInstance {
     ObservedInstance {
-        handle: InstanceHandle {
-            project: project.to_string(),
-            workload: workload.to_string(),
-            replica: 0,
-            backend_ref: "pid-0".to_string(),
-        },
+        handle: InstanceHandle::new(
+            project.to_string(),
+            workload.to_string(),
+            0,
+            "pid-0".to_string(),
+        ),
         node: 1,
         backend: "container".to_string(),
-        endpoint: Endpoint {
-            scheme: Scheme::Http,
-            host: ip.to_string(),
-            port: 8080,
-        },
+        endpoint: Endpoint::new(Scheme::Http, ip.to_string(), 8080),
         region: None,
         healthy: true,
         started_at: Some(boatramp_core::time::now_unix()),

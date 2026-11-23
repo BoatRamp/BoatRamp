@@ -1211,8 +1211,16 @@ pub mod apply_db_caps {
 ///
 /// The struct uses `deny_unknown_fields` so a manifest that tries to smuggle one of
 /// the excluded keys fails to parse rather than being silently ignored.
+///
+/// `#[non_exhaustive]`: the declarative manifest surface grows new SAFE knobs over time, so
+/// downstream crates build it via [`ApplyDatabase::new`] + the chainable `with_*` setters
+/// rather than a struct literal — a later knob is then an additive, non-breaking field. The
+/// two genuinely-required fields (`name`, `kind` — no serde default) are constructor
+/// arguments; every optional knob defaults to its serde default, so `new(name, kind)` yields
+/// exactly what deserializing a minimal `{name, kind}` manifest would (prior behavior).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ApplyDatabase {
     /// The binding name — how a guest reaches it via `sql.open("<name>")` and the
     /// `{name}` path segment of the `project/{project}/database/{name}` store key.
@@ -1287,6 +1295,150 @@ pub struct ApplyDatabase {
     /// `manual` (default: stage + mark pending) or `auto` (apply + restart now).
     #[serde(default, skip_serializing_if = "restart_policy_is_default")]
     pub restart_policy: DbRestartPolicy,
+}
+
+impl ApplyDatabase {
+    /// A declared database named `name` running engine `kind`, with every optional knob at
+    /// its serde default — identical to deserializing a minimal `{ name, kind }` manifest
+    /// (no version pin, no extensions, `small`, `single`/`project`, read-write, RLS off, no
+    /// pool/timeout/grace overrides, all-`provisioned` readiness, no delta-capture, `manual`
+    /// restart). The supported constructor now that `ApplyDatabase` is `#[non_exhaustive]`;
+    /// refine with the chainable `with_*` setters.
+    #[must_use]
+    pub fn new(name: String, kind: ApplyDatabaseKind) -> Self {
+        Self {
+            name,
+            kind,
+            version: None,
+            extensions: Vec::new(),
+            size: ApplyDatabaseSize::default(),
+            tenant: ApplyDatabaseTenant::default(),
+            tenant_scope: ApplyDatabaseScope::default(),
+            read_only: false,
+            rls_session: false,
+            tenant_guc: None,
+            session_guc: None,
+            tenant_all_marker: None,
+            pool_max: None,
+            connect_timeout_secs: None,
+            startup_grace_secs: None,
+            readiness_gate: ReadinessGate::default(),
+            delta_capture: false,
+            restart_policy: DbRestartPolicy::default(),
+        }
+    }
+
+    /// Pin the engine major version (`None` ⇒ the engine default).
+    #[must_use]
+    pub fn with_version(mut self, version: Option<u32>) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Request trusted extensions (still owner-gated at the migration step).
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: Vec<String>) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
+    /// Set the coarse sizing preset (default `small`).
+    #[must_use]
+    pub fn with_size(mut self, size: ApplyDatabaseSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Set the per-tenant isolation mechanism (default `single`).
+    #[must_use]
+    pub fn with_tenant(mut self, tenant: ApplyDatabaseTenant) -> Self {
+        self.tenant = tenant;
+        self
+    }
+
+    /// Set the tenant grain (default `project`).
+    #[must_use]
+    pub fn with_tenant_scope(mut self, tenant_scope: ApplyDatabaseScope) -> Self {
+        self.tenant_scope = tenant_scope;
+        self
+    }
+
+    /// Open every transaction `READ ONLY` (default `false`).
+    #[must_use]
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Opt in to native-RLS session injection (default `false`).
+    #[must_use]
+    pub fn with_rls_session(mut self, rls_session: bool) -> Self {
+        self.rls_session = rls_session;
+        self
+    }
+
+    /// Set the Postgres session GUC for the host-resolved tenant (`None` ⇒ unset).
+    #[must_use]
+    pub fn with_tenant_guc(mut self, tenant_guc: Option<String>) -> Self {
+        self.tenant_guc = tenant_guc;
+        self
+    }
+
+    /// Set the session GUC for the anonymous session axis (`None` ⇒ unset).
+    #[must_use]
+    pub fn with_session_guc(mut self, session_guc: Option<String>) -> Self {
+        self.session_guc = session_guc;
+        self
+    }
+
+    /// Set the reserved sentinel written to `tenant_guc` on an `all`-scoped read.
+    #[must_use]
+    pub fn with_tenant_all_marker(mut self, tenant_all_marker: Option<String>) -> Self {
+        self.tenant_all_marker = tenant_all_marker;
+        self
+    }
+
+    /// Set the maximum pooled connections (capped at lowering; `None` ⇒ the default).
+    #[must_use]
+    pub fn with_pool_max(mut self, pool_max: Option<u32>) -> Self {
+        self.pool_max = pool_max;
+        self
+    }
+
+    /// Set the connection/acquire timeout seconds (capped at lowering; `None` ⇒ default).
+    #[must_use]
+    pub fn with_connect_timeout_secs(mut self, connect_timeout_secs: Option<u64>) -> Self {
+        self.connect_timeout_secs = connect_timeout_secs;
+        self
+    }
+
+    /// Set the first-`initdb` startup grace seconds (capped at lowering; `None` ⇒ default).
+    #[must_use]
+    pub fn with_startup_grace_secs(mut self, startup_grace_secs: Option<u32>) -> Self {
+        self.startup_grace_secs = startup_grace_secs;
+        self
+    }
+
+    /// Set the per-surface readiness gate (default: every surface `provisioned`).
+    #[must_use]
+    pub fn with_readiness_gate(mut self, readiness_gate: ReadinessGate) -> Self {
+        self.readiness_gate = readiness_gate;
+        self
+    }
+
+    /// Opt in to row-level change capture for delta exports (default `false`).
+    #[must_use]
+    pub fn with_delta_capture(mut self, delta_capture: bool) -> Self {
+        self.delta_capture = delta_capture;
+        self
+    }
+
+    /// Set how a restart-requiring config change is applied (default `manual`).
+    #[must_use]
+    pub fn with_restart_policy(mut self, restart_policy: DbRestartPolicy) -> Self {
+        self.restart_policy = restart_policy;
+        self
+    }
 }
 
 /// Omit `restart_policy` from a serialized manifest when it is the `manual` default.
@@ -1836,5 +1988,37 @@ mod tests {
         assert_eq!(g.routing, ReadinessLevel::ServiceReady);
         assert_eq!(g.answerability, ReadinessLevel::Provisioned);
         assert_eq!(g.migration, ReadinessLevel::Provisioned);
+    }
+
+    #[test]
+    fn apply_database_new_equals_minimal_manifest_and_builder_is_additive() {
+        // `new(name, kind)` yields exactly what deserializing a minimal `{name, kind}`
+        // manifest would — every optional knob at its serde default (prior behavior).
+        let built = ApplyDatabase::new("app".to_string(), ApplyDatabaseKind::Postgres);
+        let deserialized: ApplyDatabase =
+            serde_json::from_value(serde_json::json!({ "name": "app", "kind": "postgres" }))
+                .expect("minimal ApplyDatabase");
+        assert_eq!(built, deserialized);
+        // Spot-check the defaults are the documented prior behavior.
+        assert_eq!(built.version, None);
+        assert!(built.extensions.is_empty());
+        assert_eq!(built.size, ApplyDatabaseSize::Small);
+        assert_eq!(built.tenant, ApplyDatabaseTenant::Single);
+        assert_eq!(built.tenant_scope, ApplyDatabaseScope::Project);
+        assert!(!built.read_only);
+        assert!(!built.rls_session);
+        assert_eq!(built.pool_max, None);
+        assert!(!built.delta_capture);
+        assert_eq!(built.restart_policy, DbRestartPolicy::Manual);
+        // A `with_*` setter refines one knob and nothing else — additive, non-breaking.
+        let refined = ApplyDatabase::new("app".to_string(), ApplyDatabaseKind::Mysql)
+            .with_tenant(ApplyDatabaseTenant::Shared)
+            .with_pool_max(Some(32));
+        assert_eq!(refined.kind, ApplyDatabaseKind::Mysql);
+        assert_eq!(refined.tenant, ApplyDatabaseTenant::Shared);
+        assert_eq!(refined.pool_max, Some(32));
+        // Unset knobs keep their defaults.
+        assert_eq!(refined.size, ApplyDatabaseSize::Small);
+        assert_eq!(refined.tenant_scope, ApplyDatabaseScope::Project);
     }
 }

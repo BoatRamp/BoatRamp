@@ -1013,21 +1013,17 @@ impl ComputeBackend for ContainerBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            isolation: IsolationClass::Namespace,
+        Capabilities::new(IsolationClass::Namespace)
             // CRIU checkpoint/restore parks an idle container to disk + wakes it
             // with in-RAM state intact — advertised only when a working `criu` was
             // detected (see `Criu::detect`), so we never promise a park we can't
             // wake.
-            scale_to_zero: self.criu.is_some(),
+            .with_scale_to_zero(self.criu.is_some())
             // Volumes are host directories bind-mounted into the jail before
             // `pivot_root`; they persist across launches (keyed by volume name).
-            persistent_volumes: true,
-            max_vcpus: None,
-            max_mem_mib: None,
+            .with_persistent_volumes(true)
             // Directly scheduled against the node ledger — a preemption participant.
-            preemptible: true,
-        }
+            .with_preemptible(true)
     }
 
     fn source_support(&self) -> SourceSupport {
@@ -1043,11 +1039,9 @@ impl ComputeBackend for ContainerBackend {
         // steers a PRIVATE image to docker, or fails closed if none), and is Tar-PRIMARY
         // (so a public image prefers the image-native docker/cloudflare backend when one is
         // also present — a tie-break, not an exclusion).
-        SourceSupport {
-            accepted_sources: vec![RootSourceKind::Image, RootSourceKind::Tar],
-            private_registry_credential: false,
-            primary_source: Some(RootSourceKind::Tar),
-        }
+        SourceSupport::new(vec![RootSourceKind::Image, RootSourceKind::Tar])
+            .with_private_registry_credential(false)
+            .with_primary_source(Some(RootSourceKind::Tar))
     }
 
     async fn materialize(
@@ -1306,14 +1300,14 @@ impl ComputeBackend for ContainerBackend {
         };
         // Container is gone; tear down the veth but hold the IP for the wake.
         let _ = VethNetwork::for_vm(&id, &bridge).teardown().await;
-        Ok(Some(Snapshot {
-            project: handle.project.clone(),
-            workload: handle.workload.clone(),
-            replica: handle.replica,
-            data_ref: format!("{stem}|{ip}|{port}"),
-            // Set by the reconcile once the artifact is exported to tenant Storage (U14).
-            exported: false,
-        }))
+        // `exported` defaults to false (home-node-only); the reconcile flips it via
+        // `with_exported` once the artifact is exported to tenant Storage (U14).
+        Ok(Some(Snapshot::new(
+            handle.project.clone(),
+            handle.workload.clone(),
+            handle.replica,
+            format!("{stem}|{ip}|{port}"),
+        )))
     }
 
     /// **Restore** (scale-to-zero wake): recreate the veth, then CRIU-restore the
@@ -1405,19 +1399,15 @@ impl ComputeBackend for ContainerBackend {
             return Err(BackendError::Launch(format!("restore netns setup: {e}")));
         }
 
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: snapshot.project.clone(),
-                workload: snapshot.workload.clone(),
-                replica: snapshot.replica,
-                backend_ref: format!("{ip}:{port}"),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: ip,
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                snapshot.project.clone(),
+                snapshot.workload.clone(),
+                snapshot.replica,
+                format!("{ip}:{port}"),
+            ),
+            Endpoint::new(Scheme::Http, ip, port),
+        ))
     }
 
     /// U14 cross-node s2z — DEFERRED for the container (CRIU) backend: this returns `None`, so
@@ -2455,19 +2445,15 @@ impl ContainerBackend {
             .await?;
         drop(child);
 
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: req.project.clone(),
-                workload: req.workload.clone(),
-                replica: req.replica,
-                backend_ref: format!("{ip}:{port}"),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: ip.to_string(),
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                req.project.clone(),
+                req.workload.clone(),
+                req.replica,
+                format!("{ip}:{port}"),
+            ),
+            Endpoint::new(Scheme::Http, ip.to_string(), port),
+        ))
     }
 
     /// Resolve a [`run_ephemeral`](ComputeBackend::run_ephemeral) client `image` to an
@@ -4073,17 +4059,16 @@ mod tests {
         let mut redaction = boatramp_core::compute::RedactionSet::new();
         redaction.push("postgres://u:P%40ss_UNIQ_9f3a@bramp-db.flycast:5432/app".into());
         redaction.set_project_opt_out(project_opt_out);
-        LaunchRequest {
-            project: "proj".into(),
-            workload: "w".into(),
-            replica: 0,
-            spec: spec_for(&"d".repeat(64)),
-            artifact: Artifact::Rootfs {
+        LaunchRequest::new(
+            "proj".into(),
+            "w".into(),
+            0,
+            spec_for(&"d".repeat(64)),
+            Artifact::Rootfs {
                 dir: "/tmp/x".into(),
             },
-            redaction,
-            priority_class: None,
-        }
+        )
+        .with_redaction(redaction)
     }
 
     /// The two-tier opt-out, wired through `build_log_redactor` (v0.70.0). This binds that the

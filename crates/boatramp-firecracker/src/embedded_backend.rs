@@ -857,29 +857,23 @@ impl ComputeBackend for EmbeddedVmmBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            isolation: IsolationClass::VmKvm,
+        Capabilities::new(IsolationClass::VmKvm)
             // Snapshot the paused VM (vCPU + chip + device-model state + RAM)
             // to disk + restore it into a fresh jailed worker that resumes.
-            scale_to_zero: true,
+            .with_scale_to_zero(true)
             // Persistent volumes as writable virtio-block images.
-            persistent_volumes: true,
-            max_vcpus: None,
-            max_mem_mib: None,
+            .with_persistent_volumes(true)
             // Directly scheduled against the node ledger — a preemption participant.
-            preemptible: true,
-        }
+            .with_preemptible(true)
     }
 
     fn source_support(&self) -> SourceSupport {
         // A micro-VM boots a prebuilt **rootfs** block image (`RootSource::Rootfs`);
         // `materialize` rejects an image/tar source, and it never pulls from a registry,
         // so no pull credential applies. Rootfs-only, not credential-capable.
-        SourceSupport {
-            accepted_sources: vec![RootSourceKind::Rootfs],
-            private_registry_credential: false,
-            primary_source: Some(RootSourceKind::Rootfs),
-        }
+        SourceSupport::new(vec![RootSourceKind::Rootfs])
+            .with_private_registry_credential(false)
+            .with_primary_source(Some(RootSourceKind::Rootfs))
     }
 
     /// Adopt the IPs of already-running embedded-VMM replicas into this backend's
@@ -1019,19 +1013,15 @@ impl ComputeBackend for EmbeddedVmmBackend {
             },
         );
 
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: req.project.clone(),
-                workload: req.workload.clone(),
-                replica: req.replica,
-                backend_ref: encode_ref(&ip.to_string(), port),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: ip.to_string(),
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                req.project.clone(),
+                req.workload.clone(),
+                req.replica,
+                encode_ref(&ip.to_string(), port),
+            ),
+            Endpoint::new(Scheme::Http, ip.to_string(), port),
+        ))
     }
 
     async fn stop(&self, handle: &InstanceHandle) -> Result<(), BackendError> {
@@ -1162,14 +1152,14 @@ impl ComputeBackend for EmbeddedVmmBackend {
         .map_err(|e| BackendError::Other(format!("join: {e}")))?
         .map_err(BackendError::Other)?;
 
-        Ok(Some(Snapshot {
-            project: handle.project.clone(),
-            workload: handle.workload.clone(),
-            replica: handle.replica,
-            data_ref: encode_snap(&stem, &ip.to_string(), port),
-            // Set by the reconcile once the artifact is exported to tenant Storage (U14).
-            exported: false,
-        }))
+        // `exported` defaults false (home-node-only); the reconcile flips it via
+        // `with_exported` once the artifact is exported to tenant Storage (U14).
+        Ok(Some(Snapshot::new(
+            handle.project.clone(),
+            handle.workload.clone(),
+            handle.replica,
+            encode_snap(&stem, &ip.to_string(), port),
+        )))
     }
 
     /// **Restore** a snapshotted replica: read its persisted config, re-create
@@ -1232,19 +1222,15 @@ impl ComputeBackend for EmbeddedVmmBackend {
             },
         );
 
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: snapshot.project.clone(),
-                workload: snapshot.workload.clone(),
-                replica: snapshot.replica,
-                backend_ref: encode_ref(&ip, port),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: ip,
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                snapshot.project.clone(),
+                snapshot.workload.clone(),
+                snapshot.replica,
+                encode_ref(&ip, port),
+            ),
+            Endpoint::new(Scheme::Http, ip, port),
+        ))
     }
 
     /// U14 cross-node s2z: the microVM snapshot is two local files under
@@ -1263,11 +1249,11 @@ impl ComputeBackend for EmbeddedVmmBackend {
         let id = vm_id(&snapshot.project, &snapshot.workload, snapshot.replica);
         let dir = self.data_dir.join("compute").join("snapshots");
         let local_stem = dir.join(&id).display().to_string();
-        Ok(Some(SnapshotArtifact {
-            files: vec![format!("{id}.snap"), format!("{id}.cfg")],
+        Ok(Some(SnapshotArtifact::new(
             dir,
-            local_data_ref: encode_snap(&local_stem, &ip, port),
-        }))
+            vec![format!("{id}.snap"), format!("{id}.cfg")],
+            encode_snap(&local_stem, &ip, port),
+        )))
     }
 
     /// Both snapshot files present on this node's local disk ⇒ no cross-node fetch needed.

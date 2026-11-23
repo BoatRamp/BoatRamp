@@ -957,26 +957,14 @@ mod tests {
     use boatramp_core::compute::ApplyDatabaseSize;
 
     fn declared(name: &str) -> ApplyDatabase {
-        ApplyDatabase {
-            name: name.to_string(),
-            kind: ApplyDatabaseKind::Postgres,
-            version: Some(16),
-            extensions: vec![],
-            size: ApplyDatabaseSize::Small,
-            tenant: boatramp_core::compute::ApplyDatabaseTenant::Shared,
-            tenant_scope: boatramp_core::compute::ApplyDatabaseScope::Project,
-            read_only: false,
-            rls_session: false,
-            tenant_guc: None,
-            session_guc: None,
-            tenant_all_marker: None,
-            pool_max: Some(1000),
-            connect_timeout_secs: Some(9999),
-            startup_grace_secs: Some(99999),
-            readiness_gate: Default::default(),
-            delta_capture: false,
-            restart_policy: Default::default(),
-        }
+        // `size`/`tenant_scope` etc. stay at their defaults (small / project); only the
+        // non-default knobs are set via the builder.
+        ApplyDatabase::new(name.to_string(), ApplyDatabaseKind::Postgres)
+            .with_version(Some(16))
+            .with_tenant(boatramp_core::compute::ApplyDatabaseTenant::Shared)
+            .with_pool_max(Some(1000))
+            .with_connect_timeout_secs(Some(9999))
+            .with_startup_grace_secs(Some(99999))
     }
 
     /// The security contract: the lowered binding is ALWAYS the managed-credential path —

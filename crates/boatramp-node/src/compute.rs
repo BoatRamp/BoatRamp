@@ -2023,14 +2023,9 @@ mod tests {
             "container"
         }
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                isolation: IsolationClass::Namespace,
-                scale_to_zero: false,
-                persistent_volumes: true,
-                max_vcpus: None,
-                max_mem_mib: None,
-                preemptible: true,
-            }
+            Capabilities::new(IsolationClass::Namespace)
+                .with_persistent_volumes(true)
+                .with_preemptible(true)
         }
         async fn materialize(
             &self,
@@ -2167,14 +2162,9 @@ mod tests {
             "container"
         }
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                isolation: IsolationClass::Namespace,
-                scale_to_zero: false,
-                persistent_volumes: true,
-                max_vcpus: None,
-                max_mem_mib: None,
-                preemptible: true,
-            }
+            Capabilities::new(IsolationClass::Namespace)
+                .with_persistent_volumes(true)
+                .with_preemptible(true)
         }
         async fn materialize(
             &self,
@@ -2216,19 +2206,10 @@ mod tests {
             (
                 proj.to_string(),
                 ObservedInstance {
-                    handle: InstanceHandle {
-                        project: proj.into(),
-                        workload: wl.into(),
-                        replica: rep,
-                        backend_ref: format!("{ip}:5432"),
-                    },
+                    handle: InstanceHandle::new(proj.into(), wl.into(), rep, format!("{ip}:5432")),
                     node: 1,
                     backend: backend.into(),
-                    endpoint: Endpoint {
-                        scheme: Scheme::Http,
-                        host: ip.into(),
-                        port: 5432,
-                    },
+                    endpoint: Endpoint::new(Scheme::Http, ip.into(), 5432),
                     region: None,
                     healthy: true,
                     started_at: None,
@@ -2320,19 +2301,10 @@ mod tests {
         // the `LaunchFailed` exclusion, the `.or_else(find Running)` fallback picked this
         // marker.
         let marker = ObservedInstance {
-            handle: InstanceHandle {
-                project: "default".into(),
-                workload: "pg".into(),
-                replica: 0,
-                backend_ref: String::new(),
-            },
+            handle: InstanceHandle::new("default".into(), "pg".into(), 0, String::new()),
             node: 1,
             backend: "docker".into(),
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: String::new(),
-                port: 0,
-            },
+            endpoint: Endpoint::new(Scheme::Http, String::new(), 0),
             region: None,
             healthy: false,
             started_at: None,
@@ -2392,14 +2364,9 @@ mod tests {
             "container"
         }
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                isolation: IsolationClass::Namespace,
-                scale_to_zero: false,
-                persistent_volumes: true,
-                max_vcpus: None,
-                max_mem_mib: None,
-                preemptible: true,
-            }
+            Capabilities::new(IsolationClass::Namespace)
+                .with_persistent_volumes(true)
+                .with_preemptible(true)
         }
         async fn materialize(
             &self,
@@ -2437,19 +2404,15 @@ mod tests {
         started_at: Option<u64>,
     ) -> ObservedInstance {
         ObservedInstance {
-            handle: InstanceHandle {
-                project: project.into(),
-                workload: workload.into(),
+            handle: InstanceHandle::new(
+                project.into(),
+                workload.into(),
                 replica,
-                backend_ref: "10.0.0.2:80".into(),
-            },
+                "10.0.0.2:80".into(),
+            ),
             node: 0,
             backend: "container".into(),
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: "10.0.0.2".into(),
-                port: 80,
-            },
+            endpoint: Endpoint::new(Scheme::Http, "10.0.0.2".into(), 80),
             region: None,
             healthy: false,
             started_at,

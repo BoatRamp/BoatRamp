@@ -461,15 +461,9 @@ async fn launch_from_registered_spec(
         .await
         .map_err(|e| format!("store staged spec: {e}"))?;
 
-    let req = LaunchRequest {
-        project: TENANT.into(),
-        workload: workload.name.clone(),
-        replica: 0,
-        spec,
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new(TENANT.into(), workload.name.clone(), 0, spec, artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     let inst = backend
         .launch(&req)
         .await

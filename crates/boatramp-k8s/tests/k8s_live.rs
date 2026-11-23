@@ -65,17 +65,17 @@ async fn k8s_phase2_generic_exec_logs_volumes_round_trip() {
         .expect("connect to the cluster");
 
     let spec = generic_spec();
-    let req = LaunchRequest {
-        project: "default".to_string(),
-        workload: "phase2-web".to_string(),
-        replica: 0,
-        artifact: Artifact::Image {
+    let req = LaunchRequest::new(
+        "default".to_string(),
+        "phase2-web".to_string(),
+        0,
+        spec.clone(),
+        Artifact::Image {
             reference: TEST_IMAGE.to_string(),
         },
-        spec: spec.clone(),
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    )
+    .with_redaction(Default::default())
+    .with_priority_class(None);
 
     // (1) launch the generic workload → Deployment + Service.
     let instance = backend.launch(&req).await.expect("launch deployment");
@@ -166,17 +166,17 @@ async fn k8s_phase1_managed_postgres_statefulset_brings_up_pgvector() {
     // the PVC to 999 — the k8s-native equivalent of the pre-owned volume on the other backends.
     spec.user = Some("999:999".to_string());
     let image = spec.root.as_str().to_string();
-    let req = LaunchRequest {
-        project: "default".to_string(),
-        workload: "pgtest".to_string(),
-        replica: 0,
-        artifact: Artifact::Image {
+    let req = LaunchRequest::new(
+        "default".to_string(),
+        "pgtest".to_string(),
+        0,
+        spec,
+        Artifact::Image {
             reference: image.clone(),
         },
-        spec,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    )
+    .with_redaction(Default::default())
+    .with_priority_class(None);
 
     // (1) launch → StatefulSet + Service(pgtest) + PVC(data-pgtest).
     let instance = backend.launch(&req).await.expect("launch managed postgres");
@@ -301,17 +301,17 @@ async fn k8s_strict_managed_postgres_boots_under_read_only_root() {
     spec.cap_add = vec!["NET_BIND_SERVICE".to_string()];
     let image = spec.root.as_str().to_string();
     let workload = "pgtest-strict";
-    let req = LaunchRequest {
-        project: "default".to_string(),
-        workload: workload.to_string(),
-        replica: 0,
-        artifact: Artifact::Image {
+    let req = LaunchRequest::new(
+        "default".to_string(),
+        workload.to_string(),
+        0,
+        spec,
+        Artifact::Image {
             reference: image.clone(),
         },
-        spec,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    )
+    .with_redaction(Default::default())
+    .with_priority_class(None);
 
     // (1) launch → StatefulSet + Service + PVC under the strict (hardened) posture.
     let instance = backend

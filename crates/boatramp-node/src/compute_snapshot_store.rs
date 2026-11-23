@@ -650,21 +650,21 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(format!("{id}.snap")), ram).unwrap();
         std::fs::write(dir.join(format!("{id}.cfg")), b"cfg-bytes").unwrap();
-        SnapshotArtifact {
-            dir: dir.to_path_buf(),
-            files: vec![format!("{id}.snap"), format!("{id}.cfg")],
-            local_data_ref: format!("{}/{id}|10.0.0.5|8080", dir.display()),
-        }
+        SnapshotArtifact::new(
+            dir.to_path_buf(),
+            vec![format!("{id}.snap"), format!("{id}.cfg")],
+            format!("{}/{id}|10.0.0.5|8080", dir.display()),
+        )
     }
 
     fn snap(project: &str, workload: &str, replica: u32) -> Snapshot {
-        Snapshot {
-            project: project.to_string(),
-            workload: workload.to_string(),
+        Snapshot::new(
+            project.to_string(),
+            workload.to_string(),
             replica,
-            data_ref: "x".into(),
-            exported: true,
-        }
+            "x".into(),
+        )
+        .with_exported(true)
     }
 
     #[tokio::test]
@@ -680,11 +680,11 @@ mod tests {
 
         // A DIFFERENT node (empty local dir) imports the same key.
         let dstdir = tmp.path().join("nodeB/web-0");
-        let dst_art = SnapshotArtifact {
-            dir: dstdir.clone(),
-            files: vec![],
-            local_data_ref: format!("{}/web-0|10.0.0.5|8080", dstdir.display()),
-        };
+        let dst_art = SnapshotArtifact::new(
+            dstdir.clone(),
+            vec![],
+            format!("{}/web-0|10.0.0.5|8080", dstdir.display()),
+        );
         assert!(
             store.import(&key, &dst_art).await.unwrap(),
             "object present"
@@ -702,11 +702,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = BlobSnapshotStore::new(Arc::new(PerProjectMemBackends::new()), env());
         let key = SnapshotKey::of_snapshot(&snap("acme", "web", 7));
-        let art = SnapshotArtifact {
-            dir: tmp.path().join("b"),
-            files: vec![],
-            local_data_ref: "x".into(),
-        };
+        let art = SnapshotArtifact::new(tmp.path().join("b"), vec![], "x".into());
         // Never exported ⇒ import reports "no object" (false) ⇒ caller cold-starts.
         assert!(!store.import(&key, &art).await.unwrap());
     }
@@ -730,11 +726,7 @@ mod tests {
         // Project B has NEVER exported web/0. Its import must be a clean miss, not A's bytes.
         let b_key = SnapshotKey::of_snapshot(&snap("tenant-b", "web", 0));
         let b_dst = tmp.path().join("b/web-0");
-        let b_art = SnapshotArtifact {
-            dir: b_dst.clone(),
-            files: vec![],
-            local_data_ref: "x".into(),
-        };
+        let b_art = SnapshotArtifact::new(b_dst.clone(), vec![], "x".into());
         assert!(
             !store.import(&b_key, &b_art).await.unwrap(),
             "tenant B must not resolve any object for its own web/0 key",
@@ -780,11 +772,7 @@ mod tests {
 
         // Tenant B's own key is absent on the shared backend (A's is under a different key).
         let b_key = SnapshotKey::of_snapshot(&snap("tenant-b", "web", 0));
-        let b_art = SnapshotArtifact {
-            dir: tmp.path().join("b/web-0"),
-            files: vec![],
-            local_data_ref: "x".into(),
-        };
+        let b_art = SnapshotArtifact::new(tmp.path().join("b/web-0"), vec![], "x".into());
         assert!(!store.import(&b_key, &b_art).await.unwrap());
         // Both keys coexist distinctly once B exports its own.
         let b_export = seed_artifact(&tmp.path().join("b/export-web-0"), "web-0", b"B-RAM");
@@ -922,11 +910,7 @@ mod tests {
         );
 
         let dst = tmp.path().join("b/web-0");
-        let dst_art = SnapshotArtifact {
-            dir: dst.clone(),
-            files: vec![],
-            local_data_ref: "x".into(),
-        };
+        let dst_art = SnapshotArtifact::new(dst.clone(), vec![], "x".into());
         assert!(
             !store.import(&key, &dst_art).await.unwrap(),
             "a tampered seal must be rejected → cold-start",
@@ -964,11 +948,7 @@ mod tests {
             .insert(BlobSnapshotStore::storage_key(&key), evil_bytes);
 
         let dst = tmp.path().join("b/web-0");
-        let dst_art = SnapshotArtifact {
-            dir: dst.clone(),
-            files: vec![],
-            local_data_ref: "x".into(),
-        };
+        let dst_art = SnapshotArtifact::new(dst.clone(), vec![], "x".into());
         assert!(
             !store.import(&key, &dst_art).await.unwrap(),
             "a tampered archive (digest mismatch) must be rejected → cold-start",
@@ -992,11 +972,7 @@ mod tests {
         store.export(&key, &art).await.unwrap();
 
         let dst = tmp.path().join("b/web-0");
-        let dst_art = SnapshotArtifact {
-            dir: dst.clone(),
-            files: vec![],
-            local_data_ref: "x".into(),
-        };
+        let dst_art = SnapshotArtifact::new(dst.clone(), vec![], "x".into());
         assert!(
             !store.import(&key, &dst_art).await.unwrap(),
             "an over-cap import must be rejected → cold-start",
@@ -1084,11 +1060,7 @@ mod tests {
         );
 
         let dst = tmp.path().join("b/web-0");
-        let dst_art = SnapshotArtifact {
-            dir: dst.clone(),
-            files: vec![],
-            local_data_ref: "x".into(),
-        };
+        let dst_art = SnapshotArtifact::new(dst.clone(), vec![], "x".into());
         assert!(store.import(&key, &dst_art).await.unwrap());
         assert_eq!(std::fs::read(dst.join("web-0.snap")).unwrap(), ram);
     }

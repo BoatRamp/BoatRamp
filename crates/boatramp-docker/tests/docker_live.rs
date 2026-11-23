@@ -39,15 +39,9 @@ async fn docker_round_trip() {
         .materialize("default", "ittest", &spec, None)
         .await
         .expect("materialize (pull)");
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "ittest".into(),
-        replica: 0,
-        spec: spec.clone(),
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new("default".into(), "ittest".into(), 0, spec.clone(), artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     let instance = backend.launch(&req).await.expect("launch");
     assert_eq!(
         backend.health(&instance.handle).await.expect("health"),
@@ -155,15 +149,9 @@ async fn docker_per_project_network_dns_and_cross_project_isolation() {
             .materialize(project, workload, spec, None)
             .await
             .expect("materialize");
-        let req = LaunchRequest {
-            project: project.into(),
-            workload: workload.into(),
-            replica: 0,
-            spec: spec.clone(),
-            artifact,
-            redaction: Default::default(),
-            priority_class: None,
-        };
+        let req = LaunchRequest::new(project.into(), workload.into(), 0, spec.clone(), artifact)
+            .with_redaction(Default::default())
+            .with_priority_class(None);
         backend.launch(&req).await.expect("launch")
     }
 
@@ -314,15 +302,9 @@ async fn docker_resolves_long_managed_db_workload_by_short_alias() {
             .materialize(project, workload, spec, None)
             .await
             .expect("materialize");
-        let req = LaunchRequest {
-            project: project.into(),
-            workload: workload.into(),
-            replica: 0,
-            spec: spec.clone(),
-            artifact,
-            redaction: Default::default(),
-            priority_class: None,
-        };
+        let req = LaunchRequest::new(project.into(), workload.into(), 0, spec.clone(), artifact)
+            .with_redaction(Default::default())
+            .with_priority_class(None);
         backend.launch(&req).await.expect("launch")
     }
 
@@ -427,15 +409,9 @@ async fn docker_recreate_on_spec_change_replaces_container_and_reattaches_projec
             .materialize(project, workload, spec, None)
             .await
             .expect("materialize");
-        let req = LaunchRequest {
-            project: project.into(),
-            workload: workload.into(),
-            replica: 0,
-            spec: spec.clone(),
-            artifact,
-            redaction: Default::default(),
-            priority_class: None,
-        };
+        let req = LaunchRequest::new(project.into(), workload.into(), 0, spec.clone(), artifact)
+            .with_redaction(Default::default())
+            .with_priority_class(None);
         backend.launch(&req).await.expect("launch")
     }
 
@@ -788,15 +764,9 @@ async fn docker_reconcile_heals_a_producer_carrying_a_stale_managed_db_alias_on_
             .materialize(project, workload, spec, None)
             .await
             .expect("materialize");
-        let req = LaunchRequest {
-            project: project.into(),
-            workload: workload.into(),
-            replica: 0,
-            spec: spec.clone(),
-            artifact,
-            redaction: Default::default(),
-            priority_class: None,
-        };
+        let req = LaunchRequest::new(project.into(), workload.into(), 0, spec.clone(), artifact)
+            .with_redaction(Default::default())
+            .with_priority_class(None);
         backend.launch(&req).await.expect("launch")
     }
 
@@ -900,12 +870,12 @@ async fn docker_reconcile_heals_a_producer_carrying_a_stale_managed_db_alias_on_
 
     // The handle the deploy store would hold for this producer (backend_ref decodes to the
     // container name; the ip:port is unused by `needs_redeploy`).
-    let db_handle = InstanceHandle {
-        project: project.into(),
-        workload: db_workload.clone(),
-        replica: 0,
-        backend_ref: format!("{db_name}@127.0.0.1:0"),
-    };
+    let db_handle = InstanceHandle::new(
+        project.into(),
+        db_workload.clone(),
+        0,
+        format!("{db_name}@127.0.0.1:0"),
+    );
 
     // (2) THE TRIGGER. The producer is primary on the per-project net (so the net-mismatch heal does
     //     NOT fire) but advertises the STALE long alias, not the current short one → recreate.
@@ -1081,15 +1051,9 @@ async fn docker_stale_unscoped_bridge_is_upgraded_on_relaunch_and_a_live_network
             .materialize(project, workload, spec, None)
             .await
             .expect("materialize");
-        let req = LaunchRequest {
-            project: project.into(),
-            workload: workload.into(),
-            replica: 0,
-            spec: spec.clone(),
-            artifact,
-            redaction: Default::default(),
-            priority_class: None,
-        };
+        let req = LaunchRequest::new(project.into(), workload.into(), 0, spec.clone(), artifact)
+            .with_redaction(Default::default())
+            .with_priority_class(None);
         backend.launch(&req).await.expect("launch")
     }
 
@@ -1468,15 +1432,9 @@ async fn docker_log_forwarding_to_the_shared_sink() {
         .materialize("default", "logfwd", &spec, None)
         .await
         .expect("materialize (pull)");
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "logfwd".into(),
-        replica: 0,
-        spec: spec.clone(),
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new("default".into(), "logfwd".into(), 0, spec.clone(), artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     let instance = backend.launch(&req).await.expect("launch");
 
     // The forwarder is a detached background task; give it a moment to attach, replay
@@ -1599,15 +1557,15 @@ async fn docker_log_redaction_to_the_shared_sink() {
     // `launch_one` does this from the resolved binding/managed-DB env in production).
     let mut redaction = boatramp_core::compute::RedactionSet::new();
     redaction.push(secret.to_string());
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: "logredact".into(),
-        replica: 0,
-        spec: spec.clone(),
+    let req = LaunchRequest::new(
+        "default".into(),
+        "logredact".into(),
+        0,
+        spec.clone(),
         artifact,
-        redaction,
-        priority_class: None,
-    };
+    )
+    .with_redaction(redaction)
+    .with_priority_class(None);
     let instance = backend.launch(&req).await.expect("launch");
 
     let id = compute_instance_id("default", "logredact", 0);

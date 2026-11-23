@@ -413,15 +413,9 @@ async fn provision_and_launch_tenant(
         .await
         .map_err(|e| format!("store staged spec: {e}"))?;
 
-    let req = LaunchRequest {
-        project: "default".into(),
-        workload: workload.name.clone(),
-        replica: 0,
-        spec,
-        artifact,
-        redaction: Default::default(),
-        priority_class: None,
-    };
+    let req = LaunchRequest::new("default".into(), workload.name.clone(), 0, spec, artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
     let inst = backend
         .launch(&req)
         .await

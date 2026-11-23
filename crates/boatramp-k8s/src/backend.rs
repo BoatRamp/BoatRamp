@@ -301,24 +301,16 @@ impl ComputeBackend for KubernetesBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            // A pod is shared-kernel — classified like native-container / docker. The
-            // `require_strong_isolation` posture excludes it exactly as it excludes those.
-            isolation: IsolationClass::Container,
-            // No scale-to-zero parking: a managed DB / stateful pod is not snapshotted +
-            // stopped on idle (the trait's `snapshot`/`restore` stay unsupported). The
-            // CSI VolumeSnapshot support is a DATA backup/clone primitive
-            // (`snapshot_volume`/`restore_volume`), distinct from compute scale-to-zero.
-            scale_to_zero: false,
-            // The data volume is a PVC on a CSI/storage class — a real persistent volume.
-            persistent_volumes: true,
-            max_vcpus: None,
-            max_mem_mib: None,
-            // A DELEGATED backend: the k8s scheduler owns capacity + eviction, so a k8s
-            // workload never enters boatramp's preemption pass. The operator priority TIER is
-            // instead mapped to a native k8s `PriorityClass` on the Deployment/StatefulSet.
-            preemptible: false,
-        }
+        // A pod is shared-kernel — classified like native-container / docker (the
+        // `require_strong_isolation` posture excludes it exactly as it excludes those). No
+        // scale-to-zero parking (default `false`): a managed DB / stateful pod is not
+        // snapshotted + stopped on idle (the CSI VolumeSnapshot support is a DATA
+        // backup/clone primitive, distinct from compute scale-to-zero). A DELEGATED backend
+        // (default non-preemptible): the k8s scheduler owns capacity + eviction, so a k8s
+        // workload never enters boatramp's preemption pass — the operator priority TIER is
+        // mapped to a native k8s `PriorityClass` on the Deployment/StatefulSet instead.
+        // The data volume IS a PVC on a CSI/storage class — a real persistent volume.
+        Capabilities::new(IsolationClass::Container).with_persistent_volumes(true)
     }
 
     fn source_support(&self) -> SourceSupport {
@@ -329,11 +321,9 @@ impl ComputeBackend for KubernetesBackend {
         // is the operator-configured `[compute].k8s_image_pull_secret`, not a project
         // `pull_secret`. Hence image-only, and (for the scheduler's `spec.pull_secret`
         // gate) not credential-capable.
-        SourceSupport {
-            accepted_sources: vec![RootSourceKind::Image],
-            private_registry_credential: false,
-            primary_source: Some(RootSourceKind::Image),
-        }
+        SourceSupport::new(vec![RootSourceKind::Image])
+            .with_private_registry_credential(false)
+            .with_primary_source(Some(RootSourceKind::Image))
     }
 
     async fn materialize(
@@ -383,19 +373,15 @@ impl ComputeBackend for KubernetesBackend {
         } else {
             self.launch_stateful(req).await?
         };
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: req.project.clone(),
-                workload: req.workload.clone(),
-                replica: req.replica,
-                backend_ref: self.namespace.clone(),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host,
-                port: req.spec.port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                req.project.clone(),
+                req.workload.clone(),
+                req.replica,
+                self.namespace.clone(),
+            ),
+            Endpoint::new(Scheme::Http, host, req.spec.port),
+        ))
     }
 
     async fn stop(&self, handle: &InstanceHandle) -> Result<(), BackendError> {
@@ -791,11 +777,7 @@ impl KubernetesBackend {
             .join()
             .await
             .map_err(|e| BackendError::Other(format!("exec join on {pod}: {e}")))?;
-        Ok(ExecOutput {
-            exit_code,
-            stdout,
-            stderr,
-        })
+        Ok(ExecOutput::new(exit_code, stdout, stderr))
     }
 
     /// Fetch a workload replica's pod logs (the operator log surface). `tail_lines` bounds

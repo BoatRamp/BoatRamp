@@ -166,28 +166,21 @@ impl ComputeBackend for VmmBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            isolation: IsolationClass::VmKvm,
-            // Firecracker full-snapshot/restore (pause→create / load→resume) backs
-            // scale-to-zero; persistent volumes are not yet supported.
-            scale_to_zero: true,
-            persistent_volumes: false,
-            max_vcpus: None,
-            max_mem_mib: None,
-            // Directly scheduled against the node ledger — a preemption participant.
-            preemptible: true,
-        }
+        // Firecracker full-snapshot/restore (pause→create / load→resume) backs
+        // scale-to-zero; persistent volumes are not yet supported (default `false`).
+        // Directly scheduled against the node ledger — a preemption participant.
+        Capabilities::new(IsolationClass::VmKvm)
+            .with_scale_to_zero(true)
+            .with_preemptible(true)
     }
 
     fn source_support(&self) -> SourceSupport {
         // A firecracker micro-VM boots a prebuilt **rootfs** block image
         // (`RootSource::Rootfs`); `materialize` rejects an image/tar source and never
         // pulls from a registry. Rootfs-only, not credential-capable.
-        SourceSupport {
-            accepted_sources: vec![RootSourceKind::Rootfs],
-            private_registry_credential: false,
-            primary_source: Some(RootSourceKind::Rootfs),
-        }
+        SourceSupport::new(vec![RootSourceKind::Rootfs])
+            .with_private_registry_credential(false)
+            .with_primary_source(Some(RootSourceKind::Rootfs))
     }
 
     async fn materialize(
@@ -276,19 +269,15 @@ impl ComputeBackend for VmmBackend {
         };
 
         let port = req.spec.port;
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: req.project.clone(),
-                workload: req.workload.clone(),
-                replica: req.replica,
-                backend_ref: encode_ref(running.pid.0, &ip.to_string(), port),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: ip.to_string(),
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                req.project.clone(),
+                req.workload.clone(),
+                req.replica,
+                encode_ref(running.pid.0, &ip.to_string(), port),
+            ),
+            Endpoint::new(Scheme::Http, ip.to_string(), port),
+        ))
     }
 
     async fn stop(&self, handle: &InstanceHandle) -> Result<(), BackendError> {
@@ -356,15 +345,15 @@ impl ComputeBackend for VmmBackend {
             .map_err(|e| BackendError::Other(format!("join: {e}")))?
             .map_err(|e| BackendError::Other(e.to_string()))?;
 
-        Ok(Some(Snapshot {
-            project: handle.project.clone(),
-            workload: handle.workload.clone(),
-            replica: handle.replica,
-            data_ref: encode_snap(&snap_path, &mem_path, &ip, port),
-            // Same-node only on the external-firecracker backend (no cross-node artifact
-            // descriptor wired here yet); the reconcile never sets this for it (U14).
-            exported: false,
-        }))
+        // Same-node only on the external-firecracker backend (no cross-node artifact
+        // descriptor wired here yet): `exported` stays at its `false` default — the
+        // reconcile never flips it for this backend (U14).
+        Ok(Some(Snapshot::new(
+            handle.project.clone(),
+            handle.workload.clone(),
+            handle.replica,
+            encode_snap(&snap_path, &mem_path, &ip, port),
+        )))
     }
 
     async fn restore(&self, snapshot: &Snapshot) -> Result<Instance, BackendError> {
@@ -400,19 +389,15 @@ impl ComputeBackend for VmmBackend {
             }
         };
 
-        Ok(Instance {
-            handle: InstanceHandle {
-                project: snapshot.project.clone(),
-                workload: snapshot.workload.clone(),
-                replica: snapshot.replica,
-                backend_ref: encode_ref(running.pid.0, &ip, port),
-            },
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: ip,
-                port,
-            },
-        })
+        Ok(Instance::new(
+            InstanceHandle::new(
+                snapshot.project.clone(),
+                snapshot.workload.clone(),
+                snapshot.replica,
+                encode_ref(running.pid.0, &ip, port),
+            ),
+            Endpoint::new(Scheme::Http, ip, port),
+        ))
     }
 }
 

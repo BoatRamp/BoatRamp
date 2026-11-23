@@ -1031,19 +1031,15 @@ async fn project_export_pg_crafted_escape_refused_via_driver_live() {
         .set_replica_state(
             boatramp_core::project::ProjectRef::new("default"),
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: "default".to_string(),
-                    workload: "pg".to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    "default".to_string(),
+                    "pg".to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -1267,19 +1263,15 @@ async fn project_sync_managed_pg_shadow_land_live() {
             .set_replica_state(
                 boatramp_core::project::ProjectRef::new("default"),
                 &ObservedInstance {
-                    handle: InstanceHandle {
-                        project: "default".to_string(),
-                        workload: "pg".to_string(),
-                        replica: 0,
-                        backend_ref: String::new(),
-                    },
+                    handle: InstanceHandle::new(
+                        "default".to_string(),
+                        "pg".to_string(),
+                        0,
+                        String::new(),
+                    ),
                     node: 0,
                     backend: "docker".to_string(),
-                    endpoint: Endpoint {
-                        scheme: Scheme::Http,
-                        host: host.to_string(),
-                        port,
-                    },
+                    endpoint: Endpoint::new(Scheme::Http, host.to_string(), port),
                     region: None,
                     healthy: true,
                     started_at: None,
@@ -1575,19 +1567,15 @@ async fn project_export_pg_pgvector_roundtrip_via_driver_live() {
         .set_replica_state(
             boatramp_core::project::ProjectRef::new("default"),
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: "default".to_string(),
-                    workload: "pg".to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    "default".to_string(),
+                    "pg".to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -2602,19 +2590,15 @@ async fn project_sync_managed_mysql_shared_shadow_land_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-mysql".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-mysql".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -3051,19 +3035,15 @@ async fn project_sync_shared_rls_force_replicate_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -3674,19 +3654,15 @@ async fn project_sync_idempotency_orphan_recovery_live() {
                 .set_replica_state(
                     ProjectRef::DEFAULT,
                     &ObservedInstance {
-                        handle: InstanceHandle {
-                            project: DEFAULT_PROJECT.to_string(),
-                            workload: compute.clone(),
-                            replica: 0,
-                            backend_ref: "test-external-pg".to_string(),
-                        },
+                        handle: InstanceHandle::new(
+                            DEFAULT_PROJECT.to_string(),
+                            compute.clone(),
+                            0,
+                            "test-external-pg".to_string(),
+                        ),
                         node: 0,
                         backend: "external".to_string(),
-                        endpoint: Endpoint {
-                            scheme: Scheme::Http,
-                            host: host.clone(),
-                            port,
-                        },
+                        endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                         region: None,
                         healthy: true,
                         started_at: None,
@@ -4221,19 +4197,15 @@ async fn project_sync_undeclared_orphan_reconcile_live() {
                 .set_replica_state(
                     ProjectRef::DEFAULT,
                     &ObservedInstance {
-                        handle: InstanceHandle {
-                            project: DEFAULT_PROJECT.to_string(),
-                            workload: compute.clone(),
-                            replica: 0,
-                            backend_ref: "test-external-pg".to_string(),
-                        },
+                        handle: InstanceHandle::new(
+                            DEFAULT_PROJECT.to_string(),
+                            compute.clone(),
+                            0,
+                            "test-external-pg".to_string(),
+                        ),
                         node: 0,
                         backend: "external".to_string(),
-                        endpoint: Endpoint {
-                            scheme: Scheme::Http,
-                            host: host.clone(),
-                            port,
-                        },
+                        endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                         region: None,
                         healthy: true,
                         started_at: None,
@@ -4752,19 +4724,15 @@ async fn project_sync_orphan_drop_clears_object_owning_roles_live() {
                 .set_replica_state(
                     ProjectRef::DEFAULT,
                     &ObservedInstance {
-                        handle: InstanceHandle {
-                            project: DEFAULT_PROJECT.to_string(),
-                            workload: compute.clone(),
-                            replica: 0,
-                            backend_ref: "test-external-pg".to_string(),
-                        },
+                        handle: InstanceHandle::new(
+                            DEFAULT_PROJECT.to_string(),
+                            compute.clone(),
+                            0,
+                            "test-external-pg".to_string(),
+                        ),
                         node: 0,
                         backend: "external".to_string(),
-                        endpoint: Endpoint {
-                            scheme: Scheme::Http,
-                            host: host.clone(),
-                            port,
-                        },
+                        endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                         region: None,
                         healthy: true,
                         started_at: None,
@@ -5506,19 +5474,15 @@ async fn project_sync_colliding_orphan_reconcile_roles_live() {
                 .set_replica_state(
                     ProjectRef::DEFAULT,
                     &ObservedInstance {
-                        handle: InstanceHandle {
-                            project: DEFAULT_PROJECT.to_string(),
-                            workload: compute.clone(),
-                            replica: 0,
-                            backend_ref: "test-external-pg".to_string(),
-                        },
+                        handle: InstanceHandle::new(
+                            DEFAULT_PROJECT.to_string(),
+                            compute.clone(),
+                            0,
+                            "test-external-pg".to_string(),
+                        ),
                         node: 0,
                         backend: "external".to_string(),
-                        endpoint: Endpoint {
-                            scheme: Scheme::Http,
-                            host: host.clone(),
-                            port,
-                        },
+                        endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                         region: None,
                         healthy: true,
                         started_at: None,
@@ -6117,19 +6081,15 @@ async fn project_sync_self_heal_tangle_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -6906,19 +6866,15 @@ async fn project_sync_self_heal_restore_failure_recoverable_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -7224,19 +7180,15 @@ async fn project_sync_self_heal_absent_primary_recoverable_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -7490,19 +7442,15 @@ async fn project_sync_self_heal_drop_soft_deleted_keeps_orphan_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -7733,19 +7681,15 @@ async fn project_sync_startup_sweep_preserves_populated_old_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -7970,19 +7914,15 @@ async fn project_sync_self_heal_tombstone_reaped_recovered_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -8327,19 +8267,15 @@ async fn project_sync_self_heal_tombstone_configured_grace_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -8578,19 +8514,15 @@ async fn project_sync_self_heal_recover_occupied_clear_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -8802,19 +8734,15 @@ async fn project_sync_boot_preserved_old_tracked_next_sync_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -9079,19 +9007,15 @@ async fn project_sync_tenancy_mismatch_fail_closed_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -9384,19 +9308,15 @@ async fn project_sync_delta_tenancy_mismatch_fail_closed_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -9714,19 +9634,15 @@ async fn project_sync_mysql_delta_tenancy_mismatch_refused_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -10028,19 +9944,15 @@ async fn project_export_mysql_routines_triggers_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-mysql".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-mysql".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -10434,19 +10346,15 @@ async fn project_export_mysql_view_name_injection_refused_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-mysql".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-mysql".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -11848,19 +11756,15 @@ async fn project_export_pg_true_delta_roundtrip_live() {
         .set_replica_state(
             boatramp_core::project::ProjectRef::new("default"),
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: "default".to_string(),
-                    workload: "pg".to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    "default".to_string(),
+                    "pg".to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -12208,19 +12112,15 @@ async fn project_export_pg_true_delta_overlap_window_live() {
         .set_replica_state(
             boatramp_core::project::ProjectRef::new("default"),
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: "default".to_string(),
-                    workload: "pg".to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    "default".to_string(),
+                    "pg".to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -12517,19 +12417,15 @@ async fn project_export_mysql_true_delta_roundtrip_live() {
         .set_replica_state(
             boatramp_core::project::ProjectRef::new("default"),
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: "default".to_string(),
-                    workload: "mysql".to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    "default".to_string(),
+                    "mysql".to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -13472,19 +13368,15 @@ async fn project_export_pg_true_delta_chain_live() {
         .set_replica_state(
             boatramp_core::project::ProjectRef::new("default"),
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: "default".to_string(),
-                    workload: "pg".to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    "default".to_string(),
+                    "pg".to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -13849,19 +13741,15 @@ async fn project_export_mysql_true_delta_chain_live() {
         .set_replica_state(
             boatramp_core::project::ProjectRef::new("default"),
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: "default".to_string(),
-                    workload: "mysql".to_string(),
-                    replica: 0,
-                    backend_ref: String::new(),
-                },
+                handle: InstanceHandle::new(
+                    "default".to_string(),
+                    "mysql".to_string(),
+                    0,
+                    String::new(),
+                ),
                 node: 0,
                 backend: "docker".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,
@@ -14581,19 +14469,15 @@ async fn project_export_clone_self_provisions_a_fresh_shared_tenant_live() {
         .set_replica_state(
             ProjectRef::DEFAULT,
             &ObservedInstance {
-                handle: InstanceHandle {
-                    project: DEFAULT_PROJECT.to_string(),
-                    workload: COMPUTE.to_string(),
-                    replica: 0,
-                    backend_ref: "test-external-pg".to_string(),
-                },
+                handle: InstanceHandle::new(
+                    DEFAULT_PROJECT.to_string(),
+                    COMPUTE.to_string(),
+                    0,
+                    "test-external-pg".to_string(),
+                ),
                 node: 0,
                 backend: "external".to_string(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: host.clone(),
-                    port,
-                },
+                endpoint: Endpoint::new(Scheme::Http, host.clone(), port),
                 region: None,
                 healthy: true,
                 started_at: None,

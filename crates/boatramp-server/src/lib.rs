@@ -5609,19 +5609,10 @@ mod tests {
     ) -> boatramp_core::compute::ObservedInstance {
         use boatramp_core::compute::{Endpoint, InstanceHandle, ReplicaPhase, Scheme, Snapshot};
         boatramp_core::compute::ObservedInstance {
-            handle: InstanceHandle {
-                project: project.into(),
-                workload: workload.into(),
-                replica: 0,
-                backend_ref: "ref-0".into(),
-            },
+            handle: InstanceHandle::new(project.into(), workload.into(), 0, "ref-0".into()),
             node: 1,
             backend: "vmm".into(),
-            endpoint: Endpoint {
-                scheme: Scheme::Http,
-                host: host.into(),
-                port: 80,
-            },
+            endpoint: Endpoint::new(Scheme::Http, host.into(), 80),
             region: None,
             healthy,
             started_at: None,
@@ -5632,13 +5623,8 @@ mod tests {
                 boatramp_core::compute::Readiness::Starting
             },
             data_dir: None,
-            snapshot: matches!(phase, ReplicaPhase::Zero).then(|| Snapshot {
-                project: project.into(),
-                workload: workload.into(),
-                replica: 0,
-                data_ref: "snap-0".into(),
-                exported: false,
-            }),
+            snapshot: matches!(phase, ReplicaPhase::Zero)
+                .then(|| Snapshot::new(project.into(), workload.into(), 0, "snap-0".into())),
             active_spec: None,
         }
     }
