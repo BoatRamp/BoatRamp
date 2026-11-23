@@ -5,7 +5,7 @@
 //! (`POSTGRES_USER`, `rolsuper`/`rolbypassrls`), which silently BYPASSES every table's row-level
 //! security — so an app that runs `FORCE ROW LEVEL SECURITY` served on that superuser DSN has its
 //! RLS un-enforced (a tenancy fail-open). The single-mode `rls_session` opt-in closes it: boatramp
-//! provisions a STABLE **non-superuser app role** ([`single_app_role_name`] via
+//! provisions a STABLE **non-superuser app role** ([`rls_app_role_name`] via
 //! [`ensure_login_role_ddl`] + [`grant_app_role_ddl`] + [`force_rls_event_trigger_ddl`]) that OWNS
 //! NOTHING (the superuser owns the schema), and serves the runtime AS that role.
 //!
@@ -39,7 +39,7 @@ use boatramp_core::sql::{SqlBackend, SqlValue};
 use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 use boatramp_storage::tenant_provision::{
     RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL, ensure_login_role_ddl, force_rls_event_trigger_ddl,
-    grant_app_role_ddl, single_app_role_name,
+    grant_app_role_ddl, rls_app_role_name,
 };
 
 const DB: &str = "rlssingle_appdb";
@@ -105,8 +105,8 @@ async fn single_mode_app_role_confines_accounts_while_the_superuser_leaks() {
     let su = connect(k, &ExternalSqlOptions::new(su_url.clone())).unwrap();
     let superuser = url_user(&su_url);
     // The STABLE app role boatramp's single-mode provisioning derives from the database name — the
-    // SAME name `single_app_role_name` produces in `provision_single_app_role`.
-    let app_role = single_app_role_name(DB);
+    // SAME name `rls_app_role_name` produces in `provision_rls_app_role`.
+    let app_role = rls_app_role_name(DB);
 
     // --- teardown any prior run (re-runnable) ---
     for stmt in [
@@ -127,7 +127,7 @@ async fn single_mode_app_role_confines_accounts_while_the_superuser_leaks() {
     // =====================================================================
     // SETUP — the REAL single-mode provisioning: the superuser owns the DB + schema; the app role is
     // a STABLE non-superuser login that OWNS NOTHING (GRANT + DEFAULT PRIVILEGES only), exactly what
-    // `provision_single_app_role` runs on the tenant-DB superuser connection.
+    // `provision_rls_app_role` runs on the tenant-DB superuser connection.
     // =====================================================================
     // (0) The superuser creates the database (so the SUPERUSER owns it + its schema — the single-mode
     //     container shape, where `POSTGRES_USER` owns everything initdb/migrations create).
@@ -139,7 +139,7 @@ async fn single_mode_app_role_confines_accounts_while_the_superuser_leaks() {
     // (1) Provision the app role: NOSUPERUSER/NOBYPASSRLS login + CONNECT, the app-role GRANTs +
     //     DEFAULT PRIVILEGES (owner = the schema-owning SUPERUSER), and the FORCE-on-ENABLE trigger
     //     (owned by the superuser). All on the tenant-DB superuser connection — byte-for-byte what
-    //     `provision_single_app_role` emits.
+    //     `provision_rls_app_role` emits.
     let mut provision = ensure_login_role_ddl(k, &app_role, APP_PW, DB);
     provision.extend(grant_app_role_ddl(k, &app_role, &superuser));
     provision.extend(force_rls_event_trigger_ddl(k, &superuser));
@@ -278,4 +278,192 @@ async fn single_mode_app_role_confines_accounts_while_the_superuser_leaks() {
     }
 
     println!("MANAGED RLS SINGLE-MODE OK [postgres]");
+}
+
+// ===========================================================================
+// SHARED + DEFAULT cell (feat/shared-default-rls) — the reserved default tenant on a SHARED server.
+// ===========================================================================
+
+const SD_DB: &str = "rlsshareddefault_appdb";
+/// The tenant GUC boatramp injects on the `rls_session` path (apps mirror it in their RLS so an app's
+/// Postgres RLS tracks boatramp's host-resolved tenant). Here it models the **structural tenant
+/// scoping** that must still bind the non-superuser app role in the Shared+default cell.
+const SD_TENANT_GUC: &str = "app.tenant_id";
+const SD_TENANT_A: &str = "tenant-a";
+const SD_TENANT_B: &str = "tenant-b";
+
+/// **Live gate: the SHARED + DEFAULT `rls_session` opt-in — the reserved default tenant on a shared
+/// server.** Structurally the SAME superuser-owned cell as a `Single` install (the shared server's
+/// OWN init database, superuser-owned, no per-tenant owner/runtime split), so it provisions + serves
+/// the identical STABLE non-superuser app role via the identical DDL helpers. What is Shared-SPECIFIC
+/// and proven here is the **coexistence of two session-var-keyed RLS layers on the non-superuser
+/// role**: boatramp's injected **tenant** GUC (`app.tenant_id` — the structural tenant scoping the app
+/// mirrors in RLS) AND the app's OWN **account** GUC (`app.account_id`). With ≥ 2 tenants × ≥ 2
+/// accounts in one `ENABLE ROW LEVEL SECURITY` table keyed on BOTH, this proves on a real Postgres:
+///
+///   1. **INVARIANT (the fix + coexistence):** served AS the provisioned non-superuser app role
+///      pinned to (tenant A, account A), a `SELECT` returns ONLY the (tenant A, account A) row — ZERO
+///      foreign bytes across BOTH the tenant axis and the account axis. The structural tenant scoping
+///      AND the app's own RLS both BIND the non-superuser role; the probe reads `0` (guard PERMITS).
+///   2. **MUTATION / the fail-open this change closes:** flip the runtime to the shared server's
+///      bootstrap SUPERUSER (the pre-opt-in Shared+default identity), pinned to the SAME GUCs — and the
+///      SAME `SELECT` returns ALL rows: `rolsuper` bypasses RLS, so BOTH layers are silently
+///      un-enforced. The probe reads `1` (guard REFUSES fail-closed). Proves the non-superuser role is
+///      load-bearing for Shared+default too.
+///
+/// Requires `BOATRAMP_TEST_PG_URL` = a **superuser** Postgres URL (skips cleanly when unset).
+/// `#[ignore]`-gated; prints `MANAGED RLS SHARED-DEFAULT OK [postgres]` on success.
+#[tokio::test]
+#[ignore = "needs a live superuser Postgres via BOATRAMP_TEST_PG_URL (run on lighthouse / the live-pg CI lane)"]
+async fn shared_default_app_role_coexists_tenant_and_account_rls_while_the_superuser_leaks() {
+    let Ok(su_url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("skip managed_rls_shared_default: BOATRAMP_TEST_PG_URL unset");
+        return;
+    };
+    let k = ExternalSqlKind::Postgres;
+    let su = connect(k, &ExternalSqlOptions::new(su_url.clone())).unwrap();
+    let superuser = url_user(&su_url);
+    // The SAME role-name helper the node's Shared-arm provisioning uses (derived from the DB name).
+    let app_role = rls_app_role_name(SD_DB);
+
+    // --- teardown any prior run (re-runnable) ---
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS \"{SD_DB}\" WITH (FORCE)"),
+        format!("DROP ROLE IF EXISTS \"{app_role}\""),
+    ] {
+        let _ = su.run_script(&stmt).await;
+    }
+    assert_ne!(
+        app_role, superuser,
+        "the Shared+default app role must never collide with the bootstrap superuser name"
+    );
+
+    // SETUP — the shared server's OWN default DB is superuser-owned (modeled by CREATE DATABASE as the
+    // superuser), exactly like the Single install's DB. Provision the app role with the IDENTICAL
+    // helpers the node runs (`provision_rls_app_role`): non-superuser login + GRANT/DEFAULT PRIVILEGES
+    // (owner = the superuser) + the FORCE-on-ENABLE trigger.
+    su.run_script(&format!("CREATE DATABASE \"{SD_DB}\""))
+        .await
+        .unwrap_or_else(|e| panic!("create db: {e}"));
+    let su_db = connect(k, &ExternalSqlOptions::new(su_to_db(&su_url, SD_DB))).unwrap();
+    let mut provision = ensure_login_role_ddl(k, &app_role, APP_PW, SD_DB);
+    provision.extend(grant_app_role_ddl(k, &app_role, &superuser));
+    provision.extend(force_rls_event_trigger_ddl(k, &superuser));
+    for stmt in provision {
+        su_db
+            .run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("shared-default provision `{stmt}`: {e}"));
+    }
+    assert_eq!(
+        probe(
+            &su_db,
+            &format!(
+                "SELECT (rolsuper OR rolbypassrls)::int FROM pg_roles WHERE rolname = '{app_role}'"
+            )
+        )
+        .await,
+        "0",
+        "the provisioned Shared+default app role must be NON-superuser and NON-BYPASSRLS"
+    );
+
+    // As the SUPERUSER (schema owner / migrator), create an ENABLE-RLS table whose policy keys on BOTH
+    // the injected TENANT GUC (structural scoping) AND the app's own ACCOUNT GUC, and seed a 2×2 grid
+    // minus one so ≥ 2 tenants and ≥ 2 accounts are present.
+    for stmt in [
+        "CREATE TABLE t (tenant text, account text, v int)".to_string(),
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY".to_string(),
+        format!(
+            "CREATE POLICY p ON t USING (tenant = current_setting('{SD_TENANT_GUC}', true) \
+             AND account = current_setting('{ACCT_GUC}', true))"
+        ),
+        format!("INSERT INTO t (tenant, account, v) VALUES ('{SD_TENANT_A}', '{ACCT_A}', 1)"),
+        format!("INSERT INTO t (tenant, account, v) VALUES ('{SD_TENANT_A}', '{ACCT_B}', 2)"),
+        format!("INSERT INTO t (tenant, account, v) VALUES ('{SD_TENANT_B}', '{ACCT_A}', 3)"),
+    ] {
+        su_db
+            .run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("superuser DDL/seed `{stmt}`: {e}"));
+    }
+    assert_eq!(
+        probe(&su_db, "SELECT count(*)::int FROM t").await,
+        "3",
+        "all three rows must exist on disk — the fence is RLS visibility, not a failed insert"
+    );
+
+    // Pin the app role to (tenant A, account A) via role-default GUCs (mirrors how boatramp sets the
+    // tenant GUC per request + how the app sets its own account GUC).
+    for stmt in [
+        format!("ALTER ROLE \"{app_role}\" SET \"{SD_TENANT_GUC}\" = '{SD_TENANT_A}'"),
+        format!("ALTER ROLE \"{app_role}\" SET \"{ACCT_GUC}\" = '{ACCT_A}'"),
+    ] {
+        su.run_script(&stmt).await.unwrap();
+    }
+
+    // STEP 1 — INVARIANT + COEXISTENCE: the non-superuser app role sees ONLY (tenant A, account A).
+    let app_conn = connect(
+        k,
+        &ExternalSqlOptions::new(as_role(&su_url, &app_role, APP_PW, SD_DB)),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(&app_conn, "SELECT current_user::text").await,
+        app_role,
+        "the Shared+default runtime serves AS the provisioned non-superuser app role"
+    );
+    assert_eq!(
+        probe(&app_conn, RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL).await,
+        "0",
+        "the runtime-role non-privilege probe must read 0 (unprivileged ⇒ serving guard permits)"
+    );
+    assert_eq!(
+        probe(&app_conn, "SELECT count(*)::int FROM t").await,
+        "1",
+        "COEXISTENCE PROOF: the non-superuser app role is bound by BOTH the injected tenant GUC AND \
+         the app's own account RLS — it sees ONLY the (tenant A, account A) row (zero foreign bytes \
+         on either axis)"
+    );
+    assert_eq!(
+        probe(&app_conn, "SELECT tenant || '/' || account FROM t").await,
+        format!("{SD_TENANT_A}/{ACCT_A}"),
+        "the only row visible to the app role must be (tenant A, account A)"
+    );
+
+    // STEP 2 — MUTATION: the bootstrap SUPERUSER (same GUCs) bypasses BOTH layers and sees ALL rows.
+    let su_serving = connect(k, &ExternalSqlOptions::new(su_to_db(&su_url, SD_DB))).unwrap();
+    for stmt in [
+        format!("SET \"{SD_TENANT_GUC}\" = '{SD_TENANT_A}'"),
+        format!("SET \"{ACCT_GUC}\" = '{ACCT_A}'"),
+    ] {
+        su_serving
+            .run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("pin the superuser session: {e}"));
+    }
+    assert_eq!(
+        probe(&su_serving, RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL).await,
+        "1",
+        "the runtime-role non-privilege probe must read 1 for the superuser (privileged ⇒ REFUSE)"
+    );
+    assert_eq!(
+        probe(&su_serving, "SELECT count(*)::int FROM t").await,
+        "3",
+        "MUTATION / EXPECTED-LEAK PROOF: served AS the bootstrap SUPERUSER, the SAME query sees ALL \
+         rows — rolsuper bypasses RLS, so Shared+default isolation BREAKS without the non-superuser \
+         app role (the fail-open this change closes)"
+    );
+
+    // --- teardown (best-effort) ---
+    drop(su_db);
+    drop(su_serving);
+    drop(app_conn);
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS \"{SD_DB}\" WITH (FORCE)"),
+        format!("DROP ROLE IF EXISTS \"{app_role}\""),
+    ] {
+        let _ = su.run_script(&stmt).await;
+    }
+
+    println!("MANAGED RLS SHARED-DEFAULT OK [postgres]");
 }

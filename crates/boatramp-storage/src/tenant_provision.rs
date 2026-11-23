@@ -324,22 +324,24 @@ pub fn tenant_owner_role_name(base: &str, tenant_ident: &str) -> String {
     sanitize_ident_capped(&format!("{base}_{tenant_ident}_owner"), MAX_ROLE_IDENT_LEN)
 }
 
-/// Derive the **STABLE non-superuser app login role** for a `Single`-isolation (dedicated-container)
-/// managed Postgres database that opts into `rls_session` (the single-mode RLS capability-parity
-/// path). A `Single` tenant's container is initialized with a **bootstrap superuser**
-/// (`POSTGRES_USER`, `rolsuper`/`rolbypassrls`), which silently bypasses the app's own
-/// `FORCE ROW LEVEL SECURITY` — so when the binding opts in, boatramp provisions THIS role, a
-/// non-superuser / non-BYPASSRLS login the runtime is served as instead.
+/// Derive the **STABLE non-superuser app login role** for a **superuser-owned managed-Postgres cell**
+/// that opts into `rls_session` — a `Single`-isolation (dedicated-container) database, OR the reserved
+/// `Shared` + default tenant (the shared server's own init database). Both are initialized with a
+/// **bootstrap superuser** (`POSTGRES_USER`, `rolsuper`/`rolbypassrls`), which silently bypasses the
+/// app's own `FORCE ROW LEVEL SECURITY` — so when the binding opts in, boatramp provisions THIS role,
+/// a non-superuser / non-BYPASSRLS login the runtime is served as instead.
 ///
 /// Scheme: `<database>_rlsapp`, re-sanitized + length-capped via [`sanitize_ident_capped`]'s
 /// whole-input digest (so it is a valid, ≤ [`MAX_ROLE_IDENT_LEN`]-byte identifier and is injective
-/// over the database name). It is **STABLE** — one fixed role per `(container, database)`, NOT a
-/// per-replica dynamic role — which is deliberate: a stable role **owns nothing** (the superuser owns
-/// the schema; this role gets only `GRANT` + `ALTER DEFAULT PRIVILEGES`), so it sidesteps the
-/// PG object-ownership-orphaning constraint that forces the `Shared` operate-as-owner path to mint
-/// per-replica roles. The digest keeps it distinct from the bootstrap superuser even when the two
-/// are derived from the same base (e.g. `database == user == "postgres"`).
-pub fn single_app_role_name(database: &str) -> String {
+/// over the database name). It is **STABLE** — one fixed role per database, NOT a per-replica dynamic
+/// role — which is deliberate: a stable role **owns nothing** (the superuser owns the schema; this
+/// role gets only `GRANT` + `ALTER DEFAULT PRIVILEGES`), so it sidesteps the PG
+/// object-ownership-orphaning constraint that forces the `Shared` non-default operate-as-owner path to
+/// mint per-replica roles. On a shared server it is a cluster role confined to its own database by the
+/// `CONNECT` grant + the non-superuser attribute (other tenants' databases `REVOKE CONNECT FROM
+/// PUBLIC`). The digest keeps it distinct from the bootstrap superuser even when the two are derived
+/// from the same base (e.g. `database == user == "postgres"`).
+pub fn rls_app_role_name(database: &str) -> String {
     sanitize_ident_capped(&format!("{database}_rlsapp"), MAX_ROLE_IDENT_LEN)
 }
 
@@ -470,26 +472,28 @@ fn mysql_user(role: &str) -> String {
 /// `managed_rls_fencing` live gates). `build_backend` asserts the non-owner invariant fail-closed.
 ///
 /// Both postures above are the **`Shared`, non-default** cell (the one with a per-tenant
-/// owner/runtime role split). For **`Single`** isolation (a dedicated container per tenant, including
-/// the reserved `default` install) there are two cases by the `rls_session` opt-in:
+/// owner/runtime role split). The **superuser-owned cells** — **`Single`** isolation (a dedicated
+/// container per tenant, including the reserved `default` install) AND the reserved **`Shared` +
+/// default** tenant (the shared server's own init database, superuser-owned, no per-tenant split) —
+/// share one `rls_session` opt-in model with two cases:
 ///
-/// * **un-opted** (`rls_session = false`, the default) — the serving identity IS the container's own
+/// * **un-opted** (`rls_session = false`, the default) — the serving identity IS the database's own
 ///   DB login, the stock-image **superuser** (`POSTGRES_USER`), which **bypasses RLS**, and NO app
-///   role / force-trigger is installed. The cross-tenant boundary is the dedicated per-tenant
-///   container, so `rls_session` here would be a non-load-bearing in-DB convenience — hence it is
-///   off by default.
+///   role / force-trigger is installed. The cross-tenant boundary is the dedicated container (Single)
+///   or the per-tenant database (Shared), so `rls_session` here would be a non-load-bearing in-DB
+///   convenience — hence it is off by default.
 /// * **opted-in** (`rls_session = true`) — boatramp provisions a **STABLE non-superuser app role**
-///   ([`single_app_role_name`] + [`ensure_login_role_ddl`]/[`grant_app_role_ddl`] +
+///   ([`rls_app_role_name`] + [`ensure_login_role_ddl`]/[`grant_app_role_ddl`] +
 ///   [`force_rls_event_trigger_ddl`]) that OWNS NOTHING (the superuser owns the schema), and the
 ///   runtime serves AS that role. A plain `ENABLE ROW LEVEL SECURITY` table binds this non-owner,
 ///   so the app's within-DB RLS is now **load-bearing** — capability parity with the `Shared`
 ///   non-owner posture. The serving path refuses fail-closed if the resolved runtime role is still a
-///   superuser / BYPASSRLS ([`RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL`]).
+///   superuser / BYPASSRLS ([`RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL`]). For `Shared` + default this
+///   is additive to the structural cross-tenant predicate (injected by the node query layer,
+///   independent of the PG role), which is unchanged and still applies to the non-superuser role.
 ///
-/// The reserved **`default` tenant on a `Shared` server** (distinct from a `Single` install) still
-/// serves as the plain configured user with no RLS. See `ExternalDatabaseConfig::rls_session`'s
-/// trust-model note in `boatramp-node`. On the `Shared` non-default path the two owner/non-owner
-/// postures above apply.
+/// See `ExternalDatabaseConfig::rls_session`'s trust-model note in `boatramp-node`. On the `Shared`
+/// non-default path the two owner/non-owner postures above apply.
 ///
 /// Default **off**: a binding WITHOUT `rls_session` (+ `tenant_guc`) gets NEITHER, and the emitted
 /// DDL is byte-identical to the pre-feature output.
@@ -1839,23 +1843,23 @@ mod tests {
         assert!(!all.to_ascii_uppercase().contains("OWNER"));
     }
 
-    /// `single_app_role_name` (the single-mode RLS app role) is a valid, bounded identifier,
+    /// `rls_app_role_name` (the single-mode RLS app role) is a valid, bounded identifier,
     /// DISTINCT from its base — even when the base equals the bootstrap superuser name
     /// (`database == user == "postgres"`), the digest keeps them apart so the runtime app role can
     /// never collide with the superuser it replaces.
     #[test]
-    fn single_app_role_name_is_bounded_and_distinct_from_base() {
-        let r = single_app_role_name("postgres");
+    fn rls_app_role_name_is_bounded_and_distinct_from_base() {
+        let r = rls_app_role_name("postgres");
         assert!(r.len() <= MAX_ROLE_IDENT_LEN, "over role cap: {r:?}");
         assert_ne!(
             r, "postgres",
             "must differ from the bootstrap superuser name"
         );
         // Deterministic + injective over the database name (distinct DBs ⇒ distinct roles).
-        assert_eq!(r, single_app_role_name("postgres"), "deterministic");
+        assert_eq!(r, rls_app_role_name("postgres"), "deterministic");
         assert_ne!(
-            single_app_role_name("appdb"),
-            single_app_role_name("other"),
+            rls_app_role_name("appdb"),
+            rls_app_role_name("other"),
             "distinct database names must yield distinct app roles"
         );
         // Valid identifier start (never digit-/pg_-leading; the superuser name `postgres` sanitizes

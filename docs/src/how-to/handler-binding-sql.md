@@ -230,14 +230,15 @@ section; the reserved `default` tenant on a shared server serves as its plain us
 owner/runtime split). The migration/DDL identity
 (`migration_url_env`, `{{sql.migration_dsn}}`) is always the owner role, regardless of `serve_as`.
 
-### Single-mode RLS — `rls_session` on a `tenant: single` Postgres binding
+### Non-superuser RLS on a superuser-owned cell — `rls_session` on `tenant: single` or `Shared` + default
 
-A **`tenant: single`** (dedicated-container) managed Postgres is initialized with a **bootstrap
-superuser** (`POSTGRES_USER`). By default the runtime is served as that superuser, which — like any
-superuser — **bypasses row-level security**, so an app's own `FORCE ROW LEVEL SECURITY` is silently
-un-enforced. Set **`rls_session: true`** on the binding to opt into capability parity with the shared
-non-owner posture: boatramp provisions a **stable non-superuser app role** and serves the runtime as
-it instead.
+Some managed-Postgres cells have a database owned by the **bootstrap superuser** (`POSTGRES_USER`)
+with no per-tenant owner/runtime role split: a **`tenant: single`** dedicated container (any tenant),
+and the reserved **`Shared` + default** tenant (the shared server's own init database). By default the
+runtime is served as that superuser, which — like any superuser — **bypasses row-level security**, so
+an app's own `FORCE ROW LEVEL SECURITY` is silently un-enforced. Set **`rls_session: true`** on the
+binding to opt into capability parity with the shared non-owner posture: boatramp provisions a **stable
+non-superuser app role** and serves the runtime as it instead.
 
 ```ron
 "app": (
@@ -255,11 +256,17 @@ it instead.
   only `GRANT` + default privileges, so it is a non-owner a plain `ENABLE ROW LEVEL SECURITY` table
   binds. Your app's RLS is now **load-bearing** on the serving DSN.
 - The role is **stable** (one per database, not per-replica), so it sidesteps object-ownership
-  orphaning; its credential is sealed under its own key, never the superuser's.
-- **Default off:** an un-opted `tenant: single` binding is unchanged — it serves as the superuser with
-  no RLS enforcement. When opted in, boatramp **refuses fail-closed** if the resolved runtime role is
-  still a superuser / `BYPASSRLS`, so an app can never silently believe it has RLS while served by a
-  superuser. (`serve_as` is not consulted — single-mode serving is always the non-superuser app role.)
+  orphaning; its credential is sealed under its own key, never the superuser's. On a shared server it
+  is a cluster role confined to its own (default-tenant) database.
+- On a **`Shared`** server this layers on top of the **structural cross-tenant isolation** (the host
+  injects the tenant predicate and scopes each tenant to its own database — see
+  [tenant isolation](./tenant-isolation.md)); that boundary is unchanged and still applies to the
+  non-superuser role. The opt-in only *adds* enforcement of the app's **own** RLS.
+- **Default off:** an un-opted binding is unchanged — it serves as the superuser with no RLS
+  enforcement. When opted in, boatramp **refuses fail-closed** if the resolved runtime role is still a
+  superuser / `BYPASSRLS`, so an app can never silently believe it has RLS while served by a superuser.
+  (`serve_as` is not consulted — a superuser-owned cell always serves the non-superuser app role. A
+  `Shared` *non-default* tenant is a different cell: it already serves a per-tenant non-owner role.)
 
 ## Typed queries with the `orm` builder
 
