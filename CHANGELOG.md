@@ -5,7 +5,7 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.71.0] — 2026-11-22
+## [0.71.0] — 2026-11-23
 
 ### Breaking
 
