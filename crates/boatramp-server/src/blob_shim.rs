@@ -2,27 +2,46 @@
 //! [`sql_shim`](crate::sql_shim), symmetric with it end to end.
 //!
 //! An opaque compute workload (container / micro-VM) cannot import the WASI
-//! `wasi:blobstore` host interface a handler uses. This shim gives it the *same*
-//! per-site-scoped [`Storage`] namespace over a plain HTTP wire: a single per-node
-//! endpoint exposing `PUT`/`GET`/`HEAD`/`DELETE` on `{BLOB_URL}/{container}/{key}` plus a
-//! `LIST` (`GET {BLOB_URL}/{container}` with an optional `?prefix=`/`?after=`/`?limit=`), so an
-//! off-the-shelf HTTP client in the guest reads/writes/enumerates exactly the objects a
-//! `wasi:blobstore` handler for the same `(project, site)` sees — objects under
-//! `hblob/{project-qualified-site}/{container}/{key}`, the SAME `Storage` backend
-//! (`BlobBackends::backend(project)`) the host binding resolves. A handler and a
-//! native worker therefore share ONE blob namespace.
+//! `wasi:blobstore` host interface a handler uses. This shim gives it an equivalent
+//! [`Storage`] namespace over a plain HTTP wire: a single per-node endpoint exposing
+//! `PUT`/`GET`/`HEAD`/`DELETE` on `{BLOB_URL}/{container}/{key}` plus a `LIST`
+//! (`GET {BLOB_URL}/{container}` with an optional `?prefix=`/`?after=`/`?limit=`), so an
+//! off-the-shelf HTTP client in the guest reads/writes/enumerates objects on the SAME `Storage`
+//! backend (`BlobBackends::backend(project)`) a `wasi:blobstore` handler resolves.
+//!
+//! ## Namespace (which blob tape a `blob` binding reaches)
+//!
+//! A `--bind blob` resolves to ONE confined `hblob/…` prefix, chosen by the binding's
+//! [`site`](ComputeBinding::site):
+//!
+//! * **No `site` (the default)** → the workload's PRIVATE **reserved compute namespace**
+//!   `hblob/{project}/_compute/{workload}/{container}/`. The `_compute` segment is RESERVED:
+//!   a site name can never be `_compute` (`is_valid_resource_slug` rejects a leading `_`), so this
+//!   namespace is **disjoint from every site's blob tape** — a compute workload can never silently
+//!   collide with a same-named site. This is the v0.73.0 convention-drop: before it, a bare `blob`
+//!   binding resolved under the WORKLOAD NAME as the site segment (`hblob/{project}/{workload}/…`),
+//!   so a workload NAMED after a site implicitly shared that site's tape — an undiscoverable,
+//!   error-prone coupling, now gone.
+//!
+//! * **Explicit `site: "blog"`** → that SITE's tape `hblob/{project}/{site}/{container}/`, the
+//!   EXACT objects a `wasi:blobstore` handler for `(project, site)` sees, so a worker and a handler
+//!   deliberately share ONE blob namespace. The `{project}` is ALWAYS the WORKLOAD's own (from its
+//!   key), NEVER the binding, so a share can never cross tenants; the server additionally gates it
+//!   at set time (the named site must EXIST in the workload's project, and the caller must hold that
+//!   site's blob-write right — see `admin_api::put_compute`). `scope` fails CLOSED on a malformed
+//!   site name (binding skipped).
 //!
 //! ## Isolation (mirrors the sql-shim's token→resolved-backend model)
 //!
 //! Requests authenticate with `Authorization: Bearer <token>`; the token maps to a
-//! [`BlobScope`] **already resolved for exactly one `project/site`** (the same
-//! `BlobBackends::backend` call + `hblob/{qualified-site}/` prefix a handler gets).
-//! The SITE is carried by the TOKEN's stored `site_prefix`, NEVER by a
-//! client-supplied or guessable field, so a workload is structurally incapable of
-//! naming another tenant's site — exactly like the WASI handler. A
+//! [`BlobScope`] **already resolved to exactly one confined `hblob/…` prefix** (the private
+//! reserved compute namespace, or — for an explicit-`site` binding — that site's tape, resolved
+//! through the same `BlobBackends::backend` call a handler gets). The prefix is carried by the
+//! TOKEN's stored `site_prefix`, NEVER by a client-supplied or guessable field, so a workload is
+//! structurally incapable of naming another namespace — exactly like the WASI handler. A
 //! `--bind blob:<name>` token is additionally bound to one container (cross-container
-//! rejected); a bare `--bind blob` token is site-wide but still confined to the
-//! site, and every object key is screened ([`validate_object_key`]) so a
+//! rejected); a bare `--bind blob` token is namespace-wide but still confined to its one
+//! prefix, and every object key is screened ([`validate_object_key`]) so a
 //! path-traversal key can never escape the container prefix. The token is
 //! boatramp-minted (HMAC over the per-node secret), instance-scoped, and rotatable
 //! (a fresh per-node secret on restart re-derives it); the operator's storage
@@ -38,22 +57,17 @@
 //! `blob_shim_url` at the bridge gateway (or loopback), never a public address. (An explicit
 //! `0.0.0.0` in the URL is honored as the operator's own choice.)
 //!
-//! ## Tenancy (project-qualified scope — Security Finding 8 closed)
+//! ## Tenancy of the resolved prefix
 //!
-//! The site identity is `ProjectRef::qualified(project, workload)`, which is ALWAYS the
-//! two-segment `{project}/{workload}` — including the reserved `default` project, which
-//! qualifies to `default/{workload}` (NOT the bare `{workload}`). So a workload's objects
-//! live under `hblob/{project}/{workload}/{container}/{key}` and every project — `default`
-//! included — occupies a DISJOINT `hblob/{project}/` subtree. Project names carry no `/`
-//! ([`validate_resource_name`]) and `default` is reserved at project-create, so no named
-//! project can be `default`: there is NO cross-project collision. The shim reuses the same
-//! `qualified` scope a `wasi:blobstore` handler for the same `(project, site)` resolves, so
-//! the two share ONE namespace that is tenant-disjoint across projects.
-//!
-//! (This closes the v0.31.0 Security Finding 8: `default` once special-cased to the bare
-//! `{workload}` one-segment scope, which made a `default`-project workload named like a real
-//! project collide with that project's `hblob/` subtree. `ProjectRef::qualified` dropped the
-//! special case — `default` is now a normal two-segment project — so the collision is gone.)
+//! Both namespace shapes are rooted at `hblob/{project}/…` where `{project}` is taken ONLY from the
+//! WORKLOAD's key (the control-plane `project/<proj>/compute/<name>` path), never from the binding —
+//! so a `blob` binding can NEVER resolve into another project's `hblob/` subtree. For the reserved
+//! default the next segment is the literal `_compute`, which `is_valid_resource_slug` rejects as a
+//! site name, so the compute keyspace is provably disjoint from every site tape (the flat `hblob/`
+//! keyspace has no in-key kind marker — the reserved `_compute` segment is the load-bearing safety).
+//! For an explicit `site` the next segment is that site, validated to a well-formed slug in
+//! [`BlobShimResolver::scope`] (a malformed one fails CLOSED → the binding is skipped), and gated to
+//! a REAL same-project site + the caller's site blob-write right at set time (`put_compute`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,7 +83,9 @@ use boatramp_core::blob_backends::BlobBackends;
 use boatramp_core::compute::{
     BindingKind, ComputeBinding, ComputeBindingResolver, SurfaceContribution,
 };
-use boatramp_core::project::{ProjectRef, validate_key_segment, validate_object_key};
+use boatramp_core::project::{
+    ProjectRef, validate_key_segment, validate_object_key, validate_resource_name,
+};
 use boatramp_core::{ByteStream, ObjectMeta, PutMeta, Storage, StorageError};
 use futures::StreamExt as _;
 use hmac::{Hmac, Mac};
@@ -93,6 +109,16 @@ const MAX_LIST_PAGE: u32 = 1000;
 /// never WRITE one ([`validate_object_key`] rejects it), but the host writes the marker, so the
 /// listing hides ANY key whose path touches it. Mirrors the host `blob-list` binding's reserve.
 const RESERVED_PREFIX: &str = ".boatramp";
+
+/// The RESERVED site-identity segment for a compute workload's PRIVATE blob namespace
+/// (`hblob/{project}/_compute/{workload}/…`), used when a `blob` binding sets no explicit
+/// [`site`](ComputeBinding::site). It is deliberately NOT a valid resource slug
+/// (`boatramp_core::project::is_valid_resource_slug` rejects the leading `_`), so NO site can ever
+/// be named `_compute` — the compute keyspace is therefore provably disjoint from every site's
+/// `hblob/{project}/{site}/` tape. This is the load-bearing safety of the v0.73.0 convention-drop
+/// (the flat `hblob/` keyspace carries no in-key kind marker, so the reserved segment IS the
+/// marker). A unit test (`default_namespace_segment_is_never_a_valid_site`) pins the invariant.
+const COMPUTE_RESERVED_SEGMENT: &str = "_compute";
 
 /// The container MARKER object name. A boatramp "container" is a key prefix PLUS this marker object,
 /// so a `wasi:blobstore` handler's `get-container`/`container-exists` only admits a container whose
@@ -318,13 +344,23 @@ impl BlobShimResolver {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 
-    /// The [`BlobScope`] for a `blob` binding on this `(project, workload)`: the SAME
-    /// backend + `hblob/{qualified-site}/` prefix the `wasi:blobstore` host binding
-    /// resolves, with the workload name standing in as the site identity (exactly as the
-    /// sql-shim treats the workload name as its site). A `--bind blob:<name>` additionally
-    /// binds the one named container; an invalid container name fails closed (`None`
-    /// returned ⇒ the binding is skipped). Pure given the provider, so the convention is
-    /// unit-testable.
+    /// The [`BlobScope`] for a `blob` binding on this `(project, workload)` — the ONE confined
+    /// `hblob/…` prefix the token is bound to, chosen by the binding's
+    /// [`site`](ComputeBinding::site):
+    ///
+    /// * **No `site`** → the workload's PRIVATE reserved namespace
+    ///   `hblob/{project}/_compute/{workload}/` ([`COMPUTE_RESERVED_SEGMENT`]) — disjoint from every
+    ///   site tape (a site can never be named `_compute`). This DROPS the pre-v0.73.0 name-match
+    ///   convention: a workload named like a site no longer shares that site's tape by default.
+    /// * **Explicit `site`** → that site's tape `hblob/{project}/{site}/`, the SAME prefix a
+    ///   `wasi:blobstore` host binding for `(project, site)` resolves — so the share is exact. The
+    ///   site name is re-validated here as a well-formed slug; a malformed one fails CLOSED (`None`
+    ///   ⇒ the binding is skipped), defense-in-depth behind the set-time existence/authz gate.
+    ///
+    /// The `{project}` is ALWAYS the WORKLOAD's own (the `project` argument, from the workload's
+    /// key), NEVER the binding, so a resolved prefix can never cross tenants. A `--bind blob:<name>`
+    /// additionally binds the one named container; an invalid container name fails closed. Pure
+    /// given the provider, so the namespace scheme is unit-testable.
     fn scope(&self, project: &str, workload: &str, binding: &ComputeBinding) -> Option<BlobScope> {
         // The container, when named (`--bind blob:<name>`), must be a safe single segment —
         // reject traversal/separators at resolve time (fail closed), mirroring the host
@@ -342,16 +378,34 @@ impl BlobShimResolver {
             Some(binding.name.clone())
         };
         // The per-project blob backend the `wasi:blobstore` binding build reads
-        // (`inner.blob_backends`); an unconfigured project resolves the global default.
-        let storage = self.provider.backend(ProjectRef::new(project));
-        // `hblob/{qualified-site}/` — `hblob/{project}/{site}/` for EVERY project including the
-        // reserved `default` (`hblob/default/{site}/`, v0.31.0 Finding 8; ProjectRef::qualified),
-        // matching the host binding's `format!("hblob/{site}/")` where `site` is
-        // `project.qualified(site)`.
-        let qualified_site = ProjectRef::new(project).qualified(workload);
+        // (`inner.blob_backends`); an unconfigured project resolves the global default. The project
+        // is the WORKLOAD's own — the structural tenant boundary (never the binding).
+        let proj = ProjectRef::new(project);
+        let storage = self.provider.backend(proj);
+        // Resolve the one confined `hblob/{project}/…/` prefix. BOTH shapes root at the workload's
+        // own project via `ProjectRef::qualified`, so neither can reach another tenant's subtree.
+        let qualified = match binding.site.as_deref() {
+            // Explicit site-share → `hblob/{project}/{site}/`, byte-identical to the host binding's
+            // `(project, site)` prefix. Fail CLOSED on a malformed site name (defense-in-depth
+            // behind the set-time existence + authz gate; the project is still the workload's own,
+            // so even a slipped-through bad site can only ever name WITHIN this tenant).
+            Some(site) => {
+                if validate_resource_name("site", site).is_err() {
+                    tracing::warn!(
+                        %project, %workload, site = %site,
+                        "blob binding: invalid site name; binding skipped (fail closed)"
+                    );
+                    return None;
+                }
+                proj.qualified(site)
+            }
+            // No explicit site → the RESERVED compute namespace `hblob/{project}/_compute/{workload}/`
+            // (the `_compute` segment can never be a site, so this is disjoint from every site tape).
+            None => format!("{}/{workload}", proj.qualified(COMPUTE_RESERVED_SEGMENT)),
+        };
         Some(BlobScope {
             storage,
-            site_prefix: format!("hblob/{qualified_site}/"),
+            site_prefix: format!("hblob/{qualified}/"),
             container,
         })
     }
@@ -411,7 +465,6 @@ impl ComputeBindingResolver for BlobShimResolver {
                 continue;
             };
             let token = self.token(project, workload, replica, binding);
-            self.shim.register(&token, scope).await;
             let url_env = binding.url_env();
             out.defaults.push((url_env.clone(), self.base_url.clone()));
             out.defaults
@@ -427,9 +480,15 @@ impl ComputeBindingResolver for BlobShimResolver {
                 out.vars
                     .insert(format!("blob.{}.token", binding.name), token.clone());
             }
+            // Mint the direct-S3 STS credential (if any) from the SAME resolved `scope` — it anchors
+            // the credential on `scope.site_prefix`, so the write cred and the HMAC read prefix are
+            // byte-identical (Security HIGH-1). This borrows `scope`, so it runs BEFORE `register`.
             #[cfg(feature = "blob-upload")]
-            self.contribute_blob_sts(project, workload, binding, single, &mut out)
+            self.contribute_blob_sts(project, workload, binding, &scope, single, &mut out)
                 .await;
+            // Register the HMAC capability LAST: `register` consumes `scope`, which the STS path above
+            // borrows. Order is immaterial to correctness (both populate maps before `out` returns).
+            self.shim.register(&token, scope).await;
         }
         out
     }
@@ -453,17 +512,23 @@ impl ComputeBindingResolver for BlobShimResolver {
 
 #[cfg(feature = "blob-upload")]
 impl BlobShimResolver {
-    /// Mint direct-S3 `TempCredentials` for a `--bind blob:<container>` and contribute the
-    /// `{{blob.*}}` STS vars + `AWS_*` default env, so an off-the-shelf S3 client talks DIRECTLY
-    /// to R2/Tigris. A bare `--bind blob` (no container) stays HMAC-only; so does any backend with
-    /// no real STS minter wired, a mint failure, or a presigned-only return — all FALL BACK to the
-    /// HMAC shim (never panic). NEVER logs the minted secret / session token (a `TempCredentials`
+    /// Mint direct-S3 `TempCredentials` for an EXPLICIT-site `--bind blob:<container>@<site>` and
+    /// contribute the `{{blob.*}}` STS vars + `AWS_*` default env, so an off-the-shelf S3 client talks
+    /// DIRECTLY to R2/Tigris. The credential is resource-scoped to the SAME `hblob/{project}/{site}/
+    /// {container}/` tree the HMAC shim reads (anchored on the passed `scope.site_prefix`, NOT the
+    /// workload name — Security HIGH-1). A bare `--bind blob` (no container) stays HMAC-only; so does a
+    /// NO-SITE binding (its reserved `hblob/{project}/_compute/{workload}/` namespace has no
+    /// single-segment site tape to mint into, and the HMAC shim already covers its full R/W), any
+    /// backend with no real STS minter wired, a mint failure, a presigned-only return, or a prefix that
+    /// diverges from the HMAC `site_prefix` — all FALL BACK to the HMAC shim (never panic). NEVER logs
+    /// the minted secret / session token (a `TempCredentials`
     /// is read field-by-field into the var/default maps, never `{:?}`-printed).
     async fn contribute_blob_sts(
         &self,
         project: &str,
         workload: &str,
         binding: &ComputeBinding,
+        scope: &BlobScope,
         single: bool,
         out: &mut SurfaceContribution,
     ) {
@@ -486,6 +551,19 @@ impl BlobShimResolver {
         if binding.name.is_empty() {
             return;
         }
+        // Only an EXPLICIT `binding.site` has a single-segment site tape a direct-S3 credential can
+        // be resource-scoped to. A NO-SITE binding resolves (in `scope`) to the reserved TWO-segment
+        // namespace `hblob/{project}/_compute/{workload}/`, which the STS mint's prefix shape — one
+        // `site` segment fed through `keypath::container_prefix` — structurally CANNOT express.
+        // Approximating it as the single-segment site `{workload}` is exactly the name-match coupling
+        // #12 removed: it would anchor a WRITE credential at a REAL same-named site's tape (the
+        // `Site·Write` gate only runs for an explicit `binding.site`), reviving the bypass on the
+        // write side. The HMAC shim already grants full R/W confined to that private
+        // `_compute/{workload}` namespace, so NO direct-S3 write credential to any site tape is issued
+        // for a no-site binding — it stays HMAC-only. (Security HIGH-1, v0.73.0.)
+        let Some(site) = binding.site.as_deref() else {
+            return;
+        };
         let target = UploadTarget::Prefix(String::new()); // the whole container (no sub-prefix)
         // Defense-in-depth: screen the container/target the SAME way the guest/operator mint path
         // does, even though `scope` already validated the container name. A refusal ⇒ HMAC-only.
@@ -496,11 +574,18 @@ impl BlobShimResolver {
             );
             return;
         }
-        let scope = MintScope {
+        let mint_scope = MintScope {
             project: project.to_string(),
-            // The SITE is host-forced to the workload name — the SAME per-site identity the shim's
-            // `hblob/{qualified-site}/` prefix + a `wasi:blobstore` handler use (never guest-named).
-            site: workload.to_string(),
+            // The SITE is the binding's EXPLICIT, set-time-authorized site — the SAME value `scope()`
+            // resolved the HMAC `site_prefix` from (`hblob/{project}/{site}/`) — so the minted
+            // credential's resource prefix (`keypath::container_prefix`, the exact string every cloud
+            // minter scopes its policy to) is byte-identical to the HMAC prefix the guest reads, and
+            // the authorized site == the write-credential site. NEVER the workload name: the pre-fix
+            // `site: workload` anchored the cred at `hblob/{project}/{workload}/…`, reviving the
+            // name-match coupling on the WRITE side and bypassing the `Site·Write` gate. The guard
+            // below pins this equality to `scope.site_prefix` so the two derivations cannot diverge
+            // again. (Security HIGH-1.)
+            site: site.to_string(),
             container: binding.name.clone(),
             target,
             // Direct-S3 is WRITE-scoped (PUT + multipart); the HMAC shim covers reads (GET).
@@ -519,7 +604,29 @@ impl BlobShimResolver {
             // short. (revoke-on-stop cuts the HMAC token + the dynamic DB role, not this lease.)
             ttl_secs: *max_ttl_secs,
         };
-        let creds: TempCredentials = match minter.mint(&scope).await {
+        // CONSOLIDATION INVARIANT (Security HIGH-1). The direct-S3 credential and the HMAC shim read
+        // path are the two faces of ONE resolved capability, so the credential MUST be resource-scoped
+        // to EXACTLY the `hblob/{project}/{site}/{container}/` tree the guest reads through the shim —
+        // `scope()`'s already-resolved `BlobScope.site_prefix` + the container. The mint's own prefix
+        // is composed by `keypath::container_prefix`, the SAME helper every cloud minter scopes its
+        // policy with (via `cloud::scoped_object_path`); pin the two together here so they can never
+        // drift back into independent derivations (the bug being fixed hardcoded `site = workload`).
+        // Both sides compute `ProjectRef::qualified(site)`, so for an explicit site this holds by
+        // construction; if it ever does not, fail CLOSED to the HMAC shim rather than hand out a write
+        // credential anchored at the wrong tape.
+        let hmac_container_root = format!("{}{}/", scope.site_prefix, binding.name);
+        let sts_container_root =
+            crate::s3_ingress::keypath::container_prefix(project, site, &binding.name);
+        if sts_container_root != hmac_container_root {
+            tracing::error!(
+                %project, %workload, %site, container = %binding.name,
+                sts = %sts_container_root, hmac = %hmac_container_root,
+                "blob binding: direct-S3 mint prefix diverged from the HMAC site_prefix; \
+                 falling back to the HMAC shim (fail closed)"
+            );
+            return;
+        }
+        let creds: TempCredentials = match minter.mint(&mint_scope).await {
             Ok(MintedCredentials::TempCredentials(t)) => t,
             Ok(MintedCredentials::PresignedPut(_)) => {
                 tracing::warn!(
@@ -1493,8 +1600,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn named_project_qualifies_the_site_prefix() {
-        // A non-default project qualifies the site: `hblob/{project}/{workload}/…`.
+    async fn default_namespace_is_reserved_under_the_project() {
+        // A `blob` binding with NO explicit site lands in the workload's PRIVATE reserved compute
+        // namespace `hblob/{project}/_compute/{workload}/…` — NOT the same-named site's tape. The
+        // project segment is the workload's own (here the NAMED project `acme`).
         let shim = BlobShim::new();
         let storage = Arc::new(MemStorage::default());
         let resolver = resolver(&shim, storage.clone());
@@ -1512,9 +1621,153 @@ mod tests {
                 .map
                 .lock()
                 .unwrap()
-                .contains_key("hblob/acme/api/assets/x.bin"),
-            "a named project lands objects under hblob/{{project}}/{{site}}/…"
+                .contains_key("hblob/acme/_compute/api/assets/x.bin"),
+            "a no-site binding lands under the reserved hblob/{{project}}/_compute/{{workload}}/…"
         );
+    }
+
+    #[test]
+    fn default_namespace_segment_is_never_a_valid_site() {
+        // The load-bearing safety of the convention-drop: the reserved `_compute` segment can NEVER
+        // be a site name (a site must be a valid resource slug, which rejects a leading `_`), so the
+        // compute keyspace `hblob/{project}/_compute/…` is provably disjoint from every site tape.
+        assert!(
+            !boatramp_core::project::is_valid_resource_slug(COMPUTE_RESERVED_SEGMENT),
+            "the reserved compute segment must be unusable as a site name"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_namespace_drops_the_name_match_convention() {
+        // A compute workload NAMED EXACTLY like a site (`api`) with a DEFAULT `blob` binding (no
+        // explicit site) NO LONGER shares that site's blob tape — it resolves to the disjoint
+        // reserved namespace `hblob/default/_compute/api/`. Opting in with `.with_site("api")` IS
+        // how a worker reaches the site's tape now.
+        let shim = BlobShim::new();
+        // Concrete handle so the test can introspect the backing map directly.
+        let storage = Arc::new(MemStorage::default());
+        let resolver = resolver(&shim, storage.clone());
+
+        // What a `wasi:blobstore` handler for site `default/api` wrote (its real tape).
+        storage
+            .put(
+                "hblob/default/api/assets/site-owned.bin",
+                once_stream(Bytes::from_static(b"site-owned")),
+                PutMeta::default(),
+            )
+            .await
+            .unwrap();
+
+        // The compute workload `api` with a DEFAULT (no-site) binding.
+        let env = resolver
+            .resolve("default", "api", 0, &[blob_binding("assets")])
+            .await;
+        let token = env
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let scope = shim.authenticate(Some(&token)).await.unwrap();
+        assert_eq!(
+            scope.site_prefix, "hblob/default/_compute/api/",
+            "a no-site binding resolves to the reserved compute namespace, NOT the site's tape"
+        );
+
+        // The site's object is INVISIBLE to the default-namespace binding (disjoint keyspaces) …
+        let (status, _) = request(&shim, "GET", "/assets/site-owned.bin", Some(&token), b"").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a name-matching workload no longer reads the same-named site's tape by default"
+        );
+        // … and the worker's own write lands under `_compute`, never under the site's tape.
+        let (status, _) =
+            request(&shim, "PUT", "/assets/worker-owned.bin", Some(&token), b"w").await;
+        assert_eq!(status, StatusCode::OK);
+        let map = storage.map.lock().unwrap();
+        assert!(
+            map.contains_key("hblob/default/_compute/api/assets/worker-owned.bin"),
+            "the worker's write lands in the reserved compute namespace"
+        );
+        assert!(
+            !map.contains_key("hblob/default/api/assets/worker-owned.bin"),
+            "the worker's write must NOT leak into the same-named site's tape"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_site_shares_that_sites_tape() {
+        // The opt-in: a workload (NOT named `api`) with `.with_site("api")` reaches site `api`'s
+        // tape — reading a handler-written object and landing its own writes there, the exact
+        // `hblob/{project}/{site}/` namespace a `wasi:blobstore` handler for `(default, api)` sees.
+        let shim = BlobShim::new();
+        // Concrete handle so the test can introspect the backing map directly.
+        let storage = Arc::new(MemStorage::default());
+        let resolver = resolver(&shim, storage.clone());
+        storage
+            .put(
+                "hblob/default/api/assets/site-owned.bin",
+                once_stream(Bytes::from_static(b"site-owned")),
+                PutMeta::default(),
+            )
+            .await
+            .unwrap();
+        let env = resolver
+            .resolve(
+                "default",
+                "worker",
+                0,
+                &[blob_binding("assets").with_site("api")],
+            )
+            .await;
+        let token = env
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let scope = shim.authenticate(Some(&token)).await.unwrap();
+        assert_eq!(scope.site_prefix, "hblob/default/api/");
+        // Reads the site's object …
+        let (status, body) =
+            request(&shim, "GET", "/assets/site-owned.bin", Some(&token), b"").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"site-owned");
+        // … and its writes land on the site's tape.
+        let (status, _) =
+            request(&shim, "PUT", "/assets/from-worker.bin", Some(&token), b"w").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .contains_key("hblob/default/api/assets/from-worker.bin"),
+            "an explicit-site worker's write lands on the site's tape"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_fails_closed_on_a_malformed_explicit_site() {
+        // Defense-in-depth behind the set-time gate: `scope` skips a binding whose explicit site is
+        // not a well-formed slug (traversal / reserved `_compute` / empty), so even a hand-crafted
+        // spec that slipped a bad site past set time injects NO env rather than resolving somewhere.
+        let shim = BlobShim::new();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let resolver = resolver(&shim, storage);
+        for bad in ["../escape", "_compute", "a/b", ""] {
+            let env = resolver
+                .resolve(
+                    "default",
+                    "worker",
+                    0,
+                    &[blob_binding("assets").with_site(bad)],
+                )
+                .await;
+            assert!(
+                env.is_empty(),
+                "a malformed explicit site {bad:?} must fail closed (no env injected)"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1625,11 +1878,18 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
         let resolver = resolver(&shim, storage.clone());
 
-        // Site "api", container-bound to "assets" (`--bind blob:assets`); project default,
-        // so the qualified site is the two-segment `default/api` (v0.31.0 Finding 8) → prefix
-        // `hblob/default/api/`.
+        // A workload `worker` that EXPLICITLY shares site `api`'s blob tape
+        // (`--bind blob:assets@api`), container-bound to `assets`; project default, so the
+        // explicit-site prefix is the two-segment `hblob/default/api/` — the SAME tape a
+        // `wasi:blobstore` handler for `(default, api)` sees, even though the workload is NOT named
+        // `api`. This exercises the explicit-site shared-namespace path end to end.
         let env = resolver
-            .resolve("default", "api", 0, &[blob_binding("assets")])
+            .resolve(
+                "default",
+                "worker",
+                0,
+                &[blob_binding("assets").with_site("api")],
+            )
             .await;
         let token = env
             .iter()
@@ -1823,7 +2083,12 @@ mod tests {
             [9u8; 32],
         );
         let cap_env = cap_resolver
-            .resolve("default", "api", 0, &[blob_binding("assets")])
+            .resolve(
+                "default",
+                "worker",
+                0,
+                &[blob_binding("assets").with_site("api")],
+            )
             .await;
         let cap_token = cap_env
             .iter()
@@ -1869,9 +2134,15 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
         let resolver = resolver(&shim, storage.clone());
 
-        // Token bound to container `assets`, site `api`, project default ⇒ prefix hblob/default/api/.
+        // Workload `worker`, container `assets`, EXPLICITLY sharing site `api` (`blob:assets@api`),
+        // project default ⇒ prefix hblob/default/api/ (the site's tape, not the workload's name).
         let env = resolver
-            .resolve("default", "api", 0, &[blob_binding("assets")])
+            .resolve(
+                "default",
+                "worker",
+                0,
+                &[blob_binding("assets").with_site("api")],
+            )
             .await;
         let token = env
             .iter()
@@ -2018,9 +2289,14 @@ mod tests {
     }
 
     /// A fake [`BlobUploadMinter`] returning fixed `TempCredentials` (bucket = the requested
-    /// container), so the direct-S3 wiring is unit-testable without a live S3/STS endpoint.
+    /// container), so the direct-S3 wiring is unit-testable without a live S3/STS endpoint. It also
+    /// RECORDS every [`MintScope`](boatramp_handlers::MintScope) it is handed in `seen`, so a test can
+    /// assert the host-stamped resource scope — crucially the `site` the credential is anchored at
+    /// (Security HIGH-1) — and that a no-site binding mints NOTHING.
     #[cfg(feature = "blob-upload")]
-    struct FakeBlobMinter;
+    struct FakeBlobMinter {
+        seen: Arc<std::sync::Mutex<Vec<boatramp_handlers::MintScope>>>,
+    }
     #[cfg(feature = "blob-upload")]
     #[async_trait::async_trait]
     impl boatramp_handlers::BlobUploadMinter for FakeBlobMinter {
@@ -2028,6 +2304,7 @@ mod tests {
             &self,
             scope: &boatramp_handlers::MintScope,
         ) -> Result<boatramp_handlers::MintedCredentials, String> {
+            self.seen.lock().unwrap().push(scope.clone());
             Ok(boatramp_handlers::MintedCredentials::TempCredentials(
                 boatramp_handlers::TempCredentials {
                     access_key_id: "AKIAFAKE".to_string(),
@@ -2046,31 +2323,52 @@ mod tests {
         }
     }
 
+    /// Build a resolver with the recording [`FakeBlobMinter`], returning the shared `seen` recorder so
+    /// a test can inspect the exact [`MintScope`](boatramp_handlers::MintScope)s the minter received
+    /// (empty ⇒ no direct-S3 credential was minted at all).
     #[cfg(feature = "blob-upload")]
-    fn resolver_with_minter(shim: &BlobShim, storage: Arc<dyn Storage>) -> BlobShimResolver {
-        BlobShimResolver::new(
+    fn resolver_with_minter(
+        shim: &BlobShim,
+        storage: Arc<dyn Storage>,
+    ) -> (
+        BlobShimResolver,
+        Arc<std::sync::Mutex<Vec<boatramp_handlers::MintScope>>>,
+    ) {
+        let seen: Arc<std::sync::Mutex<Vec<boatramp_handlers::MintScope>>> = Arc::default();
+        let resolver = BlobShimResolver::new(
             Arc::new(GlobalBlobBackend::new(storage)),
             shim.clone(),
             "http://10.0.0.1:8082".to_string(),
             [9u8; 32],
         )
-        .with_blob_minter(Some(Arc::new(FakeBlobMinter)), 3600, Some(8 * 1024 * 1024))
+        .with_blob_minter(
+            Some(Arc::new(FakeBlobMinter {
+                seen: Arc::clone(&seen),
+            })),
+            3600,
+            Some(8 * 1024 * 1024),
+        );
+        (resolver, seen)
     }
 
-    /// Phase 3: a `--bind blob:<container>` with a wired minter ALSO gets direct-S3 `TempCredentials`
-    /// — `{{blob.*}}` STS vars + the `AWS_*` convention defaults — WHILE keeping the HMAC shim env.
+    /// Phase 3: an EXPLICIT-site `--bind blob:<container>@<site>` with a wired minter ALSO gets
+    /// direct-S3 `TempCredentials` — `{{blob.*}}` STS vars + the `AWS_*` convention defaults — WHILE
+    /// keeping the HMAC shim env. (A no-site binding no longer mints direct-S3 — see
+    /// `no_site_binding_mints_no_direct_s3_credential`.)
     #[cfg(feature = "blob-upload")]
     #[tokio::test]
     async fn contribute_mints_direct_s3_temp_credentials_for_a_named_container() {
         let shim = BlobShim::new();
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
-        let resolver = resolver_with_minter(&shim, storage);
+        let (resolver, _seen) = resolver_with_minter(&shim, storage);
+        // Workload `api`, container `assets`, EXPLICIT site `media` (site deliberately != workload so
+        // the credential-anchoring site is unambiguous).
         let c = resolver
             .contribute(
                 "acme",
                 "api",
                 0,
-                &[blob_binding("assets")],
+                &[blob_binding("assets").with_site("media")],
                 &BTreeMap::new(),
             )
             .await;
@@ -2157,7 +2455,7 @@ mod tests {
     async fn contribute_bare_blob_binding_falls_back_to_hmac_even_with_a_minter() {
         let shim = BlobShim::new();
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
-        let resolver = resolver_with_minter(&shim, storage);
+        let (resolver, seen) = resolver_with_minter(&shim, storage);
         let c = resolver
             .contribute("acme", "api", 0, &[blob_binding("")], &BTreeMap::new())
             .await;
@@ -2167,5 +2465,151 @@ mod tests {
         );
         assert!(c.defaults.iter().all(|(k, _)| k != "AWS_ACCESS_KEY_ID"));
         assert!(c.vars.contains_key("blob.url"), "HMAC var still present");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a bare binding must never reach the STS minter"
+        );
+    }
+
+    /// **Security HIGH-1 (v0.73.0): the direct-S3 STS write path is anchored at the SAME site the HMAC
+    /// read path resolves — never the workload name.** For an EXPLICIT-site binding the minted
+    /// credential's resource prefix (`keypath::container_prefix(project, MintScope.site, container)`,
+    /// the exact string every cloud minter scopes its policy to via `cloud::scoped_object_path`) MUST
+    /// equal the HMAC `scope.site_prefix` + container, i.e. `hblob/{project}/{site}/{container}/` for
+    /// the AUTHORIZED site — not `hblob/{project}/{workload}/…`. Workload `worker` + `@api` ⇒ the cred
+    /// writes to `api`'s tape, never `worker`'s. (The pre-fix path hardcoded `site = workload`, which
+    /// anchored the write cred at the workload-named tape, reviving the name-match coupling on the
+    /// write side and bypassing the `Site·Write` gate.)
+    #[cfg(feature = "blob-upload")]
+    #[tokio::test]
+    async fn sts_mint_resource_prefix_equals_hmac_site_prefix_for_an_explicit_site() {
+        let shim = BlobShim::new();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let (resolver, seen) = resolver_with_minter(&shim, storage);
+
+        // Workload named `worker`, sharing site `api`'s tape via an explicit `@api`.
+        let c = resolver
+            .contribute(
+                "acme",
+                "worker",
+                0,
+                &[blob_binding("assets").with_site("api")],
+                &BTreeMap::new(),
+            )
+            .await;
+
+        // (a) The HMAC read prefix the guest is confined to (token-bound, host-stamped).
+        let token = c
+            .defaults
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .expect("HMAC token injected");
+        let hmac_scope = shim
+            .authenticate(Some(&token))
+            .await
+            .expect("token resolves to a BlobScope");
+        assert_eq!(
+            hmac_scope.site_prefix, "hblob/acme/api/",
+            "HMAC read path is confined to the AUTHORIZED site's tape"
+        );
+
+        // (b) The STS write credential the minter was handed.
+        let minted = seen.lock().unwrap();
+        assert_eq!(
+            minted.len(),
+            1,
+            "exactly one STS mint for the explicit-site binding"
+        );
+        let mint_scope = &minted[0];
+        assert_eq!(
+            mint_scope.site, "api",
+            "the credential is anchored at the AUTHORIZED site, NEVER the workload name"
+        );
+        assert_ne!(
+            mint_scope.site, "worker",
+            "the credential must NOT be anchored at the workload name (the HIGH-1 regression)"
+        );
+
+        // (c) THE invariant: the STS resource prefix == the HMAC `site_prefix` + container, byte for
+        // byte. `keypath::container_prefix` is the exact helper `cloud::scoped_object_path` composes
+        // the cloud policy's resource scope from for this empty-prefix (whole-container) target.
+        let sts_resource_prefix = crate::s3_ingress::keypath::container_prefix(
+            &mint_scope.project,
+            &mint_scope.site,
+            &mint_scope.container,
+        );
+        assert_eq!(
+            sts_resource_prefix,
+            format!("{}assets/", hmac_scope.site_prefix),
+            "STS write prefix must equal the HMAC read prefix + container"
+        );
+        assert_eq!(
+            sts_resource_prefix, "hblob/acme/api/assets/",
+            "and that prefix is the AUTHORIZED site's container tape"
+        );
+    }
+
+    /// **Security HIGH-1: a NO-SITE binding mints NO direct-S3 write credential — even a workload named
+    /// after a real site.** The no-site binding resolves to the private reserved namespace
+    /// `hblob/{project}/_compute/{workload}/`, which has no single-segment site tape the STS mint shape
+    /// can express; minting `site = workload` would hand out a WRITE credential to the same-named
+    /// site's REAL tape with no `Site·Write` gate (that gate only runs for an explicit `binding.site`).
+    /// So: no STS vars, no `AWS_*` defaults, and the minter is NEVER invoked. The HMAC shim still
+    /// provides the private namespace's full R/W.
+    #[cfg(feature = "blob-upload")]
+    #[tokio::test]
+    async fn no_site_binding_mints_no_direct_s3_credential() {
+        let shim = BlobShim::new();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let (resolver, seen) = resolver_with_minter(&shim, storage);
+
+        // Workload `api` is NAMED EXACTLY like a site, with a NO-SITE `blob:assets` binding.
+        let c = resolver
+            .contribute(
+                "acme",
+                "api",
+                0,
+                &[blob_binding("assets")],
+                &BTreeMap::new(),
+            )
+            .await;
+
+        // No direct-S3 credential was minted at all …
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a no-site binding must NOT reach the STS minter (no site-tape write cred)"
+        );
+        // … so none of the STS template vars or AWS_* write defaults are injected.
+        assert!(
+            !c.vars.contains_key("blob.endpoint"),
+            "no STS endpoint var for a no-site binding"
+        );
+        assert!(
+            c.defaults.iter().all(|(k, _)| k != "AWS_ACCESS_KEY_ID"),
+            "no AWS_* write credential default for a no-site binding"
+        );
+        // … while the HMAC shim env (full R/W over the private `_compute/{workload}` namespace) stays.
+        assert!(
+            c.vars.contains_key("blob.url"),
+            "HMAC url var still present"
+        );
+        assert!(
+            c.vars.contains_key("blob.token"),
+            "HMAC token var still present"
+        );
+
+        // Proof the HMAC path is confined to the PRIVATE namespace, never the same-named site's tape.
+        let token = c
+            .defaults
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .expect("HMAC token injected");
+        let hmac_scope = shim.authenticate(Some(&token)).await.unwrap();
+        assert_eq!(
+            hmac_scope.site_prefix, "hblob/acme/_compute/api/",
+            "a no-site binding is confined to the private reserved namespace, NOT site `api`'s tape"
+        );
     }
 }

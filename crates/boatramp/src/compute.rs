@@ -161,26 +161,26 @@ enum ComputeCommand {
         /// Allowed region (repeatable; empty = any).
         #[arg(long = "region")]
         regions: Vec<String>,
-        /// Managed binding the workload depends on, `<kind>[:<name>]` (repeatable):
+        /// Managed binding the workload depends on, `<kind>[:<name>][@<site>]` (repeatable):
         /// `sql` binds the site database, `sql:analytics` a named external DB; `kv` binds
-        /// the site key/value store, `kv:cache` one named bucket; `blob` binds the site blob
-        /// store, `blob:assets` one named container; `messaging` binds the project bus — BOTH
-        /// halves, publish AND consume (claim/ack/nack) — `messaging:deliver` one topic. The
-        /// endpoint URL + token are injected into the guest env (`BOATRAMP_SQL_URL` /
+        /// the site key/value store, `kv:cache` one named bucket; `blob` binds the workload's
+        /// private blob store, `blob:assets` one named container; `messaging` binds the project
+        /// bus — BOTH halves, publish AND consume (claim/ack/nack) — `messaging:deliver` one
+        /// topic. The endpoint URL + token are injected into the guest env (`BOATRAMP_SQL_URL` /
         /// `BOATRAMP_KV_URL` / `BOATRAMP_BLOB_URL` / `BOATRAMP_MESSAGING_URL`). NOTE: a bare
-        /// `kv`/`blob` (no `:<name>`) is SITE-WIDE — the workload can read/write EVERY
-        /// bucket/container in its site's `hkv/{site}/` (kv) / `hblob/{site}/` (blob) space;
-        /// use `kv:<name>` / `blob:<name>` to confine it. Likewise a bare `messaging` is
-        /// PROJECT-BUS-WIDE (any topic under `{project}/bus/`, for both publish and claim);
-        /// use `messaging:<topic>` to confine it to one topic. `invoke` (compute→function) is
-        /// declared only — no shim resolver yet, so it parses but injects no env (Phase 3).
-        /// FOOTGUN: a `kv`/`blob` binding resolves its namespace under THIS WORKLOAD'S NAME
-        /// as the site segment (`hblob/{project}/{workload}/…`), exactly as a `wasi:blobstore`
-        /// handler uses its SITE name. So a workload shares a site's store ONLY when it is
-        /// NAMED AFTER that site — a misnamed workload reads/writes an invisible, empty
-        /// namespace of its own with no error. Name the workload after the site whose data it
-        /// shares. (The server logs a warning at set time when a `blob`-bound workload's name
-        /// matches no known site in the project.)
+        /// `kv`/`blob` (no `:<name>`) is NAMESPACE-WIDE — the workload can read/write EVERY
+        /// bucket/container in that namespace; use `kv:<name>` / `blob:<name>` to confine it.
+        /// Likewise a bare `messaging` is PROJECT-BUS-WIDE (any topic under `{project}/bus/`, for
+        /// both publish and claim); use `messaging:<topic>` to confine it to one topic. `invoke`
+        /// (compute→function) is declared only — no shim resolver yet, so it parses but injects no
+        /// env (Phase 3). BLOB NAMESPACE: by default a `blob` binding resolves to the workload's
+        /// OWN PRIVATE namespace `hblob/{project}/_compute/{workload}/…`, disjoint from every
+        /// site's blob tape (a workload named like a site NO LONGER shares that site's blobs — the
+        /// pre-v0.73.0 name-match convention is dropped). To deliberately SHARE a site's blob tape,
+        /// append `@<site>`: `blob@blog` (whole site tape) or `blob:assets@blog` (one container),
+        /// which resolves to `hblob/{project}/blog/…` — the EXACT objects a `wasi:blobstore`
+        /// handler for that site sees. The site must exist in THIS workload's project and you must
+        /// hold its blob-write right; `@<site>` is valid only on a `blob` binding.
         #[arg(long = "bind")]
         bind: Vec<String>,
         /// Name of a **sealed registry pull credential** in THIS project's secret store
@@ -314,7 +314,7 @@ enum ComputeCommand {
         /// Allowed region (repeatable).
         #[arg(long = "region")]
         regions: Vec<String>,
-        /// Managed binding, `<kind>[:<name>]` (repeatable) — see `compute set --bind`.
+        /// Managed binding, `<kind>[:<name>][@<site>]` (repeatable) — see `compute set --bind`.
         #[arg(long = "bind")]
         bind: Vec<String>,
     },
@@ -2195,7 +2195,15 @@ fn parse_bindings(flags: &[String]) -> Result<Vec<ComputeBinding>> {
     flags
         .iter()
         .map(|raw| {
-            let (kind, name) = raw.split_once(':').unwrap_or((raw.as_str(), ""));
+            // Grammar: `<kind>[:<name>][@<site>]`. The optional `@<site>` targets a `blob` binding
+            // at that SITE's blob tape (a site in this workload's OWN project) — the deliberate
+            // opt-in that replaced the dropped name-match convention. `@` is not a slug character,
+            // so splitting on the first `@` is unambiguous.
+            let (head, site) = match raw.split_once('@') {
+                Some((h, s)) => (h, Some(s)),
+                None => (raw.as_str(), None),
+            };
+            let (kind, name) = head.split_once(':').unwrap_or((head, ""));
             let kind = match kind {
                 "sql" => BindingKind::Sql,
                 "kv" => BindingKind::Kv,
@@ -2206,6 +2214,21 @@ fn parse_bindings(flags: &[String]) -> Result<Vec<ComputeBinding>> {
                 "invoke" => BindingKind::Invoke,
                 other => return Err(Error::Args(format!("unknown binding kind `{other}`"))),
             };
+            // `@<site>` is a blob-only sharing target; reject it elsewhere rather than silently drop.
+            if let Some(site) = site {
+                if kind != BindingKind::Blob {
+                    return Err(Error::Args(format!(
+                        "`@<site>` is only valid for a `blob` binding, not `{kind}`",
+                        kind = head.split_once(':').map_or(head, |(k, _)| k)
+                    )));
+                }
+                if site.is_empty() {
+                    return Err(Error::Args(
+                        "a `blob:<container>@<site>` binding needs a site name after `@`".into(),
+                    ));
+                }
+                return Ok(ComputeBinding::new(kind).with_name(name).with_site(site));
+            }
             Ok(ComputeBinding::new(kind).with_name(name))
         })
         .collect()
@@ -2785,6 +2808,28 @@ mod tests {
         }
         // An unknown kind fails closed.
         assert!(parse_bindings(&["nope".to_string()]).is_err());
+    }
+
+    #[test]
+    fn compute_set_bind_blob_site_share_parses_and_is_blob_only() {
+        // `blob@blog` / `blob:assets@blog` parse into an explicit-site `ComputeBinding` — the
+        // deliberate opt-in that replaced the dropped name-match convention.
+        let bindings = parse_bindings(&["blob@blog".into(), "blob:assets@blog".into()])
+            .expect("the blob site-share grammar parses");
+        assert_eq!(
+            bindings,
+            vec![
+                ComputeBinding::new(BindingKind::Blob).with_site("blog"),
+                ComputeBinding::new(BindingKind::Blob)
+                    .with_name("assets")
+                    .with_site("blog"),
+            ]
+        );
+        // `@<site>` is blob-only — a `kv`/`sql` site-share fails closed.
+        assert!(parse_bindings(&["kv:cache@blog".into()]).is_err());
+        assert!(parse_bindings(&["sql@blog".into()]).is_err());
+        // An empty site after `@` fails closed.
+        assert!(parse_bindings(&["blob:assets@".into()]).is_err());
     }
 
     #[test]

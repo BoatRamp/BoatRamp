@@ -641,18 +641,23 @@ The `sql` endpoint above is the libsql / hrana shim. When the `sql` target is a
 Postgres/MySQL from a compute workload](#use-a-managed-postgresmysql-from-a-compute-workload-a-real-dsn)
 below.
 
-> **The workload name *is* the site segment.** A `kv`/`blob` binding resolves its
-> namespace under **this workload's name** as the site-identity segment —
-> `hblob/{project}/{workload}/…`, exactly as a `wasi:blobstore` handler uses its **site**
-> name. So a compute worker shares a site's data store **only when it is named after that
-> site**. A misnamed worker (say `mail-worker` binding `blob` while the site is `mailroom`)
-> silently reads and writes an *empty namespace of its own* — no error, just invisible data.
-> **Name the workload after the site** whose `kv`/`blob` data it shares. The server logs a
-> warning at `compute set` time when a `blob`-bound workload's name matches no known site in
-> the project. (There is no cross-name selector — the naming convention is the binding.)
+> **A `blob` binding is PRIVATE by default; share a site's tape with `@<site>`.** As of
+> v0.73.0 a `blob` binding resolves to the workload's **own private namespace**
+> `hblob/{project}/_compute/{workload}/…`, disjoint from every site's blob tape — a compute
+> worker named like a site no longer silently shares that site's blobs. To deliberately
+> share a site's tape, append `@<site>`: `--bind blob@mailroom` (whole site tape) or
+> `--bind blob:assets@mailroom` (one container) resolves to `hblob/{project}/mailroom/…`, the
+> exact objects a `wasi:blobstore` handler for that site sees. The site must exist in **this
+> workload's own project** and you must hold its blob-write right; `compute set` rejects an
+> unknown or cross-project site. (`@<site>` is blob-only.)
+>
+> **`kv` still uses the workload-name-as-site convention.** A `kv` binding resolves its
+> namespace under **this workload's name** as the site-identity segment
+> (`hkv/{project}/{workload}/…`), so a `kv`-bound worker shares a site's key/value store only
+> when it is **named after that site**.
 
-A bare `kv`/`blob` (no `:<name>`) is **site-wide** — the workload can read/write
-every bucket/container in the site's namespace; a bare `messaging` is
+A bare `kv`/`blob` (no `:<name>`) is **namespace-wide** — the workload can read/write
+every bucket/container in its namespace; a bare `messaging` is
 **project-bus-wide** (any topic). Name a target (`kv:cache`, `blob:assets`,
 `messaging:deliver`) to confine the credential. Each shim binds only the host its
 `[compute].<kind>_shim_url` names (the bridge gateway / loopback, never all
