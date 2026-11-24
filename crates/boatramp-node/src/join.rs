@@ -308,7 +308,11 @@ async fn join_via_seed(
 /// presented key, fetch + root-verify its attestation, confirm the attestation
 /// names the captured key, then build a server-authenticated (pinned) client.
 /// Reused by the joiner and the Kubernetes operator's membership executor.
-pub(crate) async fn pinned_client(
+///
+/// `pub` (was `pub(crate)` while this module lived in the binary) so the binary's
+/// `operator::executor` keeps reaching it through the `crate::join` re-export of
+/// [`boatramp_node::cluster::join`](crate::cluster::join) after the N4-B lift.
+pub async fn pinned_client(
     base: &str,
     roots: &[TokenPublicKey],
     now: u64,

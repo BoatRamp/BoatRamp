@@ -101,8 +101,11 @@ mod email;
 mod expose;
 #[cfg(feature = "overlay")]
 mod forward;
+// The cluster-join module was lifted into `boatramp-node` in the N4-B increment
+// (PLAN-node-library N4); re-exported here so every `crate::join::*` call site (the cluster
+// run-entry dispatch, `cluster.rs`, `operator::executor`) keeps resolving unchanged.
 #[cfg(feature = "cluster")]
-mod join;
+pub(crate) use boatramp_node::join;
 mod logs;
 mod manage;
 mod managed_wait;

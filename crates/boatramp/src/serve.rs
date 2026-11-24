@@ -44,31 +44,23 @@ pub enum Error {
     NoAcmeDnsSupport,
 
     // ---- configuration / argument validation -------------------------------
-    /// A token root **private** key (hex) failed to parse (cluster write-capability
-    /// minting). The single-node auth path's key errors now live in
-    /// [`boatramp_node::Error`].
-    #[cfg(feature = "cluster")]
-    #[error("invalid auth root private key: {0}")]
-    AuthPrivKey(String),
-    /// A raw-public-key TLS error — building the peer-mesh identity/config
-    /// (`cluster`) or the `--tls rpk` bootstrap identity/config (`tls`). Both use
-    /// the same RPK stack (`boatramp_rpktls`), so `mesh::MeshError` is an alias of
-    /// `RpkError` and they share one `From` here (a second would collide).
+    // The cluster write-capability key error (`AuthPrivKey`) and the peer-mesh
+    // non-loopback-empty-trust refusal (`MeshUnconfigured`) were lifted with the cluster
+    // run-entry into [`boatramp_node::Error`] (PLAN-node-library N4-B). After that lift the ONLY
+    // binary producer of `ClusterStartup` is the `[overlay]` setup path, so its `cfg` now tracks
+    // `overlay` (not `cluster`) — the variant is present exactly where a producer is.
+    /// A raw-public-key TLS error — building the `--tls rpk` bootstrap identity/config (`tls`).
+    /// (The peer-mesh identity/config now lives behind `boatramp_node::cluster`; both paths use
+    /// the same RPK stack, `boatramp_rpktls`, so this still carries the one `From`.)
     #[cfg(any(feature = "cluster", feature = "tls"))]
     #[error(transparent)]
     RpkTls(#[from] boatramp_rpktls::RpkError),
-    /// Refusing to serve the peer mesh on a non-loopback address with no trust set
-    /// configured — that would expose an unauthenticated control plane.
-    /// The peer mesh has no trust anchor on a non-loopback bind.
-    #[cfg(feature = "cluster")]
-    #[error(
-        "refusing to serve the peer mesh on {0} (non-loopback) with an empty trust \
-         set: found with --cluster-init or join with --cluster-join <ticket>"
-    )]
-    MeshUnconfigured(std::net::SocketAddr),
-    /// The cluster startup decision failed closed (F5) or a join could not be
-    /// completed (no join token, seeds unreachable, root mismatch, …).
-    #[cfg(feature = "cluster")]
+    /// An `[overlay]` forward-flow setup error (identity / trust-root / listener / route config).
+    /// The `run_cluster` substrate producers of this variant moved to
+    /// [`boatramp_node::Error::ClusterStartup`] (identical Display `"cluster startup: {0}"`,
+    /// surfaced here transparently via [`Error::Assembly`]); the `[overlay]` path is the sole
+    /// remaining in-binary producer, hence the `overlay` gate.
+    #[cfg(feature = "overlay")]
     #[error("cluster startup: {0}")]
     ClusterStartup(String),
     /// Configuring the secrets-at-rest envelope failed. Ungated: the #505 node-level sealed S3
@@ -182,14 +174,9 @@ pub enum Error {
     #[cfg(all(feature = "cluster", feature = "acme-dns"))]
     #[error(transparent)]
     ClusterTls(#[from] crate::cluster_tls::Error),
-    /// Building / bootstrapping the embedded-Raft cluster node failed. Boxed: the
-    /// openraft error types it wraps are ~230 bytes, and this variant is cold
-    /// (constructed once, on a fatal bootstrap failure). Boxing it keeps `Error`
-    /// — and `CliError` above it — under clippy's `result_large_err` threshold
-    /// without a blanket `#[allow]`. `#[from]` can't box, so see the `From` below.
-    #[cfg(feature = "cluster")]
-    #[error(transparent)]
-    Bootstrap(Box<boatramp_cluster::node::BootstrapError>),
+    // The embedded-Raft node build/bootstrap error (`Bootstrap`) moved with the cluster run-entry
+    // into [`boatramp_node::Error::Bootstrap`] (PLAN-node-library N4-B, still boxed there); it
+    // surfaces here transparently through [`Error::Assembly`].
     /// Opening the control-plane KV metadata store failed. Unconditional: the
     /// serve/assemble path `?`-converts a `KvError` regardless of which KV backend
     /// feature is compiled in, and `KvError` is always available in core — gating this
@@ -371,19 +358,14 @@ async fn log_pending_migration_decisions(
 /// `serve` module result; `Err` is [`Error`].
 type Result<T> = std::result::Result<T, Error>;
 
-// Box the (large, openraft-backed) bootstrap error into [`Error`]: the variant is
-// `Box<BootstrapError>` so `?` on a bare `BootstrapError` keeps working (thiserror's
-// `#[from]` would generate `From<BootstrapError>`, not the boxing conversion).
-#[cfg(feature = "cluster")]
-impl From<boatramp_cluster::node::BootstrapError> for Error {
-    fn from(e: boatramp_cluster::node::BootstrapError) -> Self {
-        Self::Bootstrap(Box::new(e))
-    }
-}
+// The `From<BootstrapError>` boxing conversion moved with the cluster run-entry into
+// `boatramp_node::Error` (PLAN-node-library N4-B); a bootstrap error now reaches `serve::Error`
+// transparently through `Assembly(#[from] boatramp_node::Error)`.
 
-// Guard the boxing decision: `Bootstrap` is boxed so this enum stays under clippy's
-// `result_large_err` threshold (128 B) without a module-wide `#[allow]`. If a future
-// variant grows past it, box that one too rather than re-adding the allow.
+// Guard the size: the largest cluster-only reach is now `Assembly(boatramp_node::Error)`, whose
+// own openraft-backed bootstrap variant stays boxed, so this enum — and `CliError` above it —
+// stays under clippy's `result_large_err` threshold (128 B) without a module-wide `#[allow]`. If
+// a future variant grows past it, box that one too rather than re-adding the allow.
 #[cfg(feature = "cluster")]
 const _: () = assert!(std::mem::size_of::<Error>() <= 128);
 
@@ -4412,257 +4394,18 @@ fn spawn_listeners(
     }
 }
 
-/// Run in **self-hosted cluster mode**: the control-plane
-/// `KvStore` and the `wasi:messaging` coordinator come from an embedded-Raft
-/// cluster node instead of the local backends. This node serves its peer mesh
-/// (`/raft/*` + `/stream/*`) on `[cluster].listen`, runs `DeployStore` over
-/// `RaftKv` (writes→leader, reads→local durable state) and the dispatcher over
-/// `RaftMessaging`, and fires crons only while it is the leader. Live multi-host
-/// behavior needs live-platform validation; every component is gate-tested in-process.
-/// How long a rotation waits for `K_new` to propagate before presenting it.
-/// Only minimises the transient-rejection window — the live
-/// verifier + dialer retry make a shorter/absent wait safe, not incorrect.
-#[cfg(feature = "cluster")]
-const MESH_ROTATION_PROPAGATION: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Default Raft peer-mesh port when a node joins/founds with only flags (no
 /// `[cluster]` section). Distinct from the public `serve.addr` port.
 #[cfg(feature = "cluster")]
 const DEFAULT_MESH_PORT: u16 = 7000;
 
-/// Parse a mesh key-rotation cadence like `"30d"`, `"12h"`, `"90m"`, `"3600s"`
-/// into a `Duration`. `None` for an empty/invalid value (⇒ no scheduled
-/// rotation). Only the `s`/`m`/`h`/`d` suffixes are accepted.
-#[cfg(feature = "cluster")]
-fn parse_rotation_interval(spec: &str) -> Option<std::time::Duration> {
-    let spec = spec.trim();
-    let split = spec.find(|c: char| !c.is_ascii_digit())?;
-    let (num, unit) = spec.split_at(split);
-    let n: u64 = num.parse().ok()?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n.checked_mul(60)?,
-        "h" => n.checked_mul(3600)?,
-        "d" => n.checked_mul(86_400)?,
-        _ => return None,
-    };
-    (secs > 0).then(|| std::time::Duration::from_secs(secs))
-}
-
-/// Clock skew tolerated on a join possession proof: `proof_iat` must be within
-/// this window of the admitting node's clock, so a captured proof cannot be
-/// replayed indefinitely (the single-use `jti` is the primary anti-replay; this
-/// bounds the pre-spend window). Symmetric to cover both directions of skew.
-#[cfg(feature = "cluster")]
-const JOIN_PROOF_MAX_SKEW_SECS: u64 = 300;
-
-/// TTL on the root-signed member assertions handed back in a join response: long
-/// enough for the joiner to verify + adopt each key within the round-trip, short
-/// enough that a captured response can't seed a node much later. The joiner
-/// verifies each against the root anchor before trusting it (PLAN-cluster-join F3).
-#[cfg(feature = "cluster")]
-const MEMBER_ASSERTION_TTL_SECS: u64 = 300;
-
-/// Bridges the server's `/api/cluster/*` control routes to the cluster runtime
-/// (join admission + key rotation) over [`ClusterNode`]. `issuer` is the
-/// control-plane **root signer**: a join admits only if this node can mint
-/// root-signed member assertions for the joiner to adopt.
-#[cfg(feature = "cluster")]
-struct ClusterMeshControl {
-    node: Arc<boatramp_cluster::node::ClusterNode>,
-    issuer: Option<Arc<dyn boatramp_core::cose::Signer>>,
-}
-
-#[cfg(feature = "cluster")]
-#[async_trait::async_trait]
-impl boatramp_server::MeshControl for ClusterMeshControl {
-    async fn admit(
-        &self,
-        mesh_pubkey_hex: &str,
-        jti: &str,
-        possession_proof: &[u8],
-        proof_iat: u64,
-        now: u64,
-        advertise_addr: Option<&str>,
-    ) -> std::result::Result<boatramp_server::JoinOutcome, String> {
-        use boatramp_server::JoinOutcome;
-
-        // (1) Freshness: the proof must be stamped within the skew window. This
-        // bounds how long a captured (pre-spend) proof stays presentable.
-        let fresh = proof_iat <= now.saturating_add(JOIN_PROOF_MAX_SKEW_SECS)
-            && now <= proof_iat.saturating_add(JOIN_PROOF_MAX_SKEW_SECS);
-        if !fresh {
-            return Ok(JoinOutcome::ProofInvalid);
-        }
-
-        // (2) The joiner is identified by the key it claims; parse it to SPKI.
-        let Ok(spki) = boatramp_cluster::mesh::parse_public_key(mesh_pubkey_hex) else {
-            return Ok(JoinOutcome::ProofInvalid);
-        };
-
-        // (3) Possession: the proof must be a signature by that very key over the
-        // domain-separated join challenge — so a bearer token alone (without the
-        // private key) cannot join in another key's name.
-        let challenge = boatramp_core::cose::join_challenge(jti, mesh_pubkey_hex, proof_iat);
-        if !boatramp_rpktls::verify_signature(&spki, &challenge, possession_proof) {
-            return Ok(JoinOutcome::ProofInvalid);
-        }
-
-        // (4) Single-use + re-admit-proof: the state machine spends the `jti`
-        // (idempotent replay ⇒ already-spent) and refuses a revoked key (F6). A
-        // stale/spent token or a revoked key that survived (3) stops here.
-        use boatramp_cluster::raft::AdmitOutcome;
-        match self
-            .node
-            .admit(mesh_pubkey_hex, jti, advertise_addr)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            AdmitOutcome::Admitted => {}
-            AdmitOutcome::Spent => return Ok(JoinOutcome::TokenSpent),
-            AdmitOutcome::Revoked => return Ok(JoinOutcome::Revoked),
-        }
-
-        // (5) Vouch for the current members with root-signed assertions so the
-        // joiner adopts each only after verifying it against the root anchor.
-        let Some(issuer) = self.issuer.as_ref() else {
-            return Err("cluster node has no root signing key to vouch for members".to_string());
-        };
-        let mut members = Vec::new();
-        for (node_id, pubkey) in self.node.trusted_member_keys().await {
-            let assertion = boatramp_core::cose::mint_member_assertion(
-                node_id,
-                &pubkey,
-                MEMBER_ASSERTION_TTL_SECS,
-                now,
-                issuer.as_ref(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            members.push(assertion);
-        }
-        // Advisory routing so the joiner can dial every member (each dial is still
-        // key-authenticated). Only entries for members it also verified above are
-        // usable to it.
-        let addrs = self.node.peer_addrs();
-        Ok(JoinOutcome::Admitted { members, addrs })
-    }
-
-    async fn rotate_key(&self) -> std::result::Result<String, String> {
-        let new_pub = self
-            .node
-            .rotate_key(MESH_ROTATION_PROPAGATION)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(new_pub.iter().map(|b| format!("{b:02x}")).collect())
-    }
-
-    async fn revoke(&self, node: u64) -> std::result::Result<(), String> {
-        self.node.revoke(node).await.map_err(|e| e.to_string())
-    }
-
-    async fn members(&self) -> std::result::Result<Vec<boatramp_server::MeshMember>, String> {
-        let addrs = self.node.peer_addrs();
-        Ok(self
-            .node
-            .members()
-            .into_iter()
-            .map(|m| boatramp_server::MeshMember {
-                node: m.node,
-                voter: m.voter,
-                caught_up: m.caught_up,
-                leader: m.leader,
-                addr: addrs.get(&m.node).cloned(),
-            })
-            .collect())
-    }
-
-    async fn promote(&self, node: u64) -> std::result::Result<(), String> {
-        self.node.promote(node).await.map_err(|e| e.to_string())
-    }
-}
-
-/// Verifies a mesh client-write **cluster-write capability**: the
-/// presented bearer must be a token signed by the control-plane root that grants
-/// the `cluster-write` role. This trust root is separate from the mesh transport
-/// key, so a mesh-key holder without a control-plane capability can't inject
-/// writes.
-#[cfg(feature = "cluster")]
-struct MeshWriteAuthz {
-    public: boatramp_core::cose::TokenPublicKey,
-}
-
-#[cfg(feature = "cluster")]
-impl boatramp_cluster::http::ClientWriteAuthz for MeshWriteAuthz {
-    fn authorize(&self, capability: Option<&str>) -> bool {
-        let Some(token) = capability else {
-            return false;
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Verify the capability with its OWN kind check (`br_kind == cluster-write`):
-        // since 8(b) the generic `cose::verify` is the ROLE path and refuses a
-        // non-role kind, so the mesh write gate uses the kind-checked sibling —
-        // which also strengthens domain separation (a role token that happened to
-        // carry a `cluster-write` grant is now rejected here, not just role-checked).
-        let Ok(verified) = boatramp_core::cose::verify_cluster_write(token, &self.public, now)
-        else {
-            return false;
-        };
-        verified.roles.iter().any(|r| r.name == "cluster-write")
-    }
-}
-
-/// Build the mesh write gate from config: when `mesh.gate_client_writes` is
-/// set and the token signer (root **private** key) is available, mint this node's
-/// cluster-write capability and an authorizer for incoming forwards. Returns
-/// `(None, None)` when disabled or the root key is absent (gating then off —
-/// defense-in-depth is opt-in and must not break a keyless cluster).
-#[cfg(feature = "cluster")]
-#[allow(clippy::type_complexity)]
-async fn build_mesh_write_gate(
-    config: &ServerConfig,
-    mesh_cfg: &crate::config::MeshConfig,
-) -> Result<(
-    Option<String>,
-    Option<Arc<dyn boatramp_cluster::http::ClientWriteAuthz>>,
-)> {
-    use boatramp_core::authz::GrantedRole;
-    use boatramp_core::cose::{self, Claims, LocalSigner, Signer};
-
-    if !mesh_cfg.gate_client_writes.unwrap_or(false) {
-        return Ok((None, None));
-    }
-    let priv_hex = config
-        .serve
-        .as_ref()
-        .and_then(|s| s.auth_root_private_key.clone());
-    let Some(priv_hex) = priv_hex else {
-        tracing::warn!(
-            "cluster.mesh.gate_client_writes is set but no token root private key is \
-             configured — mesh client-write gating is disabled"
-        );
-        return Ok((None, None));
-    };
-    let signer =
-        LocalSigner::from_private_hex(&priv_hex).map_err(|e| Error::AuthPrivKey(e.to_string()))?;
-    // No TTL: the capability lives for this node's process (now_unix unused).
-    let claims = Claims {
-        roles: vec![GrantedRole::global("cluster-write")],
-        kind: cose::KIND_CLUSTER_WRITE.to_string(),
-        ttl_secs: None,
-        now_unix: 0,
-    };
-    let capability = cose::mint(&claims, &signer)
-        .await
-        .map_err(|e| Error::AuthPrivKey(format!("minting cluster-write capability: {e}")))?;
-    let authz: Arc<dyn boatramp_cluster::http::ClientWriteAuthz> = Arc::new(MeshWriteAuthz {
-        public: signer.public_key(),
-    });
-    Ok((Some(capability), Some(authz)))
-}
+// The mesh-rotation propagation delay, the join proof-skew / member-assertion TTLs, the mesh
+// key-rotation cadence parser (`parse_rotation_interval`), the `/api/cluster/*` control bridge
+// (`ClusterMeshControl`), the mesh client-write authorizer (`MeshWriteAuthz`) + its builder
+// (`build_mesh_write_gate`), and the daemon-config apply observer were lifted into
+// `boatramp_node::cluster` with the cluster substrate run-entry (PLAN-node-library N4-B).
+// `ClusterMeshControl` is re-exported (`pub`) so this module's `mesh_control_builder` closure
+// still constructs it once the post-`configure_auth` root signer exists.
 
 /// Build the configured secrets-at-rest envelope from `[secrets]`,
 /// resolving a Vault token from the environment. `None` ⇒ store cleartext.
@@ -4709,37 +4452,12 @@ fn build_cert_envelope(
     build_envelope(spec).map_err(|e| Error::Envelope(e.to_string()))
 }
 
-/// Reloads this node's dynamic daemon-config runtime whenever a replicated
-/// `daemon/*` write is applied to the Raft state machine — push convergence for
-/// cluster followers and the leader through ordinary log replication, no polling.
-#[cfg(feature = "cluster")]
-struct DaemonConfigObserver(Arc<boatramp_server::DaemonRuntime>);
-
-#[cfg(feature = "cluster")]
-impl boatramp_cluster::raft::ApplyObserver for DaemonConfigObserver {
-    fn on_apply(&self, muts: &[boatramp_core::kv::WriteOp]) {
-        use boatramp_core::kv::WriteOp;
-        let touched = muts.iter().any(|m| match m {
-            WriteOp::Put(k, _) | WriteOp::Delete(k) => k.starts_with("daemon/"),
-        });
-        if touched {
-            self.0.notify_reload();
-        }
-    }
-
-    fn on_reset(&self, data: &std::collections::BTreeMap<String, Vec<u8>>) {
-        if data.keys().any(|k| k.starts_with("daemon/")) {
-            self.0.notify_reload();
-        }
-    }
-}
-
 #[cfg(feature = "cluster")]
 #[allow(clippy::too_many_arguments)]
 async fn run_cluster(
     args: ServeArgs,
     config: &ServerConfig,
-    mut cluster_cfg: crate::config::ClusterConfig,
+    cluster_cfg: crate::config::ClusterConfig,
     addr: SocketAddr,
     data_dir: PathBuf,
     built_blobs: boatramp_node::blobs::BuiltBlobs,
@@ -4749,28 +4467,18 @@ async fn run_cluster(
     base_blob_args: BlobArgs,
     mut options: boatramp_server::ServerOptions,
 ) -> Result<()> {
-    use boatramp_cluster::node::{ClusterParams, build_node};
-
-    // Cross-node messaging payload-spill store (PLAN-serve-single-cluster-parity, seal-messaging
-    // residual). `build_node` wires this into `RaftMessaging` BEFORE the replicated control-plane KV
-    // (`node.kv`) exists — and the node-level sealed `boatramp:` base S3 credential can only resolve
-    // AFTER that KV is up (the boot chicken-and-egg). So we hand `build_node` a LATE-BOUND handle,
-    // UNBOUND here (no credential wired early — NEVER the uncredentialed/ambient early backend), and
-    // BIND it to the SAME sealed serving backend in the post-KV pass below, strictly before
-    // `serve_assembled` serves and before any messaging traffic can flow. Fail-closed until then: a
-    // spill against the unbound handle errors rather than touching an ambient backend (defensive —
-    // in practice no spill runs before the post-KV bind, since messaging does not serve until then).
-    let messaging_spill = Arc::new(boatramp_cluster::messaging::LateStorage::unbound());
-
-    // Node-local durable Raft log/state store (distinct from the *replicated*
-    // control plane the cluster serves).
+    // ── Cluster-store open (the INJECTED store-lifecycle seam kept in the binary) ─────────────────────
+    // Node-local durable Raft log/state store (distinct from the *replicated* control plane the
+    // cluster serves). The caller owns this store's backend, repair policy, and checkpoint/GC/close
+    // lifecycle; `boatramp_node::cluster::bootstrap` takes the OPENED handle (+ the pre-open
+    // `store_dir_existed` signal) and owns the substrate bringup from there (PLAN-node-library N4-B).
     let store_dir = cluster_cfg
         .store_dir
         .clone()
         .unwrap_or_else(|| data_dir.join("raft"));
-    // Whether this node's durable store dir already exists, captured BEFORE opening
-    // (which creates it). A weak "has booted before" signal — NOT the resume gate:
-    // the dir is created just by opening the KV, before a first join completes.
+    // Whether this node's durable store dir already exists, captured BEFORE opening (which creates
+    // it). A weak "has booted before" signal — NOT the resume gate: the dir is created just by
+    // opening the KV, before a first join completes.
     let store_dir_existed = store_dir.exists();
     // Security M1: a cluster node NEVER self-quarantines its Raft-log tail. Auto-quarantining a
     // torn trailing Raft WAL object can regress the store below the committed index → a double-vote
@@ -4796,17 +4504,9 @@ async fn run_cluster(
         )
         .await?,
     );
-    // The real resume-vs-found/join signal (F5): whether the store holds COMMITTED
-    // cluster state (persisted mesh trust). A store dir that exists but has no
-    // committed trust means an earlier boot opened the KV but never finished its
-    // join — such a node must re-derive its action (rejoin), not resume into an
-    // empty-trust, fail-closed mesh. Checked once, over the raw store.
-    let has_committed_state = boatramp_cluster::persist::has_committed_trust(&durable_kv)
-        .await
-        .map_err(|e| Error::ClusterStartup(e.to_string()))?;
-    // Keep a handle to force a final flush on graceful shutdown (SHUT-1): the
-    // store is moved into the Raft stores below, so this clone is how we reach
-    // its `flush` after serving stops.
+    // Keep a handle to force a final flush on graceful shutdown (SHUT-1): the store is moved into
+    // the Raft stores inside `bootstrap`, so this clone is how we reach its `flush` after serving
+    // stops (the close-lifecycle seam stays with the caller).
     let durable_kv_handle = durable_kv.clone();
     // Periodic checkpoint + graceful-close budget (v0.9.0 KV-recovery, C1/C12) for the node-local
     // durable Raft store: the cadence bounds its WAL replay tail (openraft's own flushing keeps
@@ -4832,325 +4532,39 @@ async fn run_cluster(
         (cluster_kv_cfg.gc_interval(), cluster_kv_cfg.gc_min_age());
     spawn_kv_maintenance_gc(durable_kv_handle.clone(), kv_gc_interval, kv_gc_min_age);
 
-    use boatramp_cluster::mesh::{self, MeshIdentity, MeshTls, TrustSet};
-
-    // No static peer map: the peer directory + mesh trust set start empty and are
-    // populated by founding (self), joining (adopted members), or replication.
-    let mut peers = std::collections::BTreeMap::new();
-    let mut genesis_trust = std::collections::BTreeMap::new();
-
-    // Load (or generate + persist `0600`) this node's Ed25519 mesh identity.
-    let mesh_cfg = cluster_cfg.mesh.clone().unwrap_or_default();
-    let key_file = mesh_cfg
-        .key_file
-        .clone()
-        .unwrap_or_else(|| data_dir.join("mesh/identity.key"));
-    let identity = MeshIdentity::load_or_generate(&key_file)?;
-
-    // This node's Raft id is DERIVED from its mesh key (dynamic-join self-identity
-    // — no config id).
-    let node_id = boatramp_cluster::raft::derive_node_id(identity.public_key());
-    tracing::info!(
-        node_id,
-        pubkey = %identity.public_key_hex(),
-        "cluster: mesh identity"
-    );
-
-    // A one-paste `--cluster-join <ticket>` overrides the `[cluster]` seeds/root/
-    // token: decode it and fold it into the config so the rest of the flow is
-    // ticket-vs-config agnostic.
-    if let Some(blob) = args.cluster_join.as_deref() {
-        let ticket = crate::join::JoinTicket::decode(blob)
-            .map_err(|e| Error::ClusterStartup(e.to_string()))?;
-        cluster_cfg.seeds = ticket.seeds;
-        cluster_cfg.root_pubkeys = ticket.root_pubkeys;
-        cluster_cfg.join_token = Some(ticket.token);
-    }
-
-    // Decide founding vs joining vs resuming (F5): the single source of truth.
-    let seeds_present = !cluster_cfg.seeds.is_empty();
-    // The Kubernetes operator designates its **ordinal-0** StatefulSet pod as the
-    // founder (via the downward-API pod name) — every other ordinal joins. This
-    // designates the founder only; the node *identity* is still derived from the
-    // mesh key, so it is not the reverted per-pod-identity coupling.
+    // The Kubernetes operator designates its **ordinal-0** StatefulSet pod as the founder (via the
+    // downward-API pod name) — every other ordinal joins. This designates the founder only; the
+    // node *identity* is still derived from the mesh key, so it is not the reverted per-pod-identity
+    // coupling. A boatramp deployment detail kept in the binary; the library run-entry takes the
+    // resolved `init_requested` bool.
     let is_operator_founder =
         std::env::var("BOATRAMP_POD_NAME").is_ok_and(|name| name.rsplit('-').next() == Some("0"));
     let init_requested = args.cluster_init || is_operator_founder;
-    let action = crate::join::decide_startup(&crate::join::StartupInputs {
-        // Resume ONLY on committed state (persisted trust) — not on a store dir that
-        // merely exists, which would wedge a joiner whose first join never finished.
-        has_committed_state,
-        // The dir already existing means this node booted before, but possibly never
-        // committed any state; kept as the weaker "ever booted" signal for messaging.
-        ever_member: store_dir_existed,
-        seeds_present,
-        init_requested,
-    });
-    // A resuming node seeds no genesis trust here — it rehydrates its trust set
-    // from durable state inside `build_node`, so its empty-trust fail-closed check
-    // is deferred until after that (below). Captured now: the `match action` moves.
-    let is_resume = matches!(action, crate::join::StartupAction::Resume);
 
-    // This node's own reachable mesh URL (advertised at join so the leader can
-    // dial it), defaulting to the bind address.
-    let self_advertise = args
-        .cluster_advertise_addr
-        .clone()
-        .unwrap_or_else(|| format!("https://{}", cluster_cfg.listen));
-
-    // A dynamic joiner starts with NO static membership; the seed admits it and
-    // membership + trust arrive via replication. Bootstrap only when founding.
-    let mut do_bootstrap = false;
-    match action {
-        crate::join::StartupAction::FailClosed(reason) => {
-            return Err(Error::ClusterStartup(reason));
-        }
-        crate::join::StartupAction::Found => {
-            // Genesis: this node is the sole founding member. List itself so
-            // `build_node` takes the genesis path and `bootstrap` initializes it.
-            peers.insert(node_id, self_advertise.clone());
-            genesis_trust.insert(node_id, identity.public_key().to_vec());
-            do_bootstrap = true;
-            tracing::info!(node_id, "cluster: founding a new cluster (init)");
-        }
-        crate::join::StartupAction::Join => {
-            // Redeem the join ticket against the seeds and adopt the returned,
-            // root-verified members — seeding the trust set + peer directory with
-            // NO static peer map. This node is a joiner: it does NOT list itself,
-            // so `build_node` starts it with empty membership (the seed admits it).
-            let roots = if cluster_cfg.root_pubkeys.is_empty() {
-                config
-                    .serve
-                    .as_ref()
-                    .and_then(|s| s.auth_root_public_key.clone())
-                    .into_iter()
-                    .collect()
-            } else {
-                cluster_cfg.root_pubkeys.clone()
-            };
-            let token = cluster_cfg
-                .join_token
-                .as_deref()
-                .and_then(|s| {
-                    crate::join::resolve_join_token(s, &boatramp_core::env::SystemEnv).transpose()
-                })
-                .transpose()
-                .map_err(|e| Error::ClusterStartup(e.to_string()))?
-                .ok_or_else(|| {
-                    Error::ClusterStartup(
-                        "joining requires [cluster].join_token (env:/path:/inline)".into(),
-                    )
-                })?;
-            let ticket = crate::join::JoinTicket {
-                seeds: cluster_cfg.seeds.clone(),
-                root_pubkeys: roots,
-                token,
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let adopted = crate::join::join_cluster(&ticket, &identity, Some(&self_advertise), now)
-                .await
-                .map_err(|e| Error::ClusterStartup(e.to_string()))?;
-            tracing::info!(
-                node_id,
-                members = adopted.len(),
-                "cluster: joined via seeds"
-            );
-            for m in adopted {
-                if let Ok(spki) = mesh::parse_public_key(&m.mesh_pubkey_hex) {
-                    genesis_trust.insert(m.node_id, spki);
-                }
-                if let Some(addr) = m.mesh_addr {
-                    peers.insert(m.node_id, addr);
-                }
-            }
-        }
-        crate::join::StartupAction::Resume => {
-            // Durable state is authoritative; `build_node` hydrates trust + the
-            // peer directory from it. Never re-bootstraps.
-            tracing::info!(node_id, "cluster: resuming from durable state");
-        }
-    }
-
-    // Fail closed: never bring up a non-loopback mesh with no trusted peers.
-    // Found/Join seed `genesis_trust` right here, so they are checked now; a Resume
-    // leaves it empty on purpose and is checked after `build_node` rehydrates its
-    // trust from durable state. The non-loopback-empty-trust core is the node-library
-    // guard (byte-identical); the phase condition (`!is_resume`) composes around it.
-    if !is_resume
-        && boatramp_node::cluster::mesh_trust_fails_closed(
-            cluster_cfg.listen,
-            genesis_trust.is_empty(),
-        )
-    {
-        return Err(Error::MeshUnconfigured(cluster_cfg.listen));
-    }
-
-    let mesh_tls = Arc::new(MeshTls::new(
-        Arc::new(identity),
-        TrustSet::from_map(genesis_trust),
-    ));
-
-    // Optionally gate mesh client-writes behind a control-plane cluster-write
-    // capability (this node's capability + the authorizer for incoming forwards).
-    let (write_capability, write_authz) = build_mesh_write_gate(config, &mesh_cfg).await?;
-    if write_authz.is_some() {
-        tracing::info!("cluster: mesh client-write gating enabled");
-    }
-
-    // Dynamic daemon-config runtime: a cluster ApplyObserver wakes an immediate
-    // reload on every replicated `daemon/*` apply, so leader and followers converge
-    // by push (through ordinary log replication) with no polling.
-    let daemon_runtime = Arc::new(boatramp_server::DaemonRuntime::new(
-        boatramp_server::config_baseline(&options),
-    ));
-    options.daemon_runtime = Some(daemon_runtime.clone());
-    let daemon_observer: Arc<dyn boatramp_cluster::raft::ApplyObserver> =
-        Arc::new(DaemonConfigObserver(daemon_runtime));
-
-    // Peer-mesh transport (IU-9): `transport = "overlay"` rides boatramp's own overlay-QUIC fabric
-    // (reusing the mesh identity + live trust set verbatim); anything else (incl. unset) uses the
-    // HTTP mesh. Both bind the same `cluster.listen` (HTTP over TCP, overlay over UDP/QUIC). The
-    // overlay server gates client-writes with the same authorizer, passed in (the overlay has no
-    // HTTP header layer); the HTTP server layers it on the router below.
-    let use_overlay_mesh = match mesh_cfg
-        .transport
-        .as_deref()
-        .unwrap_or("http")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "overlay" => true,
-        "http" => false,
-        other => {
-            return Err(Error::ClusterStartup(format!(
-                "unknown [cluster.mesh] transport {other:?} (want \"http\" or \"overlay\")"
-            )));
-        }
-    };
-    let transport = if use_overlay_mesh {
-        tracing::info!(
-            listen = %cluster_cfg.listen,
-            "cluster: peer mesh on the overlay-QUIC transport (IU-9)"
-        );
-        boatramp_cluster::node::MeshTransport::Overlay {
-            bind: cluster_cfg.listen,
-            write_authz: write_authz.clone(),
-        }
-    } else {
-        boatramp_cluster::node::MeshTransport::Http
-    };
-
-    let node = Arc::new(
-        build_node(ClusterParams {
-            node_id,
-            peers,
-            // Empty ⇒ every peer votes; otherwise the listed ids are the voting
-            // quorum and the rest join as read-only learners (multi-region).
-            // Founding uses the self-only peer map ⇒ this node is the sole voter;
-            // a joiner's membership arrives from the seed. No static voter list.
-            voters: std::collections::BTreeSet::new(),
+    // ── Cluster substrate bootstrap (lifted to boatramp_node::cluster, PLAN-node-library N4-B) ────────
+    // Identity → startup decision (found / join / resume) → `build_node` (openraft bootstrap +
+    // RaftKv) → serving peer mesh (mutual TLS / overlay) → founding bootstrap → scheduled key
+    // rotation. The cluster-join authentication, the RaftKv / peer-mesh mutual-TLS posture + the
+    // non-loopback empty-trust fail-closed invariant (both phases), and the key-rotation cadence are
+    // byte-for-byte the former inline bootstrap — a relocation, not a trust-decision change. The
+    // caller resolves the post-KV serve tail below from the returned node.
+    let boatramp_node::cluster::ClusterSubstrate {
+        node,
+        messaging_spill,
+    } = boatramp_node::cluster::bootstrap(
+        boatramp_node::cluster::ClusterBootstrap {
+            config,
+            cluster_cfg,
+            data_dir: &data_dir,
             durable_kv,
-            // The late-bound messaging payload-spill handle, UNBOUND here; bound to the sealed
-            // serving backend in the post-KV pass below (seal-messaging residual).
-            storage: messaging_spill.clone(),
-            mesh: mesh_tls.clone(),
-            cluster_write_capability: write_capability,
-            extra_observers: vec![daemon_observer],
-            transport,
-        })
-        .await?,
-    );
-
-    // A resuming node rehydrated its trust set from durable state inside
-    // `build_node`. Only now can it fail closed on a genuinely empty trust (a wiped
-    // or corrupt volume) — otherwise the mesh would come up trusting no peer.
-    if is_resume
-        && boatramp_node::cluster::mesh_trust_fails_closed(
-            cluster_cfg.listen,
-            mesh_tls.trust().snapshot().is_empty(),
-        )
-    {
-        return Err(Error::MeshUnconfigured(cluster_cfg.listen));
-    }
-
-    // Serve this node's peer mesh. The overlay transport already stood up its own QUIC listener
-    // inside `build_node` (so `node.router` is empty); only the HTTP transport mounts a router on
-    // an axum mutual-TLS listener here, where every `/raft/*` + `/stream/*` request must present a
-    // trusted peer key and the application `client-write` is additionally gated by the authorizer.
-    if use_overlay_mesh {
-        tracing::info!(
-            node_id, listen = %cluster_cfg.listen,
-            "cluster: serving peer mesh (overlay QUIC, mutual RPK auth)"
-        );
-    } else {
-        let mesh_router = match write_authz {
-            Some(authz) => node.router.clone().layer(axum::Extension::<
-                boatramp_cluster::http::WriteAuthz,
-            >(Some(authz))),
-            None => node.router.clone(),
-        };
-        let mesh_config = boatramp_node::cluster::mesh_server_config(&mesh_tls)?;
-        let listen = cluster_cfg.listen;
-        tracing::info!(
-            node_id, %listen,
-            "cluster: serving peer mesh (HTTP, mutual TLS)"
-        );
-        tokio::spawn(async move {
-            if let Err(err) = boatramp_server::serve_tls(
-                listen,
-                mesh_config.into(),
-                mesh_router,
-                boatramp_server::shutdown_signal(),
-            )
-            .await
-            {
-                tracing::error!(%err, "cluster: peer mesh server exited");
-            }
-        });
-    }
-
-    // Initialize a brand-new cluster from this node (once) when founding.
-    if do_bootstrap {
-        node.bootstrap().await?;
-        // A founder is never admitted, so nothing else records its address —
-        // publish it into the replicated directory so joiners (and restarts) can
-        // dial it with no peer map.
-        node.advertise_addr(&self_advertise).await?;
-        tracing::info!("cluster: bootstrapped membership");
-    }
-
-    // Scheduled mesh key rotation. Node-local, NOT leader-gated:
-    // each node rotates its OWN key (only it holds/mints its private key), and
-    // make-before-break is per-node + fail-safe, so nodes rotating independently
-    // (even concurrently) is harmless. Absent cadence ⇒ manual rotation only.
-    if let Some(interval) = mesh_cfg
-        .key_rotation
-        .as_deref()
-        .and_then(parse_rotation_interval)
-    {
-        let rotate_node = node.clone();
-        // Stagger the first rotation by node id (seconds) so a fleet booted
-        // together doesn't rotate in lockstep; then every `interval`.
-        let stagger = std::time::Duration::from_secs(node_id % 60);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval + stagger).await;
-                match rotate_node.rotate_key(MESH_ROTATION_PROPAGATION).await {
-                    Ok(pubkey) => tracing::info!(
-                        pubkey = %pubkey.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                        "cluster: rotated mesh key on schedule"
-                    ),
-                    Err(err) => {
-                        tracing::error!(%err, "cluster: scheduled mesh key rotation failed");
-                    }
-                }
-            }
-        });
-    }
-
+            store_dir_existed,
+            cluster_join: args.cluster_join.clone(),
+            init_requested,
+            cluster_advertise_addr: args.cluster_advertise_addr.clone(),
+        },
+        &mut options,
+    )
+    .await?;
     // The control-plane KvStore + messaging are the cluster facades.
     let kv: Arc<dyn KvStore> = node.kv.clone();
 
@@ -5336,7 +4750,7 @@ async fn run_cluster(
     let mesh_node = node.clone();
     let mesh_control_builder: Option<MeshControlBuilder> = Some(Box::new(
         move |opts: &boatramp_server::ServerOptions| -> Arc<dyn boatramp_server::MeshControl> {
-            Arc::new(ClusterMeshControl {
+            Arc::new(boatramp_node::cluster::ClusterMeshControl {
                 node: mesh_node.clone(),
                 issuer: opts.issuer.clone(),
             })
@@ -7133,76 +6547,9 @@ mod tests {
         );
     }
 
-    /// The mesh write authorizer accepts only a token from the control-plane
-    /// root granting `cluster-write` — no token, a wrong-role token, garbage, or a
-    /// foreign-root capability are all refused.
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn mesh_write_authz_accepts_only_a_cluster_write_capability() {
-        use boatramp_cluster::http::ClientWriteAuthz;
-        use boatramp_core::authz::GrantedRole;
-        use boatramp_core::cose::{self, Claims, LocalSigner, Signer, TokenAlg};
-
-        async fn cap(signer: &dyn Signer, role: &str) -> String {
-            let claims = Claims {
-                roles: vec![GrantedRole::global(role)],
-                kind: cose::KIND_CLUSTER_WRITE.to_string(),
-                ttl_secs: None,
-                now_unix: 0,
-            };
-            cose::mint(&claims, signer).await.unwrap()
-        }
-
-        let signer = LocalSigner::generate(TokenAlg::Es256);
-        let authz = MeshWriteAuthz {
-            public: signer.public_key(),
-        };
-
-        assert!(
-            authz.authorize(Some(&cap(&signer, "cluster-write").await)),
-            "a real cluster-write capability"
-        );
-
-        assert!(!authz.authorize(None), "no capability");
-        assert!(
-            !authz.authorize(Some(&cap(&signer, "admin").await)),
-            "wrong role"
-        );
-        assert!(!authz.authorize(Some("not-a-token")), "garbage");
-
-        let other = LocalSigner::generate(TokenAlg::Es256);
-        assert!(
-            !authz.authorize(Some(&cap(&other, "cluster-write").await)),
-            "foreign root key"
-        );
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn rotation_interval_parses_units_and_rejects_junk() {
-        use std::time::Duration;
-        assert_eq!(
-            parse_rotation_interval("30d"),
-            Some(Duration::from_secs(30 * 86_400))
-        );
-        assert_eq!(
-            parse_rotation_interval("12h"),
-            Some(Duration::from_secs(12 * 3600))
-        );
-        assert_eq!(
-            parse_rotation_interval("90m"),
-            Some(Duration::from_secs(90 * 60))
-        );
-        assert_eq!(
-            parse_rotation_interval(" 45s "),
-            Some(Duration::from_secs(45))
-        );
-        // No unit, unknown unit, zero, and empty are all rejected (⇒ no schedule).
-        assert_eq!(parse_rotation_interval("30"), None);
-        assert_eq!(parse_rotation_interval("5w"), None);
-        assert_eq!(parse_rotation_interval("0d"), None);
-        assert_eq!(parse_rotation_interval(""), None);
-    }
+    // NOTE (PLAN-node-library N4-B): `mesh_write_authz_accepts_only_a_cluster_write_capability`
+    // and `rotation_interval_parses_units_and_rejects_junk` moved to `boatramp_node::cluster`'s
+    // own tests alongside the `MeshWriteAuthz` / `parse_rotation_interval` items they lifted.
 
     /// PLAN-serve-single-cluster-parity Stage C (reverse lift #6): on the cluster serve path a
     /// `boatramp:<name>` base S3 cred is no longer REFUSED — it is DEFERRED by the up-front scheme check

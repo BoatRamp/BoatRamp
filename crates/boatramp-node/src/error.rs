@@ -189,6 +189,41 @@ pub enum Error {
     #[cfg(feature = "tls")]
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    // ---- cluster substrate run-entry (`cluster::bootstrap`, PLAN-node-library N4-B) -----
+    // These Display IDENTICALLY to the binary's own `serve::Error` variants they were lifted
+    // from — the binary absorbs them transparently through `serve::Error::Assembly`
+    // (`#[from] boatramp_node::Error`), so an operator sees byte-for-byte the same message. The
+    // binary KEEPS its own `ClusterStartup` (the `[overlay]` setup path still produces it); the
+    // two variants carry the same `"cluster startup: {0}"` message, exactly as the pre-existing
+    // split variants (`Io`/`RpkTls`/`Rustls`) do across the two crates.
+    /// The cluster startup decision failed closed (F5) or a join could not be completed (no join
+    /// token, seeds unreachable, root mismatch, a torn durable-trust read, …).
+    #[cfg(feature = "cluster")]
+    #[error("cluster startup: {0}")]
+    ClusterStartup(String),
+    /// Refusing to serve the peer mesh on a non-loopback address with an empty trust set — that
+    /// would expose an unauthenticated control plane.
+    #[cfg(feature = "cluster")]
+    #[error(
+        "refusing to serve the peer mesh on {0} (non-loopback) with an empty trust \
+         set: found with --cluster-init or join with --cluster-join <ticket>"
+    )]
+    MeshUnconfigured(std::net::SocketAddr),
+    /// Building / bootstrapping the embedded-Raft cluster node failed. Boxed (the openraft error
+    /// types it wraps are large and this variant is cold) so `Error` — and `serve::Error` above it
+    /// via `Assembly` — stays under clippy's `result_large_err` threshold. `#[from]` can't box, so
+    /// see the manual `From` below.
+    #[cfg(feature = "cluster")]
+    #[error(transparent)]
+    Bootstrap(Box<boatramp_cluster::node::BootstrapError>),
+}
+
+#[cfg(feature = "cluster")]
+impl From<boatramp_cluster::node::BootstrapError> for Error {
+    fn from(e: boatramp_cluster::node::BootstrapError) -> Self {
+        Self::Bootstrap(Box::new(e))
+    }
 }
 
 /// Node-assembly result alias.
