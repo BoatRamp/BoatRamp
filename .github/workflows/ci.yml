@@ -1751,7 +1751,12 @@ jobs:
   # the control-plane store (durable put + checkpoint + maintenance GC + read-back + delete) under its
   # Landlock/seccomp profile with no EACCES, then a client PUT fail-closes via the INFO-2 decomposition
   # (marker `PRIVSEP NODE SELF-HOST WRITE-PLANE OK`) — the authority-scoped node app router running LIVE,
-  # not the Phase-1 stub. All ten are `#[ignore]`d (they fork + sandbox against the live kernel) so
+  # not the Phase-1 stub; and (11, P5-3-serve) a `core` holding control.admin-api + backend.kv SERVES an
+  # AUTHORIZED client control-plane mutation (a trust-root-signed cnf-bound role token + a per-call PoP +
+  # the required grant) returning 200 with the write LANDING under the backend.kv Landlock profile (a
+  # read-plane GET then resolves the host), while a FORGED principal and a MISSING-PoP mutation are BOTH
+  # refused fail-closed 503 (marker `PRIVSEP NODE SELF-HOST CONTROL-MUTATION OK`) — the client->control-
+  # plane-write authz chain. All eleven are `#[ignore]`d (they fork + sandbox against the live kernel) so
   # `--include-ignored` runs them. Greps every marker + the pass count so a silent skip / compile-out
   # fails the merge.
   live-gate-privsep:
@@ -1774,8 +1779,8 @@ jobs:
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
             --features sandbox --test privsep_live -- --include-ignored --nocapture 2>&1 | tee privsep-live.log
-          grep -qE 'test result: ok\. 10 passed' privsep-live.log \
-            || { echo "::error::privsep live gate did not run all ten tests (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 11 passed' privsep-live.log \
+            || { echo "::error::privsep live gate did not run all eleven tests (silent skip or a failure)" >&2; exit 1; }
           grep -q 'PRIVSEP LIVE OK' privsep-live.log \
             || { echo "::error::privsep composition live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
           grep -q 'PRIVSEP PROC-MEM WALL OK' privsep-live.log \
@@ -1798,6 +1803,8 @@ jobs:
             || { echo "::error::privsep node-self-host READ-PLANE serve gate never reached its marker (Phase-5 P5-2: under node_serve=node-self-host a backend.kv data-holder on os-process must serve a REAL read-plane response — the authority-scoped node app router classifies/routes/reads the control-plane KV LIVE under the per-instance Enforced sandbox, NOT the Phase-1 'minimal serve' stub; an EPERM opening the KV under the derived Landlock profile FailNodeCloses the node, and a regression that reverts to the stub — or a silent skip/compile-out — fails here — see crates/boatramp/DESIGN-privsep-phase5-selfhost.md)" >&2; exit 1; }
           grep -q 'PRIVSEP NODE SELF-HOST WRITE-PLANE OK' privsep-live.log \
             || { echo "::error::privsep node-self-host WRITE-PLANE gate never reached its marker (Phase-5 P5-3: under node_serve=node-self-host a backend.kv data-holder on os-process must STAND UP + serve, which it can only do after its boot write-plane self-validation MUTATES the control-plane store — durable put + checkpoint + maintenance GC + read-back + durable delete — under the derived per-instance Enforced Landlock/seccomp profile with NO fail-closed EACCES on the write/compaction/GC/manifest object-store paths a read never touches; then a client PUT must fail closed 503 via the INFO-2 decomposition (held write sub-op, unreachable control.admin-api authorize sub-op). A write/compaction/GC EACCES FailNodeCloses the node (the gate's exited-early panic), and a regression — or a silent skip/compile-out — fails here — see crates/boatramp/DESIGN-privsep-phase5-selfhost.md)" >&2; exit 1; }
+          grep -q 'PRIVSEP NODE SELF-HOST CONTROL-MUTATION OK' privsep-live.log \
+            || { echo "::error::privsep node-self-host CONTROL-MUTATION serve gate never reached its marker (Phase-5 P5-3-serve: under node_serve=node-self-host a core holding control.admin-api + backend.kv must SERVE an AUTHORIZED client mutation — a valid cnf-bound trust-root-signed role token + a per-call PoP bound to the mutation, with the required publisher grant — returning 200, and the authorized deploy/routing write must LAND under core's backend.kv Landlock profile (a follow-up read-plane GET resolves the host); AND a FORGED principal (token not trust-root-signed) and a MISSING-PoP mutation must BOTH be refused fail-closed 503. This is the client->control-plane-write authz chain (end-principal cose::verify + PoP re-validation + default-deny RBAC). A regression that serves an unauthenticated/unauthorized mutation, drops the verifier, or fails to land the authorized write — or a silent skip/compile-out — fails here — see crates/boatramp/DESIGN-privsep-phase5-selfhost.md §4 item 6)" >&2; exit 1; }
   # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
   # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
   # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into

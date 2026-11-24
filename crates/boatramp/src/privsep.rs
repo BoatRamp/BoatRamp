@@ -398,6 +398,74 @@ fn derive_node_reachability(config: &ServerConfig, label: &str) -> BTreeMap<Host
     reachable
 }
 
+/// Derive the node-self-host **INFO-1 crown-jewel-endpoint map** for one instance (Phase-5 P5-3-serve):
+/// for every feature-link incident to `label` that PROVABLY terminates at a WS-E `serve_authority`
+/// grammar endpoint, the crown-jewel authorities that endpoint holds become relayable over that link.
+///
+/// This is the load-bearing INFO-1 guard for the SERVED control-plane mutation: a crown-jewel sub-op
+/// (a mint/sign the authorizing control plane drives) may be relayed ONLY to the peer's WS-E grammar —
+/// which re-validates the end-principal context + PoP on every call — NEVER to a raw backend socket
+/// (a mint routed to a bare fd would be an authz BYPASS). The grammar-endpoint test REUSES
+/// [`compute_authority_serve_links`] (the SAME designation the root wires onto each crown-jewel
+/// instance): a link qualifies iff the PEER holds that link in its authority-serve set — i.e. the peer
+/// is the crown endpoint AND the link is `authority-serve`-marked (or the conservative Unspecified
+/// inference), and is NOT a [`LinkPurpose::Relay`] splice. Only crown-jewel authorities are mapped (a
+/// non-crown authority has no WS-E grammar endpoint — `control.admin-api`'s own relay is the separate
+/// P5-4 control-grammar). A HELD authority is excluded (served locally, never relayed). Pure
+/// (host-testable). The [`instance_serve::NodeServeRouter`] consumes this so a crown-jewel surface is
+/// RELAYED only over a verified grammar endpoint and REFUSED fail-closed otherwise.
+fn derive_node_authority_serve_endpoints(
+    config: &ServerConfig,
+    label: &str,
+) -> BTreeMap<HostAuthority, String> {
+    let mut endpoints: BTreeMap<HostAuthority, String> = BTreeMap::new();
+    let Some(privsep) = config.privsep.as_ref() else {
+        return endpoints;
+    };
+    let Some(me) = privsep.instances.get(label) else {
+        return endpoints;
+    };
+    let held: BTreeSet<HostAuthority> = me.capabilities.iter().copied().collect();
+    // The root's own WS-E serve-link designation — REUSED so this guard cannot drift from which links
+    // actually stand up a `serve_authority` grammar (keyed by the crown-jewel HOLDER label → its links).
+    let serve_links = compute_authority_serve_links(config);
+    for (link_name, link) in &privsep.links {
+        if link.from == link.to {
+            continue; // a self-link reaches no peer
+        }
+        let peer = if link.from == label {
+            &link.to
+        } else if link.to == label {
+            &link.from
+        } else {
+            continue; // not incident to this instance
+        };
+        // INFO-1: the link must TERMINATE at the peer's WS-E grammar endpoint — i.e. the peer serves the
+        // authority grammar ON THIS link (it is in the peer's `compute_authority_serve_links` set). A
+        // splice/relay link, or a peer that is not a designated crown endpoint, does NOT qualify.
+        let peer_serves_grammar_here = serve_links
+            .get(peer)
+            .is_some_and(|links| links.contains(link_name));
+        if !peer_serves_grammar_here {
+            continue;
+        }
+        let Some(peer_inst) = privsep.instances.get(peer) else {
+            continue;
+        };
+        for &authority in &peer_inst.capabilities {
+            // Only a crown jewel is a WS-E grammar endpoint (the only authorities `serve_authority`
+            // serves). A held authority is served locally, never relayed.
+            if !authority.is_crown_jewel() || held.contains(&authority) {
+                continue;
+            }
+            endpoints
+                .entry(authority)
+                .or_insert_with(|| link_name.clone());
+        }
+    }
+    endpoints
+}
+
 /// Build the root's authorized spawn plan — the PURE, fail-closed authorization gate
 /// (design §4.1, §5 inv4/inv6). Runs, in order and all before any spawn:
 /// 1. the secret-blind screen (F1/F11-A) over the resolved config;
@@ -3412,13 +3480,16 @@ mod instance_serve {
     use std::path::Path;
     use std::sync::Arc;
 
-    use boatramp_core::cose::{Signer, TokenPublicKey};
+    use boatramp_core::authz::{Action, AuthzPolicy, POLICY_KEY, Resource, Right};
+    use boatramp_core::cose::{AuthorityPopBinding, Signer, TokenPublicKey};
     use boatramp_core::privsep::HostAuthority;
+    use boatramp_core::project::ProjectRef;
     use boatramp_server::privsep_authority::{
-        AuthorityAudit, AuthorityRateLimiter, AuthorityRegistry, AuthorityServe, ContextVerifier,
-        DEFAULT_CONTEXT_MAX_AGE_SECS, DEFAULT_LINK_READ_DEADLINE, DEFAULT_MAX_IN_FLIGHT,
-        DurableAudit, FileRevocationList, PreVerifyThrottle, ReplayCache, RevocationCheck,
-        SealerHandler, SignerHandler, SourceBucketThrottle, TokenBucketLimiter,
+        AuthorityAudit, AuthorityContext, AuthorityRateLimiter, AuthorityRegistry, AuthorityServe,
+        CONTROL_MUTATION_POP_OP, ContextVerifier, DEFAULT_CONTEXT_MAX_AGE_SECS,
+        DEFAULT_LINK_READ_DEADLINE, DEFAULT_MAX_IN_FLIGHT, DurableAudit, FileRevocationList,
+        PreVerifyThrottle, ReplayCache, ReplayDecision, RevocationCheck, SealerHandler,
+        SignerHandler, SourceBucketThrottle, TokenBucketLimiter, control_mutation_pop_bytes,
     };
     use boatramp_server::privsep_link::LinkEndpoint;
     use boatramp_server::privsep_tenant::{
@@ -4154,18 +4225,46 @@ mod instance_serve {
         })
     }
 
-    /// Build the node-self-host serve handler (Phase-5 P5-2): the authority-scoped [`NodeServeRouter`]
-    /// (from the instance's held authority set + the reachability map derived from the live composition
-    /// link topology) + the node read plane (the held `backend.kv` control-plane KV). Fail-closed: a
-    /// read-plane stand-up failure returns `Err` so the caller exits the instance (FailNodeClosed).
+    /// Build the node-self-host serve handler (Phase-5 P5-2 read + P5-3-serve mutation): the
+    /// authority-scoped [`NodeServeRouter`] (held set + the splice reachability map + the INFO-1
+    /// crown-jewel-endpoint map, both derived from the live composition link topology) + the node data
+    /// plane (the held `backend.kv` control-plane KV) + the optional [`SelfHostControlPlane`] authorizer.
+    /// Fail-closed: a data-plane stand-up failure, or a `control.admin-api` holder with no resolvable
+    /// public trust root (the compile-enforced missing-verifier refuse), returns `Err` so the caller
+    /// exits the instance (FailNodeClosed) — never a data-holder that serves without a verifier.
     async fn build_self_host_backend_handler(
         label: &str,
         gate: &MaterializationGate,
         config: &ServerConfig,
     ) -> Result<BackendHandler, String> {
         let reachable = super::derive_node_reachability(config, label);
-        let router = NodeServeRouter::new(gate, reachable);
+        let authority_serve = super::derive_node_authority_serve_endpoints(config, label);
+        let router = NodeServeRouter::new(gate, reachable, authority_serve);
         let data_plane = build_node_data_plane(label, gate, config).await?;
+        // P5-3-serve: the self-host CONTROL-PLANE authorizer — built ONLY on an instance that HOLDS
+        // `control.admin-api`, and ONLY if a PUBLIC trust root resolves (compile-enforced missing-verifier
+        // refuse: `SelfHostControlPlane` cannot exist without a `ContextVerifier`, so a control holder
+        // that cannot build one FAILS the node CLOSED here rather than serving mutations unverified). A
+        // non-`control.admin-api` instance gets `None` → every client mutation fail-closes (a data-holder
+        // alone cannot authorize one). The trust root is the PUBLIC `auth_root_public_key` (never a
+        // signer key — a split control instance holds no crown jewel; `resolve_trust_root` requires it).
+        let control = if gate.may_materialize(HostAuthority::ControlAdminApi) {
+            let trust_root = resolve_trust_root(config, None).map_err(|e| {
+                format!(
+                    "node-self-host control plane ({label}): no public trust root to re-validate \
+                     end-principal control-plane mutations — set serve.auth_root_public_key (fail-closed: \
+                     a control.admin-api holder MUST have a verifier). {e}"
+                )
+            })?;
+            tracing::info!(
+                instance = %label,
+                "[privsep] node-self-host control plane (P5-3-serve): end-principal verifier built from \
+                 the public trust root — client mutations are default-deny, verified every call"
+            );
+            Some(SelfHostControlPlane::new(ContextVerifier::new(trust_root)))
+        } else {
+            None
+        };
         // P5-3: BEFORE serving a byte, a `backend.kv` data-holder self-validates the control-plane
         // store MUTATION path under its installed Landlock+seccomp profile (a durable put + checkpoint +
         // GC + read-back + durable delete on a reserved key). This proves the write/flush/compaction/GC
@@ -4177,7 +4276,7 @@ mod instance_serve {
         // object store spin forever instead of returning `Err`), matching the per-tenant supervisor.
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            data_plane.validate_write_plane(),
+            data_plane.validate_write_plane(probe_gc_min_age(config)),
         )
         .await
         {
@@ -4209,9 +4308,60 @@ mod instance_serve {
                 );
             }
         }
-        Ok(BackendHandler::SelfHost(NodeServeHandler::new(
-            router, data_plane,
-        )))
+        Ok(BackendHandler::SelfHost(Box::new(NodeServeHandler::new(
+            router, data_plane, control,
+        ))))
+    }
+
+    /// The node-self-host CONTROL-PLANE authorizer (P5-3-serve, design §4 item 6): the fail-closed
+    /// end-principal gate a `control.admin-api` holder drives every client control-plane mutation
+    /// through. It holds the receiver-side [`ContextVerifier`] (the PUBLIC trust root — re-validates
+    /// every relayed end principal via `cose::verify` + the tightened freshness bound + holder-binding +
+    /// a per-call PoP) and the per-call anti-replay [`ReplayCache`]. Held BY VALUE (not `Option`) so it
+    /// is structurally impossible to construct the authorizer without a verifier — the compile-enforced
+    /// missing-verifier refuse ([`NodeServeHandler::control`] is the only `Option`, gated at stand-up).
+    /// Cheaply cloneable (the verifier is `Clone`; the cache is `Arc`-shared across connection clones so
+    /// the replay witnesses are one node-wide set).
+    #[derive(Clone)]
+    pub(super) struct SelfHostControlPlane {
+        verifier: ContextVerifier,
+        replay: Arc<ReplayCache>,
+    }
+
+    impl SelfHostControlPlane {
+        /// Build the authorizer around the end-principal [`ContextVerifier`] (from the resolved public
+        /// trust root). The anti-replay cache is sized to the verifier's freshness window ([`ReplayCache`
+        /// `::with_defaults`]) — a witness lives exactly as long as a replay could re-pass the freshness
+        /// bound.
+        pub(super) fn new(verifier: ContextVerifier) -> Self {
+            Self {
+                verifier,
+                replay: Arc::new(ReplayCache::with_defaults()),
+            }
+        }
+    }
+
+    /// The minimum object age the boot write-plane GC pass uses (LOW-1). The self-host `backend.kv`
+    /// holder opens a LOCAL, single-node control-plane store ([`build_routing_deploy_store`] opens
+    /// SlateDB on the local FS — `slate_s3: None` — or a SQL KV; a shared/clustered VM/netns data-holder
+    /// is REFUSED, design §3a / P5-5). For the LOCAL SlateDB store this returns `0`: the probe runs at
+    /// stand-up BEFORE this node serves a byte and the local-FS store has no reader replica, so the
+    /// instance is the confirmed SOLE writer — making `min_age = 0` safe AND the only value that makes
+    /// the just-superseded probe object eligible for the GC DELETE pass (so the probe keeps its Landlock
+    /// delete-syscall coverage). For a SQL KV `maintenance_gc` is a no-op, so `min_age` is moot there;
+    /// return the node's never-zero [`gc_min_age()`](boatramp_node::config::KvConfig::gc_min_age) floor
+    /// anyway (correct-by-contract). **FORWARD OBLIGATION:** if a later increment wires a SHARED /
+    /// clustered SlateDB (object-store backed, reader replicas) for the self-host data plane, the
+    /// sole-writer assumption breaks — gate the `0` on the confirmed non-shared shape then, or a reader
+    /// mid-scan could have a needed object reclaimed (exactly the hazard `gc_min_age()` exists to close).
+    fn probe_gc_min_age(config: &ServerConfig) -> std::time::Duration {
+        match config.serve.as_ref().and_then(|s| s.kv.as_ref()) {
+            // A SQL control-plane KV — `maintenance_gc` is a no-op; honor the never-zero floor anyway.
+            Some(kv) if kv.sql.is_some() => kv.gc_min_age(),
+            // The confirmed-local, single-node, sole-writer SlateDB control store (or no `[serve.kv]`,
+            // which also resolves to the local SlateDB default) — `0` keeps the GC delete coverage.
+            _ => std::time::Duration::ZERO,
+        }
     }
 
     /// Build the node DATA PLANE for a data-holder instance (P5-2 read + P5-3 write): the held
@@ -4303,8 +4453,11 @@ mod instance_serve {
     pub(super) enum BackendHandler {
         /// `guest-workloads`: the Phase-1 byte-path stub (a fixed 200).
         Minimal,
-        /// `node-self-host` (P5-2): the authority-scoped node app router (real routing + read serve).
-        SelfHost(NodeServeHandler),
+        /// `node-self-host` (P5-2/P5-3): the authority-scoped node app router (real routing, the read
+        /// serve, and the authorized control-plane mutation). `Box`ed to keep the `Minimal` variant
+        /// small (`clippy::large_enum_variant`): the self-host handler carries the router's two maps
+        /// plus the control-plane verifier.
+        SelfHost(Box<NodeServeHandler>),
     }
 
     impl boatramp_http::Handler for BackendHandler {
@@ -4400,39 +4553,62 @@ mod instance_serve {
         /// it may serve locally.
         held: BTreeSet<HostAuthority>,
         /// Non-held authority → the named root-wired link that reaches its holder, derived from the
-        /// live link topology by [`super::derive_node_reachability`].
+        /// live link topology by [`super::derive_node_reachability`]. Used for a NON-crown (data/
+        /// control) relay — a backend feature-link / splice.
         reachable: BTreeMap<HostAuthority, String>,
+        /// **INFO-1 crown-jewel-endpoint map.** A non-held CROWN-JEWEL authority → the named link that
+        /// PROVABLY terminates at that authority's WS-E `serve_authority` grammar endpoint (the peer
+        /// holds the crown jewel AND the link designates WS-E serve on it, per
+        /// [`super::compute_authority_serve_links`]'s rule — NEVER a raw client-fd splice). Derived by
+        /// [`super::derive_node_authority_serve_endpoints`]. A crown-jewel relay is sound ONLY over such
+        /// a link (a mint/sign routed to a bare backend socket would be an authz BYPASS), so
+        /// [`route`](Self::route) consults THIS map — not [`reachable`](Self::reachable) — for a crown
+        /// jewel, and REFUSES a crown jewel reachable only over a splice.
+        authority_serve: BTreeMap<HostAuthority, String>,
     }
 
     impl NodeServeRouter {
-        /// Build the router from an instance's [`MaterializationGate`] (its held authority set) and
-        /// the reachability map (non-held authority → the named root-wired link that reaches its
-        /// holder, derived live by [`super::derive_node_reachability`]).
+        /// Build the router from an instance's [`MaterializationGate`] (its held authority set), the
+        /// data/control reachability map (non-held authority → the backend feature-link that reaches
+        /// its holder, [`super::derive_node_reachability`]), and the INFO-1 crown-jewel-endpoint map
+        /// (non-held crown jewel → the authority-serve link terminating at its grammar endpoint,
+        /// [`super::derive_node_authority_serve_endpoints`]).
         pub(super) fn new(
             gate: &MaterializationGate,
             reachable: BTreeMap<HostAuthority, String>,
+            authority_serve: BTreeMap<HostAuthority, String>,
         ) -> Self {
             Self {
                 held: gate.held().collect(),
                 reachable,
+                authority_serve,
             }
         }
 
         /// The routing decision for a serve surface identified by the [`HostAuthority`] it needs.
-        /// HELD ⇒ [`NodeRoute::Local`] (construct-only-what-you-hold); else reachable over a wired
-        /// link ⇒ relay ([`NodeRoute::RelayCrownJewel`] for a group-A authority, else
-        /// [`NodeRoute::RelayBackend`]); else [`NodeRoute::Refuse`] fail-closed. A HELD authority is
-        /// NEVER relayed and a non-held one is NEVER served locally — the structural invariant this
-        /// seam exists to prove (design §4 item 5).
+        /// HELD ⇒ [`NodeRoute::Local`] (construct-only-what-you-hold). Else, for a CROWN JEWEL
+        /// (group A): [`NodeRoute::RelayCrownJewel`] ONLY when the authority is reachable over a link
+        /// that provably terminates at its WS-E `serve_authority` grammar endpoint (the INFO-1
+        /// [`authority_serve`](Self::authority_serve) map) — a crown jewel reachable only over a raw
+        /// splice is [`NodeRoute::Refuse`]d (never relay a mint/sign to a bare backend socket). Else,
+        /// for a non-crown (data / control) authority: [`NodeRoute::RelayBackend`] over its backend
+        /// feature-link ([`reachable`](Self::reachable)), or [`NodeRoute::Refuse`]. A HELD authority is
+        /// NEVER relayed and a non-held one is NEVER served locally (design §4 item 5).
         pub(super) fn route(&self, surface: HostAuthority) -> NodeRoute {
             if self.held.contains(&surface) {
                 return NodeRoute::Local(surface);
             }
+            if surface.is_crown_jewel() {
+                // INFO-1: a crown-jewel relay is sound ONLY over a verified grammar endpoint.
+                return match self.authority_serve.get(&surface) {
+                    Some(link) => NodeRoute::RelayCrownJewel {
+                        authority: surface,
+                        link: link.clone(),
+                    },
+                    None => NodeRoute::Refuse(surface),
+                };
+            }
             match self.reachable.get(&surface) {
-                Some(link) if surface.is_crown_jewel() => NodeRoute::RelayCrownJewel {
-                    authority: surface,
-                    link: link.clone(),
-                },
                 Some(link) => NodeRoute::RelayBackend {
                     authority: surface,
                     link: link.clone(),
@@ -4455,29 +4631,50 @@ mod instance_serve {
     pub(super) struct NodeServeHandler {
         router: NodeServeRouter,
         data_plane: NodeDataPlane,
+        /// The self-host control-plane authorizer — `Some` ONLY on an instance that HOLDS
+        /// `control.admin-api` AND resolved a public trust root at stand-up. A control mutation serves
+        /// ONLY through this (it holds the end-principal [`ContextVerifier`] + anti-replay cache); its
+        /// ABSENCE fail-closes every mutation (a data-holder that is not also the control plane cannot
+        /// authorize one). This is the compile-enforced missing-verifier refuse: [`SelfHostControlPlane`]
+        /// cannot be constructed without a [`ContextVerifier`], and a mutation that finds `None` here
+        /// returns 503 — there is NO serve path that authorizes a mutation without a verifier.
+        control: Option<SelfHostControlPlane>,
     }
 
     impl NodeServeHandler {
-        /// Construct the handler around the instance's [`NodeServeRouter`] + node data plane.
-        pub(super) fn new(router: NodeServeRouter, data_plane: NodeDataPlane) -> Self {
-            Self { router, data_plane }
+        /// Construct the handler around the instance's [`NodeServeRouter`] + node data plane + the
+        /// optional self-host control-plane authorizer (present iff the instance holds
+        /// `control.admin-api` with a resolved trust root — see [`build_self_host_backend_handler`]).
+        pub(super) fn new(
+            router: NodeServeRouter,
+            data_plane: NodeDataPlane,
+            control: Option<SelfHostControlPlane>,
+        ) -> Self {
+            Self {
+                router,
+                data_plane,
+                control,
+            }
         }
 
         /// Serve ONE classified request through the authority-scoped router (the live apply path). Takes
-        /// the OWNED [`RequestPlan`] + `host` extracted from the request BEFORE any await, so the future
-        /// holds no `&Request` across the await and stays `Send` (the `Handler` bound) —
-        /// `http::Request<ReqBody>` is not `Sync`. Split out so host tests can drive it directly: it
-        /// routes each of the plan's per-authority sub-ops and either serves the held read or fail-closes
-        /// (never a stub 200 for a surface this cut does not serve).
+        /// the OWNED [`RequestPlan`] + `host` + the OWNED end-principal credential, all extracted from the
+        /// request BEFORE any await, so the future holds no `&Request` across the await and stays `Send`
+        /// (the `Handler` bound) — `http::Request<ReqBody>` is not `Sync`. Split out so host tests can
+        /// drive it directly: it routes each of the plan's per-authority sub-ops and either serves the
+        /// held read / the authorized mutation or fail-closes (never a stub 200 for a surface this cut
+        /// does not serve).
         pub(super) async fn serve_request(
             &self,
             plan: RequestPlan,
             host: String,
+            credential: Option<ControlMutationCredential>,
         ) -> boatramp_http::Response {
             match plan {
                 RequestPlan::Read(surface) => self.serve_read(surface, host).await,
-                RequestPlan::ControlMutation { authorize, write } => {
-                    self.serve_control_mutation(authorize, write, host).await
+                RequestPlan::ControlMutation(mutation) => {
+                    self.serve_control_mutation(mutation, host, credential)
+                        .await
                 }
             }
         }
@@ -4538,69 +4735,279 @@ mod instance_serve {
             }
         }
 
-        /// Serve a P5-3 control-plane MUTATION — decomposed into its `authorize` (`control.admin-api`)
-        /// and `write` (`backend.kv`) sub-ops (INFO-2). Route EACH independently; if ANY sub-op is
-        /// unsatisfiable by this composition (`Refuse` — neither held nor reachable), fail the WHOLE
-        /// request closed with a hard 5xx (INFO-2 + INFO-3), NEVER collapsing to the satisfiable half
-        /// (so a `backend.kv`-holding instance that cannot reach any `control.admin-api` authorizer does
-        /// NOT serve the write). When both sub-ops ARE satisfiable, the client-reachable mutation STILL
-        /// fails closed in this cut: serving it requires the end-principal AuthorityContext + PoP
-        /// re-validation (design §4 item 6) and the cross-instance `control.admin-api`→crown-jewel relay
-        /// (design §2 P5-3), NEITHER wired yet — so an unauthenticated client can never drive a
-        /// control-plane write through this path. The write SURFACE itself (the Landlock mutation path)
-        /// is proven at boot by [`NodeDataPlane::validate_write_plane`], not by this client path.
+        /// Serve a P5-3-serve control-plane MUTATION (design §4 item 6) — the SERVED, AUTHORIZED client
+        /// mutation, fail-closed-by-construction. The decomposed [`ControlMutation`] is routed per-authority
+        /// (INFO-2) and then, for a fully-LOCAL deploy/routing op, driven through the full authz chain:
+        ///
+        /// 1. **INFO-2/INFO-3 sub-op routing.** Route `authorize` (`control.admin-api`), `write`
+        ///    (`backend.kv`), and any crown-jewel `mint` sub-op. ANY sub-op routing to `Refuse` fails the
+        ///    WHOLE request closed (never a partial serve of the held half). A crown-jewel `mint` sub-op is
+        ///    only ever `RelayCrownJewel` over an INFO-1-verified grammar endpoint (see
+        ///    [`NodeServeRouter::route`]); this cut does NOT yet drive the relay (the P5-4 relay client), so
+        ///    a mint op fails closed — but SOUNDLY (the destination is proven a `serve_authority` endpoint
+        ///    or refused). A cross-instance `authorize`/`write` relay is likewise P5-4 — this cut serves
+        ///    only a fully-LOCAL deploy/routing mutation.
+        /// 2. **End-principal verification, DEFAULT-DENY (requirement #1).** The mutation serves ONLY after
+        ///    the inbound principal is re-validated via [`ContextVerifier::verify_context_and_pop`]
+        ///    (`cose::verify` the role-bearer, alg-pinned to the public trust root, + the tightened
+        ///    freshness bound + holder-binding + a per-call PoP bound to THIS exact mutation —
+        ///    [`control_mutation_pop_bytes`]), re-validated EVERY call. No asserted-id trust: the
+        ///    [`VerifiedPrincipal`] is the SOLE principal path. A missing credential / any verify failure
+        ///    (bad sig / stale / no `cnf` / missing-or-bad PoP) ⇒ 503. A missing control plane (no verifier)
+        ///    ⇒ 503 (compile-enforced: no [`SelfHostControlPlane`] ⇒ no serve path).
+        /// 3. **Anti-replay (mechanism (b)).** A verbatim `(cti, nonce)` replay / cache saturation ⇒ 503.
+        /// 4. **`control.admin-api` authorization, DEFAULT-DENY.** The verified principal must hold the
+        ///    required control-plane [`Right`] for the op's target (the node's REAL RBAC — the policy
+        ///    loaded from the held control-plane KV, else the default; fail-closed on a malformed policy).
+        ///    No matching grant ⇒ 503.
+        /// 5. **`backend.kv` write.** Apply the deploy/routing-store mutation and CONFIRM it landed
+        ///    (read-back) before replying 200 — the write lands under the `backend.kv` Landlock profile.
         async fn serve_control_mutation(
             &self,
-            authorize: HostAuthority,
-            write: HostAuthority,
+            mutation: ControlMutation,
             host: String,
+            credential: Option<ControlMutationCredential>,
         ) -> boatramp_http::Response {
+            let ControlMutation {
+                authorize,
+                write,
+                mint,
+                op,
+            } = mutation;
+
+            // (1) INFO-2: route EACH sub-op; a `Refuse` fails the WHOLE request closed (never a partial
+            // serve of the held half). The crown-jewel `mint` sub-op is INFO-1-routed by `route`.
             let authorize_route = self.router.route(authorize);
             let write_route = self.router.route(write);
-            // INFO-2: a sub-op the composition cannot satisfy fails the WHOLE request closed — never a
-            // partial serve of the held half.
-            for (name, authority, route) in [
+            let mint_route = mint.map(|c| (c, self.router.route(c)));
+            let mut sub_ops: Vec<(&str, HostAuthority, &NodeRoute)> = vec![
                 ("authorization", authorize, &authorize_route),
                 ("data-write", write, &write_route),
-            ] {
+            ];
+            if let Some((c, r)) = &mint_route {
+                sub_ops.push(("crown-jewel-mint", *c, r));
+            }
+            for (name, authority, route) in &sub_ops {
                 if let NodeRoute::Refuse(_) = route {
                     tracing::warn!(
-                        sub_op = name,
-                        surface = %authority.tag(),
-                        %host,
-                        authorize_route = ?authorize_route,
-                        write_route = ?write_route,
-                        "[privsep] node-self-host control mutation: a sub-op is neither held nor \
-                         reachable — refusing the WHOLE request fail-closed (INFO-2, never a partial \
-                         serve)"
+                        sub_op = name, surface = %authority.tag(), %host,
+                        authorize_route = ?authorize_route, write_route = ?write_route, mint_route = ?mint_route,
+                        "[privsep] node-self-host control mutation: a sub-op is neither held nor reachable \
+                         (for a crown jewel: no INFO-1-verified serve_authority grammar endpoint) — \
+                         refusing the WHOLE request fail-closed (INFO-2, never a partial serve)"
                     );
                     return fail_closed_response(&format!(
                         "control-plane mutation refused: the {name} sub-op ({}) is neither held nor \
-                         reachable in this composition (a composition-closure gap fails the whole \
-                         request closed, never a partial serve)",
+                         reachable over a sound link in this composition (a crown-jewel sub-op requires a \
+                         verified serve_authority grammar endpoint — INFO-1); the whole request fails \
+                         closed, never a partial serve",
                         authority.tag()
                     ));
                 }
             }
-            // Both sub-ops are satisfiable, but the SERVED, authorized mutation is the remaining P5-3
-            // work (end-principal re-validation + the control.admin-api→crown-jewel relay). Fail closed
-            // (INFO-3) — a client can never drive an unauthorized control-plane write here. The write
-            // surface under the sandbox is proven by the boot self-validation, not this path.
-            tracing::info!(
-                %host,
-                authorize_route = ?authorize_route,
-                write_route = ?write_route,
-                "[privsep] node-self-host control mutation: sub-ops routable, but the served authorized \
-                 mutation (end-principal re-validation + control.admin-api→crown-jewel relay) is the \
-                 remaining P5-3 work — refusing fail-closed (the write surface is boot-self-validated)"
-            );
-            fail_closed_response(
-                "control-plane mutation serve is not yet wired: it requires the end-principal \
-                 AuthorityContext + PoP re-validation and the control.admin-api→crown-jewel relay (the \
-                 remaining P5-3 work). The backend.kv write surface itself is proven under the sandbox \
-                 by the boot write-plane self-validation.",
-            )
+
+            // (1b) THIS cut serves ONLY a fully-LOCAL deploy/routing mutation: a cross-instance
+            // `control.admin-api` authorize relay, a `backend.kv` write relay, and the crown-jewel
+            // `mint`/`sign` relay are all the P5-4 relay client — fail closed here (soundly: the crown
+            // relay route is INFO-1-verified above, we simply do not yet DRIVE it).
+            if mint_route.is_some() {
+                return fail_closed_response(
+                    "control-plane mint/sign op refused: the crown-jewel relay (a verified \
+                     serve_authority grammar endpoint — INFO-1) is routable, but DRIVING the relay (the \
+                     control.admin-api→crown-jewel relay client, with the end-principal context + PoP on \
+                     every mint/sign) is the remaining P5-4 work — fail-closed this cut",
+                );
+            }
+            if !matches!(authorize_route, NodeRoute::Local(_)) {
+                return fail_closed_response(
+                    "control-plane mutation refused: the control.admin-api authorize sub-op is reachable \
+                     but NOT held locally — the cross-instance authorize relay (to a control.admin-api \
+                     serve_authority grammar endpoint) is the remaining P5-4 work; this cut serves only a \
+                     locally-held authorize",
+                );
+            }
+            if !matches!(write_route, NodeRoute::Local(w) if w.is_backend()) {
+                return fail_closed_response(
+                    "control-plane mutation refused: the backend.kv write sub-op is not held locally — a \
+                     cross-instance data-write relay is the remaining P5-4 work",
+                );
+            }
+
+            // (2) The control plane authorizer MUST be present (control.admin-api held + a trust-root
+            // verifier resolved at stand-up). Its ABSENCE fail-closes (compile-enforced missing-verifier).
+            let Some(control) = self.control.as_ref() else {
+                return fail_closed_response(
+                    "control-plane mutation refused: this instance holds backend.kv but no control-plane \
+                     authorizer (no control.admin-api authority, or no public trust root to re-validate \
+                     the end principal) — fail-closed (no verifier, no serve)",
+                );
+            };
+
+            // (2b) DEFAULT-DENY: a mutation MUST present an end-principal credential (bearer + nonce + PoP).
+            let Some(cred) = credential else {
+                tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: no end-principal credential relayed (default-deny)");
+                return fail_closed_response(
+                    "control-plane mutation refused: no end-principal credential relayed (a bearer \
+                     context token, a per-call nonce, and a proof-of-possession are REQUIRED — \
+                     default-deny)",
+                );
+            };
+
+            // The op must be a recognized, served deploy/routing mutation (default-deny on an unmapped
+            // path — never guess an unmapped mutation into a write).
+            let required_right = match op.required_right() {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(%host, op = ?op, "[privsep] node-self-host control mutation REFUSED: unmapped/unsupported control-plane op (default-deny)");
+                    return fail_closed_response(
+                        "control-plane mutation refused: the request path is not a recognized, served \
+                         deploy/routing operation (default-deny — the full /api/* map is the remaining work)",
+                    );
+                }
+            };
+
+            let now = now_unix();
+
+            // (2c) END-PRINCIPAL VERIFICATION (requirement #1), re-validated EVERY call. The PoP binds to
+            // THIS exact mutation (op + method + path + the request Host) so a frontend RCE can neither
+            // assert authority it cannot prove nor forge/replay a different mutation under an observed
+            // context. `VerifiedPrincipal` is the SOLE principal path.
+            let pop_req_bytes = control_mutation_pop_bytes(&cred.method, &cred.path, &host);
+            let binding = AuthorityPopBinding {
+                op: CONTROL_MUTATION_POP_OP,
+                context_token: &cred.token,
+                nonce: cred.nonce,
+                request_bytes: &pop_req_bytes,
+            };
+            let context = AuthorityContext::from_token(cred.token.clone());
+            let principal = match control
+                .verifier
+                .verify_context_and_pop(&context, &cred.pop, now, &binding)
+            {
+                Ok(p) => p,
+                Err(rejection) => {
+                    tracing::warn!(%host, reason = %rejection.reason(), "[privsep] node-self-host control mutation REFUSED: end-principal did not re-validate (fail-closed)");
+                    return fail_closed_response(&format!(
+                        "control-plane mutation refused: end-principal verification failed ({})",
+                        rejection.reason()
+                    ));
+                }
+            };
+
+            // (3) Anti-replay (mechanism (b)): a verbatim (cti, nonce) replay / saturation is refused.
+            let cti = principal.token().cti.clone();
+            if control.replay.check_and_record(&cti, cred.nonce, now) != ReplayDecision::Fresh {
+                tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: anti-replay (duplicate nonce or cache saturated)");
+                return fail_closed_response(
+                    "control-plane mutation refused: anti-replay (duplicate call or cache saturated)",
+                );
+            }
+
+            // (4) `control.admin-api` AUTHORIZATION, DEFAULT-DENY: the verified principal must hold the
+            // required control-plane Right for the op's target, per the node's REAL RBAC.
+            let policy = match self.data_plane.load_authz_policy().await {
+                Ok(p) => p,
+                Err(why) => {
+                    tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation REFUSED: authz policy unavailable (fail-closed)");
+                    return fail_closed_response(&format!(
+                        "control-plane mutation refused: authz policy unavailable ({why})"
+                    ));
+                }
+            };
+            let granted = policy.rights_for(&principal.token().roles);
+            if !granted.allows(&required_right) {
+                tracing::warn!(
+                    %host, principal = %principal.principal_id(), required = ?required_right,
+                    "[privsep] node-self-host control mutation REFUSED: the verified principal is not \
+                     authorized for this control-plane mutation (default-deny)"
+                );
+                return fail_closed_response(&format!(
+                    "control-plane mutation refused: the verified principal is not authorized for {} \
+                     (default-deny)",
+                    required_right.resource
+                ));
+            }
+
+            // (5) `backend.kv` WRITE: apply the deploy/routing-store mutation + confirm it landed.
+            match self.data_plane.apply_control_op(&op).await {
+                Ok(summary) => {
+                    tracing::info!(
+                        %host, principal = %principal.principal_id(),
+                        "[privsep] node-self-host control mutation SERVED: authorized deploy/routing \
+                         write landed under the backend.kv Landlock profile ({summary})"
+                    );
+                    boatramp_http::response(
+                        200,
+                        format!(
+                            "boatramp privsep node-self-host control plane: authorized mutation served \
+                             ({summary})\n"
+                        )
+                        .into_bytes(),
+                    )
+                }
+                Err(why) => {
+                    tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation: the authorized write failed — refusing fail-closed");
+                    fail_closed_response(&format!(
+                        "control-plane mutation refused: the authorized deploy/routing write failed \
+                         ({why})"
+                    ))
+                }
+            }
         }
+    }
+
+    /// The end-principal credential a control-plane mutation carries, extracted from the HTTP request
+    /// headers SYNCHRONOUSLY (before any await, since the request is not `Sync`). All three parts are
+    /// REQUIRED (default-deny — [`NodeServeHandler::serve_control_mutation`] refuses a `None`): a signed
+    /// bearer CONTEXT token, a per-call NONCE, and a per-call proof-of-possession (PoP). The `method` +
+    /// `path` are captured too (the PoP binds to them via [`control_mutation_pop_bytes`], so a captured
+    /// proof cannot be re-paired with a different method / path).
+    pub(super) struct ControlMutationCredential {
+        pub token: String,
+        pub nonce: u128,
+        pub pop: String,
+        pub method: String,
+        pub path: String,
+    }
+
+    /// The HTTP headers the node's own `/api/*` end principal relays its credential in (design §4 item
+    /// 6). `Authorization: Bearer <token>` is the standard bearer; the per-call nonce + PoP ride in
+    /// `boatramp-privsep-*` headers (lower-case per HTTP/2). These mirror the WS-E [`AuthorityCall`]
+    /// fields over HTTP — there is no asserted-id field, only the signed, PoP-bound credential.
+    const CONTROL_POP_NONCE_HEADER: &str = "boatramp-privsep-nonce";
+    const CONTROL_POP_HEADER: &str = "boatramp-privsep-pop";
+
+    /// Extract the end-principal credential from a control-plane mutation request (synchronous — no
+    /// await; the request is not `Sync`). Returns `None` (⇒ default-deny 503) unless ALL of a bearer
+    /// context token, a well-formed per-call nonce, and a PoP are present. The `method`/`path` are the
+    /// request's own, captured for the PoP binding.
+    fn extract_control_credential(
+        req: &boatramp_http::Request,
+    ) -> Option<ControlMutationCredential> {
+        let header = |name: &str| -> Option<String> {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        };
+        let token = header("authorization").and_then(|v| {
+            // `Bearer <token>` (case-insensitive scheme), else the bare value.
+            v.split_once(' ')
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .map(|(_, tok)| tok.trim().to_string())
+                .filter(|t| !t.is_empty())
+        })?;
+        let nonce = header(CONTROL_POP_NONCE_HEADER).and_then(|v| v.parse::<u128>().ok())?;
+        let pop = header(CONTROL_POP_HEADER)?;
+        Some(ControlMutationCredential {
+            token,
+            nonce,
+            pop,
+            method: req.method().as_str().to_string(),
+            path: req.uri().path().to_string(),
+        })
     }
 
     impl boatramp_http::Handler for NodeServeHandler {
@@ -4609,8 +5016,14 @@ mod instance_serve {
             // `&Request` is held across the await (the `Handler::handle` future must be `Send`).
             let plan = classify_request(&req);
             let host = request_host(&req);
+            // The end-principal credential only matters for a mutation; extracting it unconditionally is
+            // cheap and keeps the sync/await boundary in one place. A read ignores it.
+            let credential = match &plan {
+                RequestPlan::ControlMutation(_) => extract_control_credential(&req),
+                RequestPlan::Read(_) => None,
+            };
             drop(req);
-            self.serve_request(plan, host).await
+            self.serve_request(plan, host, credential).await
         }
     }
 
@@ -4718,7 +5131,10 @@ mod instance_serve {
         /// sole job is to prove the `backend.kv` Landlock MUTATION surface before the instance serves a
         /// byte, so a sandbox that denies a write FailNodeCloses the node LOUDLY at boot rather than
         /// silently refusing every future control-plane write.
-        pub(super) async fn validate_write_plane(&self) -> WriteOutcome {
+        pub(super) async fn validate_write_plane(
+            &self,
+            gc_min_age: std::time::Duration,
+        ) -> WriteOutcome {
             let store = match self {
                 Self::Deploy(store) => store,
                 // A non-`backend.kv` instance has no write plane to validate — the gate never routes a
@@ -4758,12 +5174,14 @@ mod instance_serve {
             }
             // (3) Online maintenance GC: list + delete over the `wal/`/`compacted/`/`manifest/`/
             //     `compactions/` subtrees (via `kv_physical_stats` + `kv_gc_online`) — the compaction/GC
-            //     object-store surface a read never touches. `min_age = 0` is PROBE-ONLY and safe here:
-            //     the `backend.kv` instance is the SOLE writer and this runs at stand-up BEFORE any
-            //     client is served, so no reader can be mid-scan on a young object — which maximizes
-            //     coverage by making the just-superseded v1 object eligible for deletion (exercising the
-            //     GC delete path, not just the directory walk).
-            if let Err(e) = kv.maintenance_gc(std::time::Duration::from_secs(0)).await {
+            //     object-store surface a read never touches. `gc_min_age` is the caller's LOW-1-gated
+            //     age (see `probe_gc_min_age`): `0` ONLY for the confirmed-local, sole-writer SlateDB
+            //     control store (the P5-2/P5-3 wired shape), which makes the just-superseded v1 object
+            //     eligible for the GC DELETE pass (exercising the delete path, not just the directory
+            //     walk — the Landlock mutation-syscall coverage this probe exists for); the node's
+            //     never-zero `gc_min_age()` floor otherwise, so a (future) shared/clustered store never
+            //     reclaims an object a reader replica could be mid-scan on.
+            if let Err(e) = kv.maintenance_gc(gc_min_age).await {
                 return WriteOutcome::Unavailable(format!("control-plane maintenance GC: {e}"));
             }
             // (4) Durable delete (tombstone + checkpoint) — leave the control-plane store clean. A
@@ -4773,6 +5191,111 @@ mod instance_serve {
                 return WriteOutcome::Unavailable(format!("control-plane durable delete: {e}"));
             }
             WriteOutcome::Applied
+        }
+
+        /// Load the node's RBAC [`AuthzPolicy`] from the HELD control-plane KV ([`POLICY_KEY`]), for the
+        /// `control.admin-api` authorize decision (P5-3-serve). Mirrors the monolith's source
+        /// (`crate::auth`): the stored policy, else [`AuthzPolicy::default_policy`] when ABSENT. A present
+        /// but MALFORMED policy is FAIL-CLOSED (`Err`) — never silently fall back to the default, which
+        /// could be more permissive than the operator's real (unparseable) policy. A `Refusing` plane has
+        /// no KV → `Err` (a non-`backend.kv` instance cannot authorize). (The Cedar policy-doc deny/allow
+        /// OVERLAY — the monolith's `CompiledCedar` decision — is the surfaced remaining binding; this
+        /// cut decides on the role→rights expansion, the common default-deny core.)
+        pub(super) async fn load_authz_policy(&self) -> Result<AuthzPolicy, String> {
+            let store = match self {
+                Self::Deploy(store) => store,
+                Self::Refusing => {
+                    return Err("this instance holds no backend.kv control-plane store".into());
+                }
+            };
+            match store.kv().get(POLICY_KEY).await {
+                Ok(Some(bytes)) => serde_json::from_slice::<AuthzPolicy>(&bytes).map_err(|e| {
+                    format!(
+                        "authz/policy is present but malformed (fail-closed, not defaulted): {e}"
+                    )
+                }),
+                Ok(None) => Ok(AuthzPolicy::default_policy()),
+                Err(e) => Err(format!(
+                    "reading authz/policy from the control-plane KV: {e}"
+                )),
+            }
+        }
+
+        /// Apply an AUTHORIZED deploy/routing-store mutation (P5-3-serve step 5) and CONFIRM it landed
+        /// (read-back), returning a non-secret summary for the log / response. The write goes through the
+        /// held [`DeployStore`] typed API (a REAL control-plane routing mutation, under the `backend.kv`
+        /// Landlock profile), so the P5-2 read plane resolves (upsert) / stops resolving (delete) the
+        /// host afterwards. Only the recognized routing ops reach here (the handler refuses an unmapped /
+        /// mint op before authorization); any other op is a defensive `Err`.
+        pub(super) async fn apply_control_op(&self, op: &ControlOp) -> Result<String, String> {
+            let store = match self {
+                Self::Deploy(store) => store,
+                Self::Refusing => {
+                    return Err("this instance holds no backend.kv control-plane store".into());
+                }
+            };
+            match op {
+                ControlOp::RoutingUpsert {
+                    project,
+                    site,
+                    host,
+                } => {
+                    let project_ref = ProjectRef::new(project);
+                    let mut cfg = store
+                        .get_site_config(project_ref, site)
+                        .await
+                        .map_err(|e| format!("reading the current site config: {e}"))?
+                        .unwrap_or_default();
+                    if !cfg.domains.exact_hosts().any(|h| h == host.as_str()) {
+                        cfg.domains.aliases.push(host.clone());
+                    }
+                    store
+                        .set_site_config(project_ref, site, &cfg)
+                        .await
+                        .map_err(|e| format!("registering the routing entry: {e}"))?;
+                    // Read-back CONFIRM: the host now resolves to an owner (the write landed durably).
+                    match store.resolve_site_by_host(host).await {
+                        Ok(Some(_)) => Ok(format!("routing upsert {host} -> {project}/{site}")),
+                        Ok(None) => Err(format!(
+                            "routing upsert for {host} did not resolve on read-back (write not durable?)"
+                        )),
+                        Err(e) => Err(format!("confirming the routing upsert: {e}")),
+                    }
+                }
+                ControlOp::RoutingDelete {
+                    project,
+                    site,
+                    host,
+                } => {
+                    let project_ref = ProjectRef::new(project);
+                    let mut cfg = store
+                        .get_site_config(project_ref, site)
+                        .await
+                        .map_err(|e| format!("reading the current site config: {e}"))?
+                        .unwrap_or_default();
+                    cfg.domains.primary = cfg.domains.primary.filter(|p| p != host);
+                    cfg.domains.aliases.retain(|a| a != host);
+                    store
+                        .set_site_config(project_ref, site, &cfg)
+                        .await
+                        .map_err(|e| format!("removing the routing entry: {e}"))?;
+                    // Read-back CONFIRM: the host no longer resolves to THIS owner.
+                    match store.resolve_site_by_host(host).await {
+                        Ok(None) => Ok(format!("routing delete {host} from {project}/{site}")),
+                        Ok(Some(owner)) if owner.project != *project || owner.site != *site => {
+                            Ok(format!("routing delete {host} from {project}/{site}"))
+                        }
+                        Ok(Some(_)) => Err(format!(
+                            "routing delete for {host} still resolves to {project}/{site} on read-back"
+                        )),
+                        Err(e) => Err(format!("confirming the routing delete: {e}")),
+                    }
+                }
+                ControlOp::CrownMint | ControlOp::Unsupported => Err(format!(
+                    "apply_control_op reached for a non-served op {op:?} (a bug — the handler refuses \
+                     these before the write)"
+                )),
+            }
         }
     }
 
@@ -4787,37 +5310,165 @@ mod instance_serve {
         /// A SAFE READ (`GET`/`HEAD`): one sub-op — the `backend.kv` public data-plane read surface
         /// (the host→deploy map). Served by the P5-2 read plane when the surface is HELD.
         Read(HostAuthority),
-        /// A control-plane MUTATION (any non-safe method). Decomposed (INFO-2) into its two sub-ops: the
-        /// `control.admin-api` AUTHORIZATION surface (the end-principal authz + orchestration) and the
-        /// `backend.kv` data-WRITE surface (the durable control-plane store mutation). BOTH must be
-        /// satisfiable (held locally, or soundly reachable) or the whole request fails closed. The
-        /// served, authorized mutation is the remaining P5-3 work; the write surface ITSELF is proven
-        /// under the sandbox by the boot write-plane self-validation ([`NodeDataPlane::validate_write_plane`]).
-        ControlMutation {
-            /// The authorization / orchestration sub-op — `control.admin-api`.
-            authorize: HostAuthority,
-            /// The data-write sub-op — `backend.kv` (the control-plane deploy/routing store).
-            write: HostAuthority,
-        },
+        /// A control-plane MUTATION (any non-safe method). Decomposed (INFO-2) into its per-authority
+        /// sub-ops: the `control.admin-api` AUTHORIZATION surface (the end-principal authz +
+        /// orchestration), the `backend.kv` data-WRITE surface (the durable control-plane store
+        /// mutation), and — for a mint/sign-shaped op (requirement #3) — a group-A crown-jewel
+        /// `mint`/`sign` sub-op. ALL present sub-ops must be satisfiable (held locally, or soundly
+        /// reachable) or the whole request fails closed (INFO-2/INFO-3). The deploy/routing authorized
+        /// mutation is served by [`NodeServeHandler::serve_control_mutation`] (P5-3-serve); a crown-jewel
+        /// relay stays fail-closed pending the P5-4 relay client (but is INFO-1-verified by `route`).
+        ControlMutation(ControlMutation),
     }
 
-    /// Classify a request into its per-authority [`RequestPlan`] decomposition. A safe method
-    /// (`GET`/`HEAD`) is a single-sub-op `backend.kv` READ; any other (mutating) method is a
-    /// control-plane MUTATION decomposed into the `control.admin-api` authorization + the `backend.kv`
-    /// data-write sub-ops (INFO-2). Deliberately COARSE on the method axis — the full method/path →
-    /// operation map (and a mint/sign operation's additional crown-jewel sub-op) is a P5-3+ follow-on;
-    /// this cut needs the read-vs-mutation split + the mutation's two-authority decomposition. Pure
-    /// (host-testable).
+    /// The decomposed sub-ops + parsed operation of a control-plane [`RequestPlan::ControlMutation`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct ControlMutation {
+        /// The authorization / orchestration sub-op — always `control.admin-api`. For the served
+        /// deploy/routing mutation this is held LOCALLY and performs the end-principal authz decision;
+        /// a cross-instance authorize relay (to a `control.admin-api` WS-E grammar endpoint) is P5-4.
+        pub authorize: HostAuthority,
+        /// The data-write sub-op — `backend.kv` (the control-plane deploy/routing store).
+        pub write: HostAuthority,
+        /// A group-A CROWN-JEWEL `mint`/`sign` sub-op for a mint/sign-shaped op (requirement #3 — e.g. a
+        /// `token.signer` mint), or `None` for a plain routing/deploy mutation. When present it is routed
+        /// over the INFO-1-verified grammar endpoint (never a raw splice) and, this cut, fails closed
+        /// (the relay client is P5-4).
+        pub mint: Option<HostAuthority>,
+        /// The parsed `/api/*` operation the write sub-op applies (the deploy/routing store mutation, or
+        /// an unmapped/mint-shaped op the deploy/routing serve path does not apply).
+        pub op: ControlOp,
+    }
+
+    /// The recognized `/api/*` control-plane operation a mutation names (requirement #3 — the
+    /// method/path → operation map). Deliberately NARROW for the P5-3-serve first piece: the
+    /// deploy/routing-store create/update/delete, plus a mint/sign SHAPE recognizer (not served). The
+    /// full `/api/*` surface + the Cedar policy-doc overlay + the other authority-state mutations
+    /// (`backend.sql`/`blob`/`messaging`, `acme.dns-control`) are the surfaced remaining work.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum ControlOp {
+        /// Create/update a host→`(project, site)` routing entry:
+        /// `PUT`/`POST /api/routing/<project>/<site>/<host>`. The authorized write the first piece
+        /// serves — a real deploy/routing-store mutation readable back via the P5-2 read plane.
+        RoutingUpsert {
+            project: String,
+            site: String,
+            host: String,
+        },
+        /// Remove a host routing entry: `DELETE /api/routing/<project>/<site>/<host>`.
+        RoutingDelete {
+            project: String,
+            site: String,
+            host: String,
+        },
+        /// A recognized mint/sign-SHAPED op (e.g. `POST /api/tokens`) — adds the crown-jewel `mint`
+        /// sub-op to the decomposition (requirement #3). NOT served this cut (the crown-jewel relay
+        /// client is P5-4); it is classified so the decomposition + INFO-1 routing are exercised.
+        CrownMint,
+        /// An unmapped / unsupported control-plane path — DEFAULT-DENY: a mutation the method/path map
+        /// does not recognize is refused fail-closed, never guessed into a write.
+        Unsupported,
+    }
+
+    impl ControlOp {
+        /// The `(project, site)` routing target this op mutates, when it is a routing op.
+        fn routing_target(&self) -> Option<(&str, &str, &str)> {
+            match self {
+                Self::RoutingUpsert {
+                    project,
+                    site,
+                    host,
+                }
+                | Self::RoutingDelete {
+                    project,
+                    site,
+                    host,
+                } => Some((project.as_str(), site.as_str(), host.as_str())),
+                Self::CrownMint | Self::Unsupported => None,
+            }
+        }
+
+        /// The control-plane [`Right`] the verified end principal MUST hold for this op (the
+        /// `control.admin-api` authorize decision — DEFAULT-DENY). A routing mutation requires
+        /// `Site·Write` scoped to the `<project>/<site>` target; an unmapped / mint op has no served
+        /// right here (it fails closed before the authz check). This is the node's REAL RBAC `Right`
+        /// shape ([`boatramp_core::authz`]); the full Cedar policy-doc decision is the surfaced remaining
+        /// binding.
+        fn required_right(&self) -> Option<Right> {
+            self.routing_target().map(|(project, site, _host)| {
+                Right::new(
+                    Resource::Site,
+                    Some(format!("{project}/{site}")),
+                    Action::Write,
+                )
+            })
+        }
+    }
+
+    /// Classify a request into its per-authority [`RequestPlan`] decomposition + the recognized
+    /// [`ControlOp`]. A safe method (`GET`/`HEAD`) is a single-sub-op `backend.kv` READ; a mutating
+    /// method maps its `/api/*` path to a [`ControlOp`] and decomposes into `control.admin-api`
+    /// authorize + `backend.kv` write (+ a crown-jewel `mint` sub-op for a mint/sign op — requirement
+    /// #3), per INFO-2. The method/path map is NARROW (the deploy/routing create/update/delete + a mint
+    /// shape); an unmapped mutation is [`ControlOp::Unsupported`] (default-deny). Pure (host-testable).
     pub(super) fn classify_request(req: &boatramp_http::Request) -> RequestPlan {
         let method = req.method().as_str();
         if matches!(method, "GET" | "HEAD") {
-            RequestPlan::Read(HostAuthority::BackendKv)
-        } else {
-            RequestPlan::ControlMutation {
-                authorize: HostAuthority::ControlAdminApi,
-                write: HostAuthority::BackendKv,
-            }
+            return RequestPlan::Read(HostAuthority::BackendKv);
         }
+        let (op, mint) = classify_control_op(method, req.uri().path());
+        RequestPlan::ControlMutation(ControlMutation {
+            authorize: HostAuthority::ControlAdminApi,
+            write: HostAuthority::BackendKv,
+            mint,
+            op,
+        })
+    }
+
+    /// Map a mutating `(method, path)` to its [`ControlOp`] + optional crown-jewel `mint` sub-op. The
+    /// deploy/routing map: `PUT`/`POST /api/routing/<project>/<site>/<host>` ⇒ upsert, `DELETE` ⇒
+    /// delete; a mint/sign shape (`POST /api/tokens`) ⇒ [`ControlOp::CrownMint`] + a `token.signer`
+    /// sub-op; everything else ⇒ [`ControlOp::Unsupported`] (default-deny). Segments are percent-literal
+    /// (no decode) and must be non-empty. Pure (host-testable).
+    fn classify_control_op(method: &str, path: &str) -> (ControlOp, Option<HostAuthority>) {
+        let segs: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        // `/api/routing/<project>/<site>/<host>`
+        if let ["api", "routing", project, site, host] = segs.as_slice() {
+            let (project, site, host) = (
+                (*project).to_string(),
+                (*site).to_string(),
+                (*host).to_string(),
+            );
+            return match method {
+                "PUT" | "POST" => (
+                    ControlOp::RoutingUpsert {
+                        project,
+                        site,
+                        host,
+                    },
+                    None,
+                ),
+                "DELETE" => (
+                    ControlOp::RoutingDelete {
+                        project,
+                        site,
+                        host,
+                    },
+                    None,
+                ),
+                _ => (ControlOp::Unsupported, None),
+            };
+        }
+        // A mint/sign SHAPE: `POST /api/tokens` mints a control-plane token — the decomposition gains a
+        // `token.signer` crown-jewel sub-op (requirement #3). Not served this cut (relay client = P5-4).
+        if method == "POST" && matches!(segs.as_slice(), ["api", "tokens"]) {
+            return (ControlOp::CrownMint, Some(HostAuthority::TokenSigner));
+        }
+        (ControlOp::Unsupported, None)
     }
 
     /// Extract the request `Host` (HTTP/1.1 `Host` header, else the HTTP/2 `:authority`), lowercased
@@ -6998,10 +7649,12 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
     // exercise the routing DECISION and the drop-in HANDLER shape in isolation on the host. The full
     // self-host serve path stays REFUSED fail-closed at the root gate and on the `#[ignore]` live gate.
 
-    /// The P5-1 router routes ONLY to held authorities and relays everything else — the
-    /// "construct-only-what-you-hold" discipline (design §4 item 5), proven structurally:
+    /// The P5-1/P5-3 router routes ONLY to held authorities and relays everything else — the
+    /// "construct-only-what-you-hold" discipline (design §4 item 5) + the INFO-1 crown-jewel-endpoint
+    /// guard, proven structurally:
     /// - a HELD surface ⇒ `Local` (served in-process);
-    /// - a non-held CROWN-JEWEL (group A) reachable over a link ⇒ `RelayCrownJewel` (WS-E grammar);
+    /// - a non-held CROWN-JEWEL (group A) reachable over a VERIFIED `serve_authority` grammar endpoint ⇒
+    ///   `RelayCrownJewel` (WS-E grammar); a crown jewel reachable ONLY over a splice ⇒ `Refuse` (INFO-1);
     /// - any other non-held authority reachable over a link ⇒ `RelayBackend` (typed backend request);
     /// - a non-held, UNREACHABLE surface ⇒ `Refuse` fail-closed (a composition-closure bug).
     #[cfg(unix)]
@@ -7009,15 +7662,20 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
     fn p5_1_node_router_serves_held_relays_the_rest_refuses_unreachable() {
         use super::instance_serve::{NodeRoute, NodeServeRouter};
 
-        // This instance HOLDS backend.kv only; it can REACH the signer (crown jewel, group A), the
-        // blob backend (group B) and the control plane (group E) over named root-wired links.
+        // This instance HOLDS backend.kv only; it can REACH the blob backend (group B) and the control
+        // plane (group E) over named backend links, and the signer (crown jewel, group A) over a
+        // VERIFIED authority-serve grammar endpoint.
         let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
         let reachable = BTreeMap::from([
-            (HostAuthority::TokenSigner, "to-signer".to_string()),
             (HostAuthority::BackendBlob, "to-blob".to_string()),
             (HostAuthority::ControlAdminApi, "to-control".to_string()),
+            // A crown jewel ALSO appearing in the splice reachability map (e.g. a mis-marked link): it
+            // must NOT be relayed as a crown jewel unless it is ALSO a verified grammar endpoint (INFO-1).
+            (HostAuthority::ImageSigner, "to-splice".to_string()),
         ]);
-        let router = NodeServeRouter::new(&gate, reachable);
+        let authority_serve =
+            BTreeMap::from([(HostAuthority::TokenSigner, "to-signer".to_string())]);
+        let router = NodeServeRouter::new(&gate, reachable, authority_serve);
 
         // HELD ⇒ served locally; it is NEVER relayed.
         assert_eq!(
@@ -7026,14 +7684,23 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             "a HELD authority must be served locally (construct-only-what-you-hold)"
         );
 
-        // Non-held crown jewel (group A) reachable over a link ⇒ the WS-E crown-jewel grammar relay.
+        // Non-held crown jewel reachable over a VERIFIED grammar endpoint ⇒ the WS-E crown-jewel relay.
         assert_eq!(
             router.route(HostAuthority::TokenSigner),
             NodeRoute::RelayCrownJewel {
                 authority: HostAuthority::TokenSigner,
                 link: "to-signer".to_string(),
             },
-            "a non-held crown jewel relays over the WS-E authority grammar, never served locally"
+            "a non-held crown jewel relays over its VERIFIED WS-E grammar endpoint, never served locally"
+        );
+
+        // INFO-1: a crown jewel reachable ONLY over a splice (present in `reachable`, absent from the
+        // authority-serve endpoint map) is REFUSED — never relayed to a raw backend socket.
+        assert_eq!(
+            router.route(HostAuthority::ImageSigner),
+            NodeRoute::Refuse(HostAuthority::ImageSigner),
+            "a crown jewel with no verified serve_authority grammar endpoint must be refused (INFO-1), \
+             never relayed over a splice"
         );
 
         // Non-held data-holder (group B) reachable over a link ⇒ a typed backend request relay.
@@ -7076,13 +7743,22 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         // shared link (so no surface is `Refuse` — isolating the hold-vs-relay invariant).
         let held = [HostAuthority::SecretsSealer, HostAuthority::BackendKv];
         let gate = MaterializationGate::new(&held);
+        // Non-held NON-crown authorities are reachable over a backend link; non-held CROWN jewels over a
+        // VERIFIED authority-serve grammar endpoint (INFO-1) — so no surface is `Refuse` and the
+        // hold-vs-relay invariant is isolated (a crown jewel only ever relays over its grammar endpoint).
         let reachable: BTreeMap<HostAuthority, String> = HostAuthority::ALL
             .iter()
             .copied()
-            .filter(|a| !held.contains(a))
+            .filter(|a| !held.contains(a) && !a.is_crown_jewel())
             .map(|a| (a, "to-peer".to_string()))
             .collect();
-        let router = NodeServeRouter::new(&gate, reachable);
+        let authority_serve: BTreeMap<HostAuthority, String> = HostAuthority::ALL
+            .iter()
+            .copied()
+            .filter(|a| !held.contains(a) && a.is_crown_jewel())
+            .map(|a| (a, "to-grammar".to_string()))
+            .collect();
+        let router = NodeServeRouter::new(&gate, reachable, authority_serve);
 
         for &a in HostAuthority::ALL {
             let route = router.route(a);
@@ -7175,8 +7851,9 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             Arc::new(MemoryKv::new()),
         );
         let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
-        let router = NodeServeRouter::new(&gate, BTreeMap::new());
-        let handler = NodeServeHandler::new(router, NodeDataPlane::Deploy(store));
+        let router = NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new());
+        // A pure data-holder (no control.admin-api) ⇒ no control plane authorizer (reads need none).
+        let handler = NodeServeHandler::new(router, NodeDataPlane::Deploy(store), None);
 
         // Two GETs (distinct hosts) → the router classifies each → `Local(backend.kv)` → a REAL
         // `resolve_site_by_host` read against the empty store → 404 from the read plane. A real read
@@ -7218,8 +7895,9 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         //     a `Refusing` placeholder is fine.
         let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
         let handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, BTreeMap::new()),
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
             NodeDataPlane::Refusing,
+            None,
         );
         let resp = p5_2_roundtrip(
             handler,
@@ -7232,16 +7910,18 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             &resp[..resp.len().min(80)]
         );
 
-        // (a2) WRITE, both sub-ops satisfiable but SERVE not wired — a data-holder holding BOTH
+        // (a2) WRITE, both sub-ops held but NO control-plane authorizer — a data-holder holding BOTH
         //      backend.kv AND control.admin-api routes both sub-ops `Local`, yet a client mutation STILL
-        //      fails closed 503 (the served authorized mutation — end-principal re-validation + the
-        //      crown-jewel relay — is the remaining P5-3 work; an unauthenticated client never drives a
-        //      control-plane write here).
+        //      fails closed 503: this handler was built with `control = None` (no trust-root verifier), so
+        //      the compile-enforced missing-verifier refuse fires (a mutation that finds no authorizer
+        //      can never serve). (A built control plane + a valid credential is the positive host test
+        //      `p5_3_serve_authorized_mutation_*` + the lighthouse live gate.)
         let gate =
             MaterializationGate::new(&[HostAuthority::BackendKv, HostAuthority::ControlAdminApi]);
         let handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, BTreeMap::new()),
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
             NodeDataPlane::Refusing,
+            None,
         );
         let resp = p5_2_roundtrip(
             handler,
@@ -7250,8 +7930,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         .await;
         assert!(
             resp.starts_with("HTTP/1.1 503"),
-            "a client control mutation must fail closed even when both sub-ops are held (serve is not \
-             wired), got: {:?}",
+            "a client control mutation must fail closed when there is no control-plane verifier, got: {:?}",
             &resp[..resp.len().min(80)]
         );
 
@@ -7260,8 +7939,9 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         let gate = MaterializationGate::new(&[HostAuthority::ControlAdminApi]);
         let reachable = BTreeMap::from([(HostAuthority::BackendKv, "to-data".to_string())]);
         let handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, reachable),
+            NodeServeRouter::new(&gate, reachable, BTreeMap::new()),
             NodeDataPlane::Refusing,
+            None,
         );
         let resp = p5_2_roundtrip(
             handler,
@@ -7278,8 +7958,9 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         //     the serve closed, never degrades).
         let gate = MaterializationGate::new(&[HostAuthority::ControlAdminApi]);
         let handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, BTreeMap::new()),
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
             NodeDataPlane::Refusing,
+            None,
         );
         let resp = p5_2_roundtrip(
             handler,
@@ -7293,39 +7974,91 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         );
     }
 
-    /// P5-3 classification decomposes a MUTATION into its per-authority sub-ops (INFO-2): a safe method
-    /// is a single `backend.kv` READ; any mutating method is `{control.admin-api authorize, backend.kv
-    /// write}`. Never a single collapsed "dominant" authority for a mutation. Pure.
+    /// P5-3 classification decomposes a MUTATION into its per-authority sub-ops (INFO-2) + maps the
+    /// `/api/*` path to a [`ControlOp`] (requirement #3): a safe method is a single `backend.kv` READ;
+    /// a deploy/routing mutation is `{control.admin-api authorize, backend.kv write}` with `mint: None`;
+    /// a mint/sign-shaped op ADDS the crown-jewel `mint` sub-op; an unmapped mutation is `Unsupported`
+    /// (default-deny). Never a single collapsed "dominant" authority for a mutation. Pure.
     #[cfg(unix)]
     #[test]
-    fn p5_3_classify_request_decomposes_a_mutation_into_authorize_and_write() {
-        use super::instance_serve::{RequestPlan, classify_request};
+    fn p5_3_classify_request_decomposes_a_mutation_and_maps_the_api() {
+        use super::instance_serve::{ControlMutation, ControlOp, RequestPlan, classify_request};
 
-        let classify = |m: &str| {
+        let classify = |m: &str, uri: &str| {
             let req = http::Request::builder()
                 .method(m)
-                .uri("/")
+                .uri(uri)
                 .body(boatramp_http::ReqBody::empty())
                 .expect("build a test request");
             classify_request(&req)
         };
+
+        // GET/HEAD ⇒ a single-sub-op backend.kv read.
         for m in ["GET", "HEAD"] {
             assert_eq!(
-                classify(m),
+                classify(m, "/anything"),
                 RequestPlan::Read(HostAuthority::BackendKv),
                 "{m} is a single-sub-op backend.kv read"
             );
         }
-        for m in ["POST", "PUT", "DELETE", "PATCH"] {
+
+        // A deploy/routing create/update ⇒ ControlMutation{authorize, write, mint:None, RoutingUpsert}.
+        for m in ["PUT", "POST"] {
             assert_eq!(
-                classify(m),
-                RequestPlan::ControlMutation {
+                classify(m, "/api/routing/acme/blog/node.local"),
+                RequestPlan::ControlMutation(ControlMutation {
                     authorize: HostAuthority::ControlAdminApi,
                     write: HostAuthority::BackendKv,
-                },
-                "{m} is a control mutation decomposed into authorize + write (never collapsed)"
+                    mint: None,
+                    op: ControlOp::RoutingUpsert {
+                        project: "acme".into(),
+                        site: "blog".into(),
+                        host: "node.local".into(),
+                    },
+                }),
+                "{m} /api/routing/.. is a routing upsert decomposed into authorize + write (no mint)"
             );
         }
+
+        // DELETE ⇒ a routing delete.
+        assert_eq!(
+            classify("DELETE", "/api/routing/acme/blog/node.local"),
+            RequestPlan::ControlMutation(ControlMutation {
+                authorize: HostAuthority::ControlAdminApi,
+                write: HostAuthority::BackendKv,
+                mint: None,
+                op: ControlOp::RoutingDelete {
+                    project: "acme".into(),
+                    site: "blog".into(),
+                    host: "node.local".into(),
+                },
+            }),
+            "DELETE /api/routing/.. is a routing delete"
+        );
+
+        // A mint/sign shape ⇒ ADDS the crown-jewel (token.signer) mint sub-op (requirement #3).
+        assert_eq!(
+            classify("POST", "/api/tokens"),
+            RequestPlan::ControlMutation(ControlMutation {
+                authorize: HostAuthority::ControlAdminApi,
+                write: HostAuthority::BackendKv,
+                mint: Some(HostAuthority::TokenSigner),
+                op: ControlOp::CrownMint,
+            }),
+            "POST /api/tokens adds the token.signer crown-jewel sub-op to the decomposition"
+        );
+
+        // An unmapped mutating path ⇒ Unsupported (default-deny — never guessed into a write).
+        assert_eq!(
+            classify("POST", "/"),
+            RequestPlan::ControlMutation(ControlMutation {
+                authorize: HostAuthority::ControlAdminApi,
+                write: HostAuthority::BackendKv,
+                mint: None,
+                op: ControlOp::Unsupported,
+            }),
+            "an unmapped mutation is Unsupported (default-deny)"
+        );
     }
 
     /// P5-3 WRITE PLANE apply-path (host): the boot write-plane self-validation runs the REAL
@@ -7354,8 +8087,13 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             kv.clone(),
         );
         let plane = NodeDataPlane::Deploy(store);
+        // `min_age = 0` (the confirmed-local SlateDB shape, LOW-1) so the just-superseded probe object
+        // is eligible for the GC delete pass — exercising the full round-trip the host test asserts.
         assert!(
-            matches!(plane.validate_write_plane().await, WriteOutcome::Applied),
+            matches!(
+                plane.validate_write_plane(std::time::Duration::ZERO).await,
+                WriteOutcome::Applied
+            ),
             "the control-plane store mutation round-trip must complete (Applied)"
         );
         // The probe key is cleaned up — a healthy node leaves no durable write-plane trace.
@@ -7371,10 +8109,211 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         // A non-backend instance's data plane is `Refusing` → the write-plane validation is a no-op.
         assert!(
             matches!(
-                NodeDataPlane::Refusing.validate_write_plane().await,
+                NodeDataPlane::Refusing
+                    .validate_write_plane(std::time::Duration::ZERO)
+                    .await,
                 WriteOutcome::Applied
             ),
             "a Refusing plane (no backend.kv) self-validates as a no-op"
+        );
+    }
+
+    /// P5-3-serve AUTHZ-CHAIN apply-path (host): the SERVED authorized control-plane mutation + its
+    /// fail-closed negatives, on the REAL `serve_connection` apply path (minus only the fork/sandbox —
+    /// the lighthouse live gate proves the sandbox). A `control.admin-api`+`backend.kv` holder with a
+    /// trust-root verifier:
+    /// - SERVES an AUTHORIZED `PUT /api/routing/<p>/<s>/<host>` (valid cnf-bound role token + a per-call
+    ///   PoP bound to the mutation + the required `publisher` grant) ⇒ 200, and the write LANDS (a
+    ///   follow-up read-plane GET resolves the host);
+    /// - REFUSES (503) a FORGED principal (token signed by a non-trust-root key), a MISSING PoP, and an
+    ///   UNAUTHORIZED principal (valid token, but a role for a DIFFERENT site).
+    ///
+    /// This proves the authz-chain LOGIC (verify → PoP → anti-replay → default-deny authz → write); it
+    /// is NOT the sandbox proof (that is the decisive `#[ignore]` live gate — a host test is a false
+    /// green for the Landlock question, memory `ship-the-fix-not-the-incident`).
+    #[cfg(all(unix, feature = "fs"))]
+    #[tokio::test]
+    async fn p5_3_serve_authorized_mutation_serves_and_fail_closes_the_negatives() {
+        use std::sync::Arc;
+
+        use boatramp_core::authz::GrantedRole;
+        use boatramp_core::cose::{
+            AuthorityPopBinding, Claims, KIND_ROLE, LocalSigner, Signer, TokenAlg,
+            mint_authority_pop, mint_delegatable,
+        };
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::time::now_unix;
+        use boatramp_server::privsep_authority::{
+            CONTROL_MUTATION_POP_OP, ContextVerifier, control_mutation_pop_bytes,
+        };
+        use boatramp_storage::FsStorage;
+
+        use super::instance_serve::{
+            NodeDataPlane, NodeServeHandler, NodeServeRouter, SelfHostControlPlane,
+        };
+
+        // The node's PUBLIC trust root (the `auth_root_public_key` a split control instance carries) +
+        // the end principal's holder key (the key a frontend relay does NOT hold).
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let now = now_unix();
+
+        // A `control.admin-api` + `backend.kv` holder: serves the authorized mutation LOCALLY (both
+        // sub-ops held), with the end-principal verifier from the trust root.
+        let gate =
+            MaterializationGate::new(&[HostAuthority::BackendKv, HostAuthority::ControlAdminApi]);
+        let store = DeployStore::new(
+            Arc::new(FsStorage::new(
+                std::env::temp_dir().join("boatramp-p5-3-serve-inert-blobs"),
+            )),
+            Arc::new(MemoryKv::new()),
+        );
+        let control = SelfHostControlPlane::new(ContextVerifier::new(root.public_key()));
+        let handler = NodeServeHandler::new(
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
+            NodeDataPlane::Deploy(store),
+            Some(control),
+        );
+
+        // The mutation: register `node.local` under `acme/blog`. The transport Host is `node-admin`
+        // (what the PoP binds); the registered domain rides in the path.
+        let method = "PUT";
+        let path = "/api/routing/acme/blog/node.local";
+        let transport_host = "node-admin";
+
+        // Build a PUT request with the end-principal credential headers, for a given token/nonce/pop.
+        let put_req = |token: &str, nonce: u128, pop: &str| -> Vec<u8> {
+            format!(
+                "PUT {path} HTTP/1.1\r\nHost: {transport_host}\r\nauthorization: Bearer {token}\r\n\
+                 boatramp-privsep-nonce: {nonce}\r\nboatramp-privsep-pop: {pop}\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        };
+        // Mint a cnf-bound role token + a per-call PoP bound to THIS mutation, signed by `signer` (the
+        // trust root for a genuine principal, a different key for the forged-principal negative).
+        async fn mint_cred(
+            signer: &LocalSigner,
+            holder: &LocalSigner,
+            role: GrantedRole,
+            nonce: u128,
+            now: u64,
+            req: (&str, &str, &str),
+        ) -> (String, String) {
+            let (method, path, host) = req;
+            let claims = Claims {
+                roles: vec![role],
+                kind: KIND_ROLE.to_string(),
+                ttl_secs: Some(300),
+                now_unix: now,
+            };
+            let token = mint_delegatable(&claims, &holder.public_key(), signer)
+                .await
+                .expect("mint the role token");
+            let req_bytes = control_mutation_pop_bytes(method, path, host);
+            let binding = AuthorityPopBinding {
+                op: CONTROL_MUTATION_POP_OP,
+                context_token: &token,
+                nonce,
+                request_bytes: &req_bytes,
+            };
+            let pop = mint_authority_pop(&binding, holder, now)
+                .await
+                .expect("mint the PoP");
+            (token, pop)
+        }
+
+        // --- POSITIVE: an authorized publisher@acme/blog serves the mutation (200) + the write lands.
+        let (token, pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            1,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&token, 1, &pop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "an AUTHORIZED mutation must serve (200), got:\n{resp}"
+        );
+        assert!(
+            resp.contains("authorized mutation served"),
+            "the 200 body must name the served authorized mutation, got:\n{resp}"
+        );
+        // The write LANDED: the P5-2 read plane now resolves `node.local` (a follow-up GET → 200).
+        let read = p5_2_roundtrip(
+            handler.clone(),
+            b"GET / HTTP/1.1\r\nHost: node.local\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            read.starts_with("HTTP/1.1 200") && read.contains("resolves"),
+            "the authorized write must land + be readable via the read plane (GET resolves), got:\n{read}"
+        );
+
+        // --- NEGATIVE 1: a FORGED principal (token signed by a non-trust-root key) ⇒ 503.
+        let forger = LocalSigner::generate(TokenAlg::Es256);
+        let (ftoken, fpop) = mint_cred(
+            &forger,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            2,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&ftoken, 2, &fpop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("end-principal verification failed"),
+            "a forged principal (not trust-root-signed) must fail closed (503), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 2: a MISSING PoP (no boatramp-privsep-pop header) ⇒ 503 (default-deny).
+        let (token2, _pop2) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            3,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let no_pop = format!(
+            "PUT {path} HTTP/1.1\r\nHost: {transport_host}\r\nauthorization: Bearer {token2}\r\n\
+             boatramp-privsep-nonce: 3\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let resp = p5_2_roundtrip(handler.clone(), &no_pop).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("no end-principal credential"),
+            "a missing PoP must fail closed (503, default-deny), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 3: an UNAUTHORIZED principal (valid token, but a role for a DIFFERENT site) ⇒ 503.
+        let (utoken, upop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/other"),
+            4,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&utoken, 4, &upop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("not authorized"),
+            "an unauthorized principal (role for a different site) must fail closed (503), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 4: a REPLAY of the positive call's (cti, nonce) ⇒ 503 (mechanism (b)). The exact
+        //     accepted call, re-sent, is refused by the anti-replay cache.
+        let replay = p5_2_roundtrip(handler.clone(), &put_req(&token, 1, &pop)).await;
+        assert!(
+            replay.starts_with("HTTP/1.1 503") && replay.contains("anti-replay"),
+            "a verbatim replay of an accepted mutation must be refused (503), got:\n{replay}"
         );
     }
 
@@ -7430,5 +8369,68 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             from_data.get(&HostAuthority::ListenHttpParse),
             Some(&"l".to_string())
         );
+    }
+
+    /// INFO-1: `derive_node_authority_serve_endpoints` maps a non-held CROWN JEWEL to a link ONLY when
+    /// that link provably terminates at the peer's WS-E `serve_authority` grammar endpoint (an
+    /// `authority-serve`-designated link) — NEVER a `Relay` splice, and never a non-crown authority.
+    #[test]
+    fn p5_3_derive_authority_serve_endpoints_requires_a_grammar_link() {
+        // `core` (control.admin-api + backend.kv) reaches `signer` (token.signer) over an AUTHORITY-SERVE
+        // link and `sealer` (secrets.sealer) over a RELAY splice.
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "core".to_string(),
+            inst(
+                &[HostAuthority::ControlAdminApi, HostAuthority::BackendKv],
+                &["grammar", "splice"],
+            ),
+        );
+        instances.insert(
+            "signer".to_string(),
+            inst(&[HostAuthority::TokenSigner], &["grammar"]),
+        );
+        instances.insert(
+            "sealer".to_string(),
+            inst(&[HostAuthority::SecretsSealer], &["splice"]),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(
+            "grammar".to_string(),
+            PrivsepLink {
+                from: "core".to_string(),
+                to: "signer".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::AuthorityServe,
+            },
+        );
+        links.insert(
+            "splice".to_string(),
+            PrivsepLink {
+                from: "core".to_string(),
+                to: "sealer".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::Relay,
+            },
+        );
+        let mut privsep = clean_privsep();
+        privsep.instances = instances;
+        privsep.links = links;
+        let cfg = cfg_with(Some(privsep));
+
+        let endpoints = super::derive_node_authority_serve_endpoints(&cfg, "core");
+        // The crown jewel reachable over the AUTHORITY-SERVE link IS a verified grammar endpoint.
+        assert_eq!(
+            endpoints.get(&HostAuthority::TokenSigner),
+            Some(&"grammar".to_string()),
+            "a crown jewel over an authority-serve link is a verified grammar endpoint"
+        );
+        // The crown jewel reachable ONLY over a RELAY splice is NOT a grammar endpoint (INFO-1).
+        assert!(
+            !endpoints.contains_key(&HostAuthority::SecretsSealer),
+            "a crown jewel reachable only over a Relay splice must NOT be a grammar endpoint (INFO-1)"
+        );
+        // A non-crown authority (control.admin-api) is never in the authority-serve endpoint map.
+        assert!(!endpoints.contains_key(&HostAuthority::ControlAdminApi));
     }
 }

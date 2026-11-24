@@ -801,11 +801,41 @@ impl ContextVerifier {
         call: &AuthorityCall,
         now_unix: u64,
     ) -> Result<VerifiedPrincipal, ContextRejection> {
+        // The PoP binds to the WS-E AuthorityCall shape (op, context token, nonce, serialized request).
+        let req_bytes = request_pop_bytes(&call.request);
+        let binding = AuthorityPopBinding {
+            op: call.request.op_name(),
+            context_token: &call.context.token,
+            nonce: call.nonce,
+            request_bytes: &req_bytes,
+        };
+        self.verify_context_and_pop(&call.context, &call.pop, now_unix, &binding)
+    }
+
+    /// RE-VALIDATE a relayed context TOKEN ([`verify_context`](Self::verify_context)) AND a per-call
+    /// **proof-of-possession** bound to `binding`, returning the VERIFIED principal or a fail-closed
+    /// [`ContextRejection`]. **The shared core of [`verify_call`] (the WS-E [`AuthorityCall`] relay) and
+    /// the Phase-5 node-self-host control-plane mutation path** (design §4 item 6 — the node's own
+    /// `/api/*` mutations carry the same verified context + per-call PoP the WS-E grammar requires). Both
+    /// go through the IDENTICAL token re-validation (`cose::verify` signature + `exp` + the tightened
+    /// freshness bound + cnf-present + not-an-authority-output) and the IDENTICAL per-call PoP check
+    /// against the context token's OWN `cnf` — differing ONLY in the `binding` the PoP is checked
+    /// against (the WS-E request, or the HTTP mutation's `(op, method, path, host)` —
+    /// [`control_mutation_pop_bytes`]). There is NO verify path that skips the PoP: a context lacking a
+    /// `cnf`, or a call lacking a valid PoP, is refused fail-closed, so a frontend RCE can neither assert
+    /// authority it cannot prove nor forge a new call under an observed context.
+    pub fn verify_context_and_pop(
+        &self,
+        context: &AuthorityContext,
+        pop: &str,
+        now_unix: u64,
+        binding: &AuthorityPopBinding<'_>,
+    ) -> Result<VerifiedPrincipal, ContextRejection> {
         // (token) re-validate the context token first — this also enforces cnf-present + not-an-output.
-        let principal = self.verify_context(&call.context, now_unix)?;
+        let principal = self.verify_context(context, now_unix)?;
 
         // (c.1) a PoP MUST be relayed — fail-closed on an absent one.
-        if call.pop.is_empty() {
+        if pop.is_empty() {
             return Err(ContextRejection::MissingPop);
         }
 
@@ -818,19 +848,39 @@ impl ContextVerifier {
         let holder = TokenPublicKey::from_hex(cnf)
             .map_err(|e| ContextRejection::PopUnverifiable(format!("malformed holder key: {e}")))?;
 
-        // (c.3) re-verify the PoP against the holder, bound to THIS exact call.
-        let req_bytes = request_pop_bytes(&call.request);
-        let binding = AuthorityPopBinding {
-            op: call.request.op_name(),
-            context_token: &call.context.token,
-            nonce: call.nonce,
-            request_bytes: &req_bytes,
-        };
-        cose::verify_authority_pop(&call.pop, &holder, now_unix, &binding)
+        // (c.3) re-verify the PoP against the holder, bound to THIS exact call/mutation.
+        cose::verify_authority_pop(pop, &holder, now_unix, binding)
             .map_err(|e| ContextRejection::PopUnverifiable(e.to_string()))?;
 
         Ok(principal)
     }
+}
+
+/// The op name bound into a Phase-5 node-self-host control-plane mutation's authority-call PoP (design
+/// §4 item 6). Distinct from every WS-E crown-jewel [`AuthorityRequest::op_name`] so a PoP minted for a
+/// crown-jewel call can NEVER be replayed as a control-plane mutation (nor vice-versa): the PoP binds
+/// `op`, and [`cose::verify_authority_pop`] rejects a proof whose `op` differs from the one re-derived
+/// at verify.
+pub const CONTROL_MUTATION_POP_OP: &str = "privsep_control_mutation";
+
+/// The canonical request bytes bound into a node-self-host control-plane mutation's PoP: the HTTP
+/// METHOD, the request PATH, and the request HOST, domain-separated. BOTH the ORIGINATING client (the
+/// `/api/*` caller) and the SERVING control instance run this over the SAME `(method, path, host)`, so
+/// the PoP's request binding compares identically — binding the proof to THIS exact mutation (a captured
+/// proof cannot be re-paired with a swapped method / path / host). The caller MUST lowercase + strip the
+/// port from `host` to match the serve path's `request_host` canonicalization, and pass the path exactly
+/// as the request line carries it. (Together with [`CONTROL_MUTATION_POP_OP`] as the binding `op`, this
+/// is the self-host analogue of [`request_pop_bytes`] for the WS-E grammar.)
+#[must_use]
+pub fn control_mutation_pop_bytes(method: &str, path: &str, host: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(32 + method.len() + path.len() + host.len());
+    v.extend_from_slice(b"boatramp-privsep-control-mutation/v1\n");
+    v.extend_from_slice(method.to_ascii_uppercase().as_bytes());
+    v.push(b'\n');
+    v.extend_from_slice(path.as_bytes());
+    v.push(b'\n');
+    v.extend_from_slice(host.as_bytes());
+    v
 }
 
 // =============================================================================

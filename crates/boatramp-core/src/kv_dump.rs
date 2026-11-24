@@ -60,14 +60,23 @@ const TAG_ENTRY: u8 = 0x01;
 /// Record tag: end of the stream; an `entry_count` u64 follows for a completeness self-check.
 const TAG_END: u8 = 0x00;
 
+/// Reserved prefix for the privsep node's OWN internal coordination/self-test keys (`_privsep/*`),
+/// e.g. the Phase-5 node-self-host write-plane boot self-validation probe
+/// (`_privsep/selfhost/writeplane-probe/<pid>`). The probe deletes its key when the node is healthy,
+/// but a crash BETWEEN the put and the delete can leave a stray tombstone/value behind; excluding the
+/// prefix here keeps such a stray probe key out of a KV dump (it is node-local, regenerated at the next
+/// stand-up, never part of a deployment's durable state). Mirrors the `_cp/` / `_inval/` convention.
+pub const PRIVSEP_PREFIX: &str = "_privsep/";
+
 /// Whether `key` belongs to a reserved internal coordination feed the dump never copies: the
-/// shared-mode control-plane rows ([`CP_PREFIX`] `_cp/*`) and the cache-coherence invalidation feed
-/// ([`INVAL_PREFIX`] `_inval/*`). Both regenerate per-deployment; copying them would commingle two
-/// control planes' coordination identity. (`kv_changes` is a SQL table, not a `kv` key, so it never
-/// reaches this filter and likewise regenerates.)
+/// shared-mode control-plane rows ([`CP_PREFIX`] `_cp/*`), the cache-coherence invalidation feed
+/// ([`INVAL_PREFIX`] `_inval/*`), and the privsep node-self-host internal keys ([`PRIVSEP_PREFIX`]
+/// `_privsep/*`). All regenerate per-deployment / per-stand-up; copying them would commingle two
+/// control planes' coordination identity (or export a node-local self-test tombstone). (`kv_changes`
+/// is a SQL table, not a `kv` key, so it never reaches this filter and likewise regenerates.)
 #[must_use]
 pub fn is_reserved_dump_key(key: &str) -> bool {
-    key.starts_with(CP_PREFIX) || key.starts_with(INVAL_PREFIX)
+    key.starts_with(CP_PREFIX) || key.starts_with(INVAL_PREFIX) || key.starts_with(PRIVSEP_PREFIX)
 }
 
 /// The parsed dump header.
@@ -537,6 +546,11 @@ mod tests {
         src.put("_inval/123-node1-1", b"authz/policy".to_vec())
             .await
             .unwrap();
+        // A privsep node-self-host write-plane probe key — a crash between the probe's put and its
+        // delete can leave this behind; it is node-local self-test state, never dumped (INFO-1).
+        src.put("_privsep/selfhost/writeplane-probe/4242", b"probe".to_vec())
+            .await
+            .unwrap();
 
         let bytes = export_to_bytes(&src, 42).await.unwrap();
         let decoded = decode_dump(&bytes).unwrap();
@@ -553,7 +567,10 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(dumped, expected, "reserved _cp/* and _inval/* are skipped");
+        assert_eq!(
+            dumped, expected,
+            "reserved _cp/* , _inval/* and _privsep/* are skipped"
+        );
         assert!(
             decoded.entries.iter().all(|e| e.version == 1),
             "the dump records each key's version"
