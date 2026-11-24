@@ -38,17 +38,22 @@
 //! `blob_shim_url` at the bridge gateway (or loopback), never a public address. (An explicit
 //! `0.0.0.0` in the URL is honored as the operator's own choice.)
 //!
-//! ## Known limitation (accepted — Security review Finding 8)
+//! ## Tenancy (project-qualified scope — Security Finding 8 closed)
 //!
-//! The site identity is `ProjectRef::qualified(project, workload)`: the `default` project is
-//! UNQUALIFIED (`hblob/{workload}/`) while a named project is prefixed (`hblob/{project}/{site}/`).
-//! A `default`-project workload NAMED like a real project (e.g. workload `acme/api` is impossible —
-//! names carry no `/` — but a workload `acme` under `default` yields `hblob/acme/…`, colliding with
-//! project `acme`'s prefix) therefore shares that project's `hblob/` subtree. This is an INHERITED
-//! property of the node-wide `hblob/` tenancy scheme (the SAME collision a `wasi:blobstore` handler
-//! has), not introduced here; the shim faithfully reuses `qualified` rather than inventing a parallel
-//! layout. The proper fix lives in the tenancy scheme (`ProjectRef::qualified`) and is owned
-//! separately — a conscious acceptance for this change.
+//! The site identity is `ProjectRef::qualified(project, workload)`, which is ALWAYS the
+//! two-segment `{project}/{workload}` — including the reserved `default` project, which
+//! qualifies to `default/{workload}` (NOT the bare `{workload}`). So a workload's objects
+//! live under `hblob/{project}/{workload}/{container}/{key}` and every project — `default`
+//! included — occupies a DISJOINT `hblob/{project}/` subtree. Project names carry no `/`
+//! ([`validate_resource_name`]) and `default` is reserved at project-create, so no named
+//! project can be `default`: there is NO cross-project collision. The shim reuses the same
+//! `qualified` scope a `wasi:blobstore` handler for the same `(project, site)` resolves, so
+//! the two share ONE namespace that is tenant-disjoint across projects.
+//!
+//! (This closes the v0.31.0 Security Finding 8: `default` once special-cased to the bare
+//! `{workload}` one-segment scope, which made a `default`-project workload named like a real
+//! project collide with that project's `hblob/` subtree. `ProjectRef::qualified` dropped the
+//! special case — `default` is now a normal two-segment project — so the collision is gone.)
 
 use std::collections::HashMap;
 use std::sync::Arc;

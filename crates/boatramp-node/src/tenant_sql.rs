@@ -3109,6 +3109,42 @@ async fn assert_runtime_role_unprivileged(
     }
 }
 
+/// Run the ordered, **idempotent** STABLE non-superuser **rls app-role** provisioning DDL on a LIVE
+/// bootstrap-superuser connection `admin` to the tenant database: ensure the login role (`NOSUPERUSER
+/// NOBYPASSRLS`, its OWN password) + its `GRANT`/`ALTER DEFAULT PRIVILEGES` (it OWNS NOTHING) + the
+/// defense-in-depth FORCE-on-ENABLE event trigger. ONE source of truth shared by the two paths that
+/// create this role, so the role is byte-identical whichever fires first (Consolidate, not mirror):
+/// - the reconcile's post-ready pass ([`crate::managed_sql::ManagedDbEnv::provision_rls_app_role`]);
+/// - the serve-path provision-then-serve ensure
+///   ([`ensure_rls_app_role_live`](NodeTenantSqlResolver::ensure_rls_app_role_live)).
+///
+/// `superuser_user` is the schema-owning bootstrap superuser (the grants' owner + the FORCE trigger's
+/// `SECURITY DEFINER` owner). Postgres-only callers (the only engine with an app-role split).
+pub(crate) async fn run_rls_app_role_provision_ddl(
+    admin: &ComputeResolvedSqlBackend,
+    kind: ExternalSqlKind,
+    app_role: &str,
+    app_password: &str,
+    database: &str,
+    superuser_user: &str,
+) -> Result<(), String> {
+    use boatramp_storage::tenant_provision::ensure_login_role_ddl;
+    let mut stmts = ensure_login_role_ddl(kind, app_role, app_password, database);
+    // The app role gets only GRANT + DEFAULT PRIVILEGES (owner = the schema-owning superuser),
+    // never ownership — it OWNS NOTHING (the stable-role design).
+    stmts.extend(grant_app_role_ddl(kind, app_role, superuser_user));
+    // FORCE-on-ENABLE trigger (owned by the schema-owning superuser so its SECURITY DEFINER body may
+    // FORCE the tenant tables) — belt-and-suspenders for this non-owner role, matching the Shared path.
+    stmts.extend(force_rls_event_trigger_ddl(kind, superuser_user));
+    for stmt in stmts {
+        admin
+            .run_script(&stmt)
+            .await
+            .map_err(|e| format!("rls app-role provision on {database}: {e}"))?;
+    }
+    Ok(())
+}
+
 impl NodeTenantSqlResolver {
     /// The **serving identity** `(cred_project, cred_workload, user)` for a [superuser-owned RLS
     /// cell](is_superuser_owned_rls_cell) — a `Single` install, OR the reserved `Shared` + default
@@ -3168,6 +3204,111 @@ impl NodeTenantSqlResolver {
     /// per-tenant credential, and construct the connection. Split out from `resolve`
     /// so it can be unit-tested without a live server — `resolve` runs the
     /// (server-requiring) provisioning first, then calls this.
+    /// (A) Ensure the STABLE non-superuser **rls app role** exists on the LIVE superuser-owned cell
+    /// BEFORE the serve path binds the serving identity to it — the provision-then-serve guarantee
+    /// that closes the cold-boot ordering race by construction (no timing assumption about the
+    /// detached reconcile loop). Probe-first as the bootstrap superuser: if the role already exists
+    /// this is one lightweight `pg_roles` lookup and NO DDL (the steady state); if ABSENT — the
+    /// cold-boot / just-adopted window — provision it in place via the SAME DDL the reconcile runs
+    /// ([`run_rls_app_role_provision_ddl`]), on the EXISTING database/volume, with no base-credential
+    /// rotation. The caller gates this to a superuser-owned Postgres cell with `rls_session` on.
+    ///
+    /// Fail-CLOSED: every error is returned so `resolve` refuses the request (it is NEVER served as
+    /// the superuser — the caller's identity resolution has no superuser fallback while rls is on).
+    /// The superuser connection is used ONLY for the probe + the role DDL; the serving connection
+    /// the caller then builds is the non-superuser app role (and is independently re-checked by
+    /// [`assert_runtime_role_unprivileged`]).
+    async fn ensure_rls_app_role_live(
+        &self,
+        project: &str,
+        is_default: bool,
+        names: &TenantNames,
+    ) -> Result<(), SqlError> {
+        let app_role = rls_app_role_name(&names.database);
+        let cred_project = single_credential_project(project, is_default);
+        let creds = ManagedSqlCredentials::new(self.kv.clone(), self.envelope.clone());
+        // The bootstrap superuser password — the SAME key the server-init env + the reconcile read
+        // (the superuser identity is `rls_cell_serving_identity`'s else-arm: the credential under
+        // the bare workload). Needed to run the role DDL as the schema-owning superuser.
+        let su_pw = creds
+            .password(&cred_project, &names.workload)
+            .await
+            .map_err(SqlError::other)?;
+        // A superuser admin connection to the TENANT database, routed through the SAME gated
+        // endpoint resolver the serving backend uses, so we provision exactly the replica serving
+        // will route to (unreachable ⇒ fail-closed, the same outcome the serve would have had).
+        let endpoint_project = match self.isolation {
+            TenantIsolation::Single if !is_default => project.to_string(),
+            _ => DEFAULT_PROJECT.to_string(),
+        };
+        let resolver: Arc<dyn ComputeEndpointResolver> =
+            Arc::new(DeployEndpointResolver::new_gated(
+                self.deploy.clone(),
+                endpoint_project,
+                self.binding.readiness_gate.routing,
+            ));
+        let admin = ComputeResolvedSqlBackend::new(
+            resolver,
+            names.workload.clone(),
+            self.kind,
+            names.database.clone(),
+            self.user.clone(),
+            su_pw,
+            Some(1),
+            false,
+            self.connect_timeout
+                .or(Some(std::time::Duration::from_secs(10))),
+        );
+        // Probe-first: `rls_app_role_name` is a sanitized, length-capped identifier (no quote /
+        // backslash), so it is safe to embed in this single-quoted literal (identical to
+        // `needs_reprovision`). A probe ERROR is itself a refusal (fail-closed): we must PROVE the
+        // role present or absent, never assume it.
+        let probe_sql = format!("SELECT count(*)::int FROM pg_roles WHERE rolname = '{app_role}'");
+        let present = match admin.run_query(&probe_sql).await {
+            Ok(rows) => matches!(
+                rows.rows.into_iter().flatten().next(),
+                Some(SqlValue::Integer(n)) if n > 0
+            ),
+            Err(e) => {
+                return Err(SqlError::other(format!(
+                    "rls_session provision-then-serve: the app-role existence probe on {} failed — \
+                     refusing fail-closed (cannot bind the serving identity to an unconfirmed app \
+                     role): {e}",
+                    names.database
+                )));
+            }
+        };
+        if present {
+            return Ok(());
+        }
+        // ABSENT (cold boot / just-adopted) → provision it in place as the superuser, then serve.
+        // The app-role password under its OWN distinct sealed key — the SAME key the serving
+        // connection below reads, so the role is created with exactly the password it then connects
+        // with (get-or-mint, regardless of which side touches the key first).
+        let app_cred_workload = rls_app_credential_workload_key(&names.workload);
+        let app_pw = creds
+            .password(&cred_project, &app_cred_workload)
+            .await
+            .map_err(SqlError::other)?;
+        run_rls_app_role_provision_ddl(
+            &admin,
+            self.kind,
+            &app_role,
+            &app_pw,
+            &names.database,
+            &self.user,
+        )
+        .await
+        .map_err(SqlError::other)?;
+        tracing::info!(
+            database = %names.database,
+            app_role = %app_role,
+            "rls_session provision-then-serve: the app role was absent at serve time (cold boot / \
+             just-adopted) — provisioned it in place before binding the serving identity"
+        );
+        Ok(())
+    }
+
     async fn build_backend(
         &self,
         project: &str,
@@ -3216,6 +3357,26 @@ impl NodeTenantSqlResolver {
                 self.rls_cell_serving_identity(project, is_default, &names, true)
             }
         };
+
+        // (A) PROVISION-THEN-SERVE — close the boot-ordering race by construction. For a
+        // superuser-owned `rls_session` cell (a `Single` install, or the reserved `Shared`+default
+        // tenant) the serving identity resolved just above is the STABLE non-superuser app role. On
+        // a cold boot — or in the sub-tick window right after a live rls adoption — the detached
+        // reconcile loop may not yet have created that role, so ENSURE it exists HERE, before we
+        // bind the serving connection to it: provision it in place (as the bootstrap superuser) if
+        // absent. This removes, by construction, any window where rls-on serving routes to an
+        // ABSENT app role — no timing assumption about when the reconcile first runs. Fail-CLOSED:
+        // any error refuses the resolve (a retryable error), and the identity above NEVER falls
+        // back to the superuser while rls is on, so we can never serve as the superuser here.
+        // Probe-first, so the common (role-present) cache-miss pays one lightweight `pg_roles`
+        // lookup and runs no DDL.
+        if self.rls_session
+            && self.kind == ExternalSqlKind::Postgres
+            && is_superuser_owned_rls_cell(self.isolation, is_default)
+        {
+            self.ensure_rls_app_role_live(project, is_default, &names)
+                .await?;
+        }
 
         // TENANCY INVARIANT (fail-closed) — the `rls_session` **owner-serving** contract. With
         // `rls_session` on, the app's row-level security is enforced against THIS serving role. Under
