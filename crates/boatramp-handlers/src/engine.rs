@@ -204,6 +204,24 @@ pub fn build_engine(cache_dir: Option<&Path>) -> Result<Engine, HandlerError> {
     Ok(Engine::new(&base_config(cache_dir)?)?)
 }
 
+/// A trivial, self-contained WebAssembly **component** (text form; `Component::new` accepts WAT) the
+/// engine stand-up self-validation compiles (privsep Phase-5 P5-4 — see
+/// [`HandlerEngine::self_validate_compile`]). It imports NOTHING and exports one component function
+/// whose core module body (`i32.add`) forces real cranelift codegen → the executable `mmap`/`mprotect`
+/// the sandbox proof exercises. Kept minimal so the compile is sub-millisecond and the probe has no
+/// external artifact (no fixture file, no network). NOT a `wasi:http/proxy` world — the probe compiles
+/// only (it never instantiates against the serve linker), so a bare component is exactly right.
+const SELF_VALIDATION_COMPONENT: &str = r#"(component
+  (core module $m
+    (func (export "answer") (result i32)
+      i32.const 20
+      i32.const 22
+      i32.add))
+  (core instance $i (instantiate $m))
+  (func (export "answer") (result s32)
+    (canon lift (core func $i "answer")))
+)"#;
+
 #[cfg(test)]
 thread_local! {
     /// `#[cfg(test)]`-only severance seam for the compile-cache durability gate: when set, forces
@@ -1822,6 +1840,49 @@ impl HandlerEngine {
         cache_dir: Option<&Path>,
     ) -> Result<Self, HandlerError> {
         Self::from_engine(build_engine(cache_dir)?, limits, cache_size)
+    }
+
+    /// **Stand-up SELF-VALIDATION of the wasm execution engine (privsep Phase-5 P5-4).** Build the
+    /// node's wasm engine (the SAME [`build_engine`] config the real handler engine uses — on-demand
+    /// allocator, `wasm_component_model` + `epoch_interruption` + `consume_fuel`, the persisted compile
+    /// cache pinned to `cache_dir` if given) and prove it can COMPILE a component — the cranelift
+    /// codegen → executable-`mmap`(`PROT_EXEC`) path a read/write/stub serve never exercises — by
+    /// compiling the trivial embedded [`SELF_VALIDATION_COMPONENT`]. Returns `Ok(())` iff the compile
+    /// succeeds, else [`HandlerError::Compile`].
+    ///
+    /// This is the engine counterpart of the control-plane store's boot write-plane self-validation:
+    /// a privsep `exec.wasmtime` instance runs it at stand-up, UNDER its per-capability seccomp/Landlock
+    /// profile, BEFORE it holds the engine — so a derived profile that KILLS a syscall cranelift needs
+    /// (or a Landlock wall the codegen trips) FailNodeCloses the node LOUDLY at boot rather than
+    /// surfacing as a mysterious compile failure on the first function request. It is authenticated by
+    /// construction (never on a client's behalf — it compiles a fixed, in-binary component) and touches
+    /// NO network and NO client input. The JIT `mmap`/`mprotect` syscalls are in the un-gated seccomp
+    /// baseline, so this SHOULD pass — but "should" is a design claim only a live run on a real Landlock
+    /// kernel settles (a host unit test without the sandbox is a FALSE GREEN for the derived profile);
+    /// the privsep live gate is the decisive proof.
+    ///
+    /// The persisted compile cache under `cache_dir` is BEST-EFFORT (an ungranted dir degrades to no
+    /// cache, never a failure — see `build_persistent_cache`), so this probe proves the COMPILE under
+    /// the sandbox regardless of whether the cache dir is Landlock-granted; granting
+    /// `<data_dir>/wasmtime-cache` RW so the node-own engine's cache SURVIVES a restart (rather than
+    /// recompiling cold each boot) is a separate, flagged follow-on.
+    pub fn self_validate_stand_up(cache_dir: Option<&Path>) -> Result<(), HandlerError> {
+        let engine = Self::new_with_cache_dir(Limits::default(), 1, cache_dir)?;
+        engine.self_validate_compile()
+    }
+
+    /// Compile the trivial embedded [`SELF_VALIDATION_COMPONENT`] on THIS engine to exercise the
+    /// cranelift codegen + executable-`mmap` path under whatever sandbox the caller installed. Compile
+    /// only (the sandbox-sensitive step is the codegen → `mmap(PROT_EXEC)`, which `Component::new`
+    /// performs; a trivial no-IO function makes no further syscalls when executed, and guest EXECUTION
+    /// under the instance sandbox is separately proven by the per-tenant template live gate). A compile
+    /// failure (a killed syscall, a Landlock wall) maps to [`HandlerError::Compile`].
+    pub fn self_validate_compile(&self) -> Result<(), HandlerError> {
+        Component::new(&self.engine, SELF_VALIDATION_COMPONENT)
+            .map(|_component| ())
+            .map_err(|err| {
+                HandlerError::Compile(format!("engine stand-up self-validation compile: {err}"))
+            })
     }
 
     /// Like [`new`](Self::new) but with the **pooling** instance allocator (H8,
@@ -4116,6 +4177,25 @@ mod tests {
     #[test]
     fn engine_builds() {
         build_engine(None).expect("engine builds");
+    }
+
+    /// The engine stand-up self-validation (privsep Phase-5 P5-4) COMPILES its trivial embedded
+    /// component. This proves the PROBE itself is sound — the WAT parses, is a valid component, and
+    /// cranelift accepts it — so the privsep live gate's compile-under-the-sandbox is exercising a
+    /// real compile, not a self-validation that would fail on its own WAT. It is NOT a sandbox proof
+    /// (no seccomp/Landlock installed in a host unit test — that FALSE GREEN is exactly why the live
+    /// gate is decisive); it only locks the probe's correctness.
+    // `#[tokio::test]`: building the engine spawns a background epoch ticker (`tokio::spawn` in
+    // `from_engine`), so a runtime context must be live.
+    #[tokio::test]
+    async fn engine_self_validation_compiles_the_trivial_component() {
+        HandlerEngine::self_validate_stand_up(None)
+            .expect("the stand-up self-validation compiles its embedded component");
+        // And on an already-built engine (the instance method the stand-up helper delegates to).
+        let engine = HandlerEngine::new(Limits::default(), 1).expect("engine builds");
+        engine
+            .self_validate_compile()
+            .expect("self_validate_compile compiles the embedded component");
     }
 
     /// `PLAN-handler-tcp-egress` TE-2: the outbound-TCP allowlist-membership core. Covers the three

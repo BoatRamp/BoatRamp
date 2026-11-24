@@ -3709,6 +3709,30 @@ mod instance_serve {
             return run_per_tenant_backend(label, fds);
         }
 
+        let node_self_host = config
+            .privsep
+            .as_ref()
+            .is_some_and(|p| p.node_serve.is_node_self_host());
+
+        // NODE-SELF-HOST wasm EXECUTION ENGINE SELF-VALIDATION (Phase-5 P5-4-proper): a node-self-host
+        // instance that HOLDS `exec.wasmtime` — i.e. the node OWNS its wasm execution engine — proves,
+        // at stand-up and UNDER its per-capability seccomp/Landlock profile, that the engine stands up
+        // and COMPILES a component (the cranelift codegen → executable-`mmap(PROT_EXEC)` path a read /
+        // write / stub serve never exercises), BEFORE it holds the engine. Fail-closed: a derived
+        // profile that kills a syscall the JIT needs (or a Landlock wall the codegen trips) returns
+        // `Err` → the instance exits → the root's `FailNodeClosed` tears the node down LOUDLY at boot,
+        // rather than standing up an engine that mysteriously refuses the first function request. It is
+        // the engine counterpart of the `backend.kv` boot WRITE-plane self-validation (which proves the
+        // store MUTATION path under the sandbox). Authenticated by construction (never on a client's
+        // behalf — a fixed in-binary component), no network, no client input. A per-tenant TEMPLATE
+        // returned above (it owns its own engine, scoped to one tenant); `guest-workloads` never reaches
+        // here (the whole branch is gated on `node_self_host`), so every pre-Phase-5 path is UNCHANGED.
+        // The instance then CONTINUES to its normal dispatch below (it parks holding the validated
+        // engine inert — the node-own-function SERVE routing is the surfaced remaining P5-4 work).
+        if node_self_host && gate.may_materialize(HostAuthority::ExecWasmtime) {
+            run_node_exec_engine_self_validation(label, config)?;
+        }
+
         // NODE-SELF-HOST CONTROL-PLANE AUTHORIZER (Phase-5 P5-4): a SPLIT `control.admin-api` instance
         // (holds `control.admin-api`, NOT `backend.kv`) the composition designated a
         // control-authorize-serve link for SERVES the cross-instance authorize grammar (the `rights_for`
@@ -3717,10 +3741,6 @@ mod instance_serve {
         // key). Gated on node-self-host; a `control.admin-api` holder that ALSO holds `backend.kv` is the
         // LOCAL control plane (served via `run_backend`'s self-host handler), so it does NOT take this
         // branch (it holds backend.kv). An empty designation ⇒ skipped (no running composition changes).
-        let node_self_host = config
-            .privsep
-            .as_ref()
-            .is_some_and(|p| p.node_serve.is_node_self_host());
         let control_authorize_links = super::compute_control_authorize_links(config)
             .remove(label)
             .unwrap_or_default();
@@ -4380,6 +4400,111 @@ mod instance_serve {
             let _ = drain.join();
             Ok::<(), String>(())
         })
+    }
+
+    /// **Node-own wasm EXECUTION ENGINE boot self-validation (Phase-5 P5-4-proper).** Prove, at a
+    /// node-self-host `exec.wasmtime` holder's stand-up and UNDER its installed per-capability
+    /// seccomp/Landlock profile, that the node's wasm engine stands up and COMPILES a component — the
+    /// cranelift codegen → executable-`mmap(PROT_EXEC)` path a read/write/stub serve never exercises —
+    /// before the instance holds the engine. The engine is built with the SAME [`build_engine`]
+    /// (`boatramp_handlers`) config the node's real handler engine uses, with the persisted compile
+    /// cache pinned to the node data dir (best-effort — an ungranted dir degrades to no cache, never a
+    /// failure; granting `<data_dir>/wasmtime-cache` RW is the flagged follow-on), so the COMPILE under
+    /// the sandbox is proven regardless.
+    ///
+    /// Fail-closed: a compile failure (a killed syscall the JIT needs, a Landlock wall its codegen
+    /// trips) returns `Err` → the caller exits the instance → the root's `FailNodeClosed` tears the node
+    /// down LOUDLY at boot. The build+compile is SYNCHRONOUS + CPU-bound (a trivial compile is
+    /// sub-millisecond, no retrying I/O) but is run on a dedicated thread with a fail-loud 30s bounded
+    /// join — mirroring the `backend.kv` write-plane self-validation's timeout — so a sandbox that makes
+    /// a syscall BLOCK (not merely EACCES-fail) surfaces fail-closed rather than spinning the instance
+    /// alive-but-stuck. Authenticated by construction (a fixed in-binary component; never a client's
+    /// bytes); no network, no client input.
+    #[cfg(feature = "handlers")]
+    fn run_node_exec_engine_self_validation(
+        label: &str,
+        config: &ServerConfig,
+    ) -> Result<(), String> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let data_dir = {
+            let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+            super::normalized_data_dir(config, &cwd)
+        };
+        tracing::info!(
+            instance = %label,
+            data_dir = %data_dir.display(),
+            "[privsep] node-self-host exec engine (P5-4): self-validating the wasm engine stands up + \
+             compiles under the exec.wasmtime Landlock/seccomp profile (fail-closed at boot on any \
+             EACCES / killed syscall)"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let probe_dir = data_dir.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("privsep-engine-selfval-{label}"))
+            .spawn(move || {
+                // The engine build spawns a background epoch ticker (`tokio::spawn`), so it must run
+                // inside a Tokio runtime context; a dedicated current-thread runtime — dropped when
+                // this thread returns — cancels that ticker (the probe engine is throwaway, built only
+                // to compile the self-validation component, then discarded).
+                let r = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(async {
+                        boatramp_handlers::HandlerEngine::self_validate_stand_up(Some(&probe_dir))
+                            .map_err(|e| e.to_string())
+                    }),
+                    Err(e) => Err(format!(
+                        "building a runtime for the engine self-validation: {e}"
+                    )),
+                };
+                let _ = tx.send(r);
+            })
+            .map_err(|e| format!("spawning the engine self-validation thread: {e}"))?;
+
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(())) => {
+                let _ = handle.join();
+                tracing::info!(
+                    instance = %label,
+                    "[privsep] node-self-host exec engine (P5-4): wasm engine self-validated under the \
+                     exec.wasmtime Landlock/seccomp profile (compiled a component, no fail-closed \
+                     EACCES / killed syscall)"
+                );
+                Ok(())
+            }
+            Ok(Err(why)) => Err(format!(
+                "node-self-host exec engine ({label}): the wasm engine failed to compile a component \
+                 under the exec.wasmtime Landlock/seccomp profile ({why}). The most likely cause is a \
+                 killed syscall the cranelift JIT needs, or a Landlock wall its codegen trips. Failing \
+                 closed so the instance exits → FailNodeClosed fires."
+            )),
+            Err(_) => Err(format!(
+                "node-self-host exec engine ({label}): the wasm engine self-validation did not complete \
+                 within 30s under the exec.wasmtime Landlock/seccomp profile — a syscall is BLOCKING \
+                 (not merely EACCES-failing). Failing closed so the instance exits → FailNodeClosed fires."
+            )),
+        }
+    }
+
+    /// Fail-closed stub for a build with NO wasm execution engine (the `handlers` feature off): a
+    /// node-self-host composition that declares an `exec.wasmtime` holder but cannot build an engine is
+    /// a misconfiguration — refuse rather than stand up a node that claims to own an engine it has no
+    /// code for. (The batteries-included default + the privsep live gate both enable `handlers`.)
+    #[cfg(not(feature = "handlers"))]
+    fn run_node_exec_engine_self_validation(
+        label: &str,
+        _config: &ServerConfig,
+    ) -> Result<(), String> {
+        Err(format!(
+            "node-self-host composition holds `exec.wasmtime` on instance {label:?}, but this build has \
+             NO wasm execution engine (the `handlers` feature is off). Refusing fail-closed rather than \
+             standing up a node that claims to own an engine it cannot build; rebuild with `handlers` \
+             (the batteries-included default) or drop `exec.wasmtime` from the composition."
+        ))
     }
 
     /// Build the node-self-host serve handler (Phase-5 P5-2 read + P5-3-serve mutation): the

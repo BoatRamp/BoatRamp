@@ -2755,6 +2755,184 @@ fn privsep_node_self_host_cross_instance_authorize_serves_end_to_end() {
     println!("PRIVSEP NODE SELF-HOST CROSS-INSTANCE AUTHORIZE OK");
 }
 
+/// (E, P5-4-proper) Live gate for the **node-own wasm EXECUTION ENGINE self-host**: a
+/// `node_serve: node-self-host` composition whose `aux` instance HOLDS `exec.wasmtime` — i.e. the node
+/// OWNS its wasm execution engine — STANDS UP + SERVES, which it can do only after `aux`'s boot engine
+/// self-validation (`HandlerEngine::self_validate_stand_up`) BUILT the wasm engine and COMPILED a
+/// component — the cranelift codegen → executable-`mmap(PROT_EXEC)` path a read/write/stub serve never
+/// touches — UNDER `aux`'s per-capability Landlock+seccomp profile. **This is the decisive P5-4 proof**
+/// the task demands for the engine tier: the JIT compile completes with NO fail-closed EACCES / killed
+/// syscall under real Landlock (kernel 6.12 / ABI V5 on lighthouse). If the sandbox killed a syscall
+/// cranelift needs (or walled its codegen), `run_node_exec_engine_self_validation` returns `Err` →
+/// `aux` exits → `FailNodeClosed` tears `__root` down → the "exited early" panic below fires (exactly
+/// what this gate surfaces).
+///
+/// Two assertions make it decisive, not hollow: (1) the node SERVES a real read-plane response —
+/// proving the WHOLE composition (incl. `aux`'s fail-closed engine self-validation) stood up; and (2)
+/// `aux`'s engine self-validation SUCCESS log appears in the root's stderr — proving the self-validation
+/// RAN + PASSED under the sandbox (a silent skip / compile-out, or a build that never reached the
+/// compile, fails assertion 2). The engine self-validation is COMPILE-only; guest EXECUTION under the
+/// instance sandbox is separately proven by the per-tenant template gate.
+///
+/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]`; the CI `live gate (privsep)`
+/// job greps `PRIVSEP NODE SELF-HOST EXEC-ENGINE OK`.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live: forks boatramp __root for a node-self-host composition whose aux holds \
+            exec.wasmtime; aux's boot engine self-validation must build the wasm engine + compile a \
+            component under aux's Landlock/seccomp profile (no fail-closed EACCES) or the node fails \
+            closed; run via --include-ignored in the `live gate (privsep)` job"]
+fn privsep_node_self_host_exec_engine_serves_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_boatramp");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "boatramp-privsep-selfhost-engine-{}",
+        std::process::id()
+    ));
+    let data_dir = tmp.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let port = free_port();
+    let cfg_path = tmp.join("boatramp.cfg");
+    let stderr_path = tmp.join("root.stderr.log");
+
+    // The SAME known-valid 4-instance composition the read-/write-plane gates use (edge/aux/ops/core:
+    // union == ALL, no forbidden co-residency), with `node_serve: node-self-host`. `aux` holds
+    // `exec.wasmtime` (+ the other listeners + acme) and NO links → it self-validates the node-own wasm
+    // engine at stand-up, then parks holding it inert (the node-own-function SERVE routing is P5-4's
+    // surfaced remaining work); `core` (backend.kv on os-process) serves the read plane so the gate can
+    // confirm the WHOLE composition — `aux` included — stood up.
+    let cfg = format!(
+        r#"(
+    serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
+    privsep: (
+        instances: {{
+            "edge": (
+                capabilities: ["listen.public-tls", "listen.http-parse"],
+                sandbox: Derived,
+                links: ["to-core"],
+            ),
+            "aux": (
+                capabilities: [
+                    "listen.mail", "listen.overlay",
+                    "listen.s3ingress", "listen.inbound-tcp", "listen.gateway",
+                    "exec.wasmtime", "acme.dns-control",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "ops": (
+                capabilities: ["exec.compute", "control.admin-api"],
+                sandbox: Derived,
+                links: [],
+            ),
+            "core": (
+                capabilities: [
+                    "secrets.sealer", "token.signer", "image.signer", "overlay.dial-signer",
+                    "s3ingress.root", "cluster.join-signer",
+                    "backend.kv", "backend.sql", "backend.blob", "backend.messaging",
+                ],
+                sandbox: Derived,
+                substrate: OsProcess,
+                links: ["to-core"],
+            ),
+        }},
+        links: {{ "to-core": (from: "edge", to: "core", transport: Local, purpose: Relay) }},
+        node_serve: NodeSelfHost,
+    ),
+)"#,
+        port = port,
+        data_dir = data_dir.display(),
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write the self-host exec-engine privsep config");
+
+    // Redirect the root's stderr to a FILE (not a pipe — a pipe would block the serving root once its
+    // buffer filled); the test reads it at the end to assert `aux`'s engine self-validation log.
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create the root stderr log");
+    let mut root = Command::new(bin)
+        .arg("__root")
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "boatramp=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .expect("spawn `boatramp __root`");
+
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let response = loop {
+        if Instant::now() > deadline {
+            let _ = root.kill();
+            let _ = root.wait();
+            let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "the node-self-host exec-engine node did not serve within 25s\n--- root stderr ---\n{log}"
+            );
+        }
+        // Fail-closed: if the root exited, the composition failed to stand up — most tellingly here,
+        // `aux`'s engine self-validation hit a fail-closed EACCES / killed syscall compiling under its
+        // Landlock/seccomp profile (the live-gated P5-4 unknown).
+        if let Ok(Some(status)) = root.try_wait() {
+            let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "`boatramp __root` exited early ({status}) — the node-self-host exec-engine composition \
+                 failed to stand up (aux's wasm engine would not compile a component under the \
+                 exec.wasmtime Landlock/seccomp profile? sandbox not Enforced? the backend.kv KV would \
+                 not open?).\n--- root stderr ---\n{log}"
+            );
+        }
+        match try_http_get(&addr) {
+            Ok(resp) if !resp.is_empty() => break resp,
+            _ => std::thread::sleep(Duration::from_millis(250)),
+        }
+    };
+
+    // `aux` self-validates its engine at stand-up, CONCURRENTLY with `core` coming up — so `core`
+    // may serve the read plane (breaking the loop above) a beat BEFORE `aux` flushes its success log.
+    // Poll the stderr log for that line (while the root is still alive) up to a short deadline; the
+    // self-validation completes in tens of ms (well short of its own 30s probe timeout), so a line
+    // still ABSENT here means it genuinely did not complete — a real failure, not a read race. (If the
+    // root died meanwhile, assertion (2) surfaces the captured stderr.)
+    const ENGINE_OK_LOG: &str =
+        "wasm engine self-validated under the exec.wasmtime Landlock/seccomp profile";
+    let log_deadline = Instant::now() + Duration::from_secs(10);
+    let log = loop {
+        let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        if log.contains(ENGINE_OK_LOG) || matches!(root.try_wait(), Ok(Some(_))) {
+            break log;
+        }
+        if Instant::now() > log_deadline {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let _ = root.kill();
+    let _ = root.wait();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // (1) The node served a REAL read-plane response (the whole composition — `aux` included — stood up).
+    assert!(
+        response.contains("node-self-host read plane"),
+        "expected the node read-plane body (the composition served a real read), got:\n{response}"
+    );
+    assert!(
+        !response.contains("Phase 1 minimal serve"),
+        "the node-self-host backend must NOT serve the guest-workloads stub body, got:\n{response}"
+    );
+    // (2) `aux`'s engine self-validation RAN + PASSED under its sandbox (not a silent skip / compile-out,
+    //     not a fail-closed EACCES — which would have exited aux → FailNodeClosed above).
+    assert!(
+        log.contains(ENGINE_OK_LOG),
+        "expected aux's node-own wasm engine self-validation SUCCESS log (proving the engine compiled a \
+         component under the exec.wasmtime Landlock/seccomp profile), got root stderr:\n{log}"
+    );
+
+    // The marker the CI gate greps — reached only after the node served AND aux's engine self-validation
+    // passed under the sandbox.
+    println!("PRIVSEP NODE SELF-HOST EXEC-ENGINE OK");
+}
+
 // =============================================================================
 // HIGH-1 LIVE GATE — the cross-instance `/proc/<pid>/mem` key-disclosure WALL.
 // =============================================================================

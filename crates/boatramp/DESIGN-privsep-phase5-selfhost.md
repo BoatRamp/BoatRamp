@@ -1,6 +1,10 @@
 # DESIGN — privsep Phase 5: node SELF-HOSTING
 
-**Status: P5-0 + P5-1 + P5-2 + P5-3 (write-plane SURFACE) IMPLEMENTED on `feat/privsep`.**
+**Status: P5-0 + P5-1 + P5-2 + P5-3 (write-plane SURFACE + served mutation) + P5-4 (cross-instance
+authorize relay + node-own wasm ENGINE stand-up self-validation) IMPLEMENTED on `feat/privsep`.**
+The gateway reverse-proxy serve surface + the node-own-function routing + the persistent `wasmtime-cache`
+grant are surfaced as P5-4 remainder (see §2 P5-4); the egress-decision (P5-5), the `is_wired` flip +
+full Security pass (P5-6) follow.
 P5-0 shipped the composition *vocabulary* (`[privsep].node_serve`, `NodeServeMode`) + a fail-closed
 root *gate*. P5-1 added the authority-scoped app-router *seam*. **P5-2 WIRED that seam LIVE** on the
 backend serve path for the READ data plane on the LIGHTWEIGHT substrates (`os-process` / `container`):
@@ -245,10 +249,59 @@ the fine-grained `/api/*` method/path → operation map (a mint/sign operation a
 to the decomposition) and the other control-plane authority state (`backend.sql`/`backend.blob`/
 `backend.messaging` mutations, `acme.dns-control`). Still Container/OsProcess (shared net).
 
-**P5-4 — the gateway + node-own handler engine.**
-`listen.gateway` as a self-hosted frontend (its upstream dial is the egress question, §3a) and the
-node's own `exec.wasmtime` functions (resolve the §3 scoping question first). Sequenced here because
-both are heavier and one (gateway egress) depends on §3a's answer.
+**P5-4 — the gateway + node-own handler engine. The authorize relay + the node-own wasm ENGINE
+stand-up are IMPLEMENTED; the gateway serve surface + the node-own-function routing remain.**
+
+*What landed (P5-4-authorize):* the cross-instance control-plane authorize relay — a `backend.kv`
+holder serves an authorized mutation by relaying the `rights_for` decision to a SPLIT
+`control.admin-api` holder over a verified `ControlAuthorizeServe` grammar endpoint (the group-E
+analog of the WS-E crown-jewel grammar). See the §2 P5-3 carry-forwards + the code.
+
+*What landed (P5-4-proper — the node OWNS its wasm execution engine under the sandbox):* a node-self-host
+instance holding `exec.wasmtime` SELF-VALIDATES its wasm engine at stand-up, UNDER its per-capability
+seccomp/Landlock profile, BEFORE it holds the engine — the engine counterpart of the `backend.kv` boot
+write-plane self-validation. `HandlerEngine::self_validate_stand_up` (boatramp-handlers) builds the
+node's wasm engine (the SAME `build_engine` config the real handler engine uses) and COMPILES a trivial
+embedded component — the cranelift codegen → executable-`mmap(PROT_EXEC)` path a read/write/stub serve
+never exercises. `instance_serve::run` runs it (`run_node_exec_engine_self_validation`, a fail-loud 30s
+bounded probe) for an `exec.wasmtime` holder under `node_serve = node-self-host`; a compile failure (a
+killed JIT syscall, a Landlock wall its codegen trips) returns `Err` → the instance exits →
+`FailNodeClosed`. The JIT `mmap`/`mprotect` syscalls are already in the un-gated seccomp baseline
+(name-only, no `PROT_EXEC` arg filter) and the persisted compile cache is best-effort, so the compile
+SHOULD pass — but that is a claim only a live run settles (a host test without the sandbox is a FALSE
+GREEN); the live gate `privsep_node_self_host_exec_engine_serves_end_to_end` (marker `PRIVSEP NODE
+SELF-HOST EXEC-ENGINE OK`) is the decisive proof. `is_wired(NodeSelfHost)` stays false (P5-6). A VM
+`exec.wasmtime` holder is already refused (`resolve_spawn_backend` admits only a key-free static-parser
+frontend — all-listener — on `vm`), so no new gate is needed.
+
+*What remains (surfaced, NOT this cut):*
+- **The node-own-function SERVE routing** — wiring the node's own functions to be SERVED by the
+  validated engine (classify a function request → route to the held `exec.wasmtime` → invoke). This
+  needs the §3 scoping owner decision first (which of the node's OWN surfaces are functions vs. static
+  assets — the dogfood console is static assets today, not a function), so it is deliberately not built.
+  This cut proves the engine STANDS UP under the sandbox; it does not yet serve a node-own function.
+- **The persistent `wasmtime-cache` Landlock grant** — `backend_state_subdir(ExecWasmtime)` is `None`,
+  so an `exec.wasmtime` instance is NOT granted `<data_dir>/wasmtime-cache` RW; the engine's persisted
+  AOT cache (executable native artifacts, `0o700`) therefore degrades to no-cache under the sandbox
+  (cold cranelift compile each boot — a perf, not a correctness, gap, since the cache is best-effort).
+  Granting it is a NEW FS trust decision (its own independent review): an `exec.wasmtime` instance
+  already runs native code in-process (a JIT escape "lands in this instance's authority set"), so RW to
+  its OWN executable-artifact cache subtree within its OWN `data_dir` does not widen its blast radius,
+  and the subtree is disjoint from every backend's state dir (the cross-authority leak check stays
+  live) and MAC-gated on the AOT-deserialize path (`boatramp-server::aot`). Wiring it means extending
+  the authority→state-dir grant machinery (`instance_backend_state_grants` / `backend_authority_state_dirs`
+  / the root grant-disjointness check) to cover `exec.wasmtime`, and pre-creating the dir before the
+  ruleset (mirroring `kv-slate`).
+- **The gateway (`listen.gateway`) reverse-proxy serve surface** — `listen.gateway` has no dedicated
+  bound listener fd yet (`instance_listener_addr` binds only `listen.public-tls`/`listen.http-parse`; the
+  other listener binds are a documented follow-on), and the reverse-proxy's upstream DIAL is a real
+  outbound-egress / SSRF surface (`proxy::dispatch_gateway` → `UpstreamClient::dial`, guarded by
+  `gateway_addr_allowed_for` + a pinned, anti-rebind `resolve_target`) whose general case depends on the
+  §3a egress owner decision. Its seccomp profile ALREADY permits outbound `connect()` (`needs_outbound`
+  includes `ListenGateway`), so the syscall surface is open; the remaining work is binding the gateway
+  listener fd + a node-self-host gateway serve surface (classify a proxy request → read the upstream
+  route from `backend.kv` → dial under the SSRF gate). A NEW trust decision (what the node-own gateway
+  dials), deliberately NOT made silently in this cut.
 
 **P5-5 — the EGRESS decision for VM / net-namespaced backends (gated on §3a).**
 Only after the owner settles §3a: if `backend.*` may run in a VM (or a net-namespaced container), wire

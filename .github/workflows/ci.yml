@@ -1761,7 +1761,11 @@ jobs:
   # authorize sub-op over a control-authorize-serve link to the `control` instance, which re-validates
   # the context + PoP AT THE DESTINATION and answers the rights_for decision (never a key), the write
   # landing under core's Landlock profile — while a FORGED / MISSING-PoP / REPLAYED principal are all
-  # refused 503 (marker `PRIVSEP NODE SELF-HOST CROSS-INSTANCE AUTHORIZE OK`). All twelve are `#[ignore]`d
+  # refused 503 (marker `PRIVSEP NODE SELF-HOST CROSS-INSTANCE AUTHORIZE OK`); and (13, P5-4-proper) an
+  # instance holding `exec.wasmtime` — the node OWNS its wasm execution engine — STANDS UP + serves only
+  # after its boot engine self-validation BUILT the wasm engine + COMPILED a component (the cranelift
+  # codegen → executable-mmap(PROT_EXEC) path) under its Landlock/seccomp profile with no fail-closed
+  # EACCES (marker `PRIVSEP NODE SELF-HOST EXEC-ENGINE OK`). All thirteen are `#[ignore]`d
   # (they fork + sandbox against the live kernel) so `--include-ignored` runs them. Greps every marker +
   # the pass count so a silent skip / compile-out fails the merge.
   live-gate-privsep:
@@ -1784,8 +1788,8 @@ jobs:
           set -eo pipefail
           cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp \
             --features sandbox --test privsep_live -- --include-ignored --nocapture 2>&1 | tee privsep-live.log
-          grep -qE 'test result: ok\. 12 passed' privsep-live.log \
-            || { echo "::error::privsep live gate did not run all twelve tests (silent skip or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 13 passed' privsep-live.log \
+            || { echo "::error::privsep live gate did not run all thirteen tests (silent skip or a failure)" >&2; exit 1; }
           grep -q 'PRIVSEP LIVE OK' privsep-live.log \
             || { echo "::error::privsep composition live gate never reached its marker (a WS-C root-spawn / fd-pass / per-instance-sandbox / serving-splice regression)" >&2; exit 1; }
           grep -q 'PRIVSEP PROC-MEM WALL OK' privsep-live.log \
@@ -1812,6 +1816,8 @@ jobs:
             || { echo "::error::privsep node-self-host CONTROL-MUTATION serve gate never reached its marker (Phase-5 P5-3-serve: under node_serve=node-self-host a core holding control.admin-api + backend.kv must SERVE an AUTHORIZED client mutation — a valid cnf-bound trust-root-signed role token + a per-call PoP bound to the mutation, with the required publisher grant — returning 200, and the authorized deploy/routing write must LAND under core's backend.kv Landlock profile (a follow-up read-plane GET resolves the host); AND a FORGED principal (token not trust-root-signed) and a MISSING-PoP mutation must BOTH be refused fail-closed 503. This is the client->control-plane-write authz chain (end-principal cose::verify + PoP re-validation + default-deny RBAC). A regression that serves an unauthenticated/unauthorized mutation, drops the verifier, or fails to land the authorized write — or a silent skip/compile-out — fails here — see crates/boatramp/DESIGN-privsep-phase5-selfhost.md §4 item 6)" >&2; exit 1; }
           grep -q 'PRIVSEP NODE SELF-HOST CROSS-INSTANCE AUTHORIZE OK' privsep-live.log \
             || { echo "::error::privsep node-self-host CROSS-INSTANCE AUTHORIZE gate never reached its marker (Phase-5 P5-4: under node_serve=node-self-host with control.admin-api SPLIT onto a separate instance, a core holding backend.kv (NOT control.admin-api) must SERVE an AUTHORIZED client mutation by RELAYING the authorize sub-op over a control-authorize-serve link to the control instance, which re-validates the end-principal context + per-call PoP AT THE DESTINATION and answers the rights_for decision (never a key); the authorized write then LANDS under core's backend.kv Landlock profile (a follow-up read-plane GET resolves). AND a FORGED principal (destination re-validation), a MISSING-PoP mutation (default-deny), and a verbatim REPLAY (destination anti-replay) must ALL be refused fail-closed 503. A regression that serves an unauthenticated/unauthorized/replayed cross-instance mutation, trusts a relay-forwarded assertion, lets a key cross the link, or relays to a non-grammar endpoint — or a silent skip/compile-out — fails here — see crates/boatramp/DESIGN-privsep-phase5-selfhost.md §2 P5-4)" >&2; exit 1; }
+          grep -q 'PRIVSEP NODE SELF-HOST EXEC-ENGINE OK' privsep-live.log \
+            || { echo "::error::privsep node-self-host EXEC-ENGINE gate never reached its marker (Phase-5 P5-4-proper: under node_serve=node-self-host an instance holding exec.wasmtime — the node OWNS its wasm execution engine — must STAND UP + serve, which it can only do after its boot engine self-validation BUILT the wasm engine + COMPILED a component — the cranelift codegen → executable-mmap(PROT_EXEC) path a read/write/stub serve never touches — under the instance's derived per-capability Enforced Landlock/seccomp profile with NO fail-closed EACCES / killed syscall; a killed JIT syscall or a Landlock wall FailNodeCloses the node (the gate's exited-early panic), and the gate ALSO asserts the engine self-validation SUCCESS log appeared (a silent skip/compile-out fails that) — or a silent skip/compile-out of the whole test fails here — see crates/boatramp/DESIGN-privsep-phase5-selfhost.md §2 P5-4)" >&2; exit 1; }
   # cap-req #25 DNS-PUBLISH SERVE-WIRING GATE (marker `DNS-PUBLISH SERVE-WIRING OK`). The gate above
   # proves the host GATE is correct, but it built `Bindings::with_dns_publish` DIRECTLY — exactly the
   # bypass that let v0.51.0 ship the capability INERT (nothing ever installed a provider source into
