@@ -267,6 +267,11 @@ non-superuser app role** and serves the runtime as it instead.
   superuser / `BYPASSRLS`, so an app can never silently believe it has RLS while served by a superuser.
   (`serve_as` is not consulted — a superuser-owned cell always serves the non-superuser app role. A
   `Shared` *non-default* tenant is a different cell: it already serves a per-tenant non-owner role.)
+- **Adopting it on a database that already exists:** turning `rls_session` on for a managed Postgres
+  that was already provisioned without it just works — flip it in the manifest and `apply`. The app
+  role is created **in place** on the existing database on the next reconcile (no restart, same data
+  volume, base credential untouched); until it exists the binding fails closed rather than serving as
+  the superuser. See [Adopt `rls_session` on a database that already exists](./managed-databases.md#adopt-rls_session-on-a-database-that-already-exists).
 
 ## Typed queries with the `orm` builder
 

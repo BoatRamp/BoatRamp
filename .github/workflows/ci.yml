@@ -3248,6 +3248,32 @@ jobs:
             || { echo "::error::single-mode rls_session invariant never reached its marker (the non-superuser app role leaked cross-account under ENABLE, or the superuser-serving mutation did not leak / the probe did not classify the roles)" >&2; exit 1; }
           grep -q 'MANAGED RLS SHARED-DEFAULT OK \[postgres\]' rls-single.log \
             || { echo "::error::Shared+default rls_session invariant never reached its marker (the tenant+account RLS did not coexist under the non-superuser app role, or the superuser-serving mutation did not leak / the probe did not classify the roles)" >&2; exit 1; }
+      - name: rls_session ADOPTION on an already-provisioned managed Postgres on a real Postgres (v0.71.1)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # v0.71.1 — the `rls_session` existing-DB adoption fix (a prod incident). A managed DB
+          # first provisioned WITHOUT rls_session, then re-applied with rls_session: true, must adopt
+          # the non-superuser app role on the NEXT reconcile WITHOUT a relaunch — flipping the flag
+          # does not change the launch spec, so the replica never re-enters Starting, and the one-shot
+          # provisioning pass never re-ran (the serving path then routed to an absent app role and
+          # failed closed). This node gate drives the REAL adoption path — ManagedDbEnv::needs_reprovision
+          # (the detection) + provision_managed (idempotent create-in-place), the two calls
+          # advance_readiness makes in its fixed Provisioned branch — against a real PG: provision rls-OFF
+          # + seed 2 accounts in an ENABLE-RLS table, prove serving-as-the-app-role FAILS CLOSED before
+          # adoption, reconcile, then assert the app role is created on the EXISTING DB, the seeded rows
+          # + both accounts SURVIVE (same volume), serving switches to the non-superuser app role with
+          # 2-account isolation (zero foreign bytes), and the base superuser credential is UNCHANGED.
+          # The BOATRAMP_TEST_PG_URL user is a superuser (CREATE DATABASE / ROLE / EVENT TRIGGER). A
+          # silent skip (URL unset) still prints `test result: ok`, so gate on the marker, which prints
+          # ONLY after every data-safety + isolation assertion held.
+          cargo test -p boatramp-node --features sql-postgres \
+            --test rls_adopt_existing_db_live -- --ignored --nocapture 2>&1 | tee rls-adopt.log
+          grep -qE 'test result: ok\. 1 passed' rls-adopt.log \
+            || { echo "::error::rls_session adoption gate did not run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
+          grep -q 'RLS ADOPT EXISTING DB OK \[postgres\]' rls-adopt.log \
+            || { echo "::error::rls_session adoption invariant never reached its marker (the app role was not reconciled onto the existing DB, data did not survive, serving did not switch to the non-superuser app role / isolation broke, or the base credential was rotated)" >&2; exit 1; }
       - name: Owner-gated schema-migration owner-role confinement on a real Postgres (v0.4.25)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp

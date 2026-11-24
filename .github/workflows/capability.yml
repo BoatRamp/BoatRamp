@@ -466,6 +466,44 @@ jobs:
           grep -q 'MANAGED RLS SHARED-DEFAULT OK \[postgres\]' rls-single.log \
             || { echo "::error::Shared+default rls_session invariant never reached the success marker (silent skip — pg/docker absent — or the tenant+account RLS did not coexist under the non-superuser app role / the superuser mutation did not leak)" >&2; exit 1; }
 
+      - name: rls_session ADOPTION on an already-provisioned managed Postgres holds live (hard gate — the v0.71.1 fix)
+        run: |
+          set -o pipefail
+          # The load-bearing proof of the v0.71.1 `rls_session` existing-DB adoption fix (a prod
+          # incident): a managed DB first provisioned WITHOUT rls_session, then re-applied with
+          # rls_session: true, adopts the non-superuser app role on the next reconcile WITHOUT a
+          # relaunch. Flipping the flag does not change the container launch spec, so the DB replica
+          # never re-enters Starting and the one-shot provisioning pass never re-ran — the serving
+          # path then routed to an ABSENT app role and failed closed (the incident). This node gate
+          # drives the REAL adoption path (ManagedDbEnv::needs_reprovision + provision_managed — the
+          # two calls advance_readiness makes for a Provisioned replica with a pending reprovision)
+          # against a stock pgvector reached by its container IP as the SUPERUSER (needs CREATE
+          # DATABASE/ROLE + CREATE EVENT TRIGGER). It proves: provisioned rls-OFF with 2 seeded
+          # accounts, serving-as-the-app-role FAILS CLOSED before adoption, needs_reprovision fires,
+          # then after the idempotent in-place reconcile the app role IS created on the EXISTING DB,
+          # the seeded rows + both accounts SURVIVE (same volume), serving switches to the
+          # non-superuser app role with 2-account isolation (zero foreign bytes), and the base
+          # superuser credential is UNCHANGED. A silent skip (pg/docker absent) still prints
+          # `test result: ok`, so gate on the marker, which prints ONLY after every assertion held.
+          docker rm -f rls-adopt-pg >/dev/null 2>&1 || true
+          docker run -d --name rls-adopt-pg -e POSTGRES_PASSWORD=postgres \
+            pgvector/pgvector:pg16 >/dev/null
+          for i in $(seq 1 60); do
+            docker exec rls-adopt-pg pg_isready -U postgres >/dev/null 2>&1 && break
+            sleep 2
+          done
+          PGIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rls-adopt-pg)"
+          echo "pgvector bridge IP: $PGIP"
+          BOATRAMP_TEST_PG_URL="postgres://postgres:postgres@${PGIP}:5432/postgres" \
+            timeout -k 30 600 cargo test -p boatramp-node --features sql-postgres \
+            --test rls_adopt_existing_db_live \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee rls-adopt.log
+          docker rm -f rls-adopt-pg >/dev/null 2>&1 || true
+          grep -qE 'test result: ok' rls-adopt.log \
+            || { echo "::error::rls_session adoption gate did not pass" >&2; exit 1; }
+          grep -q 'RLS ADOPT EXISTING DB OK \[postgres\]' rls-adopt.log \
+            || { echo "::error::rls_session adoption invariant never reached the success marker (silent skip — pg/docker absent — or the app role was not reconciled onto the existing DB / data did not survive / serving did not switch to the non-superuser app role / the base credential was rotated)" >&2; exit 1; }
+
       - name: Single-mode per-tenant volume isolation holds live (hard gate — the v0.3.11 fix)
         run: |
           set -o pipefail

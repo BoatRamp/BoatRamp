@@ -5,6 +5,25 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.71.1] — 2026-11-24
+
+### Fixed
+
+- **`rls_session` adoption on an already-provisioned managed Postgres (data-safety / tenancy).**
+  Turning `rls_session` **on** for a managed Postgres that was already provisioned *without* it (a
+  database first created under an earlier version, then re-`apply`d with `rls_session: true`) failed
+  closed: the non-superuser **app role** the runtime must be served as was never created. Flipping the
+  flag does not change the container launch spec, so the DB replica is never relaunched and never
+  re-enters `Starting`, and the one-shot post-ready provisioning pass that creates the app role never
+  re-ran — the serving path then routed to an absent role and failed closed indefinitely (a k8s pod
+  rollout does not reset the observed `Provisioned`). The reconcile now **detects** this on an
+  already-`Provisioned` replica (a read-only probe, scoped to the `rls_session` + Postgres
+  superuser-owned cell whose app role is missing) and **re-runs the idempotent provisioning in place**
+  to create the app role — connecting as the bootstrap superuser on the **same data volume**, never
+  destroying/recreating the volume and never rotating the base credential. Adoption now "just works"
+  on the next reconcile with no restart. Fail-closed is preserved: the binding still refuses to serve
+  as a superuser / `BYPASSRLS` while `rls_session` is on, and never serves before the app role exists.
+
 ## [0.71.0] — 2026-11-23
 
 ### Breaking
