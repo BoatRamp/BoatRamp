@@ -519,6 +519,10 @@ tower-service = "0.3"
 chrono = { version = "0.4", default-features = false, features = [
   "clock",
 ], optional = true }
+# The gateway `buffer_requests` forward path (proxy.rs) spills a length-unknown request body to a
+# per-request UNNAMED temp file (`tempfile::tempfile_in`, unlinked at creation) to bound memory
+# before forwarding it with a Content-Length — see `buffer_body_to_length_in`.
+tempfile = "3"
 
 [dev-dependencies]
 boatramp-core = { workspace = true }
@@ -573,9 +577,8 @@ hyper = { workspace = true, features = ["server", "http1"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = [
   "connect",
 ] }
-# The `blob_drain::gate` battery (feature `blob-drain-gate-mutation`) drives a real DeployStore over
-# a `FallbackStorage(primary=fs, secondary=fs)` in scratch directories.
-tempfile = "3"
+# (`tempfile` — used by the `blob_drain::gate` battery over a `FallbackStorage(primary=fs,
+# secondary=fs)` in scratch directories — is now a normal dependency, see `[dependencies]`.)
 # Serialize the MF-3/MF-4 authz gates: they set/clear the process-global `BOATRAMP_KVSQL_MUTATION`
 # env var, so they must not run concurrently with each other (or the clean-path gates). Mirrors the
 # WS4 `boatramp-core` shared-mode gate serialization.

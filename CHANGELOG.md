@@ -88,6 +88,47 @@ versions.
   orphan reaper uses), matching the docker backend, so a no-ingress consumer becomes healthy across
   both backends. A workload that exposes a port keeps the TCP readiness probe unchanged.
 
+### Added
+
+- **Gateway `buffer_requests`: front a container registry over HTTP/2 (Caddy `request_buffers`
+  parity).** A new per-upstream `buffer_requests` flag (`boatramp gateway upstream add
+  --buffer-requests`, default **off**) makes the reverse-proxy forward leg read a **length-unknown**
+  request body (an HTTP/2 `END_STREAM`-delimited body, or an inbound `Transfer-Encoding: chunked`
+  body) to a bounded temp file, establish its length, and forward it with a `Content-Length` instead
+  of chunked. This fixes fronting a **Docker/OCI container registry** (Gitea, Harbor, Distribution),
+  whose blob `PUT` rejects a chunked upload with `400 missing content-length header` — so a `docker
+  push` over the edge's HTTP/2 (no inbound `Content-Length`) previously 400-looped. A body that
+  already declares a `Content-Length` is never buffered (it forwards fixed-length, unchanged), and
+  the flag is off for every existing upstream, so default behavior is byte-identical. Drives the
+  shared `UpstreamClient::send` seam, so both the site-tier and absolute-URL forward paths honor it.
+
+### Security (gateway request buffering)
+
+- **Bounded, temp-file-backed request buffering (untrusted upload body).** When `buffer_requests` is
+  enabled, the body is spilled to a **per-request unnamed temp file** (`tempfile::tempfile_in`,
+  unlinked at creation — no reachable/guessable path, no symlink/TOCTOU target, reclaimed on every
+  exit path incl. 413, I/O error, panic). It is hard-capped by a per-upstream `max_buffer_bytes`
+  (default **1 GiB**); the running total is checked before every write, so a body over the cap is
+  rejected `413 Payload Too Large` without spilling past the bound — buffering can never grow memory
+  unbounded (RSS stays flat; the body lives on disk, not in a `Vec`) or fill the disk. Config
+  validation refuses a dangling `max_buffer_bytes` without `buffer_requests` and a zero cap.
+- **Request buffering is now time-bounded (inbound slow-loris closed).** The buffering loop reads an
+  untrusted body to the temp file *before* the upstream write, so it was bounded by neither
+  `request_timeout_ms` (which wraps only the upstream write + response head, after buffering) nor the
+  connection idle timeout (which never fires on an actively-trickling stream). A slow-trickle client
+  (e.g. one byte every few seconds) could therefore hold a connection slot + a growing temp file
+  indefinitely. The inbound body read is now bounded by **two** per-upstream timeouts, defaulted so
+  the attack is closed out of the box: a **read-idle** timeout (`buffer_read_timeout_ms`, default
+  **30 s**) on each inbound read, and a **whole-phase wall-clock budget** (`buffer_total_timeout_ms`,
+  default **120 s**) over the entire buffering phase — the backstop the per-read timeout cannot
+  provide against a trickle that never idles. On either, buffering aborts with `408 Request Timeout`,
+  dropping the temp file and releasing the slot; `408` is a 4xx, so passive health never ejects the
+  (healthy) backend for a client-side stall. Covers both the HTTP/2 and inbound-chunked paths (one
+  buffering loop). Config validation refuses either timeout without `buffer_requests`, and a zero
+  value; set them via `boatramp gateway upstream add --buffer-requests [--buffer-read-timeout-ms N]
+  [--buffer-total-timeout-ms N]`. A normal fast/large upload completes well within the bounds and is
+  unaffected.
+
 ## [0.72.0] — 2026-11-24
 
 ### Fixed

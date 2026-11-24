@@ -239,6 +239,32 @@ enum UpstreamCommand {
         /// proxy concurrency.
         #[arg(long)]
         read_buffer_bytes: Option<u64>,
+        /// Buffer a length-unknown request body (an HTTP/2 or inbound-chunked body with no
+        /// Content-Length) to a bounded temp file and forward it with a Content-Length,
+        /// instead of chunked. OFF by default. Enable it ONLY for a backend that rejects
+        /// chunked uploads — notably a Docker/OCI container registry (Gitea, Harbor) whose
+        /// blob PUT answers `400 missing content-length header`. The buffered body is capped
+        /// by `--max-buffer-bytes` (a body over the cap is rejected 413 Payload Too Large).
+        #[arg(long)]
+        buffer_requests: bool,
+        /// With `--buffer-requests`: the maximum buffered request-body size in bytes before a
+        /// 413 (default 1073741824 = 1 GiB). Size it to your largest length-unknown upload
+        /// (a registry layer) and the spill store's free space × expected concurrency.
+        #[arg(long, requires = "buffer_requests")]
+        max_buffer_bytes: Option<u64>,
+        /// With `--buffer-requests`: read-idle timeout (ms) while buffering — the longest a single
+        /// inbound body read may stall before the upload is aborted with 408 (default 30000). Bounds
+        /// the body read (which `--request-timeout-ms` does not), so a stalled client cannot pin a
+        /// connection slot + its temp file. A real upload streams continuously and never idles this
+        /// long.
+        #[arg(long, requires = "buffer_requests")]
+        buffer_read_timeout_ms: Option<u64>,
+        /// With `--buffer-requests`: whole-phase wall-clock budget (ms) for buffering one body before
+        /// it is aborted with 408 (default 120000), regardless of pacing. The backstop the read-idle
+        /// timeout cannot provide against a slow trickle that never idles. Raise it for very large
+        /// layers over slow links; lower it on a space/time-tight node.
+        #[arg(long, requires = "buffer_requests")]
+        buffer_total_timeout_ms: Option<u64>,
         /// For `--lb nearest`: the request header carrying the client's region
         /// (set by the CDN/edge, e.g. `fly-region`, `cf-ipcountry`).
         #[arg(long)]
@@ -388,6 +414,10 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<GatewayOut
             request_timeout_ms,
             tls_insecure,
             read_buffer_bytes,
+            buffer_requests,
+            max_buffer_bytes,
+            buffer_read_timeout_ms,
+            buffer_total_timeout_ms,
             client_region_header,
             regions,
         }) => {
@@ -444,6 +474,10 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<GatewayOut
                     request_timeout_ms,
                     tls_insecure,
                     read_buffer_bytes,
+                    buffer_requests,
+                    max_buffer_bytes,
+                    buffer_read_timeout_ms,
+                    buffer_total_timeout_ms,
                     regions: region_tags,
                     client_region_header,
                     ..Default::default()
@@ -609,6 +643,23 @@ fn write_gateway(gateway: &GatewayConfig, w: &mut dyn std::io::Write) -> std::io
         }
         if up.tls_insecure {
             notes.push("tls_insecure".to_string());
+        }
+        if up.buffer_requests {
+            let mut parts = Vec::new();
+            if let Some(n) = up.max_buffer_bytes {
+                parts.push(format!("max={n}"));
+            }
+            if let Some(ms) = up.buffer_read_timeout_ms {
+                parts.push(format!("read_timeout={ms}ms"));
+            }
+            if let Some(ms) = up.buffer_total_timeout_ms {
+                parts.push(format!("total_timeout={ms}ms"));
+            }
+            notes.push(if parts.is_empty() {
+                "buffer_requests".to_string()
+            } else {
+                format!("buffer_requests({})", parts.join(", "))
+            });
         }
         let suffix = if notes.is_empty() {
             String::new()
