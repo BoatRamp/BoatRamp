@@ -107,7 +107,12 @@ k8s-backend = ["dep:boatramp-k8s"]
 # Derive `clap::ValueEnum` on the backend enums (enabled by the CLI binary).
 clap = ["dep:clap"]
 cloudflare-kv = ["dep:boatramp-storage", "boatramp-storage/cloudflare-kv"]
-cluster = []
+# Cluster peer-mesh assembly (`cluster` module, PLAN-node-library N4): the mesh mutual-TLS
+# listener config + the non-loopback-empty-trust fail-closed guard. `MeshTls` is the shared
+# `boatramp_rpktls::RpkTls` crypto core (re-exported by `boatramp-cluster`), so this rides the
+# RPK stack the `tls` feature already pulls — no `boatramp-cluster` dep. The binary forwards its
+# own `cluster` feature here (and its `cluster` also forwards `tls`).
+cluster = ["tls"]
 console = ["boatramp-server/console"]
 # Marker for the overlay forward-flow serve config (`[overlay]`): parsed in every build, but its
 # structs are dead-code-allowed unless the binary's `overlay` feature consumes them.

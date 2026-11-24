@@ -132,6 +132,28 @@ pub fn acme_client_config(ca_path: &Path) -> Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::new(config))
 }
 
+/// Build the `--tls acme` (ACME TLS-ALPN-01) listener config off an ACME `resolver`: no client
+/// auth, advertising the serving ALPN (`h2` / `http/1.1`) **plus `acme-tls/1`**. The resolver
+/// (e.g. `rustls_acme::AcmeState::resolver()`) detects a TLS-ALPN-01 challenge `ClientHello` and
+/// serves the challenge cert; `serve_tls` recognizes the negotiated `acme-tls/1`, completes then
+/// drops that handshake, and serves everything else as HTTP — one config, no separate acceptor.
+///
+/// The caller owns the ACME runtime: it builds the `AcmeConfig`/state (and its cache + directory +
+/// optional extra-CA via [`acme_client_config`]) and spawns the renewal-event poller over the
+/// state stream. This lifts only the pure rustls config build — the `acme-tls/1` ALPN
+/// advertisement — crossing the crate boundary as an `Arc<dyn ResolvesServerCert>`, so no
+/// `rustls-acme` dependency (nor its `AcmeState` generics) is pulled into the library.
+pub fn acme_alpn_server_config(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> rustls::ServerConfig {
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = boatramp_server::alpn_h1_h2();
+    config.alpn_protocols.push(b"acme-tls/1".to_vec());
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +251,27 @@ mod tests {
         // A missing file fails closed (I/O error), never silently trusts nothing.
         let missing = dir.path().join("nope.pem");
         assert!(acme_client_config(&missing).is_err());
+    }
+
+    /// A no-op cert resolver standing in for the ACME state's resolver.
+    #[derive(Debug)]
+    struct NoResolver;
+    impl rustls::server::ResolvesServerCert for NoResolver {
+        fn resolve(
+            &self,
+            _client_hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            None
+        }
+    }
+
+    #[test]
+    fn acme_alpn_server_config_advertises_h1_h2_then_acme_tls_1() {
+        install_crypto_provider();
+        let config = acme_alpn_server_config(Arc::new(NoResolver));
+        // Exactly the serving ALPN plus the TLS-ALPN-01 challenge protocol, in that order.
+        let mut expected = boatramp_server::alpn_h1_h2();
+        expected.push(b"acme-tls/1".to_vec());
+        assert_eq!(config.alpn_protocols, expected);
     }
 }

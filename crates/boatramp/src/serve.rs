@@ -4977,8 +4977,14 @@ async fn run_cluster(
     // Fail closed: never bring up a non-loopback mesh with no trusted peers.
     // Found/Join seed `genesis_trust` right here, so they are checked now; a Resume
     // leaves it empty on purpose and is checked after `build_node` rehydrates its
-    // trust from durable state.
-    if !cluster_cfg.listen.ip().is_loopback() && genesis_trust.is_empty() && !is_resume {
+    // trust from durable state. The non-loopback-empty-trust core is the node-library
+    // guard (byte-identical); the phase condition (`!is_resume`) composes around it.
+    if !is_resume
+        && boatramp_node::cluster::mesh_trust_fails_closed(
+            cluster_cfg.listen,
+            genesis_trust.is_empty(),
+        )
+    {
         return Err(Error::MeshUnconfigured(cluster_cfg.listen));
     }
 
@@ -5061,7 +5067,11 @@ async fn run_cluster(
     // A resuming node rehydrated its trust set from durable state inside
     // `build_node`. Only now can it fail closed on a genuinely empty trust (a wiped
     // or corrupt volume) — otherwise the mesh would come up trusting no peer.
-    if is_resume && !cluster_cfg.listen.ip().is_loopback() && mesh_tls.trust().snapshot().is_empty()
+    if is_resume
+        && boatramp_node::cluster::mesh_trust_fails_closed(
+            cluster_cfg.listen,
+            mesh_tls.trust().snapshot().is_empty(),
+        )
     {
         return Err(Error::MeshUnconfigured(cluster_cfg.listen));
     }
@@ -5082,8 +5092,7 @@ async fn run_cluster(
             >(Some(authz))),
             None => node.router.clone(),
         };
-        let mut mesh_config = mesh_tls.server()?;
-        mesh_config.alpn_protocols = boatramp_server::alpn_h1_h2();
+        let mesh_config = boatramp_node::cluster::mesh_server_config(&mesh_tls)?;
         let listen = cluster_cfg.listen;
         tracing::info!(
             node_id, %listen,
@@ -6372,17 +6381,13 @@ async fn serve_acme(
     }
 
     let mut state = config.state();
-    // Build one rustls config off the ACME state's cert resolver, advertising both
-    // the serving ALPN (`h2`/`http/1.1`) and `acme-tls/1`. The resolver internally
-    // detects a TLS-ALPN-01 challenge ClientHello and serves the challenge cert;
-    // `serve_tls` recognizes the negotiated `acme-tls/1` and completes-then-drops
-    // that handshake, serving everything else as HTTP. One config, no separate
-    // acceptor — and no hyper.
-    let mut rustls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(state.resolver());
-    rustls_config.alpn_protocols = boatramp_server::alpn_h1_h2();
-    rustls_config.alpn_protocols.push(b"acme-tls/1".to_vec());
+    // Build one rustls config off the ACME state's cert resolver, advertising both the serving
+    // ALPN (`h2`/`http/1.1`) and `acme-tls/1` (the node-library builder). The resolver internally
+    // detects a TLS-ALPN-01 challenge ClientHello and serves the challenge cert; `serve_tls`
+    // recognizes the negotiated `acme-tls/1` and completes-then-drops that handshake, serving
+    // everything else as HTTP. One config, no separate acceptor — and no hyper. The ACME runtime
+    // (the state stream + renewal poller) stays here, in the binary.
+    let rustls_config = boatramp_node::tls::acme_alpn_server_config(state.resolver());
     tokio::spawn(async move {
         loop {
             match state.next().await {

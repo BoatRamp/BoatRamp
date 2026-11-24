@@ -42,6 +42,14 @@ pub mod blob_fallback;
 pub use boatramp_storage::blob_migrate;
 pub mod blobs;
 
+/// The cluster peer-mesh assembly (PLAN-node-library N4): the mesh mutual-TLS listener config
+/// ([`cluster::mesh_server_config`]) + the non-loopback-empty-trust fail-closed guard
+/// ([`cluster::mesh_trust_fails_closed`]), lifted out of the binary's `run_cluster` so the mesh
+/// TLS posture + the fail-closed invariant are unit-testable in-process. The binary keeps the Raft
+/// store open, join/dial, `build_node`, the `MeshTransport` construction, and the serve loop.
+/// Behaviour-preserving (a pure move). `cluster` implies `tls` (the shared RPK crypto core).
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod compute;
 /// Tenant-scoped snapshot store for cross-node scale-to-zero (U14): exports/imports a parked
 /// replica's snapshot artifact to/from the project's own blob backend under a project-scoped key.
