@@ -5,58 +5,74 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.73.0] — 2026-11-24
+## [0.73.0] — 2026-11-25
+
+### Added
+
+- **N4-B: the cluster peer-mesh + TLS runtime substrate is lifted into the `boatramp-node` library
+  (turnkey library `run-node` — PLAN-node-library N4 / N4-B).** The cluster mesh mutual-TLS listener
+  config and its non-loopback-empty-trust fail-closed guard (`boatramp_node::cluster`), the
+  joiner-side dynamic cluster-join (root-anchored join-ticket redemption against a seed's control
+  plane + the node's mesh-key possession proof, adopting only root-verified members —
+  `boatramp_node::join`, driven by the `cluster::bootstrap` run-entry), and the static-identity TLS
+  listener config assembly (the rustls `ServerConfig` builders for the `--tls custom` / `--tls rpk`
+  listeners and the HTTP/3 variant, plus the shared cert-PEM / ACME extra-CA-trust helpers —
+  `boatramp_node::tls`) all move out of the `boatramp` binary's `serve.rs` / `run_cluster` into the
+  `boatramp-node` library crate, so an embedder gets a turnkey cluster + TLS node from the library
+  and the mesh/TLS posture + fail-closed invariants are unit-testable in-process. The binary keeps
+  the file reads, the RPK-identity load/generate, the Raft store open, join/dial, the ACME renewal
+  loop, and the serve loop; it calls the lifted helpers to *build* the config. Behaviour-preserving
+  (a pure move); `cluster` / `tls` feature-gated (`cluster` implies `tls`).
+- **Gateway `buffer_requests`: opt-in per-upstream request buffering to front a container registry
+  over HTTP/2 (Caddy `request_buffers` parity).** A new per-upstream `buffer_requests` flag
+  (`boatramp gateway upstream add --buffer-requests`, default **off**) makes the reverse-proxy
+  forward leg read a **length-unknown** request body (an HTTP/2 `END_STREAM`-delimited body, or an
+  inbound `Transfer-Encoding: chunked` body) to a **bounded, per-request unnamed temp file**
+  (`tempfile::tempfile_in`, unlinked at creation — no reachable/guessable path, no symlink/TOCTOU
+  target, reclaimed on every exit path incl. 413, I/O error, panic), establish its length, and
+  forward it with a `Content-Length` instead of chunked. This fixes fronting a **Docker/OCI
+  container registry** (Gitea, Harbor, Distribution), whose blob `PUT` rejects a chunked upload with
+  `400 missing content-length header` — so a `docker push` over the edge's HTTP/2 (no inbound
+  `Content-Length`) previously 400-looped. The buffer is hard-capped by a per-upstream
+  `max_buffer_bytes` (default **1 GiB**, checked before every write → `413 Payload Too Large`), so
+  buffering can never grow memory unbounded (RSS stays flat; the body lives on disk, not in a `Vec`)
+  or fill the disk. A body that already declares a `Content-Length` is never buffered (it forwards
+  fixed-length, unchanged), and the flag is off for every existing upstream, so default behavior is
+  byte-identical. Drives the shared `UpstreamClient::send` seam, so both the site-tier and
+  absolute-URL forward paths honor it. Config validation refuses a dangling `max_buffer_bytes`
+  without `buffer_requests` and a zero cap.
+- **Compute `blob` site-targeting via the new `ComputeBinding.site` field.** A `blob` binding can
+  now **deliberately share a site's blob tape** with a native worker: set `ComputeBinding.site`, or
+  on the CLI append `@<site>` to the bind — `--bind blob@blog` (whole site tape) or
+  `--bind blob:assets@blog` (one container) resolves to `hblob/{project}/blog/…`, the exact objects
+  a `wasi:blobstore` handler for that site sees. The share is **gated at `compute set`**: the site
+  must be a real site in the **workload's own project** (the project is taken from the workload's
+  key, never the binding — the tenant invariant), the site name must be a valid slug, and the caller
+  must hold that site's blob-write right (`Site·Write` on `<project>/<site>`); the resolver
+  additionally fails closed on a malformed site. `@<site>` is valid only on a `blob` binding. The
+  new field is additive and **content-hash-neutral** when unset (omitted from the wire, so existing
+  specs keep their `ComputeSpec::id()`) — the same zero-churn pattern as `writable_root` /
+  `priority`. `boatramp compute bind-blob --site <s>` (the dev/CI loop) is unchanged for callers — it
+  now reaches the site's tape through the explicit `site`.
 
 ### Changed
 
-- **Compute `blob` bindings no longer auto-share a same-named site's tape; share is now an
-  explicit, authorized opt-in (behavior change — tenancy).** Before v0.73.0 a compute workload's
-  `blob` binding resolved its namespace under the **workload name** as the site-identity segment
+- **Compute `blob` bindings no longer auto-share a same-named site's tape; share is now an explicit,
+  authorized opt-in (behavior change — tenancy).** Before v0.73.0 a compute workload's `blob`
+  binding resolved its namespace under the **workload name** as the site-identity segment
   (`hblob/{project}/{workload}/…`), so a workload *named after a site* implicitly read and wrote that
   site's blob tape — an undiscoverable, error-prone coupling (and a workload named after nothing wrote
-  to an invisible namespace of its own). That name-match convention is **dropped**:
-  - A `blob` binding with **no explicit site** now resolves to the workload's own **private reserved
-    namespace** `hblob/{project}/_compute/{workload}/…`. The `_compute` segment can never be a site
-    name (it is not a valid resource slug), so this namespace is provably **disjoint from every
-    site's blob tape** — a compute workload can no longer silently collide with a same-named site.
-  - To **deliberately share a site's blob tape**, set the new `ComputeBinding.site` field — on the
-    CLI, append `@<site>` to the bind: `--bind blob@blog` (whole site tape) or
-    `--bind blob:assets@blog` (one container) resolves to `hblob/{project}/blog/…`, the exact objects
-    a `wasi:blobstore` handler for that site sees. The share is **gated at `compute set`**: the site
-    must be a real site in the **workload's own project** (the project is taken from the workload's
-    key, never the binding — the tenant invariant), the site name must be a valid slug, and the
-    caller must hold that site's blob-write right (`Site·Write` on `<project>/<site>`); the resolver
-    additionally fails closed on a malformed site. `@<site>` is valid only on a `blob` binding.
-  - **Migration: none required.** A fleet survey found no production workload relying on the
-    name-match (all `blob`-bound workloads were already explicit or sql-only), so no blob re-home is
-    needed. A workload that *was* relying on it must now add `--bind blob:<container>@<site>` to keep
-    sharing a site's tape. The `kv` binding is unchanged (it still resolves under the workload name).
-  - The new `ComputeBinding.site` field is additive and **content-hash-neutral** when unset (omitted
-    from the wire, so existing specs keep their `ComputeSpec::id()`) — the same zero-churn pattern as
-    `writable_root` / `priority`. `boatramp compute bind-blob --site <s>` (the dev/CI loop) is
-    unchanged for callers — it now reaches the site's tape through the explicit `site`.
-
-### Security
-
-- **Direct-S3 blob-upload STS write path now anchors on the resolved site, not the workload name
-  (HIGH — tenancy / `Site·Write` write-side bypass).** The explicit-site targeting above fixed the
-  HMAC blob shim's read/write resolution (`BlobShimResolver::scope`), but the **direct-S3 STS mint**
-  path (`contribute_blob_sts`, injected as `AWS_*` credentials for an off-the-shelf S3 client) was a
-  *separate* derivation that still hardcoded the mint scope's site to the **workload name**. The
-  minted write credential therefore anchored at `hblob/{project}/{workload}/{container}/`, ignoring
-  `binding.site` and the `_compute` default — reviving the exact name-match coupling on the **write**
-  side: (1) a no-site `blob` binding on a workload *named after a site* minted an **ungated write
-  credential to that site's real tape** (the `Site·Write` set-time gate only fires for an explicit
-  `binding.site`), and (2) an explicit `@site` share minted creds anchored at the workload name rather
-  than the authorized site, so the gated share was non-functional over the S3 client. Both stayed
-  **within the workload's own project** (not cross-tenant). The STS mint is now anchored on the SAME
-  resolved `BlobScope` the HMAC path uses: an explicit-site binding mints for `MintScope.site =
-  binding.site` (the resource prefix `keypath::container_prefix` composes is pinned byte-identical to
-  the HMAC `site_prefix` + container, failing closed to the HMAC shim on any divergence), and a
-  **no-site binding skips the direct-S3 mint entirely** — its private two-segment
-  `hblob/{project}/_compute/{workload}/` namespace has no single-segment site tape to mint into, and
-  the HMAC shim already provides its full confined R/W, so no S3 write credential to any site tape is
-  issued. Only a `blob-upload`-enabled build with a wired cloud STS minter was affected.
+  to an invisible namespace of its own). That name-match convention is **dropped**: a `blob` binding
+  with **no explicit `site`** now resolves to the workload's own **private reserved namespace**
+  `hblob/{project}/_compute/{workload}/…`. The `_compute` segment can never be a site name (it is not
+  a valid resource slug), so this namespace is provably **disjoint from every site's blob tape** — a
+  compute workload can no longer silently collide with a same-named site. To share a site's tape
+  instead, set the new `ComputeBinding.site` field (see **Added**), which resolves into
+  `hblob/{project}/{site}/…` and is same-project and authz-gated. The `kv` binding is unchanged (it
+  still resolves under the workload name). **Migration: none required** — a fleet survey found no
+  production workload relying on the name-match (all `blob`-bound workloads were already explicit or
+  sql-only); a workload that *was* relying on it must now add `--bind blob:<container>@<site>` to
+  keep sharing a site's tape.
 
 ### Fixed
 
@@ -88,32 +104,10 @@ versions.
   orphan reaper uses), matching the docker backend, so a no-ingress consumer becomes healthy across
   both backends. A workload that exposes a port keeps the TCP readiness probe unchanged.
 
-### Added
+### Security
 
-- **Gateway `buffer_requests`: front a container registry over HTTP/2 (Caddy `request_buffers`
-  parity).** A new per-upstream `buffer_requests` flag (`boatramp gateway upstream add
-  --buffer-requests`, default **off**) makes the reverse-proxy forward leg read a **length-unknown**
-  request body (an HTTP/2 `END_STREAM`-delimited body, or an inbound `Transfer-Encoding: chunked`
-  body) to a bounded temp file, establish its length, and forward it with a `Content-Length` instead
-  of chunked. This fixes fronting a **Docker/OCI container registry** (Gitea, Harbor, Distribution),
-  whose blob `PUT` rejects a chunked upload with `400 missing content-length header` — so a `docker
-  push` over the edge's HTTP/2 (no inbound `Content-Length`) previously 400-looped. A body that
-  already declares a `Content-Length` is never buffered (it forwards fixed-length, unchanged), and
-  the flag is off for every existing upstream, so default behavior is byte-identical. Drives the
-  shared `UpstreamClient::send` seam, so both the site-tier and absolute-URL forward paths honor it.
-
-### Security (gateway request buffering)
-
-- **Bounded, temp-file-backed request buffering (untrusted upload body).** When `buffer_requests` is
-  enabled, the body is spilled to a **per-request unnamed temp file** (`tempfile::tempfile_in`,
-  unlinked at creation — no reachable/guessable path, no symlink/TOCTOU target, reclaimed on every
-  exit path incl. 413, I/O error, panic). It is hard-capped by a per-upstream `max_buffer_bytes`
-  (default **1 GiB**); the running total is checked before every write, so a body over the cap is
-  rejected `413 Payload Too Large` without spilling past the bound — buffering can never grow memory
-  unbounded (RSS stays flat; the body lives on disk, not in a `Vec`) or fill the disk. Config
-  validation refuses a dangling `max_buffer_bytes` without `buffer_requests` and a zero cap.
-- **Request buffering is now time-bounded (inbound slow-loris closed).** The buffering loop reads an
-  untrusted body to the temp file *before* the upstream write, so it was bounded by neither
+- **Gateway request buffering is time-bounded (inbound slow-loris closed).** The buffering loop
+  reads an untrusted body to the temp file *before* the upstream write, so it was bounded by neither
   `request_timeout_ms` (which wraps only the upstream write + response head, after buffering) nor the
   connection idle timeout (which never fires on an actively-trickling stream). A slow-trickle client
   (e.g. one byte every few seconds) could therefore hold a connection slot + a growing temp file
@@ -128,6 +122,25 @@ versions.
   value; set them via `boatramp gateway upstream add --buffer-requests [--buffer-read-timeout-ms N]
   [--buffer-total-timeout-ms N]`. A normal fast/large upload completes well within the bounds and is
   unaffected.
+- **Direct-S3 blob-upload STS write path now anchors on the resolved site, not the workload name
+  (HIGH — tenancy / `Site·Write` write-side bypass).** The explicit-site targeting above fixed the
+  HMAC blob shim's read/write resolution (`BlobShimResolver::scope`), but the **direct-S3 STS mint**
+  path (`contribute_blob_sts`, injected as `AWS_*` credentials for an off-the-shelf S3 client) was a
+  *separate* derivation that still hardcoded the mint scope's site to the **workload name**. The
+  minted write credential therefore anchored at `hblob/{project}/{workload}/{container}/`, ignoring
+  `binding.site` and the `_compute` default — reviving the exact name-match coupling on the **write**
+  side: (1) a no-site `blob` binding on a workload *named after a site* minted an **ungated write
+  credential to that site's real tape** (the `Site·Write` set-time gate only fires for an explicit
+  `binding.site`), and (2) an explicit `@site` share minted creds anchored at the workload name rather
+  than the authorized site, so the gated share was non-functional over the S3 client. Both stayed
+  **within the workload's own project** (not cross-tenant). The STS mint is now anchored on the SAME
+  resolved `BlobScope` the HMAC path uses: an explicit-site binding mints for `MintScope.site =
+  binding.site` (the resource prefix `keypath::container_prefix` composes is pinned byte-identical to
+  the HMAC `site_prefix` + container, failing closed to the HMAC shim on any divergence), and a
+  **no-site binding skips the direct-S3 mint entirely** — its private two-segment
+  `hblob/{project}/_compute/{workload}/` namespace has no single-segment site tape to mint into, and
+  the HMAC shim already provides its full confined R/W, so no S3 write credential to any site tape is
+  issued. Only a `blob-upload`-enabled build with a wired cloud STS minter was affected.
 
 ## [0.72.0] — 2026-11-24
 
