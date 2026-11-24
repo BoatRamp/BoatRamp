@@ -4910,6 +4910,29 @@ pub trait ManagedDbEnvResolver: Send + Sync {
         false
     }
 
+    /// **Invalidate the serve-process's cached serving backend** for the managed DB this
+    /// `(project, workload)` hosts, so the NEXT request rebuilds it from the current binding
+    /// config + the current provisioned objects — the same rebuild a fresh boot does.
+    ///
+    /// Called by [`advance_readiness`] ONLY after an **adoption reprovision** succeeds (the
+    /// [`needs_reprovision`](Self::needs_reprovision) → [`provision_managed`](Self::provision_managed)
+    /// success path on an already-[`Provisioned`](Readiness::Provisioned) replica), i.e. AFTER the
+    /// missing serving object (the `rls_session` app role) has been created. The motivating case:
+    /// a live `apply` flipping `rls_session: true` on an already-serving managed Postgres. The
+    /// reconcile creates the app role, but the warm serving-backend cache keeps serving on the
+    /// cached bootstrap-SUPERUSER backend (built when the cell was rls-off), so RLS stays silently
+    /// off until the pods cycle. Invalidating that cache here makes the next request rebuild the
+    /// serving backend as the restricted non-superuser app role — engaging RLS live, with no
+    /// restart.
+    ///
+    /// Fail-closed by construction: the caller invokes this ONLY after the app role is confirmed
+    /// created, and the rebuild the invalidation triggers resolves the runtime to the app role (an
+    /// rls-on cell NEVER falls back to serving as the superuser — a missing/unconnectable app role
+    /// refuses the request instead), so invalidation can never open a serve-as-superuser gap. A
+    /// best-effort, side-effect-free signal: defaulted to a no-op so a non-DB resolver is
+    /// unaffected, and implementations MUST NOT fail the reconcile (readiness stays `Provisioned`).
+    async fn invalidate_serving_backend(&self, _project: &str, _workload: &str) {}
+
     /// **Mint** this replica's per-replica DYNAMIC database credential at launch, for a
     /// workload that CONSUMES a managed database (PLAN-compute-managed-db phase 2). Called
     /// once per launch, BEFORE binding resolution, so a DSN injector reads the freshly-
@@ -6829,11 +6852,22 @@ async fn advance_readiness(
         if let Some(m) = managed_db
             && m.needs_reprovision(project, workload, &state.endpoint)
                 .await
-            && let Err(reason) = m
+        {
+            if let Err(reason) = m
                 .provision_managed(project, workload, &state.endpoint)
                 .await
-        {
-            return Readiness::ProvisionFailed { reason };
+            {
+                return Readiness::ProvisionFailed { reason };
+            }
+            // ADOPTION SUCCEEDED (the app role was just created IN PLACE): invalidate the
+            // serve-process's cached serving backend for this cell so the NEXT request rebuilds
+            // it as the restricted non-superuser app role — engaging rls_session live, with no
+            // restart. Runs ONLY after `provision_managed` returns Ok, so the role is confirmed
+            // present before we release the warm (superuser) cache (never a serve-as-superuser
+            // gap: an rls-on rebuild resolves the app role or refuses). The caller persists this
+            // tick's `Provisioned` on a change only, and `needs_reprovision` now reports false,
+            // so this fires exactly once per adoption, not every tick.
+            m.invalidate_serving_backend(project, workload).await;
         }
         return Readiness::Provisioned;
     }
@@ -11813,6 +11847,9 @@ mod tests {
         /// `rls_session`-adoption detection). Default `false` (the trait default) — only the
         /// adoption tests flip it on to drive the re-run branch.
         needs_reprovision: bool,
+        /// Counts `invalidate_serving_backend` calls, so a test can prove the serving-cache
+        /// invalidation fires EXACTLY on the adoption success path (b1) and nowhere else.
+        invalidations: std::sync::atomic::AtomicUsize,
     }
     impl FakeManagedDb {
         fn new(probe: Option<bool>, provision_ok: bool) -> Self {
@@ -11821,6 +11858,7 @@ mod tests {
                 provision_ok,
                 provisions: std::sync::atomic::AtomicUsize::new(0),
                 needs_reprovision: false,
+                invalidations: std::sync::atomic::AtomicUsize::new(0),
             }
         }
         /// Builder for the adoption-path tests: an already-`Provisioned` replica whose
@@ -11849,6 +11887,10 @@ mod tests {
         }
         async fn needs_reprovision(&self, _p: &str, _w: &str, _e: &Endpoint) -> bool {
             self.needs_reprovision
+        }
+        async fn invalidate_serving_backend(&self, _p: &str, _w: &str) {
+            self.invalidations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -12030,6 +12072,11 @@ mod tests {
             "provisioning DDL must not re-run once the replica is already Provisioned and \
              nothing is pending"
         );
+        assert_eq!(
+            m.invalidations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "b1: with nothing to adopt, the serving-backend cache must NOT be invalidated"
+        );
     }
 
     #[tokio::test]
@@ -12051,6 +12098,14 @@ mod tests {
             1,
             "a pending reprovision on an already-Provisioned replica must re-run provision_managed"
         );
+        // b1 (engage rls live): a SUCCESSFUL adoption reprovision must ALSO invalidate the
+        // serve-process's cached serving backend, so the next request rebuilds onto the newly
+        // created non-superuser app role — RLS engages without a restart. Exactly once.
+        assert_eq!(
+            m.invalidations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a successful adoption reprovision must invalidate the serving-backend cache once"
+        );
     }
 
     #[tokio::test]
@@ -12070,6 +12125,14 @@ mod tests {
             }
         );
         assert_eq!(m.provisions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // b1 FAIL-CLOSED: a FAILED adoption reprovision must NOT invalidate the serving cache —
+        // the app role was not created, so releasing the warm cache onto it would open a
+        // fail-closed serving gap. The invalidation fires only after `provision_managed` is Ok.
+        assert_eq!(
+            m.invalidations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a FAILED adoption reprovision must never invalidate the serving-backend cache"
+        );
     }
 
     #[tokio::test]

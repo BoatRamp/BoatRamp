@@ -162,6 +162,20 @@ fn decode_ref(s: &str) -> Option<(String, u16)> {
     Some((ip.to_string(), port.parse().ok()?))
 }
 
+/// Map a container's run-state (`cgroup_alive` — the authoritative cgroup-v2 liveness probe) to
+/// [`Health`]. This is the liveness model for a NO-INGRESS (`port == 0`) consumer workload, which
+/// exposes no TCP port to probe — a TCP probe to `<ip>:0` always fails (the pre-fix false-Unhealthy
+/// loop, #11). Mirrors the docker backend (which derives `health` from container run-state) and
+/// [`replica_alive`](ComputeBackend::replica_alive). Pure, so the no-ingress decision is host-tested
+/// without a live container.
+fn run_state_health(cgroup_alive: bool) -> Health {
+    if cgroup_alive {
+        Health::Healthy
+    } else {
+        Health::Unhealthy
+    }
+}
+
 /// How a cross-node resume node deterministically **re-materializes** a parked container's
 /// content-addressed root filesystem before the CRIU restore (U14 follow-up: container
 /// cross-node scale-to-zero, v0.72.0).
@@ -1507,6 +1521,17 @@ impl ComputeBackend for ContainerBackend {
 
     async fn health(&self, handle: &InstanceHandle) -> Result<Health, BackendError> {
         let addr = &handle.backend_ref; // "ip:port"
+        // NO-INGRESS parity (#11): a consumer workload with `port: 0` exposes no TCP port, so a
+        // TCP reachability probe would connect to `<ip>:0` and ALWAYS fail — a false-Unhealthy
+        // loop the native backend had but the docker backend never did (it derives liveness from
+        // container run-state). Derive liveness from run-state here too (the SAME cgroup probe
+        // [`replica_alive`] uses), so a no-ingress consumer reads Healthy while its container is
+        // alive, consistent across backends. `port != 0` keeps the TCP readiness probe below.
+        let port = decode_ref(addr).map(|(_, p)| p).unwrap_or(0);
+        if port == 0 {
+            let id = container_id(&handle.project, &handle.workload, handle.replica);
+            return Ok(run_state_health(container_cgroup_alive(&id)));
+        }
         let connect = tokio::net::TcpStream::connect(addr.as_str());
         match tokio::time::timeout(Duration::from_secs(2), connect).await {
             Ok(Ok(_)) => Ok(Health::Healthy),
@@ -4366,6 +4391,24 @@ mod tests {
     // (env-merge + workdir application is now the shared `SandboxPlan::apply_image_config`
     // seam — unit-tested cross-platform in `sandbox.rs`, exercised on BOTH the launch and
     // ephemeral paths here.)
+
+    /// #11 — a NO-INGRESS (`port == 0`) consumer workload's `health` is its run-state (the cgroup
+    /// probe), NEVER a TCP probe to `<ip>:0`. A `backend_ref` ending in `:0` decodes to port 0, so
+    /// `health` takes the run-state branch; `run_state_health` maps a live cgroup to `Healthy` and a
+    /// gone one to `Unhealthy` — the same liveness the docker backend derives from container run
+    /// state, so a no-ingress consumer reaches `Provisioned` instead of false-looping `Unhealthy`.
+    /// A workload that DOES expose a port (`port != 0`) keeps the TCP readiness probe (port decodes
+    /// to non-zero), so this never weakens an ingress workload's readiness.
+    #[test]
+    fn no_ingress_port_zero_health_is_run_state_not_tcp() {
+        // The run-state → Health mapping the port-0 branch uses.
+        assert_eq!(run_state_health(true), Health::Healthy);
+        assert_eq!(run_state_health(false), Health::Unhealthy);
+        // A no-ingress backend_ref decodes to port 0 → `health` takes the run-state branch.
+        assert_eq!(decode_ref("10.88.0.7:0").map(|(_, p)| p), Some(0));
+        // An ingress backend_ref decodes to a non-zero port → `health` keeps the TCP probe.
+        assert_eq!(decode_ref("10.88.0.7:8080").map(|(_, p)| p), Some(8080));
+    }
 
     /// A `Storage` that serves one in-memory blob for every `get` — enough to
     /// exercise the `materialize` rootfs-staging path with no privilege (the

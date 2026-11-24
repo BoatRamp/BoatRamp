@@ -5,6 +5,38 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.72.1] — 2026-11-24
+
+### Fixed
+
+- **`rls_session` now ENGAGES live on an already-serving managed Postgres — no restart (tenancy).**
+  v0.72.0 made `rls_session` *adoptable* on an already-provisioned managed Postgres (the reconcile
+  creates the missing non-superuser **app role** in place), but a running node did not actually
+  start serving under it without a pod cycle: the warm, process-cached serving backend — built as
+  the bootstrap **superuser** while the cell was rls-off — was never invalidated when the config
+  flipped, so RLS stayed silently off until the pods recycled. The reconcile now **invalidates the
+  cached serving backend on the adoption success path** (after, and only after, the app role is
+  confirmed created), so the next request rebuilds the serving backend as the restricted app role
+  and RLS engages live. Fail-closed is preserved end to end: the invalidation fires only once the
+  app role exists, and an rls-on cell never falls back to serving as the superuser — a missing or
+  unconnectable app role refuses the request instead.
+- **Provision-then-serve closes the cold-boot ordering window for an rls-on managed Postgres
+  (tenancy).** The compute reconcile loop is spawned detached, so on a cold boot the serve listener
+  could bind slightly before the first reconcile tick provisioned the app role — a brief window
+  where an rls-on cell's serving identity could route to a not-yet-created role. The serve path now
+  **ensures the app role exists before binding the serving identity to it** — provisioning it in
+  place (as the bootstrap superuser) if absent — so there is no timing window by construction. If
+  the role cannot be provisioned the request is refused (fail-closed); the serve path never falls
+  back to the superuser while `rls_session` is on. The role-creation DDL is shared with the
+  reconcile's provisioning pass, so the app role is byte-identical whichever path creates it first.
+- **Native `container` backend honors `port: 0` (no-ingress) consumer workloads in `health`.** The
+  native container backend's health check TCP-probed the app port unconditionally, so a no-ingress
+  consumer workload (`port: 0`) — one that only *consumes* bindings and exposes no port — probed
+  `<ip>:0`, always failed, and false-looped `Unhealthy`, never reaching `Provisioned`. It now
+  derives such a workload's liveness from its container run-state (the same cgroup liveness the
+  orphan reaper uses), matching the docker backend, so a no-ingress consumer becomes healthy across
+  both backends. A workload that exposes a port keeps the TCP readiness probe unchanged.
+
 ## [0.72.0] — 2026-11-24
 
 ### Fixed

@@ -523,10 +523,7 @@ impl ManagedDbEnv {
         db: &ManagedDbSpec,
         superuser_password: String,
     ) -> Result<(), String> {
-        use boatramp_storage::tenant_provision::{
-            ensure_login_role_ddl, force_rls_event_trigger_ddl, grant_app_role_ddl,
-            rls_app_role_name,
-        };
+        use boatramp_storage::tenant_provision::rls_app_role_name;
         // Opt-in + Postgres-only. MySQL single-mode has no RLS (and no owner/runtime split); an
         // un-opted single-mode DB keeps serving as the superuser exactly as today.
         if !db.rls_session || !matches!(db.kind, ExternalSqlKind::Postgres) {
@@ -557,20 +554,18 @@ impl ManagedDbEnv {
             &db.user,
             superuser_password,
         );
-        let mut stmts = ensure_login_role_ddl(db.kind, &app_role, &app_password, &db.database);
-        // The app role gets only GRANT + DEFAULT PRIVILEGES (owner = the schema-owning superuser),
-        // never ownership — it OWNS NOTHING.
-        stmts.extend(grant_app_role_ddl(db.kind, &app_role, &db.user));
-        // Defense-in-depth FORCE-on-ENABLE trigger (owned by the schema-owning superuser so its
-        // SECURITY DEFINER body may FORCE the tenant tables). The app role is a non-owner that ENABLE
-        // already binds, so FORCE is belt-and-suspenders here — installed to match the Shared path.
-        stmts.extend(force_rls_event_trigger_ddl(db.kind, &db.user));
-        for stmt in stmts {
-            admin
-                .run_script(&stmt)
-                .await
-                .map_err(|e| format!("rls app-role provision on {}: {e}", db.database))?;
-        }
+        // ONE source of truth for the app-role DDL — the SAME helper the serve-path
+        // provision-then-serve ensure runs, so the role created here (reconcile) and there (first
+        // serve) is byte-identical.
+        crate::tenant_sql::run_rls_app_role_provision_ddl(
+            &admin,
+            db.kind,
+            &app_role,
+            &app_password,
+            &db.database,
+            &db.user,
+        )
+        .await?;
         tracing::info!(
             database = %db.database,
             app_role = %app_role,
@@ -758,6 +753,67 @@ impl ManagedDbEnv {
             });
         }
         None
+    }
+
+    /// The OPERATOR-FACING serving binding name(s) this `(project, workload)` backs — the keys the
+    /// serve-process's epoch-stamped SQL caches (the composite per-tenant cache + the declared-DB
+    /// resolver cache) stamp under, so [`invalidate_serving_backend`](ManagedDbEnvResolver::invalidate_serving_backend)
+    /// knows which `sql_binding_epochs` entries to bump.
+    ///
+    /// A managed workload is addressed on the serve path by the operator-chosen BINDING name (the
+    /// `[databases]` config key / the `apply` database name), NOT by the backing compute workload,
+    /// and the caches key their credential epoch by `(project, binding-name)` — exactly what the
+    /// drop/deprovision paths bump. This maps a `(project, workload)` back to those names:
+    /// - **node-static** `[databases]`: every binding whose `compute` equals `workload` (the base
+    ///   server / default-Single install) or is a `-`-separated prefix of it (a `Single` per-tenant
+    ///   `<base>-<ident>` workload), mirroring [`resolve_static`](Self::resolve_static);
+    /// - **applied** (`bramp-db-…` derived workload): the declared database whose derived workload
+    ///   matches, mirroring [`resolve_applied`](Self::resolve_applied) — the declared NAME is the
+    ///   cache key.
+    ///
+    /// Returns every match (over-bumping a sibling binding is harmless — a bump only ever forces a
+    /// re-resolve). Empty only for a workload no serving binding maps to (then there is nothing
+    /// cached to invalidate).
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    async fn serving_cache_names(&self, project: &str, workload: &str) -> Vec<String> {
+        use boatramp_storage::tenant_provision::DERIVED_MANAGED_DB_PREFIX;
+        let mut names: Vec<String> = Vec::new();
+        // Node-static bindings (the composite per-tenant cache's keys).
+        for (name, cfg) in &self.databases {
+            let Some(compute) = cfg.compute.as_deref().filter(|c| !c.is_empty()) else {
+                continue;
+            };
+            let exact = compute == workload;
+            let per_tenant_single = matches!(cfg.tenant, crate::config::TenantIsolation::Single)
+                && workload
+                    .strip_prefix(compute)
+                    .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1);
+            if exact || per_tenant_single {
+                names.push(name.clone());
+            }
+        }
+        // Applied (declared) databases (the declared-DB resolver cache's keys). Only a derived
+        // `bramp-db-…` workload can be one, so a node-static workload pays no store read.
+        if workload.starts_with(DERIVED_MANAGED_DB_PREFIX)
+            && let Ok(declarations) = self
+                .deploy
+                .list_project_databases(ProjectRef::new(project))
+                .await
+        {
+            for apply_db in &declarations {
+                let derived = crate::managed_db_declare::derived_workload(project, &apply_db.name);
+                let lowered = crate::managed_db_declare::lower(project, apply_db);
+                let is_match = workload == derived
+                    || (matches!(lowered.tenant, crate::config::TenantIsolation::Single)
+                        && workload
+                            .strip_prefix(derived.as_str())
+                            .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1));
+                if is_match && !names.contains(&apply_db.name) {
+                    names.push(apply_db.name.clone());
+                }
+            }
+        }
+        names
     }
 }
 
@@ -1000,6 +1056,41 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
             ),
             // Probe error ⇒ fail safe: do not force a reprovision; retry next tick.
             Err(_) => false,
+        }
+    }
+
+    /// Invalidate the serve-process's cached serving backend for this managed DB (b1 — engage
+    /// `rls_session` live). [`advance_readiness`](boatramp_core::compute) calls this ONLY after a
+    /// successful adoption reprovision (the app role is now present), so the next request rebuilds
+    /// the serving backend onto the restricted non-superuser app role instead of continuing to
+    /// serve on the warm bootstrap-superuser backend built when the cell was rls-off.
+    ///
+    /// Bumps the monotonic `sql_binding_epochs` generation for every operator-facing binding this
+    /// `(project, workload)` backs (see [`serving_cache_names`](Self::serving_cache_names)) — the
+    /// SAME keys the composite per-tenant cache + the declared-DB resolver stamp, and the SAME keys
+    /// the managed-DB drop / tenant deprovision paths bump. A bump can only force a re-resolve (it
+    /// never serves a staler credential), so it is safe + fail-closed: the rebuild resolves the app
+    /// role (an rls-on cell never falls back to the superuser), and this never fails the reconcile.
+    async fn invalidate_serving_backend(&self, project: &str, workload: &str) {
+        let names = self.serving_cache_names(project, workload).await;
+        if names.is_empty() {
+            tracing::debug!(
+                %project,
+                %workload,
+                "rls_session adoption: no serving binding maps to this workload — nothing cached \
+                 to invalidate"
+            );
+            return;
+        }
+        for name in names {
+            boatramp_core::sql::sql_binding_epochs().bump(project, &name);
+            tracing::info!(
+                %project,
+                binding = %name,
+                %workload,
+                "rls_session adopted live: invalidated the cached serving backend — the next \
+                 request rebuilds it as the non-superuser app role (rls engaged, no restart)"
+            );
         }
     }
 
@@ -4164,6 +4255,60 @@ mod tests {
         assert_eq!(
             env.managed_db_privilege("acme", "pg-metrics-acme").await,
             Some(PrivilegeDirective::Rootless { uid: 999, gid: 999 })
+        );
+    }
+
+    /// b1 (engage rls live): `serving_cache_names` maps a `(project, workload)` back to the
+    /// OPERATOR-FACING binding name(s) the serve-process's SQL caches stamp their epoch under — the
+    /// keys `invalidate_serving_backend` bumps. A node-static binding's compute matched EXACTLY (the
+    /// base server / default-Single install) OR as a `-`-prefix base (a `Single` per-tenant
+    /// `<base>-<ident>` workload); a workload no binding maps to yields nothing (nothing cached).
+    #[tokio::test]
+    async fn serving_cache_names_maps_workload_to_static_binding_names() {
+        use crate::config::TenantIsolation;
+
+        let mut analytics = db("postgres", Some("pg"), "", None);
+        analytics.tenant = TenantIsolation::Single;
+        let mut metrics = db("postgres", Some("pgx"), "", None);
+        metrics.tenant = TenantIsolation::Single;
+
+        let mut dbs = BTreeMap::new();
+        dbs.insert("analytics".to_string(), analytics);
+        dbs.insert("metrics".to_string(), metrics);
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let creds = ManagedSqlCredentials::new(kv, Arc::new(ReverseEnvelope));
+        let env = ManagedDbEnv::from_config(
+            &dbs,
+            creds,
+            ManagedDbPrivilege::default(),
+            DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new())),
+            std::collections::BTreeSet::new(),
+        );
+
+        // Exact compute match (the base server / default-Single install) → the binding name.
+        assert_eq!(
+            env.serving_cache_names("acme", "pg").await,
+            vec!["analytics".to_string()],
+            "the base workload maps to exactly its binding name"
+        );
+        // A `Single` per-tenant `<base>-<ident>` workload maps back to the base binding — and NOT to
+        // the unrelated `pgx`/`metrics` binding.
+        let per_tenant = env.serving_cache_names("acme", "pg-acme").await;
+        assert!(
+            per_tenant.contains(&"analytics".to_string()),
+            "a Single per-tenant `<base>-<ident>` workload maps to its base binding: {per_tenant:?}"
+        );
+        assert!(
+            !per_tenant.contains(&"metrics".to_string()),
+            "an unrelated binding must NOT be bumped: {per_tenant:?}"
+        );
+        // A workload no static binding maps to (and not a `bramp-db-…` applied one) → nothing.
+        assert!(
+            env.serving_cache_names("acme", "unrelated")
+                .await
+                .is_empty(),
+            "a workload no serving binding maps to has nothing cached to invalidate"
         );
     }
 
