@@ -4903,6 +4903,42 @@ mod instance_serve {
                 );
             }
 
+            // (4a) TOKEN-REVOCATION CHECK (parity with the monolith's EVERY-request revocation gate —
+            // `crate::auth::AuthInner::revocation` / `is_revoked_or_unreadable`, boatramp-server/auth.rs).
+            // This control plane HOLDS `backend.kv`, so it reads the LIVE `authz/revoked/<cti>` marker
+            // DIRECTLY from the same store the policy read + the write below use (NOT the KV-blind crown
+            // jewel's out-of-band file projection — that is the authority-serve path's `RevocationCheck`).
+            // Mirrors `is_revoked_or_unreadable` EXACTLY: FAIL-CLOSED on present-OR-unreadable — a PRESENT
+            // marker ⇒ refuse (revoked); an UNREADABLE/errored marker ⇒ refuse (shed, MF-4), NEVER
+            // silently honored (the pre-MF-4 hole). There is NO single-writer fail-OPEN escape here: a
+            // served control-plane mutation is a privileged WRITE, which the monolith itself reads
+            // fail-closed. This closes the window where a revoked-but-still-fresh end-principal token
+            // would be honored for up to the verifier freshness bound (~the context max age).
+            match self.data_plane.revocation_status(&cti).await {
+                RevocationStatus::NotRevoked => {}
+                RevocationStatus::Revoked => {
+                    tracing::warn!(
+                        %host, principal = %principal.principal_id(),
+                        "[privsep] node-self-host control mutation REFUSED: the end-principal token is \
+                         revoked (an authz/revoked/<cti> marker is present) — fail-closed"
+                    );
+                    return fail_closed_response(
+                        "control-plane mutation refused: the end-principal token is revoked",
+                    );
+                }
+                RevocationStatus::Unreadable(why) => {
+                    tracing::warn!(
+                        %host, reason = %why,
+                        "[privsep] node-self-host control mutation REFUSED: the token-revocation marker \
+                         could not be read — shed fail-closed (MF-4), never silently honored"
+                    );
+                    return fail_closed_response(&format!(
+                        "control-plane mutation refused: the token-revocation marker could not be read \
+                         (fail-closed / shed, never silently honored): {why}"
+                    ));
+                }
+            }
+
             // (4) `control.admin-api` AUTHORIZATION, DEFAULT-DENY: the verified principal must hold the
             // required control-plane Right for the op's target, per the node's REAL RBAC.
             let policy = match self.data_plane.load_authz_policy().await {
@@ -4914,7 +4950,15 @@ mod instance_serve {
                     ));
                 }
             };
-            let granted = policy.rights_for(&principal.token().roles);
+            // (I1 parity) NORMALIZE the verified grants BEFORE expanding them to rights. The monolith
+            // normalizes at token→roles ingestion (`AuthzPolicy::normalize_grants`, auth.rs) and
+            // `rights_for`'s doc contract REQUIRES already-normalized grants (a legacy bare-target grant
+            // — a pre-0.2.0 `publisher:blog` — must read as the `default` project to match a path-derived
+            // `<project>/<site>` target). Strictly fail-closed today (an un-normalized legacy grant
+            // simply fails to match the qualified target), so this is parity/correctness, not a hole — it
+            // keeps the self-host authz decision identical to the monolith's as the `/api/*` map grows.
+            let roles = policy.normalize_grants(&principal.token().roles);
+            let granted = policy.rights_for(&roles);
             if !granted.allows(&required_right) {
                 tracing::warn!(
                     %host, principal = %principal.principal_id(), required = ?required_right,
@@ -5064,6 +5108,21 @@ mod instance_serve {
         Applied,
         /// The mutation could not be performed (store error / no write authority) — fail-closed.
         Unavailable(String),
+    }
+
+    /// The token-revocation status the self-host control-plane serve path reads from the held
+    /// `backend.kv` ([`NodeDataPlane::revocation_status`]). Mirrors the monolith's revocation gate
+    /// (`crate::auth`, boatramp-server/auth.rs): a PRESENT `authz/revoked/<cti>` marker is `Revoked`, a
+    /// clean absence is `NotRevoked`, and a store error / no authority is `Unreadable`. The serve path
+    /// fails CLOSED on BOTH `Revoked` and `Unreadable` (shed-on-unreadable, MF-4) — only `NotRevoked`
+    /// continues, so a revoked-but-still-fresh token can never be honored up to the freshness bound.
+    pub(super) enum RevocationStatus {
+        /// An `authz/revoked/<cti>` marker is present — the token is revoked (refuse).
+        Revoked,
+        /// No marker — the token is not revoked (continue; absence is read-through fresh).
+        NotRevoked,
+        /// The marker could not be read (store error / no authority) — fail CLOSED (shed), never honor.
+        Unreadable(String),
     }
 
     /// The node DATA PLANE a `node-self-host` data-holder serves its own data plane from: the held
@@ -5217,6 +5276,40 @@ mod instance_serve {
                 Ok(None) => Ok(AuthzPolicy::default_policy()),
                 Err(e) => Err(format!(
                     "reading authz/policy from the control-plane KV: {e}"
+                )),
+            }
+        }
+
+        /// Read the end-principal token's revocation marker (`authz/revoked/<cti>`) from the HELD
+        /// control-plane KV, for the P5-3-serve revocation gate. The DATA-PLANE counterpart of the
+        /// monolith's EVERY-request revocation check (`crate::auth::AuthInner::revocation` /
+        /// `is_revoked_or_unreadable`, boatramp-server/auth.rs): reuses the SHARED key-shape
+        /// ([`boatramp_core::authz::revoked_key`] — `authz/revoked/<cti>`), so a revoke written by any
+        /// writer is seen at once (the marker's absence is read-through fresh by construction, never
+        /// negative-cached). A PRESENT marker ⇒ [`RevocationStatus::Revoked`]; a clean absence ⇒
+        /// [`RevocationStatus::NotRevoked`]; a store error / no authority (a `Refusing` plane) ⇒
+        /// [`RevocationStatus::Unreadable`]. The CALLER fails CLOSED on BOTH `Revoked` and `Unreadable`
+        /// (shed-on-unreadable, MF-4) — a privileged control-plane WRITE never silently honors a token
+        /// whose revocation marker it could not read (the pre-MF-4 hole the monolith closed).
+        pub(super) async fn revocation_status(&self, cti: &str) -> RevocationStatus {
+            let store = match self {
+                Self::Deploy(store) => store,
+                // No held `backend.kv` ⇒ the marker is UNREADABLE (fail-closed), never "not revoked".
+                Self::Refusing => {
+                    return RevocationStatus::Unreadable(
+                        "this instance holds no backend.kv control-plane store".into(),
+                    );
+                }
+            };
+            match store
+                .kv()
+                .get(&boatramp_core::authz::revoked_key(cti))
+                .await
+            {
+                Ok(Some(_)) => RevocationStatus::Revoked,
+                Ok(None) => RevocationStatus::NotRevoked,
+                Err(e) => RevocationStatus::Unreadable(format!(
+                    "reading the token-revocation marker from the control-plane KV: {e}"
                 )),
             }
         }
@@ -8136,13 +8229,14 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
     async fn p5_3_serve_authorized_mutation_serves_and_fail_closes_the_negatives() {
         use std::sync::Arc;
 
-        use boatramp_core::authz::GrantedRole;
+        use boatramp_core::authz::{GrantedRole, revoked_key};
         use boatramp_core::cose::{
             AuthorityPopBinding, Claims, KIND_ROLE, LocalSigner, Signer, TokenAlg,
-            mint_authority_pop, mint_delegatable,
+            mint_authority_pop, mint_delegatable, verify_credential,
         };
         use boatramp_core::deploy::DeployStore;
-        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::error::KvError;
+        use boatramp_core::kv::{KvStore, MemoryKv};
         use boatramp_core::time::now_unix;
         use boatramp_server::privsep_authority::{
             CONTROL_MUTATION_POP_OP, ContextVerifier, control_mutation_pop_bytes,
@@ -8163,11 +8257,14 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         // sub-ops held), with the end-principal verifier from the trust root.
         let gate =
             MaterializationGate::new(&[HostAuthority::BackendKv, HostAuthority::ControlAdminApi]);
+        // Keep the backing KV handle: the revocation negative (NEGATIVE 5) writes a live
+        // `authz/revoked/<cti>` marker into the SAME store the serve path reads.
+        let kv = Arc::new(MemoryKv::new());
         let store = DeployStore::new(
             Arc::new(FsStorage::new(
                 std::env::temp_dir().join("boatramp-p5-3-serve-inert-blobs"),
             )),
-            Arc::new(MemoryKv::new()),
+            kv.clone(),
         );
         let control = SelfHostControlPlane::new(ContextVerifier::new(root.public_key()));
         let handler = NodeServeHandler::new(
@@ -8314,6 +8411,86 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         assert!(
             replay.starts_with("HTTP/1.1 503") && replay.contains("anti-replay"),
             "a verbatim replay of an accepted mutation must be refused (503), got:\n{replay}"
+        );
+
+        // --- NEGATIVE 5: a REVOKED principal (M1) — a token that would OTHERWISE be authorized (the
+        //     same `publisher@acme/blog` grant + a valid PoP + a fresh nonce), but whose
+        //     `authz/revoked/<cti>` marker is present in the held `backend.kv` ⇒ 503 (revoked). This
+        //     proves the revocation gate fires BEFORE the authz allow decision: the role IS authorized,
+        //     so a 503 can only come from the revocation check (parity with the monolith's
+        //     EVERY-request revocation gate).
+        let (rtoken, rpop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            5,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        // Mark the token's authority revocation id (`cti`) revoked — the SAME key-shape the monolith
+        // writes (`authz::revoked_key`), into the SAME store the serve path reads.
+        let rcti = verify_credential(&rtoken, &root.public_key(), now)
+            .expect("the revoked-negative token verifies against the trust root")
+            .cti;
+        kv.put(&revoked_key(&rcti), Vec::new())
+            .await
+            .expect("write the revocation marker into the held backend.kv");
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&rtoken, 5, &rpop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("revoked"),
+            "a revoked end-principal token (authz/revoked marker present) must fail closed (503), \
+             got:\n{resp}"
+        );
+
+        // --- NEGATIVE 6: the revocation marker UNREADABLE (M1, shed-on-unreadable / MF-4) — an
+        //     otherwise-authorized principal whose revocation marker read ERRORS (a store partition)
+        //     must SHED (503), never silently honored. A SECOND handler whose data-plane KV errors on
+        //     every `get` (so the FIRST data-plane read — the revocation marker — fails closed before
+        //     the policy read / the write is ever reached).
+        struct FailingKv;
+        #[async_trait::async_trait]
+        impl KvStore for FailingKv {
+            async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, KvError> {
+                Err(KvError::backend("control-plane KV unreachable (test)"))
+            }
+            async fn put(&self, _key: &str, _value: Vec<u8>) -> Result<(), KvError> {
+                Ok(())
+            }
+            async fn delete(&self, _key: &str) -> Result<(), KvError> {
+                Ok(())
+            }
+            async fn list_prefix(&self, _prefix: &str) -> Result<Vec<String>, KvError> {
+                Ok(Vec::new())
+            }
+        }
+        let unreadable_store = DeployStore::new(
+            Arc::new(FsStorage::new(
+                std::env::temp_dir().join("boatramp-p5-3-serve-unreadable-blobs"),
+            )),
+            Arc::new(FailingKv),
+        );
+        let unreadable_handler = NodeServeHandler::new(
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
+            NodeDataPlane::Deploy(unreadable_store),
+            Some(SelfHostControlPlane::new(ContextVerifier::new(
+                root.public_key(),
+            ))),
+        );
+        let (un_token, un_pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            6,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(unreadable_handler, &put_req(&un_token, 6, &un_pop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("could not be read"),
+            "an unreadable revocation marker must SHED (503, fail-closed), never silently honored, \
+             got:\n{resp}"
         );
     }
 
