@@ -186,10 +186,23 @@ boatramp gateway route add /v2/** registry --site registry.example.com
   The spill store is the service's temp directory; under the packaged systemd unit that
   is the private `PrivateTmp`. If that temp directory is a RAM-backed `tmpfs`, buffering
   uses RAM (still hard-capped) rather than disk, so size the cap accordingly.
+- **Time-bounded (slow-loris-safe).** The inbound body read during buffering is bounded
+  by two timeouts so a slow client cannot pin a connection slot + its temp file: a
+  **read-idle** timeout, `--buffer-read-timeout-ms` (default **30000** = 30 s), the longest
+  a single inbound read may stall, and a **whole-phase wall-clock budget**,
+  `--buffer-total-timeout-ms` (default **120000** = 120 s), over the entire buffering phase
+  — the backstop against a trickle that keeps resetting the read-idle timer but never makes
+  progress. On either, buffering aborts with `408 Request Timeout` (a 4xx, so a healthy
+  backend is never faulted for a client-side stall). These bound the body read, which the
+  per-upstream `--request-timeout-ms` does not (that applies only to the upstream write and
+  response). A normal upload streams continuously and completes well within both bounds;
+  raise `--buffer-total-timeout-ms` for an unusually large layer over a slow link, or lower
+  it on a space/time-tight node.
 
 > **Security:** `--buffer-requests` buffers an untrusted upload body. It is an explicit,
-> per-upstream opt-in and is hard-bounded by `--max-buffer-bytes`; leave it off for every
-> upstream that does not specifically need it.
+> per-upstream opt-in, hard-bounded by `--max-buffer-bytes` (size) and the
+> `--buffer-read-timeout-ms` / `--buffer-total-timeout-ms` timeouts (time); leave it off for
+> every upstream that does not specifically need it.
 
 ## Private and Unix-socket upstreams
 

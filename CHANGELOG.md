@@ -31,6 +31,22 @@ versions.
   rejected `413 Payload Too Large` without spilling past the bound — buffering can never grow memory
   unbounded (RSS stays flat; the body lives on disk, not in a `Vec`) or fill the disk. Config
   validation refuses a dangling `max_buffer_bytes` without `buffer_requests` and a zero cap.
+- **Request buffering is now time-bounded (inbound slow-loris closed).** The buffering loop reads an
+  untrusted body to the temp file *before* the upstream write, so it was bounded by neither
+  `request_timeout_ms` (which wraps only the upstream write + response head, after buffering) nor the
+  connection idle timeout (which never fires on an actively-trickling stream). A slow-trickle client
+  (e.g. one byte every few seconds) could therefore hold a connection slot + a growing temp file
+  indefinitely. The inbound body read is now bounded by **two** per-upstream timeouts, defaulted so
+  the attack is closed out of the box: a **read-idle** timeout (`buffer_read_timeout_ms`, default
+  **30 s**) on each inbound read, and a **whole-phase wall-clock budget** (`buffer_total_timeout_ms`,
+  default **120 s**) over the entire buffering phase — the backstop the per-read timeout cannot
+  provide against a trickle that never idles. On either, buffering aborts with `408 Request Timeout`,
+  dropping the temp file and releasing the slot; `408` is a 4xx, so passive health never ejects the
+  (healthy) backend for a client-side stall. Covers both the HTTP/2 and inbound-chunked paths (one
+  buffering loop). Config validation refuses either timeout without `buffer_requests`, and a zero
+  value; set them via `boatramp gateway upstream add --buffer-requests [--buffer-read-timeout-ms N]
+  [--buffer-total-timeout-ms N]`. A normal fast/large upload completes well within the bounds and is
+  unaffected.
 
 ## [0.72.0] — 2026-11-24
 

@@ -340,6 +340,26 @@ fn check_upstream_buffering(name: &str, up: &Upstream) -> Result<(), crate::Conf
              buffered body with 413; set a positive cap or leave it unset for the default"
         )));
     }
+    // The buffering read/total timeouts only apply when buffering is on, and a zero timeout would
+    // 408 every buffered body the instant it starts — both are operator mistakes, caught at declare.
+    for (field, value) in [
+        ("buffer_read_timeout_ms", up.buffer_read_timeout_ms),
+        ("buffer_total_timeout_ms", up.buffer_total_timeout_ms),
+    ] {
+        if value.is_some() && !up.buffer_requests {
+            return Err(crate::ConfigError::parse(format!(
+                "gateway upstream `{name}` sets `{field}` without `buffer_requests` — the buffering \
+                 timeout only applies when request buffering is enabled; set `buffer_requests: \
+                 true` or drop it"
+            )));
+        }
+        if value == Some(0) {
+            return Err(crate::ConfigError::parse(format!(
+                "gateway upstream `{name}` sets `{field}: 0` — a zero timeout aborts every buffered \
+                 body with 408; set a positive timeout or leave it unset for the default"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -694,6 +714,25 @@ pub struct Upstream {
     /// `buffer_requests` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_buffer_bytes: Option<u64>,
+    /// With [`Upstream::buffer_requests`]: the **read-idle timeout** (ms) while buffering a
+    /// length-unknown body — the longest a single inbound body read may stall before buffering is
+    /// aborted with `408 Request Timeout`. `None` → the server default (30 s). This bounds the
+    /// inbound body read, which `request_timeout_ms` does NOT (that wraps only the upstream write +
+    /// response head, after buffering); without it a stalled upload pins a connection slot + its
+    /// temp file. A legitimate upload streams body bytes continuously and never idles this long.
+    /// Ignored unless `buffer_requests` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_read_timeout_ms: Option<u64>,
+    /// With [`Upstream::buffer_requests`]: the **whole-phase wall-clock budget** (ms) for buffering
+    /// one length-unknown body — the longest buffering may run end-to-end before it is aborted with
+    /// `408 Request Timeout`, regardless of how the body is paced. `None` → the server default
+    /// (120 s). This is the backstop [`Upstream::buffer_read_timeout_ms`] cannot provide: a
+    /// slow-loris that trickles just often enough to keep resetting the read-idle timer never idles,
+    /// so only a total-time bound stops it holding a connection slot + a growing temp file. Raise it
+    /// per upstream for unusually large layers over slow links; lower it on a space/time-tight node.
+    /// Ignored unless `buffer_requests` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_total_timeout_ms: Option<u64>,
     /// Header rewrites applied to the request before forwarding.
     #[serde(skip_serializing_if = "HeaderOps::is_empty")]
     pub header_up: HeaderOps,
@@ -1035,17 +1074,21 @@ mod tests {
 
     #[test]
     fn buffer_requests_round_trips_and_default_off_is_byte_identical() {
-        // A buffering upstream round-trips with its bound.
+        // A buffering upstream round-trips with its bound + its buffering timeouts.
         let up = Upstream {
             target: "http://registry.internal:3000".into(),
             buffer_requests: true,
             max_buffer_bytes: Some(2 * 1024 * 1024 * 1024),
+            buffer_read_timeout_ms: Some(15_000),
+            buffer_total_timeout_ms: Some(300_000),
             ..Default::default()
         };
         let json = serde_json::to_string(&up).unwrap();
         assert_eq!(serde_json::from_str::<Upstream>(&json).unwrap(), up);
         assert!(json.contains("\"buffer_requests\":true"));
         assert!(json.contains("\"max_buffer_bytes\":2147483648"));
+        assert!(json.contains("\"buffer_read_timeout_ms\":15000"));
+        assert!(json.contains("\"buffer_total_timeout_ms\":300000"));
 
         // DEFAULT-OFF is byte-identical: an upstream that leaves buffering unset serializes
         // with no `buffer_requests` / `max_buffer_bytes` key at all (the skip_serializing_if
@@ -1057,6 +1100,8 @@ mod tests {
         .unwrap();
         assert!(!plain.contains("buffer_requests"));
         assert!(!plain.contains("max_buffer_bytes"));
+        assert!(!plain.contains("buffer_read_timeout_ms"));
+        assert!(!plain.contains("buffer_total_timeout_ms"));
     }
 
     #[test]
@@ -1090,6 +1135,48 @@ mod tests {
         };
         assert!(validate_site_gateway(&zero).is_err());
 
+        // A buffering timeout without `buffer_requests` is a dangling knob — refused (both fields).
+        for dangling_timeout in [
+            Upstream {
+                target: "http://x".into(),
+                buffer_read_timeout_ms: Some(10_000),
+                ..Default::default()
+            },
+            Upstream {
+                target: "http://x".into(),
+                buffer_total_timeout_ms: Some(60_000),
+                ..Default::default()
+            },
+        ] {
+            let cfg = GatewayConfig {
+                upstreams: BTreeMap::from([("u".to_string(), dangling_timeout)]),
+                ..Default::default()
+            };
+            assert!(validate_site_gateway(&cfg).is_err());
+        }
+
+        // A zero buffering timeout would 408 everything — refused (both fields).
+        for zero_timeout in [
+            Upstream {
+                target: "http://x".into(),
+                buffer_requests: true,
+                buffer_read_timeout_ms: Some(0),
+                ..Default::default()
+            },
+            Upstream {
+                target: "http://x".into(),
+                buffer_requests: true,
+                buffer_total_timeout_ms: Some(0),
+                ..Default::default()
+            },
+        ] {
+            let cfg = GatewayConfig {
+                upstreams: BTreeMap::from([("u".to_string(), zero_timeout)]),
+                ..Default::default()
+            };
+            assert!(validate_site_gateway(&cfg).is_err());
+        }
+
         // The intended shape (buffering on, positive or default cap) validates.
         let ok = GatewayConfig {
             upstreams: BTreeMap::from([(
@@ -1116,6 +1203,21 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_site_gateway(&ok_default).is_ok());
+        // Buffering on with positive timeouts validates.
+        let ok_timeouts = GatewayConfig {
+            upstreams: BTreeMap::from([(
+                "u".to_string(),
+                Upstream {
+                    target: "http://x".into(),
+                    buffer_requests: true,
+                    buffer_read_timeout_ms: Some(15_000),
+                    buffer_total_timeout_ms: Some(300_000),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(validate_site_gateway(&ok_timeouts).is_ok());
     }
 
     #[test]
@@ -1201,6 +1303,8 @@ mod tests {
             "discover",
             "buffer_requests",
             "max_buffer_bytes",
+            "buffer_read_timeout_ms",
+            "buffer_total_timeout_ms",
         ] {
             assert!(
                 !json.contains(absent),
