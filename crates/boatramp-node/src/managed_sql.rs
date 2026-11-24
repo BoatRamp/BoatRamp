@@ -872,6 +872,75 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
         }
     }
 
+    /// Detect, on an already-[`Provisioned`](boatramp_core::compute::Readiness::Provisioned)
+    /// managed-DB replica, whether [`provision_managed`](Self::provision_managed) must be
+    /// RE-RUN — the v0.71.1 `rls_session` existing-DB adoption fix.
+    ///
+    /// Flipping `rls_session` on with a re-`apply` does NOT change the container launch spec,
+    /// so the DB replica is never relaunched and never re-enters `Starting`; the one-shot
+    /// post-ready provisioning pass that would create the STABLE non-superuser app role
+    /// therefore never re-runs, and the serving path (which now resolves the runtime to that
+    /// app role) routes to an ABSENT role and fails closed. This read-only probe recognizes
+    /// exactly that gap: `rls_session` on + Postgres (the only cell that provisions an app
+    /// role post-launch — both the `Single` arm and the `Shared` + default arm of
+    /// `provision_managed` call [`provision_rls_app_role`](Self::provision_rls_app_role)) +
+    /// the STABLE app role not yet present on the live server. When it fires,
+    /// [`advance_readiness`](boatramp_core::compute) re-runs the idempotent
+    /// `provision_managed`, which creates the role IN PLACE (connecting as the bootstrap
+    /// superuser, SAME volume) — never a volume destroy/recreate, never a base-cred rotation.
+    ///
+    /// **Fail-safe to `false`** at every uncertain step (not a managed DB, rls off / MySQL,
+    /// the superuser credential unresolvable yet, or the existence probe errors): the worst
+    /// case is we retry next tick, never a spurious reprovision. Returns `true` ONLY when the
+    /// probe ran and the app role is provably absent, so the common already-adopted DB runs
+    /// one lightweight `pg_roles` lookup per tick and the DDL is never re-run.
+    async fn needs_reprovision(
+        &self,
+        project: &str,
+        workload: &str,
+        _endpoint: &boatramp_core::compute::Endpoint,
+    ) -> bool {
+        // Not a managed database → nothing this resolver provisions.
+        let Some(db) = self.resolve_spec(project, workload).await else {
+            return false;
+        };
+        // Only the `rls_session` + Postgres opt-in provisions a role post-launch. An un-opted
+        // cell (serve-as-superuser) and every MySQL cell have no app role to be missing, so
+        // there is never anything to reconcile here — identical to the pre-fix short-circuit.
+        if !db.rls_session || !matches!(db.kind, ExternalSqlKind::Postgres) {
+            return false;
+        }
+        // The bootstrap superuser's sealed password (same key the server-init env + the
+        // readiness probe use). Unresolvable yet ⇒ not ready to reconcile; retry next tick.
+        let Ok(password) = self.creds.password(project, workload).await else {
+            return false;
+        };
+        // Read-only existence probe for the STABLE non-superuser app role, as the bootstrap
+        // superuser against the DB's OWN database (the role is cluster-scoped; any extant DB
+        // on the server would do, and `db.database` is guaranteed present post-provision).
+        // NO mutation, NO credential mint — a reprovision decision must never itself write.
+        let app_role = boatramp_storage::tenant_provision::rls_app_role_name(&db.database);
+        let admin =
+            self.admin_backend(project, workload, db.kind, &db.database, &db.user, password);
+        // The role name is a sanitized, length-capped identifier (`rls_app_role_name` →
+        // `sanitize_ident_capped`), so it carries no quote/backslash and is safe to embed in
+        // this single-quoted literal; `count(*)::int` comes back as `SqlValue::Integer`.
+        let sql = format!(
+            "SELECT count(*)::int FROM pg_roles WHERE rolname = '{}'",
+            app_role
+        );
+        match admin.run_query(&sql).await {
+            // `0` ⇒ the app role is absent: the rls_session opt-in was adopted AFTER this cell
+            // was first provisioned (rls-off), so the role was never created → reprovision.
+            Ok(rows) => matches!(
+                rows.rows.into_iter().flatten().next(),
+                Some(boatramp_core::sql::SqlValue::Integer(0))
+            ),
+            // Probe error ⇒ fail safe: do not force a reprovision; retry next tick.
+            Err(_) => false,
+        }
+    }
+
     async fn mint_dynamic_db_cred(
         &self,
         project: &str,

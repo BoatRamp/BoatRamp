@@ -239,6 +239,22 @@ shared-tenant server (it hosts other tenants) or a site-scoped binding (no singl
 out of scope and refused with a clear message, and a bring-your-own-URL database is not
 boatramp's to restart. The restart API is `POST /api/databases/{name}/restart`, `Project·Admin`.
 
+### Adopt `rls_session` on a database that already exists
+
+Turning `rls_session` **on** for a managed Postgres that was **already provisioned without it**
+(a database first created under an earlier manifest, then re-`apply`d with `rls_session: true`)
+is adopted **automatically on the next reconcile** — no restart, and no manual step. Unlike
+`delta_capture`, flipping `rls_session` does not change how the container starts, so the database
+is **never relaunched**: the reconcile instead detects that the non-superuser app role the opt-in
+requires (see [the SQL binding how-to](./handler-binding-sql.md#non-superuser-rls-on-a-superuser-owned-cell--rls_session-on-tenant-single-or-shared--default))
+has not been created yet and **creates it in place** on the existing database — connecting as the
+bootstrap superuser, on the **same data volume**, touching neither your data nor the base
+credential. Serving switches to that app role once it exists (until then the binding **fails
+closed** rather than silently serving as the RLS-bypassing superuser). You do **not** need
+`boatramp db restart` for an `rls_session` flip; just `apply` and let the DB reconcile. (Turning
+`rls_session` **off** again similarly needs no restart — the binding simply resolves back to the
+superuser identity; the app role is left in place, harmless.)
+
 ## How the declaration merges with node config
 
 A declared database is persisted to a project-scoped, cluster-replicated

@@ -4876,6 +4876,40 @@ pub trait ManagedDbEnvResolver: Send + Sync {
         Ok(())
     }
 
+    /// Whether an **already-[`Provisioned`](Readiness::Provisioned)** managed-DB replica
+    /// still needs its derived provisioning [RE-RUN](Self::provision_managed) because a
+    /// config change applied AFTER it first became `Provisioned` introduced a serving-
+    /// identity requirement the original provisioning pass never satisfied.
+    ///
+    /// The motivating (and, today, only) case is **`rls_session` adoption on an
+    /// already-provisioned managed Postgres**: a DB first provisioned WITHOUT `rls_session`
+    /// (served as the bootstrap superuser) whose binding is later re-`apply`d with
+    /// `rls_session: true`. Flipping the flag does NOT change the container launch spec, so
+    /// the replica is never relaunched and never re-enters `Starting` (a k8s pod rollout
+    /// does not reset boatramp's observed `Provisioned` either) — yet the serving path now
+    /// resolves the runtime to a STABLE non-superuser **app role** that the original
+    /// (rls-off) provisioning never created. Serving then routes to that absent role and
+    /// fails closed indefinitely. [`advance_readiness`] consults this BEFORE the
+    /// `Provisioned` short-circuit and, when it is `true`, re-runs the idempotent
+    /// [`provision_managed`] so the app role is created **in place** — reattach-only, SAME
+    /// data volume, NEVER a volume destroy/recreate and NEVER a base-credential rotation.
+    ///
+    /// Implementations MUST be a **read-only** probe (no DDL, no credential mint) and MUST
+    /// fail safe to `false` — a probe error or an unresolvable credential returns `false`
+    /// (retry next tick) rather than forcing a reprovision attempt. `false` for a
+    /// non-managed workload, a non-opted-in cell, or when the required object already
+    /// exists, so the common already-adopted DB performs at most one lightweight existence
+    /// query per tick and never re-runs DDL. Defaulted to `false` so a non-DB resolver is
+    /// unaffected.
+    async fn needs_reprovision(
+        &self,
+        _project: &str,
+        _workload: &str,
+        _endpoint: &Endpoint,
+    ) -> bool {
+        false
+    }
+
     /// **Mint** this replica's per-replica DYNAMIC database credential at launch, for a
     /// workload that CONSUMES a managed database (PLAN-compute-managed-db phase 2). Called
     /// once per launch, BEFORE binding resolution, so a DSN injector reads the freshly-
@@ -6777,7 +6811,30 @@ async fn advance_readiness(
     }
     // Already provisioned: done — don't re-run idempotent actions every tick. A relaunch
     // resets this to `Starting` (see `launch_one`), so a replaced replica re-provisions.
+    //
+    // EXCEPTION — adoption of a config change that needs NO relaunch: a flag flipped AFTER
+    // this replica became `Provisioned` can introduce a serving-identity requirement the
+    // original provisioning pass never satisfied, WITHOUT changing the container launch
+    // spec (so the replica is never relaunched and never re-enters `Starting`). The live
+    // case is `rls_session` adopted on an already-provisioned managed Postgres: the serving
+    // path now resolves the runtime to a non-superuser app role the rls-off provisioning
+    // never created, so it routes to an absent role and fails closed forever. Consult the
+    // resolver's READ-ONLY `needs_reprovision` probe (scoped to exactly that case, failing
+    // safe to `false`) and, only when it fires, RE-RUN the idempotent `provision_managed`
+    // to create the missing object IN PLACE — reattach-only, SAME volume, no base-cred
+    // rotation. On success readiness stays `Provisioned` (no flap); a failure surfaces as
+    // `ProvisionFailed` so the operator sees it (the DB was already failing to serve).
     if state.readiness.is_provisioned() {
+        let workload = &state.handle.workload;
+        if let Some(m) = managed_db
+            && m.needs_reprovision(project, workload, &state.endpoint)
+                .await
+            && let Err(reason) = m
+                .provision_managed(project, workload, &state.endpoint)
+                .await
+        {
+            return Readiness::ProvisionFailed { reason };
+        }
         return Readiness::Provisioned;
     }
     let workload = &state.handle.workload;
@@ -11752,6 +11809,10 @@ mod tests {
         probe: Option<bool>,
         provision_ok: bool,
         provisions: std::sync::atomic::AtomicUsize,
+        /// Whether an already-`Provisioned` replica reports a pending reprovision (the
+        /// `rls_session`-adoption detection). Default `false` (the trait default) — only the
+        /// adoption tests flip it on to drive the re-run branch.
+        needs_reprovision: bool,
     }
     impl FakeManagedDb {
         fn new(probe: Option<bool>, provision_ok: bool) -> Self {
@@ -11759,7 +11820,14 @@ mod tests {
                 probe,
                 provision_ok,
                 provisions: std::sync::atomic::AtomicUsize::new(0),
+                needs_reprovision: false,
             }
+        }
+        /// Builder for the adoption-path tests: an already-`Provisioned` replica whose
+        /// resolved serving identity now requires an object the original pass never created.
+        fn with_needs_reprovision(mut self, needs: bool) -> Self {
+            self.needs_reprovision = needs;
+            self
         }
     }
     #[async_trait::async_trait]
@@ -11778,6 +11846,9 @@ mod tests {
             } else {
                 Err("boom".into())
             }
+        }
+        async fn needs_reprovision(&self, _p: &str, _w: &str, _e: &Endpoint) -> bool {
+            self.needs_reprovision
         }
     }
 
@@ -11944,8 +12015,9 @@ mod tests {
 
     #[tokio::test]
     async fn advance_readiness_already_provisioned_does_not_rerun_ddl() {
-        // Once Provisioned, the idempotent DDL must NOT be re-run every tick: a resolver
-        // whose provision would FAIL must never be called, and the state stays Provisioned.
+        // Once Provisioned and with NOTHING pending (`needs_reprovision` false — the default),
+        // the idempotent DDL must NOT be re-run every tick: a resolver whose provision would
+        // FAIL must never be called, and the state stays Provisioned.
         let backend = FakeBackend;
         let m = FakeManagedDb::new(Some(true), false);
         let s = observed("w", 0, 1, true); // `observed` sets healthy ⇒ Provisioned
@@ -11955,8 +12027,49 @@ mod tests {
         assert_eq!(
             m.provisions.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "provisioning DDL must not re-run once the replica is already Provisioned"
+            "provisioning DDL must not re-run once the replica is already Provisioned and \
+             nothing is pending"
         );
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_provisioned_reprovisions_when_pending() {
+        // v0.71.1 — the `rls_session` existing-DB adoption fix. An already-`Provisioned`
+        // replica whose resolver reports a pending reprovision (rls_session flipped on, the
+        // non-superuser app role not yet created) MUST re-run the idempotent provisioning
+        // pass IN PLACE, then stay `Provisioned`. This is the single mechanism the prod
+        // incident lacked: without it the serving path routes to an absent app role and
+        // fails closed forever, because flipping the flag never relaunches the replica.
+        let backend = FakeBackend;
+        let m = FakeManagedDb::new(Some(true), true).with_needs_reprovision(true);
+        let s = observed("w", 0, 1, true); // healthy ⇒ Provisioned
+        assert_eq!(s.readiness, Readiness::Provisioned);
+        let r = advance_readiness(&backend, Some(&m), "default", &spec(1, 128), &s).await;
+        assert_eq!(r, Readiness::Provisioned);
+        assert_eq!(
+            m.provisions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a pending reprovision on an already-Provisioned replica must re-run provision_managed"
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_readiness_provisioned_reprovision_failure_surfaces() {
+        // When the pending reprovision itself FAILS, the readiness flips to ProvisionFailed
+        // so the operator sees it (the DB was already failing to serve as the absent role) —
+        // it is not silently left `Provisioned`.
+        let backend = FakeBackend;
+        let m = FakeManagedDb::new(Some(true), false).with_needs_reprovision(true);
+        let s = observed("w", 0, 1, true); // healthy ⇒ Provisioned
+        assert_eq!(s.readiness, Readiness::Provisioned);
+        let r = advance_readiness(&backend, Some(&m), "default", &spec(1, 128), &s).await;
+        assert_eq!(
+            r,
+            Readiness::ProvisionFailed {
+                reason: "boom".into()
+            }
+        );
+        assert_eq!(m.provisions.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
