@@ -39,7 +39,7 @@ use boatramp_core::sql::{SqlBackend, SqlValue};
 use boatramp_storage::sql_sqlx::{ExternalSqlKind, ExternalSqlOptions, connect};
 use boatramp_storage::tenant_provision::{
     RUNTIME_ROLE_RLS_PRIVILEGED_PROBE_SQL, ensure_login_role_ddl, force_rls_event_trigger_ddl,
-    grant_app_role_ddl, rls_app_role_name,
+    grant_app_role_ddl, rls_app_role_name, shared_default_db_connect_lockdown_ddl,
 };
 
 const DB: &str = "rlssingle_appdb";
@@ -466,4 +466,157 @@ async fn shared_default_app_role_coexists_tenant_and_account_rls_while_the_super
     }
 
     println!("MANAGED RLS SHARED-DEFAULT OK [postgres]");
+}
+
+// ===========================================================================
+// SHARED + DEFAULT CONNECT lockdown (INFO-1) — the shared server's OWN init DB.
+// ===========================================================================
+
+const SDC_DB: &str = "rlssdconnect_appdb";
+/// A STRAY cluster role modeling some OTHER tenant's per-tenant role. It is a member of `PUBLIC`
+/// (every login is), but it is NEVER granted CONNECT on the default DB — so the lockdown must block
+/// it. Non-superuser, so it is genuinely subject to the CONNECT privilege check.
+const SDC_STRAY_ROLE: &str = "rlssdconnect_stray";
+const SDC_STRAY_PW: &str = "straypw";
+
+/// Connect as `url` and run a trivial `SELECT 1`, returning whether the connection + query
+/// SUCCEEDED. A role denied `CONNECT` on the target database fails here (sqlx surfaces the privilege
+/// error when the pooled connection is first acquired for the query), which is exactly the signal
+/// the lockdown assertions need.
+async fn can_connect(url: &str) -> bool {
+    let k = ExternalSqlKind::Postgres;
+    match connect(k, &ExternalSqlOptions::new(url.to_string())) {
+        Ok(be) => be.run_query("SELECT 1").await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// **Live gate: the INFO-1 CONNECT lockdown on the shared server's OWN default database.** The
+/// shared server's init DB is created by the image's `initdb`, which leaves Postgres's default
+/// everyone-in-`PUBLIC`-can-connect grant in place — so a stray per-tenant cluster role (a member of
+/// `PUBLIC`) can `CONNECT` to it, unlike every NON-default Shared database (which `provision_shared`
+/// already `REVOKE CONNECT … FROM PUBLIC`-locks). [`shared_default_db_connect_lockdown_ddl`] closes
+/// that gap. On a real Postgres this proves, with a BEFORE/AFTER mutation:
+///
+///   1. **MUTATION / the gap (baseline):** a plain `CREATE DATABASE` (modeling `initdb`) leaves
+///      `PUBLIC` able to connect, so the stray non-superuser role CAN connect to the default DB.
+///   2. **INVARIANT (the fix):** after the lockdown DDL runs, the SAME stray role CANNOT connect
+///      (`REVOKE CONNECT … FROM PUBLIC` with no grant to it), while BOTH legitimate principals still
+///      connect and serve: the bootstrap SUPERUSER, and the STABLE non-superuser rls app role (its
+///      explicit grant survives the PUBLIC revoke).
+///   3. **IDEMPOTENT:** a second lockdown pass (the reconcile re-run) re-asserts the same state —
+///      legitimate roles still connect, the stray stays blocked.
+///
+/// Requires `BOATRAMP_TEST_PG_URL` = a **superuser** Postgres URL (skips cleanly when unset).
+/// `#[ignore]`-gated; prints `MANAGED RLS SHARED-DEFAULT CONNECT-LOCKDOWN OK [postgres]` on success.
+#[tokio::test]
+#[ignore = "needs a live superuser Postgres via BOATRAMP_TEST_PG_URL (run on lighthouse / the live-pg CI lane)"]
+async fn shared_default_connect_lockdown_blocks_stray_roles_keeps_legitimate() {
+    let Ok(su_url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("skip managed_rls_shared_default_connect: BOATRAMP_TEST_PG_URL unset");
+        return;
+    };
+    let k = ExternalSqlKind::Postgres;
+    let su = connect(k, &ExternalSqlOptions::new(su_url.clone())).unwrap();
+    let superuser = url_user(&su_url);
+    let app_role = rls_app_role_name(SDC_DB);
+
+    // --- teardown any prior run (re-runnable) ---
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS \"{SDC_DB}\" WITH (FORCE)"),
+        format!("DROP ROLE IF EXISTS \"{app_role}\""),
+        format!("DROP ROLE IF EXISTS \"{SDC_STRAY_ROLE}\""),
+    ] {
+        let _ = su.run_script(&stmt).await;
+    }
+
+    // SETUP — model the shared server's OWN init DB: a plain `CREATE DATABASE` as the superuser,
+    // which (like `initdb`) leaves PUBLIC able to connect. Create the rls app role (with its own
+    // CONNECT grant, exactly as `ensure_login_role_ddl` does on the opt-in path) and a STRAY
+    // non-superuser role that is NEVER granted CONNECT here.
+    su.run_script(&format!("CREATE DATABASE \"{SDC_DB}\""))
+        .await
+        .unwrap_or_else(|e| panic!("create db: {e}"));
+    let su_db = connect(k, &ExternalSqlOptions::new(su_to_db(&su_url, SDC_DB))).unwrap();
+    for stmt in ensure_login_role_ddl(k, &app_role, APP_PW, SDC_DB) {
+        su_db
+            .run_script(&stmt)
+            .await
+            .unwrap_or_else(|e| panic!("provision app role `{stmt}`: {e}"));
+    }
+    su.run_script(&format!(
+        "CREATE ROLE \"{SDC_STRAY_ROLE}\" LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '{SDC_STRAY_PW}'"
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("create stray role: {e}"));
+
+    let stray_url = as_role(&su_url, SDC_STRAY_ROLE, SDC_STRAY_PW, SDC_DB);
+    let app_url = as_role(&su_url, &app_role, APP_PW, SDC_DB);
+    let su_db_url = su_to_db(&su_url, SDC_DB);
+
+    // STEP 1 — MUTATION / the gap: before the lockdown, PUBLIC's default connect grant lets the
+    // stray role reach the default DB.
+    assert!(
+        can_connect(&stray_url).await,
+        "BASELINE/MUTATION: before the lockdown a stray PUBLIC member CAN connect to the shared \
+         server's default DB (the INFO-1 gap left by initdb) — if this is already false the test is \
+         not exercising the gap"
+    );
+
+    // STEP 2 — THE FIX: run the real lockdown DDL (opted-in cell ⇒ the app role is admitted too).
+    let lockdown = shared_default_db_connect_lockdown_ddl(k, SDC_DB, &superuser, true);
+    assert!(
+        !lockdown.is_empty(),
+        "the Postgres lockdown DDL must be non-empty"
+    );
+    for stmt in &lockdown {
+        su_db
+            .run_script(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("lockdown `{stmt}`: {e}"));
+    }
+
+    // STEP 3 — INVARIANT: the stray role is now BLOCKED, both legitimate principals still connect.
+    assert!(
+        !can_connect(&stray_url).await,
+        "INVARIANT: after REVOKE CONNECT … FROM PUBLIC the stray role must NOT be able to connect \
+         to the shared server's default DB"
+    );
+    assert!(
+        can_connect(&su_db_url).await,
+        "the bootstrap superuser must still connect to its own default DB after the lockdown"
+    );
+    assert!(
+        can_connect(&app_url).await,
+        "the STABLE non-superuser rls app role must still connect after the lockdown (its explicit \
+         CONNECT grant survives the PUBLIC revoke)"
+    );
+
+    // STEP 4 — IDEMPOTENT: a second reconcile pass re-asserts the same state.
+    for stmt in &lockdown {
+        su_db
+            .run_script(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("idempotent re-run `{stmt}`: {e}"));
+    }
+    assert!(
+        !can_connect(&stray_url).await,
+        "IDEMPOTENT: the stray role stays blocked after a second lockdown pass"
+    );
+    assert!(
+        can_connect(&su_db_url).await && can_connect(&app_url).await,
+        "IDEMPOTENT: both legitimate principals still connect after a second lockdown pass"
+    );
+
+    // --- teardown (best-effort) ---
+    drop(su_db);
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS \"{SDC_DB}\" WITH (FORCE)"),
+        format!("DROP ROLE IF EXISTS \"{app_role}\""),
+        format!("DROP ROLE IF EXISTS \"{SDC_STRAY_ROLE}\""),
+    ] {
+        let _ = su.run_script(&stmt).await;
+    }
+
+    println!("MANAGED RLS SHARED-DEFAULT CONNECT-LOCKDOWN OK [postgres]");
 }

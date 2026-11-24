@@ -957,6 +957,75 @@ pub fn grant_app_role_ddl(kind: ExternalSqlKind, role: &str, owner: &str) -> Vec
     }
 }
 
+/// Ordered, **idempotent** DDL that locks `CONNECT` on the **shared server's OWN init database**
+/// (the reserved `Shared` + default cell) down to only the principals that legitimately reach it —
+/// the belt-and-suspenders close of the Shared+default RLS review's INFO-1.
+///
+/// # The gap this closes (Postgres only)
+///
+/// Every per-tenant NON-default `Shared` database is created by [`provision_ddl`], which
+/// `REVOKE CONNECT … FROM PUBLIC` then admits only that tenant's own roles — so a stray cluster
+/// role can never reach it. The shared server's OWN default database, however, is created by the
+/// container image's `initdb`, which leaves Postgres's default everyone-in-`PUBLIC`-can-connect
+/// grant in place. A per-tenant cluster role (minted for some OTHER tenant's database) is a member
+/// of `PUBLIC`, so it CAN `CONNECT` to the default database even though nothing there is granted to
+/// it. That reads nothing today — there are no table grants, RLS binds the non-superuser app role,
+/// and PG ≥ 15 ships no `PUBLIC` `CREATE` on schema `public` — so it is defense-in-depth, not a live
+/// leak; but it is a gap in the isolation invariant the non-default path already enforces, so we run
+/// the SAME `REVOKE`-then-admit lockdown on the default database.
+///
+/// # Who legitimately connects (so nothing is locked out)
+///
+/// Exactly two principals reach the shared server's default database:
+/// - the **bootstrap superuser** (`POSTGRES_USER`) — it owns the cell and serves it when
+///   `rls_session` is off (and runs migrations); a `rolsuper` bypasses the `CONNECT` check
+///   regardless, but it is granted explicitly so the lockdown stays correct even if an operator
+///   image somehow initialized with a non-superuser bootstrap user;
+/// - when the cell opts into `rls_session`, the **STABLE non-superuser app role**
+///   ([`rls_app_role_name`]) the runtime is served as (it already holds its own `CONNECT` grant from
+///   [`ensure_login_role_ddl`]; re-asserted here so the lockdown is self-contained).
+///
+/// Per-tenant (non-default) roles connect to their OWN databases, NEVER this one, so they are
+/// deliberately NOT admitted here — blocking them is the whole point. Both legitimate principals are
+/// granted `CONNECT` BEFORE the `PUBLIC` revoke, so the revoke can never strip a live connector's
+/// access (and the superuser connection this DDL runs on is unaffected either way).
+///
+/// # MySQL
+///
+/// Empty. MySQL has no cluster-wide `CONNECT ON DATABASE` / `PUBLIC` grant — a user reaches a schema
+/// only through an explicit `db.*` grant — so there is no everyone-can-connect default on the shared
+/// server's init database to strip. The gap is Postgres-specific.
+pub fn shared_default_db_connect_lockdown_ddl(
+    kind: ExternalSqlKind,
+    database: &str,
+    superuser: &str,
+    rls_session: bool,
+) -> Vec<String> {
+    match kind {
+        ExternalSqlKind::Postgres => {
+            let db_id = quote_ident(kind, database);
+            let superuser_id = quote_ident(kind, superuser);
+            // Admit the legitimate connectors FIRST, THEN strip PUBLIC — so the revoke can never
+            // leave a live connector without CONNECT.
+            let mut stmts = vec![format!(
+                "GRANT CONNECT ON DATABASE {db_id} TO {superuser_id};"
+            )];
+            // The app role exists only when the cell opts into rls_session (provisioned by
+            // `provision_rls_app_role`); admit it so the serve-as-non-superuser runtime keeps
+            // CONNECT after the PUBLIC revoke.
+            if rls_session {
+                let app_role_id = quote_ident(kind, &rls_app_role_name(database));
+                stmts.push(format!(
+                    "GRANT CONNECT ON DATABASE {db_id} TO {app_role_id};"
+                ));
+            }
+            stmts.push(format!("REVOKE CONNECT ON DATABASE {db_id} FROM PUBLIC;"));
+            stmts
+        }
+        ExternalSqlKind::Mysql => Vec::new(),
+    }
+}
+
 /// Ordered DDL to drop a tenant cleanly. Every statement is `IF EXISTS`-guarded,
 /// so deprovisioning a never-provisioned or already-deprovisioned tenant is a
 /// no-op rather than an error.
@@ -2059,6 +2128,82 @@ mod tests {
         );
         assert!(joined.contains("FLUSH PRIVILEGES"));
         assert!(!joined.contains(" deadbeef"), "unquoted password leaked");
+    }
+
+    // ---- shared_default_db_connect_lockdown_ddl --------------------------
+
+    /// The INFO-1 lockdown on the shared server's OWN default DB: PUBLIC is stripped, the
+    /// superuser is re-admitted, the rls app role is re-admitted ONLY when the cell opts in, a
+    /// stray role is NEVER admitted, and every admit precedes the revoke (no lock-out window).
+    #[test]
+    fn shared_default_connect_lockdown_admits_only_legitimate_roles() {
+        // rls_session OFF: only the superuser is re-admitted, then PUBLIC is revoked. The rls app
+        // role (which does not exist on an un-opted cell) is never referenced.
+        let off = shared_default_db_connect_lockdown_ddl(
+            ExternalSqlKind::Postgres,
+            "shared_init_db",
+            "postgres",
+            false,
+        );
+        let joined = off.join("\n");
+        assert!(
+            joined.contains("GRANT CONNECT ON DATABASE \"shared_init_db\" TO \"postgres\""),
+            "the bootstrap superuser must keep CONNECT:\n{joined}"
+        );
+        assert!(
+            joined.contains("REVOKE CONNECT ON DATABASE \"shared_init_db\" FROM PUBLIC"),
+            "PUBLIC's default connect grant must be stripped:\n{joined}"
+        );
+        assert!(
+            !joined.contains("_rlsapp"),
+            "an un-opted cell must not reference the rls app role (it does not exist):\n{joined}"
+        );
+        // Ordering: the superuser is admitted BEFORE PUBLIC is revoked (no lock-out window).
+        let idx = |n: &str| off.iter().position(|s| s.contains(n)).unwrap();
+        assert!(
+            idx("GRANT CONNECT") < idx("REVOKE CONNECT"),
+            "every admit must precede the PUBLIC revoke:\n{joined}"
+        );
+
+        // rls_session ON: the superuser AND the STABLE app role are both re-admitted before the
+        // PUBLIC revoke, so the serve-as-non-superuser runtime keeps CONNECT.
+        let on = shared_default_db_connect_lockdown_ddl(
+            ExternalSqlKind::Postgres,
+            "shared_init_db",
+            "postgres",
+            true,
+        );
+        let joined_on = on.join("\n");
+        let app_role = rls_app_role_name("shared_init_db");
+        assert!(
+            joined_on.contains(&format!(
+                "GRANT CONNECT ON DATABASE \"shared_init_db\" TO \"{app_role}\""
+            )),
+            "the opted-in cell must re-admit the rls app role:\n{joined_on}"
+        );
+        // Both admits precede the single revoke, which is last.
+        assert_eq!(
+            on.last().map(String::as_str),
+            Some("REVOKE CONNECT ON DATABASE \"shared_init_db\" FROM PUBLIC;"),
+            "the PUBLIC revoke must be the final statement:\n{joined_on}"
+        );
+        assert_eq!(
+            on.iter().filter(|s| s.contains("REVOKE CONNECT")).count(),
+            1,
+            "exactly one PUBLIC revoke:\n{joined_on}"
+        );
+
+        // MySQL has no PUBLIC-connect default to strip → empty (no lockdown emitted).
+        assert!(
+            shared_default_db_connect_lockdown_ddl(
+                ExternalSqlKind::Mysql,
+                "shared_init_db",
+                "root",
+                true,
+            )
+            .is_empty(),
+            "MySQL emits no CONNECT lockdown (no PUBLIC-connect default exists)"
+        );
     }
 
     // ---- deprovision_ddl / rotate_ddl ------------------------------------

@@ -465,6 +465,8 @@ jobs:
             || { echo "::error::single-mode rls_session invariant never reached the success marker (silent skip — pg/docker absent — or the non-superuser app role leaked cross-account / the superuser-serving mutation did not leak)" >&2; exit 1; }
           grep -q 'MANAGED RLS SHARED-DEFAULT OK \[postgres\]' rls-single.log \
             || { echo "::error::Shared+default rls_session invariant never reached the success marker (silent skip — pg/docker absent — or the tenant+account RLS did not coexist under the non-superuser app role / the superuser mutation did not leak)" >&2; exit 1; }
+          grep -q 'MANAGED RLS SHARED-DEFAULT CONNECT-LOCKDOWN OK \[postgres\]' rls-single.log \
+            || { echo "::error::Shared+default CONNECT lockdown (INFO-1) never reached the success marker (silent skip — pg/docker absent — or the stray role was not blocked by REVOKE CONNECT … FROM PUBLIC / a legitimate role lost CONNECT / the idempotent re-run regressed)" >&2; exit 1; }
 
       - name: rls_session ADOPTION on an already-provisioned managed Postgres holds live (hard gate — the v0.71.1 fix)
         run: |

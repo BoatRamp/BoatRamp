@@ -5,7 +5,7 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.71.1] — 2026-11-24
+## [0.72.0] — 2026-11-24
 
 ### Fixed
 
@@ -23,6 +23,24 @@ versions.
   destroying/recreating the volume and never rotating the base credential. Adoption now "just works"
   on the next reconcile with no restart. Fail-closed is preserved: the binding still refuses to serve
   as a superuser / `BYPASSRLS` while `rls_session` is on, and never serves before the app role exists.
+
+### Security
+
+- **`REVOKE CONNECT` on the shared server's own init database (Shared+default RLS review INFO-1).**
+  Every per-tenant NON-default `Shared` database is provisioned with `REVOKE CONNECT … FROM PUBLIC`
+  + an explicit per-role `GRANT CONNECT`, so a stray cluster role can never reach it. The shared
+  server's OWN default database, however, is created by the container image's `initdb`, which leaves
+  Postgres's default everyone-in-`PUBLIC`-can-connect grant in place — so a per-tenant cluster role
+  minted for some *other* tenant could `CONNECT` to the default database (it reads nothing there —
+  no table grants, RLS binds the non-superuser app role, and PG ≥ 15 ships no `PUBLIC` `CREATE` on
+  schema `public` — so this was defense-in-depth, not a live leak). The shared-server reconcile's
+  post-ready pass now runs the same lockdown on the default database: it re-admits the bootstrap
+  superuser (and, when the cell opts into `rls_session`, the STABLE non-superuser app role), then
+  `REVOKE CONNECT … FROM PUBLIC`. Idempotent (re-asserted every reconcile), data-safe (pure CONNECT
+  privilege tightening — no data, schema, or ownership change), and Postgres-only (MySQL has no
+  cluster-wide `PUBLIC` connect default to strip). A live-gated mutation test proves a stray role
+  can connect before the lockdown but not after, while the superuser and the rls app role keep
+  connecting across an idempotent re-run.
 
 ## [0.71.0] — 2026-11-23
 
