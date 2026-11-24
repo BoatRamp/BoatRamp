@@ -42,6 +42,30 @@ boatramp-k8s = { workspace = true, optional = true, default-features = false, fe
 # optional, pulled only by the `handlers` feature (the lean node has no wasm engine).
 boatramp-handlers = { workspace = true, optional = true }
 boatramp-storage = { workspace = true, optional = true }
+# RFC 7250 raw-public-key TLS: the `--tls rpk` bootstrap listener config assembly
+# (`tls::rpk_server_config`). OPTIONAL + pulled only by this crate's `tls` feature, so a
+# non-TLS node links none of it; the binary forwards its own `tls` feature here.
+boatramp-rpktls = { workspace = true, optional = true }
+# The embedded-Raft cluster coordinator (`build_node`/`ClusterParams`/`ClusterNode` + the
+# RaftKv / RaftMessaging facades + the peer mesh). OPTIONAL + pulled only by this crate's
+# `cluster` feature, so a single-node build links none of the openraft tree. The cluster
+# run-entry (`cluster::bootstrap`, PLAN-node-library N4) owns the substrate bootstrap, so the
+# `boatramp-cluster → boatramp-node` edge the Raft bootstrap needs lives here (owner-approved
+# for reuse). `http`/`overlay` mirror the binary's own cluster feature: both peer-mesh
+# transports compile in so the choice stays pure config.
+boatramp-cluster = { workspace = true, optional = true }
+# The mesh router write-authz layering (`node.router.layer(axum::Extension::<WriteAuthz>(..))`)
+# in the cluster run-entry. OPTIONAL + pulled only by `cluster` (the binary forwards `dep:axum`
+# the same way). A dev-dependency `axum` also exists for the in-process router test.
+axum = { workspace = true, optional = true }
+# Join-ticket codec (magic-prefixed base64url of JSON) in the lifted `cluster::join` module.
+# OPTIONAL + pulled only by `cluster`.
+base64 = { workspace = true, optional = true }
+# The joiner-side HTTP client in `cluster::join`: redeeming the join ticket over the seed's pinned
+# (RPK-TLS) control plane. OPTIONAL + pulled only by `cluster` (it rides the workspace reqwest
+# feature set the binary already uses). A dev-dependency `reqwest` also exists for the blob-robustness
+# and true-delta live gates.
+reqwest = { workspace = true, optional = true }
 # Optional: derives `clap::ValueEnum` on the backend-selection enums so the CLI
 # binary uses them directly in its args. A non-CLI embedder never pulls clap.
 clap = { workspace = true, optional = true }
@@ -103,7 +127,25 @@ k8s-backend = ["dep:boatramp-k8s"]
 # Derive `clap::ValueEnum` on the backend enums (enabled by the CLI binary).
 clap = ["dep:clap"]
 cloudflare-kv = ["dep:boatramp-storage", "boatramp-storage/cloudflare-kv"]
-cluster = []
+# Cluster peer-mesh assembly + the substrate run-entry (`cluster` module, PLAN-node-library N4).
+# Part 1 lifted the pure mesh mutual-TLS listener config + the non-loopback-empty-trust
+# fail-closed guard (these ride the `boatramp_rpktls::RpkTls` crypto core the `tls` feature
+# pulls). Part 2 (N4-B) lifts the RUNTIME PLUMBING — the cluster-join decision/redemption
+# (`cluster::join`), the mesh write-gate + control bridge, and the `cluster::bootstrap`
+# run-entry (identity → startup decision → `build_node` → peer-mesh serve → bootstrap → key
+# rotation) — which genuinely needs the `boatramp-cluster` Raft bootstrap, the `axum` mesh
+# router layering, and the `base64` join-ticket codec. `cluster` still forwards `tls`. Both
+# mesh transports (`http` + `overlay`) compile in so the transport choice stays pure config,
+# mirroring the binary's own `cluster` feature.
+cluster = [
+  "tls",
+  "dep:boatramp-cluster",
+  "boatramp-cluster/http",
+  "boatramp-cluster/overlay",
+  "dep:axum",
+  "dep:base64",
+  "dep:reqwest",
+]
 console = ["boatramp-server/console"]
 # Marker for the overlay forward-flow serve config (`[overlay]`): parsed in every build, but its
 # structs are dead-code-allowed unless the binary's `overlay` feature consumes them.
@@ -190,7 +232,10 @@ blob-upload = [
 ]
 s3 = ["dep:boatramp-storage", "boatramp-storage/s3", "fallback"]
 slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
-tls = []
+# The static-identity TLS listener config assembly (`tls` module, PLAN-node-library N4): the
+# rustls `ServerConfig` builders for `--tls custom` / `--tls rpk` + the shared cert-PEM/ACME-trust
+# helpers. Pulls the RPK stack for the `rpk_server_config` builder. The binary forwards its `tls`.
+tls = ["dep:boatramp-rpktls"]
 # CI gate lane for #505 sealed-store S3 credential sourcing (`S3 SEALED-CRED SOURCING OK`). When ON,
 # the `s3_credential::gate` battery compiles + each `BOATRAMP_S3SEALED_MUTATE_*` env var neuters exactly
 # ONE security check (via a `#[cfg(feature = "s3-sealed-cred-gate-mutation")]` seam), so CI can prove the
@@ -231,6 +276,10 @@ reaper-liveness-gate-mutation = []
 # synthetic request over a temp `FsStorage` + `MemoryKv` (gated on `fs`).
 axum = "0.8"
 tempfile = "3"
+# The `tls` module config-assembly tests mint a throwaway self-signed cert/key (custom-cert
+# listener) exactly as the server/bin TLS tests do; the RPK builder test uses an in-memory
+# `RpkIdentity::generate()`, no fixture.
+rcgen = "0.13"
 # Serialize the reaper liveness-gate mutation test (it toggles a process-global env var).
 serial_test = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

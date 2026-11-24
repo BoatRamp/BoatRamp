@@ -42,6 +42,14 @@ pub mod blob_fallback;
 pub use boatramp_storage::blob_migrate;
 pub mod blobs;
 
+/// The cluster peer-mesh assembly (PLAN-node-library N4): the mesh mutual-TLS listener config
+/// ([`cluster::mesh_server_config`]) + the non-loopback-empty-trust fail-closed guard
+/// ([`cluster::mesh_trust_fails_closed`]), lifted out of the binary's `run_cluster` so the mesh
+/// TLS posture + the fail-closed invariant are unit-testable in-process. The binary keeps the Raft
+/// store open, join/dial, `build_node`, the `MeshTransport` construction, and the serve loop.
+/// Behaviour-preserving (a pure move). `cluster` implies `tls` (the shared RPK crypto core).
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod compute;
 /// Tenant-scoped snapshot store for cross-node scale-to-zero (U14): exports/imports a parked
 /// replica's snapshot artifact to/from the project's own blob backend under a project-scoped key.
@@ -63,6 +71,14 @@ pub mod dynamic_creds;
 pub mod error;
 pub use error::Error;
 pub mod handlers;
+/// Joiner-side dynamic cluster join (PLAN-cluster-join CJ-2), lifted out of the binary in the
+/// N4-B increment (PLAN-node-library N4): redeem a root-anchored **join ticket** against a seed's
+/// control plane, prove possession of the node's mesh key, and adopt only root-verified members.
+/// The `cluster::bootstrap` run-entry drives it; the binary re-exports it as `crate::join` so the
+/// Kubernetes operator's membership executor keeps reaching [`pinned_client`](join::pinned_client).
+/// Behaviour-preserving (a pure file move) — the cluster-join trust decisions are byte-identical.
+#[cfg(feature = "cluster")]
+pub mod join;
 /// The shared managed-env template engine + unified render stage (PLAN-compute-managed-resources
 /// Phase 3): the `{{key}}` expander every surface resolver's vars are rendered against, and the
 /// [`RenderStageResolver`](managed_env_template::RenderStageResolver) the node wraps the binding
@@ -119,4 +135,12 @@ pub mod s3_credential;
 pub mod tenant_sql;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod tenant_tombstone;
+/// The static-identity TLS listener config assembly (PLAN-node-library N4): the rustls
+/// `ServerConfig` builders for the `--tls custom` / `--tls rpk` listeners (+ the HTTP/3 variant)
+/// and the shared cert-PEM / ACME extra-CA-trust helpers, lifted out of the `boatramp` binary's
+/// `serve.rs` so the ALPN / client-auth / trust-anchor assembly is unit-testable in-process. The
+/// binary keeps the file reads, the RPK-identity load/generate, the ACME renewal loop, and the
+/// serve loop; it calls these to BUILD the config. Behaviour-preserving (a pure move).
+#[cfg(feature = "tls")]
+pub mod tls;
 pub use node::{NodeInput, RunningNode, assemble};

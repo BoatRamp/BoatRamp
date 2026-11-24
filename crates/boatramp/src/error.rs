@@ -221,9 +221,10 @@ pub enum CliError {
     VzWorker(String),
 }
 
-// `CliError`'s largest variant is `Serve(serve::Error)`, kept small by boxing
-// serve::Error's openraft-backed bootstrap variant (see `serve::Error::Bootstrap`).
-// Guard it so a future variant can't silently reintroduce `result_large_err` — and
-// the blanket `#[allow]`s it would need — on the cold CLI dispatch path in `main`.
+// `CliError`'s largest variant is `Serve(serve::Error)`, kept small because its openraft-backed
+// bootstrap error is boxed (now inside `boatramp_node::Error::Bootstrap`, reached via
+// `serve::Error::Assembly`). Guard it so a future variant can't silently reintroduce
+// `result_large_err` — and the blanket `#[allow]`s it would need — on the cold CLI dispatch path
+// in `main`.
 #[cfg(feature = "cluster")]
 const _: () = assert!(std::mem::size_of::<CliError>() <= 128);
