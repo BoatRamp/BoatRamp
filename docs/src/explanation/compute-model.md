@@ -71,9 +71,15 @@ fail-closed, so **nftables is effectively required for multi-tenant compute**; a
 
 ## Scale to zero
 
-A microVM workload can snapshot its running state and stop when idle, then
-restore on the next request, so an idle service costs nothing. A restore resumes
-the guest where it paused rather than booting it. See
+A microVM workload — and, on a Linux host with a working CRIU, a native container
+workload — can snapshot its running state and stop when idle, then restore on the
+next request, so an idle service costs nothing. A restore resumes the guest where
+it paused rather than booting it. A parked snapshot can also wake on **another
+node** when its home node is full or gone: the resume node fetches the snapshot
+from tenant-scoped storage and, for a container, re-materializes its
+content-addressed rootfs before the restore. A container is cross-node-capable
+only for a deterministically re-materializable, volumeless shape (a tar blob or a
+digest-pinned image, no persistent volume); anything else stays same-node. See
 [Scale compute to zero](../how-to/scale-to-zero.md).
 
 ## Where it runs

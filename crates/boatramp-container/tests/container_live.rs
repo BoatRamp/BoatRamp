@@ -1201,6 +1201,174 @@ async fn container_criu_roundtrip() {
     eprintln!("container scale-to-zero round-trip OK: nonce {nonce1} preserved across park/wake");
 }
 
+/// Copy every regular file of a CRIU image directory from `src` into `dst` — the test
+/// stand-in for the tenant-Storage export→import hop (whose byte-faithful, sealed, capped,
+/// tenant-scoped round-trip is unit-tested in `boatramp-node::compute_snapshot_store`). The
+/// point of THIS test is the REAL CRIU restore + rootfs re-materialization on a node that
+/// never ran the workload, not the Storage transport.
+fn copy_criu_dir(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).expect("create dst criu dir");
+    for entry in std::fs::read_dir(src).expect("read src criu dir") {
+        let entry = entry.expect("dir entry");
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).expect("copy criu file");
+        }
+    }
+}
+
+/// The **cross-node scale-to-zero round-trip** (U14 follow-up, v0.72.0): a container parks on
+/// node A and wakes on node B — a backend with a SEPARATE `data_dir` that NEVER ran the
+/// workload. Node B re-materializes the container's content-addressed rootfs from the
+/// snapshot's descriptor (re-staging the shared tar blob) BEFORE the CRIU restore, then serves
+/// the SAME per-process nonce — proving the in-RAM state survived a genuine cross-node wake.
+///
+/// The two backends share ONE rootfs blob store (so node B can re-stage) but have DISTINCT
+/// data dirs (so node B's rootfs + CRIU image genuinely start empty). The CRIU image is copied
+/// A→B via [`copy_criu_dir`] (the Storage hop stand-in); the load-bearing seams under test are
+/// (1) node B's rootfs is ABSENT before restore and PRESENT (re-staged) after, and (2) the CRIU
+/// restore succeeds against that re-staged `--root` and serves the preserved nonce.
+///
+/// Needs Linux + root + a bridge + a rootfs tar + a working `criu` (as the same-node
+/// round-trip); skips (passes) when a fixture is absent or the backend reports no s2z.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Linux + root + a bridge + a rootfs tar + criu (privileged live seam)"]
+async fn container_cross_node_s2z_roundtrip() {
+    let (Some(bin), Some(rootfs_path)) = (
+        std::env::var_os("BOATRAMP_BIN"),
+        std::env::var_os("BOATRAMP_CONTAINER_ROOTFS"),
+    ) else {
+        eprintln!("container_xnode: set BOATRAMP_BIN + BOATRAMP_CONTAINER_ROOTFS to run");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+
+    // ONE shared rootfs blob store (node B must be able to re-stage the same content-addressed
+    // tar), but DISTINCT data dirs for node A (parks) and node B (wakes, never ran it).
+    let rootfs = std::fs::read(&rootfs_path).expect("read rootfs tar");
+    let storage = Arc::new(FileBlob(rootfs));
+    let data_a = std::env::temp_dir().join(format!("boatramp-xnodeA-{}", std::process::id()));
+    let data_b = std::env::temp_dir().join(format!("boatramp-xnodeB-{}", std::process::id()));
+    let node_a = ContainerBackend::new(
+        storage.clone(),
+        data_a.clone(),
+        bridge.clone(),
+        &subnet,
+        PathBuf::from(bin.clone()),
+    )
+    .expect("node A backend");
+    let node_b = ContainerBackend::new(
+        storage.clone(),
+        data_b.clone(),
+        bridge,
+        &subnet,
+        PathBuf::from(bin),
+    )
+    .expect("node B backend");
+
+    if !node_a.capabilities().scale_to_zero {
+        eprintln!("container_xnode: backend reports no scale-to-zero (criu unusable); skipping");
+        let _ = std::fs::remove_dir_all(&data_a);
+        let _ = std::fs::remove_dir_all(&data_b);
+        return;
+    }
+
+    let hash = "d".repeat(64);
+    let spec = spec_for(&hash);
+
+    // Node A: materialize + launch + serve a nonce.
+    let artifact = node_a
+        .materialize("default", "cxnode", &spec, None)
+        .await
+        .expect("materialize A");
+    let req = LaunchRequest::new("default".into(), "cxnode".into(), 0, spec, artifact)
+        .with_redaction(Default::default())
+        .with_priority_class(None);
+    let inst = node_a.launch(&req).await.expect("launch A");
+    let nonce1 = probe_nonce(&inst.endpoint.host, inst.endpoint.port);
+    assert!(
+        !nonce1.is_empty(),
+        "node A should serve a nonce before park"
+    );
+
+    // Node A: park (CRIU dump). The snapshot's data_ref must carry a re-materialization
+    // descriptor (an eligible tar-rootfs, volumeless shape) — proving cross-node participation.
+    let snap = node_a
+        .snapshot(&inst.handle)
+        .await
+        .expect("snapshot A ok")
+        .expect("snapshot produced");
+    assert!(
+        snap.data_ref.starts_with("remat="),
+        "an eligible container's snapshot carries a cross-node descriptor, got {:?}",
+        snap.data_ref,
+    );
+    assert!(
+        probe_nonce(&inst.endpoint.host, inst.endpoint.port).is_empty(),
+        "parked container should not serve",
+    );
+
+    // Node B has never seen this workload: its artifact is NOT present locally.
+    assert!(
+        !node_b
+            .snapshot_present(&snap)
+            .await
+            .expect("present check B"),
+        "node B (never ran it) must report the artifact absent → fetch + re-materialize",
+    );
+
+    // Simulate the tenant-Storage import: node B names its OWN local CRIU dir; copy A's
+    // checkpoint files into it, then repoint the snapshot at node B's local paths.
+    let art_b = node_b
+        .snapshot_artifact(&snap)
+        .await
+        .expect("artifact B ok")
+        .expect("node B yields a cross-node artifact");
+    let src_criu = data_a.join("compute").join("criu").join("cxnode-0");
+    copy_criu_dir(&src_criu, &art_b.dir);
+    let mut snap_b = snap.clone();
+    snap_b.data_ref = art_b.local_data_ref.clone();
+
+    // The load-bearing precondition: node B's rootfs is ABSENT before the restore — the wake
+    // MUST re-materialize it (not silently reuse a local copy).
+    let b_rootfs = data_b
+        .join("compute")
+        .join("rootfs")
+        .join(format!("{hash}.b100000"));
+    assert!(
+        !b_rootfs.join(".boatramp-ready").exists(),
+        "node B must NOT have the rootfs staged before the cross-node wake",
+    );
+
+    // Node B: wake. `restore` re-materializes the rootfs from the descriptor, then CRIU-restores.
+    let inst2 = node_b
+        .restore(&snap_b)
+        .await
+        .expect("cross-node restore B ok");
+    let nonce2 = probe_nonce(&inst2.endpoint.host, inst2.endpoint.port);
+
+    // The rootfs was re-materialized on node B as part of the wake.
+    let rematerialized = b_rootfs.join(".boatramp-ready").exists();
+
+    let _ = node_b.stop(&inst2.handle).await;
+    let _ = std::fs::remove_dir_all(&data_a);
+    let _ = std::fs::remove_dir_all(&data_b);
+
+    assert!(
+        rematerialized,
+        "node B must have re-materialized the container rootfs during the cross-node wake",
+    );
+    assert_eq!(
+        nonce1, nonce2,
+        "cross-node-restored container must serve the SAME nonce (state preserved on a node \
+         that never ran it)",
+    );
+    eprintln!(
+        "CONTAINER-XNODE-S2Z-OK: parked on node A, re-materialized rootfs + CRIU-restored on \
+         node B (never ran it); nonce {nonce1} preserved",
+    );
+}
+
 /// **Exec into a running container** (docker-exec style): launch a container, then
 /// re-enter its namespaces via `ComputeBackend::exec` and run a one-shot command,
 /// asserting (a) a plain command returns exit 0 with its stdout captured, and (b)

@@ -162,20 +162,148 @@ fn decode_ref(s: &str) -> Option<(String, u16)> {
     Some((ip.to_string(), port.parse().ok()?))
 }
 
-/// Encode the persistent part of a snapshot ref: `<image-dir>|<rootfs>`. The
-/// running IP/port are appended by `snapshot` (`|<ip>|<port>`).
-fn encode_snap(image_dir: &str, rootfs: &str) -> String {
-    format!("{image_dir}|{rootfs}")
+/// How a cross-node resume node deterministically **re-materializes** a parked container's
+/// content-addressed root filesystem before the CRIU restore (U14 follow-up: container
+/// cross-node scale-to-zero, v0.72.0).
+///
+/// A CRIU restore needs the container's rootfs tree present on the target node
+/// (`--root <rootfs>`), and that tree is derived from the live mounts at park time — not
+/// reconstructable offline on a node that never ran the container. But boatramp's native
+/// container rootfs is a **shared, content-addressed base** (`stage_rootfs`/`stage_image` →
+/// `<data_dir>/compute/{rootfs,images}/<hash>.b<base>`), with the workload's mutable state
+/// in volumes / tmpfs, not the base tree. So an **eligible** container's rootfs is
+/// re-materialized on the resume node by re-staging exactly that content-addressed input —
+/// the same way the microVM backend re-`materialize`s its content-addressed kernel/rootfs
+/// blobs. ONLY a content-addressed source qualifies, so the re-staged tree is byte-identical
+/// to the one CRIU dumped against:
+/// - a **tar** rootfs blob (always content-addressed, in the shared store); or
+/// - a **digest-pinned** OCI image (`…@sha256:…`) — a mutable `name:tag` is ambient,
+///   cross-tenant-poisonable state that could re-pull *different* bytes, so it does NOT
+///   qualify and its workload stays SAME-NODE.
+///
+/// A workload with a **persistent volume** also stays same-node (its data is node-local and
+/// isn't moved by s2z — the same boundary the microVM backend has). An ineligible shape emits
+/// no descriptor, so [`snapshot_artifact`](ComputeBackend::snapshot_artifact) returns `None`
+/// and the snapshot never leaves its home node, exactly as before this change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RematSource {
+    /// A tar rootfs blob (content-addressed in the shared store), staged for userns `base`.
+    Tar { hash: String, base: u32 },
+    /// A digest-pinned OCI image (content-addressed), pulled + overlaid for userns `base`.
+    Image { reference: String, base: u32 },
 }
 
-/// Decode a snapshot `data_ref` (`<image-dir>|<rootfs>|<ip>|<port>`).
-fn decode_snap(s: &str) -> Option<(String, String, String, u16)> {
-    let mut it = s.rsplitn(4, '|');
+impl RematSource {
+    /// The cross-node re-materialization descriptor for `spec` staged at `base`, or `None`
+    /// when the shape is NOT deterministically re-materializable offline (a mutable-tag or
+    /// rootfs-block source, or a workload carrying node-local persistent volumes) — such a
+    /// workload stays same-node. Pure, so the launch-time hint and a test share one rule.
+    fn for_spec(spec: &ComputeSpec, base: u32) -> Option<Self> {
+        // A persistent volume is node-local state s2z does not move: keep it same-node.
+        if !spec.volumes.is_empty() {
+            return None;
+        }
+        match &spec.root {
+            RootSource::Tar(hash) => Some(Self::Tar {
+                hash: hash.clone(),
+                base,
+            }),
+            RootSource::Image(reference)
+                if boatramp_types::compute::image_is_digest_pinned(reference) =>
+            {
+                Some(Self::Image {
+                    reference: reference.clone(),
+                    base,
+                })
+            }
+            // A mutable-tag image (non-content-addressed) or a rootfs block image (not this
+            // backend's) is not re-materializable here → same-node.
+            _ => None,
+        }
+    }
+
+    /// Encode as a single `|`-free token for embedding in a snapshot `data_ref`. The image
+    /// reference (which may itself contain `:`/`@`, never `|`) is placed LAST so a 3-way
+    /// split recovers it whole.
+    fn encode(&self) -> String {
+        match self {
+            Self::Tar { hash, base } => format!("t:{base}:{hash}"),
+            Self::Image { reference, base } => format!("i:{base}:{reference}"),
+        }
+    }
+
+    /// Inverse of [`encode`](Self::encode); `None` on a malformed token.
+    fn decode(s: &str) -> Option<Self> {
+        let mut it = s.splitn(3, ':');
+        let tag = it.next()?;
+        let base: u32 = it.next()?.parse().ok()?;
+        let rest = it.next()?;
+        if rest.is_empty() {
+            return None;
+        }
+        match tag {
+            "t" => Some(Self::Tar {
+                hash: rest.to_string(),
+                base,
+            }),
+            "i" => Some(Self::Image {
+                reference: rest.to_string(),
+                base,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A decoded snapshot `data_ref`: the local CRIU image dir + rootfs + endpoint, plus the
+/// optional cross-node re-materialization descriptor ([`RematSource`]). A `data_ref` with no
+/// descriptor is a pre-v0.72 / same-node-only snapshot (`remat == None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedSnap {
+    image_dir: String,
+    rootfs: String,
+    ip: String,
+    port: u16,
+    remat: Option<RematSource>,
+}
+
+/// Encode the persistent part of a snapshot ref: `<image-dir>|<rootfs>`, optionally prefixed
+/// with a cross-node re-materialization descriptor (`remat=<desc>|…`) for an eligible shape.
+/// The running IP/port are appended by `snapshot` (`|<ip>|<port>`).
+fn encode_snap(image_dir: &str, rootfs: &str, remat: Option<&RematSource>) -> String {
+    match remat {
+        Some(r) => format!("remat={}|{image_dir}|{rootfs}", r.encode()),
+        None => format!("{image_dir}|{rootfs}"),
+    }
+}
+
+/// Decode a snapshot `data_ref`:
+/// `[remat=<desc>|]<image-dir>|<rootfs>|<ip>|<port>`. The optional `remat=` prefix (a
+/// `|`-free descriptor) is stripped first; the remainder keeps the pre-v0.72 shape, so a
+/// snapshot parked by an older server (no prefix) decodes with `remat == None`.
+fn decode_snap(s: &str) -> Option<DecodedSnap> {
+    let (remat, rest) = match s.strip_prefix("remat=") {
+        // The descriptor is `|`-free, so the FIRST `|` ends it.
+        Some(r) => {
+            let (desc, rest) = r.split_once('|')?;
+            (Some(RematSource::decode(desc)?), rest)
+        }
+        None => (None, s),
+    };
+    // `<image-dir>|<rootfs>|<ip>|<port>` — split the last 3 off the right so the image dir
+    // (the catch-all head) may itself contain a `|`.
+    let mut it = rest.rsplitn(4, '|');
     let port = it.next()?.parse().ok()?;
     let ip = it.next()?.to_string();
     let rootfs = it.next()?.to_string();
     let image_dir = it.next()?.to_string();
-    Some((image_dir, rootfs, ip, port))
+    Some(DecodedSnap {
+        image_dir,
+        rootfs,
+        ip,
+        port,
+        remat,
+    })
 }
 
 /// Reject a volume whose `name` or `mount` could escape its sandboxed location
@@ -1004,6 +1132,171 @@ impl ContainerBackend {
             Err(_) => boatramp_firecracker::oci::ImageConfig::default(),
         }
     }
+
+    // ---- cross-node scale-to-zero (U14 follow-up: container rootfs re-materialization) ----
+
+    /// This node's local CRIU image directory for a replica (`<data_dir>/compute/criu/<id>`).
+    /// Derived from the replica's own identity + THIS node's `data_dir`, so on a resume node
+    /// it names the LOCAL import target — never the parking node's path baked into `data_ref`.
+    fn criu_image_dir(&self, project: &str, workload: &str, replica: u32) -> PathBuf {
+        let id = container_id(project, workload, replica);
+        self.data_dir.join("compute").join("criu").join(id)
+    }
+
+    /// Path to a replica's **re-materialization hint** sidecar — a sibling of its CRIU image
+    /// dir (`<data_dir>/compute/criu/<id>.remat`) recording the [`RematSource`] so a later
+    /// `snapshot` (park) stamps it into the snapshot `data_ref`. Written at launch/restore for
+    /// an eligible (cross-node-capable) shape only; absent ⇒ the workload stays same-node.
+    fn remat_hint_path(&self, id: &str) -> PathBuf {
+        self.data_dir
+            .join("compute")
+            .join("criu")
+            .join(format!("{id}.remat"))
+    }
+
+    /// Persist the cross-node re-materialization hint for `id` (best-effort — a write failure
+    /// just keeps the workload same-node, never fails the launch/restore).
+    async fn write_remat_hint(&self, id: &str, remat: &RematSource) {
+        let path = self.remat_hint_path(id);
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Err(e) = tokio::fs::write(&path, remat.encode()).await {
+            tracing::warn!(
+                id,
+                error = %e,
+                "compute: could not persist cross-node re-materialization hint; workload stays same-node",
+            );
+        }
+    }
+
+    /// Read back a replica's re-materialization hint (`None` when absent/malformed — a
+    /// same-node-only workload, or one launched by a pre-v0.72 server).
+    async fn read_remat_hint(&self, id: &str) -> Option<RematSource> {
+        let bytes = tokio::fs::read(self.remat_hint_path(id)).await.ok()?;
+        RematSource::decode(std::str::from_utf8(&bytes).ok()?.trim())
+    }
+
+    /// The deterministic local path a [`RematSource`] stages into on THIS node — exactly the
+    /// path [`stage_rootfs`](Self::stage_rootfs) / [`stage_image`](Self::stage_image) publish,
+    /// so a resume node's re-stage lands where `restore` expects the `--root`.
+    fn rematerialized_rootfs_path(&self, remat: &RematSource) -> PathBuf {
+        match remat {
+            RematSource::Tar { hash, base } => self
+                .data_dir
+                .join("compute")
+                .join("rootfs")
+                .join(format!("{hash}.b{base}")),
+            RematSource::Image { reference, base } => {
+                let key = boatramp_types::manifest::sha256_hex(reference.as_bytes());
+                self.data_dir
+                    .join("compute")
+                    .join("images")
+                    .join(format!("{key}.b{base}"))
+            }
+        }
+    }
+
+    /// Re-materialize `remat`'s content-addressed rootfs on THIS node (re-stage the tar blob
+    /// or re-pull+overlay the digest-pinned image), returning the staged `--root` directory.
+    /// Reuses the EXACT [`stage_rootfs`](Self::stage_rootfs)/[`stage_image`](Self::stage_image)
+    /// path the normal launch uses — no new fetch surface — and is idempotent (a warm cache is
+    /// reused). Any failure propagates so `restore` can fall back to a clean cold-start.
+    ///
+    /// A re-staged base tree holds only the image's own files, but a container CRIU restore
+    /// needs the worker's standard mount points (`/proc`·`/sys`·`/dev`·`/tmp`·`/run`) present in
+    /// `--root` to restore their mounts — on the home node the launch-time worker created those
+    /// (a container CRIU restore mounts over them, it does not create them). So this also
+    /// re-asserts that mount-point skeleton on the freshly staged tree, reproducing the shape
+    /// the launch path leaves behind.
+    async fn rematerialize_rootfs(&self, remat: &RematSource) -> Result<PathBuf, BackendError> {
+        let (dir, base) = match remat {
+            RematSource::Tar { hash, base } => (self.stage_rootfs(hash, *base).await?, *base),
+            RematSource::Image { reference, base } => {
+                (self.stage_image(reference, *base).await?, *base)
+            }
+        };
+        let skel_dir = dir.clone();
+        tokio::task::spawn_blocking(move || ensure_criu_mount_points(&skel_dir, base))
+            .await
+            .map_err(|e| BackendError::Materialize(format!("join: {e}")))?
+            .map_err(|e| BackendError::Materialize(format!("re-materialize mount points: {e}")))?;
+        Ok(dir)
+    }
+}
+
+/// The worker's standard container mount targets (mirrors [`SandboxPlan::for_spec`]'s mount
+/// list). A CRIU restore mounts over these, so they must EXIST in the re-materialized `--root`.
+const CRIU_MOUNT_POINTS: &[&str] = &["proc", "sys", "dev", "tmp", "run"];
+
+/// Create the standard container mount-point directories under a freshly (re-)staged rootfs
+/// `dir` and own them at the container's userns `base` (consistent with the ownership-shifted
+/// tree), so a cross-node CRIU restore can stat + mount over them. Idempotent: a mount point
+/// that already exists (a warm, launch-populated cache) is left as is.
+fn ensure_criu_mount_points(dir: &Path, base: u32) -> std::io::Result<()> {
+    for mp in CRIU_MOUNT_POINTS {
+        let target = dir.join(mp);
+        match std::fs::create_dir(&target) {
+            Ok(()) => {
+                // Match the ownership-shifted tree so the restored in-container root owns it.
+                std::os::unix::fs::chown(&target, Some(base), Some(base))?;
+            }
+            // Already present (launch-populated or a prior re-materialization) — leave it.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Whether `dir` holds at least one CRIU image file (`*.img`) — the local-presence check a
+/// cross-node wake uses to decide whether to fetch the checkpoint from tenant Storage first.
+async fn has_criu_images(dir: &Path) -> bool {
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+        return false;
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(".img"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The flat regular-file names under `dir`, sorted — the EXPORT selection for a CRIU image
+/// directory (a resume node's empty/absent dir yields an empty list, which import ignores: the
+/// archive is self-describing). CRIU image dirs are flat, so sub-directories are skipped.
+async fn criu_image_files(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry
+                .file_type()
+                .await
+                .map(|t| t.is_file())
+                .unwrap_or(false)
+                && let Some(name) = entry.file_name().to_str()
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Whether a staged rootfs directory is present + complete on this node (its
+/// `.boatramp-ready` marker exists). Both [`stage_rootfs`](ContainerBackend::stage_rootfs) and
+/// [`stage_image`](ContainerBackend::stage_image) write this marker only after a fully
+/// successful stage, so it is the authoritative "rootfs usable here" signal.
+async fn rootfs_ready(rootfs: &str) -> bool {
+    tokio::fs::try_exists(Path::new(rootfs).join(".boatramp-ready"))
+        .await
+        .unwrap_or(false)
 }
 
 #[async_trait]
@@ -1191,6 +1484,11 @@ impl ComputeBackend for ContainerBackend {
         let log = logsink::log_path(&self.logs_dir(), &id);
         let _ = std::fs::remove_file(&log);
         let _ = std::fs::remove_file(logsink::backup_path(&log));
+        // Discard the cross-node re-materialization hint + any local CRIU image (a stopped
+        // replica keeps no parked snapshot — Stop is the scale-down/redeploy/forget path; the
+        // tenant-Storage copy is swept by the reconcile's `SnapshotStore::remove`).
+        let _ = std::fs::remove_file(self.remat_hint_path(&id));
+        let _ = std::fs::remove_dir_all(self.data_dir.join("compute").join("criu").join(&id));
         VethNetwork::for_vm(&id, &self.bridge)
             .teardown()
             .await
@@ -1278,28 +1576,37 @@ impl ComputeBackend for ContainerBackend {
         let bridge = self.bridge.clone();
         let id_for_dump = id.clone();
 
-        // The CRIU work is blocking; run it off the async runtime.
-        let dumped = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
-            let Some(pid1) = crate::criu::find_pid1(Path::new(&format!("{cgroup}/cgroup.procs")))
-            else {
-                return Ok(None); // not running
-            };
-            let rootfs = crate::criu::rootfs_of(pid1)
-                .ok_or_else(|| format!("no rootfs mount for pid {pid1}"))?;
-            let image_dir = data_dir.join("compute").join("criu").join(&id_for_dump);
-            let _ = std::fs::remove_dir_all(&image_dir);
-            criu.dump(pid1, &rootfs, &image_dir)?;
-            Ok(Some(encode_snap(&image_dir.display().to_string(), &rootfs)))
-        })
-        .await
-        .map_err(|e| BackendError::Other(format!("join: {e}")))?
-        .map_err(BackendError::Other)?;
+        // The CRIU work is blocking; run it off the async runtime. It returns the (image_dir,
+        // rootfs) pair the restore needs, or `None` when the container isn't running.
+        let dumped =
+            tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>, String> {
+                let Some(pid1) =
+                    crate::criu::find_pid1(Path::new(&format!("{cgroup}/cgroup.procs")))
+                else {
+                    return Ok(None); // not running
+                };
+                let rootfs = crate::criu::rootfs_of(pid1)
+                    .ok_or_else(|| format!("no rootfs mount for pid {pid1}"))?;
+                let image_dir = data_dir.join("compute").join("criu").join(&id_for_dump);
+                let _ = std::fs::remove_dir_all(&image_dir);
+                criu.dump(pid1, &rootfs, &image_dir)?;
+                Ok(Some((image_dir.display().to_string(), rootfs)))
+            })
+            .await
+            .map_err(|e| BackendError::Other(format!("join: {e}")))?
+            .map_err(BackendError::Other)?;
 
-        let Some(stem) = dumped else {
+        let Some((image_dir, rootfs)) = dumped else {
             return Ok(None);
         };
         // Container is gone; tear down the veth but hold the IP for the wake.
         let _ = VethNetwork::for_vm(&id, &bridge).teardown().await;
+        // Cross-node (v0.72.0): stamp the re-materialization descriptor into the `data_ref`
+        // for an eligible shape (a launch-time hint recorded it). Absent ⇒ a same-node-only
+        // snapshot (no descriptor), exactly as before — `snapshot_artifact` then returns
+        // `None` and the planner never re-places its wake.
+        let remat = self.read_remat_hint(&id).await;
+        let stem = encode_snap(&image_dir, &rootfs, remat.as_ref());
         // `exported` defaults to false (home-node-only); the reconcile flips it via
         // `with_exported` once the artifact is exported to tenant Storage (U14).
         Ok(Some(Snapshot::new(
@@ -1317,7 +1624,13 @@ impl ComputeBackend for ContainerBackend {
     /// Returns the resumed replica at its original endpoint.
     async fn restore(&self, snapshot: &Snapshot) -> Result<Instance, BackendError> {
         let criu = self.criu.clone().ok_or(BackendError::Unsupported)?;
-        let (image_dir, rootfs, ip, port) = decode_snap(&snapshot.data_ref).ok_or_else(|| {
+        let DecodedSnap {
+            image_dir,
+            mut rootfs,
+            ip,
+            port,
+            remat,
+        } = decode_snap(&snapshot.data_ref).ok_or_else(|| {
             BackendError::Other(format!("bad snapshot ref {:?}", snapshot.data_ref))
         })?;
         let addr: Ipv4Addr = ip
@@ -1326,6 +1639,28 @@ impl ComputeBackend for ContainerBackend {
         let id = container_id(&snapshot.project, &snapshot.workload, snapshot.replica);
         // Fail-closed on a multi-tenant node without usable nftables (no L2 isolation).
         self.ensure_antispoof_allows_launch()?;
+
+        // CROSS-NODE WAKE (v0.72.0): if the content-addressed rootfs isn't staged on THIS node
+        // — a resume node that never ran the workload — re-materialize it from the carried
+        // descriptor BEFORE the CRIU restore (re-stage the tar blob / re-pull+overlay the
+        // digest-pinned image, into the SAME path `--root` expects). On the home node the
+        // rootfs is already staged, so this is a no-op and the wake is byte-identical to pre-
+        // v0.72. Fail-closed: a re-materialization failure (or a missing descriptor when the
+        // rootfs is absent) returns an error, so the reconcile drops the Zero record and the
+        // next tick cold-starts the ordinal cleanly — never a wrong/partial container.
+        if !rootfs_ready(&rootfs).await {
+            let Some(remat) = remat.as_ref() else {
+                return Err(BackendError::Other(format!(
+                    "container restore: rootfs {rootfs} is not present on this node and the \
+                     snapshot carries no re-materialization descriptor (not cross-node-capable)",
+                )));
+            };
+            let staged = self.rematerialize_rootfs(remat).await?;
+            rootfs = staged.display().to_string();
+            // Re-persist the hint on THIS node so a later re-park can cross-node again
+            // (restore, not launch, brought the replica here — no launch hint was written).
+            self.write_remat_hint(&id, remat).await;
+        }
 
         // Re-reserve the IP (recording ownership for this replica) and recreate the
         // host veth (the peer lands in the restored netns via the action-script below).
@@ -1410,26 +1745,91 @@ impl ComputeBackend for ContainerBackend {
         ))
     }
 
-    /// U14 cross-node s2z — DEFERRED for the container (CRIU) backend: this returns `None`, so
-    /// a CRIU-parked workload stays strictly SAME-NODE (the snapshot never leaves the home
-    /// node and the planner never re-places a wake). A `None` here also means
-    /// [`snapshot_present`](ComputeBackend::snapshot_present) keeps its default `true`, so a
-    /// same-node wake restores from the local CRIU image directly, exactly as before U14.
+    /// U14 cross-node scale-to-zero for the container (CRIU) backend (v0.72.0 — the U14
+    /// follow-up). Returns the on-disk layout the tenant-scoped [`SnapshotStore`] archives on
+    /// park + unpacks on a resume node: the **CRIU image directory** (the process checkpoint —
+    /// the analogue of the microVM's RAM `.snap`). The container's **rootfs is NOT archived**;
+    /// it is re-materialized on the resume node from the content-addressed descriptor the
+    /// snapshot `data_ref` carries (see [`RematSource`] + [`restore`](Self::restore)), exactly
+    /// as the microVM backend re-`materialize`s its content-addressed kernel/rootfs blobs.
     ///
-    /// LIMITATION (why deferred): a CRIU **restore** needs the container's rootfs tree
-    /// materialized on the target node (`--root <rootfs>`), and that rootfs is derived from
-    /// the live mounts at park time — NOT reconstructable on a node that never ran the
-    /// container. Exporting the CRIU image to tenant Storage without that would upload/download
-    /// on every park/wake only to fail `restore` and cold-start anyway (wasted I/O + storage),
-    /// and the "criu dir non-empty ⇒ present" residue could make a later wake skip the fetch,
-    /// fail `restore`, and retry rather than cold-start. Container cross-node is deferred until
-    /// rootfs re-materialization on the resume node is wired; the microVM (embedded firecracker)
-    /// backend remains full cross-node. See `../boatramp-roadmap` for the follow-up.
+    /// `Ok(None)` for a snapshot with no re-materialization descriptor — a workload whose
+    /// rootfs can't be deterministically re-materialized offline (a mutable-tag image, a
+    /// persistent-volume workload) or one parked by a pre-v0.72 server. Such a snapshot stays
+    /// strictly SAME-NODE (the planner never re-places its wake), exactly as before.
+    ///
+    /// The returned `dir`/`local_data_ref` are derived from the snapshot's OWN identity +
+    /// THIS node's `data_dir` — never the parking node's path baked into `data_ref` — so a
+    /// resume node imports into its own local CRIU dir and restores against its own
+    /// re-staged rootfs. The `project` segment of the Storage key is the tenant boundary (a
+    /// node only ever addresses its own `(project, workload, replica)`), so this adds no
+    /// cross-tenant reach beyond the microVM backend's.
     async fn snapshot_artifact(
         &self,
-        _snapshot: &Snapshot,
+        snapshot: &Snapshot,
     ) -> Result<Option<SnapshotArtifact>, BackendError> {
-        Ok(None)
+        let Some(decoded) = decode_snap(&snapshot.data_ref) else {
+            return Ok(None);
+        };
+        // No descriptor ⇒ not cross-node-capable ⇒ same-node only (pre-v0.72 behavior).
+        let Some(remat) = decoded.remat else {
+            return Ok(None);
+        };
+        // THIS node's local CRIU image dir (export source on the home node; import target on a
+        // resume node), from identity + local data_dir — not the stale `data_ref` path.
+        let local_image_dir =
+            self.criu_image_dir(&snapshot.project, &snapshot.workload, snapshot.replica);
+        // Export selection: the flat CRIU image files in the local dir (home node). On a resume
+        // node the dir is absent/empty → empty, which import ignores (the archive self-describes).
+        let files = criu_image_files(&local_image_dir).await;
+        // The resume node's rootfs path (deterministic from the content-addressed descriptor);
+        // `restore` re-stages exactly there before the CRIU restore.
+        let local_rootfs = self
+            .rematerialized_rootfs_path(&remat)
+            .display()
+            .to_string();
+        let local_data_ref = {
+            let stem = encode_snap(
+                &local_image_dir.display().to_string(),
+                &local_rootfs,
+                Some(&remat),
+            );
+            format!("{stem}|{}|{}", decoded.ip, decoded.port)
+        };
+        Ok(Some(SnapshotArtifact::new(
+            local_image_dir,
+            files,
+            local_data_ref,
+        )))
+    }
+
+    /// Whether `snapshot`'s artifact is usable on THIS node without a cross-node fetch.
+    ///
+    /// For a same-node-only snapshot (no re-materialization descriptor) this keeps the trait
+    /// default (`true`): the home-node wake restores from the local CRIU image directly, byte-
+    /// identical to pre-v0.72. For a cross-node-capable snapshot it is `true` only when BOTH
+    /// the local CRIU image dir holds checkpoint files AND the content-addressed rootfs is
+    /// staged + `.boatramp-ready` here — so on a node that parked it the wake is local, and on
+    /// a fresh resume node (`false`) the reconcile fetches the checkpoint from tenant Storage
+    /// and `restore` re-materializes the rootfs first.
+    async fn snapshot_present(&self, snapshot: &Snapshot) -> Result<bool, BackendError> {
+        let Some(decoded) = decode_snap(&snapshot.data_ref) else {
+            return Ok(true); // unparseable → assume local, try the restore directly
+        };
+        let Some(remat) = decoded.remat else {
+            return Ok(true); // same-node only → the default
+        };
+        let local_image_dir =
+            self.criu_image_dir(&snapshot.project, &snapshot.workload, snapshot.replica);
+        let criu_here = has_criu_images(&local_image_dir).await;
+        let rootfs_here = rootfs_ready(
+            &self
+                .rematerialized_rootfs_path(&remat)
+                .display()
+                .to_string(),
+        )
+        .await;
+        Ok(criu_here && rootfs_here)
     }
 
     /// **Exec** (docker-exec style): run `argv` inside the already-running
@@ -2298,6 +2698,15 @@ impl ContainerBackend {
                  concurrent relaunch. Refusing to boot a mismatched rootfs/mapping; retry.",
                 mapping.base
             )));
+        }
+        // Cross-node scale-to-zero (v0.72.0): record how to re-materialize this container's
+        // content-addressed rootfs on a resume node, for an eligible shape (a tar blob or a
+        // digest-pinned image, no persistent volume). A later `snapshot` reads this hint and
+        // stamps the descriptor into the snapshot `data_ref`. Absent ⇒ the workload stays
+        // same-node (`snapshot_artifact` returns `None`). Best-effort; staged at the effective
+        // userns base so the resume node re-stages the IDENTICAL ownership-shifted tree.
+        if let Some(remat) = RematSource::for_spec(&req.spec, mapping.base) {
+            self.write_remat_hint(id, &remat).await;
         }
         let mut plan = SandboxPlan::for_spec(&req.spec, rootfs, id, uid, gid);
         // Apply the image's OCI runtime config (`Env`/`WorkingDir`) on the long-running
@@ -4039,6 +4448,307 @@ mod tests {
         ComputeSpec::builder(RootSource::Tar(hash.into()), 1, 64, 8080)
             .entrypoint(vec!["/bin/hello".into()])
             .build()
+    }
+
+    // ---- cross-node scale-to-zero: re-materialization descriptor + gating (v0.72.0) ----
+
+    /// The eligibility rule ([`RematSource::for_spec`]): a content-addressed, volumeless shape
+    /// is cross-node-capable; a mutable-tag image, a rootfs block image, and any workload with
+    /// a persistent volume stay SAME-NODE (no descriptor).
+    #[test]
+    fn remat_source_for_spec_gates_on_content_addressed_volumeless_shapes() {
+        let tar = ComputeSpec::builder(RootSource::Tar("a".repeat(64)), 1, 64, 80).build();
+        assert_eq!(
+            RematSource::for_spec(&tar, 100_000),
+            Some(RematSource::Tar {
+                hash: "a".repeat(64),
+                base: 100_000
+            }),
+            "a tar rootfs blob is content-addressed → cross-node"
+        );
+
+        let digest = ComputeSpec::builder(
+            RootSource::Image("docker.io/library/nginx@sha256:abc".into()),
+            1,
+            64,
+            80,
+        )
+        .build();
+        assert_eq!(
+            RematSource::for_spec(&digest, 0),
+            Some(RematSource::Image {
+                reference: "docker.io/library/nginx@sha256:abc".into(),
+                base: 0
+            }),
+            "a digest-pinned image is content-addressed → cross-node"
+        );
+
+        let mutable =
+            ComputeSpec::builder(RootSource::Image("nginx:latest".into()), 1, 64, 80).build();
+        assert_eq!(
+            RematSource::for_spec(&mutable, 0),
+            None,
+            "a mutable-tag image is not deterministically re-materializable → same-node"
+        );
+
+        let block = ComputeSpec::builder(RootSource::Rootfs("b".repeat(64)), 1, 64, 80).build();
+        assert_eq!(
+            RematSource::for_spec(&block, 0),
+            None,
+            "a rootfs block image is not this backend's → same-node"
+        );
+
+        let with_vol = ComputeSpec::builder(RootSource::Tar("c".repeat(64)), 1, 64, 80)
+            .volumes(vec![boatramp_core::compute::VolumeRef::new(
+                "/data", "data", 1024,
+            )])
+            .build();
+        assert_eq!(
+            RematSource::for_spec(&with_vol, 0),
+            None,
+            "a persistent-volume workload keeps node-local data → same-node"
+        );
+    }
+
+    /// The descriptor round-trips through its compact token encoding, including an image
+    /// reference that itself contains `:` and `@`.
+    #[test]
+    fn remat_source_token_round_trips() {
+        for r in [
+            RematSource::Tar {
+                hash: "d".repeat(64),
+                base: 0,
+            },
+            RematSource::Tar {
+                hash: "e".repeat(64),
+                base: 100_000,
+            },
+            RematSource::Image {
+                reference: "registry.example.com:5000/acme/app@sha256:deadbeef".into(),
+                base: 100_000,
+            },
+        ] {
+            assert_eq!(RematSource::decode(&r.encode()), Some(r.clone()), "{r:?}");
+        }
+        assert_eq!(RematSource::decode("garbage"), None);
+        assert_eq!(RematSource::decode("t:notanumber:hash"), None);
+        assert_eq!(RematSource::decode("t:0:"), None, "empty payload rejected");
+    }
+
+    /// `data_ref` decodes BOTH the pre-v0.72 same-node shape (no descriptor) and the new
+    /// cross-node shape (a `remat=` prefix), with the image dir path preserved intact.
+    #[test]
+    fn decode_snap_handles_same_node_and_cross_node_shapes() {
+        // Pre-v0.72 / same-node: no descriptor.
+        let same =
+            decode_snap("/dataA/compute/criu/web-0|/dataA/compute/rootfs/h.b0|10.0.0.5|8080")
+                .expect("decodes");
+        assert_eq!(same.image_dir, "/dataA/compute/criu/web-0");
+        assert_eq!(same.rootfs, "/dataA/compute/rootfs/h.b0");
+        assert_eq!(same.ip, "10.0.0.5");
+        assert_eq!(same.port, 8080);
+        assert_eq!(same.remat, None);
+
+        // Cross-node: a descriptor prefix, then the usual 4 fields.
+        let remat = RematSource::Tar {
+            hash: "h".repeat(64),
+            base: 100_000,
+        };
+        let encoded = format!(
+            "{}|10.0.0.5|8080",
+            encode_snap(
+                "/dataA/compute/criu/web-0",
+                "/dataA/compute/rootfs/x.b100000",
+                Some(&remat)
+            )
+        );
+        let xnode = decode_snap(&encoded).expect("decodes");
+        assert_eq!(xnode.image_dir, "/dataA/compute/criu/web-0");
+        assert_eq!(xnode.rootfs, "/dataA/compute/rootfs/x.b100000");
+        assert_eq!(xnode.ip, "10.0.0.5");
+        assert_eq!(xnode.port, 8080);
+        assert_eq!(xnode.remat, Some(remat));
+    }
+
+    /// The re-materialized rootfs path a resume node derives matches the EXACT staging path
+    /// `stage_rootfs`/`stage_image` publish (so `restore`'s `--root` lands on the re-stage).
+    #[test]
+    fn rematerialized_rootfs_path_matches_staging_layout() {
+        let data_dir = unique_dir("rematpath");
+        let backend = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            data_dir.clone(),
+            "br-boatramp".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/proc/self/exe"),
+        )
+        .expect("backend");
+
+        let tar = RematSource::Tar {
+            hash: "f".repeat(64),
+            base: 100_000,
+        };
+        assert_eq!(
+            backend.rematerialized_rootfs_path(&tar),
+            data_dir
+                .join("compute")
+                .join("rootfs")
+                .join(format!("{}.b100000", "f".repeat(64))),
+        );
+
+        let img_ref = "docker.io/library/nginx@sha256:abc";
+        let image = RematSource::Image {
+            reference: img_ref.into(),
+            base: 0,
+        };
+        let key = boatramp_types::manifest::sha256_hex(img_ref.as_bytes());
+        assert_eq!(
+            backend.rematerialized_rootfs_path(&image),
+            data_dir
+                .join("compute")
+                .join("images")
+                .join(format!("{key}.b0")),
+        );
+    }
+
+    /// `snapshot_artifact` participates in cross-node (returns `Some`) ONLY for a snapshot
+    /// carrying a descriptor, and names THIS node's local CRIU dir + a re-staged rootfs path
+    /// in the rewritten `local_data_ref` — not the parking node's paths from `data_ref`. A
+    /// descriptor-less (same-node) snapshot returns `None` and `snapshot_present` stays `true`.
+    #[tokio::test]
+    async fn snapshot_artifact_is_some_only_for_cross_node_candidates() {
+        let data_dir = unique_dir("xnode-art");
+        let backend = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            data_dir.clone(),
+            "br-boatramp".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/proc/self/exe"),
+        )
+        .expect("backend");
+
+        // A same-node (descriptor-less) snapshot: no cross-node participation.
+        let same = Snapshot::new(
+            "acme".into(),
+            "web".into(),
+            0,
+            "/other/compute/criu/acme-web-0|/other/compute/rootfs/h.b0|10.0.0.5|8080".into(),
+        );
+        assert!(backend.snapshot_artifact(&same).await.unwrap().is_none());
+        assert!(
+            backend.snapshot_present(&same).await.unwrap(),
+            "a same-node snapshot keeps the default 'present' (restore locally)"
+        );
+
+        // A cross-node snapshot: the data_ref carries a descriptor + the PARKING node's paths.
+        let remat = RematSource::Tar {
+            hash: "h".repeat(64),
+            base: 100_000,
+        };
+        let stem = encode_snap(
+            "/parknode/compute/criu/acme-web-0",
+            "/parknode/compute/rootfs/h.b100000",
+            Some(&remat),
+        );
+        let xnode = Snapshot::new(
+            "acme".into(),
+            "web".into(),
+            0,
+            format!("{stem}|10.0.0.5|8080"),
+        );
+        let art = backend
+            .snapshot_artifact(&xnode)
+            .await
+            .unwrap()
+            .expect("cross-node candidate yields an artifact");
+        // The import target is THIS node's local CRIU dir (derived from identity + data_dir).
+        assert_eq!(
+            art.dir,
+            data_dir.join("compute").join("criu").join("acme-web-0"),
+        );
+        // local_data_ref points at THIS node's CRIU dir + re-staged rootfs (NOT the parker's).
+        let local = decode_snap(&art.local_data_ref).expect("local_data_ref decodes");
+        assert_eq!(
+            local.image_dir,
+            data_dir
+                .join("compute")
+                .join("criu")
+                .join("acme-web-0")
+                .display()
+                .to_string(),
+        );
+        assert_eq!(
+            local.rootfs,
+            backend
+                .rematerialized_rootfs_path(&remat)
+                .display()
+                .to_string(),
+        );
+        assert_eq!(local.remat, Some(remat));
+        assert_eq!(local.ip, "10.0.0.5");
+        assert_eq!(local.port, 8080);
+
+        // On THIS fresh node nothing is staged yet → not present → the reconcile fetches +
+        // re-materializes before restore.
+        assert!(
+            !backend.snapshot_present(&xnode).await.unwrap(),
+            "a resume node that never ran the workload reports the artifact absent",
+        );
+    }
+
+    /// TENANCY: two tenants' identically-named `web/0` snapshots resolve to BYTE-DISTINCT local
+    /// CRIU dirs and re-staged rootfs paths, and each `local_data_ref` names only its OWN
+    /// tenant's identity — so a resume node can never fetch/import another tenant's checkpoint
+    /// or rootfs by re-using the other's artifact layout. (The Storage key's `project` segment
+    /// is the enforced boundary; this proves the backend-side naming never crosses tenants.)
+    #[tokio::test]
+    async fn cross_node_artifact_naming_is_tenant_scoped() {
+        let data_dir = unique_dir("xnode-tenancy");
+        let backend = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            data_dir.clone(),
+            "br-boatramp".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/proc/self/exe"),
+        )
+        .expect("backend");
+
+        let mk = |project: &str| {
+            // SAME workload/replica/rootfs-hash for both tenants — only the project differs.
+            let remat = RematSource::Tar {
+                hash: "h".repeat(64),
+                base: 0,
+            };
+            let stem = encode_snap("/p/compute/criu/x", "/p/compute/rootfs/h.b0", Some(&remat));
+            Snapshot::new(
+                project.into(),
+                "web".into(),
+                0,
+                format!("{stem}|10.0.0.5|8080"),
+            )
+        };
+        let a = backend
+            .snapshot_artifact(&mk("tenant-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        let b = backend
+            .snapshot_artifact(&mk("tenant-b"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            a.dir, b.dir,
+            "distinct tenants get distinct local CRIU dirs"
+        );
+        assert!(
+            a.dir.display().to_string().contains("tenant-a")
+                && b.dir.display().to_string().contains("tenant-b"),
+            "each dir names only its own tenant: {a:?} / {b:?}",
+        );
+        // Neither tenant's artifact layout references the other's identity anywhere.
+        assert!(!a.local_data_ref.contains("tenant-b"));
+        assert!(!b.local_data_ref.contains("tenant-a"));
     }
 
     /// A cheap backend for `build_log_redactor` wiring tests (no storage/network touched).
