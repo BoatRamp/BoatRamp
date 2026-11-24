@@ -102,14 +102,15 @@ pub enum Error {
     #[cfg(feature = "tls")]
     #[error("--tls-key is required for --tls custom")]
     TlsKeyRequired,
-    /// The `--tls-cert` PEM held no certificates (custom-cert / HTTP/3 loading).
-    #[cfg(feature = "tls")]
+    /// The listener static cert PEM held no certificates (`use_node_cert` fail-closed +
+    /// the no-static-cert-configured guard in the inbound-TLS `spawn_listeners` path — the only
+    /// remaining producer in the binary, hence the `tcp-listener` co-gate). The custom-cert /
+    /// HTTP/3 / listener PEM-loading variant now lives in [`boatramp_node::Error::NoCert`] (lifted
+    /// with `boatramp_node::tls::load_cert_chain_and_key`), surfaced here transparently through
+    /// [`Error::Assembly`] (byte-identical Display).
+    #[cfg(all(feature = "tls", feature = "tcp-listener"))]
     #[error("no certificates in {0}")]
     NoCert(String),
-    /// The `--tls-key` PEM held no private key (custom-cert / HTTP/3 loading).
-    #[cfg(feature = "tls")]
-    #[error("no private key in {0}")]
-    NoPrivateKey(String),
     /// `--tls acme` with no `--acme-domain`.
     #[cfg(feature = "tls")]
     #[error("at least one --acme-domain is required for --tls acme")]
@@ -4176,7 +4177,7 @@ fn spawn_listeners(
         #[cfg(feature = "tls")]
         let tls_config = if let Some(t) = &l.tls {
             let build = || -> Result<std::sync::Arc<rustls::ServerConfig>> {
-                install_crypto_provider();
+                boatramp_node::tls::install_crypto_provider();
                 // The listener's own static cert is now OPTIONAL (cap-req #29): a `(cert, key)` PEM pair
                 // when configured (served for `server_names` + SNI-less, and the fallback under
                 // `use_node_cert`), `None` for a pure node-managed listener. A half pair is refused at
@@ -4276,8 +4277,10 @@ fn spawn_listeners(
                 let (cert_pem, key_pem) = static_pem.ok_or_else(|| {
                     Error::NoCert("<listener tls: no static cert_file/key_file>".into())
                 })?;
-                let (certs, private_key) =
-                    load_cert_chain_and_key_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+                let (certs, private_key) = boatramp_node::tls::load_cert_chain_and_key_from_pem(
+                    cert_pem.as_bytes(),
+                    key_pem.as_bytes(),
+                )?;
                 // Transport-level: one listener = one fixed cert, served regardless of SNI; no ALPN,
                 // no client auth. Protocol-agnostic — nothing here depends on what runs over the TLS.
                 let cfg = rustls::ServerConfig::builder()
@@ -5663,7 +5666,7 @@ async fn serve_acme_dns(
     if args.acme_domain.is_empty() {
         return Err(Error::NoAcmeDomainDns);
     }
-    install_crypto_provider();
+    boatramp_node::tls::install_crypto_provider();
 
     // cap-req #27: when `[serve.dns_providers]` is configured the registry IS the provider (per-zone
     // routing for every challenge write); otherwise the single env-seeded provider path is unchanged.
@@ -6199,15 +6202,12 @@ async fn serve_custom(
     #[cfg(feature = "http3")] anycast_node_id: Option<u8>,
     #[cfg(feature = "http3")] advertise_h3: bool,
 ) -> Result<()> {
-    install_crypto_provider();
+    boatramp_node::tls::install_crypto_provider();
     let cert = args.tls_cert.clone().ok_or(Error::TlsCertRequired)?;
     let key = args.tls_key.clone().ok_or(Error::TlsKeyRequired)?;
 
-    let (certs, private_key) = load_cert_chain_and_key(&cert, &key)?;
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, private_key)?;
-    config.alpn_protocols = boatramp_server::alpn_h1_h2();
+    let (certs, private_key) = boatramp_node::tls::load_cert_chain_and_key(&cert, &key)?;
+    let config = boatramp_node::tls::custom_server_config(certs, private_key)?;
     tracing::info!(%addr, "serving HTTPS (custom certificate)");
     // Optionally serve HTTP/3 on the same UDP port, feeding the same router. The `--tls custom` path
     // uses a STATIC cert (no renewal), so the QUIC endpoint is prepared here from the SAME cert/key and
@@ -6218,12 +6218,9 @@ async fn serve_custom(
     #[cfg(feature = "http3")]
     let h3_endpoint = if args.http3 {
         let build = || -> Result<boatramp_server::Http3Endpoint> {
-            let (h3_certs, h3_key) = load_cert_chain_and_key(&cert, &key)?;
-            let mut h3_tls = rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(h3_certs, h3_key)?;
-            // QUIC mandates exactly the `h3` ALPN on this listener.
-            h3_tls.alpn_protocols = vec![b"h3".to_vec()];
+            let (h3_certs, h3_key) = boatramp_node::tls::load_cert_chain_and_key(&cert, &key)?;
+            // QUIC mandates exactly the `h3` ALPN on this listener (set by the node-library builder).
+            let h3_tls = boatramp_node::tls::custom_h3_server_config(h3_certs, h3_key)?;
             Ok(boatramp_server::http3_endpoint(
                 addr,
                 boatramp_server::quinn_server_config(h3_tls)?,
@@ -6273,10 +6270,10 @@ async fn serve_rpk(
     mut options: boatramp_server::ServerOptions,
     data_dir: &Path,
 ) -> Result<()> {
-    install_crypto_provider();
+    boatramp_node::tls::install_crypto_provider();
 
     let key_file = data_dir.join("controlplane-tls.key");
-    let identity = boatramp_rpktls::RpkIdentity::load_or_generate(&key_file)?;
+    let identity = Arc::new(boatramp_rpktls::RpkIdentity::load_or_generate(&key_file)?);
     let fingerprint = identity.public_key_hex();
 
     // If this node holds the root signing key, mint a root-signed attestation of
@@ -6318,14 +6315,7 @@ async fn serve_rpk(
     // so the handshake accepts any possession-proven client key and the real check is
     // the app-layer binding.
     let require_channel_bound = options.posture.require_channel_bound_tokens;
-    let rpk =
-        boatramp_rpktls::RpkTls::new(Arc::new(identity), boatramp_rpktls::TrustSet::default());
-    let mut config = if require_channel_bound {
-        rpk.server_accept_any_client()?
-    } else {
-        rpk.server_auth()?
-    };
-    config.alpn_protocols = boatramp_server::alpn_h1_h2();
+    let config = boatramp_node::tls::rpk_server_config(identity, require_channel_bound)?;
 
     if require_channel_bound {
         tracing::info!(
@@ -6354,42 +6344,6 @@ async fn serve_rpk(
     .await
 }
 
-/// Load a PEM cert chain + private key as DER — for the rustls `ServerConfig`
-/// built by the custom-cert listener and (when enabled) the HTTP/3 (quinn) one.
-#[cfg(feature = "tls")]
-fn load_cert_chain_and_key(
-    cert: &Path,
-    key: &Path,
-) -> Result<(
-    Vec<rustls::pki_types::CertificateDer<'static>>,
-    rustls::pki_types::PrivateKeyDer<'static>,
-)> {
-    let cert_pem = std::fs::read(cert)?;
-    let key_pem = std::fs::read(key)?;
-    load_cert_chain_and_key_from_pem(&cert_pem, &key_pem)
-}
-
-/// Parse an already-read PEM cert chain + private key as DER (cap-req #29: a listener's static cert is
-/// now read into memory first, since it is OPTIONAL and composed with the node-managed resolver, so the
-/// static fallback path parses the bytes rather than re-reading the files).
-#[cfg(feature = "tls")]
-fn load_cert_chain_and_key_from_pem(
-    cert_pem: &[u8],
-    key_pem: &[u8],
-) -> Result<(
-    Vec<rustls::pki_types::CertificateDer<'static>>,
-    rustls::pki_types::PrivateKeyDer<'static>,
-)> {
-    let certs =
-        rustls_pemfile::certs(&mut &cert_pem[..]).collect::<std::result::Result<Vec<_>, _>>()?;
-    if certs.is_empty() {
-        return Err(Error::NoCert("<listener tls: empty PEM cert chain>".into()));
-    }
-    let key = rustls_pemfile::private_key(&mut &key_pem[..])?
-        .ok_or_else(|| Error::NoPrivateKey("<listener tls: no PEM private key>".into()))?;
-    Ok((certs, key))
-}
-
 #[cfg(feature = "tls")]
 async fn serve_acme(
     args: &ServeArgs,
@@ -6405,7 +6359,7 @@ async fn serve_acme(
     if args.acme_domain.is_empty() {
         return Err(Error::NoAcmeDomain);
     }
-    install_crypto_provider();
+    boatramp_node::tls::install_crypto_provider();
 
     let mut config = AcmeConfig::new(args.acme_domain.clone())
         .cache(DirCache::new(args.acme_cache.clone()))
@@ -6414,7 +6368,7 @@ async fn serve_acme(
         config = config.contact_push(format!("mailto:{contact}"));
     }
     if let Some(ca) = &args.acme_ca_cert {
-        config = config.client_tls_config(acme_client_config(ca)?);
+        config = config.client_tls_config(boatramp_node::tls::acme_client_config(ca)?);
     }
 
     let mut state = config.state();
@@ -6451,28 +6405,6 @@ async fn serve_acme(
         true,
     )
     .await
-}
-
-/// Install a process-wide default rustls crypto provider (rustls 0.23 requires
-/// one before building any TLS config). Idempotent.
-#[cfg(feature = "tls")]
-fn install_crypto_provider() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-}
-
-/// Build a rustls client config that trusts an extra root CA (for a test ACME
-/// server like Pebble whose directory uses a self-signed certificate).
-#[cfg(feature = "tls")]
-fn acme_client_config(ca_path: &std::path::Path) -> Result<Arc<rustls::ClientConfig>> {
-    let pem = std::fs::read(ca_path)?;
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut &pem[..]) {
-        roots.add(cert?)?;
-    }
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
 }
 
 #[cfg(not(feature = "tls"))]

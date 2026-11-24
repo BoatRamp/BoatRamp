@@ -119,4 +119,12 @@ pub mod s3_credential;
 pub mod tenant_sql;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod tenant_tombstone;
+/// The static-identity TLS listener config assembly (PLAN-node-library N4): the rustls
+/// `ServerConfig` builders for the `--tls custom` / `--tls rpk` listeners (+ the HTTP/3 variant)
+/// and the shared cert-PEM / ACME extra-CA-trust helpers, lifted out of the `boatramp` binary's
+/// `serve.rs` so the ALPN / client-auth / trust-anchor assembly is unit-testable in-process. The
+/// binary keeps the file reads, the RPK-identity load/generate, the ACME renewal loop, and the
+/// serve loop; it calls these to BUILD the config. Behaviour-preserving (a pure move).
+#[cfg(feature = "tls")]
+pub mod tls;
 pub use node::{NodeInput, RunningNode, assemble};

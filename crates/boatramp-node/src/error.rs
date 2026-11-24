@@ -163,6 +163,32 @@ pub enum Error {
     /// Building the `[secrets]` envelope (local KEK / Vault) failed.
     #[error("secrets envelope: {0}")]
     Envelope(String),
+
+    // ---- TLS listener config assembly (`tls` module, PLAN-node-library N4) -----
+    // These Display IDENTICALLY to the binary's own `serve::Error` variants they were
+    // lifted from — the binary absorbs them transparently through `serve::Error::Assembly`
+    // (`#[from] boatramp_node::Error`), so an operator sees byte-for-byte the same message.
+    /// A cert PEM held no certificates (custom-cert / HTTP/3 / inbound-listener loading).
+    #[cfg(feature = "tls")]
+    #[error("no certificates in {0}")]
+    NoCert(String),
+    /// A key PEM held no private key (custom-cert / HTTP/3 / inbound-listener loading).
+    #[cfg(feature = "tls")]
+    #[error("no private key in {0}")]
+    NoPrivateKey(String),
+    /// A raw-public-key TLS error building the `--tls rpk` bootstrap listener config.
+    #[cfg(feature = "tls")]
+    #[error(transparent)]
+    RpkTls(#[from] boatramp_rpktls::RpkError),
+    /// A rustls error building a TLS listener/client config (e.g. a bad cert/key pair, or
+    /// adding an ACME extra-CA trust anchor).
+    #[cfg(feature = "tls")]
+    #[error(transparent)]
+    Rustls(#[from] rustls::Error),
+    /// A filesystem I/O error reading a cert/key/CA PEM, or a PEM-parse I/O error, for a TLS config.
+    #[cfg(feature = "tls")]
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 /// Node-assembly result alias.

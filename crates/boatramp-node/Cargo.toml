@@ -42,6 +42,10 @@ boatramp-k8s = { workspace = true, optional = true, default-features = false, fe
 # optional, pulled only by the `handlers` feature (the lean node has no wasm engine).
 boatramp-handlers = { workspace = true, optional = true }
 boatramp-storage = { workspace = true, optional = true }
+# RFC 7250 raw-public-key TLS: the `--tls rpk` bootstrap listener config assembly
+# (`tls::rpk_server_config`). OPTIONAL + pulled only by this crate's `tls` feature, so a
+# non-TLS node links none of it; the binary forwards its own `tls` feature here.
+boatramp-rpktls = { workspace = true, optional = true }
 # Optional: derives `clap::ValueEnum` on the backend-selection enums so the CLI
 # binary uses them directly in its args. A non-CLI embedder never pulls clap.
 clap = { workspace = true, optional = true }
@@ -190,7 +194,10 @@ blob-upload = [
 ]
 s3 = ["dep:boatramp-storage", "boatramp-storage/s3", "fallback"]
 slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
-tls = []
+# The static-identity TLS listener config assembly (`tls` module, PLAN-node-library N4): the
+# rustls `ServerConfig` builders for `--tls custom` / `--tls rpk` + the shared cert-PEM/ACME-trust
+# helpers. Pulls the RPK stack for the `rpk_server_config` builder. The binary forwards its `tls`.
+tls = ["dep:boatramp-rpktls"]
 # CI gate lane for #505 sealed-store S3 credential sourcing (`S3 SEALED-CRED SOURCING OK`). When ON,
 # the `s3_credential::gate` battery compiles + each `BOATRAMP_S3SEALED_MUTATE_*` env var neuters exactly
 # ONE security check (via a `#[cfg(feature = "s3-sealed-cred-gate-mutation")]` seam), so CI can prove the
@@ -231,6 +238,10 @@ reaper-liveness-gate-mutation = []
 # synthetic request over a temp `FsStorage` + `MemoryKv` (gated on `fs`).
 axum = "0.8"
 tempfile = "3"
+# The `tls` module config-assembly tests mint a throwaway self-signed cert/key (custom-cert
+# listener) exactly as the server/bin TLS tests do; the RPK builder test uses an in-memory
+# `RpkIdentity::generate()`, no fixture.
+rcgen = "0.13"
 # Serialize the reaper liveness-gate mutation test (it toggles a process-global env var).
 serial_test = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
