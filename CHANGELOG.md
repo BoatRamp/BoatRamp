@@ -5,6 +5,30 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Added
+
+- **Cross-node scale-to-zero for native container (CRIU) workloads (U14 follow-up).** A parked
+  container can now wake on a node that never ran it, reaching parity with the microVM backend
+  (which has had cross-node scale-to-zero since U14). On a cross-node wake the resume node
+  **re-materializes the container's root filesystem** from its content-addressed source —
+  re-staging the tar rootfs blob, or re-pulling + overlaying the digest-pinned image — into the
+  exact path the CRIU restore expects, *before* restoring the checkpoint, the same way a microVM
+  re-materializes its content-addressed kernel/rootfs blobs. The exported CRIU checkpoint rides the
+  same tenant-scoped snapshot store U14 added (a per-project `csnap/<project>/…` key on the
+  project's own backend, an authenticated-integrity seal verified fail-closed on import, and an
+  import byte-cap), so a node can only ever fetch its own tenant's snapshot and rootfs inputs.
+  - **Boundary (surfaced, not forced).** A container is cross-node-capable only when its rootfs is
+    deterministically re-materializable offline and it carries no node-local-only state: the source
+    is a **tar blob** or a **digest-pinned image** (`…@sha256:…`), and the workload declares **no
+    persistent volume**. A mutable-tag image (not content-addressed) or a volume-bearing workload
+    (node-local data) stays **same-node**, exactly as before — it still parks and wakes on its home
+    node, just isn't re-placed elsewhere.
+  - **Fail-closed.** A failed re-materialization or CRIU restore on the resume node drops the parked
+    record and cold-starts the replica cleanly on the next reconcile — never a partial or wrong
+    container.
+
 ## [0.71.0] — 2026-11-23
 
 ### Breaking
