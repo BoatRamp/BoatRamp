@@ -1003,6 +1003,13 @@ impl PrivsepLink {
         matches!(self.purpose, LinkPurpose::AuthorityServe)
     }
 
+    /// Whether this link is EXPLICITLY purpose-marked as a control-authorize-serve link (Phase-5
+    /// P5-4) — the group-E analog of [`Self::is_authority_serve`]: it designates the `control.admin-api`
+    /// endpoint to serve the cross-instance authorize grammar to a relaying `backend.*`/app peer.
+    pub const fn is_control_authorize_serve(&self) -> bool {
+        matches!(self.purpose, LinkPurpose::ControlAuthorizeServe)
+    }
+
     /// Whether this link is EXPLICITLY purpose-marked as a serving-splice relay (frontend→backend).
     pub const fn is_relay(&self) -> bool {
         matches!(self.purpose, LinkPurpose::Relay)
@@ -1042,6 +1049,17 @@ pub enum LinkPurpose {
     /// sibling authority layer owns). The composition-closure lint REFUSES an `authority-serve` link
     /// that lacks exactly one crown-jewel endpoint ([`CompositionViolation::AuthorityServeLinkNotSingleCrownJewel`]).
     AuthorityServe,
+    /// A CONTROL-AUTHORIZE-SERVE link (Phase-5 P5-4): the group-E analog of [`AuthorityServe`]. The
+    /// non-control endpoint (a `backend.*` / app instance serving the node's own `/api/*` mutation
+    /// path) relays a bounded `ControlAuthorizeCall` — the end principal's relayed context + per-call
+    /// PoP + request line — to the `control.admin-api` endpoint, which re-validates the context + PoP
+    /// AT THE DESTINATION and answers the `rights_for` authorization DECISION (never key material). It
+    /// is byte-for-byte the same TOPOLOGY as a client-fd serving splice, so — exactly like
+    /// [`AuthorityServe`] for a crown jewel — an explicit marker is required to designate it (the
+    /// inference never auto-designates a splice-shaped link for a grammar). The composition-closure
+    /// lint REFUSES a `control-authorize-serve` link that lacks EXACTLY ONE `control.admin-api`
+    /// endpoint ([`CompositionViolation::ControlAuthorizeServeLinkNotSingleControlApi`]).
+    ControlAuthorizeServe,
 }
 
 /// The link transport — a config SHAPE behind one API (design §3.3). WS-A placeholder.
@@ -1312,6 +1330,20 @@ pub enum CompositionViolation {
         /// Its endpoints that hold a crown jewel (0, or ≥2 — never exactly 1, or this would not fire).
         crown_endpoints: Vec<String>,
     },
+    /// A link is explicitly purpose-marked [`LinkPurpose::ControlAuthorizeServe`] but does NOT have
+    /// EXACTLY ONE `control.admin-api` endpoint, so it cannot be a control-authorize-serve link
+    /// (Phase-5 P5-4): the authorize grammar (the cross-instance `rights_for` decision) is served only
+    /// by a `control.admin-api` holder, so ZERO `control.admin-api` endpoints has no server, and TWO is
+    /// an ambiguous control↔control shape. Fail-closed: a misconfigured marker refuses the node closed
+    /// rather than standing up an unserveable or ambiguous authorize link (the group-E analog of
+    /// [`Self::AuthorityServeLinkNotSingleCrownJewel`]).
+    ControlAuthorizeServeLinkNotSingleControlApi {
+        /// The offending link name.
+        link: String,
+        /// Its endpoints that hold `control.admin-api` (0, or ≥2 — never exactly 1, or this would not
+        /// fire).
+        control_endpoints: Vec<String>,
+    },
     /// A per-tenant TEMPLATE instance ([`InstanceLifecycle::PerTenantTemplate`]) holds a capability
     /// set OTHER than exactly `{exec.wasmtime}` (design §Phase-4 WS-A). A template is the guest-JIT
     /// surface the compute plane instantiates per tenant; it must materialize ONLY `exec.wasmtime` so
@@ -1528,6 +1560,18 @@ impl std::fmt::Display for CompositionViolation {
                  bootstrap-unseal, not an authority serve",
                 crown_endpoints.len(),
                 crown_endpoints.join(", ")
+            ),
+            Self::ControlAuthorizeServeLinkNotSingleControlApi {
+                link,
+                control_endpoints,
+            } => write!(
+                f,
+                "link {link:?} is purpose-marked `control-authorize-serve` but has {} \
+                 `control.admin-api` endpoint(s) [{}] — a control-authorize-serve link must have \
+                 EXACTLY ONE `control.admin-api` endpoint (the authorizer) and one non-control relay \
+                 (the serving backend/app that forwards the end-principal credential)",
+                control_endpoints.len(),
+                control_endpoints.join(", ")
             ),
             Self::WasmTemplateNotSoleExecWasmtime {
                 instance,
@@ -2018,6 +2062,41 @@ pub fn check_composition_closure(
                 CompositionViolation::AuthorityServeLinkNotSingleCrownJewel {
                     link: link_name.clone(),
                     crown_endpoints,
+                },
+            );
+        }
+    }
+
+    // --- Purpose-marker closure (Phase-5 P5-4): a `control-authorize-serve` link needs EXACTLY ONE
+    //     `control.admin-api` endpoint — the group-E analog of the `authority-serve` check above. Only
+    //     meaningful when both endpoints are hosted (an unhosted endpoint already reports
+    //     LinkEndpointUnhosted). ---
+    for (link_name, link) in &cfg.links {
+        if !link.is_control_authorize_serve() {
+            continue;
+        }
+        let from_hosted = cfg.instances.contains_key(&link.from);
+        let to_hosted = cfg.instances.contains_key(&link.to);
+        if !(from_hosted && to_hosted) {
+            continue;
+        }
+        let holds_control_api = |ep: &str| -> bool {
+            cfg.instances.get(ep).is_some_and(|i| {
+                i.capabilities
+                    .iter()
+                    .any(|a| matches!(a, HostAuthority::ControlAdminApi))
+            })
+        };
+        let control_endpoints: Vec<String> = [&link.from, &link.to]
+            .into_iter()
+            .filter(|ep| holds_control_api(ep))
+            .cloned()
+            .collect();
+        if control_endpoints.len() != 1 {
+            violations.push(
+                CompositionViolation::ControlAuthorizeServeLinkNotSingleControlApi {
+                    link: link_name.clone(),
+                    control_endpoints,
                 },
             );
         }
@@ -3365,6 +3444,73 @@ mod tests {
         assert!(
             !authorityserve_fault(&cfg4),
             "an unmarked link is never subject to the authority-serve purpose check"
+        );
+    }
+
+    #[test]
+    fn control_authorize_serve_marker_requires_exactly_one_control_api_endpoint() {
+        // A control.admin-api ↔ non-control control-authorize-serve link is accepted (exactly one
+        // control.admin-api endpoint = the authorizer).
+        let mut instances = BTreeMap::new();
+        instances.insert("core".to_string(), inst(&[HostAuthority::BackendKv]));
+        instances.insert(
+            "control".to_string(),
+            inst(&[HostAuthority::ControlAdminApi]),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(
+            "to-control".to_string(),
+            PrivsepLink {
+                from: "core".to_string(),
+                to: "control".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::ControlAuthorizeServe,
+            },
+        );
+        let cfg = PrivsepConfig {
+            instances,
+            links,
+            supervisor: None,
+            per_tenant: PerTenantPolicy::default(),
+            node_serve: NodeServeMode::default(),
+        };
+        let control_fault = |cfg: &PrivsepConfig| {
+            check_composition_closure(cfg).err().is_some_and(|e| {
+                e.violations.iter().any(|v| {
+                    matches!(
+                        v,
+                        CompositionViolation::ControlAuthorizeServeLinkNotSingleControlApi { .. }
+                    )
+                })
+            })
+        };
+        assert!(
+            !control_fault(&cfg),
+            "a control↔non-control control-authorize-serve link must not raise the purpose-marker fault"
+        );
+
+        // control↔control — two control.admin-api endpoints → the fault fires (ambiguous authorizer).
+        let mut cfg2 = cfg.clone();
+        cfg2.instances.get_mut("core").unwrap().capabilities = vec![HostAuthority::ControlAdminApi];
+        assert!(
+            control_fault(&cfg2),
+            "a control↔control control-authorize-serve link must be refused (ambiguous authorizer)"
+        );
+
+        // non-control ↔ non-control — zero control.admin-api endpoints → the fault fires (no authorizer).
+        let mut cfg3 = cfg.clone();
+        cfg3.instances.get_mut("control").unwrap().capabilities = vec![HostAuthority::BackendBlob];
+        assert!(
+            control_fault(&cfg3),
+            "a control-authorize-serve link with no control.admin-api endpoint must be refused"
+        );
+
+        // The SAME topology WITHOUT the marker (Unspecified) raises no purpose-marker fault.
+        let mut cfg4 = cfg3.clone();
+        cfg4.links.get_mut("to-control").unwrap().purpose = LinkPurpose::Unspecified;
+        assert!(
+            !control_fault(&cfg4),
+            "an unmarked link is never subject to the control-authorize-serve purpose check"
         );
     }
 

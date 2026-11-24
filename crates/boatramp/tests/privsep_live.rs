@@ -2514,6 +2514,247 @@ fn privsep_node_self_host_control_mutation_serves_end_to_end() {
     println!("PRIVSEP NODE SELF-HOST CONTROL-MUTATION OK");
 }
 
+/// (E) The P5-4 **cross-instance authorize relay** live gate — the DECISIVE proof of the
+/// cross-instance control-plane authz TRUST decision under REAL Landlock. A host test over a socketpair
+/// proves the wire protocol + decision logic; only a forked composition on a real Landlock kernel
+/// proves the SPLIT holds end-to-end — so this is the authoritative gate ([[ignore-gated-tests-not-evidence]]).
+///
+/// A `node_serve: node-self-host` composition where `authorize` (`control.admin-api`) is held on a
+/// DIFFERENT instance (`control`) than the `backend.kv` write (`core`): `core` (holds `backend.kv` +
+/// the other backends + `exec.compute`, NOT `control.admin-api`) receives the client fd from `edge`,
+/// decomposes the mutation, and RELAYS the `authorize` sub-op to `control` (holds only
+/// `control.admin-api`) over a `control-authorize-serve`-marked link; `control` re-validates the
+/// end-principal context + per-call PoP AT THE DESTINATION and answers the `rights_for` DECISION (never
+/// a key), and `core` — the revocation-marker authority — enforces revocation + applies the write under
+/// its `backend.kv` Landlock profile. Proves:
+/// - **(a) POSITIVE:** an AUTHORIZED `PUT /api/routing/acme/blog/served.example` (a valid cnf-bound
+///   `publisher@acme/blog` role token + a per-call PoP) SERVES cross-instance (200) and the write LANDS
+///   (a follow-up read-plane `GET Host: served.example` resolves). The node served it only after the
+///   SEPARATE `control` instance verified + authorized the principal and `core` wrote under Landlock.
+/// - **(b) NEGATIVES:** a FORGED principal (non-trust-root key) is refused by the DESTINATION
+///   re-validation (no asserted-id trust across the link); a MISSING-PoP mutation is default-denied; and
+///   a verbatim REPLAY of the accepted call is refused by the destination's anti-replay. All 503.
+///
+/// (The "relay to a non-grammar endpoint is refused" negative is a PURE ROUTING decision — proven
+/// decisively by the host tests `p5_4_cross_instance_authorize_relay_serves_and_fail_closes` (NEGATIVE
+/// 7) + `p5_1_node_router_serves_held_relays_the_rest_refuses_unreachable`; it needs no Landlock, so a
+/// host test is not a false green for it.)
+///
+/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]`; the CI `live gate (privsep)`
+/// job greps `PRIVSEP NODE SELF-HOST CROSS-INSTANCE AUTHORIZE OK`.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live: forks boatramp __root for a node-self-host composition that SPLITS control.admin-api \
+            onto a separate instance; an AUTHORIZED client mutation serves cross-instance over the \
+            control-authorize relay + lands under the backend.kv Landlock profile, a forged / \
+            missing-PoP / replayed one is refused 503; run via --include-ignored in `live gate (privsep)`"]
+fn privsep_node_self_host_cross_instance_authorize_serves_end_to_end() {
+    use boatramp_core::authz::GrantedRole;
+    use boatramp_core::cose::{
+        AuthorityPopBinding, Claims, KIND_ROLE, LocalSigner, Signer, TokenAlg, mint_authority_pop,
+        mint_delegatable,
+    };
+    use boatramp_server::privsep_authority::{CONTROL_MUTATION_POP_OP, control_mutation_pop_bytes};
+
+    let bin = env!("CARGO_BIN_EXE_boatramp");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "boatramp-privsep-selfhost-xinst-authz-{}",
+        std::process::id()
+    ));
+    let data_dir = tmp.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let port = free_port();
+    let cfg_path = tmp.join("boatramp.cfg");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build a current-thread runtime for the mints");
+    let root = LocalSigner::generate(TokenAlg::Es256);
+    let holder = LocalSigner::generate(TokenAlg::Es256);
+    let forger = LocalSigner::generate(TokenAlg::Es256);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let method = "PUT";
+    let path = "/api/routing/acme/blog/served.example";
+    let transport_host = "node-admin";
+    let mint = |signer: &LocalSigner, role: GrantedRole, nonce: u128| -> (String, String) {
+        rt.block_on(async {
+            let claims = Claims {
+                roles: vec![role],
+                kind: KIND_ROLE.to_string(),
+                ttl_secs: Some(300),
+                now_unix: now,
+            };
+            let token = mint_delegatable(&claims, &holder.public_key(), signer)
+                .await
+                .expect("mint the role token");
+            let req_bytes = control_mutation_pop_bytes(method, path, transport_host);
+            let binding = AuthorityPopBinding {
+                op: CONTROL_MUTATION_POP_OP,
+                context_token: &token,
+                nonce,
+                request_bytes: &req_bytes,
+            };
+            let pop = mint_authority_pop(&binding, &holder, now)
+                .await
+                .expect("mint the PoP");
+            (token, pop)
+        })
+    };
+
+    // The SPLIT composition: `control` holds ONLY `control.admin-api` (the authorizer); `core` holds
+    // `backend.kv` + the other backends + `exec.compute` (the serving writer) and RELAYS the authorize
+    // sub-op to `control` over the `control-authorize-serve`-marked `core-to-control` link. `edge` is
+    // the public parser frontend; `aux` holds the other listeners + exec.wasmtime + acme; `jewels` holds
+    // the 6 crown jewels. union == ALL, no forbidden co-residency, exactly one control.admin-api on the
+    // control-authorize link.
+    let cfg = format!(
+        r#"(
+    serve: (
+        addr: "127.0.0.1:{port}",
+        data_dir: "{data_dir}",
+        auth_root_public_key: "{root_pub}",
+    ),
+    privsep: (
+        instances: {{
+            "edge": (
+                capabilities: ["listen.public-tls", "listen.http-parse"],
+                sandbox: Derived,
+                links: ["to-core"],
+            ),
+            "aux": (
+                capabilities: [
+                    "listen.mail", "listen.overlay",
+                    "listen.s3ingress", "listen.inbound-tcp", "listen.gateway",
+                    "exec.wasmtime", "acme.dns-control",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "jewels": (
+                capabilities: [
+                    "secrets.sealer", "token.signer", "image.signer", "overlay.dial-signer",
+                    "s3ingress.root", "cluster.join-signer",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "control": (
+                capabilities: ["control.admin-api"],
+                sandbox: Derived,
+                substrate: OsProcess,
+                links: ["core-to-control"],
+            ),
+            "core": (
+                capabilities: [
+                    "exec.compute",
+                    "backend.kv", "backend.sql", "backend.blob", "backend.messaging",
+                ],
+                sandbox: Derived,
+                substrate: OsProcess,
+                links: ["to-core", "core-to-control"],
+            ),
+        }},
+        links: {{
+            "to-core": (from: "edge", to: "core", transport: Local, purpose: Relay),
+            "core-to-control": (from: "core", to: "control", transport: Local, purpose: ControlAuthorizeServe),
+        }},
+        node_serve: NodeSelfHost,
+    ),
+)"#,
+        port = port,
+        data_dir = data_dir.display(),
+        root_pub = root.public_key().to_hex(),
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write the cross-instance-authorize privsep config");
+
+    let mut root_proc = Command::new(bin)
+        .arg("__root")
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "boatramp=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn `boatramp __root`");
+
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        if Instant::now() > deadline {
+            let _ = root_proc.kill();
+            let _ = root_proc.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!("the node-self-host cross-instance-authorize node did not serve within 25s");
+        }
+        if let Ok(Some(status)) = root_proc.try_wait() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "`boatramp __root` exited early ({status}) — the cross-instance-authorize composition \
+                 failed to stand up (sandbox not Enforced? the split `control` verifier could not \
+                 resolve the trust root? a backend.kv Landlock EACCES? the control-authorize link not \
+                 wired?)"
+            );
+        }
+        match try_http_get(&addr) {
+            Ok(resp) if resp.contains("node-self-host read plane") => break,
+            _ => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+
+    // --- (a) POSITIVE: an authorized publisher@acme/blog serves cross-instance (200) + the write lands.
+    let (token, pop) = mint(&root, GrantedRole::scoped("publisher", "acme/blog"), 1);
+    let served = try_http_put_authed(&addr, path, transport_host, &token, 1, Some(&pop))
+        .expect("issue the authorized cross-instance PUT");
+    let read_back = try_http_get_host(&addr, "served.example").expect("read-back GET");
+
+    // --- (b) NEGATIVE 1: a FORGED principal (non-trust-root key) ⇒ the DESTINATION re-validation fails.
+    let (ftoken, fpop) = mint(&forger, GrantedRole::scoped("publisher", "acme/blog"), 2);
+    let forged = try_http_put_authed(&addr, path, transport_host, &ftoken, 2, Some(&fpop))
+        .expect("issue the forged cross-instance PUT");
+
+    // --- (b) NEGATIVE 2: a MISSING PoP ⇒ default-deny (before any relay).
+    let (token3, _pop3) = mint(&root, GrantedRole::scoped("publisher", "acme/blog"), 3);
+    let no_pop = try_http_put_authed(&addr, path, transport_host, &token3, 3, None)
+        .expect("issue the missing-PoP cross-instance PUT");
+
+    // --- (b) NEGATIVE 3: a verbatim REPLAY of the accepted call ⇒ the DESTINATION anti-replay refuses.
+    let replay = try_http_put_authed(&addr, path, transport_host, &token, 1, Some(&pop))
+        .expect("issue the replayed cross-instance PUT");
+
+    let _ = root_proc.kill();
+    let _ = root_proc.wait();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert!(
+        served.starts_with("HTTP/1.1 200") && served.contains("authorized mutation served"),
+        "an AUTHORIZED client mutation must SERVE (200) over the cross-instance authorize relay, got:\n{served}"
+    );
+    assert!(
+        read_back.starts_with("HTTP/1.1 200") && read_back.contains("resolves"),
+        "the cross-instance-authorized write must LAND + be readable via the read plane, got:\n{read_back}"
+    );
+    assert!(
+        forged.starts_with("HTTP/1.1 503"),
+        "a FORGED principal must be REFUSED 503 (destination re-validation), got:\n{forged}"
+    );
+    assert!(
+        no_pop.starts_with("HTTP/1.1 503") && no_pop.contains("no end-principal credential"),
+        "a MISSING-PoP mutation must be REFUSED 503 (default-deny), got:\n{no_pop}"
+    );
+    assert!(
+        replay.starts_with("HTTP/1.1 503") && replay.contains("anti-replay"),
+        "a verbatim REPLAY must be REFUSED 503 by the destination anti-replay, got:\n{replay}"
+    );
+
+    // The marker the CI gate greps — reached ONLY after the AUTHORIZED cross-instance mutation served +
+    // landed under Landlock AND the forged / missing-PoP / replayed mutations were all refused.
+    println!("PRIVSEP NODE SELF-HOST CROSS-INSTANCE AUTHORIZE OK");
+}
+
 // =============================================================================
 // HIGH-1 LIVE GATE — the cross-instance `/proc/<pid>/mem` key-disclosure WALL.
 // =============================================================================

@@ -2052,6 +2052,106 @@ fn compute_authority_serve_links(config: &ServerConfig) -> BTreeMap<String, BTre
     out
 }
 
+/// Compute the per-instance **control-authorize-serve link** designation the root wires onto each
+/// `control.admin-api` instance (Phase-5 P5-4): the feature-links on which that instance should serve
+/// the cross-instance authorize grammar (the `rights_for` decision) to a relaying `backend.*`/app peer.
+/// The group-E analog of [`compute_authority_serve_links`], keyed by the `control.admin-api` HOLDER
+/// label → its control-authorize links. Secret-blind (link names only).
+///
+/// **The designation rule.** Unlike the crown-jewel grammar (which infers a conservative Unspecified
+/// shape), a control-authorize link is ALWAYS splice-shaped (a `backend.*`/app endpoint relaying to the
+/// `control.admin-api` endpoint), so there is no safe inference — it is designated ONLY by the EXPLICIT
+/// [`LinkPurpose::ControlAuthorizeServe`] marker. The composition-closure lint
+/// ([`CompositionViolation::ControlAuthorizeServeLinkNotSingleControlApi`]) enforces exactly one
+/// `control.admin-api` endpoint, so a marked link reaching here always has its single control endpoint.
+/// A [`LinkPurpose::Relay`] / [`LinkPurpose::AuthorityServe`] / [`LinkPurpose::Unspecified`] link is
+/// NEVER designated here. Pure (host-testable).
+fn compute_control_authorize_links(config: &ServerConfig) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let Some(privsep) = config.privsep.as_ref() else {
+        return out;
+    };
+    let holds_control = |label: &str| -> bool {
+        privsep
+            .instances
+            .get(label)
+            .is_some_and(|i| i.capabilities.contains(&HostAuthority::ControlAdminApi))
+    };
+    for (link_name, link) in &privsep.links {
+        if link.from == link.to || !link.is_control_authorize_serve() {
+            continue;
+        }
+        let from_ctrl = holds_control(&link.from);
+        let to_ctrl = holds_control(&link.to);
+        // EXACTLY ONE control.admin-api endpoint (XOR) — the lint refuses any other shape for a marked
+        // control-authorize link, so a marked link that reaches here always has its single endpoint.
+        let holder = match (from_ctrl, to_ctrl) {
+            (true, false) => &link.from,
+            (false, true) => &link.to,
+            _ => continue,
+        };
+        out.entry(holder.clone())
+            .or_default()
+            .insert(link_name.clone());
+    }
+    out
+}
+
+/// Derive the node-self-host **control-authorize endpoint map** for one instance (Phase-5 P5-4): the
+/// group-E analog of [`derive_node_authority_serve_endpoints`]. For every feature-link incident to
+/// `label` that PROVABLY terminates at the peer's `control.admin-api` control-authorize grammar
+/// endpoint (an explicit [`LinkPurpose::ControlAuthorizeServe`] link, per
+/// [`compute_control_authorize_links`]), `control.admin-api` becomes relayable over that link.
+///
+/// This is the load-bearing guard for the cross-instance authorize relay: a `control.admin-api`
+/// authorize sub-op the serving instance does NOT hold is relayed ONLY over such a verified grammar
+/// endpoint — NEVER a raw `Relay` client-fd splice (relaying an authorize decision to a bare backend
+/// socket would be an authz bypass). The [`instance_serve::NodeServeRouter`] consumes this so a
+/// non-held `control.admin-api` surface routes to [`instance_serve::NodeRoute::RelayControlAuthority`]
+/// only over the endpoint, and REFUSES one reachable solely over a splice. Pure (host-testable).
+fn derive_node_control_authorize_endpoints(
+    config: &ServerConfig,
+    label: &str,
+) -> BTreeMap<HostAuthority, String> {
+    let mut endpoints: BTreeMap<HostAuthority, String> = BTreeMap::new();
+    let Some(privsep) = config.privsep.as_ref() else {
+        return endpoints;
+    };
+    let Some(me) = privsep.instances.get(label) else {
+        return endpoints;
+    };
+    // A control.admin-api HOLDER serves the authorize decision locally — never relays it.
+    if me.capabilities.contains(&HostAuthority::ControlAdminApi) {
+        return endpoints;
+    }
+    // REUSED so this map cannot drift from which links actually stand up a control-authorize grammar.
+    let serve_links = compute_control_authorize_links(config);
+    for (link_name, link) in &privsep.links {
+        if link.from == link.to {
+            continue;
+        }
+        let peer = if link.from == label {
+            &link.to
+        } else if link.to == label {
+            &link.from
+        } else {
+            continue;
+        };
+        // The link must TERMINATE at the peer's control-authorize grammar endpoint (it is in the peer's
+        // `compute_control_authorize_links` set). A splice / relay / non-control peer does NOT qualify.
+        let peer_serves_grammar_here = serve_links
+            .get(peer)
+            .is_some_and(|links| links.contains(link_name));
+        if !peer_serves_grammar_here {
+            continue;
+        }
+        endpoints
+            .entry(HostAuthority::ControlAdminApi)
+            .or_insert_with(|| link_name.clone());
+    }
+    endpoints
+}
+
 /// The CODE-FAIL-CLOSED stand-up gate for a LIVE authority serve (Security re-review). Standing up a
 /// live seal/unseal/**mint_token** grammar on a relay→crown-jewel link is refused unless BOTH Phase-3
 /// wiring-gate preconditions hold:
@@ -3609,6 +3709,29 @@ mod instance_serve {
             return run_per_tenant_backend(label, fds);
         }
 
+        // NODE-SELF-HOST CONTROL-PLANE AUTHORIZER (Phase-5 P5-4): a SPLIT `control.admin-api` instance
+        // (holds `control.admin-api`, NOT `backend.kv`) the composition designated a
+        // control-authorize-serve link for SERVES the cross-instance authorize grammar (the `rights_for`
+        // decision P5-3-serve does locally, now answerable remotely) over that link — re-validating
+        // every relayed end-principal context + PoP AT THE DESTINATION, answering a DECISION (never a
+        // key). Gated on node-self-host; a `control.admin-api` holder that ALSO holds `backend.kv` is the
+        // LOCAL control plane (served via `run_backend`'s self-host handler), so it does NOT take this
+        // branch (it holds backend.kv). An empty designation ⇒ skipped (no running composition changes).
+        let node_self_host = config
+            .privsep
+            .as_ref()
+            .is_some_and(|p| p.node_serve.is_node_self_host());
+        let control_authorize_links = super::compute_control_authorize_links(config)
+            .remove(label)
+            .unwrap_or_default();
+        if node_self_host
+            && gate.may_materialize(HostAuthority::ControlAdminApi)
+            && !gate.may_materialize(HostAuthority::BackendKv)
+            && !control_authorize_links.is_empty()
+        {
+            return run_control_authority_serve(label, fds, config, &control_authorize_links);
+        }
+
         if let Some(listener_fd) = fds.listener {
             let link_fd = *fds.links.values().next().ok_or_else(|| {
                 "a listener instance has no feature-link to forward client connections over \
@@ -3635,8 +3758,8 @@ mod instance_serve {
             // child (fork), and relays the client fd onward. This is the half the parser's spawn + KV
             // authority was split onto.
             run_per_tenant_supervisor(label, gate, fds, config, config_path)
-        } else if let Some((lname, link_fd)) = fds.links.iter().next() {
-            run_backend(label, lname, *link_fd, gate, config)
+        } else if !fds.links.is_empty() {
+            run_backend(label, fds, gate, config)
         } else {
             tracing::info!(
                 instance = %label,
@@ -4161,27 +4284,61 @@ mod instance_serve {
     ///   instance EXITS → the root's `FailNodeClosed` tears the node down rather than serving degraded.
     fn run_backend(
         label: &str,
-        link_name: &str,
-        link_fd: i32,
+        fds: &PrivsepChildFds,
         gate: &MaterializationGate,
         config: &ServerConfig,
     ) -> Result<(), String> {
-        // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
+        let self_host = config
+            .privsep
+            .as_ref()
+            .is_some_and(|p| p.node_serve.is_node_self_host());
+        // P5-4: the OUTBOUND control-authorize relay link — the link that provably terminates at a
+        // `control.admin-api` control-authorize grammar endpoint (if this self-host backend relays the
+        // authorize sub-op to a SPLIT control instance). Pure, from the resolved composition.
+        let control_link_name: Option<String> = if self_host {
+            super::derive_node_control_authorize_endpoints(config, label)
+                .remove(&HostAuthority::ControlAdminApi)
+        } else {
+            None
+        };
+        // The INBOUND client-splice link = the first root-wired link that is NOT the control-authorize
+        // relay link (a self-host backend RECEIVES client fds over one link and RELAYS authorize over
+        // the other). Deterministic (`links` is a `BTreeMap`).
+        let (link_name, link_fd) = {
+            let (name, fd) = fds
+                .links
+                .iter()
+                .find(|(name, _)| Some(name.as_str()) != control_link_name.as_deref())
+                .ok_or_else(|| {
+                    "a backend instance has no client-splice feature-link to receive client \
+                     connections over (the composition must link it to a frontend)"
+                        .to_string()
+                })?;
+            (name.clone(), *fd)
+        };
+        // Build the control-authorize relay CLIENT from the OUTBOUND link fd (owns that distinct fd via
+        // `from_inherited_fd` — never the splice fd). Only when a grammar endpoint is designated.
+        let control_relay: Option<ControlAuthorizeClient> =
+            control_link_name.as_ref().and_then(|name| {
+                fds.links.get(name).map(|&fd| {
+                    // SAFETY: `fd` is a distinct root-dup'd link fd named in the fd map; adopted once.
+                    let ep = unsafe { LinkEndpoint::from_inherited_fd(fd) };
+                    ControlAuthorizeClient::new(name.clone(), ep)
+                })
+            });
+        // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map (the splice,
+        // distinct from the control-authorize fd adopted above).
         let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("building the Tokio runtime: {e}"))?;
-        let self_host = config
-            .privsep
-            .as_ref()
-            .is_some_and(|p| p.node_serve.is_node_self_host());
         rt.block_on(async move {
             // Build the per-connection serve handler ONCE (an owned, cheaply-cloneable value — no
             // borrow escapes into a spawned task). Under node-self-host this opens the node read plane;
             // a stand-up failure returns `Err` → the instance exits → FailNodeClosed (no degraded serve).
             let handler = if self_host {
-                let h = build_self_host_backend_handler(label, gate, config).await?;
+                let h = build_self_host_backend_handler(label, gate, config, control_relay).await?;
                 tracing::info!(
                     instance = %label,
                     link = %link_name,
@@ -4236,10 +4393,15 @@ mod instance_serve {
         label: &str,
         gate: &MaterializationGate,
         config: &ServerConfig,
+        control_relay: Option<ControlAuthorizeClient>,
     ) -> Result<BackendHandler, String> {
         let reachable = super::derive_node_reachability(config, label);
         let authority_serve = super::derive_node_authority_serve_endpoints(config, label);
-        let router = NodeServeRouter::new(gate, reachable, authority_serve);
+        // P5-4: the control-authorize-endpoint map — a non-held `control.admin-api` reachable over a
+        // verified control-authorize grammar endpoint (never a splice). The router routes the authorize
+        // sub-op to `RelayControlAuthority` over exactly this link, which `control_relay` relays over.
+        let control_authorize = super::derive_node_control_authorize_endpoints(config, label);
+        let router = NodeServeRouter::new(gate, reachable, authority_serve, control_authorize);
         let data_plane = build_node_data_plane(label, gate, config).await?;
         // P5-3-serve: the self-host CONTROL-PLANE authorizer — built ONLY on an instance that HOLDS
         // `control.admin-api`, and ONLY if a PUBLIC trust root resolves (compile-enforced missing-verifier
@@ -4309,8 +4471,117 @@ mod instance_serve {
             }
         }
         Ok(BackendHandler::SelfHost(Box::new(NodeServeHandler::new(
-            router, data_plane, control,
+            router,
+            data_plane,
+            control,
+            control_relay,
         ))))
+    }
+
+    /// Serve the P5-4 CONTROL-AUTHORIZE grammar for a SPLIT `control.admin-api` instance on each
+    /// root-wired control-authorize-serve link (design §Phase-5 P5-4) — the group-E analog of
+    /// [`run_authority_serve`]. Builds the end-principal [`ContextVerifier`] from the PUBLIC trust root
+    /// (fail-closed if absent — an authorizer with no verifier serves nothing), a node-wide anti-replay
+    /// [`ReplayCache`], and the node's DEFAULT RBAC policy (a split control instance holds no
+    /// `backend.kv`; see [`ControlAuthorizer`]'s policy-source note + the serving side's custom-policy
+    /// fail-closed guard), then serves [`ControlAuthorizer::authorize`] on one blocking thread per link.
+    /// Each call is re-validated AT THE DESTINATION (context + per-call PoP) and answered with a
+    /// DECISION — NEVER key material. Fail-closed: a missing trust root / a designated link with no
+    /// root-wired fd returns `Err` → the instance exits → FailNodeClosed.
+    fn run_control_authority_serve(
+        label: &str,
+        fds: &PrivsepChildFds,
+        config: &ServerConfig,
+        control_links: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        // The PUBLIC trust root (never a signer key — a split control instance holds no crown jewel;
+        // `resolve_trust_root(_, None)` requires the public `serve.auth_root_public_key`). Fail-closed.
+        let trust_root = resolve_trust_root(config, None).map_err(|e| {
+            format!(
+                "node-self-host control-authorize ({label}): no public trust root to re-validate \
+                 relayed end-principal authorize calls — set serve.auth_root_public_key (fail-closed: \
+                 a control.admin-api authorizer MUST have a verifier). {e}"
+            )
+        })?;
+        let authorizer = ControlAuthorizer::new(
+            ContextVerifier::new(trust_root),
+            Arc::new(ReplayCache::with_defaults()),
+            Arc::new(AuthzPolicy::default_policy()),
+        );
+        tracing::info!(
+            instance = %label,
+            links = control_links.len(),
+            "[privsep] node-self-host control-authorize (P5-4): serving the cross-instance authorize \
+             grammar (context+PoP re-validated at the destination, default-deny, no key response)"
+        );
+        let mut threads = Vec::new();
+        for link_name in control_links {
+            let Some(link_fd) = fds.links.get(link_name).copied() else {
+                return Err(format!(
+                    "node-self-host control-authorize ({label}): the designated control-authorize link \
+                     {link_name:?} has no root-wired fd (composition/fd-map drift) — fail-closed"
+                ));
+            };
+            // SAFETY: `link_fd` is the fd the root dup'd into this child + named in the fd map.
+            let link = unsafe { LinkEndpoint::from_inherited_fd(link_fd) };
+            let authorizer = authorizer.clone();
+            let link_name = link_name.clone();
+            let label = label.to_string();
+            threads.push(std::thread::spawn(move || {
+                serve_control_authorize_link(&label, &link_name, &link, &authorizer);
+            }));
+        }
+        for t in threads {
+            let _ = t.join();
+        }
+        // Every peer closed its link — the authorizer's grammar is done; park (authority held inert).
+        park();
+    }
+
+    /// The blocking receiver-side serve loop for ONE control-authorize link: receive a bounded
+    /// [`ControlAuthorizeCall`], decide it ([`ControlAuthorizer::authorize`] — re-validate context +
+    /// PoP AT THE DESTINATION, anti-replay, `rights_for`), and reply a bounded [`ControlAuthorizeReply`]
+    /// (a DECISION, never a key). A read deadline bounds an in-progress frame (slowloris); a malformed
+    /// call is a non-secret `Refused`. Loops until the peer closes (EOF) or a transport error.
+    pub(super) fn serve_control_authorize_link(
+        label: &str,
+        link_name: &str,
+        link: &LinkEndpoint,
+        authorizer: &ControlAuthorizer,
+    ) {
+        loop {
+            let frame = match link.recv_frame_within(DEFAULT_LINK_READ_DEADLINE) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    tracing::debug!(instance = %label, link = %link_name, "[privsep] control-authorize: peer closed the link (EOF)");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(instance = %label, link = %link_name, error = %e, "[privsep] control-authorize: link recv ended (fail-closed)");
+                    return;
+                }
+            };
+            let reply = match serde_json::from_slice::<ControlAuthorizeCall>(&frame) {
+                Ok(call) => authorizer.authorize(&call, now_unix()),
+                Err(e) => {
+                    tracing::warn!(instance = %label, link = %link_name, error = %e, "[privsep] control-authorize: malformed call — refusing");
+                    ControlAuthorizeReply::Refused {
+                        reason: "malformed control-authorize call".to_string(),
+                    }
+                }
+            };
+            let bytes = match serde_json::to_vec(&reply) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(instance = %label, link = %link_name, error = %e, "[privsep] control-authorize: encoding the reply failed — ending peer");
+                    return;
+                }
+            };
+            if let Err(e) = link.send_frame(&bytes) {
+                tracing::warn!(instance = %label, link = %link_name, error = %e, "[privsep] control-authorize: sending the reply failed — ending peer");
+                return;
+            }
+        }
     }
 
     /// The node-self-host CONTROL-PLANE authorizer (P5-3-serve, design §4 item 6): the fail-closed
@@ -4338,6 +4609,240 @@ mod instance_serve {
                 verifier,
                 replay: Arc::new(ReplayCache::with_defaults()),
             }
+        }
+    }
+
+    // =====================================================================================
+    // P5-4: the cross-instance CONTROL-AUTHORIZE grammar (the group-E analog of the WS-E
+    // crown-jewel grammar). The `rights_for` decision P5-3-serve does LOCALLY, now answerable
+    // REMOTELY by a split `control.admin-api` holder over a verified control-authorize-serve link.
+    // =====================================================================================
+
+    /// The end-principal credential + request line a serving `backend.*`/app instance FORWARDS VERBATIM
+    /// to the control-plane authorizer over a control-authorize-serve link (P5-4). It carries ONLY the
+    /// relayed credential the ORIGINATING client itself signed — a signed bearer CONTEXT token, a
+    /// per-call NONCE, and a per-call PoP bound to THIS mutation (via [`control_mutation_pop_bytes`]) —
+    /// plus the request line (`method`/`path`/`host`) the PoP binds to. There is deliberately **NO
+    /// asserted-id field and NO caller-supplied `Right`**: the authorizer RE-VALIDATES the context +
+    /// PoP AT THE DESTINATION and DERIVES the required `Right` from the PoP-bound `method`+`path` itself
+    /// ([`classify_control_op`]), so a relaying instance can neither assert an identity nor a right it
+    /// cannot prove (the PoP seals `method`/`path`/`host` — a relay cannot tamper them without breaking
+    /// it). Mirrors the WS-E [`AuthorityCall`](boatramp_server::privsep_authority) discipline over the
+    /// control grammar.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub(super) struct ControlAuthorizeCall {
+        /// The relayed end-principal bearer CONTEXT token (base64url COSE/CWT), re-validated at the
+        /// destination against the public trust root before any decision.
+        pub token: String,
+        /// The client's per-call anti-replay NONCE (the authorizer records `(cti, nonce)`).
+        pub nonce: u128,
+        /// The client's per-call PoP (base64url), re-verified at the destination against the token's
+        /// own `cnf` over the SAME control-mutation binding the client signed.
+        pub pop: String,
+        /// The request's method — part of the PoP binding (a relay cannot alter it).
+        pub method: String,
+        /// The request's path — part of the PoP binding; the authorizer derives the required `Right`
+        /// from it.
+        pub path: String,
+        /// The request's transport `Host` — part of the PoP binding.
+        pub host: String,
+    }
+
+    /// The control-plane authorizer's REPLY to a [`ControlAuthorizeCall`] (P5-4). Mirrors the WS-E
+    /// [`AuthorityResponse`](boatramp_server::privsep_authority) **no-key discipline**: every variant is
+    /// a bounded DECISION or a non-secret refusal — there is NO variant that can carry a key, the RBAC
+    /// policy bytes, or the token. [`Allowed`](Self::Allowed) returns the verified `cti` ONLY so the
+    /// relaying `backend.kv` holder (the revocation-marker authority) can check `authz/revoked/<cti>` on
+    /// the SAME principal the authorizer verified — a non-secret token id (already in the audit log),
+    /// never any secret.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub(super) enum ControlAuthorizeReply {
+        /// The verified principal IS authorized for the op (the `Right` the authorizer derived from the
+        /// PoP-bound method+path). Carries the verified `cti` for the caller's revocation check.
+        Allowed { cti: String },
+        /// The verified principal is NOT authorized (default-deny) — a bounded, non-secret decision.
+        Denied,
+        /// A fail-closed refusal: the context/PoP did not re-validate, a replay / cache saturation, an
+        /// unmapped op, or an internal error. Carries a non-secret reason only (never the token / a key).
+        Refused { reason: String },
+    }
+
+    /// The node-self-host CONTROL-PLANE AUTHORIZER served over a control-authorize-serve link (P5-4):
+    /// the group-E analog of the WS-E crown-jewel grammar handler. It holds the receiver-side
+    /// [`ContextVerifier`] (the PUBLIC trust root — re-validates every relayed end principal via
+    /// `cose::verify` + the tightened freshness bound + holder-binding + the per-call PoP), a per-call
+    /// anti-replay [`ReplayCache`], and the node's effective RBAC [`AuthzPolicy`]. Its sole job is the
+    /// `rights_for` DECISION on the re-validated principal; the no-key reply type forecloses returning
+    /// anything else.
+    ///
+    /// **Policy source (surfaced limitation).** A SPLIT `control.admin-api` authorizer holds no
+    /// `backend.kv`, so it authorizes under the node's DEFAULT RBAC policy ([`AuthzPolicy::default_policy`]).
+    /// A KV-stored CUSTOM operator policy doc is NOT honored here — that needs the authorizer to reach
+    /// `backend.kv` (the full P5-4 control→backend policy-read relay / the §1.1 orchestrator). The
+    /// SERVING `backend.kv` holder fails the relayed-authorize path CLOSED when a custom policy doc is
+    /// present (see [`NodeServeHandler::serve_control_mutation`]), so the default-policy assumption never
+    /// SILENTLY under-enforces a more-restrictive operator policy.
+    #[derive(Clone)]
+    pub(super) struct ControlAuthorizer {
+        verifier: ContextVerifier,
+        replay: Arc<ReplayCache>,
+        policy: Arc<AuthzPolicy>,
+    }
+
+    impl ControlAuthorizer {
+        pub(super) fn new(
+            verifier: ContextVerifier,
+            replay: Arc<ReplayCache>,
+            policy: Arc<AuthzPolicy>,
+        ) -> Self {
+            Self {
+                verifier,
+                replay,
+                policy,
+            }
+        }
+
+        /// Decide a relayed [`ControlAuthorizeCall`], fail-closed-by-construction. Re-validates the
+        /// end-principal context + PoP AT THE DESTINATION (the SAME binding the local P5-3-serve path
+        /// uses — [`control_mutation_pop_bytes`] over op+method+path+host — so no asserted id is
+        /// trusted), checks anti-replay, DERIVES the required `Right` from the PoP-bound method+path via
+        /// the SAME `/api/*` map ([`classify_control_op`]), and applies `rights_for` under the node's
+        /// policy. Any verify/PoP failure, a replay, or an unmapped op ⇒ [`ControlAuthorizeReply::Refused`];
+        /// a sound-but-unauthorized principal ⇒ [`ControlAuthorizeReply::Denied`]; else
+        /// [`ControlAuthorizeReply::Allowed`] with the verified `cti`. Pure w.r.t. `now` (sync — all of
+        /// `verify_context_and_pop` / `rights_for` are sync).
+        pub(super) fn authorize(
+            &self,
+            call: &ControlAuthorizeCall,
+            now: u64,
+        ) -> ControlAuthorizeReply {
+            // (1) RE-VALIDATE the end principal AT THE DESTINATION — the control-mutation binding the
+            //     client itself signed (NOT a relay-forwarded assertion). `VerifiedPrincipal` is the
+            //     SOLE principal path.
+            let pop_req_bytes = control_mutation_pop_bytes(&call.method, &call.path, &call.host);
+            let binding = AuthorityPopBinding {
+                op: CONTROL_MUTATION_POP_OP,
+                context_token: &call.token,
+                nonce: call.nonce,
+                request_bytes: &pop_req_bytes,
+            };
+            let context = AuthorityContext::from_token(call.token.clone());
+            let principal = match self
+                .verifier
+                .verify_context_and_pop(&context, &call.pop, now, &binding)
+            {
+                Ok(p) => p,
+                Err(rejection) => {
+                    tracing::warn!(reason = %rejection.reason(), "[privsep] control-authorize REFUSED: end-principal did not re-validate at the destination (fail-closed)");
+                    return ControlAuthorizeReply::Refused {
+                        reason: format!(
+                            "end-principal verification failed ({})",
+                            rejection.reason()
+                        ),
+                    };
+                }
+            };
+            let cti = principal.token().cti.clone();
+
+            // (2) Anti-replay: the authorizer owns the one node-wide `(cti, nonce)` cache for the
+            //     authorize grammar — a verbatim replay / saturation is refused here.
+            if self.replay.check_and_record(&cti, call.nonce, now) != ReplayDecision::Fresh {
+                tracing::warn!(
+                    "[privsep] control-authorize REFUSED: anti-replay (duplicate call or cache saturated)"
+                );
+                return ControlAuthorizeReply::Refused {
+                    reason: "anti-replay (duplicate call or cache saturated)".to_string(),
+                };
+            }
+
+            // (3) DERIVE the required `Right` from the PoP-BOUND method+path (so a relay cannot forge it)
+            //     via the SAME `/api/*` map the local path uses. An unmapped op has no served right ⇒
+            //     default-deny.
+            let (op, _mint) = classify_control_op(&call.method, &call.path);
+            let Some(required) = op.required_right() else {
+                tracing::warn!(op = ?op, "[privsep] control-authorize REFUSED: unmapped/unsupported control-plane op (default-deny)");
+                return ControlAuthorizeReply::Refused {
+                    reason:
+                        "the request path is not a recognized, served deploy/routing operation \
+                             (default-deny)"
+                            .to_string(),
+                };
+            };
+
+            // (4) `rights_for` under the node's effective policy (normalized grants — I1 parity).
+            let roles = self.policy.normalize_grants(&principal.token().roles);
+            if self.policy.rights_for(&roles).allows(&required) {
+                tracing::info!(principal = %principal.principal_id(), "[privsep] control-authorize ALLOWED (cross-instance rights_for decision)");
+                ControlAuthorizeReply::Allowed { cti }
+            } else {
+                tracing::warn!(principal = %principal.principal_id(), required = ?required, "[privsep] control-authorize DENIED: the verified principal is not authorized (default-deny)");
+                ControlAuthorizeReply::Denied
+            }
+        }
+    }
+
+    /// The RELAY CLIENT a serving `backend.*`/app instance uses to DRIVE a cross-instance authorize over
+    /// its control-authorize-serve link (P5-4). Cheaply cloneable (the link is `Arc`-shared) so it is
+    /// cloned into each connection task; the `Mutex` serializes the request/response pairs over the one
+    /// link so concurrent relays cannot interleave frames. The relay NEVER carries key material — it
+    /// forwards the client's own signed credential and receives a bounded [`ControlAuthorizeReply`].
+    #[derive(Clone)]
+    pub(super) struct ControlAuthorizeClient {
+        /// The name of the control-authorize-serve link this client relays over (matched against the
+        /// router's [`NodeRoute::RelayControlAuthority`] link so the handler relays over the RIGHT link).
+        link_name: String,
+        link: Arc<std::sync::Mutex<LinkEndpoint>>,
+    }
+
+    impl ControlAuthorizeClient {
+        pub(super) fn new(link_name: String, link: LinkEndpoint) -> Self {
+            Self {
+                link_name,
+                link: Arc::new(std::sync::Mutex::new(link)),
+            }
+        }
+
+        /// The link name this client relays over.
+        pub(super) fn link_name(&self) -> &str {
+            &self.link_name
+        }
+
+        /// Relay ONE authorize call to the control-plane authorizer and return its typed reply. The
+        /// link I/O is BLOCKING (so it runs on a `spawn_blocking` thread); the bounded read deadline
+        /// turns a dead/stalled authorizer into a fail-closed `Err` rather than a hang. A transport /
+        /// codec failure is an `Err` (⇒ the caller fails the mutation closed).
+        pub(super) async fn authorize(
+            &self,
+            cred: &ControlMutationCredential,
+            host: &str,
+        ) -> Result<ControlAuthorizeReply, String> {
+            let call = ControlAuthorizeCall {
+                token: cred.token.clone(),
+                nonce: cred.nonce,
+                pop: cred.pop.clone(),
+                method: cred.method.clone(),
+                path: cred.path.clone(),
+                host: host.to_string(),
+            };
+            let link = Arc::clone(&self.link);
+            let link_name = self.link_name.clone();
+            tokio::task::spawn_blocking(move || {
+                let guard = link
+                    .lock()
+                    .map_err(|_| "control-authorize link mutex poisoned".to_string())?;
+                let bytes = serde_json::to_vec(&call)
+                    .map_err(|e| format!("encoding the authorize call: {e}"))?;
+                guard
+                    .send_frame(&bytes)
+                    .map_err(|e| format!("relaying the authorize call over {link_name:?}: {e}"))?;
+                let reply = guard
+                    .recv_frame_within(DEFAULT_LINK_READ_DEADLINE)
+                    .map_err(|e| format!("reading the authorize reply over {link_name:?}: {e}"))?;
+                serde_json::from_slice::<ControlAuthorizeReply>(&reply)
+                    .map_err(|e| format!("decoding the authorize reply: {e}"))
+            })
+            .await
+            .map_err(|e| format!("control-authorize relay task join: {e}"))?
         }
     }
 
@@ -4524,10 +5029,21 @@ mod instance_serve {
             authority: HostAuthority,
             link: String,
         },
-        /// RELAY to a data-holder / control peer over the named backend feature-link: a typed request
-        /// the peer serves against its OWN held credential (any non-crown-jewel holder — group B
-        /// `backend.*`, group D `exec.*`, group E `control.*`/`acme.*`).
+        /// RELAY to a data-holder peer over the named backend feature-link: a typed request the peer
+        /// serves against its OWN held credential (a non-crown-jewel data/exec/acme holder — group B
+        /// `backend.*`, group D `exec.*`, group E `acme.*`).
         RelayBackend {
+            authority: HostAuthority,
+            link: String,
+        },
+        /// RELAY a `control.admin-api` AUTHORIZE sub-op to the control-plane authorizer (Phase-5 P5-4)
+        /// over the named link that PROVABLY terminates at its control-authorize grammar endpoint
+        /// ([`super::derive_node_control_authorize_endpoints`]) — the group-E analog of
+        /// [`RelayCrownJewel`](Self::RelayCrownJewel). The authorizer re-validates the relayed
+        /// end-principal context + per-call PoP AT THE DESTINATION and answers the `rights_for`
+        /// decision (never key material). A `control.admin-api` reachable only over a raw splice is
+        /// [`Refuse`](Self::Refuse)d — never relay an authorize decision to a bare backend socket.
+        RelayControlAuthority {
             authority: HostAuthority,
             link: String,
         },
@@ -4565,6 +5081,16 @@ mod instance_serve {
         /// [`route`](Self::route) consults THIS map — not [`reachable`](Self::reachable) — for a crown
         /// jewel, and REFUSES a crown jewel reachable only over a splice.
         authority_serve: BTreeMap<HostAuthority, String>,
+        /// **P5-4 control-authorize-endpoint map.** The group-E analog of
+        /// [`authority_serve`](Self::authority_serve): a non-held `control.admin-api` authority → the
+        /// named link that PROVABLY terminates at its control-authorize grammar endpoint
+        /// ([`super::derive_node_control_authorize_endpoints`]) — the peer holds `control.admin-api` AND
+        /// the link is explicitly [`LinkPurpose::ControlAuthorizeServe`](boatramp_core::privsep::LinkPurpose::ControlAuthorizeServe)-marked,
+        /// NEVER a raw client-fd splice. A cross-instance authorize relay is sound ONLY over such a link
+        /// (a decision routed to a bare backend socket would be an authz bypass), so
+        /// [`route`](Self::route) consults THIS map — not [`reachable`](Self::reachable) — for
+        /// `control.admin-api`, and REFUSES one reachable only over a splice.
+        control_authorize: BTreeMap<HostAuthority, String>,
     }
 
     impl NodeServeRouter {
@@ -4577,11 +5103,13 @@ mod instance_serve {
             gate: &MaterializationGate,
             reachable: BTreeMap<HostAuthority, String>,
             authority_serve: BTreeMap<HostAuthority, String>,
+            control_authorize: BTreeMap<HostAuthority, String>,
         ) -> Self {
             Self {
                 held: gate.held().collect(),
                 reachable,
                 authority_serve,
+                control_authorize,
             }
         }
 
@@ -4602,6 +5130,18 @@ mod instance_serve {
                 // INFO-1: a crown-jewel relay is sound ONLY over a verified grammar endpoint.
                 return match self.authority_serve.get(&surface) {
                     Some(link) => NodeRoute::RelayCrownJewel {
+                        authority: surface,
+                        link: link.clone(),
+                    },
+                    None => NodeRoute::Refuse(surface),
+                };
+            }
+            if surface == HostAuthority::ControlAdminApi {
+                // P5-4: a cross-instance authorize relay is sound ONLY over a verified control-authorize
+                // grammar endpoint — NEVER a raw splice (a decision relayed to a bare backend socket
+                // would be an authz bypass), exactly as for a crown jewel above.
+                return match self.control_authorize.get(&surface) {
+                    Some(link) => NodeRoute::RelayControlAuthority {
                         authority: surface,
                         link: link.clone(),
                     },
@@ -4639,6 +5179,13 @@ mod instance_serve {
         /// cannot be constructed without a [`ContextVerifier`], and a mutation that finds `None` here
         /// returns 503 — there is NO serve path that authorizes a mutation without a verifier.
         control: Option<SelfHostControlPlane>,
+        /// The P5-4 cross-instance authorize RELAY client — `Some` ONLY on an instance that does NOT
+        /// hold `control.admin-api` locally but is wired to a `control.admin-api` control-authorize
+        /// grammar endpoint over a verified link ([`derive_node_control_authorize_endpoints`]). A
+        /// control mutation whose `authorize` sub-op routes to [`NodeRoute::RelayControlAuthority`] is
+        /// driven over THIS client; its ABSENCE (or a link-name mismatch) fail-closes the mutation (a
+        /// data-holder with no authorizer, local or relayed, cannot authorize one).
+        control_relay: Option<ControlAuthorizeClient>,
     }
 
     impl NodeServeHandler {
@@ -4649,11 +5196,13 @@ mod instance_serve {
             router: NodeServeRouter,
             data_plane: NodeDataPlane,
             control: Option<SelfHostControlPlane>,
+            control_relay: Option<ControlAuthorizeClient>,
         ) -> Self {
             Self {
                 router,
                 data_plane,
                 control,
+                control_relay,
             }
         }
 
@@ -4806,26 +5355,21 @@ mod instance_serve {
                 }
             }
 
-            // (1b) THIS cut serves ONLY a fully-LOCAL deploy/routing mutation: a cross-instance
-            // `control.admin-api` authorize relay, a `backend.kv` write relay, and the crown-jewel
-            // `mint`/`sign` relay are all the P5-4 relay client — fail closed here (soundly: the crown
-            // relay route is INFO-1-verified above, we simply do not yet DRIVE it).
+            // (1b) The crown-jewel `mint`/`sign` relay CLIENT is the remaining P5-4 work — this cut
+            // DRIVES the `control.admin-api` authorize relay (below) but keeps mint/sign fail-closed.
+            // SOUNDLY: the crown relay route is INFO-1-verified (`RelayCrownJewel` over a verified
+            // serve_authority grammar endpoint), we simply do not yet drive the mint/sign `AuthorityCall`
+            // (its originating-client WS-E PoP half is the cross-repo guest-SDK follow-on).
             if mint_route.is_some() {
                 return fail_closed_response(
                     "control-plane mint/sign op refused: the crown-jewel relay (a verified \
-                     serve_authority grammar endpoint — INFO-1) is routable, but DRIVING the relay (the \
-                     control.admin-api→crown-jewel relay client, with the end-principal context + PoP on \
-                     every mint/sign) is the remaining P5-4 work — fail-closed this cut",
+                     serve_authority grammar endpoint — INFO-1) is routable, but DRIVING the mint/sign \
+                     relay (the control.admin-api→crown-jewel AuthorityCall, with the end-principal \
+                     context + PoP on every mint/sign) is the remaining P5-4 work — fail-closed this cut",
                 );
             }
-            if !matches!(authorize_route, NodeRoute::Local(_)) {
-                return fail_closed_response(
-                    "control-plane mutation refused: the control.admin-api authorize sub-op is reachable \
-                     but NOT held locally — the cross-instance authorize relay (to a control.admin-api \
-                     serve_authority grammar endpoint) is the remaining P5-4 work; this cut serves only a \
-                     locally-held authorize",
-                );
-            }
+            // The `backend.kv` WRITE must be held LOCALLY (this instance IS the control-plane store
+            // owner + its single writer). A cross-instance data-write relay is separate P5-4 work.
             if !matches!(write_route, NodeRoute::Local(w) if w.is_backend()) {
                 return fail_closed_response(
                     "control-plane mutation refused: the backend.kv write sub-op is not held locally — a \
@@ -4833,17 +5377,8 @@ mod instance_serve {
                 );
             }
 
-            // (2) The control plane authorizer MUST be present (control.admin-api held + a trust-root
-            // verifier resolved at stand-up). Its ABSENCE fail-closes (compile-enforced missing-verifier).
-            let Some(control) = self.control.as_ref() else {
-                return fail_closed_response(
-                    "control-plane mutation refused: this instance holds backend.kv but no control-plane \
-                     authorizer (no control.admin-api authority, or no public trust root to re-validate \
-                     the end principal) — fail-closed (no verifier, no serve)",
-                );
-            };
-
-            // (2b) DEFAULT-DENY: a mutation MUST present an end-principal credential (bearer + nonce + PoP).
+            // DEFAULT-DENY: a mutation MUST present an end-principal credential (bearer + nonce + PoP),
+            // whether the authorize decision is made LOCALLY or RELAYED (both re-validate it).
             let Some(cred) = credential else {
                 tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: no end-principal credential relayed (default-deny)");
                 return fail_closed_response(
@@ -4854,7 +5389,8 @@ mod instance_serve {
             };
 
             // The op must be a recognized, served deploy/routing mutation (default-deny on an unmapped
-            // path — never guess an unmapped mutation into a write).
+            // path — never guess an unmapped mutation into a write). Required for the LOCAL authz check
+            // and the write below; the RELAYED authorizer re-derives it from the PoP-bound path itself.
             let required_right = match op.required_right() {
                 Some(r) => r,
                 None => {
@@ -4866,117 +5402,39 @@ mod instance_serve {
                 }
             };
 
-            let now = now_unix();
-
-            // (2c) END-PRINCIPAL VERIFICATION (requirement #1), re-validated EVERY call. The PoP binds to
-            // THIS exact mutation (op + method + path + the request Host) so a frontend RCE can neither
-            // assert authority it cannot prove nor forge/replay a different mutation under an observed
-            // context. `VerifiedPrincipal` is the SOLE principal path.
-            let pop_req_bytes = control_mutation_pop_bytes(&cred.method, &cred.path, &host);
-            let binding = AuthorityPopBinding {
-                op: CONTROL_MUTATION_POP_OP,
-                context_token: &cred.token,
-                nonce: cred.nonce,
-                request_bytes: &pop_req_bytes,
-            };
-            let context = AuthorityContext::from_token(cred.token.clone());
-            let principal = match control
-                .verifier
-                .verify_context_and_pop(&context, &cred.pop, now, &binding)
-            {
-                Ok(p) => p,
-                Err(rejection) => {
-                    tracing::warn!(%host, reason = %rejection.reason(), "[privsep] node-self-host control mutation REFUSED: end-principal did not re-validate (fail-closed)");
-                    return fail_closed_response(&format!(
-                        "control-plane mutation refused: end-principal verification failed ({})",
-                        rejection.reason()
-                    ));
+            // AUTHORIZE — either LOCALLY (this instance HOLDS `control.admin-api`) or over the P5-4
+            // cross-instance RELAY (the authorize sub-op routes to a verified control-authorize grammar
+            // endpoint). Each branch re-validates the end-principal context + PoP, checks anti-replay +
+            // revocation, and makes the `rights_for` decision; any failure fails the WHOLE request closed
+            // BEFORE the write. On success it yields a non-secret principal label for the write log.
+            let principal_label = match &authorize_route {
+                NodeRoute::Local(_) => {
+                    match self.authorize_local(&cred, &host, &required_right).await {
+                        Ok(label) => label,
+                        Err(resp) => return resp,
+                    }
                 }
-            };
-
-            // (3) Anti-replay (mechanism (b)): a verbatim (cti, nonce) replay / saturation is refused.
-            let cti = principal.token().cti.clone();
-            if control.replay.check_and_record(&cti, cred.nonce, now) != ReplayDecision::Fresh {
-                tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: anti-replay (duplicate nonce or cache saturated)");
-                return fail_closed_response(
-                    "control-plane mutation refused: anti-replay (duplicate call or cache saturated)",
-                );
-            }
-
-            // (4a) TOKEN-REVOCATION CHECK (parity with the monolith's EVERY-request revocation gate —
-            // `crate::auth::AuthInner::revocation` / `is_revoked_or_unreadable`, boatramp-server/auth.rs).
-            // This control plane HOLDS `backend.kv`, so it reads the LIVE `authz/revoked/<cti>` marker
-            // DIRECTLY from the same store the policy read + the write below use (NOT the KV-blind crown
-            // jewel's out-of-band file projection — that is the authority-serve path's `RevocationCheck`).
-            // Mirrors `is_revoked_or_unreadable` EXACTLY: FAIL-CLOSED on present-OR-unreadable — a PRESENT
-            // marker ⇒ refuse (revoked); an UNREADABLE/errored marker ⇒ refuse (shed, MF-4), NEVER
-            // silently honored (the pre-MF-4 hole). There is NO single-writer fail-OPEN escape here: a
-            // served control-plane mutation is a privileged WRITE, which the monolith itself reads
-            // fail-closed. This closes the window where a revoked-but-still-fresh end-principal token
-            // would be honored for up to the verifier freshness bound (~the context max age).
-            match self.data_plane.revocation_status(&cti).await {
-                RevocationStatus::NotRevoked => {}
-                RevocationStatus::Revoked => {
-                    tracing::warn!(
-                        %host, principal = %principal.principal_id(),
-                        "[privsep] node-self-host control mutation REFUSED: the end-principal token is \
-                         revoked (an authz/revoked/<cti> marker is present) — fail-closed"
-                    );
+                NodeRoute::RelayControlAuthority { link, .. } => {
+                    match self.authorize_relayed(&cred, &host, link).await {
+                        Ok(label) => label,
+                        Err(resp) => return resp,
+                    }
+                }
+                other => {
+                    tracing::warn!(%host, route = ?other, "[privsep] node-self-host control mutation REFUSED: the authorize sub-op routed to an unexpected decision (fail-closed)");
                     return fail_closed_response(
-                        "control-plane mutation refused: the end-principal token is revoked",
+                        "control-plane mutation refused: the control.admin-api authorize sub-op is \
+                         neither held locally nor reachable over a verified control-authorize grammar \
+                         endpoint — fail-closed",
                     );
-                }
-                RevocationStatus::Unreadable(why) => {
-                    tracing::warn!(
-                        %host, reason = %why,
-                        "[privsep] node-self-host control mutation REFUSED: the token-revocation marker \
-                         could not be read — shed fail-closed (MF-4), never silently honored"
-                    );
-                    return fail_closed_response(&format!(
-                        "control-plane mutation refused: the token-revocation marker could not be read \
-                         (fail-closed / shed, never silently honored): {why}"
-                    ));
-                }
-            }
-
-            // (4) `control.admin-api` AUTHORIZATION, DEFAULT-DENY: the verified principal must hold the
-            // required control-plane Right for the op's target, per the node's REAL RBAC.
-            let policy = match self.data_plane.load_authz_policy().await {
-                Ok(p) => p,
-                Err(why) => {
-                    tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation REFUSED: authz policy unavailable (fail-closed)");
-                    return fail_closed_response(&format!(
-                        "control-plane mutation refused: authz policy unavailable ({why})"
-                    ));
                 }
             };
-            // (I1 parity) NORMALIZE the verified grants BEFORE expanding them to rights. The monolith
-            // normalizes at token→roles ingestion (`AuthzPolicy::normalize_grants`, auth.rs) and
-            // `rights_for`'s doc contract REQUIRES already-normalized grants (a legacy bare-target grant
-            // — a pre-0.2.0 `publisher:blog` — must read as the `default` project to match a path-derived
-            // `<project>/<site>` target). Strictly fail-closed today (an un-normalized legacy grant
-            // simply fails to match the qualified target), so this is parity/correctness, not a hole — it
-            // keeps the self-host authz decision identical to the monolith's as the `/api/*` map grows.
-            let roles = policy.normalize_grants(&principal.token().roles);
-            let granted = policy.rights_for(&roles);
-            if !granted.allows(&required_right) {
-                tracing::warn!(
-                    %host, principal = %principal.principal_id(), required = ?required_right,
-                    "[privsep] node-self-host control mutation REFUSED: the verified principal is not \
-                     authorized for this control-plane mutation (default-deny)"
-                );
-                return fail_closed_response(&format!(
-                    "control-plane mutation refused: the verified principal is not authorized for {} \
-                     (default-deny)",
-                    required_right.resource
-                ));
-            }
 
             // (5) `backend.kv` WRITE: apply the deploy/routing-store mutation + confirm it landed.
             match self.data_plane.apply_control_op(&op).await {
                 Ok(summary) => {
                     tracing::info!(
-                        %host, principal = %principal.principal_id(),
+                        %host, principal = %principal_label,
                         "[privsep] node-self-host control mutation SERVED: authorized deploy/routing \
                          write landed under the backend.kv Landlock profile ({summary})"
                     );
@@ -4995,6 +5453,223 @@ mod instance_serve {
                         "control-plane mutation refused: the authorized deploy/routing write failed \
                          ({why})"
                     ))
+                }
+            }
+        }
+
+        /// The LOCAL authorize decision (this instance HOLDS `control.admin-api` AND `backend.kv`): the
+        /// original P5-3-serve chain — re-validate the end-principal context + PoP (requirement #1,
+        /// every call), anti-replay, token-revocation (M1, read live from the held `backend.kv`), and
+        /// the `rights_for` DEFAULT-DENY decision under the authoritative policy. `Ok(principal_id)` ⇒
+        /// authorized; `Err(response)` ⇒ a fail-closed 503 the caller returns verbatim. No key, no serve
+        /// without a verifier (the compile-enforced missing-verifier refuse: no [`SelfHostControlPlane`]
+        /// ⇒ 503).
+        async fn authorize_local(
+            &self,
+            cred: &ControlMutationCredential,
+            host: &str,
+            required_right: &Right,
+        ) -> Result<String, boatramp_http::Response> {
+            // (2) The control plane authorizer MUST be present (control.admin-api held + a trust-root
+            // verifier resolved at stand-up). Its ABSENCE fail-closes (compile-enforced missing-verifier).
+            let Some(control) = self.control.as_ref() else {
+                return Err(fail_closed_response(
+                    "control-plane mutation refused: this instance holds backend.kv but no control-plane \
+                     authorizer (no control.admin-api authority, or no public trust root to re-validate \
+                     the end principal) — fail-closed (no verifier, no serve)",
+                ));
+            };
+
+            let now = now_unix();
+
+            // (2c) END-PRINCIPAL VERIFICATION (requirement #1), re-validated EVERY call. The PoP binds to
+            // THIS exact mutation (op + method + path + the request Host) so a frontend RCE can neither
+            // assert authority it cannot prove nor forge/replay a different mutation under an observed
+            // context. `VerifiedPrincipal` is the SOLE principal path.
+            let pop_req_bytes = control_mutation_pop_bytes(&cred.method, &cred.path, host);
+            let binding = AuthorityPopBinding {
+                op: CONTROL_MUTATION_POP_OP,
+                context_token: &cred.token,
+                nonce: cred.nonce,
+                request_bytes: &pop_req_bytes,
+            };
+            let context = AuthorityContext::from_token(cred.token.clone());
+            let principal = match control
+                .verifier
+                .verify_context_and_pop(&context, &cred.pop, now, &binding)
+            {
+                Ok(p) => p,
+                Err(rejection) => {
+                    tracing::warn!(%host, reason = %rejection.reason(), "[privsep] node-self-host control mutation REFUSED: end-principal did not re-validate (fail-closed)");
+                    return Err(fail_closed_response(&format!(
+                        "control-plane mutation refused: end-principal verification failed ({})",
+                        rejection.reason()
+                    )));
+                }
+            };
+
+            // (3) Anti-replay (mechanism (b)): a verbatim (cti, nonce) replay / saturation is refused.
+            let cti = principal.token().cti.clone();
+            if control.replay.check_and_record(&cti, cred.nonce, now) != ReplayDecision::Fresh {
+                tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: anti-replay (duplicate nonce or cache saturated)");
+                return Err(fail_closed_response(
+                    "control-plane mutation refused: anti-replay (duplicate call or cache saturated)",
+                ));
+            }
+
+            // (4a) TOKEN-REVOCATION CHECK (parity with the monolith's EVERY-request revocation gate —
+            // `crate::auth::AuthInner::revocation` / `is_revoked_or_unreadable`, boatramp-server/auth.rs).
+            // This control plane HOLDS `backend.kv`, so it reads the LIVE `authz/revoked/<cti>` marker
+            // DIRECTLY from the same store the policy read + the write use. FAIL-CLOSED on present-OR-
+            // unreadable (shed, MF-4), never silently honored.
+            self.check_revocation(&cti, host).await?;
+
+            // (4) `control.admin-api` AUTHORIZATION, DEFAULT-DENY: the verified principal must hold the
+            // required control-plane Right for the op's target, per the node's REAL RBAC.
+            let policy = match self.data_plane.load_authz_policy().await {
+                Ok(p) => p,
+                Err(why) => {
+                    tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation REFUSED: authz policy unavailable (fail-closed)");
+                    return Err(fail_closed_response(&format!(
+                        "control-plane mutation refused: authz policy unavailable ({why})"
+                    )));
+                }
+            };
+            // (I1 parity) NORMALIZE the verified grants BEFORE expanding them to rights.
+            let roles = policy.normalize_grants(&principal.token().roles);
+            if !policy.rights_for(&roles).allows(required_right) {
+                tracing::warn!(
+                    %host, principal = %principal.principal_id(), required = ?required_right,
+                    "[privsep] node-self-host control mutation REFUSED: the verified principal is not \
+                     authorized for this control-plane mutation (default-deny)"
+                );
+                return Err(fail_closed_response(&format!(
+                    "control-plane mutation refused: the verified principal is not authorized for {} \
+                     (default-deny)",
+                    required_right.resource
+                )));
+            }
+            Ok(principal.principal_id())
+        }
+
+        /// The P5-4 CROSS-INSTANCE authorize decision (this instance holds `backend.kv` but NOT
+        /// `control.admin-api`): DRIVE the relay to the control-authorize grammar endpoint. The end-
+        /// principal context + per-call PoP are re-validated AT THE DESTINATION (the authorizer re-runs
+        /// `cose::verify` + the PoP check + anti-replay + `rights_for` on the client's OWN signed
+        /// credential — never a relay-forwarded assertion). The REVOCATION check stays HERE (this
+        /// instance is the `backend.kv`/revocation-marker authority; it checks `authz/revoked/<cti>` on
+        /// the `cti` the authorizer verified — reusing [`boatramp_core::authz::revoked_key`]). Fail-
+        /// closed on: no relay client / a link mismatch, a CUSTOM policy doc the split authorizer cannot
+        /// honor (the default-policy limitation — surfaced P5-4), a DENIED / REFUSED decision, an
+        /// unreachable authorizer, or a revoked/unreadable marker. `Ok(label)` ⇒ authorized.
+        async fn authorize_relayed(
+            &self,
+            cred: &ControlMutationCredential,
+            host: &str,
+            link: &str,
+        ) -> Result<String, boatramp_http::Response> {
+            // The relay client MUST be present AND wired to THIS link (the router resolved the authorize
+            // to a verified control-authorize grammar endpoint; the handler must relay over the SAME
+            // link). Its absence / a mismatch fail-closes (a data-holder with no reachable authorizer).
+            let Some(relay) = self
+                .control_relay
+                .as_ref()
+                .filter(|r| r.link_name() == link)
+            else {
+                tracing::warn!(%host, %link, "[privsep] node-self-host control mutation REFUSED: no control-authorize relay client for the routed grammar-endpoint link (fail-closed)");
+                return Err(fail_closed_response(
+                    "control-plane mutation refused: the control.admin-api authorize sub-op routes to a \
+                     control-authorize grammar endpoint but this instance has no relay client wired to \
+                     that link — fail-closed",
+                ));
+            };
+
+            // CUSTOM-POLICY FAIL-CLOSED GUARD (the default-policy limitation of a SPLIT authorizer). A
+            // split `control.admin-api` holder authorizes under the node's DEFAULT RBAC policy (it holds
+            // no backend.kv). This instance HOLDS backend.kv, so it is the authority on whether a CUSTOM
+            // operator policy doc exists; if one does, the split authorizer cannot honor it (it could be
+            // MORE restrictive than the default), so refuse the relayed-authorize path CLOSED rather
+            // than under-enforce. Honoring a KV-stored custom policy over the relay is the control→
+            // backend policy-read orchestrator — the remaining P5-4 work.
+            match self.data_plane.custom_policy_present().await {
+                Ok(false) => {}
+                Ok(true) => {
+                    tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: a CUSTOM authz policy doc is present but the cross-instance (split) authorizer honors only the default policy (fail-closed)");
+                    return Err(fail_closed_response(
+                        "control-plane mutation refused: a custom operator authz policy doc is present, \
+                         but the cross-instance (split control.admin-api) authorizer honors only the \
+                         node's DEFAULT RBAC policy — honoring a KV-stored custom policy over the relay \
+                         (the control→backend policy-read orchestrator) is the remaining P5-4 work; \
+                         fail-closed rather than under-enforce",
+                    ));
+                }
+                Err(why) => {
+                    tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation REFUSED: could not read the authz policy doc to guard the split-authorizer default-policy limitation (fail-closed)");
+                    return Err(fail_closed_response(&format!(
+                        "control-plane mutation refused: could not read the authz policy doc to confirm \
+                         the split authorizer can honor it (fail-closed): {why}"
+                    )));
+                }
+            }
+
+            // RELAY: the authorizer re-validates the end-principal context + PoP AT THE DESTINATION,
+            // checks anti-replay, re-derives the required Right from the PoP-bound method+path, and
+            // answers the `rights_for` decision. A transport failure / an unreachable holder ⇒ 503.
+            let cti = match relay.authorize(cred, host).await {
+                Ok(ControlAuthorizeReply::Allowed { cti }) => cti,
+                Ok(ControlAuthorizeReply::Denied) => {
+                    tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: the cross-instance authorizer DENIED (default-deny)");
+                    return Err(fail_closed_response(
+                        "control-plane mutation refused: the verified principal is not authorized \
+                         (default-deny, decided by the cross-instance control.admin-api authorizer)",
+                    ));
+                }
+                Ok(ControlAuthorizeReply::Refused { reason }) => {
+                    tracing::warn!(%host, %reason, "[privsep] node-self-host control mutation REFUSED: the cross-instance authorizer refused fail-closed");
+                    return Err(fail_closed_response(&format!(
+                        "control-plane mutation refused: the cross-instance control.admin-api authorizer \
+                         refused ({reason})"
+                    )));
+                }
+                Err(why) => {
+                    tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation REFUSED: the control-authorize relay failed (unreachable holder / transport) — fail-closed");
+                    return Err(fail_closed_response(&format!(
+                        "control-plane mutation refused: the cross-instance authorize relay failed \
+                         (an unreachable or unresponsive control.admin-api holder — fail-closed): {why}"
+                    )));
+                }
+            };
+
+            // REVOCATION at the backend.kv holder (M1 parity), on the `cti` the authorizer VERIFIED.
+            // This instance holds the authoritative `authz/revoked/<cti>` markers; FAIL-CLOSED on
+            // present-OR-unreadable (shed, MF-4). (The authorizer re-validated the PRINCIPAL; this node
+            // enforces its REVOCATION — the two authority holders each own their fact.)
+            self.check_revocation(&cti, host).await?;
+            Ok(format!("cti={cti} (cross-instance authorize)"))
+        }
+
+        /// The shared TOKEN-REVOCATION gate (M1): read the LIVE `authz/revoked/<cti>` marker from the
+        /// held `backend.kv` and FAIL-CLOSED on present (revoked) OR unreadable (shed, MF-4) — never
+        /// silently honored. `Ok(())` ⇒ not revoked; `Err(response)` ⇒ the fail-closed 503.
+        async fn check_revocation(
+            &self,
+            cti: &str,
+            host: &str,
+        ) -> Result<(), boatramp_http::Response> {
+            match self.data_plane.revocation_status(cti).await {
+                RevocationStatus::NotRevoked => Ok(()),
+                RevocationStatus::Revoked => {
+                    tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: the end-principal token is revoked (an authz/revoked/<cti> marker is present) — fail-closed");
+                    Err(fail_closed_response(
+                        "control-plane mutation refused: the end-principal token is revoked",
+                    ))
+                }
+                RevocationStatus::Unreadable(why) => {
+                    tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation REFUSED: the token-revocation marker could not be read — shed fail-closed (MF-4), never silently honored");
+                    Err(fail_closed_response(&format!(
+                        "control-plane mutation refused: the token-revocation marker could not be read \
+                         (fail-closed / shed, never silently honored): {why}"
+                    )))
                 }
             }
         }
@@ -5276,6 +5951,30 @@ mod instance_serve {
                 Ok(None) => Ok(AuthzPolicy::default_policy()),
                 Err(e) => Err(format!(
                     "reading authz/policy from the control-plane KV: {e}"
+                )),
+            }
+        }
+
+        /// Whether a CUSTOM operator authz policy doc is STORED in the held control-plane KV (P5-4). The
+        /// cross-instance (split) `control.admin-api` authorizer authorizes under the node's DEFAULT
+        /// policy only (it holds no `backend.kv`); this instance IS the `backend.kv` holder, so it is the
+        /// authority on whether a custom doc exists. `Ok(true)` ⇒ a doc is present (the split authorizer
+        /// cannot honor it — the serve path then fails the relayed-authorize CLOSED, never under-enforce);
+        /// `Ok(false)` ⇒ the default policy is in effect (the split authorizer is faithful); a read error
+        /// ⇒ `Err` (fail-closed). Reuses [`POLICY_KEY`] — the SAME key [`load_authz_policy`](Self::load_authz_policy)
+        /// reads — so the two never drift.
+        pub(super) async fn custom_policy_present(&self) -> Result<bool, String> {
+            let store = match self {
+                Self::Deploy(store) => store,
+                Self::Refusing => {
+                    return Err("this instance holds no backend.kv control-plane store".into());
+                }
+            };
+            match store.kv().get(POLICY_KEY).await {
+                Ok(Some(_)) => Ok(true),
+                Ok(None) => Ok(false),
+                Err(e) => Err(format!(
+                    "reading authz/policy presence from the control-plane KV: {e}"
                 )),
             }
         }
@@ -7742,33 +8441,41 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
     // exercise the routing DECISION and the drop-in HANDLER shape in isolation on the host. The full
     // self-host serve path stays REFUSED fail-closed at the root gate and on the `#[ignore]` live gate.
 
-    /// The P5-1/P5-3 router routes ONLY to held authorities and relays everything else — the
+    /// The P5-1/P5-3/P5-4 router routes ONLY to held authorities and relays everything else — the
     /// "construct-only-what-you-hold" discipline (design §4 item 5) + the INFO-1 crown-jewel-endpoint
-    /// guard, proven structurally:
+    /// guard + the P5-4 control-authorize-endpoint guard, proven structurally:
     /// - a HELD surface ⇒ `Local` (served in-process);
     /// - a non-held CROWN-JEWEL (group A) reachable over a VERIFIED `serve_authority` grammar endpoint ⇒
     ///   `RelayCrownJewel` (WS-E grammar); a crown jewel reachable ONLY over a splice ⇒ `Refuse` (INFO-1);
-    /// - any other non-held authority reachable over a link ⇒ `RelayBackend` (typed backend request);
+    /// - a non-held `control.admin-api` (group E) reachable over a VERIFIED control-authorize grammar
+    ///   endpoint ⇒ `RelayControlAuthority`; reachable ONLY over a splice ⇒ `Refuse` (the P5-4 guard);
+    /// - any OTHER non-held authority reachable over a link ⇒ `RelayBackend` (typed backend request);
     /// - a non-held, UNREACHABLE surface ⇒ `Refuse` fail-closed (a composition-closure bug).
     #[cfg(unix)]
     #[test]
     fn p5_1_node_router_serves_held_relays_the_rest_refuses_unreachable() {
         use super::instance_serve::{NodeRoute, NodeServeRouter};
 
-        // This instance HOLDS backend.kv only; it can REACH the blob backend (group B) and the control
-        // plane (group E) over named backend links, and the signer (crown jewel, group A) over a
-        // VERIFIED authority-serve grammar endpoint.
+        // This instance HOLDS backend.kv only; it can REACH the blob backend (group B) + acme control
+        // (group E non-control) over named backend links, the signer (crown jewel, group A) over a
+        // VERIFIED authority-serve grammar endpoint, and the control plane (control.admin-api, group E)
+        // over a VERIFIED control-authorize grammar endpoint.
         let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
         let reachable = BTreeMap::from([
             (HostAuthority::BackendBlob, "to-blob".to_string()),
-            (HostAuthority::ControlAdminApi, "to-control".to_string()),
+            (HostAuthority::AcmeDnsControl, "to-acme".to_string()),
+            // control.admin-api ALSO appearing in the splice reachability map (e.g. a mis-marked link):
+            // it must NOT be relayed over a splice — only over a verified control-authorize endpoint.
+            (HostAuthority::ControlAdminApi, "to-splice".to_string()),
             // A crown jewel ALSO appearing in the splice reachability map (e.g. a mis-marked link): it
             // must NOT be relayed as a crown jewel unless it is ALSO a verified grammar endpoint (INFO-1).
             (HostAuthority::ImageSigner, "to-splice".to_string()),
         ]);
         let authority_serve =
             BTreeMap::from([(HostAuthority::TokenSigner, "to-signer".to_string())]);
-        let router = NodeServeRouter::new(&gate, reachable, authority_serve);
+        let control_authorize =
+            BTreeMap::from([(HostAuthority::ControlAdminApi, "to-control".to_string())]);
+        let router = NodeServeRouter::new(&gate, reachable, authority_serve, control_authorize);
 
         // HELD ⇒ served locally; it is NEVER relayed.
         assert_eq!(
@@ -7806,15 +8513,43 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             "a non-held backend relays a typed request over its feature-link"
         );
 
-        // Non-held control-plane (group E) reachable over a link ⇒ a typed backend request relay too
-        // (control.admin-api is reached by a typed request, not the crown-jewel grammar).
+        // P5-4: a non-held `control.admin-api` reachable over a VERIFIED control-authorize grammar
+        // endpoint ⇒ `RelayControlAuthority` over THAT link — NOT the splice it also appears in under
+        // `reachable` (`to-splice`): the control_authorize map wins, never a raw backend socket.
         assert_eq!(
             router.route(HostAuthority::ControlAdminApi),
-            NodeRoute::RelayBackend {
+            NodeRoute::RelayControlAuthority {
                 authority: HostAuthority::ControlAdminApi,
                 link: "to-control".to_string(),
             },
-            "a non-held, non-crown-jewel surface relays a typed request (group E included)"
+            "a non-held control.admin-api relays over its VERIFIED control-authorize grammar endpoint, \
+             never over the splice it also appears in"
+        );
+
+        // Group-E NON-control (acme.dns-control) reachable over a backend link ⇒ a typed backend relay
+        // (only control.admin-api is gated on the control-authorize grammar endpoint; acme is not).
+        assert_eq!(
+            router.route(HostAuthority::AcmeDnsControl),
+            NodeRoute::RelayBackend {
+                authority: HostAuthority::AcmeDnsControl,
+                link: "to-acme".to_string(),
+            },
+            "a non-held group-E non-control authority relays a typed backend request"
+        );
+
+        // The P5-4 guard, isolated: a `control.admin-api` reachable ONLY over a splice (present in
+        // `reachable`, ABSENT from the control-authorize endpoint map) is REFUSED — never a bare socket.
+        let splice_only = NodeServeRouter::new(
+            &gate,
+            BTreeMap::from([(HostAuthority::ControlAdminApi, "to-splice".to_string())]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            splice_only.route(HostAuthority::ControlAdminApi),
+            NodeRoute::Refuse(HostAuthority::ControlAdminApi),
+            "a control.admin-api with no verified control-authorize grammar endpoint must be refused, \
+             never relayed over a splice (the P5-4 authz-bypass guard)"
         );
 
         // Non-held AND unreachable ⇒ REFUSE fail-closed (never a silent local serve or degraded path).
@@ -7836,13 +8571,16 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         // shared link (so no surface is `Refuse` — isolating the hold-vs-relay invariant).
         let held = [HostAuthority::SecretsSealer, HostAuthority::BackendKv];
         let gate = MaterializationGate::new(&held);
-        // Non-held NON-crown authorities are reachable over a backend link; non-held CROWN jewels over a
-        // VERIFIED authority-serve grammar endpoint (INFO-1) — so no surface is `Refuse` and the
-        // hold-vs-relay invariant is isolated (a crown jewel only ever relays over its grammar endpoint).
+        // Non-held NON-crown, NON-control authorities are reachable over a backend link; non-held CROWN
+        // jewels over a VERIFIED authority-serve grammar endpoint (INFO-1); non-held `control.admin-api`
+        // over a VERIFIED control-authorize grammar endpoint (P5-4) — so no surface is `Refuse` and the
+        // hold-vs-relay invariant is isolated (each kind only ever relays over its proper endpoint).
         let reachable: BTreeMap<HostAuthority, String> = HostAuthority::ALL
             .iter()
             .copied()
-            .filter(|a| !held.contains(a) && !a.is_crown_jewel())
+            .filter(|a| {
+                !held.contains(a) && !a.is_crown_jewel() && *a != HostAuthority::ControlAdminApi
+            })
             .map(|a| (a, "to-peer".to_string()))
             .collect();
         let authority_serve: BTreeMap<HostAuthority, String> = HostAuthority::ALL
@@ -7851,7 +8589,11 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             .filter(|a| !held.contains(a) && a.is_crown_jewel())
             .map(|a| (a, "to-grammar".to_string()))
             .collect();
-        let router = NodeServeRouter::new(&gate, reachable, authority_serve);
+        let control_authorize = BTreeMap::from([(
+            HostAuthority::ControlAdminApi,
+            "to-control-grammar".to_string(),
+        )]);
+        let router = NodeServeRouter::new(&gate, reachable, authority_serve, control_authorize);
 
         for &a in HostAuthority::ALL {
             let route = router.route(a);
@@ -7869,7 +8611,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
                     a.tag()
                 );
                 // Non-held ⇒ a relay whose kind follows the authority's group (crown jewel ⇒ WS-E
-                // grammar, else a backend request).
+                // grammar; control.admin-api ⇒ the control-authorize grammar; else a backend request).
                 match route {
                     NodeRoute::RelayCrownJewel { authority, .. } => {
                         assert!(
@@ -7878,10 +8620,19 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
                             a.tag()
                         );
                     }
+                    NodeRoute::RelayControlAuthority { authority, .. } => {
+                        assert_eq!(
+                            authority,
+                            HostAuthority::ControlAdminApi,
+                            "{}: a control-authorize relay is ONLY for control.admin-api",
+                            a.tag()
+                        );
+                    }
                     NodeRoute::RelayBackend { authority, .. } => {
                         assert!(
-                            !authority.is_crown_jewel(),
-                            "{}: a backend-request relay is never a crown jewel",
+                            !authority.is_crown_jewel()
+                                && authority != HostAuthority::ControlAdminApi,
+                            "{}: a backend-request relay is never a crown jewel or control.admin-api",
                             a.tag()
                         );
                     }
@@ -7944,9 +8695,9 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             Arc::new(MemoryKv::new()),
         );
         let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
-        let router = NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new());
+        let router = NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         // A pure data-holder (no control.admin-api) ⇒ no control plane authorizer (reads need none).
-        let handler = NodeServeHandler::new(router, NodeDataPlane::Deploy(store), None);
+        let handler = NodeServeHandler::new(router, NodeDataPlane::Deploy(store), None, None);
 
         // Two GETs (distinct hosts) → the router classifies each → `Local(backend.kv)` → a REAL
         // `resolve_site_by_host` read against the empty store → 404 from the read plane. A real read
@@ -7988,8 +8739,9 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         //     a `Refusing` placeholder is fine.
         let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
         let handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
             NodeDataPlane::Refusing,
+            None,
             None,
         );
         let resp = p5_2_roundtrip(
@@ -8012,8 +8764,9 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         let gate =
             MaterializationGate::new(&[HostAuthority::BackendKv, HostAuthority::ControlAdminApi]);
         let handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
             NodeDataPlane::Refusing,
+            None,
             None,
         );
         let resp = p5_2_roundtrip(
@@ -8032,8 +8785,9 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         let gate = MaterializationGate::new(&[HostAuthority::ControlAdminApi]);
         let reachable = BTreeMap::from([(HostAuthority::BackendKv, "to-data".to_string())]);
         let handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, reachable, BTreeMap::new()),
+            NodeServeRouter::new(&gate, reachable, BTreeMap::new(), BTreeMap::new()),
             NodeDataPlane::Refusing,
+            None,
             None,
         );
         let resp = p5_2_roundtrip(
@@ -8051,8 +8805,9 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         //     the serve closed, never degrades).
         let gate = MaterializationGate::new(&[HostAuthority::ControlAdminApi]);
         let handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
             NodeDataPlane::Refusing,
+            None,
             None,
         );
         let resp = p5_2_roundtrip(
@@ -8268,9 +9023,10 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         );
         let control = SelfHostControlPlane::new(ContextVerifier::new(root.public_key()));
         let handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
             NodeDataPlane::Deploy(store),
             Some(control),
+            None,
         );
 
         // The mutation: register `node.local` under `acme/blog`. The transport Host is `node-admin`
@@ -8471,11 +9227,12 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             Arc::new(FailingKv),
         );
         let unreadable_handler = NodeServeHandler::new(
-            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new()),
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
             NodeDataPlane::Deploy(unreadable_store),
             Some(SelfHostControlPlane::new(ContextVerifier::new(
                 root.public_key(),
             ))),
+            None,
         );
         let (un_token, un_pop) = mint_cred(
             &root,
@@ -8490,6 +9247,294 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         assert!(
             resp.starts_with("HTTP/1.1 503") && resp.contains("could not be read"),
             "an unreadable revocation marker must SHED (503, fail-closed), never silently honored, \
+             got:\n{resp}"
+        );
+    }
+
+    /// **P5-4: the cross-instance authorize RELAY.** A serving `backend.kv` holder that does NOT hold
+    /// `control.admin-api` DRIVES the `rights_for` decision over a control-authorize-serve link to a
+    /// SPLIT authorizer (here, the SAME `serve_control_authorize_link` the live gate runs, over a real
+    /// `socketpair`). Proves the destination RE-VALIDATES the end-principal context + PoP (never a
+    /// relay-forwarded assertion), the reply carries NO key, and the whole chain fails closed on every
+    /// negative. (A host test over a socketpair proves the wire protocol + decision logic; the
+    /// cross-instance TRUST decision under real Landlock is the lighthouse live gate's job.)
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p5_4_cross_instance_authorize_relay_serves_and_fail_closes() {
+        use std::sync::Arc;
+
+        use boatramp_core::authz::{AuthzPolicy, GrantedRole, revoked_key};
+        use boatramp_core::cose::{
+            AuthorityPopBinding, Claims, KIND_ROLE, LocalSigner, Signer, TokenAlg,
+            mint_authority_pop, mint_delegatable, verify_credential,
+        };
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_core::time::now_unix;
+        use boatramp_server::privsep_authority::{
+            CONTROL_MUTATION_POP_OP, ContextVerifier, ReplayCache, control_mutation_pop_bytes,
+        };
+        use boatramp_server::privsep_link::LinkEndpoint;
+        use boatramp_storage::FsStorage;
+
+        use super::instance_serve::{
+            ControlAuthorizeClient, ControlAuthorizer, NodeDataPlane, NodeServeHandler,
+            NodeServeRouter, serve_control_authorize_link,
+        };
+
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let now = now_unix();
+
+        // The SPLIT authorizer (holds control.admin-api, NO backend.kv): it re-validates + decides over
+        // its OWN link end, with the PUBLIC trust root + the DEFAULT RBAC policy. Served by the SAME
+        // `serve_control_authorize_link` the live-gate `__root` dispatch runs, over a real socketpair.
+        let (server_ep, client_ep) = LinkEndpoint::socketpair().expect("socketpair");
+        let authorizer = ControlAuthorizer::new(
+            ContextVerifier::new(root.public_key()),
+            Arc::new(ReplayCache::with_defaults()),
+            Arc::new(AuthzPolicy::default_policy()),
+        );
+        // The authorizer serve loop runs on a detached thread for the test's lifetime (the process
+        // exits at test end; a single blocked `recv` on an idle link is harmless).
+        std::thread::spawn(move || {
+            serve_control_authorize_link("control", "to-control", &server_ep, &authorizer);
+        });
+
+        // The SERVING backend.kv holder: router routes `authorize` (control.admin-api, NOT held) to the
+        // control-authorize grammar endpoint `to-control`; `write` (backend.kv, HELD) is Local. The data
+        // plane is a real DeployStore over MemoryKv (the write + revocation + custom-policy guard reads).
+        let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
+        let kv = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(
+            Arc::new(FsStorage::new(
+                std::env::temp_dir().join("boatramp-p5-4-relay-blobs"),
+            )),
+            kv.clone(),
+        );
+        let control_authorize =
+            BTreeMap::from([(HostAuthority::ControlAdminApi, "to-control".to_string())]);
+        let client = ControlAuthorizeClient::new("to-control".to_string(), client_ep);
+        let handler = NodeServeHandler::new(
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new(), control_authorize),
+            NodeDataPlane::Deploy(store),
+            None,         // NO local authorizer — this instance does NOT hold control.admin-api.
+            Some(client), // the P5-4 relay client to the split authorizer.
+        );
+
+        let method = "PUT";
+        let path = "/api/routing/acme/blog/served.example";
+        let transport_host = "node-admin";
+        let put_req = |token: &str, nonce: u128, pop: &str| -> Vec<u8> {
+            format!(
+                "PUT {path} HTTP/1.1\r\nHost: {transport_host}\r\nauthorization: Bearer {token}\r\n\
+                 boatramp-privsep-nonce: {nonce}\r\nboatramp-privsep-pop: {pop}\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        };
+        async fn mint_cred(
+            signer: &LocalSigner,
+            holder: &LocalSigner,
+            role: GrantedRole,
+            nonce: u128,
+            now: u64,
+            req: (&str, &str, &str),
+        ) -> (String, String) {
+            let (method, path, host) = req;
+            let claims = Claims {
+                roles: vec![role],
+                kind: KIND_ROLE.to_string(),
+                ttl_secs: Some(300),
+                now_unix: now,
+            };
+            let token = mint_delegatable(&claims, &holder.public_key(), signer)
+                .await
+                .expect("mint the role token");
+            let req_bytes = control_mutation_pop_bytes(method, path, host);
+            let binding = AuthorityPopBinding {
+                op: CONTROL_MUTATION_POP_OP,
+                context_token: &token,
+                nonce,
+                request_bytes: &req_bytes,
+            };
+            let pop = mint_authority_pop(&binding, holder, now)
+                .await
+                .expect("mint the PoP");
+            (token, pop)
+        }
+
+        // --- POSITIVE: an authorized publisher@acme/blog SERVES cross-instance (200) + the write lands.
+        let (token, pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            1,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&token, 1, &pop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.contains("authorized mutation served"),
+            "an AUTHORIZED cross-instance mutation must SERVE (200), got:\n{resp}"
+        );
+        let read = p5_2_roundtrip(
+            handler.clone(),
+            b"GET / HTTP/1.1\r\nHost: served.example\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            read.starts_with("HTTP/1.1 200") && read.contains("resolves"),
+            "the cross-instance-authorized write must land + be readable (GET resolves), got:\n{read}"
+        );
+
+        // --- NEGATIVE 1: a FORGED principal (non-trust-root key) ⇒ the DESTINATION re-validation fails
+        //     (no asserted-id trust across the link) ⇒ 503.
+        let forger = LocalSigner::generate(TokenAlg::Es256);
+        let (ftoken, fpop) = mint_cred(
+            &forger,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            2,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&ftoken, 2, &fpop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503")
+                && resp.contains("end-principal verification failed")
+                && resp.contains("cross-instance"),
+            "a forged principal must be REFUSED at the destination (503), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 2: a MISSING PoP header ⇒ 503 (default-deny, before any relay).
+        let (token2, _pop2) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            3,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let no_pop = format!(
+            "PUT {path} HTTP/1.1\r\nHost: {transport_host}\r\nauthorization: Bearer {token2}\r\n\
+             boatramp-privsep-nonce: 3\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let resp = p5_2_roundtrip(handler.clone(), &no_pop).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("no end-principal credential"),
+            "a missing PoP must fail closed (503, default-deny), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 3: an UNAUTHORIZED principal (role for a DIFFERENT site) ⇒ the DESTINATION DENIES
+        //     ⇒ 503 (default-deny, decided by the cross-instance authorizer).
+        let (utoken, upop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/other"),
+            4,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&utoken, 4, &upop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("not authorized"),
+            "an unauthorized principal must be DENIED by the cross-instance authorizer (503), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 4: a REPLAY of the positive call's (cti, nonce) ⇒ the DESTINATION's replay cache
+        //     refuses ⇒ 503 (the cross-instance authorizer owns the anti-replay).
+        let replay = p5_2_roundtrip(handler.clone(), &put_req(&token, 1, &pop)).await;
+        assert!(
+            replay.starts_with("HTTP/1.1 503") && replay.contains("anti-replay"),
+            "a verbatim replay must be refused by the cross-instance authorizer (503), got:\n{replay}"
+        );
+
+        // --- NEGATIVE 5: a REVOKED principal — the DESTINATION ALLOWS (role authorized) but the SERVING
+        //     backend.kv holder (the revocation-marker authority) refuses on the live marker ⇒ 503.
+        let (rtoken, rpop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            5,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let rcti = verify_credential(&rtoken, &root.public_key(), now)
+            .expect("the revoked-negative token verifies")
+            .cti;
+        kv.put(&revoked_key(&rcti), Vec::new())
+            .await
+            .expect("write the revocation marker into the held backend.kv");
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&rtoken, 5, &rpop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("revoked"),
+            "a revoked token must fail closed at the backend.kv holder even when the authorizer allows \
+             (503), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 6: a CUSTOM policy doc present ⇒ the split authorizer cannot honor it, so the
+        //     serving holder fails the relayed-authorize path CLOSED (never under-enforce) ⇒ 503.
+        kv.put(
+            boatramp_core::authz::POLICY_KEY,
+            serde_json::to_vec(&AuthzPolicy::default_policy()).expect("serialize a policy doc"),
+        )
+        .await
+        .expect("write a custom policy doc");
+        let (ctoken, cpop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            7,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&ctoken, 7, &cpop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("custom operator authz policy"),
+            "a custom policy doc must fail the split-authorizer relay path closed (503), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 7: a relay to a NON-GRAMMAR endpoint — control.admin-api reachable ONLY over a
+        //     splice (not in the control-authorize map) ⇒ the router REFUSES it (never a bare socket) ⇒
+        //     the whole request fails closed 503 (INFO-2). No relay client is driven.
+        let splice_handler = NodeServeHandler::new(
+            NodeServeRouter::new(
+                &gate,
+                BTreeMap::from([(HostAuthority::ControlAdminApi, "to-splice".to_string())]),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+            NodeDataPlane::Deploy(DeployStore::new(
+                Arc::new(FsStorage::new(
+                    std::env::temp_dir().join("boatramp-p5-4-splice-blobs"),
+                )),
+                Arc::new(MemoryKv::new()),
+            )),
+            None,
+            None,
+        );
+        let (stoken, spop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            8,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(splice_handler, &put_req(&stoken, 8, &spop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503")
+                && resp.contains("neither held nor reachable over a sound link"),
+            "a control.admin-api reachable only over a splice must be REFUSED (no bare-socket relay), \
              got:\n{resp}"
         );
     }
@@ -8609,5 +9654,77 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         );
         // A non-crown authority (control.admin-api) is never in the authority-serve endpoint map.
         assert!(!endpoints.contains_key(&HostAuthority::ControlAdminApi));
+    }
+
+    /// P5-4: `compute_control_authorize_links` + `derive_node_control_authorize_endpoints` map a
+    /// non-held `control.admin-api` to a link ONLY when that link is explicitly
+    /// `control-authorize-serve`-marked and terminates at the peer's `control.admin-api` holder — NEVER
+    /// a splice (a `Relay` / `Unspecified` link), and NEVER a crown jewel or any other authority.
+    #[test]
+    fn p5_4_derive_control_authorize_endpoints_requires_a_grammar_link() {
+        // `core` (backend.kv, NOT control.admin-api) reaches `control` (control.admin-api) over a
+        // CONTROL-AUTHORIZE-SERVE link and `other-control` (control.admin-api) over a RELAY splice.
+        let mut instances = BTreeMap::new();
+        instances.insert(
+            "core".to_string(),
+            inst(&[HostAuthority::BackendKv], &["grammar", "splice"]),
+        );
+        instances.insert(
+            "control".to_string(),
+            inst(&[HostAuthority::ControlAdminApi], &["grammar"]),
+        );
+        instances.insert(
+            "other-control".to_string(),
+            inst(&[HostAuthority::AcmeDnsControl], &["splice"]),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(
+            "grammar".to_string(),
+            PrivsepLink {
+                from: "core".to_string(),
+                to: "control".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::ControlAuthorizeServe,
+            },
+        );
+        links.insert(
+            "splice".to_string(),
+            PrivsepLink {
+                from: "core".to_string(),
+                to: "other-control".to_string(),
+                transport: LinkTransport::Local,
+                purpose: LinkPurpose::Relay,
+            },
+        );
+        let mut privsep = clean_privsep();
+        privsep.instances = instances;
+        privsep.links = links;
+        let cfg = cfg_with(Some(privsep));
+
+        // `compute_control_authorize_links` keys the control.admin-api HOLDER → its grammar link.
+        let serve_links = super::compute_control_authorize_links(&cfg);
+        assert_eq!(
+            serve_links.get("control").map(|s| s.contains("grammar")),
+            Some(true),
+            "the control.admin-api holder is designated the control-authorize-serve link"
+        );
+        assert!(
+            !serve_links.contains_key("other-control"),
+            "a non-marked (Relay) link is never a control-authorize endpoint"
+        );
+
+        // From `core`: control.admin-api is reachable over the VERIFIED control-authorize grammar link.
+        let endpoints = super::derive_node_control_authorize_endpoints(&cfg, "core");
+        assert_eq!(
+            endpoints.get(&HostAuthority::ControlAdminApi),
+            Some(&"grammar".to_string()),
+            "control.admin-api over a control-authorize-serve link is a verified grammar endpoint"
+        );
+
+        // The control.admin-api HOLDER serves locally — its OWN derive map is EMPTY (never relays).
+        assert!(
+            super::derive_node_control_authorize_endpoints(&cfg, "control").is_empty(),
+            "a control.admin-api holder serves the authorize decision locally, never relays it"
+        );
     }
 }
