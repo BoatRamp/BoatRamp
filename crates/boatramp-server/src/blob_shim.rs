@@ -465,7 +465,6 @@ impl ComputeBindingResolver for BlobShimResolver {
                 continue;
             };
             let token = self.token(project, workload, replica, binding);
-            self.shim.register(&token, scope).await;
             let url_env = binding.url_env();
             out.defaults.push((url_env.clone(), self.base_url.clone()));
             out.defaults
@@ -481,9 +480,15 @@ impl ComputeBindingResolver for BlobShimResolver {
                 out.vars
                     .insert(format!("blob.{}.token", binding.name), token.clone());
             }
+            // Mint the direct-S3 STS credential (if any) from the SAME resolved `scope` — it anchors
+            // the credential on `scope.site_prefix`, so the write cred and the HMAC read prefix are
+            // byte-identical (Security HIGH-1). This borrows `scope`, so it runs BEFORE `register`.
             #[cfg(feature = "blob-upload")]
-            self.contribute_blob_sts(project, workload, binding, single, &mut out)
+            self.contribute_blob_sts(project, workload, binding, &scope, single, &mut out)
                 .await;
+            // Register the HMAC capability LAST: `register` consumes `scope`, which the STS path above
+            // borrows. Order is immaterial to correctness (both populate maps before `out` returns).
+            self.shim.register(&token, scope).await;
         }
         out
     }
@@ -507,17 +512,23 @@ impl ComputeBindingResolver for BlobShimResolver {
 
 #[cfg(feature = "blob-upload")]
 impl BlobShimResolver {
-    /// Mint direct-S3 `TempCredentials` for a `--bind blob:<container>` and contribute the
-    /// `{{blob.*}}` STS vars + `AWS_*` default env, so an off-the-shelf S3 client talks DIRECTLY
-    /// to R2/Tigris. A bare `--bind blob` (no container) stays HMAC-only; so does any backend with
-    /// no real STS minter wired, a mint failure, or a presigned-only return — all FALL BACK to the
-    /// HMAC shim (never panic). NEVER logs the minted secret / session token (a `TempCredentials`
+    /// Mint direct-S3 `TempCredentials` for an EXPLICIT-site `--bind blob:<container>@<site>` and
+    /// contribute the `{{blob.*}}` STS vars + `AWS_*` default env, so an off-the-shelf S3 client talks
+    /// DIRECTLY to R2/Tigris. The credential is resource-scoped to the SAME `hblob/{project}/{site}/
+    /// {container}/` tree the HMAC shim reads (anchored on the passed `scope.site_prefix`, NOT the
+    /// workload name — Security HIGH-1). A bare `--bind blob` (no container) stays HMAC-only; so does a
+    /// NO-SITE binding (its reserved `hblob/{project}/_compute/{workload}/` namespace has no
+    /// single-segment site tape to mint into, and the HMAC shim already covers its full R/W), any
+    /// backend with no real STS minter wired, a mint failure, a presigned-only return, or a prefix that
+    /// diverges from the HMAC `site_prefix` — all FALL BACK to the HMAC shim (never panic). NEVER logs
+    /// the minted secret / session token (a `TempCredentials`
     /// is read field-by-field into the var/default maps, never `{:?}`-printed).
     async fn contribute_blob_sts(
         &self,
         project: &str,
         workload: &str,
         binding: &ComputeBinding,
+        scope: &BlobScope,
         single: bool,
         out: &mut SurfaceContribution,
     ) {
@@ -540,6 +551,19 @@ impl BlobShimResolver {
         if binding.name.is_empty() {
             return;
         }
+        // Only an EXPLICIT `binding.site` has a single-segment site tape a direct-S3 credential can
+        // be resource-scoped to. A NO-SITE binding resolves (in `scope`) to the reserved TWO-segment
+        // namespace `hblob/{project}/_compute/{workload}/`, which the STS mint's prefix shape — one
+        // `site` segment fed through `keypath::container_prefix` — structurally CANNOT express.
+        // Approximating it as the single-segment site `{workload}` is exactly the name-match coupling
+        // #12 removed: it would anchor a WRITE credential at a REAL same-named site's tape (the
+        // `Site·Write` gate only runs for an explicit `binding.site`), reviving the bypass on the
+        // write side. The HMAC shim already grants full R/W confined to that private
+        // `_compute/{workload}` namespace, so NO direct-S3 write credential to any site tape is issued
+        // for a no-site binding — it stays HMAC-only. (Security HIGH-1, v0.73.0.)
+        let Some(site) = binding.site.as_deref() else {
+            return;
+        };
         let target = UploadTarget::Prefix(String::new()); // the whole container (no sub-prefix)
         // Defense-in-depth: screen the container/target the SAME way the guest/operator mint path
         // does, even though `scope` already validated the container name. A refusal ⇒ HMAC-only.
@@ -550,11 +574,18 @@ impl BlobShimResolver {
             );
             return;
         }
-        let scope = MintScope {
+        let mint_scope = MintScope {
             project: project.to_string(),
-            // The SITE is host-forced to the workload name — the SAME per-site identity the shim's
-            // `hblob/{qualified-site}/` prefix + a `wasi:blobstore` handler use (never guest-named).
-            site: workload.to_string(),
+            // The SITE is the binding's EXPLICIT, set-time-authorized site — the SAME value `scope()`
+            // resolved the HMAC `site_prefix` from (`hblob/{project}/{site}/`) — so the minted
+            // credential's resource prefix (`keypath::container_prefix`, the exact string every cloud
+            // minter scopes its policy to) is byte-identical to the HMAC prefix the guest reads, and
+            // the authorized site == the write-credential site. NEVER the workload name: the pre-fix
+            // `site: workload` anchored the cred at `hblob/{project}/{workload}/…`, reviving the
+            // name-match coupling on the WRITE side and bypassing the `Site·Write` gate. The guard
+            // below pins this equality to `scope.site_prefix` so the two derivations cannot diverge
+            // again. (Security HIGH-1.)
+            site: site.to_string(),
             container: binding.name.clone(),
             target,
             // Direct-S3 is WRITE-scoped (PUT + multipart); the HMAC shim covers reads (GET).
@@ -573,7 +604,29 @@ impl BlobShimResolver {
             // short. (revoke-on-stop cuts the HMAC token + the dynamic DB role, not this lease.)
             ttl_secs: *max_ttl_secs,
         };
-        let creds: TempCredentials = match minter.mint(&scope).await {
+        // CONSOLIDATION INVARIANT (Security HIGH-1). The direct-S3 credential and the HMAC shim read
+        // path are the two faces of ONE resolved capability, so the credential MUST be resource-scoped
+        // to EXACTLY the `hblob/{project}/{site}/{container}/` tree the guest reads through the shim —
+        // `scope()`'s already-resolved `BlobScope.site_prefix` + the container. The mint's own prefix
+        // is composed by `keypath::container_prefix`, the SAME helper every cloud minter scopes its
+        // policy with (via `cloud::scoped_object_path`); pin the two together here so they can never
+        // drift back into independent derivations (the bug being fixed hardcoded `site = workload`).
+        // Both sides compute `ProjectRef::qualified(site)`, so for an explicit site this holds by
+        // construction; if it ever does not, fail CLOSED to the HMAC shim rather than hand out a write
+        // credential anchored at the wrong tape.
+        let hmac_container_root = format!("{}{}/", scope.site_prefix, binding.name);
+        let sts_container_root =
+            crate::s3_ingress::keypath::container_prefix(project, site, &binding.name);
+        if sts_container_root != hmac_container_root {
+            tracing::error!(
+                %project, %workload, %site, container = %binding.name,
+                sts = %sts_container_root, hmac = %hmac_container_root,
+                "blob binding: direct-S3 mint prefix diverged from the HMAC site_prefix; \
+                 falling back to the HMAC shim (fail closed)"
+            );
+            return;
+        }
+        let creds: TempCredentials = match minter.mint(&mint_scope).await {
             Ok(MintedCredentials::TempCredentials(t)) => t,
             Ok(MintedCredentials::PresignedPut(_)) => {
                 tracing::warn!(
@@ -2236,9 +2289,14 @@ mod tests {
     }
 
     /// A fake [`BlobUploadMinter`] returning fixed `TempCredentials` (bucket = the requested
-    /// container), so the direct-S3 wiring is unit-testable without a live S3/STS endpoint.
+    /// container), so the direct-S3 wiring is unit-testable without a live S3/STS endpoint. It also
+    /// RECORDS every [`MintScope`](boatramp_handlers::MintScope) it is handed in `seen`, so a test can
+    /// assert the host-stamped resource scope — crucially the `site` the credential is anchored at
+    /// (Security HIGH-1) — and that a no-site binding mints NOTHING.
     #[cfg(feature = "blob-upload")]
-    struct FakeBlobMinter;
+    struct FakeBlobMinter {
+        seen: Arc<std::sync::Mutex<Vec<boatramp_handlers::MintScope>>>,
+    }
     #[cfg(feature = "blob-upload")]
     #[async_trait::async_trait]
     impl boatramp_handlers::BlobUploadMinter for FakeBlobMinter {
@@ -2246,6 +2304,7 @@ mod tests {
             &self,
             scope: &boatramp_handlers::MintScope,
         ) -> Result<boatramp_handlers::MintedCredentials, String> {
+            self.seen.lock().unwrap().push(scope.clone());
             Ok(boatramp_handlers::MintedCredentials::TempCredentials(
                 boatramp_handlers::TempCredentials {
                     access_key_id: "AKIAFAKE".to_string(),
@@ -2264,31 +2323,52 @@ mod tests {
         }
     }
 
+    /// Build a resolver with the recording [`FakeBlobMinter`], returning the shared `seen` recorder so
+    /// a test can inspect the exact [`MintScope`](boatramp_handlers::MintScope)s the minter received
+    /// (empty ⇒ no direct-S3 credential was minted at all).
     #[cfg(feature = "blob-upload")]
-    fn resolver_with_minter(shim: &BlobShim, storage: Arc<dyn Storage>) -> BlobShimResolver {
-        BlobShimResolver::new(
+    fn resolver_with_minter(
+        shim: &BlobShim,
+        storage: Arc<dyn Storage>,
+    ) -> (
+        BlobShimResolver,
+        Arc<std::sync::Mutex<Vec<boatramp_handlers::MintScope>>>,
+    ) {
+        let seen: Arc<std::sync::Mutex<Vec<boatramp_handlers::MintScope>>> = Arc::default();
+        let resolver = BlobShimResolver::new(
             Arc::new(GlobalBlobBackend::new(storage)),
             shim.clone(),
             "http://10.0.0.1:8082".to_string(),
             [9u8; 32],
         )
-        .with_blob_minter(Some(Arc::new(FakeBlobMinter)), 3600, Some(8 * 1024 * 1024))
+        .with_blob_minter(
+            Some(Arc::new(FakeBlobMinter {
+                seen: Arc::clone(&seen),
+            })),
+            3600,
+            Some(8 * 1024 * 1024),
+        );
+        (resolver, seen)
     }
 
-    /// Phase 3: a `--bind blob:<container>` with a wired minter ALSO gets direct-S3 `TempCredentials`
-    /// — `{{blob.*}}` STS vars + the `AWS_*` convention defaults — WHILE keeping the HMAC shim env.
+    /// Phase 3: an EXPLICIT-site `--bind blob:<container>@<site>` with a wired minter ALSO gets
+    /// direct-S3 `TempCredentials` — `{{blob.*}}` STS vars + the `AWS_*` convention defaults — WHILE
+    /// keeping the HMAC shim env. (A no-site binding no longer mints direct-S3 — see
+    /// `no_site_binding_mints_no_direct_s3_credential`.)
     #[cfg(feature = "blob-upload")]
     #[tokio::test]
     async fn contribute_mints_direct_s3_temp_credentials_for_a_named_container() {
         let shim = BlobShim::new();
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
-        let resolver = resolver_with_minter(&shim, storage);
+        let (resolver, _seen) = resolver_with_minter(&shim, storage);
+        // Workload `api`, container `assets`, EXPLICIT site `media` (site deliberately != workload so
+        // the credential-anchoring site is unambiguous).
         let c = resolver
             .contribute(
                 "acme",
                 "api",
                 0,
-                &[blob_binding("assets")],
+                &[blob_binding("assets").with_site("media")],
                 &BTreeMap::new(),
             )
             .await;
@@ -2375,7 +2455,7 @@ mod tests {
     async fn contribute_bare_blob_binding_falls_back_to_hmac_even_with_a_minter() {
         let shim = BlobShim::new();
         let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
-        let resolver = resolver_with_minter(&shim, storage);
+        let (resolver, seen) = resolver_with_minter(&shim, storage);
         let c = resolver
             .contribute("acme", "api", 0, &[blob_binding("")], &BTreeMap::new())
             .await;
@@ -2385,5 +2465,151 @@ mod tests {
         );
         assert!(c.defaults.iter().all(|(k, _)| k != "AWS_ACCESS_KEY_ID"));
         assert!(c.vars.contains_key("blob.url"), "HMAC var still present");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a bare binding must never reach the STS minter"
+        );
+    }
+
+    /// **Security HIGH-1 (v0.73.0): the direct-S3 STS write path is anchored at the SAME site the HMAC
+    /// read path resolves — never the workload name.** For an EXPLICIT-site binding the minted
+    /// credential's resource prefix (`keypath::container_prefix(project, MintScope.site, container)`,
+    /// the exact string every cloud minter scopes its policy to via `cloud::scoped_object_path`) MUST
+    /// equal the HMAC `scope.site_prefix` + container, i.e. `hblob/{project}/{site}/{container}/` for
+    /// the AUTHORIZED site — not `hblob/{project}/{workload}/…`. Workload `worker` + `@api` ⇒ the cred
+    /// writes to `api`'s tape, never `worker`'s. (The pre-fix path hardcoded `site = workload`, which
+    /// anchored the write cred at the workload-named tape, reviving the name-match coupling on the
+    /// write side and bypassing the `Site·Write` gate.)
+    #[cfg(feature = "blob-upload")]
+    #[tokio::test]
+    async fn sts_mint_resource_prefix_equals_hmac_site_prefix_for_an_explicit_site() {
+        let shim = BlobShim::new();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let (resolver, seen) = resolver_with_minter(&shim, storage);
+
+        // Workload named `worker`, sharing site `api`'s tape via an explicit `@api`.
+        let c = resolver
+            .contribute(
+                "acme",
+                "worker",
+                0,
+                &[blob_binding("assets").with_site("api")],
+                &BTreeMap::new(),
+            )
+            .await;
+
+        // (a) The HMAC read prefix the guest is confined to (token-bound, host-stamped).
+        let token = c
+            .defaults
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .expect("HMAC token injected");
+        let hmac_scope = shim
+            .authenticate(Some(&token))
+            .await
+            .expect("token resolves to a BlobScope");
+        assert_eq!(
+            hmac_scope.site_prefix, "hblob/acme/api/",
+            "HMAC read path is confined to the AUTHORIZED site's tape"
+        );
+
+        // (b) The STS write credential the minter was handed.
+        let minted = seen.lock().unwrap();
+        assert_eq!(
+            minted.len(),
+            1,
+            "exactly one STS mint for the explicit-site binding"
+        );
+        let mint_scope = &minted[0];
+        assert_eq!(
+            mint_scope.site, "api",
+            "the credential is anchored at the AUTHORIZED site, NEVER the workload name"
+        );
+        assert_ne!(
+            mint_scope.site, "worker",
+            "the credential must NOT be anchored at the workload name (the HIGH-1 regression)"
+        );
+
+        // (c) THE invariant: the STS resource prefix == the HMAC `site_prefix` + container, byte for
+        // byte. `keypath::container_prefix` is the exact helper `cloud::scoped_object_path` composes
+        // the cloud policy's resource scope from for this empty-prefix (whole-container) target.
+        let sts_resource_prefix = crate::s3_ingress::keypath::container_prefix(
+            &mint_scope.project,
+            &mint_scope.site,
+            &mint_scope.container,
+        );
+        assert_eq!(
+            sts_resource_prefix,
+            format!("{}assets/", hmac_scope.site_prefix),
+            "STS write prefix must equal the HMAC read prefix + container"
+        );
+        assert_eq!(
+            sts_resource_prefix, "hblob/acme/api/assets/",
+            "and that prefix is the AUTHORIZED site's container tape"
+        );
+    }
+
+    /// **Security HIGH-1: a NO-SITE binding mints NO direct-S3 write credential — even a workload named
+    /// after a real site.** The no-site binding resolves to the private reserved namespace
+    /// `hblob/{project}/_compute/{workload}/`, which has no single-segment site tape the STS mint shape
+    /// can express; minting `site = workload` would hand out a WRITE credential to the same-named
+    /// site's REAL tape with no `Site·Write` gate (that gate only runs for an explicit `binding.site`).
+    /// So: no STS vars, no `AWS_*` defaults, and the minter is NEVER invoked. The HMAC shim still
+    /// provides the private namespace's full R/W.
+    #[cfg(feature = "blob-upload")]
+    #[tokio::test]
+    async fn no_site_binding_mints_no_direct_s3_credential() {
+        let shim = BlobShim::new();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let (resolver, seen) = resolver_with_minter(&shim, storage);
+
+        // Workload `api` is NAMED EXACTLY like a site, with a NO-SITE `blob:assets` binding.
+        let c = resolver
+            .contribute(
+                "acme",
+                "api",
+                0,
+                &[blob_binding("assets")],
+                &BTreeMap::new(),
+            )
+            .await;
+
+        // No direct-S3 credential was minted at all …
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a no-site binding must NOT reach the STS minter (no site-tape write cred)"
+        );
+        // … so none of the STS template vars or AWS_* write defaults are injected.
+        assert!(
+            !c.vars.contains_key("blob.endpoint"),
+            "no STS endpoint var for a no-site binding"
+        );
+        assert!(
+            c.defaults.iter().all(|(k, _)| k != "AWS_ACCESS_KEY_ID"),
+            "no AWS_* write credential default for a no-site binding"
+        );
+        // … while the HMAC shim env (full R/W over the private `_compute/{workload}` namespace) stays.
+        assert!(
+            c.vars.contains_key("blob.url"),
+            "HMAC url var still present"
+        );
+        assert!(
+            c.vars.contains_key("blob.token"),
+            "HMAC token var still present"
+        );
+
+        // Proof the HMAC path is confined to the PRIVATE namespace, never the same-named site's tape.
+        let token = c
+            .defaults
+            .iter()
+            .find(|(k, _)| k == "BOATRAMP_BLOB_URL_AUTH_TOKEN")
+            .map(|(_, v)| v.clone())
+            .expect("HMAC token injected");
+        let hmac_scope = shim.authenticate(Some(&token)).await.unwrap();
+        assert_eq!(
+            hmac_scope.site_prefix, "hblob/acme/_compute/api/",
+            "a no-site binding is confined to the private reserved namespace, NOT site `api`'s tape"
+        );
     }
 }

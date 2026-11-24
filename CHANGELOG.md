@@ -36,6 +36,28 @@ versions.
     `writable_root` / `priority`. `boatramp compute bind-blob --site <s>` (the dev/CI loop) is
     unchanged for callers — it now reaches the site's tape through the explicit `site`.
 
+### Security
+
+- **Direct-S3 blob-upload STS write path now anchors on the resolved site, not the workload name
+  (HIGH — tenancy / `Site·Write` write-side bypass).** The explicit-site targeting above fixed the
+  HMAC blob shim's read/write resolution (`BlobShimResolver::scope`), but the **direct-S3 STS mint**
+  path (`contribute_blob_sts`, injected as `AWS_*` credentials for an off-the-shelf S3 client) was a
+  *separate* derivation that still hardcoded the mint scope's site to the **workload name**. The
+  minted write credential therefore anchored at `hblob/{project}/{workload}/{container}/`, ignoring
+  `binding.site` and the `_compute` default — reviving the exact name-match coupling on the **write**
+  side: (1) a no-site `blob` binding on a workload *named after a site* minted an **ungated write
+  credential to that site's real tape** (the `Site·Write` set-time gate only fires for an explicit
+  `binding.site`), and (2) an explicit `@site` share minted creds anchored at the workload name rather
+  than the authorized site, so the gated share was non-functional over the S3 client. Both stayed
+  **within the workload's own project** (not cross-tenant). The STS mint is now anchored on the SAME
+  resolved `BlobScope` the HMAC path uses: an explicit-site binding mints for `MintScope.site =
+  binding.site` (the resource prefix `keypath::container_prefix` composes is pinned byte-identical to
+  the HMAC `site_prefix` + container, failing closed to the HMAC shim on any divergence), and a
+  **no-site binding skips the direct-S3 mint entirely** — its private two-segment
+  `hblob/{project}/_compute/{workload}/` namespace has no single-segment site tape to mint into, and
+  the HMAC shim already provides its full confined R/W, so no S3 write credential to any site tape is
+  issued. Only a `blob-upload`-enabled build with a wired cloud STS minter was affected.
+
 ## [0.72.0] — 2026-11-24
 
 ### Fixed
