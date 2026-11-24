@@ -3234,20 +3234,25 @@ jobs:
           # init DB). Both init a bootstrap SUPERUSER (rolsuper/rolbypassrls) that silently bypasses
           # RLS; the `rls_session` opt-in provisions a STABLE non-superuser app role
           # (ensure_login_role_ddl + grant_app_role_ddl + force_rls_event_trigger_ddl) that OWNS
-          # NOTHING and serves the runtime AS it. On a real PG this file's TWO tests prove, each with a
-          # confined-app-role invariant + a superuser-flip MUTATION leak + the probe classification:
+          # NOTHING and serves the runtime AS it. On a real PG this file's THREE tests prove, each
+          # with an invariant + a MUTATION:
           #   (single) 2 app accounts in one ENABLE-RLS table keyed on app.account_id;
           #   (Shared+default) 2 tenants × 2 accounts keyed on BOTH the injected tenant GUC AND the
           #   app's own account GUC — proving the structural tenant scoping and the app's own RLS
-          #   COEXIST under the non-superuser role. A regression on any arm fails the assertion.
+          #   COEXIST under the non-superuser role;
+          #   (Shared+default CONNECT lockdown / INFO-1) a stray PUBLIC member can connect to the
+          #   server's own init DB BEFORE the lockdown but CANNOT after, while the superuser + rls app
+          #   role keep connecting (idempotent). A regression on any arm fails the assertion.
           cargo test -p boatramp-storage --features sql-postgres \
             --test managed_rls_single_mode_sqlx_live -- --ignored --nocapture 2>&1 | tee rls-single.log
-          grep -qE 'test result: ok\. 2 passed' rls-single.log \
-            || { echo "::error::rls_session superuser-owned-cell gates did not both run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 3 passed' rls-single.log \
+            || { echo "::error::rls_session superuser-owned-cell gates did not all run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
           grep -q 'MANAGED RLS SINGLE-MODE OK \[postgres\]' rls-single.log \
             || { echo "::error::single-mode rls_session invariant never reached its marker (the non-superuser app role leaked cross-account under ENABLE, or the superuser-serving mutation did not leak / the probe did not classify the roles)" >&2; exit 1; }
           grep -q 'MANAGED RLS SHARED-DEFAULT OK \[postgres\]' rls-single.log \
             || { echo "::error::Shared+default rls_session invariant never reached its marker (the tenant+account RLS did not coexist under the non-superuser app role, or the superuser-serving mutation did not leak / the probe did not classify the roles)" >&2; exit 1; }
+          grep -q 'MANAGED RLS SHARED-DEFAULT CONNECT-LOCKDOWN OK \[postgres\]' rls-single.log \
+            || { echo "::error::Shared+default CONNECT lockdown (INFO-1) never reached its marker (the stray role was not blocked by REVOKE CONNECT … FROM PUBLIC, or a legitimate role — superuser / rls app role — lost CONNECT, or the idempotent re-run regressed)" >&2; exit 1; }
       - name: Owner-gated schema-migration owner-role confinement on a real Postgres (v0.4.25)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp

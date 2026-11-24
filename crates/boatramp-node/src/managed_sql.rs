@@ -579,6 +579,57 @@ impl ManagedDbEnv {
         Ok(())
     }
 
+    /// INFO-1 lockdown (Postgres only): strip the shared server's OWN default database of its
+    /// `initdb`-left everyone-in-`PUBLIC`-can-connect grant and re-admit only the principals that
+    /// legitimately reach it — the bootstrap superuser, and (when the cell opts into `rls_session`)
+    /// the STABLE non-superuser app role. Called ONLY from the `Shared` arm of
+    /// [`provision_managed`](ManagedDbEnvResolver::provision_managed), AFTER
+    /// [`provision_rls_app_role`](Self::provision_rls_app_role) so the app role exists before it is
+    /// granted. Every per-tenant NON-default Shared database is already locked down by
+    /// [`provision_shared`](crate::tenant_sql); this closes the one database that path never touches
+    /// (the server's own init DB). A no-op on MySQL (no cluster-wide `PUBLIC` CONNECT default to
+    /// strip). Idempotent — the DDL re-asserts the same grants + revoke every reconcile.
+    ///
+    /// The grants/revoke run on the init SUPERUSER's connection to the server's OWN (default)
+    /// database. `GRANT`/`REVOKE … ON DATABASE` are database-level objects (cluster-visible), and the
+    /// superuser both owns the cell and — being a `rolsuper` — is unaffected by the revoke, so this
+    /// never locks out the connection it runs on.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    async fn lock_down_shared_default_connect(
+        &self,
+        project: &str,
+        workload: &str,
+        db: &ManagedDbSpec,
+        superuser_password: String,
+    ) -> Result<(), String> {
+        use boatramp_storage::tenant_provision::shared_default_db_connect_lockdown_ddl;
+        let stmts =
+            shared_default_db_connect_lockdown_ddl(db.kind, &db.database, &db.user, db.rls_session);
+        // MySQL (and any future engine without a PUBLIC-connect default) emits nothing.
+        if stmts.is_empty() {
+            return Ok(());
+        }
+        let admin = self.admin_backend(
+            project,
+            workload,
+            db.kind,
+            &db.database,
+            &db.user,
+            superuser_password,
+        );
+        for stmt in stmts {
+            admin.run_script(&stmt).await.map_err(|e| {
+                format!("shared default-db connect lockdown on {}: {e}", db.database)
+            })?;
+        }
+        tracing::info!(
+            database = %db.database,
+            rls_session = db.rls_session,
+            "shared+default: locked CONNECT down to the superuser + rls app role (REVOKE … FROM PUBLIC)"
+        );
+        Ok(())
+    }
+
     /// Resolve the launched `(project, workload)` to the [`ManagedDbSpec`] whose
     /// server-init env it needs, consulting BOTH the node-static config and — for an
     /// APPLIED (deploy-store) managed db — the per-project declaration store.
@@ -824,7 +875,18 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
                 // they get their own non-owner runtime role via `provision_shared` (lazy, on first
                 // resolve), and `rls_session` there is already load-bearing via that non-owner role.
                 // Default off ⇒ no role, serve-as-superuser (byte-identical to today).
-                self.provision_rls_app_role(project, workload, &db, password)
+                self.provision_rls_app_role(project, workload, &db, password.clone())
+                    .await?;
+                // INFO-1 (Shared+default RLS review): the shared server's OWN default database is
+                // created by the image's `initdb`, which leaves Postgres's default
+                // everyone-in-PUBLIC-can-connect grant in place — so a stray per-tenant cluster role
+                // (a member of PUBLIC) can CONNECT to it even though every NON-default Shared database
+                // is already `REVOKE CONNECT … FROM PUBLIC`-locked by `provision_shared`. It reads
+                // nothing today (no table grants, RLS binds the non-superuser app role, PG ≥ 15 has no
+                // PUBLIC CREATE), so this is belt-and-suspenders, not a live leak. Close it by running
+                // the SAME lockdown on the default DB: re-admit the superuser (+ the rls app role when
+                // opted in), then REVOKE CONNECT FROM PUBLIC. Postgres-only; idempotent per reconcile.
+                self.lock_down_shared_default_connect(project, workload, &db, password)
                     .await
             }
             // A dedicated per-tenant (or single-install) container: ensure its declared
