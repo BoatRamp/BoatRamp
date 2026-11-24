@@ -631,7 +631,7 @@ boatramp compute set app --image myapp:latest --port 8080 \
 | --- | --- | --- |
 | `sql` / `sql:<name>` | The site's default database, or a named external one. | `BOATRAMP_SQL_URL` |
 | `kv` / `kv:<bucket>` | The per-site `hkv/{site}/…` key/value store (default bucket, or one named bucket). | `BOATRAMP_KV_URL` |
-| `blob` / `blob:<container>` | The per-site `hblob/{site}/…` blob store (default, or one named container). | `BOATRAMP_BLOB_URL` |
+| `blob` / `blob:<container>` | The workload's PRIVATE `hblob/{project}/_compute/{workload}/…` blob namespace (whole, or one named container); share a site's tape with `@<site>` — see below. | `BOATRAMP_BLOB_URL` |
 | `messaging` / `messaging:<topic>` | BOTH halves of the project bus — publish AND consume (claim/ack/nack). | `BOATRAMP_MESSAGING_URL` |
 | `invoke` | Compute → function calls. **Declared only** — it parses and round-trips, but no shim backs it yet, so no env is injected (Phase 3). | — |
 
