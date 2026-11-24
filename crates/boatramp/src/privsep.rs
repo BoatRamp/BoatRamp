@@ -288,44 +288,51 @@ pub const NODE_SELF_HOST_VM_DATA_HOLDER_MARKER: &str =
 /// [`resolve_spawn_backend`]'s substrate gate: keyed on the serve mode, decided BEFORE any allocation.
 /// Pure (host-testable).
 ///
-/// **Phase-5 P5-2 (this cut) — the READ-PLANE increment.** `node_serve = node-self-host` is now
-/// ADMITTED for the P5-2 shape: the node's own READ data plane served by a `backend.*` data-holder
-/// instance confined to a LIGHTWEIGHT, shared-net substrate (`os-process` / `container` Option C),
-/// reached by a `listen.*` frontend over the splice (the authority-scoped node app router,
-/// [`instance_serve::NodeServeHandler`], runs LIVE on the backend serve path — design §1). The ONE
-/// composition constraint P5-2 enforces here is the VM-data-holder refusal
-/// ([`check_node_self_host_read_plane`]): a `backend.*` data-holder on `substrate: vm` is refused
-/// fail-closed, because a confined guest cannot reach its store without the owner-gated P5-5 data-reach
-/// mechanism (§3a). Everything the read plane cannot yet serve — a write/mutation surface, a
-/// crown-jewel or backend RELAY — is refused fail-closed PER REQUEST by the router (never a stubbed
-/// 200), so admitting the mode never silently downgrades an unbuilt surface.
+/// **Phase-5 P5-2 + P5-3 — the node DATA PLANE (read + control-plane mutation).** `node_serve =
+/// node-self-host` is ADMITTED for the data-plane shape: the node's own data plane served by a
+/// `backend.*` data-holder instance confined to a LIGHTWEIGHT, shared-net substrate (`os-process` /
+/// `container` Option C), reached by a `listen.*` frontend over the splice (the authority-scoped node
+/// app router, [`instance_serve::NodeServeHandler`], runs LIVE on the backend serve path — design §1).
+/// P5-2 wired the READ surface (a real `resolve_site_by_host` read); P5-3 adds the control-plane
+/// MUTATION surface under the `backend.kv` sandbox — a boot write-plane self-validation
+/// ([`instance_serve::NodeDataPlane::validate_write_plane`]) proves the durable-write/checkpoint/GC path
+/// survives the Landlock+seccomp profile, while a CLIENT mutation still fails closed per request
+/// (serving it needs the end-principal re-validation + the control.admin-api→crown-jewel relay — the
+/// remaining P5-3 work). The ONE composition constraint this gate enforces is the VM-data-holder
+/// refusal ([`check_node_self_host_data_plane`]): a `backend.*` data-holder on `substrate: vm` is
+/// refused fail-closed, because a confined guest cannot reach its store without the owner-gated P5-5
+/// data-reach mechanism (§3a). Everything the data plane cannot yet serve — an unauthorized client
+/// mutation, a crown-jewel or backend RELAY — is refused fail-closed PER REQUEST by the router (never a
+/// stubbed 200), so admitting the mode never silently downgrades an unbuilt surface.
 ///
 /// [`NodeServeMode::is_wired`] stays `false` for `NodeSelfHost`: it tracks the FULL self-host serve
-/// path (control-plane mutations, the gateway, the node-own handler engine — Phase-5 P5-3..P5-5), which
-/// is NOT wired; P5-2 wires only the read plane. The gate therefore keys on the mode + the P5-2 shape,
-/// not on `is_wired`.
+/// path (the SERVED control-plane mutation, the gateway, the node-own handler engine — Phase-5
+/// P5-3-serve..P5-5), which is NOT wired; this cut wires the read plane + the write SURFACE under the
+/// sandbox. The gate therefore keys on the mode + the data-plane shape, not on `is_wired`.
 fn check_node_self_host_gate(privsep: &PrivsepConfig) -> Result<(), PrivsepError> {
     if !privsep.node_serve.is_node_self_host() {
         // `guest-workloads` (the wired default): a no-op — every pre-Phase-5 composition is unchanged.
         return Ok(());
     }
-    // `node-self-host` (P5-2 read plane): admit the lightweight-substrate shape; refuse a VM data-holder.
-    check_node_self_host_read_plane(privsep)
+    // `node-self-host`: admit the lightweight-substrate data-plane shape; refuse a VM data-holder.
+    check_node_self_host_data_plane(privsep)
 }
 
-/// The Phase-5 P5-2 read-plane shape lint: a `node_serve = node-self-host` composition may run its
+/// The Phase-5 P5-2/P5-3 data-plane shape lint: a `node_serve = node-self-host` composition may run its
 /// `backend.*` DATA-HOLDER instances only on a LIGHTWEIGHT, shared-net substrate (`os-process` /
 /// `container`), never a `vm` (design §3a — the VM data-holder's egress/secret-blindness problem is
-/// the owner-gated P5-5 question). Refuses fail-closed, naming every offending instance, with the
+/// the owner-gated P5-5 question). The constraint is identical for the read surface (P5-2) and the
+/// control-plane mutation surface (P5-3) — both run the `backend.kv` store in the data-holder's address
+/// space over the shared net namespace. Refuses fail-closed, naming every offending instance, with the
 /// greppable [`NODE_SELF_HOST_VM_DATA_HOLDER_MARKER`].
 ///
 /// This is a Phase-5-worded, DEFENCE-IN-DEPTH refusal: a `backend.*` on `vm` is ALSO refused — for
 /// every `node_serve` mode — by [`check_vm_secret_blindness_closure`]'s Tier-3 scope lint
 /// (`VmInstanceOutsideApprovedScope`, run at `plan_root` step 2b-vm, BEFORE this gate) and by
-/// [`resolve_spawn_backend`]'s VM-shape gate at spawn. Keeping an explicit P5-2 clause here documents
-/// the read-plane's substrate contract at its own gate and guards against a future reordering that
+/// [`resolve_spawn_backend`]'s VM-shape gate at spawn. Keeping an explicit clause here documents
+/// the data-plane's substrate contract at its own gate and guards against a future reordering that
 /// might move this check ahead of the S2 lint. Pure (host-testable).
-fn check_node_self_host_read_plane(privsep: &PrivsepConfig) -> Result<(), PrivsepError> {
+fn check_node_self_host_data_plane(privsep: &PrivsepConfig) -> Result<(), PrivsepError> {
     let vm_data_holders: Vec<String> = privsep
         .instances
         .iter()
@@ -340,8 +347,9 @@ fn check_node_self_host_read_plane(privsep: &PrivsepConfig) -> Result<(), Privse
     }
     Err(PrivsepError::NodeSelfHostVmDataHolder(format!(
         "composition selects `node_serve = node-self-host` but places backend.* data-holder \
-         instance(s) {vm_data_holders:?} on the `vm` substrate; the P5-2 read plane runs data-holders \
-         only on the lightweight shared-net substrates (`os-process` / `container`)"
+         instance(s) {vm_data_holders:?} on the `vm` substrate; the node data plane (P5-2 read + P5-3 \
+         control-plane mutation) runs data-holders only on the lightweight shared-net substrates \
+         (`os-process` / `container`)"
     )))
 }
 
@@ -4157,32 +4165,76 @@ mod instance_serve {
     ) -> Result<BackendHandler, String> {
         let reachable = super::derive_node_reachability(config, label);
         let router = NodeServeRouter::new(gate, reachable);
-        let read_plane = build_node_read_plane(label, gate, config).await?;
+        let data_plane = build_node_data_plane(label, gate, config).await?;
+        // P5-3: BEFORE serving a byte, a `backend.kv` data-holder self-validates the control-plane
+        // store MUTATION path under its installed Landlock+seccomp profile (a durable put + checkpoint +
+        // GC + read-back + durable delete on a reserved key). This proves the write/flush/compaction/GC
+        // object-store surface a READ never touches survives the sandbox; a fail-closed EACCES here
+        // EXITS the instance → the root's `FailNodeClosed` tears the node down LOUDLY at boot, rather
+        // than standing up a data-holder that silently refuses every future control-plane write. A
+        // non-`backend.kv` instance's data plane is `Refusing` → the probe is a no-op. Bounded by the
+        // SAME fail-loud 30s timeout as the store open (a grant/path-mismatch EACCES makes the retrying
+        // object store spin forever instead of returning `Err`), matching the per-tenant supervisor.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            data_plane.validate_write_plane(),
+        )
+        .await
+        {
+            Ok(WriteOutcome::Applied) => {
+                tracing::info!(
+                    instance = %label,
+                    "[privsep] node-self-host backend (P5-3): control-plane write plane self-validated \
+                     under the backend.kv Landlock/seccomp profile (durable put + checkpoint + GC + \
+                     read-back + delete, no fail-closed EACCES)"
+                );
+            }
+            Ok(WriteOutcome::Unavailable(why)) => {
+                return Err(format!(
+                    "node-self-host write plane: the control-plane store MUTATION path failed under \
+                     the backend.kv Landlock/seccomp profile ({why}). The most likely cause is that \
+                     the `backend.kv` rw grant does not cover a write/compaction/GC object-store path \
+                     under `<data_dir>/kv-slate` (see `sandbox::backend_state_subdir(BackendKv)`), or a \
+                     killed write syscall. Failing closed so the instance exits → FailNodeClosed fires."
+                ));
+            }
+            Err(_) => {
+                return Err(
+                    "node-self-host write plane: the control-plane store MUTATION self-validation timed \
+                     out after 30s under the backend.kv Landlock/seccomp profile — a write is stuck. \
+                     The most likely cause is a `backend.kv` rw-grant/store-path mismatch EACCES that \
+                     the retrying object store spins on forever. Failing closed so the instance exits → \
+                     FailNodeClosed fires."
+                        .to_string(),
+                );
+            }
+        }
         Ok(BackendHandler::SelfHost(NodeServeHandler::new(
-            router, read_plane,
+            router, data_plane,
         )))
     }
 
-    /// Build the P5-2 node READ PLANE for a data-holder instance: the held `backend.kv` control-plane
-    /// store (a [`DeployStore`](boatramp_core::deploy::DeployStore) over the node KV + blob `Storage`),
-    /// opened UNDER this instance's Landlock grant by REUSING [`build_routing_deploy_store`] (the exact
-    /// node control-plane store the per-tenant router opens). An instance that does NOT hold `backend.kv`
-    /// gets a [`NodeReadPlane::Refusing`] placeholder — the router never routes a read to it (a non-held
-    /// surface is a relay/refuse, not a local serve), so the placeholder is defensive, never reached.
+    /// Build the node DATA PLANE for a data-holder instance (P5-2 read + P5-3 write): the held
+    /// `backend.kv` control-plane store (a [`DeployStore`](boatramp_core::deploy::DeployStore) over the
+    /// node KV + blob `Storage`), opened UNDER this instance's Landlock grant by REUSING
+    /// [`build_routing_deploy_store`] (the exact node control-plane store the per-tenant router opens).
+    /// An instance that does NOT hold `backend.kv` gets a [`NodeDataPlane::Refusing`] placeholder — the
+    /// router never routes a data surface to it (a non-held surface is a relay/refuse, not a local
+    /// serve), so the placeholder is defensive, never reached.
     ///
-    /// **Live-gated (lighthouse).** Whether the real control-plane store actually opens + reads under the
-    /// derived per-capability seccomp/Landlock profile (vs. a fail-closed `EPERM` the `MinimalHandler`
-    /// stub never surfaced) is the single biggest P5-2 unknown and can only be confirmed by a live run
-    /// on Linux (design §5; memory `ship-the-fix-not-the-incident`). Host tests inject a
-    /// [`NodeReadPlane::Deploy`] over an in-memory store, which exercises the router + read serve on the
-    /// real apply path WITHOUT the fork/sandbox/pool-open — that remains the live gate's job.
-    async fn build_node_read_plane(
+    /// **Live-gated (lighthouse).** Whether the real control-plane store actually opens + reads (P5-2)
+    /// AND mutates (P5-3 — see [`NodeDataPlane::validate_write_plane`]) under the derived per-capability
+    /// seccomp/Landlock profile (vs. a fail-closed `EPERM` the `MinimalHandler` stub never surfaced) can
+    /// only be confirmed by a live run on Linux (design §5; memory `ship-the-fix-not-the-incident`).
+    /// Host tests inject a [`NodeDataPlane::Deploy`] over an in-memory store, which exercises the router
+    /// + serve on the real apply path WITHOUT the fork/sandbox/pool-open — that remains the live gate's job.
+    async fn build_node_data_plane(
         label: &str,
         gate: &MaterializationGate,
         config: &ServerConfig,
-    ) -> Result<NodeReadPlane, String> {
+    ) -> Result<NodeDataPlane, String> {
         if !gate.may_materialize(HostAuthority::BackendKv) {
-            return Ok(NodeReadPlane::Refusing);
+            return Ok(NodeDataPlane::Refusing);
         }
         tracing::info!(
             instance = %label,
@@ -4216,7 +4268,7 @@ mod instance_serve {
                 );
             }
         };
-        Ok(NodeReadPlane::Deploy(store))
+        Ok(NodeDataPlane::Deploy(store))
     }
 
     /// Serve one received client connection with the hand-rolled HTTP/1+2 stack (the same
@@ -4390,44 +4442,58 @@ mod instance_serve {
         }
     }
 
-    /// The node app-router HANDLER (design §Phase-5 P5-2): the [`boatramp_http::Handler`] a data-holder
-    /// instance constructs from its [`MaterializationGate`] + the live reachability map + the node read
-    /// plane to serve the node's OWN serve path under `node_serve = node-self-host`, REPLACING
-    /// [`MinimalHandler`]. For each request it CLASSIFIES the serve surface
-    /// ([`classify_request_surface`]), makes the authority-scoped [`NodeRoute`] decision, and EXECUTES
-    /// it — serving a real read from the held data plane for a HELD data-plane READ surface, and
-    /// fail-closing every surface the P5-2 read plane does not yet serve. Cheaply cloneable (the router
-    /// is [`Clone`]; the read plane is `Arc`-backed) so it is cloned into each connection task.
+    /// The node app-router HANDLER (design §Phase-5 P5-2/P5-3): the [`boatramp_http::Handler`] a
+    /// data-holder instance constructs from its [`MaterializationGate`] + the live reachability map +
+    /// the node data plane to serve the node's OWN serve path under `node_serve = node-self-host`,
+    /// REPLACING [`MinimalHandler`]. For each request it decomposes the per-authority [`RequestPlan`]
+    /// ([`classify_request`]), routes EACH sub-op through the authority-scoped [`NodeRoute`] decision,
+    /// and EXECUTES it — serving a real read from the held data plane for a HELD data-plane READ
+    /// surface, and fail-closing every surface this cut does not yet serve (a client control mutation,
+    /// a relay). Cheaply cloneable (the router is [`Clone`]; the data plane is `Arc`-backed) so it is
+    /// cloned into each connection task.
     #[derive(Clone)]
     pub(super) struct NodeServeHandler {
         router: NodeServeRouter,
-        read_plane: NodeReadPlane,
+        data_plane: NodeDataPlane,
     }
 
     impl NodeServeHandler {
-        /// Construct the handler around the instance's [`NodeServeRouter`] + node read plane.
-        pub(super) fn new(router: NodeServeRouter, read_plane: NodeReadPlane) -> Self {
-            Self { router, read_plane }
+        /// Construct the handler around the instance's [`NodeServeRouter`] + node data plane.
+        pub(super) fn new(router: NodeServeRouter, data_plane: NodeDataPlane) -> Self {
+            Self { router, data_plane }
         }
 
-        /// Serve ONE classified request through the authority-scoped router (the live P5-2 apply path).
-        /// Takes OWNED inputs (`surface`, `is_read`, `host`) extracted from the request BEFORE any await,
-        /// so the future holds no `&Request` across the await and stays `Send` (the `Handler` bound) —
+        /// Serve ONE classified request through the authority-scoped router (the live apply path). Takes
+        /// the OWNED [`RequestPlan`] + `host` extracted from the request BEFORE any await, so the future
+        /// holds no `&Request` across the await and stays `Send` (the `Handler` bound) —
         /// `http::Request<ReqBody>` is not `Sync`. Split out so host tests can drive it directly: it
-        /// routes the surface and either serves the held data-plane read or refuses fail-closed (never a
-        /// stub 200 for a surface P5-2 does not serve).
-        pub(super) async fn serve_surface(
+        /// routes each of the plan's per-authority sub-ops and either serves the held read or fail-closes
+        /// (never a stub 200 for a surface this cut does not serve).
+        pub(super) async fn serve_request(
+            &self,
+            plan: RequestPlan,
+            host: String,
+        ) -> boatramp_http::Response {
+            match plan {
+                RequestPlan::Read(surface) => self.serve_read(surface, host).await,
+                RequestPlan::ControlMutation { authorize, write } => {
+                    self.serve_control_mutation(authorize, write, host).await
+                }
+            }
+        }
+
+        /// Serve a P5-2 READ surface: a HELD `backend.kv` read is served from the held control-plane
+        /// store; any other route (relay / refuse / a non-data held surface) fail-closes (503), never a
+        /// stubbed 200 — the "no silent downgrade" invariant.
+        async fn serve_read(
             &self,
             surface: HostAuthority,
-            is_read: bool,
             host: String,
         ) -> boatramp_http::Response {
             let route = self.router.route(surface);
             match &route {
-                // A HELD data-plane READ surface: serve the node's own read from the held control-plane
-                // store. This is the P5-2 read-only data plane (design §2 P5-2).
-                NodeRoute::Local(authority) if is_read && authority.is_backend() => {
-                    match self.read_plane.resolve_domain(&host).await {
+                NodeRoute::Local(authority) if authority.is_backend() => {
+                    match self.data_plane.resolve_domain(&host).await {
                         ReadOutcome::Resolved => boatramp_http::response(
                             200,
                             format!(
@@ -4456,24 +4522,84 @@ mod instance_serve {
                         }
                     }
                 }
-                // Everything else the P5-2 read plane does NOT yet serve: a non-read method on a held
-                // data surface (a write — P5-3), a held non-data surface (control/exec), or any RELAY /
-                // REFUSE. Fail-closed (503), never a stubbed 200 — the "no silent downgrade" invariant.
                 other => {
                     tracing::info!(
                         surface = %surface.tag(),
-                        is_read,
                         route = ?other,
-                        "[privsep] node-self-host: surface not served by the P5-2 read plane — \
-                         refusing fail-closed (write / control / relay are P5-3..P5-5)"
+                        "[privsep] node-self-host: read surface not served by this instance — \
+                         refusing fail-closed (relay reads are P5-4+)"
                     );
                     fail_closed_response(&format!(
-                        "surface {} ({:?}) is not served by the Phase-5 P5-2 read plane",
+                        "read surface {} ({:?}) is not served by this node-self-host instance",
                         surface.tag(),
                         other
                     ))
                 }
             }
+        }
+
+        /// Serve a P5-3 control-plane MUTATION — decomposed into its `authorize` (`control.admin-api`)
+        /// and `write` (`backend.kv`) sub-ops (INFO-2). Route EACH independently; if ANY sub-op is
+        /// unsatisfiable by this composition (`Refuse` — neither held nor reachable), fail the WHOLE
+        /// request closed with a hard 5xx (INFO-2 + INFO-3), NEVER collapsing to the satisfiable half
+        /// (so a `backend.kv`-holding instance that cannot reach any `control.admin-api` authorizer does
+        /// NOT serve the write). When both sub-ops ARE satisfiable, the client-reachable mutation STILL
+        /// fails closed in this cut: serving it requires the end-principal AuthorityContext + PoP
+        /// re-validation (design §4 item 6) and the cross-instance `control.admin-api`→crown-jewel relay
+        /// (design §2 P5-3), NEITHER wired yet — so an unauthenticated client can never drive a
+        /// control-plane write through this path. The write SURFACE itself (the Landlock mutation path)
+        /// is proven at boot by [`NodeDataPlane::validate_write_plane`], not by this client path.
+        async fn serve_control_mutation(
+            &self,
+            authorize: HostAuthority,
+            write: HostAuthority,
+            host: String,
+        ) -> boatramp_http::Response {
+            let authorize_route = self.router.route(authorize);
+            let write_route = self.router.route(write);
+            // INFO-2: a sub-op the composition cannot satisfy fails the WHOLE request closed — never a
+            // partial serve of the held half.
+            for (name, authority, route) in [
+                ("authorization", authorize, &authorize_route),
+                ("data-write", write, &write_route),
+            ] {
+                if let NodeRoute::Refuse(_) = route {
+                    tracing::warn!(
+                        sub_op = name,
+                        surface = %authority.tag(),
+                        %host,
+                        authorize_route = ?authorize_route,
+                        write_route = ?write_route,
+                        "[privsep] node-self-host control mutation: a sub-op is neither held nor \
+                         reachable — refusing the WHOLE request fail-closed (INFO-2, never a partial \
+                         serve)"
+                    );
+                    return fail_closed_response(&format!(
+                        "control-plane mutation refused: the {name} sub-op ({}) is neither held nor \
+                         reachable in this composition (a composition-closure gap fails the whole \
+                         request closed, never a partial serve)",
+                        authority.tag()
+                    ));
+                }
+            }
+            // Both sub-ops are satisfiable, but the SERVED, authorized mutation is the remaining P5-3
+            // work (end-principal re-validation + the control.admin-api→crown-jewel relay). Fail closed
+            // (INFO-3) — a client can never drive an unauthorized control-plane write here. The write
+            // surface under the sandbox is proven by the boot self-validation, not this path.
+            tracing::info!(
+                %host,
+                authorize_route = ?authorize_route,
+                write_route = ?write_route,
+                "[privsep] node-self-host control mutation: sub-ops routable, but the served authorized \
+                 mutation (end-principal re-validation + control.admin-api→crown-jewel relay) is the \
+                 remaining P5-3 work — refusing fail-closed (the write surface is boot-self-validated)"
+            );
+            fail_closed_response(
+                "control-plane mutation serve is not yet wired: it requires the end-principal \
+                 AuthorityContext + PoP re-validation and the control.admin-api→crown-jewel relay (the \
+                 remaining P5-3 work). The backend.kv write surface itself is proven under the sandbox \
+                 by the boot write-plane self-validation.",
+            )
         }
     }
 
@@ -4481,10 +4607,10 @@ mod instance_serve {
         async fn handle(&self, req: boatramp_http::Request) -> boatramp_http::Response {
             // Extract everything from the (non-`Sync`) request SYNCHRONOUSLY, before any await, so no
             // `&Request` is held across the await (the `Handler::handle` future must be `Send`).
-            let (surface, is_read) = classify_request_surface(&req);
+            let plan = classify_request(&req);
             let host = request_host(&req);
             drop(req);
-            self.serve_surface(surface, is_read, host).await
+            self.serve_request(plan, host).await
         }
     }
 
@@ -4508,19 +4634,41 @@ mod instance_serve {
         Unavailable(String),
     }
 
-    /// The node READ PLANE a `node-self-host` data-holder serves its P5-2 read surface from: the held
-    /// `backend.kv` control-plane store (a [`DeployStore`](boatramp_core::deploy::DeployStore)). Cloneable
-    /// (the store is `Arc`-backed); [`NodeReadPlane::Refusing`] is the placeholder for an instance that
-    /// holds no `backend.kv` (the router never routes a read to it, so it is never reached for a held read).
+    /// The reserved control-plane KV key the P5-3 write-plane boot self-validation round-trips. The
+    /// `_`-prefix marks it a reserved INTERNAL feed — the same convention as the `_cp/` / `_inval/`
+    /// coordination feeds [`boatramp_core::kv_dump::is_reserved_dump_key`] filters out — so it never
+    /// collides with a `domain/` / `project/` / `manifests/` deploy key; the probe DELETES it when
+    /// done, so a healthy node leaves only a GC-reclaimable tombstone. A `{pid}` suffix keeps two
+    /// concurrent nodes / live-gate runs sharing a `data_dir` from racing the same key.
+    pub(super) const WRITE_PLANE_PROBE_KEY_PREFIX: &str = "_privsep/selfhost/writeplane-probe";
+
+    /// The outcome of the node WRITE plane's boot self-validation (the held control-plane store's
+    /// MUTATION path). `Applied` ⇒ the full durable-write → checkpoint → GC → read-back → durable-
+    /// delete round-trip completed under the sandbox; `Unavailable` ⇒ it could not (a store error — the
+    /// load-bearing case being a `backend.kv` Landlock-grant/store-path mismatch EACCES) — fail-closed.
+    pub(super) enum WriteOutcome {
+        /// The control-plane store mutation round-trip completed durably under the sandbox.
+        Applied,
+        /// The mutation could not be performed (store error / no write authority) — fail-closed.
+        Unavailable(String),
+    }
+
+    /// The node DATA PLANE a `node-self-host` data-holder serves its own data plane from: the held
+    /// `backend.kv` control-plane store (a [`DeployStore`](boatramp_core::deploy::DeployStore)), used for
+    /// both the P5-2 READ surface ([`resolve_domain`](Self::resolve_domain)) and the P5-3 control-plane
+    /// MUTATION surface ([`validate_write_plane`](Self::validate_write_plane)). Cloneable (the store is
+    /// `Arc`-backed); [`NodeDataPlane::Refusing`] is the placeholder for an instance that holds no
+    /// `backend.kv` (the router never routes a data surface to it, so it is never reached for a held one).
     #[derive(Clone)]
-    pub(super) enum NodeReadPlane {
-        /// Backed by the held control-plane deploy store (KV + blob), which `resolve_site_by_host` reads.
+    pub(super) enum NodeDataPlane {
+        /// Backed by the held control-plane deploy store (KV + blob): `resolve_site_by_host` reads it,
+        /// and the P5-3 write-plane self-validation mutates it (durable put + checkpoint + GC).
         Deploy(boatramp_core::deploy::DeployStore),
-        /// No read authority held — every read fail-closes (defensive; never reached for a held read).
+        /// No data authority held — every surface fail-closes (defensive; never reached for a held one).
         Refusing,
     }
 
-    impl NodeReadPlane {
+    impl NodeDataPlane {
         /// Resolve a `Host` against the control-plane deploy table via the PUBLIC
         /// [`DeployStore::resolve_site_by_host`](boatramp_core::deploy::DeployStore::resolve_site_by_host)
         /// read path (it canonicalizes the host and walks the control-plane KV — a genuine `backend.kv`
@@ -4542,21 +4690,133 @@ mod instance_serve {
                 ),
             }
         }
+
+        /// **P5-3 WRITE-PLANE boot self-validation (the Landlock MUTATION surface).** Exercise the REAL
+        /// control-plane store MUTATION path end-to-end against the held `backend.kv` store, UNDER this
+        /// instance's per-capability seccomp/Landlock profile, and fail closed on any error. This is the
+        /// P5-3 counterpart to P5-2's read-plane open: a READ (`resolve_domain`) touches only the
+        /// manifest + the referenced SSTs, but a MUTATION drives the SlateDB WAL write, the memtable
+        /// freeze to an L0 SST + the manifest rewrite (`checkpoint`), and the online GC's directory
+        /// list + delete (`maintenance_gc` → `kv_physical_stats` + `kv_gc_online`) — object-store paths a
+        /// read never exercises. All of them live under `<data_dir>/kv-slate` (object_store's
+        /// `LocalFileSystem` roots there; its atomic put writes a temp file + hard-links it, all within
+        /// the prefix), which is exactly the `backend.kv` rw grant
+        /// ([`sandbox::backend_state_subdir`](boatramp_server::sandbox::backend_state_subdir) = `kv-slate`,
+        /// pre-created before the ruleset install so the grant canonicalizes). The seccomp ALLOW set a
+        /// `backend.kv` holder keeps already includes `fsync`/`fdatasync`/`ftruncate`/`fallocate`/
+        /// `rename*`/`unlink*`/`link*` (they are in the Phase-0 base, not capability-gated). So the wall
+        /// SHOULD permit a mutation — but that is a claim only a LIVE run on a real Landlock kernel can
+        /// settle (a grant/path mismatch EACCES-denies the write and the retrying object store spins on
+        /// it forever); a host unit test over a tempdir is a FALSE GREEN here. The lighthouse live gate
+        /// (`privsep_node_self_host_write_plane_serves_end_to_end`) is the decisive proof.
+        ///
+        /// **Authenticated by construction** — the node runs this at stand-up on a RESERVED, cleaned-up
+        /// key ([`WRITE_PLANE_PROBE_KEY_PREFIX`]), NEVER on a client's behalf; it mirrors the signer's
+        /// boot key self-test. It is NOT the served control-plane mutation path (that is gated on the
+        /// end-principal re-validation + the `control.admin-api`→crown-jewel relay — the remaining P5-3
+        /// work; a client mutation fails closed, see [`NodeServeHandler::serve_control_mutation`]). Its
+        /// sole job is to prove the `backend.kv` Landlock MUTATION surface before the instance serves a
+        /// byte, so a sandbox that denies a write FailNodeCloses the node LOUDLY at boot rather than
+        /// silently refusing every future control-plane write.
+        pub(super) async fn validate_write_plane(&self) -> WriteOutcome {
+            let store = match self {
+                Self::Deploy(store) => store,
+                // A non-`backend.kv` instance has no write plane to validate — the gate never routes a
+                // data mutation to it. A no-op (never reached for a held data surface).
+                Self::Refusing => return WriteOutcome::Applied,
+            };
+            let kv = store.kv();
+            let probe = format!("{WRITE_PLANE_PROBE_KEY_PREFIX}/{}", std::process::id());
+            let v1 = b"boatramp privsep node-self-host write-plane probe v1".to_vec();
+            let v2 = b"boatramp privsep node-self-host write-plane probe v2".to_vec();
+
+            // (1) Durable put (WAL write) + checkpoint (freeze the memtable to an L0 SST + rewrite the
+            //     manifest), then a SECOND durable put that SUPERSEDES it — so the first version's SST +
+            //     the superseded manifest become reclaimable, giving the GC pass below a real object to
+            //     delete (not just a directory walk).
+            if let Err(e) = kv.put_durable_checkpointed(&probe, v1).await {
+                return WriteOutcome::Unavailable(format!("control-plane durable put (v1): {e}"));
+            }
+            if let Err(e) = kv.put_durable_checkpointed(&probe, v2.clone()).await {
+                return WriteOutcome::Unavailable(format!("control-plane durable put (v2): {e}"));
+            }
+            // (2) Read-back: the acked write is durable AND visible (a real round-trip, not a blind put).
+            match kv.get(&probe).await {
+                Ok(Some(got)) if got == v2 => {}
+                Ok(other) => {
+                    return WriteOutcome::Unavailable(format!(
+                        "control-plane write-plane read-back mismatch (got {} bytes, expected {})",
+                        other.map(|v| v.len()).unwrap_or(0),
+                        v2.len()
+                    ));
+                }
+                Err(e) => {
+                    return WriteOutcome::Unavailable(format!(
+                        "control-plane write-plane read-back: {e}"
+                    ));
+                }
+            }
+            // (3) Online maintenance GC: list + delete over the `wal/`/`compacted/`/`manifest/`/
+            //     `compactions/` subtrees (via `kv_physical_stats` + `kv_gc_online`) — the compaction/GC
+            //     object-store surface a read never touches. `min_age = 0` is PROBE-ONLY and safe here:
+            //     the `backend.kv` instance is the SOLE writer and this runs at stand-up BEFORE any
+            //     client is served, so no reader can be mid-scan on a young object — which maximizes
+            //     coverage by making the just-superseded v1 object eligible for deletion (exercising the
+            //     GC delete path, not just the directory walk).
+            if let Err(e) = kv.maintenance_gc(std::time::Duration::from_secs(0)).await {
+                return WriteOutcome::Unavailable(format!("control-plane maintenance GC: {e}"));
+            }
+            // (4) Durable delete (tombstone + checkpoint) — leave the control-plane store clean. A
+            //     deploy export never copies the key (it is deleted + `_`-reserved-prefixed), so a
+            //     healthy node leaves no durable trace of the probe.
+            if let Err(e) = kv.delete_checkpointed(&probe).await {
+                return WriteOutcome::Unavailable(format!("control-plane durable delete: {e}"));
+            }
+            WriteOutcome::Applied
+        }
     }
 
-    /// Classify a request into (the serve surface its route needs, whether it is a SAFE READ). P5-2's
-    /// read plane serves only the data-plane READ surface; this maps a safe method (`GET`/`HEAD`) to
-    /// the `backend.kv` read surface and any other (mutating) method to the `control.admin-api` write
-    /// surface, which the router then routes (and the handler fail-closes under P5-2). Deliberately
-    /// coarse — the full method/path → surface map is a P5-3+ follow-on; P5-2 needs only the read vs.
-    /// not-read split. Pure (host-testable).
-    pub(super) fn classify_request_surface(req: &boatramp_http::Request) -> (HostAuthority, bool) {
+    /// The per-authority SUB-OPERATIONS a request decomposes into (P5-2 review INFO-2). A request may
+    /// need MORE THAN ONE authority; the node app router must route EACH sub-op independently and fail
+    /// the WHOLE request closed if ANY is unsatisfiable — NEVER collapse a multi-authority request to a
+    /// single "dominant" authority (that would serve the held half of a request whose other half the
+    /// composition cannot authorize). [`NodeServeHandler`] routes each surface below through the same
+    /// [`NodeServeRouter`] and fail-closes the whole request if any routes to a non-served decision.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum RequestPlan {
+        /// A SAFE READ (`GET`/`HEAD`): one sub-op — the `backend.kv` public data-plane read surface
+        /// (the host→deploy map). Served by the P5-2 read plane when the surface is HELD.
+        Read(HostAuthority),
+        /// A control-plane MUTATION (any non-safe method). Decomposed (INFO-2) into its two sub-ops: the
+        /// `control.admin-api` AUTHORIZATION surface (the end-principal authz + orchestration) and the
+        /// `backend.kv` data-WRITE surface (the durable control-plane store mutation). BOTH must be
+        /// satisfiable (held locally, or soundly reachable) or the whole request fails closed. The
+        /// served, authorized mutation is the remaining P5-3 work; the write surface ITSELF is proven
+        /// under the sandbox by the boot write-plane self-validation ([`NodeDataPlane::validate_write_plane`]).
+        ControlMutation {
+            /// The authorization / orchestration sub-op — `control.admin-api`.
+            authorize: HostAuthority,
+            /// The data-write sub-op — `backend.kv` (the control-plane deploy/routing store).
+            write: HostAuthority,
+        },
+    }
+
+    /// Classify a request into its per-authority [`RequestPlan`] decomposition. A safe method
+    /// (`GET`/`HEAD`) is a single-sub-op `backend.kv` READ; any other (mutating) method is a
+    /// control-plane MUTATION decomposed into the `control.admin-api` authorization + the `backend.kv`
+    /// data-write sub-ops (INFO-2). Deliberately COARSE on the method axis — the full method/path →
+    /// operation map (and a mint/sign operation's additional crown-jewel sub-op) is a P5-3+ follow-on;
+    /// this cut needs the read-vs-mutation split + the mutation's two-authority decomposition. Pure
+    /// (host-testable).
+    pub(super) fn classify_request(req: &boatramp_http::Request) -> RequestPlan {
         let method = req.method().as_str();
-        let is_read = matches!(method, "GET" | "HEAD");
-        if is_read {
-            (HostAuthority::BackendKv, true)
+        if matches!(method, "GET" | "HEAD") {
+            RequestPlan::Read(HostAuthority::BackendKv)
         } else {
-            (HostAuthority::ControlAdminApi, false)
+            RequestPlan::ControlMutation {
+                authorize: HostAuthority::ControlAdminApi,
+                write: HostAuthority::BackendKv,
+            }
         }
     }
 
@@ -5502,17 +5762,18 @@ mod tests {
         );
     }
 
-    // ---- Phase-5 P5-2: the node self-hosting read-plane gate ----
+    // ---- Phase-5 P5-2 + P5-3: the node self-hosting data-plane gate ----
 
     #[test]
-    fn node_self_host_read_plane_admits_lightweight_and_refuses_vm_data_holder() {
+    fn node_self_host_data_plane_admits_lightweight_and_refuses_vm_data_holder() {
         // The DEFAULT mode (guest-workloads) is the Phase-1..4 wired behavior — the gate is a no-op
         // and a clean composition still authorizes (no running composition changes).
         assert_eq!(NodeServeMode::default(), NodeServeMode::GuestWorkloads);
         assert!(NodeServeMode::GuestWorkloads.is_wired());
-        // `is_wired(NodeSelfHost)` stays FALSE: it tracks the FULL self-host serve path (writes /
-        // control / gateway / node-own exec — P5-3..P5-5), which is NOT wired. P5-2 wires only the
-        // read plane, admitted by the gate's P5-2 shape lint, not by `is_wired`.
+        // `is_wired(NodeSelfHost)` stays FALSE: it tracks the FULL self-host serve path (the SERVED
+        // control mutation / gateway / node-own exec — P5-3-serve..P5-5), which is NOT wired. This cut
+        // wires the read plane + the write SURFACE under the sandbox, admitted by the gate's data-plane
+        // shape lint, not by `is_wired`.
         assert!(!NodeServeMode::NodeSelfHost.is_wired());
         assert!(NodeServeMode::NodeSelfHost.is_node_self_host());
         let clean = clean_privsep();
@@ -5525,18 +5786,18 @@ mod tests {
         )
         .expect("a clean guest-workloads composition still authorizes");
 
-        // P5-2: node self-hosting with every `backend.*` data-holder on a LIGHTWEIGHT substrate
-        // (`clean_privsep`'s `data` is on the default OsProcess) is ADMITTED — the read plane runs.
+        // P5-2/P5-3: node self-hosting with every `backend.*` data-holder on a LIGHTWEIGHT substrate
+        // (`clean_privsep`'s `data` is on the default OsProcess) is ADMITTED — the data plane runs.
         let mut lightweight = clean_privsep();
         lightweight.node_serve = NodeServeMode::NodeSelfHost;
         check_node_self_host_gate(&lightweight)
-            .expect("P5-2 admits node-self-host with data-holders on a lightweight substrate");
+            .expect("admits node-self-host with data-holders on a lightweight substrate");
         plan_root(
             &cfg_with(Some(lightweight)),
             Path::new("boatramp.cfg"),
             fake_env(),
         )
-        .expect("a P5-2 read-plane composition (lightweight data-holders) authorizes end-to-end");
+        .expect("a data-plane composition (lightweight data-holders) authorizes end-to-end");
 
         // A `backend.*` data-holder on the `vm` substrate is REFUSED fail-closed. The pure P5-2 gate
         // refuses directly with the greppable VM-data-holder marker...
@@ -5565,8 +5826,8 @@ mod tests {
 
         // ...and `plan_root` refuses a VM data-holder end-to-end before any spawn. The structural S2
         // VM-secret-blindness scope lint (step 2b-vm, `VmInstanceOutsideApprovedScope`) fires BEFORE
-        // the P5-2 gate (step 2d) — defence in depth — so either refusal is acceptable; what matters
-        // is that NO spawn plan is produced for a VM data-holder.
+        // the data-plane gate (step 2d) — defence in depth — so either refusal is acceptable; what
+        // matters is that NO spawn plan is produced for a VM data-holder.
         let err = plan_root(&cfg_with(Some(vm)), Path::new("boatramp.cfg"), fake_env())
             .expect_err("plan_root must refuse a VM data-holder before any spawn");
         assert!(
@@ -5574,7 +5835,7 @@ mod tests {
                 err,
                 PrivsepError::Composition(_) | PrivsepError::NodeSelfHostVmDataHolder(_)
             ),
-            "plan_root must refuse a VM data-holder (S2 scope lint or the P5-2 gate), got {err:?}"
+            "plan_root must refuse a VM data-holder (S2 scope lint or the data-plane gate), got {err:?}"
         );
     }
 
@@ -6903,7 +7164,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         use boatramp_core::kv::MemoryKv;
         use boatramp_storage::FsStorage;
 
-        use super::instance_serve::{NodeReadPlane, NodeServeHandler, NodeServeRouter};
+        use super::instance_serve::{NodeDataPlane, NodeServeHandler, NodeServeRouter};
 
         // An in-memory control-plane deploy store (empty KV + an inert FS blob half the resolve never
         // touches). The data-holder holds `backend.kv`, so the read surface is HELD → served locally.
@@ -6915,7 +7176,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         );
         let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
         let router = NodeServeRouter::new(&gate, BTreeMap::new());
-        let handler = NodeServeHandler::new(router, NodeReadPlane::Deploy(store));
+        let handler = NodeServeHandler::new(router, NodeDataPlane::Deploy(store));
 
         // Two GETs (distinct hosts) → the router classifies each → `Local(backend.kv)` → a REAL
         // `resolve_site_by_host` read against the empty store → 404 from the read plane. A real read
@@ -6941,22 +7202,24 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         }
     }
 
-    /// P5-2 fail-closed: every surface the read plane does NOT serve is a 503 (never a stubbed 200) —
-    /// a WRITE (a mutating method → `control.admin-api` surface), a RELAY (a read surface held by a
-    /// PEER, reachable over a link), and a REFUSE (a read surface neither held nor reachable). Exercised
-    /// over the live `serve_connection` apply path.
+    /// Fail-closed: every surface the data plane does NOT serve is a 503 (never a stubbed 200) —
+    /// a WRITE (a mutating method → the `control.admin-api`+`backend.kv` mutation decomposition), a
+    /// RELAY (a read surface held by a PEER, reachable over a link), and a REFUSE (a read surface
+    /// neither held nor reachable). Exercised over the live `serve_connection` apply path.
     #[cfg(unix)]
     #[tokio::test]
     async fn p5_2_node_serve_handler_fail_closes_write_relay_and_refuse() {
-        use super::instance_serve::{NodeReadPlane, NodeServeHandler, NodeServeRouter};
+        use super::instance_serve::{NodeDataPlane, NodeServeHandler, NodeServeRouter};
 
-        // (a) WRITE — a POST classifies to the control write surface; this data-holder does not hold it
-        //     and cannot reach it → Refuse → 503 (the P5-2 read plane serves no write). The read plane is
-        //     never invoked (the route is not a held READ), so a `Refusing` placeholder is fine.
+        // (a) WRITE — a POST decomposes (INFO-2) into {control.admin-api authorize, backend.kv write}.
+        //     This data-holder HOLDS backend.kv (write → Local) but neither holds nor can reach
+        //     control.admin-api (authorize → Refuse) → the WHOLE request fails closed 503 (never a
+        //     partial serve of the held write half). The data plane is never mutated via this path, so
+        //     a `Refusing` placeholder is fine.
         let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
         let handler = NodeServeHandler::new(
             NodeServeRouter::new(&gate, BTreeMap::new()),
-            NodeReadPlane::Refusing,
+            NodeDataPlane::Refusing,
         );
         let resp = p5_2_roundtrip(
             handler,
@@ -6965,17 +7228,40 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         .await;
         assert!(
             resp.starts_with("HTTP/1.1 503"),
-            "a write surface must fail closed (503), got: {:?}",
+            "a control mutation with an unsatisfiable authorize sub-op must fail closed (503), got: {:?}",
+            &resp[..resp.len().min(80)]
+        );
+
+        // (a2) WRITE, both sub-ops satisfiable but SERVE not wired — a data-holder holding BOTH
+        //      backend.kv AND control.admin-api routes both sub-ops `Local`, yet a client mutation STILL
+        //      fails closed 503 (the served authorized mutation — end-principal re-validation + the
+        //      crown-jewel relay — is the remaining P5-3 work; an unauthenticated client never drives a
+        //      control-plane write here).
+        let gate =
+            MaterializationGate::new(&[HostAuthority::BackendKv, HostAuthority::ControlAdminApi]);
+        let handler = NodeServeHandler::new(
+            NodeServeRouter::new(&gate, BTreeMap::new()),
+            NodeDataPlane::Refusing,
+        );
+        let resp = p5_2_roundtrip(
+            handler,
+            b"POST / HTTP/1.1\r\nHost: node.local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503"),
+            "a client control mutation must fail closed even when both sub-ops are held (serve is not \
+             wired), got: {:?}",
             &resp[..resp.len().min(80)]
         );
 
         // (b) RELAY — an instance NOT holding `backend.kv` but able to REACH it over a link: a GET read
-        //     surface routes to `RelayBackend`, which the P5-2 read plane does not execute → 503.
+        //     surface routes to `RelayBackend`, which this cut does not execute → 503.
         let gate = MaterializationGate::new(&[HostAuthority::ControlAdminApi]);
         let reachable = BTreeMap::from([(HostAuthority::BackendKv, "to-data".to_string())]);
         let handler = NodeServeHandler::new(
             NodeServeRouter::new(&gate, reachable),
-            NodeReadPlane::Refusing,
+            NodeDataPlane::Refusing,
         );
         let resp = p5_2_roundtrip(
             handler,
@@ -6984,7 +7270,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         .await;
         assert!(
             resp.starts_with("HTTP/1.1 503"),
-            "a relayed read surface must fail closed in P5-2 (503), got: {:?}",
+            "a relayed read surface must fail closed in this cut (503), got: {:?}",
             &resp[..resp.len().min(80)]
         );
 
@@ -6993,7 +7279,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         let gate = MaterializationGate::new(&[HostAuthority::ControlAdminApi]);
         let handler = NodeServeHandler::new(
             NodeServeRouter::new(&gate, BTreeMap::new()),
-            NodeReadPlane::Refusing,
+            NodeDataPlane::Refusing,
         );
         let resp = p5_2_roundtrip(
             handler,
@@ -7004,6 +7290,91 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             resp.starts_with("HTTP/1.1 503"),
             "an unreachable read surface must fail closed (503), got: {:?}",
             &resp[..resp.len().min(80)]
+        );
+    }
+
+    /// P5-3 classification decomposes a MUTATION into its per-authority sub-ops (INFO-2): a safe method
+    /// is a single `backend.kv` READ; any mutating method is `{control.admin-api authorize, backend.kv
+    /// write}`. Never a single collapsed "dominant" authority for a mutation. Pure.
+    #[cfg(unix)]
+    #[test]
+    fn p5_3_classify_request_decomposes_a_mutation_into_authorize_and_write() {
+        use super::instance_serve::{RequestPlan, classify_request};
+
+        let classify = |m: &str| {
+            let req = http::Request::builder()
+                .method(m)
+                .uri("/")
+                .body(boatramp_http::ReqBody::empty())
+                .expect("build a test request");
+            classify_request(&req)
+        };
+        for m in ["GET", "HEAD"] {
+            assert_eq!(
+                classify(m),
+                RequestPlan::Read(HostAuthority::BackendKv),
+                "{m} is a single-sub-op backend.kv read"
+            );
+        }
+        for m in ["POST", "PUT", "DELETE", "PATCH"] {
+            assert_eq!(
+                classify(m),
+                RequestPlan::ControlMutation {
+                    authorize: HostAuthority::ControlAdminApi,
+                    write: HostAuthority::BackendKv,
+                },
+                "{m} is a control mutation decomposed into authorize + write (never collapsed)"
+            );
+        }
+    }
+
+    /// P5-3 WRITE PLANE apply-path (host): the boot write-plane self-validation runs the REAL
+    /// control-plane store MUTATION round-trip (durable put ×2 + checkpoint + maintenance GC + read-back
+    /// + durable delete) against an in-memory `backend.kv` store and reports `Applied`; the reserved
+    /// probe key is cleaned up (no durable trace). This proves the mutation LOGIC end-to-end; whether it
+    /// survives the per-capability seccomp/Landlock profile (the write/compaction/GC object-store paths
+    /// a read never touches) is the LIGHTHOUSE live gate's job — a host test over a tempdir is a FALSE
+    /// GREEN for the sandbox question (design §5). A `Refusing` plane (no backend.kv) is a no-op `Applied`.
+    #[cfg(all(unix, feature = "fs"))]
+    #[tokio::test]
+    async fn p5_3_write_plane_self_validation_round_trips_a_control_plane_mutation() {
+        use std::sync::Arc;
+
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_storage::FsStorage;
+
+        use super::instance_serve::{NodeDataPlane, WRITE_PLANE_PROBE_KEY_PREFIX, WriteOutcome};
+
+        let kv = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(
+            Arc::new(FsStorage::new(
+                std::env::temp_dir().join("boatramp-p5-3-writeplane-inert-blobs"),
+            )),
+            kv.clone(),
+        );
+        let plane = NodeDataPlane::Deploy(store);
+        assert!(
+            matches!(plane.validate_write_plane().await, WriteOutcome::Applied),
+            "the control-plane store mutation round-trip must complete (Applied)"
+        );
+        // The probe key is cleaned up — a healthy node leaves no durable write-plane trace.
+        let leftover = kv
+            .list_prefix(WRITE_PLANE_PROBE_KEY_PREFIX)
+            .await
+            .expect("list the reserved probe prefix");
+        assert!(
+            leftover.is_empty(),
+            "the write-plane probe must delete its reserved key(s), found: {leftover:?}"
+        );
+
+        // A non-backend instance's data plane is `Refusing` → the write-plane validation is a no-op.
+        assert!(
+            matches!(
+                NodeDataPlane::Refusing.validate_write_plane().await,
+                WriteOutcome::Applied
+            ),
+            "a Refusing plane (no backend.kv) self-validates as a no-op"
         );
     }
 

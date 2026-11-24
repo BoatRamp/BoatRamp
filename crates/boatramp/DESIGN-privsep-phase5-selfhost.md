@@ -1,18 +1,27 @@
 # DESIGN — privsep Phase 5: node SELF-HOSTING
 
-**Status: P5-0 + P5-1 + P5-2 IMPLEMENTED on `feat/privsep` (pending the P5-2 Security review).**
+**Status: P5-0 + P5-1 + P5-2 + P5-3 (write-plane SURFACE) IMPLEMENTED on `feat/privsep`.**
 P5-0 shipped the composition *vocabulary* (`[privsep].node_serve`, `NodeServeMode`) + a fail-closed
-root *gate*. P5-1 added the authority-scoped app-router *seam*. **P5-2 (this cut) WIRES that seam LIVE**
-on the backend serve path for the READ data plane on the LIGHTWEIGHT substrates (`os-process` /
-`container`): under `node_serve = node-self-host` a `backend.*` data-holder serves the node's own read
-plane through the authority-scoped router (classify → route → a real control-plane KV read), replacing
-the Phase-1 `MinimalHandler` stub; the **VM data-holder stays REFUSED** (design §3a). The remaining
-self-host surfaces — control-plane WRITES, the gateway, the node-own handler engine, and any VM/net-ns
-data-reach — stay fail-closed per request and are P5-3..P5-5; `NodeServeMode::is_wired(NodeSelfHost)`
-stays `false` (it tracks the FULL mode, flipped only at P5-6 after each increment's Security review).
-This note defines the target, sequences the increments, and SURFACES — without deciding — the owner
-questions. It is the companion to `DESIGN-privsep-phase3-container.md`,
-`DESIGN-privsep-phase3-vm-scoped.md`, and `DESIGN-privsep-phase3-vm.md`.
+root *gate*. P5-1 added the authority-scoped app-router *seam*. **P5-2 WIRED that seam LIVE** on the
+backend serve path for the READ data plane on the LIGHTWEIGHT substrates (`os-process` / `container`):
+under `node_serve = node-self-host` a `backend.*` data-holder serves the node's own read plane through
+the authority-scoped router (classify → route → a real control-plane KV read), replacing the Phase-1
+`MinimalHandler` stub; the **VM data-holder stays REFUSED** (design §3a). **P5-3 (this cut) adds the
+control-plane MUTATION SURFACE under the `backend.kv` sandbox**: a boot WRITE-plane self-validation
+(`NodeDataPlane::validate_write_plane`) exercises the real control-plane store mutation path (durable
+put + checkpoint + maintenance GC + read-back + durable delete) under the per-capability Landlock/seccomp
+profile — the write/flush/compaction/GC/manifest object-store paths a READ never touches — and
+fail-closes the node (FailNodeClosed) on any EACCES; the request classifier now DECOMPOSES a mutation
+into its `{control.admin-api authorize, backend.kv write}` sub-ops (INFO-2) and the handler routes each
+independently, failing the whole request closed if any is unsatisfiable (INFO-3 hard 5xx). The SERVED,
+authorized client mutation (end-principal re-validation + the `control.admin-api`→crown-jewel relay)
+stays fail-closed — the remaining P5-3 work. The remaining self-host surfaces — the SERVED mutation,
+the gateway, the node-own handler engine, and any VM/net-ns data-reach — stay fail-closed per request
+and are P5-3-serve..P5-5; `NodeServeMode::is_wired(NodeSelfHost)` stays `false` (it tracks the FULL
+mode, flipped only at P5-6 after each increment's Security review). This note defines the target,
+sequences the increments, and SURFACES — without deciding — the owner questions. It is the companion to
+`DESIGN-privsep-phase3-container.md`, `DESIGN-privsep-phase3-vm-scoped.md`, and
+`DESIGN-privsep-phase3-vm.md`.
 
 Terminology note: "self-hosted" is overloaded in this codebase (the self-hosted-vs-Vercel product
 framing; `--mode cluster` self-hosted cluster). This note means something narrower and internal:
@@ -207,11 +216,34 @@ read-plane serve is a flagged lighthouse follow-on: the substrate wiring is alre
 `PRIVSEP CONTAINER SUBSTRATE OK` and the read-plane handler is substrate-independent (host-tested), so
 only a Container re-run of gate B remains to confirm the KV opens under the container's Landlock FS wall.
 
-**P5-3 — control-plane MUTATION on `control.admin-api` + the crown-jewel grammars.**
-Wire `/api/*` mutations: the frontend relays to `control.admin-api`, which relays mint/sign to the
-group-A grammars (already built) and writes through `backend.*`. This exercises the cross-instance
-authorization fully (verified context + PoP on every crown-jewel call) for the node's own control
-plane. Still Container/OsProcess (shared net).
+**P5-3 — control-plane MUTATION. The WRITE SURFACE under the `backend.kv` sandbox is IMPLEMENTED; the
+SERVED authorized mutation is the remaining work.**
+
+*What landed (code):* the coherent first piece — the deploy/routing-store MUTATION path proven under
+the `backend.kv` per-capability Landlock/seccomp profile.
+- `NodeReadPlane` → `NodeDataPlane` (read + write), holding the one `backend.kv` control-plane
+  `DeployStore` (no double-open). `NodeDataPlane::validate_write_plane` runs a REAL control-plane store
+  mutation round-trip — `put_durable_checkpointed` ×2 (WAL write → memtable freeze to an L0 SST →
+  manifest rewrite) + `maintenance_gc` (the `wal/`/`compacted/`/`manifest/`/`compactions/` list+delete)
+  + read-back + `delete_checkpointed` — on a RESERVED, cleaned-up key (`_privsep/selfhost/writeplane-
+  probe/<pid>`). This drives the write/flush/compaction/GC/manifest object-store paths a READ never
+  touches, all under `<data_dir>/kv-slate` (the `backend.kv` rw grant). Run at `backend.kv`-holder
+  stand-up BEFORE serving a byte, authenticated-by-construction (never on a client's behalf — it mirrors
+  the signer's boot key self-test), bounded by the same fail-loud 30s timeout as the store open; a
+  fail-closed EACCES returns `Err` → the instance exits → `FailNodeClosed`.
+- `classify_request` now returns a `RequestPlan` DECOMPOSITION (INFO-2): a safe method is a single
+  `backend.kv` read; a mutating method is a `ControlMutation { authorize: control.admin-api, write:
+  backend.kv }`. `NodeServeHandler::serve_control_mutation` routes EACH sub-op independently and fails
+  the WHOLE request closed (hard 503, INFO-3) if any is `Refuse` — never a partial serve of the held
+  half.
+
+*What remains (P5-3-serve):* the SERVED, authorized client mutation. A client PUT still fails closed:
+serving it requires (a) the end-principal `AuthorityContext` + PoP re-validation (design §4 item 6) so a
+frontend RCE cannot assert authority it cannot prove, and (b) the cross-instance `control.admin-api`→
+group-A crown-jewel relay (verified context + PoP on every mint/sign). Both are the next increment. Plus
+the fine-grained `/api/*` method/path → operation map (a mint/sign operation adds a crown-jewel sub-op
+to the decomposition) and the other control-plane authority state (`backend.sql`/`backend.blob`/
+`backend.messaging` mutations, `acme.dns-control`). Still Container/OsProcess (shared net).
 
 **P5-4 — the gateway + node-own handler engine.**
 `listen.gateway` as a self-hosted frontend (its upstream dial is the egress question, §3a) and the
@@ -365,29 +397,36 @@ number, they are independent workstreams.
 
 ---
 
-## 6. What the P5-0/P5-1/P5-2 cuts ship
+## 6. What the P5-0/P5-1/P5-2/P5-3 cuts ship
 
 - **Vocabulary** (`boatramp-types/src/privsep.rs`, P5-0): `NodeServeMode { GuestWorkloads, NodeSelfHost }`
   with `tag()` / `is_wired()` / `is_node_self_host()` (mirrors `InstanceSubstrate`), and a
   `node_serve: NodeServeMode` field on `PrivsepConfig` (struct-level `#[serde(default)]` ⇒ every
   pre-Phase-5 config is byte-unchanged; default `GuestWorkloads`). `is_wired(NodeSelfHost)` stays
-  `false` through P5-2 (it tracks the FULL mode; P5-6 flips it).
+  `false` through P5-3 (it tracks the FULL mode — incl. the SERVED mutation; P5-6 flips it).
 - **Gate** (`boatramp/src/privsep.rs`): `check_node_self_host_gate`, wired into `plan_root` (step 2d).
-  `GuestWorkloads` is a no-op. **P5-2 REPLACED P5-0's whole-mode "unwired" refusal** (the
-  `NODE_SELF_HOST_UNWIRED_MARKER` / `PrivsepError::NodeSelfHostUnwired` scaffolding, now removed) with
-  `check_node_self_host_read_plane`: it ADMITS node-self-host for the P5-2 read-plane shape and REFUSES
-  a `backend.*` data-holder on `substrate: vm` (`PrivsepError::NodeSelfHostVmDataHolder`, marker
-  `NODE_SELF_HOST_VM_DATA_HOLDER_MARKER` = `"PRIVSEP_NODE_SELF_HOST_VM_DATA_HOLDER_REFUSED"`).
-- **Serve path** (P5-1 seam → P5-2 live): `NodeServeRouter` / `NodeRoute` / `NodeServeHandler` /
-  `NodeReadPlane` + `run_backend`'s `node_serve` branch (see §2 P5-2 for the detail).
-- **Tests:** host unit/apply-path tests — `node_self_host_read_plane_admits_lightweight_and_refuses_vm_data_holder`,
+  `GuestWorkloads` is a no-op. `check_node_self_host_data_plane` (renamed from P5-2's
+  `check_node_self_host_read_plane`) ADMITS node-self-host for the data-plane shape (P5-2 read + P5-3
+  write) and REFUSES a `backend.*` data-holder on `substrate: vm` (`PrivsepError::NodeSelfHostVmDataHolder`,
+  marker `NODE_SELF_HOST_VM_DATA_HOLDER_MARKER` = `"PRIVSEP_NODE_SELF_HOST_VM_DATA_HOLDER_REFUSED"`).
+- **Serve path** (P5-1 seam → P5-2 read live → P5-3 write surface): `NodeServeRouter` / `NodeRoute` /
+  `NodeServeHandler` / `NodeDataPlane` (read + `validate_write_plane`) / `RequestPlan` (the INFO-2
+  mutation decomposition) + `run_backend`'s `node_serve` branch (which runs the boot write-plane
+  self-validation). See §2 P5-2/P5-3.
+- **Tests:** host unit/apply-path tests — `node_self_host_data_plane_admits_lightweight_and_refuses_vm_data_holder`,
   `p5_2_node_serve_handler_serves_a_held_read_on_the_live_apply_path`,
-  `p5_2_node_serve_handler_fail_closes_write_relay_and_refuse`,
+  `p5_2_node_serve_handler_fail_closes_write_relay_and_refuse` (now incl. the mutation decomposition),
+  `p5_3_classify_request_decomposes_a_mutation_into_authorize_and_write`,
+  `p5_3_write_plane_self_validation_round_trips_a_control_plane_mutation`,
   `p5_2_derive_node_reachability_maps_peer_authorities_over_links`, plus the P5-1 router tests; live
   gates (`tests/privsep_live.rs`, `#[ignore]`d) `privsep_node_self_host_read_plane_serves_end_to_end`
-  (`PRIVSEP NODE SELF-HOST READ-PLANE OK`) + `privsep_node_self_host_vm_data_holder_refused_end_to_end`
-  (`PRIVSEP NODE SELF-HOST VM DATA-HOLDER REFUSED OK`); `ci.yml` bumped to 9 privsep-live tests.
+  (`PRIVSEP NODE SELF-HOST READ-PLANE OK`), `privsep_node_self_host_write_plane_serves_end_to_end`
+  (`PRIVSEP NODE SELF-HOST WRITE-PLANE OK`) + `privsep_node_self_host_vm_data_holder_refused_end_to_end`
+  (`PRIVSEP NODE SELF-HOST VM DATA-HOLDER REFUSED OK`); `ci.yml` bumped to 10 privsep-live tests.
 
-**Still NOT wired (fail-closed, pending P5-3..P5-6 + their Security reviews):** control-plane WRITES,
-the gateway, the node-own handler engine, any VM/net-ns data-reach, and the full `is_wired(NodeSelfHost)`
-flip. These are refused per request by the router (a 503), never served from a stub.
+**Still NOT wired (fail-closed, pending P5-3-serve..P5-6 + their Security reviews):** the SERVED
+authorized control-plane mutation (end-principal re-validation + the `control.admin-api`→crown-jewel
+relay), the gateway, the node-own handler engine, any VM/net-ns data-reach, and the full
+`is_wired(NodeSelfHost)` flip. These are refused per request by the router (a 503), never served from a
+stub. The `backend.kv` write SURFACE itself is proven under the sandbox by the boot write-plane
+self-validation.

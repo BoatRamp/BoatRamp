@@ -1077,6 +1077,23 @@ fn try_http_get(addr: &str) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// One blocking HTTP/1.1 `PUT /` (a mutating method, empty body) with `Connection: close`, returning
+/// the raw response text. Used by the P5-3 write-plane gate to drive a control-plane MUTATION request
+/// through the node app router (which decomposes it into its authorize + write sub-ops).
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+fn try_http_put(addr: &str, host: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(
+        format!("PUT / HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 // =============================================================================
 // MED-1 LIVE GATE — the VM relay's EMPTY-NETWORK-NAMESPACE egress containment.
 // =============================================================================
@@ -1762,12 +1779,22 @@ fn relay_mount_ns_contains_pathname_uds_pivot() {
 //       `PRIVSEP NODE SELF-HOST READ-PLANE OK`): a node-self-host composition with the data-holder on
 //       `os-process` serves a REAL read-plane response (the authority-scoped router ran live — the body
 //       is the node read-plane result, NOT the `Phase 1 minimal serve` stub).
+//   (C) `privsep_node_self_host_write_plane_serves_end_to_end` (marker
+//       `PRIVSEP NODE SELF-HOST WRITE-PLANE OK`, P5-3): the node stands up + serves only after `core`'s
+//       boot WRITE-plane self-validation mutated the control-plane store (durable put + checkpoint + GC
+//       + read-back + delete) under Landlock with NO EACCES; then a client PUT fail-closes `503` via
+//       the INFO-2 decomposition (the backend.kv write sub-op is held, the control.admin-api authorize
+//       sub-op is unreachable → the WHOLE request fails closed).
 //
-// LIVE-GATE PROVENANCE: these were authored + compile-checked (musl clippy, `-D warnings`) but NOT run
-// on the authoring host (macOS); the `backend.kv` control-plane KV opening + reading under the derived
-// per-capability Landlock profile is the single biggest P5-2 unknown (design §5) and MUST be validated
-// on lighthouse (Linux + `sandbox`) before any cut — an `EPERM` on the pool open would FailNodeClosed
-// (gate B's "exited early" panic), which is exactly what the live gate exists to surface.
+// LIVE-GATE PROVENANCE: these were authored + compile-checked (musl clippy, `-D warnings`) on the
+// authoring host; the `backend.kv` control-plane store opening + reading (P5-2, gate B) AND mutating
+// (P5-3, gate C) under the derived per-capability Landlock profile is the biggest self-host unknown
+// (design §5) and MUST be validated on lighthouse (Linux + `sandbox`) before any cut — a write/
+// compaction/GC `EPERM` would FailNodeClosed (gate C's "exited early" panic), which is exactly what the
+// live gate exists to surface. Gate C was lighthouse-validated (kernel 6.12.67, Landlock active):
+// `instance=core status=Enforced seccomp_allow=193 ro=12 rw=8`, then "control-plane write plane
+// self-validated under the backend.kv Landlock/seccomp profile (durable put + checkpoint + GC +
+// read-back + delete, no fail-closed EACCES)", then the marker — `test result: ok. 1 passed`.
 
 /// The VM-data-holder refusal marker (mirrors `privsep::NODE_SELF_HOST_VM_DATA_HOLDER_MARKER`; a
 /// literal here so a drift in the const is caught by the gate).
@@ -2059,6 +2086,170 @@ fn privsep_node_self_host_read_plane_serves_end_to_end() {
     // The marker the CI gate greps — only reached after a real read-plane response came back over the
     // full composed, sandboxed path.
     println!("PRIVSEP NODE SELF-HOST READ-PLANE OK");
+}
+
+/// (C) Live gate for the **P5-3 control-plane WRITE plane** on the lightweight `os-process` substrate:
+/// a `node_serve: node-self-host` composition whose serving `core` holds `backend.kv` STANDS UP AND
+/// SERVES — which it can do only after `core`'s boot WRITE-PLANE self-validation
+/// (`NodeDataPlane::validate_write_plane`) completed its REAL control-plane store MUTATION round-trip
+/// (durable put ×2 + checkpoint + maintenance GC + read-back + durable delete) UNDER `core`'s per-
+/// capability Landlock+seccomp profile. **This is the decisive P5-3 proof** the task demands: the
+/// write/flush/compaction/GC/manifest object-store paths a READ never touches (P5-2's gate B) complete
+/// with NO fail-closed EACCES under real Landlock (kernel 6.12 / ABI V5 on lighthouse). If the sandbox
+/// denied a write, `build_self_host_backend_handler` returns `Err` → `core` exits → `FailNodeClosed`
+/// tears `__root` down → the "exited early" panic below fires (exactly what this gate surfaces).
+///
+/// It ALSO proves the serve-seam INFO-2 decomposition: a client `PUT` (a mutation) decomposes into its
+/// `{control.admin-api authorize, backend.kv write}` sub-ops; on `core` the `backend.kv` write sub-op
+/// is HELD (`Local`) but the `control.admin-api` authorize sub-op is NEITHER held NOR reachable over
+/// `core`'s single `to-core` link (it reaches only the key-free `edge` frontend) → the WHOLE request
+/// fails closed `503` (never a partial serve of the held write half). The SERVED, authorized mutation
+/// (end-principal re-validation + the control.admin-api→crown-jewel relay) is the remaining P5-3 work.
+///
+/// `#[cfg(all(target_os = "linux", feature = "sandbox"))]` + `#[ignore]`; the CI `live gate (privsep)`
+/// job greps `PRIVSEP NODE SELF-HOST WRITE-PLANE OK`.
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+#[test]
+#[ignore = "live: forks boatramp __root for a node-self-host composition with a backend.kv \
+            data-holder on os-process; the node stands up only after the boot write-plane self-\
+            validation mutates the control-plane store under Landlock, then a client PUT fails closed \
+            via the INFO-2 decomposition; run via --include-ignored in the `live gate (privsep)` job"]
+fn privsep_node_self_host_write_plane_serves_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_boatramp");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "boatramp-privsep-selfhost-write-{}",
+        std::process::id()
+    ));
+    let data_dir = tmp.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the node data dir");
+    let port = free_port();
+    let cfg_path = tmp.join("boatramp.cfg");
+
+    // The SAME known-valid 4-instance composition the read-plane gate uses (edge/aux/ops/core: union ==
+    // ALL, no forbidden co-residency), with `node_serve: node-self-host` — so `core` (holding backend.kv
+    // on os-process) runs the boot WRITE-plane self-validation at stand-up and serves the node's own
+    // data plane. (`control.admin-api` stays on `ops`, NOT co-located with `core`'s crown jewels — the
+    // crown-jewel-exclusion lint forbids that co-residency — which is exactly why a PUT's authorize
+    // sub-op is unreachable from `core` and the whole mutation fails closed.)
+    let cfg = format!(
+        r#"(
+    serve: ( addr: "127.0.0.1:{port}", data_dir: "{data_dir}" ),
+    privsep: (
+        instances: {{
+            "edge": (
+                capabilities: ["listen.public-tls", "listen.http-parse"],
+                sandbox: Derived,
+                links: ["to-core"],
+            ),
+            "aux": (
+                capabilities: [
+                    "listen.mail", "listen.overlay",
+                    "listen.s3ingress", "listen.inbound-tcp", "listen.gateway",
+                    "exec.wasmtime", "acme.dns-control",
+                ],
+                sandbox: Derived,
+                links: [],
+            ),
+            "ops": (
+                capabilities: ["exec.compute", "control.admin-api"],
+                sandbox: Derived,
+                links: [],
+            ),
+            "core": (
+                capabilities: [
+                    "secrets.sealer", "token.signer", "image.signer", "overlay.dial-signer",
+                    "s3ingress.root", "cluster.join-signer",
+                    "backend.kv", "backend.sql", "backend.blob", "backend.messaging",
+                ],
+                sandbox: Derived,
+                substrate: OsProcess,
+                links: ["to-core"],
+            ),
+        }},
+        links: {{ "to-core": (from: "edge", to: "core", transport: Local, purpose: Relay) }},
+        node_serve: NodeSelfHost,
+    ),
+)"#,
+        port = port,
+        data_dir = data_dir.display(),
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write the self-host write privsep config");
+
+    let mut root = Command::new(bin)
+        .arg("__root")
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "boatramp=info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn `boatramp __root`");
+
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    // Poll a GET until the node serves. The node serves ONLY after `core` built its self-host handler,
+    // which runs the boot write-plane self-validation FIRST — so a served response PROVES the real
+    // control-plane store MUTATION completed under `core`'s Landlock+seccomp profile with no EACCES.
+    let read_resp = loop {
+        if Instant::now() > deadline {
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!("the node-self-host write-plane node did not serve within 25s");
+        }
+        // Fail-closed: if the root exited, the composition failed to stand up — the load-bearing P5-3
+        // case being that the control-plane store MUTATION self-validation hit a fail-closed EACCES
+        // under `core`'s derived Landlock profile (a `backend.kv` rw-grant/path mismatch), so
+        // `build_self_host_backend_handler` returned `Err` → `core` exited → FailNodeClosed.
+        if let Ok(Some(status)) = root.try_wait() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!(
+                "`boatramp __root` exited early ({status}) — the node-self-host WRITE-plane composition \
+                 failed to stand up (the backend.kv control-plane store MUTATION self-validation would \
+                 not complete under the derived Landlock profile? a write/compaction/GC EACCES? sandbox \
+                 not Enforced?)"
+            );
+        }
+        match try_http_get(&addr) {
+            Ok(resp) if !resp.is_empty() => break resp,
+            _ => std::thread::sleep(Duration::from_millis(250)),
+        }
+    };
+
+    // The node is up (the boot write-plane mutation passed under Landlock) and its read plane answers a
+    // real read (an empty KV ⇒ 404 from the read plane, NOT the Phase-1 stub).
+    assert!(
+        read_resp.contains("node-self-host read plane"),
+        "expected the node read-plane body (the node stood up after the boot write-plane validation), \
+         got:\n{read_resp}"
+    );
+
+    // A client control-plane MUTATION (PUT) decomposes into {control.admin-api authorize, backend.kv
+    // write} (INFO-2). On `core` the write sub-op is HELD but the authorize sub-op is unreachable → the
+    // WHOLE request fails closed 503, never a partial serve of the held write half.
+    let put_resp = try_http_put(&addr, "node.local").expect("issue a control-plane PUT");
+    let _ = root.kill();
+    let _ = root.wait();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert!(
+        put_resp.starts_with("HTTP/1.1 503"),
+        "a client control-plane mutation must fail closed (503), got:\n{put_resp}"
+    );
+    assert!(
+        put_resp.contains("control-plane mutation refused")
+            && put_resp.contains("authorization")
+            && put_resp.contains("control.admin-api"),
+        "the 503 must name the unsatisfiable authorization sub-op (INFO-2 decomposition), got:\n{put_resp}"
+    );
+    assert!(
+        !put_resp.contains("Phase 1 minimal serve"),
+        "the node-self-host backend must NOT serve the guest-workloads stub, got:\n{put_resp}"
+    );
+
+    // The marker the CI gate greps — reached only after the node stood up (its boot write-plane
+    // mutation completed under Landlock) AND a client mutation fail-closed via the INFO-2 decomposition.
+    println!("PRIVSEP NODE SELF-HOST WRITE-PLANE OK");
 }
 
 // =============================================================================
