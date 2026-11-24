@@ -154,6 +154,43 @@ boatramp gateway upstream add api http://10.0.0.5:8080 \
   --read-buffer-bytes 131072 --site my-site
 ```
 
+## Front a container registry (buffer length-unknown uploads)
+
+Most backends accept a streamed upload with no `Content-Length` — boatramp forwards
+such a body (an HTTP/2 upload, or an inbound `Transfer-Encoding: chunked` body) to the
+upstream `chunked`, which is correct and uses no extra memory. A few backends reject
+it: a **Docker/OCI container registry** (Gitea, Harbor, Distribution) answers `400
+missing content-length header` on a blob `PUT`. Over the edge's HTTP/2 a `docker push`
+arrives with no `Content-Length`, so without help the forward leg frames it chunked and
+the push fails.
+
+`--buffer-requests` fixes exactly this upstream: the forward leg reads the whole
+length-unknown body to a bounded temp file, establishes its length, and forwards it with
+a `Content-Length`. A body that already declares its length is never buffered (it
+forwards fixed-length as before).
+
+```sh
+boatramp gateway upstream add registry http://127.0.0.1:3000 \
+  --buffer-requests --max-buffer-bytes 2147483648 --site registry.example.com
+boatramp gateway route add /v2/** registry --site registry.example.com
+```
+
+- **Off by default.** Every existing upstream is unchanged — enable this only on an
+  upstream whose backend needs it.
+- **Bounded (DoS-safe).** The buffered body is spilled to a **per-request unnamed temp
+  file** (no on-disk path, cleaned up on every exit path) and capped by
+  `--max-buffer-bytes` (default **1 GiB**). A body over the cap is rejected `413 Payload
+  Too Large` — buffering never grows memory without bound or fills the disk. Size the
+  cap to your largest layer **and** the spill store's free space times the expected
+  number of concurrent uploads (each in-flight buffered upload holds up to the cap).
+  The spill store is the service's temp directory; under the packaged systemd unit that
+  is the private `PrivateTmp`. If that temp directory is a RAM-backed `tmpfs`, buffering
+  uses RAM (still hard-capped) rather than disk, so size the cap accordingly.
+
+> **Security:** `--buffer-requests` buffers an untrusted upload body. It is an explicit,
+> per-upstream opt-in and is hard-bounded by `--max-buffer-bytes`; leave it off for every
+> upstream that does not specifically need it.
+
 ## Private and Unix-socket upstreams
 
 Targeting a private IP or a `unix:` socket is gated by the operator

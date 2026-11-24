@@ -239,6 +239,19 @@ enum UpstreamCommand {
         /// proxy concurrency.
         #[arg(long)]
         read_buffer_bytes: Option<u64>,
+        /// Buffer a length-unknown request body (an HTTP/2 or inbound-chunked body with no
+        /// Content-Length) to a bounded temp file and forward it with a Content-Length,
+        /// instead of chunked. OFF by default. Enable it ONLY for a backend that rejects
+        /// chunked uploads — notably a Docker/OCI container registry (Gitea, Harbor) whose
+        /// blob PUT answers `400 missing content-length header`. The buffered body is capped
+        /// by `--max-buffer-bytes` (a body over the cap is rejected 413 Payload Too Large).
+        #[arg(long)]
+        buffer_requests: bool,
+        /// With `--buffer-requests`: the maximum buffered request-body size in bytes before a
+        /// 413 (default 1073741824 = 1 GiB). Size it to your largest length-unknown upload
+        /// (a registry layer) and the spill store's free space × expected concurrency.
+        #[arg(long, requires = "buffer_requests")]
+        max_buffer_bytes: Option<u64>,
         /// For `--lb nearest`: the request header carrying the client's region
         /// (set by the CDN/edge, e.g. `fly-region`, `cf-ipcountry`).
         #[arg(long)]
@@ -388,6 +401,8 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<GatewayOut
             request_timeout_ms,
             tls_insecure,
             read_buffer_bytes,
+            buffer_requests,
+            max_buffer_bytes,
             client_region_header,
             regions,
         }) => {
@@ -444,6 +459,8 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<GatewayOut
                     request_timeout_ms,
                     tls_insecure,
                     read_buffer_bytes,
+                    buffer_requests,
+                    max_buffer_bytes,
                     regions: region_tags,
                     client_region_header,
                     ..Default::default()
@@ -609,6 +626,12 @@ fn write_gateway(gateway: &GatewayConfig, w: &mut dyn std::io::Write) -> std::io
         }
         if up.tls_insecure {
             notes.push("tls_insecure".to_string());
+        }
+        if up.buffer_requests {
+            notes.push(match up.max_buffer_bytes {
+                Some(n) => format!("buffer_requests(max={n})"),
+                None => "buffer_requests".to_string(),
+            });
         }
         let suffix = if notes.is_empty() {
             String::new()

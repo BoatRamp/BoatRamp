@@ -1795,6 +1795,8 @@ Declare or replace an upstream. Give a single positional `target`, a pool of `--
 | `--request-timeout-ms <REQUEST_TIMEOUT_MS>` | — | — | — | Overall request timeout (milliseconds) |
 | `--tls-insecure` | — | — | — | Accept a self-signed / invalid upstream TLS certificate |
 | `--read-buffer-bytes <READ_BUFFER_BYTES>` | — | — | — | Cap the per-connection upstream read buffer (bytes); default 32768. Higher trades memory for fewer read syscalls (throughput on large responses); lower trades syscalls for less memory. Matters most at high proxy concurrency |
+| `--buffer-requests` | — | — | — | Buffer a length-unknown request body (an HTTP/2 or inbound-chunked body with no Content-Length) to a bounded temp file and forward it with a Content-Length, instead of chunked. OFF by default. Enable it ONLY for a backend that rejects chunked uploads — notably a Docker/OCI container registry (Gitea, Harbor) whose blob PUT answers `400 missing content-length header`. The buffered body is capped by `--max-buffer-bytes` (a body over the cap is rejected 413 Payload Too Large) |
+| `--max-buffer-bytes <MAX_BUFFER_BYTES>` | — | — | — | With `--buffer-requests`: the maximum buffered request-body size in bytes before a 413 (default 1073741824 = 1 GiB). Size it to your largest length-unknown upload (a registry layer) and the spill store's free space × expected concurrency |
 | `--client-region-header <CLIENT_REGION_HEADER>` | — | — | — | For `--lb nearest`: the request header carrying the client's region (set by the CDN/edge, e.g. `fly-region`, `cf-ipcountry`) |
 | `--region <URL=REGION>` | — | — | — | For `--lb nearest`: tag a backend with a region as `URL=REGION` (repeatable). Untagged backends are region-neutral |
 

@@ -5,6 +5,33 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.73.0] — unreleased
+
+### Added
+
+- **Gateway `buffer_requests`: front a container registry over HTTP/2 (Caddy `request_buffers`
+  parity).** A new per-upstream `buffer_requests` flag (`boatramp gateway upstream add
+  --buffer-requests`, default **off**) makes the reverse-proxy forward leg read a **length-unknown**
+  request body (an HTTP/2 `END_STREAM`-delimited body, or an inbound `Transfer-Encoding: chunked`
+  body) to a bounded temp file, establish its length, and forward it with a `Content-Length` instead
+  of chunked. This fixes fronting a **Docker/OCI container registry** (Gitea, Harbor, Distribution),
+  whose blob `PUT` rejects a chunked upload with `400 missing content-length header` — so a `docker
+  push` over the edge's HTTP/2 (no inbound `Content-Length`) previously 400-looped. A body that
+  already declares a `Content-Length` is never buffered (it forwards fixed-length, unchanged), and
+  the flag is off for every existing upstream, so default behavior is byte-identical. Drives the
+  shared `UpstreamClient::send` seam, so both the site-tier and absolute-URL forward paths honor it.
+
+### Security
+
+- **Bounded, temp-file-backed request buffering (untrusted upload body).** When `buffer_requests` is
+  enabled, the body is spilled to a **per-request unnamed temp file** (`tempfile::tempfile_in`,
+  unlinked at creation — no reachable/guessable path, no symlink/TOCTOU target, reclaimed on every
+  exit path incl. 413, I/O error, panic). It is hard-capped by a per-upstream `max_buffer_bytes`
+  (default **1 GiB**); the running total is checked before every write, so a body over the cap is
+  rejected `413 Payload Too Large` without spilling past the bound — buffering can never grow memory
+  unbounded (RSS stays flat; the body lives on disk, not in a `Vec`) or fill the disk. Config
+  validation refuses a dangling `max_buffer_bytes` without `buffer_requests` and a zero cap.
+
 ## [0.72.0] — 2026-11-24
 
 ### Fixed

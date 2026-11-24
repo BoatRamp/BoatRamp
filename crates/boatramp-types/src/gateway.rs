@@ -323,12 +323,33 @@ fn check_host_forward(name: &str, up: &Upstream) -> Result<(), crate::ConfigErro
     Ok(())
 }
 
+/// Reject a nonsensical request-buffering config so a declarative `apply` / deploy bundle cannot
+/// persist one (the CLI's `requires` already screens its own path). A `max_buffer_bytes` without
+/// `buffer_requests` is a dangling knob (the body is never buffered, so the cap means nothing), and a
+/// zero cap would `413` every length-unknown body — both are operator mistakes, caught at declare.
+fn check_upstream_buffering(name: &str, up: &Upstream) -> Result<(), crate::ConfigError> {
+    if up.max_buffer_bytes.is_some() && !up.buffer_requests {
+        return Err(crate::ConfigError::parse(format!(
+            "gateway upstream `{name}` sets `max_buffer_bytes` without `buffer_requests` — the cap \
+             only applies when request buffering is enabled; set `buffer_requests: true` or drop it"
+        )));
+    }
+    if up.max_buffer_bytes == Some(0) {
+        return Err(crate::ConfigError::parse(format!(
+            "gateway upstream `{name}` sets `max_buffer_bytes: 0` — a zero cap rejects every \
+             buffered body with 413; set a positive cap or leave it unset for the default"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a **site/operator** gateway: every route references a declared upstream, and every route
 /// pattern + reserved-path glob compiles. (The private-upstream trust decision is the operator's to
 /// make, bounded by the node posture at serve — not refused here.)
 pub fn validate_site_gateway(site: &GatewayConfig) -> Result<(), crate::ConfigError> {
     for (name, up) in &site.upstreams {
         check_host_forward(name, up)?;
+        check_upstream_buffering(name, up)?;
     }
     for route in &site.routes {
         Pattern::compile(&route.matches)?;
@@ -385,6 +406,7 @@ pub fn validate_project_gateway(
     }
     for (name, up) in &project.upstreams {
         check_host_forward(name, up)?;
+        check_upstream_buffering(name, up)?;
         if up.shared {
             return Err(crate::ConfigError::parse(format!(
                 "project gateway upstream `{name}` sets `shared` — only a site/operator upstream may \
@@ -646,6 +668,32 @@ pub struct Upstream {
     /// memory-tight node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_buffer_bytes: Option<u64>,
+    /// **Buffer a length-unknown request body before forwarding** (Caddy's `request_buffers`
+    /// parity). OFF by default — a request body that arrives with no declared `Content-Length`
+    /// (an HTTP/2 `END_STREAM`-delimited body, or an inbound `Transfer-Encoding: chunked` body)
+    /// is forwarded to the upstream `chunked`, which is correct for every well-behaved backend.
+    /// A few backends REJECT a chunked upload: a Docker/OCI **container registry** (Gitea,
+    /// Harbor, Distribution) answers `400 missing content-length header` on a blob `PUT`, so the
+    /// edge cannot front a registry over HTTP/2. Set this to `true` on *only* such an upstream and
+    /// the forward leg instead reads the whole body to a bounded temp file, establishes its length,
+    /// and forwards it with a `Content-Length`. A body that arrives WITH a declared length is never
+    /// buffered (it already forwards fixed-length), so this changes nothing for it.
+    ///
+    /// SECURITY / DoS: the body is spilled to a **per-request, unnamed temp file** (no reachable
+    /// path), bounded by [`Upstream::max_buffer_bytes`] — a body exceeding the bound is rejected
+    /// `413 Payload Too Large`, so buffering can never grow memory unbounded or fill the disk. The
+    /// temp file is reclaimed on every exit path (success, 413, error, panic). Leave it OFF
+    /// (default) unless a specific upstream's backend needs it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub buffer_requests: bool,
+    /// Hard cap (bytes) on a buffered request body when [`Upstream::buffer_requests`] is set: a
+    /// body exceeding it is rejected `413 Payload Too Large` rather than spilled further. `None` →
+    /// the server default (1 GiB). Size it to the operator's largest expected length-unknown
+    /// upload (a registry layer) AND the spill store's free space × the expected concurrency —
+    /// each in-flight buffered upload holds up to this much temp space. Ignored unless
+    /// `buffer_requests` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_buffer_bytes: Option<u64>,
     /// Header rewrites applied to the request before forwarding.
     #[serde(skip_serializing_if = "HeaderOps::is_empty")]
     pub header_up: HeaderOps,
@@ -986,6 +1034,91 @@ mod tests {
     }
 
     #[test]
+    fn buffer_requests_round_trips_and_default_off_is_byte_identical() {
+        // A buffering upstream round-trips with its bound.
+        let up = Upstream {
+            target: "http://registry.internal:3000".into(),
+            buffer_requests: true,
+            max_buffer_bytes: Some(2 * 1024 * 1024 * 1024),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&up).unwrap();
+        assert_eq!(serde_json::from_str::<Upstream>(&json).unwrap(), up);
+        assert!(json.contains("\"buffer_requests\":true"));
+        assert!(json.contains("\"max_buffer_bytes\":2147483648"));
+
+        // DEFAULT-OFF is byte-identical: an upstream that leaves buffering unset serializes
+        // with no `buffer_requests` / `max_buffer_bytes` key at all (the skip_serializing_if
+        // guards), so an existing stored gateway is unchanged by this field's addition.
+        let plain = serde_json::to_string(&Upstream {
+            target: "http://x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!plain.contains("buffer_requests"));
+        assert!(!plain.contains("max_buffer_bytes"));
+    }
+
+    #[test]
+    fn validate_rejects_dangling_or_zero_buffer_cap() {
+        // `max_buffer_bytes` without `buffer_requests` is a dangling knob — refused.
+        let dangling = GatewayConfig {
+            upstreams: BTreeMap::from([(
+                "u".to_string(),
+                Upstream {
+                    target: "http://x".into(),
+                    max_buffer_bytes: Some(1024),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(validate_site_gateway(&dangling).is_err());
+
+        // A zero cap would 413 everything — refused.
+        let zero = GatewayConfig {
+            upstreams: BTreeMap::from([(
+                "u".to_string(),
+                Upstream {
+                    target: "http://x".into(),
+                    buffer_requests: true,
+                    max_buffer_bytes: Some(0),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(validate_site_gateway(&zero).is_err());
+
+        // The intended shape (buffering on, positive or default cap) validates.
+        let ok = GatewayConfig {
+            upstreams: BTreeMap::from([(
+                "u".to_string(),
+                Upstream {
+                    target: "http://x".into(),
+                    buffer_requests: true,
+                    max_buffer_bytes: Some(1024),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(validate_site_gateway(&ok).is_ok());
+        let ok_default = GatewayConfig {
+            upstreams: BTreeMap::from([(
+                "u".to_string(),
+                Upstream {
+                    target: "http://x".into(),
+                    buffer_requests: true,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(validate_site_gateway(&ok_default).is_ok());
+    }
+
+    #[test]
     fn pool_round_trips_and_resolves_backends() {
         let cfg = GatewayConfig {
             upstreams: BTreeMap::from([(
@@ -1066,6 +1199,8 @@ mod tests {
             "passive_health",
             "active_health",
             "discover",
+            "buffer_requests",
+            "max_buffer_bytes",
         ] {
             assert!(
                 !json.contains(absent),

@@ -104,6 +104,11 @@ pub(super) async fn proxy(
             (StatusCode::GATEWAY_TIMEOUT, "upstream timeout\n").into_response()
         }
         Err(UpstreamError::Failed) => (StatusCode::BAD_GATEWAY, "upstream error\n").into_response(),
+        // Unreachable on the absolute-URL path (buffering is never enabled on `pinned_client`),
+        // but mapped for exhaustiveness and so the shared `send` seam has one 413 contract.
+        Err(UpstreamError::PayloadTooLarge) => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n").into_response()
+        }
     }
 }
 
@@ -182,6 +187,15 @@ async fn check_proxy_target(
 /// the knee (profiled) — far below hyper's 400 KiB default, at a few percent read
 /// overhead. Operators can override it per upstream (`read_buffer_bytes`).
 const DEFAULT_UPSTREAM_READ_BUFFER: usize = 32 * 1024;
+
+/// Default hard cap on a buffered request body (`buffer_requests`), used when an upstream sets
+/// no `max_buffer_bytes`. 1 GiB covers a large registry layer while bounding the temp space a
+/// single length-unknown upload can hold; the operator raises it per upstream for larger layers,
+/// or lowers it on a space-tight node. This bounds BOTH memory and disk: the body is streamed to
+/// a temp file (so RSS stays flat regardless of size) and the running total is checked before
+/// every write, so a single request can never spill past this (→ 413), and total exposure is this
+/// cap × the number of concurrent buffered uploads.
+const DEFAULT_MAX_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Pool key for pinned upstream connections: the pinned resolution plus the per-upstream
 /// options that determine how a connection is dialed (so a TLS and a plaintext connection,
@@ -269,6 +283,9 @@ enum UpstreamError {
     Timeout,
     /// Connect / handshake / protocol failure → `502 Bad Gateway`.
     Failed,
+    /// A buffered (length-unknown) request body exceeded the upstream's `max_buffer_bytes`
+    /// → `413 Payload Too Large`. Only reachable on a `buffer_requests` upstream.
+    PayloadTooLarge,
 }
 
 /// An idle keep-alive upstream connection plus when it went idle (for the reap bound).
@@ -367,9 +384,27 @@ type BodyData = Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>;
 #[derive(Clone)]
 struct UpstreamClient {
     key: UpstreamClientKey,
+    /// Opt-in: buffer a length-unknown request body to a bounded temp file and forward it with a
+    /// `Content-Length` (default OFF — a length-unknown body forwards `chunked`). NOT part of the
+    /// pool key: it changes only how THIS request's body is framed, never how a connection is
+    /// dialed, so two upstreams differing only here may share pooled connections.
+    buffer_requests: bool,
+    /// Hard cap (bytes) on a buffered body before `413`; only read when `buffer_requests`.
+    max_buffer_bytes: u64,
 }
 
 impl UpstreamClient {
+    /// Turn request buffering on (or off) for this handle, with an optional per-upstream byte cap
+    /// (`None` keeps the server default). A no-op when `enabled` is false — the handle keeps
+    /// today's streaming semantics.
+    fn with_buffering(mut self, enabled: bool, max_bytes: Option<u64>) -> Self {
+        self.buffer_requests = enabled;
+        if let Some(n) = max_bytes {
+            self.max_buffer_bytes = n;
+        }
+        self
+    }
+
     /// Send `req` upstream and return the response with its body streamed straight back to
     /// the client — no hyper connection task, and no copy of the body between the upstream
     /// read buffer and the downstream writer. Enforces the per-upstream total-request
@@ -439,6 +474,33 @@ impl UpstreamClient {
             }
             None => match data.next().await {
                 None => BodyPlan::None,
+                Some(Ok(first)) if self.buffer_requests => {
+                    // `buffer_requests` upstream (e.g. a container registry that rejects chunked
+                    // uploads): read the whole length-unknown body to a bounded temp file, so we
+                    // can forward it with a `Content-Length` instead of `Transfer-Encoding:
+                    // chunked`. Bounded + spilled to disk (see `buffer_body_to_length_in`), so an
+                    // untrusted upload can neither exhaust memory nor the disk — over the cap it is
+                    // rejected `413`.
+                    let (len, replay) = match buffer_body_to_length_in(
+                        first,
+                        &mut data,
+                        self.max_buffer_bytes,
+                        &std::env::temp_dir(),
+                    )
+                    .await
+                    {
+                        Ok(buffered) => buffered,
+                        Err(BufferError::TooLarge) => return Err(UpstreamError::PayloadTooLarge),
+                        Err(BufferError::Io) => return Err(UpstreamError::Failed),
+                    };
+                    // The `&mut data` borrow above has ended; swap in the temp-file replay stream
+                    // and forward it fixed-length.
+                    data = replay;
+                    parts
+                        .headers
+                        .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+                    BodyPlan::Fixed
+                }
                 Some(Ok(first)) => {
                     parts.headers.insert(
                         header::TRANSFER_ENCODING,
@@ -617,6 +679,85 @@ fn empty_body_data() -> BodyData {
     Box::pin(futures::stream::empty())
 }
 
+/// Why bounded request-body buffering stopped short.
+#[derive(Debug)]
+enum BufferError {
+    /// The body exceeded the upstream's `max_buffer_bytes` → `413 Payload Too Large`.
+    TooLarge,
+    /// A temp-file I/O error (create/write/seek) or an inbound body-read error → `502 Bad Gateway`.
+    Io,
+}
+
+/// Buffer a length-unknown request body — the already-peeked `first` chunk plus the rest of
+/// `data` — to a **bounded, per-request temp file** in `dir`, returning `(content_length, replay)`
+/// where `replay` streams the buffered bytes back so the body can be forwarded fixed-length.
+///
+/// This is the resource-sensitive seam (an untrusted upload body), designed so it cannot become a
+/// memory, disk, or cross-tenant vector:
+///
+/// - **Bounded.** The running total is checked BEFORE every write; a body that would cross `max`
+///   is rejected ([`BufferError::TooLarge`] → `413`) WITHOUT spilling past the bound. A single
+///   request therefore spends at most `max` bytes of temp space, and total exposure across the
+///   node is `max` × concurrent buffered uploads (itself bounded by the server's connection
+///   limits). RSS stays flat regardless of body size — the body lives on disk, not in a `Vec`;
+///   only one read/write chunk (≤ 64 KiB) is resident at a time.
+/// - **Safe temp file.** [`tempfile::tempfile_in`] creates the spill file and immediately unlinks
+///   it (or uses `O_TMPFILE`), so it has NO reachable directory entry: no guessable or shared
+///   name, no symlink/TOCTOU target, and nothing another tenant or process can open by path. Each
+///   call gets its own fresh file. Under the packaged systemd unit the spill dir is the service's
+///   `PrivateTmp` (private to the boatramp process), so even the directory is not shared off-box.
+/// - **Cleaned up on EVERY path.** Because the inode is unlinked at creation, its storage is
+///   reclaimed the moment the owning handle closes — on success (the `replay` stream owns the
+///   handle and drops after the forward), on the `413` / I/O-error returns here (the local `file`
+///   drops), and on a panic or task-cancel (drop still runs). There is no unlink step to forget on
+///   an error path, so no leak is possible.
+///
+/// NOTE: the spill store is `std::env::temp_dir()` in production. If an operator points that at a
+/// RAM-backed `tmpfs`, buffering consumes RAM rather than disk — still hard-bounded by `max`, so
+/// it cannot OOM unbounded, but size `max_buffer_bytes` accordingly.
+async fn buffer_body_to_length_in(
+    first: Bytes,
+    data: &mut BodyData,
+    max: u64,
+    dir: &std::path::Path,
+) -> Result<(u64, BodyData), BufferError> {
+    use futures::StreamExt;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    // An unnamed temp file in `dir` — unlinked at creation, so there is no path to leak or race.
+    let std_file = tempfile::tempfile_in(dir).map_err(|_| BufferError::Io)?;
+    let mut file = tokio::fs::File::from_std(std_file);
+    let mut total: u64 = 0u64;
+
+    // Spill `first`, then each subsequent chunk, enforcing the cap BEFORE each write so the temp
+    // file never grows past `max` even by one chunk.
+    let mut chunk = first;
+    loop {
+        let would_be = total
+            .checked_add(chunk.len() as u64)
+            .filter(|n| *n <= max)
+            .ok_or(BufferError::TooLarge)?;
+        file.write_all(&chunk).await.map_err(|_| BufferError::Io)?;
+        total = would_be;
+        match data.next().await {
+            Some(Ok(next)) => chunk = next,
+            Some(Err(_)) => return Err(BufferError::Io),
+            None => break,
+        }
+    }
+    file.flush().await.map_err(|_| BufferError::Io)?;
+    // Rewind to replay the buffered body from the start.
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|_| BufferError::Io)?;
+
+    // Stream the temp file back as the request body; the stream owns `file`, so the (unlinked)
+    // temp file is reclaimed when the forward finishes and the stream drops.
+    let replay = tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024)
+        .map(|r| r.map_err(axum::Error::new));
+    Ok((total, Box::pin(replay)))
+}
+
 /// The reverse-proxy response body: streams the upstream response body straight to the
 /// downstream client off the pooled connection, then — on a clean, fully-drained,
 /// keep-alive response — returns that connection to [`POOL`] for reuse. A mid-body error
@@ -748,6 +889,10 @@ fn cached_client(
             tls_insecure,
             read_buffer_bytes,
         },
+        // Buffering is OFF unless the caller opts in via `with_buffering` (so the default path —
+        // and the absolute-URL `proxy` path, which has no per-upstream config — is unchanged).
+        buffer_requests: false,
+        max_buffer_bytes: DEFAULT_MAX_BUFFER_BYTES,
     })
 }
 
@@ -1366,6 +1511,9 @@ async fn proxy_upstream(
         Ok(client) => client,
         Err(_) => return (StatusCode::BAD_GATEWAY, "gateway client error\n").into_response(),
     };
+    // Opt this upstream into request buffering when configured (registry-fronting parity): a
+    // length-unknown body is spilled to a bounded temp file and forwarded with a Content-Length.
+    let client = client.with_buffering(upstream.buffer_requests, upstream.max_buffer_bytes);
 
     let scheme = parts
         .headers
@@ -1459,6 +1607,10 @@ async fn proxy_upstream(
             (StatusCode::GATEWAY_TIMEOUT, "upstream timeout\n").into_response()
         }
         Err(UpstreamError::Failed) => (StatusCode::BAD_GATEWAY, "upstream error\n").into_response(),
+        Err(UpstreamError::PayloadTooLarge) => {
+            tracing::warn!(%host, "gateway upstream request body exceeded the buffer_requests cap");
+            (StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n").into_response()
+        }
     }
 }
 
@@ -2539,6 +2691,162 @@ Connection: close\r\n\r\n";
         assert!(
             !lower.contains("content-length"),
             "a chunked body must not also carry a Content-Length (no CL×TE); got head:\n{head}"
+        );
+    }
+
+    // --- request buffering (buffer_requests): registry-fronting over HTTP/2 ----------------
+    //
+    // The v0.73.0 fix. A `docker push` over the edge's HTTP/2 arrives END_STREAM-delimited with
+    // no Content-Length, so the h2→h1 forward leg would frame it `Transfer-Encoding: chunked` —
+    // which a Gitea/OCI registry rejects on a blob PUT ("missing content-length header"). With
+    // `buffer_requests` the forward leg buffers the body to a bounded temp file, computes its
+    // length, and forwards it fixed-length. Default-off leaves the chunked path unchanged (see
+    // `native_client_forwards_chunked_put_body_intact`, above).
+
+    /// With `buffer_requests` ON, a length-unknown streamed body (no `Content-Length`) is buffered
+    /// and forwarded FIXED-LENGTH: the upstream receives the exact bytes under a single
+    /// `Content-Length: N` and NO `Transfer-Encoding`, which is what the registry blob PUT needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_buffers_length_unknown_body_to_fixed_length() {
+        const OK: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, rx) = capture_upstream(OK).await;
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false)
+            .unwrap()
+            .with_buffering(true, Some(16 * 1024 * 1024));
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/u4",
+            addr.port()
+        );
+
+        // No Content-Length + a streamed body ⇒ WITHOUT buffering this would forward chunked.
+        let parts: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"layer-")),
+            Ok(Bytes::from_static(b"segment-")),
+            Ok(Bytes::from_static(b"payload")),
+        ];
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .body(Body::from_stream(futures::stream::iter(parts)))
+            .unwrap();
+        let resp = client.send(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let _ = axum::body::to_bytes(Body::from_stream(resp.into_body()), 1 << 20)
+            .await
+            .unwrap();
+
+        let (head, body) = rx.await.unwrap();
+        let lower = head.to_ascii_lowercase();
+        assert_eq!(
+            body, b"layer-segment-payload",
+            "the upstream must receive the buffered body intact"
+        );
+        assert!(
+            lower.contains(&format!(
+                "content-length: {}",
+                "layer-segment-payload".len()
+            )),
+            "a buffered body must forward a computed Content-Length; got head:\n{head}"
+        );
+        assert!(
+            !lower.contains("transfer-encoding"),
+            "a buffered body must NOT be chunked (that is the bug being fixed); got head:\n{head}"
+        );
+    }
+
+    /// DoS guard: with `buffer_requests` ON, a length-unknown body that exceeds `max_buffer_bytes`
+    /// is REJECTED (`PayloadTooLarge` → `413`) rather than buffered without bound — so an untrusted
+    /// upload can neither exhaust memory nor fill the disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_buffer_requests_rejects_body_over_cap() {
+        const OK: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        // Bind an upstream so a (buggy) forward would succeed loudly rather than hang; the guard
+        // must trip before any dial, so the upstream is never actually contacted.
+        let (addr, _rx) = capture_upstream(OK).await;
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false)
+            .unwrap()
+            .with_buffering(true, Some(8)); // 8-byte cap
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/u5",
+            addr.port()
+        );
+
+        // 15 bytes with no declared length — over the 8-byte cap.
+        let parts: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"aaaaa")),
+            Ok(Bytes::from_static(b"bbbbb")),
+            Ok(Bytes::from_static(b"ccccc")),
+        ];
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .body(Body::from_stream(futures::stream::iter(parts)))
+            .unwrap();
+        match client.send(req).await {
+            Err(UpstreamError::PayloadTooLarge) => {}
+            Ok(_) => panic!("a body over the buffer cap must be rejected, not forwarded"),
+            Err(e) => panic!("expected PayloadTooLarge, got {e:?}"),
+        }
+    }
+
+    /// Unit on the bounded-buffer helper: it spills to an UNNAMED temp file and leaves nothing
+    /// behind on ANY exit path. Success path — the body replays intact and the dir stays empty
+    /// (the file is unlinked at creation, so no directory entry ever appears). Over-cap path —
+    /// `TooLarge`, and still nothing is left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffer_body_to_length_in_is_bounded_and_leaves_no_tempfile() {
+        fn dir_entry_count(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir).unwrap().count()
+        }
+
+        // --- success: an under-cap body round-trips and leaves no file ---
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(dir_entry_count(tmp.path()), 0);
+        let first = Bytes::from_static(b"hello ");
+        let rest: Vec<Result<Bytes, axum::Error>> = vec![
+            Ok(Bytes::from_static(b"brave ")),
+            Ok(Bytes::from_static(b"world")),
+        ];
+        let mut data: BodyData = Box::pin(futures::stream::iter(rest));
+        let (len, replay) = buffer_body_to_length_in(first, &mut data, 1024, tmp.path())
+            .await
+            .expect("an under-cap body buffers");
+        assert_eq!(len, b"hello brave world".len() as u64);
+        // Unlinked at creation — the dir shows no entry even while the handle is live.
+        assert_eq!(
+            dir_entry_count(tmp.path()),
+            0,
+            "no named temp file is ever created (crash-safe: unlinked at creation)"
+        );
+        let buffered = axum::body::to_bytes(Body::from_stream(replay), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            buffered.as_ref(),
+            b"hello brave world",
+            "the buffered body replays intact"
+        );
+        assert_eq!(
+            dir_entry_count(tmp.path()),
+            0,
+            "nothing is left behind after the replay stream drops"
+        );
+
+        // --- over-cap: rejected, still nothing left behind ---
+        let first = Bytes::from_static(b"0123456789");
+        let rest: Vec<Result<Bytes, axum::Error>> = vec![Ok(Bytes::from_static(b"abcdef"))];
+        let mut data: BodyData = Box::pin(futures::stream::iter(rest));
+        let err = buffer_body_to_length_in(first, &mut data, 12, tmp.path())
+            .await
+            .err();
+        assert!(
+            matches!(err, Some(BufferError::TooLarge)),
+            "an over-cap body is rejected with TooLarge"
+        );
+        assert_eq!(
+            dir_entry_count(tmp.path()),
+            0,
+            "the over-cap error path leaves no temp file"
         );
     }
 
