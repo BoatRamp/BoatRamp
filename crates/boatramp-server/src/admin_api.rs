@@ -1244,10 +1244,13 @@ fn effective_put_priority(
 
 /// Create/update a workload: content-address its spec, then flip the desired
 /// state (replicas/placement) — the atomic activation pointer.
+#[allow(clippy::too_many_arguments)] // axum extractors: +Auth/+VerifiedPrincipal for the site gate
 pub(super) async fn put_compute(
     State(deploy): State<DeployStore>,
     Extension(daemon): Extension<Arc<DaemonRuntime>>,
     Extension(project): axum::extract::Extension<ProjectContext>,
+    Extension(auth): Extension<crate::auth::Auth>,
+    principal: Option<Extension<crate::auth::VerifiedPrincipal>>,
     Path(name): Path<String>,
     axum::extract::Query(params): axum::extract::Query<PutComputeParams>,
     Json(mut request): Json<PutComputeRequest>,
@@ -1301,34 +1304,92 @@ pub(super) async fn put_compute(
     // Non-fatal set-time advisories (F2): collected here AND logged, then returned in the
     // response body so a `Project·Admin` — who cannot read node logs — sees them in the CLI.
     let mut warnings: Vec<String> = Vec::new();
-    // Likely-mistake advisory (PLAN-compute-dx #1): a `blob` binding resolves its namespace
-    // under the WORKLOAD name as the site-identity segment (`hblob/{project}/{workload}/…`),
-    // exactly as a `wasi:blobstore` handler uses its SITE name — so a workload shares a
-    // site's blob store ONLY when it is named after that site. A blob-bound workload whose
-    // name matches no known site almost certainly means the author expected to share a
-    // site's container but is silently writing to an invisible namespace of its own. Warn,
-    // never block; best-effort, so a site-list error just skips the advisory.
-    if request
+    // EXPLICIT blob site-share gate (#12, tenancy-sensitive). A `blob` binding with an explicit
+    // `site` shares that SITE's blob tape (`hblob/{project}/{site}/…`) — the same tape a
+    // `wasi:blobstore` handler for `(project, site)` sees. This REPLACES the pre-v0.73.0 name-match
+    // convention (a workload named after a site silently shared its tape) with a deliberate,
+    // authorized opt-in. Gate each explicit site here, fail-CLOSED, BEFORE storing the spec:
+    //   1. a well-formed site slug (`validate_resource_name`);
+    //   2. a REAL site in the workload's OWN project (`deploy.all_sites(project)`) — the project is
+    //      the request's `ProjectContext` (server-forced from the path), NEVER the binding, so a
+    //      share can only ever name a site WITHIN this tenant (the tenant invariant);
+    //   3. the caller holds the site's blob-WRITE right (`Site·Write` on `<project>/<site>`) —
+    //      the per-site right that governs that tape's data plane, re-checked against the caller's
+    //      verified roles under the live policy. The path gate for compute is `Project·Deploy`;
+    //      this additionally binds the cross-resource coupling to the site's own right, so a
+    //      principal that can ship compute but lacks the site grant cannot cross-wire its blobs.
+    let explicit_sites: Vec<String> = request
         .spec
         .bindings
         .iter()
-        .any(|b| b.kind == boatramp_core::compute::BindingKind::Blob)
-        && let Ok(sites) = deploy.all_sites(project.as_ref()).await
-        && boatramp_core::compute::blob_bind_names_unknown_site(
-            &name,
-            &request.spec.bindings,
-            &sites,
-        )
-    {
-        let msg = format!(
-            "workload `{name}` declares a `blob` binding but its name matches no site in the \
-             project; a blob bind resolves under the WORKLOAD name as the site segment \
-             (hblob/<project>/{name}/…), so unless the workload is named after the site whose \
-             data it shares it reads/writes an empty namespace of its own — name it after that \
-             site (see `compute set --bind`)"
-        );
-        tracing::warn!(project = %project.as_ref(), workload = %name, "{msg}");
-        warnings.push(msg);
+        .filter(|b| b.kind == boatramp_core::compute::BindingKind::Blob)
+        .filter_map(|b| b.site.clone())
+        .collect();
+    if !explicit_sites.is_empty() {
+        let proj = project.as_ref().as_str().to_string();
+        // Load this project's sites once (the tenant boundary — never the binding's).
+        let sites = match deploy.all_sites(project.as_ref()).await {
+            Ok(s) => s,
+            Err(err) => return deploy_error_response(err),
+        };
+        for site in &explicit_sites {
+            // (1) structural: a well-formed site slug (homoglyph-safe), else a clear 400.
+            if let Err(e) = boatramp_core::project::validate_resource_name("site", site) {
+                return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response();
+            }
+            // (2) tenancy: the site must EXIST in the workload's OWN project.
+            if !sites.iter().any(|s| s == site) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "blob binding targets site `{site}`, which does not exist in project \
+                         `{proj}`; a compute workload can only share a site in its OWN project \
+                         (create the site, or fix the `--bind blob:<container>@<site>` target)\n"
+                    ),
+                )
+                    .into_response();
+            }
+            // (3) authz: the caller must hold the site's blob-write right. Re-checked against the
+            // caller's verified, normalized roles under the LIVE policy, fail-closed.
+            let required = boatramp_core::authz::Right::new(
+                boatramp_core::authz::Resource::Site,
+                Some(format!("{proj}/{site}")),
+                boatramp_core::authz::Action::Write,
+            );
+            let authorized = if auth.is_disabled() {
+                true // dev: the control plane is open, no RBAC principal exists
+            } else {
+                match principal.as_ref() {
+                    Some(Extension(p)) => {
+                        match auth.authorize_roles(&p.roles, &required, true).await {
+                            Ok(v) => v,
+                            // Policy store unreachable → shed (503), never a silent allow.
+                            Err(_) => {
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "authz policy store unreachable; retry shortly\n",
+                                )
+                                    .into_response();
+                            }
+                        }
+                    }
+                    // Auth enabled but no verified principal (should never happen behind
+                    // `require_auth`) → fail CLOSED.
+                    None => false,
+                }
+            };
+            if !authorized {
+                return (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "not authorized to bind a compute workload to site `{site}`'s blob tape \
+                         in project `{proj}` (requires the site's blob-write right, \
+                         Site·Write on `{proj}/{site}`)\n"
+                    ),
+                )
+                    .into_response();
+            }
+        }
     }
     // Tenancy advisory (PLAN-compute-dx #3): opting into local-image reuse (a `pull_policy`
     // other than `always`) with a MUTABLE `name:tag` is unsound even single-tenant — the tag
@@ -3378,9 +3439,15 @@ pub(super) async fn compute_dev_bind_blob(
     {
         return resp;
     }
+    // Bind EXPLICITLY to the named site's blob tape (`hblob/{project}/{site}/…`). Post-v0.73.0 the
+    // workload name no longer stands in as the site identity, so the dev-bind affordance names the
+    // site directly via the binding's `site` — reaching the SAME tape a managed `--bind
+    // blob:<c>@<site>` workload (or a `wasi:blobstore` handler) for that site sees. `site` was
+    // already slug-validated above; `scope` re-validates fail-closed.
     let binding =
         boatramp_core::compute::ComputeBinding::new(boatramp_core::compute::BindingKind::Blob)
-            .with_name(req.container.unwrap_or_default());
+            .with_name(req.container.unwrap_or_default())
+            .with_site(&req.site);
     let env = resolver
         .resolve(
             project,

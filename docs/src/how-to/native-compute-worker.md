@@ -77,10 +77,30 @@ and a per-replica bearer token into the workload's environment:
 | `--bind blob` (or `blob:<container>`) | `BOATRAMP_BLOB_URL`, `BOATRAMP_BLOB_URL_AUTH_TOKEN` |
 
 A bare `--bind messaging` is bus-wide (any topic); `--bind messaging:deliver` confines the
-token to the `deliver` topic. A bare `--bind blob` is site-wide; `--bind blob:assets` confines
-the token to the `assets` container. The token is minted per replica, rotates on restart, and
-is revoked when the replica stops — the operator's storage/bus credentials never enter the
-guest.
+token to the `deliver` topic. A bare `--bind blob` is namespace-wide; `--bind blob:assets`
+confines the token to the `assets` container. The token is minted per replica, rotates on
+restart, and is revoked when the replica stops — the operator's storage/bus credentials never
+enter the guest.
+
+### Which blob tape a `--bind blob` reaches
+
+By default a `blob` binding resolves to the workload's **own private namespace**,
+`hblob/{project}/_compute/{workload}/…`. This is disjoint from every site's blob tape: a
+compute workload named like a site does **not** share that site's blobs. (Before v0.73.0 a
+`blob` binding resolved under the workload *name* as the site segment, so a workload named
+after a site implicitly shared its tape — an undiscoverable coupling that is now gone.)
+
+To deliberately **share a site's blob tape**, append `@<site>` to the bind:
+
+| `--bind` | Blob namespace |
+|---|---|
+| `--bind blob` / `blob:assets` | the workload's private `hblob/{project}/_compute/{workload}/…` |
+| `--bind blob@blog` / `blob:assets@blog` | site `blog`'s tape `hblob/{project}/blog/…` — the same objects a `wasi:blobstore` handler for that site sees |
+
+The site must exist in **this workload's own project** (the project is taken from the
+workload's key, never the bind), and you must hold that site's blob-write right; the server
+rejects an unknown or cross-project site at `compute set` time. `@<site>` is valid only on a
+`blob` binding.
 
 If your program reads differently named variables, remap with templated `--env`: the
 `{{messaging.url}}` / `{{messaging.token}}` and `{{blob.url}}` / `{{blob.token}}` placeholders
@@ -156,8 +176,9 @@ eval "$(boatramp compute bind-messaging --topic deliver --export)"
 
 `--server` is accepted on the `compute` command (`boatramp compute bind-blob --server <url>
 …`), falling back to `$BOATRAMP_SERVER` and then `[deploy].server`. `bind-blob` requires
-`--site` (the workload identity whose per-site namespace to bind); `bind-messaging` has no
-`--site` because the bus is project-scoped. Both take `--project` (default `default`); omit
+`--site` (the site whose blob tape to bind, `hblob/{project}/{site}/…` — the same tape a
+deployed `--bind blob:<container>@<site>` workload reaches); `bind-messaging` has no `--site`
+because the bus is project-scoped. Both take `--project` (default `default`); omit
 `--container`/`--topic` for a namespace-wide credential.
 
 ### Enable the bind loop on the node (operator)

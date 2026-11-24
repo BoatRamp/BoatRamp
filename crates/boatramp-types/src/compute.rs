@@ -447,6 +447,21 @@ pub struct ComputeBinding {
     /// referencing `{{sql.migration_dsn}}` injects the migration DSN regardless of this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_url_env: Option<String>,
+    /// For a `blob` binding ONLY: the **site** in this workload's OWN project whose blob tape the
+    /// workload shares. `Some("blog")` resolves the binding to that site's `hblob/{project}/blog/`
+    /// namespace — the SAME tape a `wasi:blobstore` handler for `(project, blog)` sees — so a worker
+    /// can deliberately co-locate on a site's blobs. The project is ALWAYS the workload's own (taken
+    /// from its key), never this field, so a binding can never reach another tenant's data; the
+    /// server gates the share at set time (the named site must exist in the workload's project, and
+    /// the caller must hold the site's blob-write right). `None` (the default) resolves the binding
+    /// to the workload's PRIVATE reserved compute namespace `hblob/{project}/_compute/{workload}/`,
+    /// which is disjoint from every site tape (a site name can never be `_compute`). Dropping this
+    /// field entirely is the v0.73.0 convention-drop: a `blob`-bound workload no longer silently
+    /// shares the same-named site's tape — set `site` to opt into a share. Omitted from the wire +
+    /// the content hash when `None` (back-compat: existing specs keep their id), like
+    /// [`url_env`](Self::url_env) / `migration_url_env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
 }
 
 /// The managed-resource kinds a [`ComputeBinding`] may name. `Sql`/`Kv`/`Blob`/`Messaging` each
@@ -481,6 +496,7 @@ impl ComputeBinding {
             name: String::new(),
             url_env: None,
             migration_url_env: None,
+            site: None,
         }
     }
 
@@ -503,6 +519,16 @@ impl ComputeBinding {
     #[must_use]
     pub fn with_migration_url_env(mut self, migration_url_env: Option<String>) -> Self {
         self.migration_url_env = migration_url_env;
+        self
+    }
+
+    /// For a `blob` binding, EXPLICITLY share the named [`site`](Self::site)'s blob tape (a site in
+    /// this workload's own project). `None` (the default) keeps the workload's private reserved
+    /// compute namespace — see [`site`](Self::site). No effect on a non-`blob` binding's resolution
+    /// (the shim honors it only for `blob`).
+    #[must_use]
+    pub fn with_site(mut self, site: impl Into<String>) -> Self {
+        self.site = Some(site.into());
         self
     }
 
@@ -1694,9 +1720,42 @@ mod tests {
             name: String::new(),
             url_env: None,
             migration_url_env: None,
+            site: None,
         }];
         assert_ne!(a.id(), b.id(), "a declared binding changes the id");
         assert!(serde_json::to_string(&b).unwrap().contains("bindings"));
+    }
+
+    #[test]
+    fn blob_binding_site_is_content_hash_neutral_when_unset() {
+        // A blob binding with NO explicit site omits the `site` field entirely, so a spec
+        // declaring it serializes byte-identically to a pre-`site` spec and keeps its content
+        // hash (the same zero-churn pattern as writable_root / priority / url_env). This is the
+        // invariant the v0.73.0 convention-drop rides on: adding the field re-homes nothing.
+        let mut a = spec();
+        a.bindings = vec![ComputeBinding::new(BindingKind::Blob).with_name("assets")];
+        let json_a = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json_a.contains("\"site\""),
+            "an unset binding site is omitted from the wire: {json_a}"
+        );
+
+        // Opting into an explicit site is recorded, round-trips, and CHANGES the content hash
+        // (the site-share is part of the workload's identity — it changes which tape it reaches).
+        let mut b = spec();
+        b.bindings = vec![
+            ComputeBinding::new(BindingKind::Blob)
+                .with_name("assets")
+                .with_site("blog"),
+        ];
+        assert_ne!(a.id(), b.id(), "an explicit binding site changes the id");
+        let json_b = serde_json::to_string(&b).unwrap();
+        assert!(
+            json_b.contains("\"site\":\"blog\""),
+            "an explicit site is on the wire: {json_b}"
+        );
+        let round: ComputeSpec = serde_json::from_str(&json_b).unwrap();
+        assert_eq!(round.bindings[0].site.as_deref(), Some("blog"));
     }
 
     #[test]
@@ -1710,6 +1769,7 @@ mod tests {
             name: String::new(),
             url_env: None,
             migration_url_env: None,
+            site: None,
         };
         assert_eq!(sql.url_env(), "BOATRAMP_SQL_URL");
         let custom = ComputeBinding {
@@ -1717,6 +1777,7 @@ mod tests {
             name: "analytics".into(),
             url_env: Some("ANALYTICS_URL".into()),
             migration_url_env: None,
+            site: None,
         };
         assert_eq!(custom.url_env(), "ANALYTICS_URL");
         // The migration/DDL env var defaults to `<url_env>_MIGRATION`, or an explicit override.
@@ -1727,6 +1788,7 @@ mod tests {
             name: "analytics".into(),
             url_env: Some("ANALYTICS_URL".into()),
             migration_url_env: Some("ANALYTICS_DDL_URL".into()),
+            site: None,
         };
         assert_eq!(explicit.migration_url_env(), "ANALYTICS_DDL_URL");
     }
@@ -1749,6 +1811,7 @@ mod tests {
             name: String::new(),
             url_env: None,
             migration_url_env: None,
+            site: None,
         };
         assert_eq!(invoke.url_env(), "BOATRAMP_INVOKE_URL");
         // Every kind's stable tag is distinct (the shim token HMAC relies on this).
@@ -1781,6 +1844,7 @@ mod tests {
             name: String::new(),
             url_env: None,
             migration_url_env: None,
+            site: None,
         }];
         assert_ne!(a.id(), b.id(), "a declared invoke binding changes the id");
         assert!(serde_json::to_string(&b).unwrap().contains("invoke"));

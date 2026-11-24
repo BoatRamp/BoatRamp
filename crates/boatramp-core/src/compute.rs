@@ -5322,25 +5322,6 @@ pub fn managed_db_spec(
     .build()
 }
 
-/// Whether a workload that declares a `blob` [`ComputeBinding`] is likely **misnamed**: it
-/// binds a blob store but its name matches no known site in the project. A `blob` (or `kv`)
-/// binding resolves its namespace under the **workload name** as the site-identity segment
-/// (`hblob/{project}/{workload}/…`, exactly as a `wasi:blobstore` handler uses its SITE name
-/// — see `boatramp_server::blob_shim`), so a workload shares a site's container only when it
-/// is NAMED AFTER that site; a name matching no site writes to an invisible, empty namespace
-/// of its own with no error. Returns true only when there IS a `blob` binding **and**
-/// `workload` is absent from `known_sites` — a likely-mistake signal the server logs at set
-/// time. Pure and case-sensitive (site names are case-sensitive store keys), so it is
-/// unit-testable without a store.
-pub fn blob_bind_names_unknown_site(
-    workload: &str,
-    bindings: &[ComputeBinding],
-    known_sites: &[String],
-) -> bool {
-    bindings.iter().any(|b| b.kind == BindingKind::Blob)
-        && !known_sites.iter().any(|s| s == workload)
-}
-
 /// Persist a drained preemption victim's durable [`Readiness::Preempted`] MARKER — the record
 /// (kept, not deleted) that makes `compute status` show `PREEMPTED` with the preemptor
 /// attribution and that the reconcile retries once its cooldown expires + capacity frees. Built
@@ -7124,37 +7105,6 @@ async fn launch_with_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn blob_bind(name: &str) -> ComputeBinding {
-        ComputeBinding::new(BindingKind::Blob).with_name(name)
-    }
-
-    #[test]
-    fn blob_bind_site_mismatch_warns_only_on_a_blob_bind_with_an_unknown_name() {
-        let sites = vec!["mailroom".to_string(), "shop".to_string()];
-        // A blob-bound workload NAMED after a site is fine (shares that site's store).
-        assert!(!blob_bind_names_unknown_site(
-            "mailroom",
-            &[blob_bind("")],
-            &sites
-        ));
-        // A blob-bound workload whose name matches NO site is the footgun — warn.
-        assert!(blob_bind_names_unknown_site(
-            "mail-worker",
-            &[blob_bind("inbox")],
-            &sites
-        ));
-        // No blob binding ⇒ never warn, even for an unknown name (sql/kv/messaging don't
-        // share this blob-shim site-identity footgun on the blob store).
-        let sql = ComputeBinding::new(BindingKind::Sql);
-        assert!(!blob_bind_names_unknown_site("mail-worker", &[sql], &sites));
-        // Matching is case-sensitive (store keys are) — a case-mismatch is still a "no site".
-        assert!(blob_bind_names_unknown_site(
-            "Mailroom",
-            &[blob_bind("")],
-            &sites
-        ));
-    }
 
     #[test]
     fn pg_client_image_matches_the_server_major() {

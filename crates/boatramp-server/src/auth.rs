@@ -317,6 +317,35 @@ impl Auth {
         self.inner.as_ref().map(|i| i.public.clone())
     }
 
+    /// Whether the already-verified, normalized granted `roles` satisfy `required` under the LIVE
+    /// RBAC policy — a defense-in-depth, in-handler re-check for a cross-resource coupling the
+    /// path-level [`require_auth`] gate cannot express. (Example: `put_compute` is gated at
+    /// `Project·Deploy`, but a `blob` binding that shares a SITE's blob tape must ALSO hold that
+    /// site's own blob-write right — a custom policy could grant `Project·Deploy` without the
+    /// per-site grant, and this closes that gap.) Uses the SAME fenced, fail-closed policy load the
+    /// middleware uses — pass `is_write = true` at a write/mint point so a shared-mode node reads
+    /// THROUGH to the live store — and the SAME normalize-then-Cedar decision. Returns `Ok(true)` /
+    /// `Ok(false)`; `Err(KvError)` when the policy store is UNREACHABLE, so the caller fails CLOSED
+    /// (shed / deny — NEVER allow). When auth is **disabled** (dev) returns `Ok(true)`: the control
+    /// plane is already open and no RBAC principal exists.
+    pub async fn authorize_roles(
+        &self,
+        roles: &[authz::GrantedRole],
+        required: &Right,
+        is_write: bool,
+    ) -> Result<bool, KvError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(true); // auth disabled (dev) — the control plane is already open
+        };
+        // MF-3/MF-4: the SAME fenced, fail-closed policy load `authorize` uses. A store-unreachable
+        // read → `Err` → the caller fails CLOSED (never falls to the looser built-in default).
+        let (policy, compiled) = inner.policy(is_write).await?;
+        // Normalize (idempotent on already-normalized grants) against the SAME policy the authorizer
+        // compiled from, then decide with the compiled Cedar authorizer — one verdict source.
+        let roles = policy.normalize_grants(roles);
+        Ok(compiled.authorize(&roles, required))
+    }
+
     /// The "any valid token" gate (protected previews): a token that is
     /// authentic, unexpired, and not revoked — no RBAC right required. Returns
     /// `false` when auth is disabled (no tokens exist to present).
