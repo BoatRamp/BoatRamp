@@ -157,6 +157,45 @@ pub fn is_conforming_role_target(target: &str) -> bool {
     }
 }
 
+/// Validate a messaging **consumer group** name as a single clean key segment (M-A). A non-empty
+/// group keys `mqgstate/{topic}/{group}` (and the group's DLQ / payload pins), so a group that
+/// carried a `/` would COLLIDE a victim group's per-topic keyspace AND cross the per-topic authz grain
+/// (a token scoped to topic `orders` could corrupt the `orders/created` group state of a victim
+/// confined to that subtopic). `validate_object_key` is INSUFFICIENT — it is a `/`-separated PATH
+/// validator and deliberately permits `/`.
+///
+/// This is the single, shared rule enforced fail-closed in the durable core
+/// (`boatramp_core::messaging` `claim_grouped` / `ack` / `nack` / `nack_after`) AND loudly-early at
+/// every registration surface (the long-poll / stream query params, `WebhookSink::validate`, and
+/// `DeployConfig::compile_check`). A group, like a tenant / container value, is a DATA-PLANE segment,
+/// so it keeps the `.`/`@`-tolerant **key-safety denylist** (the exact character class of
+/// `boatramp_core::project::validate_key_segment`, pinned equal by a drift test there) rather than the
+/// stricter operator slug: it rejects the empty string, a name over [`MAX_RESOURCE_NAME_LEN`] bytes,
+/// `.`/`..`, and any `/`, `\`, `*`, whitespace, or control byte — nothing that could reshape the key or
+/// traverse — while still admitting an ordinary dotted / `@`-bearing lane name. Returns the offending
+/// reason; the caller maps it to its own error type.
+pub fn validate_consumer_group(group: &str) -> Result<(), &'static str> {
+    if group.is_empty() {
+        return Err("must not be empty");
+    }
+    if group.len() > MAX_RESOURCE_NAME_LEN {
+        return Err("must not exceed 63 bytes");
+    }
+    if group == "." || group == ".." {
+        return Err("must not be '.' or '..'");
+    }
+    for c in group.chars() {
+        match c {
+            '/' | '\\' => return Err("must not contain a path separator ('/' or '\\')"),
+            '*' => return Err("must not contain '*'"),
+            c if c.is_whitespace() => return Err("must not contain whitespace"),
+            c if c.is_control() => return Err("must not contain control characters"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// KV prefix for the mutable pointer `projectmeta/<name>` → active spec hash.
 pub const POINTER_PREFIX: &str = "projectmeta/";
 /// KV prefix for the immutable, content-addressed project spec body.

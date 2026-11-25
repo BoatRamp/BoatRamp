@@ -64,6 +64,16 @@ pub struct DeployConfig {
     /// paths — activated on deploy, folded into the manifest (atomic with the content) — sharing the
     /// SAME [`WebhookSink`] record + [`WebhookSink::validate`] as the runtime
     /// `PUT /api/projects/{proj}/bus/sinks/{name}` surface.
+    ///
+    /// **SSRF floor at apply (N1).** The static [`WebhookSink::validate`] (name / topic / group /
+    /// secret-ref / egress-glob syntax) runs at `validate`/`sync`. The *destination* SSRF floor
+    /// (resolve the sealed URL → `is_global_ip` + the per-sink allowlist, the register-time floor the
+    /// runtime `PUT` runs) needs the secret store, so it runs at **activation** when a node secret
+    /// store is wired — a config sink pointed at an internal/metadata/loopback address is refused
+    /// there, LOUDLY, not silently dead-lettered at delivery. On a node with NO secret store wired at
+    /// the apply phase the sink keeps ONLY its delivery-time flooring (the POST still floors on every
+    /// attempt), so the asymmetry is: a bad-destination config sink is caught at activation where the
+    /// store exists, else at first delivery.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub webhook_sinks: Vec<WebhookSink>,
     /// Scheduled handler invocations (cron).
@@ -266,6 +276,17 @@ impl DeployConfig {
             // BR-REQ-2: lint the consumer lane's dynamic egress host syntax (the consumer lane HONORS
             // the field, same as a handler).
             validate_dynamic_egress_hosts(&consumer.dynamic_egress_hosts)?;
+            // M-A (N6): a non-empty consumer group keys the per-topic group state
+            // (`mqgstate/{topic}/{group}`), so refuse a `/`-bearing (or otherwise non-segment) group
+            // LOUDLY at apply/validate — never as a silent cross-topic keyspace collision at claim.
+            if !consumer.group.is_empty()
+                && let Err(reason) = crate::project::validate_consumer_group(&consumer.group)
+            {
+                return Err(ConfigError::parse(format!(
+                    "consumer group {:?} is invalid — {reason}",
+                    consumer.group
+                )));
+            }
         }
         // Webhook sinks (PLAN-messaging-consumer-delivery, increment d): the config-declared half of a
         // sink's two registration paths runs the SAME `WebhookSink::validate` the runtime
@@ -1454,6 +1475,21 @@ impl SubscriptionParams {
     pub const MAX_BATCH: usize = 1024;
     /// Default fan-out retention (ms): 24 h — mirrors [`ConsumerConfig`]'s `retention_ms` default.
     pub const DEFAULT_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+    /// L-4: hard cap on a request-/config-supplied **visibility lease** (1 h). A client-chosen lease
+    /// holds a claimed message invisible until it expires, so an unbounded `lease_ms` would let a
+    /// consumer (long-poll / stream / webhook) strand its own messages from redelivery for arbitrarily
+    /// long. Clamped to `[1, MAX_LEASE_MS]` at the one shared [`resolve`](Self::resolve) site, so every
+    /// transport inherits the bound.
+    pub const MAX_LEASE_MS: u64 = 60 * 60 * 1000;
+    /// L-4: hard cap on the request-/config-supplied **dead-letter threshold**. Bounds the redelivery
+    /// amplification of one poison message — an unbounded `max_attempts` would effectively defeat the
+    /// DLQ (a message redelivered billions of times before it is ever quarantined). Also the N2 clamp
+    /// for a webhook sink (which resolves through this same site).
+    pub const MAX_MAX_ATTEMPTS: u32 = 100;
+    /// L-4: hard cap on a request-/config-supplied **`max_ack_pending`** (outstanding-unacked per
+    /// connection). Bounds a slow consumer's leased-but-unacked set; `None` stays unbounded-by-this
+    /// (the per-claim batch — itself clamped to [`MAX_BATCH`] — bounds a single claim regardless).
+    pub const MAX_ACK_PENDING: usize = 100_000;
 
     /// Resolve with the STREAM/SINK batch default ([`Self::DEFAULT_MAX_BATCH`]).
     pub fn resolve(&self) -> ResolvedSubscription {
@@ -1468,13 +1504,25 @@ impl SubscriptionParams {
         ResolvedSubscription {
             group: self.group.clone(),
             start: self.start,
-            lease_ms: self.lease_ms.unwrap_or(Self::DEFAULT_LEASE_MS),
+            // L-4: clamp the client-supplied lease to `[1, MAX_LEASE_MS]` (no 0-lease churn, no
+            // arbitrarily-long self-stranding).
+            lease_ms: self
+                .lease_ms
+                .unwrap_or(Self::DEFAULT_LEASE_MS)
+                .clamp(1, Self::MAX_LEASE_MS),
             max_batch: self
                 .max_batch
                 .unwrap_or(default_batch)
                 .clamp(1, Self::MAX_BATCH),
-            max_attempts: self.max_attempts.unwrap_or(Self::DEFAULT_MAX_ATTEMPTS),
-            max_ack_pending: self.max_ack_pending,
+            // L-4 / N2: clamp the dead-letter threshold so one poison message can't be redelivered an
+            // unbounded number of times before it quarantines.
+            max_attempts: self
+                .max_attempts
+                .unwrap_or(Self::DEFAULT_MAX_ATTEMPTS)
+                .min(Self::MAX_MAX_ATTEMPTS),
+            // L-4: a request-set outstanding-unacked cap is clamped to a sane max; `None` stays
+            // unbounded-by-this (the per-claim batch still bounds a single claim).
+            max_ack_pending: self.max_ack_pending.map(|c| c.min(Self::MAX_ACK_PENDING)),
             backoff_ms: self.backoff_ms.unwrap_or(0),
             retention_ms: self.retention_ms.unwrap_or(Self::DEFAULT_RETENTION_MS),
         }
@@ -1593,6 +1641,17 @@ impl WebhookSink {
                 "webhook sink {:?} topic {topic:?} must be a relative bus topic (no leading '/', no \
                  '.'/'..' segments)",
                 self.name
+            )));
+        }
+        // M-A (N6): the fan-out group (empty ⇒ the default work-queue) keys the per-topic group state,
+        // so validate it as a single clean key segment here — refused LOUDLY at register/apply, never
+        // a silent cross-topic keyspace collision at drain.
+        if !self.group.is_empty()
+            && let Err(reason) = crate::project::validate_consumer_group(&self.group)
+        {
+            return Err(ConfigError::parse(format!(
+                "webhook sink {:?} group {:?} is invalid — {reason}",
+                self.name, self.group
             )));
         }
         for (field, value) in [
@@ -3435,6 +3494,112 @@ mod tests {
             )
             .is_err(),
             "a non-sealed url_secret must fail compile_check (secrets must be sealed)"
+        );
+    }
+
+    // M-A (N6): a `/`-bearing (or otherwise non-segment) consumer/sink group is refused loudly at the
+    // config surface — never a silent cross-topic keyspace collision at claim.
+    #[test]
+    fn config_surfaces_reject_a_slash_bearing_group() {
+        // A webhook sink with a bad group fails validate (and so compile_check).
+        let mut sink = WebhookSink {
+            name: "s".into(),
+            topic: "orders/created".into(),
+            group: "created/evil".into(),
+            url_secret: "boatramp:u".into(),
+            egress_allow: vec!["*.example.com:443".into()],
+            sign_secret: "boatramp:k".into(),
+            lease_ms: None,
+            max_attempts: None,
+            backoff_ms: None,
+            max_ack_pending: None,
+        };
+        assert!(sink.validate().is_err(), "a '/'-group sink is refused");
+        sink.group = "fulfillment".into();
+        assert!(sink.validate().is_ok(), "a clean group sink validates");
+        sink.group = String::new();
+        assert!(
+            sink.validate().is_ok(),
+            "the default work-queue (empty group) is fine"
+        );
+
+        // A consumer with a bad group fails compile_check.
+        assert!(
+            DeployConfig::from_ron(
+                r#"( handlers: [ ( route: "/x", component: "h.wasm" ) ],
+                     consumers: [ ( topic: "orders", component: "c.wasm", group: "created/evil" ) ] )"#,
+            )
+            .is_err(),
+            "a '/'-group consumer must fail compile_check"
+        );
+        DeployConfig::from_ron(
+            r#"( handlers: [ ( route: "/x", component: "h.wasm" ) ],
+                 consumers: [ ( topic: "orders", component: "c.wasm", group: "created" ) ] )"#,
+        )
+        .expect("a clean consumer group validates");
+    }
+
+    // L-4: `SubscriptionParams::resolve` clamps a request-/config-supplied lease / max_attempts /
+    // max_ack_pending to the server caps (the one shared clamp site every transport inherits). Also the
+    // N2 `max_attempts` clamp for a webhook sink (it resolves through here).
+    #[test]
+    fn subscription_params_resolve_clamps_the_knobs() {
+        let p = SubscriptionParams {
+            group: String::new(),
+            start: StartPosition::default(),
+            lease_ms: Some(u64::MAX),
+            max_attempts: Some(u32::MAX),
+            max_batch: Some(usize::MAX),
+            max_ack_pending: Some(usize::MAX),
+            backoff_ms: None,
+            retention_ms: None,
+        };
+        let r = p.resolve();
+        assert_eq!(
+            r.lease_ms,
+            SubscriptionParams::MAX_LEASE_MS,
+            "lease clamped"
+        );
+        assert_eq!(
+            r.max_attempts,
+            SubscriptionParams::MAX_MAX_ATTEMPTS,
+            "max_attempts clamped"
+        );
+        assert_eq!(r.max_batch, SubscriptionParams::MAX_BATCH, "batch clamped");
+        assert_eq!(
+            r.max_ack_pending,
+            Some(SubscriptionParams::MAX_ACK_PENDING),
+            "max_ack_pending clamped"
+        );
+        // A 0-lease is floored to ≥ 1 (no 0-lease churn); `None` max_ack_pending stays unbounded.
+        let p0 = SubscriptionParams {
+            lease_ms: Some(0),
+            max_ack_pending: None,
+            ..Default::default()
+        };
+        let r0 = p0.resolve();
+        assert!(r0.lease_ms >= 1, "a 0 lease is floored to at least 1ms");
+        assert_eq!(
+            r0.max_ack_pending, None,
+            "None max_ack_pending stays unbounded"
+        );
+        // A webhook sink's resolved max_attempts is clamped too (N2 via the shared site).
+        let sink = WebhookSink {
+            name: "s".into(),
+            topic: "t".into(),
+            group: String::new(),
+            url_secret: "boatramp:u".into(),
+            egress_allow: vec!["*.example.com:443".into()],
+            sign_secret: "boatramp:k".into(),
+            lease_ms: None,
+            max_attempts: Some(u32::MAX),
+            backoff_ms: None,
+            max_ack_pending: None,
+        };
+        assert_eq!(
+            sink.subscription().resolve().max_attempts,
+            SubscriptionParams::MAX_MAX_ATTEMPTS,
+            "a sink's max_attempts is clamped (N2)"
         );
     }
 

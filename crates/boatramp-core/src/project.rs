@@ -414,6 +414,47 @@ mod object_key_tests {
         let at = "a".repeat(MAX_OBJECT_KEY_LEN);
         assert!(validate_object_key(&at).is_ok());
     }
+
+    // M-A drift guard: `validate_consumer_group` (boatramp-types, shared by the durable core + every
+    // registration surface) must accept/reject EXACTLY what `validate_key_segment` does — the group is
+    // a data-plane key segment, so the two rules must never diverge. Pin them equal over a battery.
+    #[test]
+    fn consumer_group_rule_matches_key_segment_rule() {
+        let over = "a".repeat(MAX_RESOURCE_NAME_LEN + 1);
+        let cases: &[&str] = &[
+            "fulfillment",
+            "analytics",
+            "my-group",
+            "group_1",
+            "orders.created",
+            "user@acme.com",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "created/evil",
+            "back\\slash",
+            "star*key",
+            "nul\0byte",
+            "new\nline",
+            "tab\tkey",
+            "with space",
+            &over,
+        ];
+        for c in cases {
+            assert_eq!(
+                validate_consumer_group(c).is_ok(),
+                validate_key_segment("group", c).is_ok(),
+                "group rule diverged from the key-segment rule on {c:?}"
+            );
+        }
+        // Spot-check the task's explicit rejection set + an accepted clean segment.
+        assert!(validate_consumer_group("fulfillment").is_ok());
+        assert!(validate_consumer_group("a/b").is_err());
+        assert!(validate_consumer_group("").is_err());
+        assert!(validate_consumer_group("..").is_err());
+        assert!(validate_consumer_group("x\u{1}y").is_err());
+    }
 }
 
 #[cfg(test)]

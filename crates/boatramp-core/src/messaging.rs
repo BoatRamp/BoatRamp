@@ -734,71 +734,174 @@ pub trait Messaging: Send + Sync {
 /// topic, payload, or context (isolation), and a lost/coalesced pulse never loses a message (the
 /// durable ready-set + safety-net are the authority, B12).
 ///
-/// Runtime-agnostic (core uses `futures`, not `tokio`): a single-slot coalescing flag
-/// ([`AtomicBool`](std::sync::atomic::AtomicBool)) plus a [`futures::task::AtomicWaker`]. Many
-/// `notify` calls between two `notified().await`s set the one flag and resolve the await ONCE — the
-/// wake says "go look at the ready-set", not "here is one message", so coalescing is exactly right
-/// and there is no unbounded buffering. A `notify` that fires while no one is awaiting is not lost:
-/// the flag stays set and the next `notified()` returns immediately.
+/// Runtime-agnostic (core uses `futures`, not `tokio`) and **multi-waiter**: a monotonic notify
+/// `generation` ([`AtomicU64`](std::sync::atomic::AtomicU64)) plus a parked-waker registry. A single
+/// `Wake` is shared (cloned) by the node's scheduler/drainer AND every external bus-consumer
+/// (long-poll (a), durable stream (b), webhook sink (d)) — so `notify` must wake ALL of them, not just
+/// the last to register. (The previous single [`futures::task::AtomicWaker`] held ONE waker slot, so a
+/// second parker silently overwrote the first's registration and only the last-registered woke on a
+/// publish — L-2. The scheduler and a concurrent long-poll fell to their timers instead.)
+///
+/// `notify` sets a coalescing single-consumer latch, increments `generation`, and wakes (and clears)
+/// every registered waiter. A `notified()` future completes on EITHER the latch (consumed on its
+/// first poll — so a `notify` that fired before the caller re-armed `notified()`, e.g. a publish
+/// during the drainer's own drain, is NOT lost for that caller) OR the generation advancing past the
+/// value it recorded at its first poll (so EVERY parked waiter wakes on one `notify`). This is
+/// coalescing (many `notify`s between two `notified().await`s complete a parked waiter once — the
+/// wake says "go look at the ready-set", not "here is one message", so there is no buffering) and has
+/// no lost wake from the await onward: a `notify` racing a waiter's registration is caught by the
+/// post-register re-check. The latch is deliberately single-consumer (one caller consumes a pre-arm
+/// pulse); it never weakens the multi-waiter guarantee, since every PARKED waiter wakes via the
+/// generation regardless. Each `notified()` future removes its registry entry on drop, so a timed-out
+/// / cancelled waiter (e.g. a long-poll that hit its `wait_ms`, or an SSE park that hit `EMPTY_PARK`)
+/// never leaks a stale waker — the registry is bounded by the live waiter count, not by churn.
 #[derive(Clone)]
 pub struct Wake {
     inner: Arc<WakeInner>,
 }
 
 struct WakeInner {
-    /// A pending pulse the next `notified()` will consume. Set by `notify`, cleared by `notified`.
+    /// Monotonic notify counter: bumped once per [`Wake::notify`]. A PARKED [`Wake::notified`] future
+    /// completes as soon as this differs from the value it observed at its first poll — this is the
+    /// multi-waiter mechanism (every parked waiter observes every notify).
+    generation: std::sync::atomic::AtomicU64,
+    /// Coalescing **single-consumer latch**: set by every `notify`, consumed (swapped to `false`) by
+    /// the first `notified()` to check it. It restores the old "a notify that fires while no one is
+    /// awaiting is not lost — the next `notified()` returns immediately" property for the drainer's
+    /// re-arm loop (a publish during its drain is not missed). It is deliberately a SINGLE latch (one
+    /// caller consumes a pre-arm pulse); every PARKED waiter still wakes via `generation`, so the
+    /// latch never weakens the multi-waiter guarantee.
     pending: std::sync::atomic::AtomicBool,
-    /// The parked drainer's waker, roused on `notify`.
-    waker: futures::task::AtomicWaker,
+    /// Every currently-parked waiter, keyed by a registry id so a dropped waiter removes exactly its
+    /// own entry (no leak) and a surviving one can refresh its waker in place.
+    waiters: std::sync::Mutex<Waiters>,
+}
+
+/// The parked-waker registry behind [`WakeInner`]. A small `Vec` (linear scan) — bounded by the live
+/// concurrent-waiter count (drainer + a handful of streams/long-polls), never by churn.
+#[derive(Default)]
+struct Waiters {
+    next_id: u64,
+    parked: Vec<(u64, std::task::Waker)>,
+}
+
+/// RAII registry entry for one parked [`Wake::notified`] future: removes exactly its own waker on
+/// drop, so a cancelled / timed-out waiter leaves nothing behind.
+struct WaiterGuard {
+    inner: Arc<WakeInner>,
+    id: u64,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if let Ok(mut w) = self.inner.waiters.lock() {
+            w.parked.retain(|(sid, _)| *sid != self.id);
+        }
+    }
+}
+
+impl WakeInner {
+    /// Register `waker` as a fresh parked waiter, returning its RAII guard.
+    fn park(self: &Arc<Self>, waker: std::task::Waker) -> WaiterGuard {
+        let id = {
+            let mut w = self.waiters.lock().unwrap();
+            let id = w.next_id;
+            w.next_id = w.next_id.wrapping_add(1);
+            w.parked.push((id, waker));
+            id
+        };
+        WaiterGuard {
+            inner: self.clone(),
+            id,
+        }
+    }
+
+    /// Refresh an already-registered waiter's waker (idempotent when it is the same task). The entry
+    /// is guaranteed present here: the only remover is [`Wake::notify`], which bumps `generation`
+    /// first, so a taken entry is observed as an advanced generation (→ `Ready`) before this runs.
+    /// The defensive re-register arm cannot drop a wake (a genuinely taken entry means the generation
+    /// already advanced).
+    fn refresh(&self, guard: &mut WaiterGuard, waker: &std::task::Waker) {
+        let mut w = self.waiters.lock().unwrap();
+        if let Some(slot) = w.parked.iter_mut().find(|(sid, _)| *sid == guard.id) {
+            if !slot.1.will_wake(waker) {
+                slot.1 = waker.clone();
+            }
+        } else {
+            let id = w.next_id;
+            w.next_id = w.next_id.wrapping_add(1);
+            w.parked.push((id, waker.clone()));
+            guard.id = id;
+        }
+    }
 }
 
 impl Wake {
-    /// A fresh wake with no pending pulse.
+    /// A fresh wake with no pending pulse and no parked waiters.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(WakeInner {
+                generation: std::sync::atomic::AtomicU64::new(0),
                 pending: std::sync::atomic::AtomicBool::new(false),
-                waker: futures::task::AtomicWaker::new(),
+                waiters: std::sync::Mutex::new(Waiters::default()),
             }),
         }
     }
 
-    /// Fire the wake: set the pending flag and rouse the parked drainer (if any). If none is parked,
-    /// the flag stays set so the next `notified().await` returns immediately (no lost wake). Fired
-    /// strictly AFTER the durable commit returns (B12), so a woken drainer always sees the committed
-    /// ready-set marker.
+    /// Fire the wake: set the single-consumer latch, advance the generation, and rouse EVERY parked
+    /// waiter (the scheduler/drainer and every external consumer parked on this node's wake), clearing
+    /// the registry. Fired strictly AFTER the durable commit returns (B12), so a woken waiter always
+    /// sees the committed ready-set marker. A `notify` with no one parked leaves the latch set, so the
+    /// next `notified()` returns immediately (no lost wake for the drainer's re-arm loop).
     pub fn notify(&self) {
-        self.inner
-            .pending
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.inner.waker.wake();
+        use std::sync::atomic::Ordering::{AcqRel, Release};
+        // The latch must be visible to a `notified()` that observes the generation bump (or the
+        // wake), so set it FIRST (Release), then advance the generation, then wake.
+        self.inner.pending.store(true, Release);
+        self.inner.generation.fetch_add(1, AcqRel);
+        // Collect under the lock, wake outside it (a woken task may re-enter `notified` → the registry
+        // lock).
+        let woken: Vec<std::task::Waker> = {
+            let mut w = self.inner.waiters.lock().unwrap();
+            w.parked.drain(..).map(|(_, wk)| wk).collect()
+        };
+        for wk in woken {
+            wk.wake();
+        }
     }
 
-    /// Await the next wake pulse (consuming the pending flag). Coalescing: many `notify` calls
-    /// between two awaits wake the drainer once (it then drains the whole ready-set).
+    /// Await the next wake pulse. Completes on EITHER (a) the single-consumer latch — a `notify` that
+    /// fired before this call is consumed on the first poll, so a pre-arm pulse is never lost for the
+    /// caller that consumes it; OR (b) the generation advancing past the value seen at the first poll
+    /// — so every PARKED waiter wakes on one `notify` (multi-waiter), including a `notify` that races
+    /// the waiter's own registration. Coalescing: a burst of `notify`s completes a parked waiter once.
     pub async fn notified(&self) {
-        futures::future::poll_fn(|cx| {
-            // Fast path: a pulse is already pending — consume it and return ready.
-            if self
-                .inner
-                .pending
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
-            {
-                return std::task::Poll::Ready(());
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        use std::task::Poll;
+        let inner = &self.inner;
+        let start = inner.generation.load(Acquire);
+        let mut guard: Option<WaiterGuard> = None;
+        futures::future::poll_fn(move |cx| {
+            // Fast path: consume the latch (a notify fired before/while we checked), or observe the
+            // generation advancing since we started.
+            if inner.pending.swap(false, AcqRel) || inner.generation.load(Acquire) != start {
+                return Poll::Ready(());
             }
-            // Register our waker, then re-check (a `notify` racing the register must not be lost).
-            self.inner.waker.register(cx.waker());
-            if self
-                .inner
-                .pending
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
-            {
-                std::task::Poll::Ready(())
-            } else {
-                std::task::Poll::Pending
+            // Register (or refresh) our waker, THEN re-check so a `notify` racing the registration is
+            // never lost (it set the latch we re-read, bumped the generation we re-read, or will wake
+            // the waker we just parked).
+            match &mut guard {
+                Some(g) => inner.refresh(g, cx.waker()),
+                None => guard = Some(inner.park(cx.waker().clone())),
             }
+            if inner.pending.swap(false, AcqRel) || inner.generation.load(Acquire) != start {
+                return Poll::Ready(());
+            }
+            Poll::Pending
         })
         .await;
+        // The `guard` moved into the poll_fn closure deregisters our waker when that future is
+        // dropped — on normal completion AND on cancellation (the whole point of the RAII guard).
     }
 }
 
@@ -1272,6 +1375,20 @@ pub fn gpayload_key(topic: &str, id: &str) -> String {
 /// existence also registers the group on the topic (⇒ publish retains the log).
 pub fn gstate_key(topic: &str, group: &str) -> String {
     format!("mqgstate/{topic}/{group}")
+}
+
+/// Fail-closed validation of a NON-empty consumer `group` as a single clean key segment (M-A) — the
+/// AUTHORITATIVE backstop under every consumer surface (long-poll claim, durable stream, webhook
+/// sink, and the wasm PUSH consumer). A `/`-bearing group would key `mqgstate/{topic}/{group}` (and
+/// the group DLQ) so as to collide a victim group's per-topic keyspace and cross the per-topic authz
+/// grain, so it is refused and the op errors. The empty group (the default work-queue) is handled by
+/// each caller BEFORE this and never reaches it. Reuses the one shared
+/// [`validate_consumer_group`](crate::project::validate_consumer_group) rule (a `/`-group is also
+/// refused loudly-early at the registration surfaces).
+fn check_group(group: &str) -> Result<(), MessagingError> {
+    crate::project::validate_consumer_group(group).map_err(|reason| {
+        MessagingError::Backend(format!("invalid consumer group {group:?}: {reason}"))
+    })
 }
 /// KV prefix over a topic's group states (⇒ the set of registered groups).
 pub fn gstate_prefix(topic: &str) -> String {
@@ -2692,6 +2809,10 @@ impl Messaging for LogMessaging {
         if group.is_empty() {
             return self.claim(topic, lease, max_batch, max_attempts).await;
         }
+        // M-A: a non-empty group MUST be a single clean key segment — fail-closed before it is ever
+        // composed into `gstate_key`, so a `/`-bearing group can neither collide another group's
+        // per-topic keyspace nor cross the per-topic authz grain.
+        check_group(group)?;
         // Flow control (P2): a paused topic delivers nothing to any group.
         if self.is_paused(topic).await? {
             return Ok(Vec::new());
@@ -2795,6 +2916,8 @@ impl Messaging for LogMessaging {
         // every group has passed it). Serialized with `claim` — both mutate the
         // single compact group-state value.
         if !msg.group.is_empty() {
+            // M-A: fail-closed on a `/`-bearing group before it keys the group state.
+            check_group(&msg.group)?;
             let _guard = self.claim_lock.lock().await;
             let Some(mut state) = self.get_group_state(&msg.topic, &msg.group).await? else {
                 return Ok(()); // group gone
@@ -2806,26 +2929,44 @@ impl Messaging for LogMessaging {
             }
             return Ok(());
         }
+        // M-1: the inline accounting must come from the AUTHORITATIVE stored record, NEVER from the
+        // `AckHandle`-reconstructed `msg` (the handle is client-forgeable base64url(JSON), not
+        // integrity-protected). A forged ack claiming `inline: true` + a large payload would otherwise
+        // decrement the node-global `inline_inflight_bytes` by an attacker-chosen amount and pin the
+        // cross-tenant inline soft-guard at 0. So READ the stored record first, decide inline-ness and
+        // the real inline size from it (exactly as `nack_after` / `purge_dead_letters` do), THEN delete.
+        let key = meta_key(&msg.topic, &msg.id);
+        let stored_inline_len = self
+            .kv
+            .get(&key)
+            .await
+            .map_err(MessagingError::backend)?
+            .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
+            .and_then(|r| r.inline.map(|p| p.len()));
         self.kv
-            .delete(&meta_key(&msg.topic, &msg.id))
+            .delete(&key)
             .await
             .map_err(MessagingError::backend)?;
-        // A3: an inlined payload lived IN the record just deleted — no object-store object exists, so
-        // skip the delete (avoids a wasted object-store round-trip, the whole point of inlining), and
-        // release its bytes from the SA1 aggregate-inline budget.
-        if msg.inline {
-            // Saturating (never wrap on underflow — a post-restart ack of a pre-restart inline
-            // message would otherwise underflow the counter and wedge the budget at "full").
-            let _ = self.inline_inflight_bytes.try_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |v| Some(v.saturating_sub(msg.payload.len())),
-            );
-        } else {
-            self.storage
-                .delete(&payload_key(&msg.topic, &msg.id))
-                .await
-                .map_err(MessagingError::backend)?;
+        match stored_inline_len {
+            // A3: an inlined payload lived IN the record just deleted — no object-store object exists,
+            // so skip the delete (the whole point of inlining) and release its REAL bytes from the SA1
+            // aggregate-inline budget. Saturating (never wrap on underflow — a post-restart ack of a
+            // pre-restart inline message would otherwise underflow and wedge the budget at "full").
+            Some(len) => {
+                let _ = self.inline_inflight_bytes.try_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(len)),
+                );
+            }
+            // A non-inline record (or one already acked/gone): free the object-store payload. A
+            // double-ack / forged ack of an already-gone record frees nothing (no budget skew).
+            None => {
+                self.storage
+                    .delete(&payload_key(&msg.topic, &msg.id))
+                    .await
+                    .map_err(MessagingError::backend)?;
+            }
         }
         Ok(())
     }
@@ -2953,6 +3094,8 @@ impl Messaging for LogMessaging {
         // A grouped nack resets the in-flight entry's lease in the compact group-state value;
         // serialized with `claim`.
         if !msg.group.is_empty() {
+            // M-A: fail-closed on a `/`-bearing group before it keys the group state.
+            check_group(&msg.group)?;
             let _guard = self.claim_lock.lock().await;
             let Some(mut state) = self.get_group_state(&msg.topic, &msg.group).await? else {
                 return Ok(()); // group gone
@@ -4944,6 +5087,229 @@ mod tests {
         assert!(
             more.iter().any(|m| m.payload == b"ddddd" && m.inline),
             "after ack freed budget, the next small publish inlines again"
+        );
+    }
+
+    // M-A: a non-empty consumer `group` must be a single clean key segment. A `/`-bearing group is
+    // refused fail-closed by claim_grouped / ack / nack(_after) BEFORE it keys `mqgstate/{topic}/…`,
+    // so it can neither collide another group's per-topic keyspace nor cross the per-topic authz
+    // grain. (`validate_object_key` is insufficient — it permits `/`.)
+    #[tokio::test]
+    async fn grouped_ops_reject_a_slash_bearing_group() {
+        let mq = mq();
+        mq.publish("orders", b"x").await.unwrap();
+        // claim_grouped refuses a `/`-group…
+        let claim = mq
+            .claim_grouped(
+                "orders",
+                "created/evil",
+                StartPosition::Latest,
+                LEASE,
+                10,
+                5,
+            )
+            .await;
+        assert!(
+            claim.is_err(),
+            "claim_grouped must refuse a '/'-bearing group"
+        );
+        // …as do ack / nack / nack_after when a forged handle reconstructs such a group.
+        let forged = ClaimedMessage {
+            id: "1-ab".into(),
+            topic: "orders".into(),
+            payload: Vec::new(),
+            attempts: 1,
+            group: "created/evil".into(),
+            signed_context: None,
+            inline: false,
+        };
+        assert!(
+            mq.ack(&forged).await.is_err(),
+            "ack must refuse a '/'-group"
+        );
+        assert!(
+            mq.nack(&forged).await.is_err(),
+            "nack must refuse a '/'-group"
+        );
+        assert!(
+            mq.nack_after(&forged, 1000).await.is_err(),
+            "nack_after must refuse a '/'-group"
+        );
+        // The empty group (default work-queue) and a clean group are still accepted.
+        assert!(
+            mq.claim_grouped("orders", "", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .is_ok(),
+            "the default work-queue (empty group) is unaffected"
+        );
+        assert!(
+            mq.claim_grouped("orders", "created", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .is_ok(),
+            "a clean single-segment group is accepted"
+        );
+    }
+
+    // M-A (collision scenario): a victim consumes topic `orders` under group `created`; its durable
+    // state keys `mqgstate/orders/created`. An attacker scoped to topic `orders` cannot forge a
+    // group `created/evil` on topic `orders` to reshape that SAME key — the op is refused before any
+    // key is composed, so the victim's group state is never touched.
+    #[tokio::test]
+    async fn slash_group_cannot_collide_a_victim_group_keyspace() {
+        let mq = mq();
+        // Register the victim group FIRST (grouped publish-time retention turns on at registration),
+        // then publish, then claim — so the fan-out message is retained for the group.
+        let _ = mq
+            .claim_grouped("orders", "created", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        mq.publish("orders", b"legit").await.unwrap();
+        let v = mq
+            .claim_grouped("orders", "created", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(v.len(), 1, "victim claims its one message");
+        let victim_state_key = gstate_key("orders", "created");
+        let before = mq.kv.get(&victim_state_key).await.unwrap();
+        assert!(before.is_some(), "victim group state exists");
+        // Attacker attempts a `/`-group that would key into the victim's per-topic keyspace.
+        assert!(
+            mq.claim_grouped(
+                "orders",
+                "created/evil",
+                StartPosition::Earliest,
+                LEASE,
+                10,
+                5
+            )
+            .await
+            .is_err(),
+            "a '/'-group claim is refused"
+        );
+        // The victim's group state is byte-identical — never corrupted.
+        let after = mq.kv.get(&victim_state_key).await.unwrap();
+        assert_eq!(before, after, "the victim group state is untouched");
+    }
+
+    // M-1: `ack`'s node-global inline-budget decrement must come from the AUTHORITATIVE stored record,
+    // never from the client-forgeable `AckHandle` fields. A forged ack claiming `inline:true` + a huge
+    // payload for a NONEXISTENT id must not free any budget (which would otherwise pin the cross-tenant
+    // inline soft-guard at 0); a LEGIT ack of a real inline message still frees exactly its real bytes.
+    #[tokio::test]
+    async fn ack_inline_budget_uses_stored_record_not_forged_handle() {
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage.clone(), kv).with_inline_budget(10);
+        mq.publish("t", b"aaaaa").await.unwrap(); // inline, used = 5
+        mq.publish("t", b"bbbbb").await.unwrap(); // inline, used = 10 (full)
+        let got = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert_eq!(got.iter().filter(|m| m.inline).count(), 2, "both inlined");
+
+        // Forged ack: a nonexistent id, inline:true, 1000-byte payload. The OLD code would decrement
+        // the counter by 1000 (saturating to 0 used) and wrongly free the whole budget.
+        let forged = ClaimedMessage {
+            id: "forged-nonexistent".into(),
+            topic: "t".into(),
+            payload: vec![7u8; 1000],
+            attempts: 1,
+            group: String::new(),
+            signed_context: None,
+            inline: true,
+        };
+        mq.ack(&forged).await.unwrap();
+
+        // Budget must still be full (10/10): a new 5-byte publish falls back to the object store.
+        mq.publish("t", b"ccccc").await.unwrap();
+        let after = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        let ccc = after.iter().find(|m| m.payload == b"ccccc").unwrap();
+        assert!(
+            !ccc.inline,
+            "the forged ack must NOT free budget — the next publish still falls back to object store"
+        );
+
+        // A LEGIT ack of a real inline message frees exactly its 5 bytes, so the next small publish
+        // inlines again (proving the authoritative path still decrements correctly).
+        let real_inline = got.iter().find(|m| m.inline).unwrap().clone();
+        mq.ack(&real_inline).await.unwrap();
+        mq.publish("t", b"ddddd").await.unwrap();
+        let more = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert!(
+            more.iter().any(|m| m.payload == b"ddddd" && m.inline),
+            "a legit ack frees the real inline bytes → the next small publish inlines again"
+        );
+    }
+
+    // L-2: the node `Wake` is MULTI-WAITER — a single `notify` wakes EVERY concurrently-parked
+    // `notified()` (the scheduler + every long-poll + every stream), not just the last to register as
+    // the old single `AtomicWaker` did. Both waiters here must resolve from ONE notify.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wake_wakes_all_concurrent_waiters() {
+        let wake = Wake::new();
+        let (w1, w2) = (wake.clone(), wake.clone());
+        let a = tokio::spawn(async move { w1.notified().await });
+        let b = tokio::spawn(async move { w2.notified().await });
+        // Give both tasks a moment to park, then fire ONE notify.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        wake.notify();
+        // BOTH must complete (not just one) within a bounded time.
+        let both = tokio::time::timeout(Duration::from_secs(2), async {
+            a.await.unwrap();
+            b.await.unwrap();
+        })
+        .await;
+        assert!(both.is_ok(), "one notify must wake BOTH parked waiters");
+    }
+
+    // L-2: coalescing / no-lost-wake from the await onward — a `notify` that fires while no one is
+    // parked still completes the NEXT `notified()` immediately (the generation advanced), and a burst
+    // of notifies wakes a single waiter once.
+    #[tokio::test]
+    async fn wake_is_coalescing_and_not_lost() {
+        let wake = Wake::new();
+        // A `notify` with no waiter parked: the next `notified()` still returns promptly.
+        wake.notify();
+        let got = tokio::time::timeout(Duration::from_secs(1), wake.notified()).await;
+        assert!(
+            got.is_ok(),
+            "a notify advances the generation; the next notified completes"
+        );
+        // A burst coalesces: several notifies then one notified completes once.
+        wake.notify();
+        wake.notify();
+        wake.notify();
+        let got = tokio::time::timeout(Duration::from_secs(1), wake.notified()).await;
+        assert!(
+            got.is_ok(),
+            "a burst of notifies coalesces into one completion"
+        );
+    }
+
+    // L-2: a timed-out / cancelled `notified()` future deregisters its waker (no leak) — after many
+    // cancelled waiters with NO intervening notify, the registry does not grow, and a later waiter
+    // still wakes correctly on a notify.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wake_cancelled_waiters_do_not_leak() {
+        let wake = Wake::new();
+        for _ in 0..1000 {
+            // Each `notified()` is created, parked (first poll), then dropped by the timeout — its
+            // guard must remove its registry entry.
+            let _ = tokio::time::timeout(Duration::from_millis(1), wake.notified()).await;
+        }
+        // The registry is back to empty (no leaked wakers), and a fresh waiter still wakes on notify.
+        assert_eq!(
+            wake.inner.waiters.lock().unwrap().parked.len(),
+            0,
+            "cancelled waiters left no registry entries"
+        );
+        let w = wake.clone();
+        let h = tokio::spawn(async move { w.notified().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        wake.notify();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), h)
+                .await
+                .is_ok(),
+            "a waiter after churn still wakes on notify"
         );
     }
 

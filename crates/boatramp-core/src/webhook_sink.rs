@@ -24,6 +24,12 @@ pub struct WebhookSinkStore {
 }
 
 impl WebhookSinkStore {
+    /// N2 DoS bound: the most webhook sinks ONE project may hold. Each registered sink spawns a
+    /// durable per-sink drainer task (`run_webhook_sink`), so an unbounded register from a single
+    /// `Messaging·Admin` token would be an unbounded-task DoS on the leader-serialized claim plane.
+    /// Mirrors [`SecretStore::MAX_TENANT_SECRET_NAMES`](crate::secret_store::MAX_TENANT_SECRET_NAMES).
+    pub const MAX_PROJECT_SINKS: usize = 256;
+
     #[must_use]
     pub fn new(kv: Arc<dyn KvStore>) -> Self {
         Self { kv }
@@ -35,10 +41,36 @@ impl WebhookSinkStore {
 
     /// Persist (create or replace) a sink under its project. The caller validates the record
     /// ([`WebhookSink::validate`]) and the destination (the SSRF floor) before this.
+    ///
+    /// N2: a NEW sink name is refused once the project already holds [`Self::MAX_PROJECT_SINKS`]
+    /// sinks (a replace of an existing name is always allowed, so re-registering a sink never trips
+    /// the cap). List-then-check, mirroring the secret store's per-tenant name cap.
     pub async fn set(&self, project: &str, sink: &WebhookSink) -> Result<(), String> {
+        let key = Self::key(project, &sink.name);
+        let is_new = self
+            .kv
+            .get(&key)
+            .await
+            .map_err(|e| format!("read webhook sink: {e}"))?
+            .is_none();
+        if is_new {
+            let prefix = crate::deploy::keys::bus_webhook_sink_prefix(ProjectRef::new(project));
+            let existing = self
+                .kv
+                .scan_prefix(&prefix)
+                .await
+                .map_err(|e| format!("list webhook sinks: {e}"))?
+                .len();
+            if existing >= Self::MAX_PROJECT_SINKS {
+                return Err(format!(
+                    "project already has the maximum of {} webhook sinks",
+                    Self::MAX_PROJECT_SINKS
+                ));
+            }
+        }
         let bytes = serde_json::to_vec(sink).map_err(|e| format!("encode webhook sink: {e}"))?;
         self.kv
-            .put(&Self::key(project, &sink.name), bytes)
+            .put(&key, bytes)
             .await
             .map_err(|e| format!("persist webhook sink: {e}"))
     }
@@ -137,5 +169,33 @@ mod tests {
         assert!(store.delete("acme", "a").await.unwrap());
         assert!(!store.delete("acme", "a").await.unwrap());
         assert!(store.get("acme", "a").await.unwrap().is_none());
+    }
+
+    // N2: a project may hold at most `MAX_PROJECT_SINKS` sinks — a new name past the cap is refused
+    // (unbounded-drainer-task DoS bound), while a REPLACE of an existing name is always allowed and
+    // never trips the cap.
+    #[tokio::test]
+    async fn per_project_sink_count_is_capped() {
+        let store = WebhookSinkStore::new(Arc::new(MemoryKv::new()));
+        for i in 0..WebhookSinkStore::MAX_PROJECT_SINKS {
+            store.set("acme", &sink(&format!("s{i}"))).await.unwrap();
+        }
+        // A NEW name past the cap is refused.
+        let over = store.set("acme", &sink("one-too-many")).await;
+        assert!(over.is_err(), "a new sink past the cap must be refused");
+        assert!(
+            over.unwrap_err().contains("maximum"),
+            "the refusal names the cap"
+        );
+        // A REPLACE of an existing sink is still allowed (it does not grow the count).
+        store
+            .set("acme", &sink("s0"))
+            .await
+            .expect("replacing an existing sink never trips the cap");
+        // Another project is unaffected (per-project cap).
+        store
+            .set("other", &sink("fresh"))
+            .await
+            .expect("a different project has its own budget");
     }
 }
