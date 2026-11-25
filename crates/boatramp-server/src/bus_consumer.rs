@@ -21,13 +21,14 @@
 //! nack/lease-expiry redelivers with the attempt count, DLQ at `max_attempts`. The adapter parks on
 //! the waker — ZERO busy-poll.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::*;
 
 use base64::Engine as _;
 use boatramp_core::config::{ResolvedSubscription, StartPosition, SubscriptionParams};
-use boatramp_core::messaging::{ClaimedMessage, Messaging};
+use boatramp_core::messaging::{ClaimedMessage, Messaging, Wake};
 use boatramp_core::project::validate_object_key;
 
 use crate::messaging_shim::AckHandle;
@@ -81,6 +82,22 @@ struct ClaimedDto {
     payload_b64: String,
     /// Opaque ack/nack handle.
     handle: String,
+}
+
+impl ClaimedDto {
+    /// Frame one [`ClaimedMessage`] for the wire under the consumer's BARE `topic`: base64 the
+    /// payload and mint the opaque [`AckHandle`] the consumer presents back to `ack`/`nack`. Shared
+    /// by the long-poll claim response (a) and every durable-stream delivery frame (b), so one
+    /// handle shape serves the whole surface.
+    fn from_message(bare_topic: &str, m: &ClaimedMessage) -> Self {
+        Self {
+            id: m.id.clone(),
+            topic: bare_topic.to_string(),
+            attempts: m.attempts,
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(&m.payload),
+            handle: AckHandle::encode(bare_topic, m),
+        }
+    }
 }
 
 /// The `POST …/bus/claim/{*topic}` response body.
@@ -216,13 +233,7 @@ pub(crate) async fn bus_claim(
         Ok(claimed) => {
             let messages = claimed
                 .iter()
-                .map(|m| ClaimedDto {
-                    id: m.id.clone(),
-                    topic: topic.clone(),
-                    attempts: m.attempts,
-                    payload_b64: base64::engine::general_purpose::STANDARD.encode(&m.payload),
-                    handle: AckHandle::encode(&topic, m),
-                })
+                .map(|m| ClaimedDto::from_message(&topic, m))
                 .collect();
             Json(ClaimResponse { messages }).into_response()
         }
@@ -307,6 +318,520 @@ pub(crate) async fn bus_nack(
             (StatusCode::BAD_GATEWAY, "messaging backend unavailable\n").into_response()
         }
     }
+}
+
+// =====================================================================================================
+// (b) Durable streaming subscription (PLAN-messaging-consumer-delivery §(b) / Increment 2).
+//
+// A long-lived per-connection loop that claims a durable **consumer group** with a per-subscriber
+// lease and frames each `ClaimedMessage` out over SSE (default) or WebSocket (on `Upgrade`), reading
+// acks back. This is NOT the lossy at-most-once `Messaging::subscribe` fan-out the configured-stream
+// SSE path uses — delivery rides the SAME durable `claim_grouped` / `ack` / `nack` / DLQ core as the
+// long-poll claim (a) and the wasm PUSH consumer, so:
+//   - at-least-once is unchanged; the durable claim/lease is the sole authority;
+//   - redelivery on lease-expiry and dead-lettering at `max_attempts` are the core's existing
+//     behavior (inherited — not reimplemented here);
+//   - `subscribe()` is NOT used at all (not even as a hint): the fast-path `Wake` is the latency hint
+//     (a "go claim now" pulse), never the delivery path;
+//   - it is **cluster-correct for free** — `claim_grouped` is leader-serialized in `RaftMessaging`, so
+//     (b) needs NO new cross-node fan-out (no `StreamBus`/`StreamHubs`), unlike the lossy SSE path.
+//
+// The transport scaffolding — per-scope + per-IP connection permits, SSE heartbeat / idle-close, the
+// WebSocket RFC-6455 handshake — is REUSED from the configured-stream surface (`crate::stream`); only
+// the fan-out body changes (lossy `subscribe` → durable `claim_grouped` loop). Per-connection authz
+// (`Messaging·Read` on the exact `<project>/<topic>`) runs in `require_auth` BEFORE this handler, i.e.
+// before the first byte, exactly as `serve_stream`'s `authorize_stream_topics` does for a configured
+// stream.
+
+/// Query params for `GET …/bus/subscribe/{*topic}` (transport (b)). All optional; absent ⇒ the server
+/// defaults, clamped by [`SubscriptionParams::resolve`] EXACTLY as the shim/long-poll claim clamps.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct SubscribeQuery {
+    /// Consumer **group** — the durable fan-out lane (own cursor / lease / retry / DLQ). Empty ⇒ the
+    /// competing-consumer work-queue shared with the long-poll claim surface.
+    #[serde(default)]
+    group: Option<String>,
+    /// Where a NEW group starts on first subscription (`latest` | `earliest`); ignored for an
+    /// existing group (its durable cursor is authoritative).
+    #[serde(default)]
+    start: Option<StartPosition>,
+    /// Visibility lease (ms) each delivered-but-unacked message holds before redelivery.
+    #[serde(default)]
+    lease_ms: Option<u64>,
+    /// **MaxAckPending**: the most leased-but-unacked messages this connection may hold at once —
+    /// back-pressure for a slow consumer (see [`pump_until_batch`]). Absent ⇒ unbounded (only the
+    /// per-claim batch bounds it).
+    #[serde(default)]
+    max_ack_pending: Option<usize>,
+    /// Dead-letter threshold (delivery attempts before a message is dead-lettered).
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    /// Max messages leased per underlying claim (the per-tick batch). Clamped to
+    /// `[1, `[`SubscriptionParams::MAX_BATCH`]`]`.
+    #[serde(default)]
+    max: Option<usize>,
+}
+
+/// Fallback park between empty durable claims on a substrate that HAS a fast [`Wake`]: the wake —
+/// fired AFTER a durable publish/nack commit (B12) — normally rouses delivery immediately, so this
+/// only caps the latency of a pathologically missed/coalesced pulse. Large enough that a genuinely
+/// idle stream issues NO steady trickle of claims (not a busy-poll), small enough to self-heal. It is
+/// also the sole delivery latency on a substrate WITHOUT a wake (where it degrades to a single bounded
+/// park, still zero-spin).
+const EMPTY_PARK: Duration = Duration::from_secs(30);
+
+/// Re-check interval while a connection sits AT its `max_ack_pending` cap. An ack frees a slot but
+/// fires no wake (only publish/nack do), so a back-pressured connection re-evaluates the DURABLE
+/// in-flight count this often (raced against the wake, which still rouses it on the next publish/nack).
+/// No claim is issued while capped, so this is back-pressure bookkeeping, never a claim busy-poll.
+const CAP_RECHECK: Duration = Duration::from_millis(250);
+
+/// Park on the fast-path [`Wake`] (a "go claim now" pulse) raced against `fallback`, or — on a
+/// substrate with no wake — a single bounded sleep. ZERO SPIN either way: one parked future, resolved
+/// by a genuine wake (publish/nack) or the fallback deadline, never a timer-driven re-scan.
+async fn park_delivery_hint(wake: &Option<Wake>, fallback: Duration) {
+    match wake {
+        Some(w) => {
+            tokio::select! {
+                _ = w.notified() => {}
+                _ = tokio::time::sleep(fallback) => {}
+            }
+        }
+        None => tokio::time::sleep(fallback).await,
+    }
+}
+
+/// The shared durable-delivery **pump**: advance one delivery step and return the next non-empty
+/// batch of [`ClaimedMessage`]s, parking (never spinning) until one appears. Both transports (SSE and
+/// WS) drive this one loop; it is `pub(crate)` + separated from the handlers so the runtime gate can
+/// drive the REAL `LogMessaging` claim core and count the underlying claims (proving zero busy-poll).
+///
+/// Per iteration, in order:
+/// 1. **Back-pressure gate (P2 MaxAckPending)** — IDENTICAL to the wasm dispatcher
+///    (`handler_dispatch.rs:4235`): with a cap set, read the topic's DURABLE `in_flight_count`
+///    (leased-but-unacked) and claim at most `cap − in_flight` this step; at/over the cap, claim
+///    NOTHING and park (an ack via the shared side-channel / an inline WS frame drops the durable
+///    in-flight, which the next step observes). A slight over-count for a single group — the safe
+///    direction (it caps sooner), same as the dispatcher.
+/// 2. **Durable claim** — `claim_grouped(key, group, start, lease, batch, max_attempts)`: the group's
+///    own cursor / lease / retry / DLQ. A non-empty batch returns immediately.
+/// 3. **Zero-spin park** — on an empty claim, park on the [`Wake`] (raced against [`EMPTY_PARK`]); the
+///    claim re-runs only on a genuine wake (coalesced wakes still see the whole batch), never on a
+///    timer tick. Redelivery-on-lease-expiry and DLQ-at-`max_attempts` are the core's behavior,
+///    unchanged.
+pub(crate) async fn pump_until_batch(
+    messaging: &dyn Messaging,
+    key: &str,
+    sub: &ResolvedSubscription,
+    wake: &Option<Wake>,
+) -> Result<Vec<ClaimedMessage>, boatramp_core::messaging::MessagingError> {
+    let lease = Duration::from_millis(sub.lease_ms);
+    loop {
+        let batch = match sub.max_ack_pending {
+            Some(cap) => {
+                let in_flight = messaging.in_flight_count(key).await.unwrap_or(0);
+                let available = cap.saturating_sub(in_flight);
+                if available == 0 {
+                    // At the cap: issue NO claim; park (wake or a bounded re-check so an ack — which
+                    // fires no wake — is still noticed) and re-evaluate.
+                    park_delivery_hint(wake, CAP_RECHECK).await;
+                    continue;
+                }
+                sub.max_batch.min(available)
+            }
+            None => sub.max_batch,
+        };
+        let claimed = messaging
+            .claim_grouped(key, &sub.group, sub.start, lease, batch, sub.max_attempts)
+            .await?;
+        if !claimed.is_empty() {
+            return Ok(claimed);
+        }
+        park_delivery_hint(wake, EMPTY_PARK).await;
+    }
+}
+
+/// `GET /api/projects/{proj}/bus/subscribe/{*topic}?group&start&lease_ms&max_ack_pending&max_attempts&max`
+/// — transport (b). SSE by default; a WebSocket when the request carries an `Upgrade`. Authorization
+/// (`Messaging·Read` on the exact `<project>/<topic>`) is enforced by `require_auth` →
+/// `Right::required_for`'s `bus` arm BEFORE this handler runs (authz-before-first-byte). The project
+/// is the TRUSTED [`ProjectContext`] (the gated `{proj}` segment), never client-supplied, so a
+/// connection is structurally confined to its own project bus; the topic is traversal-screened like
+/// the long-poll claim.
+#[cfg(feature = "handlers")]
+pub(crate) async fn bus_subscribe(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<ProjectContext>,
+    Path((_project_seg, topic)): Path<(String, String)>,
+    Query(q): Query<SubscribeQuery>,
+    request: Request,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m.clone(),
+        Err(resp) => return resp,
+    };
+    // The runtime inner backs the shared per-scope / per-IP stream-permit pools.
+    let Some(inner) = handlers.inner.as_ref() else {
+        return not_found();
+    };
+    // Screen the topic (traversal / control bytes / reserved namespace) exactly as the claim path.
+    if let Err(e) = validate_object_key(&topic) {
+        return (StatusCode::BAD_REQUEST, format!("invalid topic: {e}\n")).into_response();
+    }
+    let key = bus_namespace(&project.as_ref(), &topic);
+
+    // Resolve the subscription knobs with the STREAM batch default (16, per-tick), clamped identically
+    // to the shim/claim (lease/attempts/batch caps + `MAX_BATCH`).
+    let params = SubscriptionParams {
+        group: q.group.unwrap_or_default(),
+        start: q.start.unwrap_or_default(),
+        lease_ms: q.lease_ms,
+        max_attempts: q.max_attempts,
+        max_batch: q.max,
+        max_ack_pending: q.max_ack_pending,
+        backoff_ms: None,
+        retention_ms: None,
+    };
+    let sub = params.resolve();
+
+    let client_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip())
+        .unwrap_or(IpAddr::from([0u8, 0, 0, 0]));
+    // `Last-Event-ID` is accepted for resume, but a durable group's cursor + outstanding leases are
+    // the authority: an unacked (still-leased) message redelivers on lease-expiry regardless, so we do
+    // NOT seek the cursor from the header (which could SKIP an unacked message) — resume is inherent.
+    let after = request
+        .headers()
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    if boatramp_http::is_upgrade_request(request.headers()) {
+        serve_bus_ws(
+            inner, messaging, project, topic, key, sub, client_ip, request,
+        )
+        .await
+    } else {
+        serve_bus_sse(inner, messaging, &key, &topic, sub, client_ip, after).await
+    }
+}
+
+/// Frame one durable [`ClaimedMessage`] as an SSE delivery event: `event: message`, the durable
+/// message id as the SSE `id:` (for `Last-Event-ID` resume), and a JSON [`ClaimedDto`] body carrying
+/// the base64 payload + the opaque [`AckHandle`] the client acks with. The JSON serializer escapes
+/// every control byte, so the payload can never break SSE framing (no raw `\n`/`\r`).
+#[cfg(feature = "handlers")]
+fn sse_delivery_event(topic: &str, m: &ClaimedMessage) -> axum::response::sse::Event {
+    let dto = ClaimedDto::from_message(topic, m);
+    let data = serde_json::to_string(&dto).unwrap_or_else(|_| "{}".to_string());
+    axum::response::sse::Event::default()
+        .id(m.id.clone())
+        .event("message")
+        .data(data)
+}
+
+/// Serve a durable subscription as **Server-Sent Events** (server→client): the durable `claim_grouped`
+/// pump ([`pump_until_batch`]) frames each message as an SSE `message` event carrying the opaque
+/// handle; the client acks/nacks out-of-band via the shared `POST …/bus/ack` / `.../bus/nack`
+/// side-channel (which re-authorizes `Messaging·Read` on `<project>/*` every call). Reuses the
+/// configured-stream per-scope + per-IP permits, heartbeat, and idle-close.
+#[cfg(feature = "handlers")]
+async fn serve_bus_sse(
+    inner: &HandlerRuntimeInner,
+    messaging: Arc<dyn Messaging>,
+    key: &str,
+    topic: &str,
+    sub: ResolvedSubscription,
+    client_ip: IpAddr,
+    _after: Option<String>,
+) -> Response {
+    use axum::response::sse::{KeepAlive, Sse};
+
+    // deny-before-resource-use: per-connection authz already ran in `require_auth`; cap the connection
+    // on the shared per-scope + per-IP stream pools, keyed by the full `{project}/bus/<topic>` key (so
+    // bus and configured-stream scopes never collide, and each project/topic is bounded independently).
+    let scope = key.to_string();
+    let site_permit = match crate::stream::acquire_stream_permit_capped(
+        inner,
+        &scope,
+        crate::stream::DEFAULT_STREAM_CONNECTIONS,
+    ) {
+        Ok(p) => p,
+        Err(()) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bus stream connection limit reached\n",
+            )
+                .into_response();
+        }
+    };
+    let ip_guard = match crate::stream::acquire_stream_ip_slot(inner, &scope, client_ip) {
+        Ok(g) => g,
+        Err(()) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "per-client bus stream connection limit reached\n",
+            )
+                .into_response();
+        }
+    };
+
+    struct SseState {
+        messaging: Arc<dyn Messaging>,
+        key: String,
+        topic: String,
+        sub: ResolvedSubscription,
+        wake: Option<Wake>,
+        buffer: VecDeque<ClaimedMessage>,
+        _site_permit: tokio::sync::OwnedSemaphorePermit,
+        _ip_guard: crate::stream::IpStreamGuard,
+    }
+    let state = SseState {
+        wake: messaging.wake_handle(),
+        messaging,
+        key: key.to_string(),
+        topic: topic.to_string(),
+        sub,
+        buffer: VecDeque::new(),
+        _site_permit: site_permit,
+        _ip_guard: ip_guard,
+    };
+
+    let body = futures::stream::unfold(state, |mut st| async move {
+        loop {
+            // Drain this step's claimed batch one frame at a time.
+            if let Some(m) = st.buffer.pop_front() {
+                let event = sse_delivery_event(&st.topic, &m);
+                return Some((Ok::<_, std::convert::Infallible>(event), st));
+            }
+            // Pump the next durable batch, bounded by the idle-close (the heartbeat keeps a live
+            // client warm while this single future parks on the wake — ZERO spin). A durable-cursor
+            // idle close drops no unacked message: leased messages redeliver on reconnect.
+            match tokio::time::timeout(
+                crate::stream::STREAM_IDLE_TIMEOUT,
+                pump_until_batch(st.messaging.as_ref(), &st.key, &st.sub, &st.wake),
+            )
+            .await
+            {
+                Ok(Ok(batch)) => st.buffer.extend(batch),
+                Ok(Err(err)) => {
+                    tracing::warn!(key = %st.key, error = %err, "bus-consumer stream claim fault");
+                    return None;
+                }
+                Err(_) => return None, // idle timeout → close; client reconnects (durable resume)
+            }
+        }
+    });
+
+    Sse::new(body)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(crate::stream::STREAM_HEARTBEAT)
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// Serve a durable subscription as a **WebSocket** (RFC 6455): server→client, the durable pump frames
+/// each message as a Text [`ClaimedDto`] JSON; client→server, the client acks/nacks INLINE on the same
+/// socket with `{"ack":"<handle>"}` / `{"nack":"<handle>","delay_ms":…}` frames. Mirrors the
+/// configured-stream WS handshake + `boatramp_http` upgrade seam. The durable pump runs as its OWN
+/// task feeding a bounded channel, so an inbound ack never cancels an in-flight claim (at-least-once
+/// is preserved) and the bounded channel + `max_ack_pending` both bound read-ahead.
+#[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
+async fn serve_bus_ws(
+    inner: &HandlerRuntimeInner,
+    messaging: Arc<dyn Messaging>,
+    project: ProjectContext,
+    topic: String,
+    key: String,
+    sub: ResolvedSubscription,
+    client_ip: IpAddr,
+    mut request: Request,
+) -> Response {
+    // RFC 6455 opening handshake (mirrors `serve_ws_stream`): require version 13 + a key, derive the
+    // accept token, and take over the connection via boatramp-http's upgrade seam.
+    let version_ok = request
+        .headers()
+        .get("sec-websocket-version")
+        .is_some_and(|v| v.as_bytes() == b"13");
+    let accept = request
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|k| k.to_str().ok())
+        .map(boatramp_http::sec_websocket_accept);
+    let (Some(accept), true) = (accept, version_ok) else {
+        return (StatusCode::BAD_REQUEST, "invalid websocket handshake\n").into_response();
+    };
+    let on_upgrade = match boatramp_http::on_upgrade(&mut request) {
+        Some(u) => u,
+        None => return (StatusCode::BAD_REQUEST, "no upgrade handle\n").into_response(),
+    };
+    drop(request); // the WS handshake carries no body; release it before any await
+
+    // Cap the connection BEFORE taking over the socket (deny before resource use).
+    let scope = key.clone();
+    let site_permit = match crate::stream::acquire_stream_permit_capped(
+        inner,
+        &scope,
+        crate::stream::DEFAULT_STREAM_CONNECTIONS,
+    ) {
+        Ok(p) => p,
+        Err(()) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bus stream connection limit reached\n",
+            )
+                .into_response();
+        }
+    };
+    let ip_guard = match crate::stream::acquire_stream_ip_slot(inner, &scope, client_ip) {
+        Ok(g) => g,
+        Err(()) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "per-client bus stream connection limit reached\n",
+            )
+                .into_response();
+        }
+    };
+
+    let wake = messaging.wake_handle();
+    // The durable pump task: claim → push each message into a bounded channel. Isolated from the WS
+    // read loop so an inbound ack can never cancel an in-flight `claim_grouped` (at-least-once safe).
+    // The bounded channel (sized to the per-claim batch) + `max_ack_pending` both bound read-ahead.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ClaimedMessage>(sub.max_batch.max(1));
+    let pump_messaging = messaging.clone();
+    let pump_task = tokio::spawn(async move {
+        loop {
+            match pump_until_batch(pump_messaging.as_ref(), &key, &sub, &wake).await {
+                Ok(batch) => {
+                    for m in batch {
+                        if tx.send(m).await.is_err() {
+                            return; // client gone (rx dropped)
+                        }
+                    }
+                }
+                Err(_) => return, // backend fault
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        // Permits held for the socket's lifetime; dropped (releasing the slot) when this task ends.
+        let _permits = (site_permit, ip_guard);
+        let Ok(upgraded) = on_upgrade.await else {
+            pump_task.abort();
+            return;
+        };
+        let socket =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
+        let (mut sink, mut incoming) = socket.split();
+        loop {
+            tokio::select! {
+                biased;
+                // Inbound ack/nack frames FIRST (biased), so acks stay prompt and back-pressure drains.
+                msg = incoming.next() => match msg {
+                    Some(Ok(Message::Text(t))) => {
+                        handle_ws_ack(messaging.as_ref(), &project, &topic, t.as_bytes()).await;
+                    }
+                    Some(Ok(Message::Binary(b))) => {
+                        handle_ws_ack(messaging.as_ref(), &project, &topic, &b).await;
+                    }
+                    // Close / error / end-of-stream: tungstenite auto-answers pings; stop otherwise.
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                },
+                // A durable delivery → one Text frame carrying the opaque handle.
+                delivered = rx.recv() => match delivered {
+                    Some(m) => {
+                        let dto = ClaimedDto::from_message(&topic, &m);
+                        let text = serde_json::to_string(&dto).unwrap_or_else(|_| "{}".to_string());
+                        if sink.send(Message::Text(text)).await.is_err() {
+                            break; // client gone
+                        }
+                    }
+                    None => break, // pump ended (backend fault)
+                },
+            }
+        }
+        pump_task.abort();
+    });
+
+    // The `101` that triggers the serve loop's upgrade handoff — `Connection`/`Upgrade` must survive to
+    // the client (the serve bridge preserves a `101` verbatim).
+    (
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (header::CONNECTION, "upgrade"),
+            (header::UPGRADE, "websocket"),
+            (header::SEC_WEBSOCKET_ACCEPT, accept.as_str()),
+        ],
+        axum::body::Body::empty(),
+    )
+        .into_response()
+}
+
+/// Apply one INLINE WebSocket ack/nack frame (`{"ack":"<handle>"}` or `{"nack":"<handle>","delay_ms":…}`).
+///
+/// SECURITY: the frame is confined to the connection's OWN subscribe topic. A durable stream claims
+/// ONLY from `conn_topic`, so every handle it legitimately minted names that topic; the connection was
+/// authorized `Messaging·Read` on exactly `<project>/<conn_topic>` (NARROWER than the project-wildcard
+/// the SSE side-channel's `ack`/`nack` require), so a handle naming ANY OTHER topic is dropped — the
+/// inline ack can never reach beyond the single topic this connection is scoped to. The full key is
+/// recomposed from the TRUSTED path project (never the handle), identical to the shared side-channel,
+/// so a tampered handle can never cross a project boundary either. A malformed/foreign frame is
+/// silently ignored (an inline control frame has no response channel).
+#[cfg(feature = "handlers")]
+async fn handle_ws_ack(
+    messaging: &dyn Messaging,
+    project: &ProjectContext,
+    conn_topic: &str,
+    frame: &[u8],
+) {
+    #[derive(Deserialize)]
+    struct WsAckFrame {
+        #[serde(default)]
+        ack: Option<String>,
+        #[serde(default)]
+        nack: Option<String>,
+        #[serde(default)]
+        delay_ms: Option<u64>,
+    }
+    let Ok(f) = serde_json::from_slice::<WsAckFrame>(frame) else {
+        return;
+    };
+    let (handle, is_ack) = match (&f.ack, &f.nack) {
+        (Some(h), _) => (h.as_str(), true),
+        (None, Some(h)) => (h.as_str(), false),
+        (None, None) => return,
+    };
+    // Confine to THIS connection's authorized topic (see the security note above): a handle that is
+    // malformed, or names any topic OTHER than the one this connection subscribed to, is dropped.
+    let Some(decoded) = AckHandle::decode(handle) else {
+        return;
+    };
+    if decoded.topic != conn_topic {
+        return;
+    }
+    let Ok(msg) = handle_to_message(project, handle) else {
+        return;
+    };
+    let _ = if is_ack {
+        messaging.ack(&msg).await
+    } else {
+        match f.delay_ms {
+            Some(d) if d > 0 => messaging.nack_after(&msg, d).await,
+            _ => messaging.nack(&msg).await,
+        }
+    };
 }
 
 // ---- Runtime gate A: the long-poll wakes on a real publish, with zero busy-poll, and inherits the
@@ -516,6 +1041,12 @@ mod tests {
         async fn backlog(&self, topic: &str) -> Result<usize, MessagingError> {
             self.inner.backlog(topic).await
         }
+        // Forward the durable in-flight count UNCHANGED so the `max_ack_pending` back-pressure gate is
+        // exercised against the REAL `LogMessaging` grouped-lease bookkeeping (the default trait impl
+        // returns 0 and would silently disable the cap — a false green).
+        async fn in_flight_count(&self, topic: &str) -> Result<usize, MessagingError> {
+            self.inner.in_flight_count(topic).await
+        }
         fn wake_handle(&self) -> Option<Wake> {
             self.inner.wake_handle()
         }
@@ -682,6 +1213,291 @@ mod tests {
             counting.claims() - before,
             1,
             "wait=0 must make exactly one claim"
+        );
+    }
+
+    // ---- Runtime gate B (b, durable streaming subscription): the durable `claim_grouped` pump
+    // delivers every message with a usable handle, redelivers an unacked message on lease-expiry with
+    // the attempt count preserved, dead-letters past `max_attempts`, back-pressures on `max_ack_pending`,
+    // resumes without skipping an unacked message, and wakes on a real publish with ZERO busy-poll — all
+    // against the REAL `LogMessaging` grouped-claim core (no stub). -----------------------------------
+
+    /// A STREAM (per-tick) subscription over a durable consumer `group`.
+    fn stream_sub(
+        group: &str,
+        lease_ms: u64,
+        max_attempts: u32,
+        max_ack_pending: Option<usize>,
+    ) -> ResolvedSubscription {
+        SubscriptionParams {
+            group: group.to_string(),
+            start: StartPosition::Latest,
+            lease_ms: Some(lease_ms),
+            max_attempts: Some(max_attempts),
+            max_batch: None, // stream default (16)
+            max_ack_pending,
+            backoff_ms: None,
+            retention_ms: None,
+        }
+        .resolve()
+    }
+
+    /// Register a durable group on first claim: sets its cursor at the current logmax (so only
+    /// messages published AFTER this are delivered) and turns on publish-time fan-out retention.
+    async fn register_group(m: &dyn Messaging, key: &str, group: &str) {
+        let _ = m
+            .claim_grouped(
+                key,
+                group,
+                StartPosition::Latest,
+                Duration::from_millis(50),
+                16,
+                5,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// GATE B (core) — a durable grouped subscription delivers every produced message with a usable
+    /// opaque handle; an ack deletes for good; an UNACKED message redelivers on lease-expiry with the
+    /// attempt count preserved (which is ALSO resume — the durable lease, not `Last-Event-ID`, is the
+    /// authority, so a reconnect never skips it); a poison message dead-letters past `max_attempts`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_stream_delivers_acks_redelivers_and_dead_letters() {
+        let (_counting, m) = substrate();
+        let key = "acme/bus/orders/created";
+        let group = "analytics";
+        let wake = m.wake_handle();
+        // Short lease so the redelivery path is exercised quickly.
+        let sub = stream_sub(group, 60, 3, None);
+
+        register_group(m.as_ref(), key, group).await;
+        let n = 5usize;
+        for i in 0..n {
+            m.publish(key, format!("msg-{i}").as_bytes()).await.unwrap();
+        }
+
+        // ---- delivery: every message arrives with a handle that round-trips to its topic ----
+        let mut delivered: Vec<ClaimedMessage> = Vec::new();
+        while delivered.len() < n {
+            let batch = pump_until_batch(m.as_ref(), key, &sub, &wake)
+                .await
+                .unwrap();
+            for cm in &batch {
+                let dto = ClaimedDto::from_message("orders/created", cm);
+                let decoded = AckHandle::decode(&dto.handle).expect("the delivery handle decodes");
+                assert_eq!(
+                    decoded.topic, "orders/created",
+                    "handle carries the bare topic"
+                );
+                assert_eq!(cm.attempts, 1, "first delivery is attempt 1");
+            }
+            delivered.extend(batch);
+        }
+        assert_eq!(delivered.len(), n, "every produced message is delivered");
+
+        // ---- ack deletes two for good ----
+        m.ack(&delivered[0]).await.unwrap();
+        m.ack(&delivered[1]).await.unwrap();
+
+        // ---- the 3 UNACKED leases redeliver (== resume) with the attempt count preserved +1 ----
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        let mut redelivered: Vec<ClaimedMessage> = Vec::new();
+        while redelivered.len() < 3 {
+            let batch = pump_until_batch(m.as_ref(), key, &sub, &wake)
+                .await
+                .unwrap();
+            redelivered.extend(batch);
+        }
+        assert_eq!(
+            redelivered.len(),
+            3,
+            "the 3 unacked leases must redeliver (never skipped)"
+        );
+        assert!(
+            redelivered.iter().all(|cm| cm.attempts == 2),
+            "lease-expiry redelivery preserves + increments the attempt count"
+        );
+        // The two ACKED messages are gone for good — their ids never reappear.
+        let acked_ids = [delivered[0].id.clone(), delivered[1].id.clone()];
+        assert!(
+            redelivered.iter().all(|cm| !acked_ids.contains(&cm.id)),
+            "an acked message is deleted for good — it must not redeliver"
+        );
+        for cm in &redelivered {
+            m.ack(cm).await.unwrap();
+        }
+
+        // ---- DLQ: a poison message dead-letters past max_attempts (grouped core, unchanged) ----
+        let dlq_key = "acme/bus/orders/poison";
+        let dlq_group = "dlq-g";
+        let max_attempts = 2u32;
+        register_group(m.as_ref(), dlq_key, dlq_group).await;
+        m.publish(dlq_key, b"poison").await.unwrap();
+        for _ in 0..6 {
+            let c = m
+                .claim_grouped(
+                    dlq_key,
+                    dlq_group,
+                    StartPosition::Latest,
+                    Duration::from_millis(30),
+                    16,
+                    max_attempts,
+                )
+                .await
+                .unwrap();
+            if c.is_empty() {
+                break;
+            }
+            m.nack(&c[0]).await.unwrap();
+        }
+        let after = m
+            .claim_grouped(
+                dlq_key,
+                dlq_group,
+                StartPosition::Latest,
+                Duration::from_millis(30),
+                16,
+                max_attempts,
+            )
+            .await
+            .unwrap();
+        assert!(
+            after.is_empty(),
+            "a message past max_attempts must be dead-lettered, not redelivered"
+        );
+        assert!(
+            m.dead_letter_count(dlq_key).await.unwrap() >= 1,
+            "the poison message must land in the group's DLQ"
+        );
+    }
+
+    /// GATE B (back-pressure) — `max_ack_pending` caps outstanding-unacked per connection via the
+    /// durable `in_flight_count` gate: at the cap the pump claims NOTHING (parks), and an ack frees
+    /// exactly one slot that the next claim fills. No message is lost or double-delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_stream_max_ack_pending_caps_outstanding() {
+        let (_counting, m) = substrate();
+        let key = "acme/bus/orders/bp";
+        let group = "slow";
+        let wake = m.wake_handle();
+        // Long lease (no mid-test redelivery) + a cap of 2.
+        let sub = stream_sub(group, 30_000, 5, Some(2));
+
+        register_group(m.as_ref(), key, group).await;
+        for i in 0..5 {
+            m.publish(key, format!("m{i}").as_bytes()).await.unwrap();
+        }
+
+        // The first claim is clamped to the cap: at most 2 leased-but-unacked outstanding.
+        let first = pump_until_batch(m.as_ref(), key, &sub, &wake)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.len(),
+            2,
+            "the initial claim is clamped to max_ack_pending"
+        );
+
+        // While both are unacked the pump must deliver NOTHING (it parks on the cap).
+        let capped = tokio::time::timeout(
+            Duration::from_millis(400),
+            pump_until_batch(m.as_ref(), key, &sub, &wake),
+        )
+        .await;
+        assert!(
+            capped.is_err(),
+            "at the cap the pump must park — no new delivery until an ack frees a slot"
+        );
+
+        // Ack one → frees exactly one slot → the next claim delivers exactly one more.
+        m.ack(&first[0]).await.unwrap();
+        let more = tokio::time::timeout(
+            Duration::from_secs(2),
+            pump_until_batch(m.as_ref(), key, &sub, &wake),
+        )
+        .await
+        .expect("an ack frees a slot before the timeout")
+        .unwrap();
+        assert_eq!(more.len(), 1, "an ack freed exactly one outstanding slot");
+    }
+
+    /// GATE B (no busy-poll) — the durable pump returns at ~produce-time (woken by the real publish,
+    /// not a poll tick) having issued only a small constant number of underlying grouped claims.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_stream_wakes_on_publish_with_zero_busy_poll() {
+        let (counting, m) = substrate();
+        let key = "acme/bus/orders/stream";
+        let group = "g1";
+        let wake = m.wake_handle();
+        let sub = stream_sub(group, 30_000, 5, None);
+        register_group(m.as_ref(), key, group).await;
+
+        // Produce a message ~400 ms into the pump.
+        let producer = {
+            let m = m.clone();
+            let key = key.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                m.publish(&key, b"hi").await.unwrap();
+            })
+        };
+
+        let before = counting.claims();
+        let start = Instant::now();
+        let batch = pump_until_batch(m.as_ref(), key, &sub, &wake)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        producer.await.unwrap();
+
+        assert_eq!(batch.len(), 1, "the produced message must be delivered");
+        assert_eq!(batch[0].payload, b"hi");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "returned before the message was produced: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "did NOT wake on the publish — returned near the 30s park (poll tick?): {elapsed:?}"
+        );
+        let claims = counting.claims() - before;
+        assert!(
+            (1..=4).contains(&claims),
+            "expected a small constant number of grouped claims (initial empty + post-wake); got \
+             {claims} — a busy-poll would be hundreds"
+        );
+    }
+
+    /// GATE B (security) — an inline WS ack/nack frame naming a topic OTHER than the connection's own
+    /// subscribe topic is DROPPED: the decode-level confinement keeps the inline ack within the exact
+    /// `<project>/<topic>` the connection was authorized for (narrower than the side-channel's
+    /// `<project>/*`). A frame for the OWN topic is accepted.
+    #[test]
+    fn ws_inline_ack_is_confined_to_the_connection_topic() {
+        let msg = ClaimedMessage {
+            id: "01HSOMEID".to_string(),
+            topic: "acme/bus/orders/created".to_string(),
+            payload: b"x".to_vec(),
+            attempts: 1,
+            group: "analytics".to_string(),
+            signed_context: None,
+            inline: false,
+        };
+        // A handle for THIS connection's topic decodes to that bare topic — accepted by the guard.
+        let own = AckHandle::encode("orders/created", &msg);
+        let decoded = AckHandle::decode(&own).unwrap();
+        assert_eq!(
+            decoded.topic, "orders/created",
+            "a frame for the connection's own topic passes the confinement check"
+        );
+        // A handle for a DIFFERENT topic fails the `decoded.topic == conn_topic` guard, so
+        // `handle_ws_ack` drops it (it can never ack a message outside the connection's scope).
+        let foreign = AckHandle::encode("payments/charged", &msg);
+        let decoded_foreign = AckHandle::decode(&foreign).unwrap();
+        assert_ne!(
+            decoded_foreign.topic, "orders/created",
+            "a foreign-topic handle is rejected by the inline-ack confinement"
         );
     }
 }

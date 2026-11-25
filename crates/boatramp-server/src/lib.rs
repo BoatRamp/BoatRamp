@@ -248,7 +248,7 @@ pub(crate) use operator::{
 #[cfg(feature = "handlers")]
 mod bus_consumer;
 #[cfg(feature = "handlers")]
-pub(crate) use bus_consumer::{bus_ack, bus_claim, bus_nack};
+pub(crate) use bus_consumer::{bus_ack, bus_claim, bus_nack, bus_subscribe};
 mod proxy;
 pub use proxy::spawn_compute_reconcile;
 pub(crate) use proxy::{

@@ -762,10 +762,17 @@ pub fn router_with_fast(
         // the handlers namespace the bus from that trusted context, and authz sees the original
         // project-qualified path. Verb-prefixed `{*topic}` tail (mirroring the shim) so a topic with
         // `/` rides the path without colliding with the `ack`/`nack` verbs.
-        // (a) long-poll claim; the shared ack/nack side-channel is reused by increments b/d.
+        // (a) long-poll claim; (b) durable streaming subscription (SSE by default, WebSocket on
+        // `Upgrade`); the shared ack/nack side-channel is reused by both and by increment d. `subscribe`
+        // carries the topic in the PATH tail, mapped to `Messaging·Read` on the exact `<project>/<topic>`
+        // by `required_for`'s `bus` arm (enforced before the first byte) — same per-topic grain as claim.
         .route(
             "/api/projects/{project}/bus/claim/{*topic}",
             post(bus_claim),
+        )
+        .route(
+            "/api/projects/{project}/bus/subscribe/{*topic}",
+            get(bus_subscribe),
         )
         .route("/api/projects/{project}/bus/ack", post(bus_ack))
         .route("/api/projects/{project}/bus/nack", post(bus_nack))

@@ -7,17 +7,25 @@ use super::*;
 /// SSE heartbeat interval: a `: keep-alive` comment is emitted this often so a
 /// dead client (whose buffer never drains) is detected and its connection — and
 /// the permits it holds — reclaimed.
+///
+/// `pub(super)` so the external bus-consumer durable-stream surface
+/// ([`crate::bus_consumer`], PLAN-messaging-consumer-delivery (b)) reuses the SAME heartbeat
+/// cadence as the configured-stream fan-out.
 #[cfg(feature = "handlers")]
-const STREAM_HEARTBEAT: Duration = Duration::from_secs(15);
+pub(super) const STREAM_HEARTBEAT: Duration = Duration::from_secs(15);
 /// Close a stream that has produced no *event* (heartbeats aside) for this long,
 /// reclaiming the connection permit from a quiet topic. A client that still
 /// wants the feed reconnects (with `Last-Event-ID`).
+///
+/// `pub(super)` so [`crate::bus_consumer`]'s durable stream reuses the SAME idle-close bound.
 #[cfg(feature = "handlers")]
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+pub(super) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Default per-scope SSE connection cap when the site sets no
-/// `maxStreamConnections`, so streams can never grow unbounded.
+/// `maxStreamConnections`, so streams can never grow unbounded. `pub(super)` so the external
+/// bus-consumer durable stream ([`crate::bus_consumer`]) caps its per-`{project}/bus/<topic>`
+/// connections with the same default.
 #[cfg(feature = "handlers")]
-const DEFAULT_STREAM_CONNECTIONS: u32 = 256;
+pub(super) const DEFAULT_STREAM_CONNECTIONS: u32 = 256;
 /// Hard per-`(scope, IP)` concurrent SSE connection cap, so one client can't
 /// monopolise the per-site budget.
 #[cfg(feature = "handlers")]
@@ -81,12 +89,25 @@ pub(super) fn acquire_stream_permit(
     let max = site_handlers
         .max_stream_connections
         .unwrap_or(DEFAULT_STREAM_CONNECTIONS)
-        .max(1) as usize;
-    // `KeyedSemaphores::gate` re-sizes on a `maxStreamConnections` reload; `try_acquire` keeps the
-    // shed-to-503 semantics.
+        .max(1);
+    acquire_stream_permit_capped(inner, scope, max)
+}
+
+/// Acquire a per-scope SSE/stream connection permit against an EXPLICIT `max` cap, rather than a
+/// site config's `maxStreamConnections`. The seam [`acquire_stream_permit`] delegates to (passing the
+/// resolved site cap) and the one the external bus-consumer durable stream ([`crate::bus_consumer`])
+/// uses directly — a `{project}/bus/<topic>` connection has no `HandlersSiteConfig`, so it caps with
+/// [`DEFAULT_STREAM_CONNECTIONS`] — so BOTH surfaces share one per-scope semaphore pool + the
+/// shed-to-503 / reload-resize semantics (`KeyedSemaphores::gate`). `Err(())` when at the cap.
+#[cfg(feature = "handlers")]
+pub(super) fn acquire_stream_permit_capped(
+    inner: &HandlerRuntimeInner,
+    scope: &str,
+    max: u32,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ()> {
     inner
         .stream_semaphores
-        .gate(scope, max)
+        .gate(scope, max.max(1) as usize)
         .try_acquire_owned()
         .map_err(|_| ())
 }
