@@ -529,6 +529,60 @@ Docker Desktop / macOS); `bind` uses a host directory under
 **node-local** — it is not part of the blob-snapshot durability story the microVM
 backend's volumes get, and does not follow a workload across nodes.
 
+### Ephemeral scratch mounts (`--mount`)
+
+For **throwaway** scratch or cache space — a build dir, a render cache, a tmpfile
+area — an **ephemeral mount** is the right tool, not a persistent volume. It is a
+sized, RAM-backed `tmpfs` at a declared in-guest path, set up **fresh per replica**
+and reclaimed when the workload stops (never persisted, never snapshotted — the
+cheap counterpart to a persistent volume). Declare one (repeatable) with `--mount
+<path>[:<size_mib>]`:
+
+```sh
+boatramp compute set builder --image acme/builder:1 --port 8080 \
+  --mount /cache \            # 64 MiB (the default) at /cache
+  --mount /work:512           # 512 MiB at /work
+```
+
+Each mount is `nosuid,nodev` and its `<size_mib>` becomes the tmpfs `size=` cap, so
+it can never grow without bound; the pages are charged to the **workload's own
+memory** (the container memory cgroup, or the micro-VM's guest RAM), so a mount is
+bounded both by its explicit `size=` and by the workload's memory ceiling — size
+your `--mem-mib` to cover the mounts you declare.
+
+**This is the multi-tenant-safe way to get a writable path on the hardened
+read-only root.** Unlike [`--writable-root`](#docker-workloads-read-only-root-writable-root-and-volumes)
+and `--cap-add` (honored only single-tenant), an ephemeral mount is a per-workload
+tmpfs inside the workload's own mount namespace that can never reach another tenant,
+so it needs **no posture gating** — it is honored under **any** security posture, on
+the container, Docker, and micro-VM backends alike.
+
+The declarative surface is `ComputeSpec.ephemeral_mounts` in a `project.cfg`
+`compute` spec (the same record `--mount` builds):
+
+```ron
+spec: (
+    root: image("acme/builder:1"), vcpus: 1, mem_mib: 1024, port: 8080,
+    ephemeral_mounts: [ ( mount: "/cache", size_mib: 64 ), ( mount: "/work", size_mib: 512 ) ],
+),
+```
+
+Bounds, validated fail-closed at `compute set` **and** server-side at apply (a
+violation is a `400`, never a silently dead mount):
+
+| Rule | Value |
+| --- | --- |
+| Default size when `:<size_mib>` is omitted | **64 MiB** |
+| Max size per mount | **8 GiB** (`8192` MiB); `0` is rejected |
+| Max mounts per workload | **16** |
+| Path | absolute, canonical, no `..`; **not** a reserved mount (`/`, `/proc`, `/sys`, `/dev`, `/tmp`, `/run`) |
+| Collisions | no duplicate mount point, and no overlap with a persistent `volumes` mount at the same path |
+
+On a **micro-VM** backend the mount point must already exist in the guest image
+(best-effort); container backends honor any path. `compute build` does not take
+`--mount` — ephemeral mounts are a `compute set` / manifest concern; declaring none
+leaves the spec hash unchanged (an all-defaults spec round-trips byte-identically).
+
 ## Running a stock image that needs privileges (e.g. a database)
 
 Because every capability is dropped, a stock image whose entrypoint runs as root and

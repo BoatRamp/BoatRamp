@@ -813,6 +813,32 @@ A function that self-declares a subgraph auto-registers on deploy; pass
 `?register_subgraph=false` to `PUT /api/functions/:name` to opt a deploy out. See
 [Federation](../how-to/graphql.md#federation).
 
+## Project bus (consumer delivery)
+
+The **external, authenticated** project-bus consumer surface — how an off-node client
+drains a project's `{project}/bus/<topic>` topics without the in-cluster messaging
+shim. Three transports (long-poll claim, durable stream, webhook sink) ride one durable
+claim/lease/ack/nack/redelivery/DLQ core. Gated by the dedicated
+[`Messaging` right](./rbac.md#resources) — **`Messaging·Read`** for consuming,
+**`Messaging·Admin`** for sinks — and distinct from the `_boatramp/bus` **operator**
+surface below (which uses `Project·*`). The `{project}` path segment is the tenant
+boundary. Present with the `handlers` feature. Since 0.74.0.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/projects/:project/bus/claim/{*topic}` | **Long-poll claim.** Lease a batch, parking up to `?wait_ms` on a publish wake (no busy-poll), else return `[]`. Query: `wait_ms` (≤5 min), `lease_ms`, `max`, `max_attempts`, `group`, `start`. Each message carries an opaque `handle` the client settles with. `Messaging·Read` on `<project>/<topic>`. |
+| `GET` | `/api/projects/:project/bus/subscribe/{*topic}` | **Durable stream.** A long-lived group subscription — SSE by default, **WebSocket** on `Upgrade`. Query: `group`, `start`, `lease_ms`, `max_ack_pending` (back-pressure), `max_attempts`, `max`. SSE settles out-of-band via `ack`/`nack` below; WS settles inline with `{"ack"\|"nack":"<handle>","delay_ms"?}` text frames. `Messaging·Read` on `<project>/<topic>`. |
+| `POST` | `/api/projects/:project/bus/ack` | Delete a claimed message for good; body `{ handle }`. `Messaging·Read` on `<project>/*` (the topic is in the opaque handle, not the path). |
+| `POST` | `/api/projects/:project/bus/nack` | Redeliver a claimed message, now or after a backoff; body `{ handle, delay_ms? }`. The attempt count is preserved (still dead-letters at `max_attempts`). `Messaging·Read` on `<project>/*`. |
+| `PUT` | `/api/projects/:project/bus/sinks/:name` | Register/replace a **webhook sink** (host-run signed-POST consumer). Body is a `WebhookSink` (`topic`, sealed `url_secret`/`sign_secret`, `egress_allow`, …). The destination is SSRF-floored at register time; a sink whose secrets aren't sealed, or whose destination is non-global, is a `400`. `Messaging·Admin` on `<project>`. |
+| `DELETE` | `/api/projects/:project/bus/sinks/:name` | Remove a sink's **runtime** registration (idempotent; `404` if absent). A same-named config-declared sink becomes active again on the next reconcile. `Messaging·Admin` on `<project>`. |
+
+A consumer that `ack`/`nack`s needs `Messaging·Read` on the project **wildcard**
+`<project>/*` (a per-topic grant alone cannot settle). Only the global `admin` role
+carries `Messaging` by default; an operator grants a consumer its right through the
+[RBAC policy](./rbac.md#the-policy-document). See
+[Consume the bus from outside the sandbox](../how-to/background-work.md#consume-the-bus-from-outside-the-sandbox-non-wasm-clients).
+
 ## Observability
 
 Present with the `handlers` feature.

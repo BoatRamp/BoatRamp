@@ -27,9 +27,10 @@ does not satisfy any right on `site`.
 
 ## Resources
 
-Four resources are target-scoped: `site` (target `<project>/<site>`), `project`
-(target `<project>`, since 0.2.0), `secrets` (target `<project>`, since 0.3.10), and
-`blob_upload` (target `<project>`, at the mint route). The rest are global.
+Five resources are target-scoped: `site` (target `<project>/<site>`), `project`
+(target `<project>`, since 0.2.0), `secrets` (target `<project>`, since 0.3.10),
+`blob_upload` (target `<project>`, at the mint route), and `messaging` (target
+`<project>/<topic>` or `<project>`, since 0.74.0). The rest are global.
 
 | Resource | Scoped | Governs |
 | --- | --- | --- |
@@ -43,6 +44,7 @@ Four resources are target-scoped: `site` (target `<project>/<site>`), `project`
 | `cache` | global | Cache invalidation. |
 | `system` | global | Metrics, prune, scrub, site/project listing, cluster membership, authz policy. |
 | `overlay` | global | Overlay forward-flow discovery + capability minting (`/api/overlay/*`). Three tiers: `read` lists/resolves the service directory; `write` mints a holder-bound **dial** capability (self-serve `boatramp forward`); `admin` mints a holder-bound **publish** capability (self-serve `boatramp expose`) — strictly above `write`, because publishing claims a service name that forward clients trust and pin. Granted only via `admin` (or an explicit grant), never a default tenant role. **`admin` is coarse: it may mint a publish capability for ANY service name, and a live exposer shadows a static route of the same name — so an `overlay·admin` holder can reroute or capture any service's forward-client traffic. Treat it as near-admin trust and keep it admin-only until per-name publish scoping exists.** |
+| `messaging` | `<project>/<topic>` or `<project>` | The external, authenticated **project-bus consumer** surface (`/api/projects/<proj>/bus/*`): long-poll claim, durable SSE/WebSocket subscribe, ack/nack, and webhook-sink registration. Two tiers: `read` on `<project>/<topic>` consumes (claim/subscribe), and on the project-wildcard `<project>/*` settles (ack/nack — the topic rides the opaque handle, not the path); `admin` on `<project>` registers a webhook sink (an egress grant, strictly higher). Deliberately **not** `project` (a routine data-plane consumer must never hold project-admin). Only the global `admin` role carries it by default — grant a consumer its right in the policy (a dedicated `messaging_consumer` default role is under consideration and may ship later). Since 0.74.0. |
 
 ## Default roles
 
@@ -129,6 +131,10 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `PUT`/`DELETE` | `/api/projects/<proj>/email/profiles/<name>` | `secrets` · `write` *(proj)* |
 | `GET` | `/api/projects/<proj>/tenancy` | `project` · `read` *(proj)* |
 | `PUT`/`DELETE` | `/api/projects/<proj>/tenancy` | `project` · `admin` *(proj)* — mutating the tenant-isolation boundary is owner-level, above the publisher's `deploy` |
+| `POST` | `/api/projects/<proj>/bus/claim/<topic>` | `messaging` · `read` *(`<proj>/<topic>`)* — long-poll claim a project-bus topic |
+| `GET` | `/api/projects/<proj>/bus/subscribe/<topic>` | `messaging` · `read` *(`<proj>/<topic>`)* — durable SSE/WebSocket subscription |
+| `POST` | `/api/projects/<proj>/bus/{ack,nack}` | `messaging` · `read` *(`<proj>/*`)* — the topic rides the opaque handle, not the path, so this maps to the project wildcard |
+| `PUT`/`DELETE` | `/api/projects/<proj>/bus/sinks/<name>` | `messaging` · `admin` *(proj)* — register/remove a webhook sink (an egress grant, strictly above the consumer `read`) |
 | `POST` | `/api/[projects/<proj>/]sites/<site>/deployments` | `site` · `deploy` *(target)* |
 | `GET` | `/api/[projects/<proj>/]sites/<site>/deployments[/<id>]` | `site` · `read` *(target)* |
 | `POST` | `/api/[projects/<proj>/]sites/<site>/deployments/<id>/activate` | `site` · `deploy` *(target)* |

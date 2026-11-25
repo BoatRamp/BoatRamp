@@ -27,7 +27,7 @@ Once a token verifies, the request is authorized with
 [Cedar](https://www.cedarpolicy.com/). Cedar decides whether the token's granted
 roles carry a **right** — an action (`read`, `write`, `deploy`, `admin`) on a
 **resource** (`site`, `project`, `secrets`, `blobs`, `blob_upload`, `tokens`,
-`certs`, `cache`, `system`, `overlay`), optionally scoped to a target — that
+`certs`, `cache`, `system`, `overlay`, `messaging`), optionally scoped to a target — that
 satisfies what the endpoint requires. The
 policy is data: a default role-to-rights mapping ships built in, and an operator
 can replace it (validated server-side, so a bad policy cannot brick the control
