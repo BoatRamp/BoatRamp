@@ -1202,8 +1202,15 @@ where
     let notify = notify.clone();
     let handler = handler.clone();
     tokio::spawn(async move {
+        // The request method is part of the response's HTTP framing: a HEAD request (like a
+        // 1xx/204/304 status) carries NO body, so the writer must send HEADERS (keeping the
+        // declared `content-length`) + END_STREAM and no DATA — and must NOT mistake the
+        // expected empty body for a declared-length under-run (which would wrongly RST the
+        // stream). Capture it before `handle` consumes the request; mirrors the h1 writer's
+        // `no_body` rule (`h1::serve::write_response`).
+        let method = req.method().clone();
         let resp = handler.handle(req).await;
-        emit_response(&shared, &notify, sid, resp).await;
+        emit_response(&shared, &notify, sid, &method, resp).await;
         {
             let mut s = shared.lock().unwrap();
             s.active_handlers -= 1;
@@ -1217,21 +1224,46 @@ where
 /// is drained chunk by chunk over time and forwarded as DATA frames — so the writer streams
 /// it without the whole body ever being held (the reverse-proxy fast-path). `StreamSized`
 /// additionally carries a `content-length` header so the client gets a known length.
-async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Response) {
+async fn emit_response(
+    shared: &Conn,
+    notify: &Arc<Notify>,
+    sid: u32,
+    method: &::http::Method,
+    resp: Response,
+) {
     let (parts, body) = resp.into_parts();
+    // No-body responses carry HEADERS (keeping the declared `content-length`) + END_STREAM and
+    // NO DATA — the identical rule the h1 writer applies (`h1::serve::write_response`'s
+    // `no_body`). For a HEAD the handler still produces the body a GET would (so the declared
+    // length is right), but those bytes must never reach the wire; and a declared-length body
+    // that is (expectedly) empty here must NOT be treated as a §8.1.2.6 under-run and RST.
+    let status = parts.status.as_u16();
+    let no_body = *method == ::http::Method::HEAD
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304;
     match body {
         // A streamed body with no declared length: frame it with the producer's own headers
         // (no re-derived content-length) — the stream ending delimits it.
         http::Body::Stream(stream) => {
-            emit_streaming(shared, notify, sid, &parts, None, stream).await;
+            emit_streaming(shared, notify, sid, &parts, None, no_body, stream).await;
         }
         // A streamed body with a declared length: emit a `content-length` header (if the
         // producer didn't already) so the client gets progress/range, then stream the body.
         http::Body::StreamSized { stream, len } => {
-            emit_streaming(shared, notify, sid, &parts, Some(len as usize), stream).await;
+            emit_streaming(
+                shared,
+                notify,
+                sid,
+                &parts,
+                Some(len as usize),
+                no_body,
+                stream,
+            )
+            .await;
         }
         other => {
-            let frames = response_to_frames(parts, other).await;
+            let frames = response_to_frames(parts, other, no_body).await;
             // Seed the backpressure counter with this response's unsent DATA bytes so
             // the writer's accounting stays balanced (a buffered body never parks).
             let unsent: usize = frames
@@ -1269,9 +1301,28 @@ async fn emit_streaming(
     sid: u32,
     parts: &::http::response::Parts,
     content_length: Option<usize>,
+    no_body: bool,
     mut stream: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = http::BodyChunk> + Send>>,
 ) {
     let fields = response_fields(parts, content_length);
+    // A no-body response (HEAD / 1xx / 204 / 304): emit the HEADERS — INCLUDING the declared
+    // `content-length`, so a HEAD reports the length its GET would carry — with END_STREAM, and
+    // stop. No DATA frame, and crucially none of the declared-length under-run RST below runs:
+    // the empty body is EXPECTED here, not a truncation. h1-parity with `write_response`'s
+    // `no_body` short-circuit. (The genuine under-run RST stays in force for every other
+    // response — a GET whose body falls short of its declared length still resets.)
+    if no_body {
+        push_out(
+            shared,
+            notify,
+            sid,
+            OutFrame::Headers {
+                fields,
+                end_stream: true,
+            },
+        );
+        return;
+    }
     if !push_out(
         shared,
         notify,
@@ -1451,7 +1502,22 @@ fn reset_local(shared: &Conn, notify: &Arc<Notify>, sid: u32, code: ErrorCode) {
 async fn response_to_frames(
     parts: ::http::response::Parts,
     body: http::Body,
+    no_body: bool,
 ) -> VecDeque<OutFrame> {
+    // A no-body response (HEAD / 1xx / 204 / 304): emit HEADERS + END_STREAM and no DATA, while
+    // keeping the `content-length` the body WOULD carry (a HEAD reports its GET's length) —
+    // taken from the body's declared length WITHOUT reading it (a `File`/`Bytes` body knows its
+    // size). h1-parity: `write_response` likewise short-circuits before touching the body.
+    if no_body {
+        let len = body.len();
+        let fields = response_fields(&parts, (len > 0).then_some(len));
+        let mut out = VecDeque::new();
+        out.push_back(OutFrame::Headers {
+            fields,
+            end_stream: true,
+        });
+        return out;
+    }
     let body = body_bytes(body).await;
     let has_body = !body.is_empty();
     let fields = response_fields(&parts, has_body.then_some(body.len()));

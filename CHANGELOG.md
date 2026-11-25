@@ -5,6 +5,34 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.73.1] — 2026-11-25
+
+### Fixed
+
+- **HTTP/2 serving: a `HEAD` response that declares a `Content-Length` is no longer reset.** The
+  h2 serving writer framed any response carrying a `Content-Length` as a declared-length body
+  regardless of the request method, so a `HEAD` (whose body is empty) tripped the defensive
+  RFC 7540 §8.1.2.6 declared-length **under-run** check (`0 < len`) and the stream was
+  `RST_STREAM`'d — dropping the already-queued HEADERS. A real `HEAD /v2/<name>/blobs/<digest>`
+  relayed over HTTP/2 to the edge was therefore reset instead of completing, breaking registry
+  blob-existence checks (and any h2 `HEAD` to a `Content-Length`-bearing resource, e.g. a static
+  file). The h2 writer now applies the same **`no_body`** rule the h1 writer already did (`HEAD` /
+  `1xx` / `204` / `304`): it sends HEADERS — **including** the `Content-Length` — with `END_STREAM`
+  and **no** DATA, and does not treat the expected-empty body as an under-run. The defensive
+  under-run RST is unchanged for every other response: a non-`HEAD` body that falls short of its
+  declared `Content-Length` still resets. This completes the v0.70.0 response-path
+  `Content-Length`-preserve fix, which kept the header but did not stop the h2 writer from
+  resetting the stream. A new real-h2-stack regression gate
+  (`boatramp-http/tests/h2_head_framing.rs`, driven by the reference `h2` client against
+  `serve_connection_mux`) covers it — the in-process tower `oneshot` conformance path bypasses the
+  writer, which is why this slipped through.
+- **Gateway: the HTTP-upgrade decline passthrough no longer strips `Content-Length`.** When an
+  upstream *declines* a WebSocket/HTTP upgrade and returns an ordinary (non-101) response, the
+  gateway passed it through but dropped `Content-Length`, forcing the re-streamed body to chunked /
+  length-unknown — a latent inconsistency with the v0.70.0 response-path `Content-Length`
+  preservation. The known length is now kept (the `101 Switching Protocols` path is unaffected), so
+  a declined upgrade keeps progress/range and relays a `HEAD`'s `Content-Length`.
+
 ## [0.73.0] — 2026-11-25
 
 ### Added

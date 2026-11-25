@@ -2160,15 +2160,19 @@ where
         return (StatusCode::SWITCHING_PROTOCOLS, headers, Body::empty()).into_response();
     }
 
-    // Upstream declined the upgrade — pass its response through. `append` preserves
-    // REPEATED headers — notably every `Set-Cookie` (see `forward_response_headers`).
+    // Upstream declined the upgrade — this is an ordinary (non-101) response, so pass it
+    // through like the normal reverse-proxy path. A known `Content-Length` is KEPT (not
+    // stripped): the serving stack frames the re-streamed body with it so a proxied
+    // known-length download keeps progress + range, and a registry blob `HEAD` relays its
+    // `content-length` — matching the v0.70.0 response-path CL-preserve fix (stripping it
+    // here was a latent inconsistency). The strip is NOT needed for upgrade framing: this
+    // branch is reached only when the upstream did NOT switch protocols, and the 101 path
+    // above forwards headers verbatim. `append` preserves REPEATED headers — notably every
+    // `Set-Cookie` (see `forward_response_headers`).
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut headers = HeaderMap::new();
     for (name, value) in upstream_resp.headers() {
-        if name == header::CONTENT_LENGTH {
-            continue;
-        }
         headers.append(name.clone(), value.clone());
     }
     (status, headers, Body::new(upstream_resp.into_body())).into_response()
