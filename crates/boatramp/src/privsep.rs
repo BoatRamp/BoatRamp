@@ -4607,9 +4607,10 @@ mod instance_serve {
     /// root-wired control-authorize-serve link (design §Phase-5 P5-4) — the group-E analog of
     /// [`run_authority_serve`]. Builds the end-principal [`ContextVerifier`] from the PUBLIC trust root
     /// (fail-closed if absent — an authorizer with no verifier serves nothing), a node-wide anti-replay
-    /// [`ReplayCache`], and the node's DEFAULT RBAC policy (a split control instance holds no
-    /// `backend.kv`; see [`ControlAuthorizer`]'s policy-source note + the serving side's custom-policy
-    /// fail-closed guard), then serves [`ControlAuthorizer::authorize`] on one blocking thread per link.
+    /// [`ReplayCache`], and the node's built-in DEFAULT RBAC policy — used ONLY when a relayed request
+    /// conveys [`RelayedPolicy::Default`]; a stored CUSTOM operator doc arrives per-call from the
+    /// backend.kv store authority and is evaluated instead (INFO-B — see [`ControlAuthorizer`]'s
+    /// policy-source note). Serves [`ControlAuthorizer::authorize`] on one blocking thread per link.
     /// Each call is re-validated AT THE DESTINATION (context + per-call PoP) and answered with a
     /// DECISION — NEVER key material. Fail-closed: a missing trust root / a designated link with no
     /// root-wired fd returns `Err` → the instance exits → FailNodeClosed.
@@ -4664,10 +4665,12 @@ mod instance_serve {
     }
 
     /// The blocking receiver-side serve loop for ONE control-authorize link: receive a bounded
-    /// [`ControlAuthorizeCall`], decide it ([`ControlAuthorizer::authorize`] — re-validate context +
-    /// PoP AT THE DESTINATION, anti-replay, `rights_for`), and reply a bounded [`ControlAuthorizeReply`]
-    /// (a DECISION, never a key). A read deadline bounds an in-progress frame (slowloris); a malformed
-    /// call is a non-secret `Refused`. Loops until the peer closes (EOF) or a transport error.
+    /// [`ControlAuthorizeRequest`] (the verbatim-client call + the backend-sourced operator policy),
+    /// decide it ([`ControlAuthorizer::authorize`] — re-validate context + PoP AT THE DESTINATION,
+    /// anti-replay, `rights_for` under the operator's effective policy), and reply a bounded
+    /// [`ControlAuthorizeReply`] (a DECISION, never a key). A read deadline bounds an in-progress frame
+    /// (slowloris); a malformed request is a non-secret `Refused`. Loops until the peer closes (EOF) or a
+    /// transport error.
     pub(super) fn serve_control_authorize_link(
         label: &str,
         link_name: &str,
@@ -4686,12 +4689,12 @@ mod instance_serve {
                     return;
                 }
             };
-            let reply = match serde_json::from_slice::<ControlAuthorizeCall>(&frame) {
-                Ok(call) => authorizer.authorize(&call, now_unix()),
+            let reply = match serde_json::from_slice::<ControlAuthorizeRequest>(&frame) {
+                Ok(request) => authorizer.authorize(&request, now_unix()),
                 Err(e) => {
-                    tracing::warn!(instance = %label, link = %link_name, error = %e, "[privsep] control-authorize: malformed call — refusing");
+                    tracing::warn!(instance = %label, link = %link_name, error = %e, "[privsep] control-authorize: malformed request — refusing");
                     ControlAuthorizeReply::Refused {
-                        reason: "malformed control-authorize call".to_string(),
+                        reason: "malformed control-authorize request".to_string(),
                     }
                 }
             };
@@ -4773,6 +4776,47 @@ mod instance_serve {
         pub host: String,
     }
 
+    /// How the SERVING `backend.kv` holder conveys the operator's EFFECTIVE authz policy to the SPLIT
+    /// `control.admin-api` authorizer over the control-authorize-serve relay (P5-4 INFO-B — the
+    /// control→backend policy-read orchestrator). It is sourced ONLY from the backend.kv holder's own
+    /// control-plane store ([`NodeDataPlane::load_custom_authz_policy`] reading [`POLICY_KEY`] — the SAME
+    /// key the monolith (`crate::auth`) and the LOCAL [`NodeServeHandler::authorize_local`] read), NEVER
+    /// from the originating client's request (the PoP-sealed credential in [`ControlAuthorizeCall`] is the
+    /// CLIENT's; the policy is the OPERATOR's, read from the store). Carried as a SEPARATE element from
+    /// the verbatim-client call ([`ControlAuthorizeRequest`]) so a frontend RCE can never assert a policy
+    /// — only the backend.kv store authority supplies it.
+    ///
+    /// `Default` ⇒ NO custom doc is stored, so the authorizer evaluates under its OWN trusted
+    /// [`AuthzPolicy::default_policy`] (no policy crosses the link in the common case — byte-identical to
+    /// the pre-INFO-B default-policy behavior). `Custom(policy)` ⇒ a custom operator doc IS stored, read
+    /// from the store; the authorizer evaluates `rights_for` under THAT (closing the over-restriction
+    /// where ANY custom doc previously 503'd the relay path). An UNREADABLE / MALFORMED store never
+    /// reaches here — the backend.kv holder fails the mutation CLOSED before relaying (M1 discipline).
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub(super) enum RelayedPolicy {
+        /// No custom operator policy doc is stored — the authorizer uses its own built-in default.
+        Default,
+        /// The operator's STORED custom RBAC policy, read from [`POLICY_KEY`] by the backend.kv holder.
+        Custom(AuthzPolicy),
+    }
+
+    /// The full request a serving `backend.kv` holder relays to the SPLIT `control.admin-api` authorizer
+    /// over a control-authorize-serve link (P5-4): the verbatim-client [`ControlAuthorizeCall`] credential
+    /// PLUS the operator's effective [`RelayedPolicy`] the backend.kv holder sourced from its OWN store.
+    /// The two are architecturally DISTINCT inputs: `call` is the CLIENT's PoP-sealed credential
+    /// (re-validated at the destination, never trusted as an assertion); `policy` is the OPERATOR's
+    /// store-sourced RBAC the authorizer evaluates `rights_for` under — so an in-process
+    /// ([`NodeServeHandler::authorize_local`]) and a relayed decision reach the SAME result for the same
+    /// stored policy + the same client context.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub(super) struct ControlAuthorizeRequest {
+        /// The verbatim client credential + request line (unchanged — PoP-sealed, re-validated at the
+        /// destination). NEVER carries policy.
+        pub call: ControlAuthorizeCall,
+        /// The operator's effective policy, sourced from the backend.kv holder's control-plane store.
+        pub policy: RelayedPolicy,
+    }
+
     /// The control-plane authorizer's REPLY to a [`ControlAuthorizeCall`] (P5-4). Mirrors the WS-E
     /// [`AuthorityResponse`](boatramp_server::privsep_authority) **no-key discipline**: every variant is
     /// a bounded DECISION or a non-secret refusal — there is NO variant that can carry a key, the RBAC
@@ -4800,47 +4844,60 @@ mod instance_serve {
     /// `rights_for` DECISION on the re-validated principal; the no-key reply type forecloses returning
     /// anything else.
     ///
-    /// **Policy source (surfaced limitation).** A SPLIT `control.admin-api` authorizer holds no
-    /// `backend.kv`, so it authorizes under the node's DEFAULT RBAC policy ([`AuthzPolicy::default_policy`]).
-    /// A KV-stored CUSTOM operator policy doc is NOT honored here — that needs the authorizer to reach
-    /// `backend.kv` (the full P5-4 control→backend policy-read relay / the §1.1 orchestrator). The
-    /// SERVING `backend.kv` holder fails the relayed-authorize path CLOSED when a custom policy doc is
-    /// present (see [`NodeServeHandler::serve_control_mutation`]), so the default-policy assumption never
-    /// SILENTLY under-enforces a more-restrictive operator policy.
+    /// **Policy source (INFO-B closed).** A SPLIT `control.admin-api` authorizer holds no `backend.kv`,
+    /// so it cannot read the operator's policy store itself. It evaluates `rights_for` under the operator's
+    /// EFFECTIVE policy as CONVEYED per-call in the [`ControlAuthorizeRequest`]'s [`RelayedPolicy`]: the
+    /// serving `backend.kv` holder — the store authority — reads the operator's own doc from [`POLICY_KEY`]
+    /// ([`NodeDataPlane::load_custom_authz_policy`], the SAME source the monolith + the local
+    /// [`NodeServeHandler::authorize_local`] read) and sends either `Custom(doc)` or `Default`. When
+    /// `Default`, the authorizer uses its OWN trusted [`AuthzPolicy::default_policy`] (`default_policy`
+    /// below) — no policy crosses the link in the common case. This closes the earlier over-restriction
+    /// (any custom doc used to 503 the relay path) while keeping the policy sourced ONLY from the operator
+    /// store, never from the client's request. An unreadable/malformed store fail-closes at the backend.kv
+    /// holder BEFORE relaying. (The Cedar policy-doc deny/allow OVERLAY is still the surfaced remaining
+    /// binding for BOTH the local and the relayed path — see [`NodeDataPlane::load_authz_policy`].)
     #[derive(Clone)]
     pub(super) struct ControlAuthorizer {
         verifier: ContextVerifier,
         replay: Arc<ReplayCache>,
-        policy: Arc<AuthzPolicy>,
+        /// The authorizer's OWN trusted default, used ONLY when the relayed [`RelayedPolicy`] is
+        /// `Default` (no custom operator doc stored). A stored custom doc arrives per-call and is
+        /// evaluated instead — never this default.
+        default_policy: Arc<AuthzPolicy>,
     }
 
     impl ControlAuthorizer {
         pub(super) fn new(
             verifier: ContextVerifier,
             replay: Arc<ReplayCache>,
-            policy: Arc<AuthzPolicy>,
+            default_policy: Arc<AuthzPolicy>,
         ) -> Self {
             Self {
                 verifier,
                 replay,
-                policy,
+                default_policy,
             }
         }
 
-        /// Decide a relayed [`ControlAuthorizeCall`], fail-closed-by-construction. Re-validates the
+        /// Decide a relayed [`ControlAuthorizeRequest`], fail-closed-by-construction. Re-validates the
         /// end-principal context + PoP AT THE DESTINATION (the SAME binding the local P5-3-serve path
         /// uses — [`control_mutation_pop_bytes`] over op+method+path+host — so no asserted id is
         /// trusted), checks anti-replay, DERIVES the required `Right` from the PoP-bound method+path via
-        /// the SAME `/api/*` map ([`classify_control_op`]), and applies `rights_for` under the node's
-        /// policy. Any verify/PoP failure, a replay, or an unmapped op ⇒ [`ControlAuthorizeReply::Refused`];
+        /// the SAME `/api/*` map ([`classify_control_op`]), and applies `rights_for` under the OPERATOR's
+        /// EFFECTIVE policy — the custom doc the backend.kv holder sourced and conveyed in
+        /// `request.policy` ([`RelayedPolicy::Custom`]), else the authorizer's OWN trusted default
+        /// ([`RelayedPolicy::Default`]). This is the SAME `AuthzPolicy::normalize_grants` + `rights_for`
+        /// evaluator the monolith and the local [`NodeServeHandler::authorize_local`] run (INFO-B parity).
+        /// Any verify/PoP failure, a replay, or an unmapped op ⇒ [`ControlAuthorizeReply::Refused`];
         /// a sound-but-unauthorized principal ⇒ [`ControlAuthorizeReply::Denied`]; else
         /// [`ControlAuthorizeReply::Allowed`] with the verified `cti`. Pure w.r.t. `now` (sync — all of
         /// `verify_context_and_pop` / `rights_for` are sync).
         pub(super) fn authorize(
             &self,
-            call: &ControlAuthorizeCall,
+            request: &ControlAuthorizeRequest,
             now: u64,
         ) -> ControlAuthorizeReply {
+            let call = &request.call;
             // (1) RE-VALIDATE the end principal AT THE DESTINATION — the control-mutation binding the
             //     client itself signed (NOT a relay-forwarded assertion). `VerifiedPrincipal` is the
             //     SOLE principal path.
@@ -4894,10 +4951,17 @@ mod instance_serve {
                 };
             };
 
-            // (4) `rights_for` under the node's effective policy (normalized grants — I1 parity).
-            let roles = self.policy.normalize_grants(&principal.token().roles);
-            if self.policy.rights_for(&roles).allows(&required) {
-                tracing::info!(principal = %principal.principal_id(), "[privsep] control-authorize ALLOWED (cross-instance rights_for decision)");
+            // (4) `rights_for` under the OPERATOR's EFFECTIVE policy (INFO-B): the custom doc the
+            //     backend.kv store authority sourced + conveyed, else the authorizer's OWN trusted
+            //     default. The SAME `AuthzPolicy::normalize_grants` + `rights_for` the monolith + the
+            //     local `authorize_local` run (I1 parity — normalize grants BEFORE expanding to rights).
+            let effective_policy: &AuthzPolicy = match &request.policy {
+                RelayedPolicy::Default => &self.default_policy,
+                RelayedPolicy::Custom(policy) => policy,
+            };
+            let roles = effective_policy.normalize_grants(&principal.token().roles);
+            if effective_policy.rights_for(&roles).allows(&required) {
+                tracing::info!(principal = %principal.principal_id(), custom_policy = matches!(request.policy, RelayedPolicy::Custom(_)), "[privsep] control-authorize ALLOWED (cross-instance rights_for decision under the operator's effective policy)");
                 ControlAuthorizeReply::Allowed { cti }
             } else {
                 tracing::warn!(principal = %principal.principal_id(), required = ?required, "[privsep] control-authorize DENIED: the verified principal is not authorized (default-deny)");
@@ -4932,22 +4996,29 @@ mod instance_serve {
             &self.link_name
         }
 
-        /// Relay ONE authorize call to the control-plane authorizer and return its typed reply. The
-        /// link I/O is BLOCKING (so it runs on a `spawn_blocking` thread); the bounded read deadline
-        /// turns a dead/stalled authorizer into a fail-closed `Err` rather than a hang. A transport /
-        /// codec failure is an `Err` (⇒ the caller fails the mutation closed).
+        /// Relay ONE authorize request to the control-plane authorizer and return its typed reply. The
+        /// request bundles the verbatim-client credential ([`ControlAuthorizeCall`]) with the operator's
+        /// effective `policy` the backend.kv store authority sourced ([`RelayedPolicy`], INFO-B) — the
+        /// policy is NEVER taken from the client's request, only conveyed here from the store. The link
+        /// I/O is BLOCKING (so it runs on a `spawn_blocking` thread); the bounded read deadline turns a
+        /// dead/stalled authorizer into a fail-closed `Err` rather than a hang. A transport / codec
+        /// failure is an `Err` (⇒ the caller fails the mutation closed).
         pub(super) async fn authorize(
             &self,
             cred: &ControlMutationCredential,
             host: &str,
+            policy: RelayedPolicy,
         ) -> Result<ControlAuthorizeReply, String> {
-            let call = ControlAuthorizeCall {
-                token: cred.token.clone(),
-                nonce: cred.nonce,
-                pop: cred.pop.clone(),
-                method: cred.method.clone(),
-                path: cred.path.clone(),
-                host: host.to_string(),
+            let request = ControlAuthorizeRequest {
+                call: ControlAuthorizeCall {
+                    token: cred.token.clone(),
+                    nonce: cred.nonce,
+                    pop: cred.pop.clone(),
+                    method: cred.method.clone(),
+                    path: cred.path.clone(),
+                    host: host.to_string(),
+                },
+                policy,
             };
             let link = Arc::clone(&self.link);
             let link_name = self.link_name.clone();
@@ -4955,8 +5026,8 @@ mod instance_serve {
                 let guard = link
                     .lock()
                     .map_err(|_| "control-authorize link mutex poisoned".to_string())?;
-                let bytes = serde_json::to_vec(&call)
-                    .map_err(|e| format!("encoding the authorize call: {e}"))?;
+                let bytes = serde_json::to_vec(&request)
+                    .map_err(|e| format!("encoding the authorize request: {e}"))?;
                 guard
                     .send_frame(&bytes)
                     .map_err(|e| format!("relaying the authorize call over {link_name:?}: {e}"))?;
@@ -5683,10 +5754,14 @@ mod instance_serve {
         /// `cose::verify` + the PoP check + anti-replay + `rights_for` on the client's OWN signed
         /// credential — never a relay-forwarded assertion). The REVOCATION check stays HERE (this
         /// instance is the `backend.kv`/revocation-marker authority; it checks `authz/revoked/<cti>` on
-        /// the `cti` the authorizer verified — reusing [`boatramp_core::authz::revoked_key`]). Fail-
-        /// closed on: no relay client / a link mismatch, a CUSTOM policy doc the split authorizer cannot
-        /// honor (the default-policy limitation — surfaced P5-4), a DENIED / REFUSED decision, an
-        /// unreachable authorizer, or a revoked/unreadable marker. `Ok(label)` ⇒ authorized.
+        /// the `cti` the authorizer verified — reusing [`boatramp_core::authz::revoked_key`]). The
+        /// operator's EFFECTIVE policy is SOURCED HERE from the held `backend.kv` (INFO-B — the
+        /// control→backend policy-read orchestrator: this instance is the store authority, so it reads
+        /// the operator's own doc from [`POLICY_KEY`] via [`NodeDataPlane::load_custom_authz_policy`] and
+        /// conveys it to the authorizer as the policy to decide under, custom-or-default) — so a relayed
+        /// decision matches the local [`authorize_local`] one. Fail-closed on: no relay client / a link
+        /// mismatch, an UNREADABLE / MALFORMED policy doc, a DENIED / REFUSED decision, an unreachable
+        /// authorizer, or a revoked/unreadable marker. `Ok(label)` ⇒ authorized.
         async fn authorize_relayed(
             &self,
             cred: &ControlMutationCredential,
@@ -5709,38 +5784,33 @@ mod instance_serve {
                 ));
             };
 
-            // CUSTOM-POLICY FAIL-CLOSED GUARD (the default-policy limitation of a SPLIT authorizer). A
-            // split `control.admin-api` holder authorizes under the node's DEFAULT RBAC policy (it holds
-            // no backend.kv). This instance HOLDS backend.kv, so it is the authority on whether a CUSTOM
-            // operator policy doc exists; if one does, the split authorizer cannot honor it (it could be
-            // MORE restrictive than the default), so refuse the relayed-authorize path CLOSED rather
-            // than under-enforce. Honoring a KV-stored custom policy over the relay is the control→
-            // backend policy-read orchestrator — the remaining P5-4 work.
-            match self.data_plane.custom_policy_present().await {
-                Ok(false) => {}
-                Ok(true) => {
-                    tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: a CUSTOM authz policy doc is present but the cross-instance (split) authorizer honors only the default policy (fail-closed)");
-                    return Err(fail_closed_response(
-                        "control-plane mutation refused: a custom operator authz policy doc is present, \
-                         but the cross-instance (split control.admin-api) authorizer honors only the \
-                         node's DEFAULT RBAC policy — honoring a KV-stored custom policy over the relay \
-                         (the control→backend policy-read orchestrator) is the remaining P5-4 work; \
-                         fail-closed rather than under-enforce",
-                    ));
-                }
+            // SOURCE THE OPERATOR POLICY (INFO-B — the control→backend policy-read orchestrator). This
+            // instance IS the backend.kv store authority, so it reads the operator's OWN authz policy doc
+            // from the SAME POLICY_KEY the monolith + the local `authorize_local` read — NEVER from the
+            // client's request. A stored CUSTOM doc is conveyed to the split authorizer as the policy to
+            // decide under (closing the earlier over-restriction where ANY custom doc 503'd this path);
+            // its ABSENCE conveys `Default` (the authorizer uses its OWN trusted default — no policy
+            // crosses the link in the common case). An UNREADABLE / MALFORMED doc FAILS CLOSED HERE
+            // (M1 discipline) — never relayed, never under-enforced (defaulting could be more permissive
+            // than the operator's real/unparseable policy).
+            let relayed_policy = match self.data_plane.load_custom_authz_policy().await {
+                Ok(Some(policy)) => RelayedPolicy::Custom(policy),
+                Ok(None) => RelayedPolicy::Default,
                 Err(why) => {
-                    tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation REFUSED: could not read the authz policy doc to guard the split-authorizer default-policy limitation (fail-closed)");
+                    tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation REFUSED: could not source the operator authz policy from the held backend.kv for the cross-instance authorize relay (fail-closed)");
                     return Err(fail_closed_response(&format!(
-                        "control-plane mutation refused: could not read the authz policy doc to confirm \
-                         the split authorizer can honor it (fail-closed): {why}"
+                        "control-plane mutation refused: could not read the operator authz policy doc \
+                         from the control-plane store to authorize the relayed mutation (fail-closed, \
+                         never under-enforced): {why}"
                     )));
                 }
-            }
+            };
 
             // RELAY: the authorizer re-validates the end-principal context + PoP AT THE DESTINATION,
             // checks anti-replay, re-derives the required Right from the PoP-bound method+path, and
-            // answers the `rights_for` decision. A transport failure / an unreachable holder ⇒ 503.
-            let cti = match relay.authorize(cred, host).await {
+            // answers the `rights_for` decision UNDER THE OPERATOR POLICY sourced above. A transport
+            // failure / an unreachable holder ⇒ 503.
+            let cti = match relay.authorize(cred, host, relayed_policy).await {
                 Ok(ControlAuthorizeReply::Allowed { cti }) => cti,
                 Ok(ControlAuthorizeReply::Denied) => {
                     tracing::warn!(%host, "[privsep] node-self-host control mutation REFUSED: the cross-instance authorizer DENIED (default-deny)");
@@ -6052,15 +6122,21 @@ mod instance_serve {
             WriteOutcome::Applied
         }
 
-        /// Load the node's RBAC [`AuthzPolicy`] from the HELD control-plane KV ([`POLICY_KEY`]), for the
-        /// `control.admin-api` authorize decision (P5-3-serve). Mirrors the monolith's source
-        /// (`crate::auth`): the stored policy, else [`AuthzPolicy::default_policy`] when ABSENT. A present
-        /// but MALFORMED policy is FAIL-CLOSED (`Err`) — never silently fall back to the default, which
-        /// could be more permissive than the operator's real (unparseable) policy. A `Refusing` plane has
-        /// no KV → `Err` (a non-`backend.kv` instance cannot authorize). (The Cedar policy-doc deny/allow
-        /// OVERLAY — the monolith's `CompiledCedar` decision — is the surfaced remaining binding; this
-        /// cut decides on the role→rights expansion, the common default-deny core.)
-        pub(super) async fn load_authz_policy(&self) -> Result<AuthzPolicy, String> {
+        /// Source the operator's CUSTOM RBAC policy doc from the HELD control-plane KV ([`POLICY_KEY`]) —
+        /// the ONE KV-policy-read seam (the monolith's source, `crate::auth`, reads the SAME key).
+        /// `Ok(Some(policy))` ⇒ a custom operator doc IS stored (honor it); `Ok(None)` ⇒ ABSENT (the
+        /// built-in [`AuthzPolicy::default_policy`] is in effect); `Err` ⇒ the doc is present-but-MALFORMED
+        /// **or** the store read ERRORED — BOTH fail-closed (never silently defaulted, which could be more
+        /// permissive than the operator's real/unparseable policy). A `Refusing` plane holds no KV ⇒ `Err`
+        /// (a non-`backend.kv` instance cannot source the policy).
+        ///
+        /// This is the sourcing primitive the P5-4 cross-instance authorize relay uses (INFO-B, the
+        /// control→backend policy-read orchestrator): the `backend.kv` holder — the store authority —
+        /// reads the operator's OWN policy here and conveys it to the SPLIT `control.admin-api` authorizer
+        /// as the policy to evaluate `rights_for` under (custom-or-default), so a relayed decision matches
+        /// the in-process [`NodeServeHandler::authorize_local`] one and a present custom doc no longer
+        /// 503's the relay path. The policy is NEVER taken from the client's request — only from this key.
+        pub(super) async fn load_custom_authz_policy(&self) -> Result<Option<AuthzPolicy>, String> {
             let store = match self {
                 Self::Deploy(store) => store,
                 Self::Refusing => {
@@ -6068,40 +6144,32 @@ mod instance_serve {
                 }
             };
             match store.kv().get(POLICY_KEY).await {
-                Ok(Some(bytes)) => serde_json::from_slice::<AuthzPolicy>(&bytes).map_err(|e| {
-                    format!(
-                        "authz/policy is present but malformed (fail-closed, not defaulted): {e}"
-                    )
-                }),
-                Ok(None) => Ok(AuthzPolicy::default_policy()),
-                Err(e) => Err(format!(
-                    "reading authz/policy from the control-plane KV: {e}"
-                )),
+                Ok(Some(bytes)) => serde_json::from_slice::<AuthzPolicy>(&bytes)
+                    .map(Some)
+                    .map_err(|e| {
+                        format!(
+                            "authz/policy is present but malformed (fail-closed, not defaulted): {e}"
+                        )
+                    }),
+                Ok(None) => Ok(None),
+                Err(e) => Err(format!("reading authz/policy from the control-plane KV: {e}")),
             }
         }
 
-        /// Whether a CUSTOM operator authz policy doc is STORED in the held control-plane KV (P5-4). The
-        /// cross-instance (split) `control.admin-api` authorizer authorizes under the node's DEFAULT
-        /// policy only (it holds no `backend.kv`); this instance IS the `backend.kv` holder, so it is the
-        /// authority on whether a custom doc exists. `Ok(true)` ⇒ a doc is present (the split authorizer
-        /// cannot honor it — the serve path then fails the relayed-authorize CLOSED, never under-enforce);
-        /// `Ok(false)` ⇒ the default policy is in effect (the split authorizer is faithful); a read error
-        /// ⇒ `Err` (fail-closed). Reuses [`POLICY_KEY`] — the SAME key [`load_authz_policy`](Self::load_authz_policy)
-        /// reads — so the two never drift.
-        pub(super) async fn custom_policy_present(&self) -> Result<bool, String> {
-            let store = match self {
-                Self::Deploy(store) => store,
-                Self::Refusing => {
-                    return Err("this instance holds no backend.kv control-plane store".into());
-                }
-            };
-            match store.kv().get(POLICY_KEY).await {
-                Ok(Some(_)) => Ok(true),
-                Ok(None) => Ok(false),
-                Err(e) => Err(format!(
-                    "reading authz/policy presence from the control-plane KV: {e}"
-                )),
-            }
+        /// Load the node's EFFECTIVE RBAC [`AuthzPolicy`] from the HELD control-plane KV for the LOCAL
+        /// `control.admin-api` authorize decision ([`NodeServeHandler::authorize_local`], P5-3-serve):
+        /// the stored custom doc, else [`AuthzPolicy::default_policy`] when ABSENT. Delegates to
+        /// [`load_custom_authz_policy`](Self::load_custom_authz_policy) — the ONE KV-read source of truth —
+        /// so the LOCAL and the RELAYED (P5-4) paths resolve the operator's policy IDENTICALLY: a
+        /// present-but-malformed / unreadable doc fail-closes (`Err`) in BOTH. (The Cedar policy-doc
+        /// deny/allow OVERLAY — the monolith's `CompiledCedar` decision — is the surfaced remaining binding
+        /// for BOTH the local and relayed paths; this cut decides the role→rights expansion, the common
+        /// default-deny core.)
+        pub(super) async fn load_authz_policy(&self) -> Result<AuthzPolicy, String> {
+            Ok(self
+                .load_custom_authz_policy()
+                .await?
+                .unwrap_or_else(AuthzPolicy::default_policy))
         }
 
         /// Read the end-principal token's revocation marker (`authz/revoked/<cti>`) from the HELD
@@ -9394,7 +9462,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             mint_authority_pop, mint_delegatable, verify_credential,
         };
         use boatramp_core::deploy::DeployStore;
-        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_core::kv::{KvError, KvStore, MemoryKv};
         use boatramp_core::time::now_unix;
         use boatramp_server::privsep_authority::{
             CONTROL_MUTATION_POP_OP, ContextVerifier, ReplayCache, control_mutation_pop_bytes,
@@ -9412,8 +9480,10 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
         let now = now_unix();
 
         // The SPLIT authorizer (holds control.admin-api, NO backend.kv): it re-validates + decides over
-        // its OWN link end, with the PUBLIC trust root + the DEFAULT RBAC policy. Served by the SAME
-        // `serve_control_authorize_link` the live-gate `__root` dispatch runs, over a real socketpair.
+        // its OWN link end, with the PUBLIC trust root + its OWN built-in default (used only when the
+        // relayed request conveys `RelayedPolicy::Default`; a stored custom doc arrives per-call from the
+        // backend.kv holder — INFO-B). Served by the SAME `serve_control_authorize_link` the live-gate
+        // `__root` dispatch runs, over a real socketpair.
         let (server_ep, client_ep) = LinkEndpoint::socketpair().expect("socketpair");
         let authorizer = ControlAuthorizer::new(
             ContextVerifier::new(root.public_key()),
@@ -9428,7 +9498,7 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
 
         // The SERVING backend.kv holder: router routes `authorize` (control.admin-api, NOT held) to the
         // control-authorize grammar endpoint `to-control`; `write` (backend.kv, HELD) is Local. The data
-        // plane is a real DeployStore over MemoryKv (the write + revocation + custom-policy guard reads).
+        // plane is a real DeployStore over MemoryKv (the write + revocation + the INFO-B policy source).
         let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
         let kv = Arc::new(MemoryKv::new());
         let store = DeployStore::new(
@@ -9604,28 +9674,217 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
              (503), got:\n{resp}"
         );
 
-        // --- NEGATIVE 6: a CUSTOM policy doc present ⇒ the split authorizer cannot honor it, so the
-        //     serving holder fails the relayed-authorize path CLOSED (never under-enforce) ⇒ 503.
-        kv.put(
-            boatramp_core::authz::POLICY_KEY,
-            serde_json::to_vec(&AuthzPolicy::default_policy()).expect("serialize a policy doc"),
-        )
-        .await
-        .expect("write a custom policy doc");
-        let (ctoken, cpop) = mint_cred(
+        // =====================================================================================
+        // INFO-B (the P5-4 control→backend policy-read orchestrator): the split authorizer now honors
+        // the operator's ACTUAL policy (custom-or-default), SOURCED by the backend.kv holder from
+        // POLICY_KEY (NEVER the client's request) and conveyed over the relay as a `RelayedPolicy`. The
+        // relayed decision uses the SAME `AuthzPolicy::normalize_grants` + `rights_for` evaluator the
+        // monolith + the local `authorize_local` run, so it matches the in-process decision for the same
+        // stored policy — closing the earlier over-restriction where ANY custom doc 503'd this path.
+        // =====================================================================================
+
+        // --- INFO-B 1: a CUSTOM policy MORE PERMISSIVE than default now AUTHORIZES (was 503). The role
+        //     `blogadmin` is NOT in the default policy (so `rights_for` yields nothing ⇒ default DENIES),
+        //     then a custom doc defining `blogadmin` with publisher's right templates makes the SAME
+        //     principal authorize — the operator's custom policy is honored over the relay.
+        //     (a) default (no custom doc yet): `blogadmin@acme/blog` is DENIED (503).
+        let (blog_denied_token, blog_denied_pop) = mint_cred(
             &root,
             &holder,
-            GrantedRole::scoped("publisher", "acme/blog"),
-            7,
+            GrantedRole::scoped("blogadmin", "acme/blog"),
+            10,
             now,
             (method, path, transport_host),
         )
         .await;
-        let resp = p5_2_roundtrip(handler.clone(), &put_req(&ctoken, 7, &cpop)).await;
+        let resp = p5_2_roundtrip(
+            handler.clone(),
+            &put_req(&blog_denied_token, 10, &blog_denied_pop),
+        )
+        .await;
         assert!(
-            resp.starts_with("HTTP/1.1 503") && resp.contains("custom operator authz policy"),
-            "a custom policy doc must fail the split-authorizer relay path closed (503), got:\n{resp}"
+            resp.starts_with("HTTP/1.1 503") && resp.contains("not authorized"),
+            "under the DEFAULT policy an undefined role (blogadmin) must be DENIED by the cross-instance \
+             authorizer (503), got:\n{resp}"
         );
+        //     (b) store a CUSTOM doc = default + `blogadmin` := publisher's right templates; the SAME
+        //         principal now AUTHORIZES (200). (`publisher@acme/blog` served 200 in the POSITIVE case,
+        //         so `blogadmin` cloned from it grants the identical routing right on acme/blog.)
+        let mut more_permissive = AuthzPolicy::default_policy();
+        let publisher_templates = more_permissive
+            .roles
+            .get("publisher")
+            .cloned()
+            .expect("the default policy defines a publisher role");
+        more_permissive
+            .roles
+            .insert("blogadmin".to_string(), publisher_templates);
+        kv.put(
+            boatramp_core::authz::POLICY_KEY,
+            serde_json::to_vec(&more_permissive)
+                .expect("serialize the more-permissive custom policy"),
+        )
+        .await
+        .expect("store the more-permissive custom policy doc");
+        let (blog_allowed_token, blog_allowed_pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("blogadmin", "acme/blog"),
+            11,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(
+            handler.clone(),
+            &put_req(&blog_allowed_token, 11, &blog_allowed_pop),
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.contains("authorized mutation served"),
+            "a CUSTOM policy MORE PERMISSIVE than default must now AUTHORIZE the relayed mutation (200, \
+             was 503) — the operator's policy is honored over the relay, got:\n{resp}"
+        );
+
+        // --- INFO-B 2: a CUSTOM policy that DENIES is honored (parity with the monolith, NOT a fallback
+        //     to the looser default). A doc with `publisher` REMOVED denies `publisher@acme/blog` — which
+        //     the DEFAULT policy ALLOWS (the POSITIVE case) — so the relay path now returns 503 because
+        //     the custom restriction is applied.
+        let mut restrictive = AuthzPolicy::default_policy();
+        restrictive.roles.remove("publisher");
+        kv.put(
+            boatramp_core::authz::POLICY_KEY,
+            serde_json::to_vec(&restrictive).expect("serialize the restrictive custom policy"),
+        )
+        .await
+        .expect("store the restrictive custom policy doc");
+        let (deny_token, deny_pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            12,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &put_req(&deny_token, 12, &deny_pop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("not authorized"),
+            "a CUSTOM policy that REMOVES publisher must DENY publisher@acme/blog over the relay (503) — \
+             the custom restriction is honored, NOT a fallback to the looser default, got:\n{resp}"
+        );
+
+        // --- INFO-B 3: no custom policy (default only) is UNCHANGED. Remove the doc ⇒ ABSENT ⇒ the
+        //     authorizer uses its OWN trusted default (no policy crosses the link) ⇒ `publisher@acme/blog`
+        //     AUTHORIZES again (200), exactly as before INFO-B.
+        kv.delete(boatramp_core::authz::POLICY_KEY)
+            .await
+            .expect("remove the custom policy doc");
+        let (default_token, default_pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            13,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp =
+            p5_2_roundtrip(handler.clone(), &put_req(&default_token, 13, &default_pop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.contains("authorized mutation served"),
+            "with NO custom doc the default-policy path must be UNCHANGED (publisher@acme/blog serves \
+             200), got:\n{resp}"
+        );
+
+        // --- INFO-B 4a: a present-but-MALFORMED policy doc FAILS CLOSED on the relay path (503, never
+        //     silently defaulted — a defaulted decision could be more permissive than the operator's
+        //     real/unparseable policy). The backend.kv holder's policy SOURCE errors BEFORE relaying.
+        kv.put(
+            boatramp_core::authz::POLICY_KEY,
+            b"{ this is not valid policy json".to_vec(),
+        )
+        .await
+        .expect("store a malformed policy doc");
+        let (malformed_token, malformed_pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            14,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(
+            handler.clone(),
+            &put_req(&malformed_token, 14, &malformed_pop),
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("operator authz policy"),
+            "a MALFORMED custom policy doc must FAIL CLOSED on the relay path (503, never defaulted), \
+             got:\n{resp}"
+        );
+        kv.delete(boatramp_core::authz::POLICY_KEY)
+            .await
+            .expect("clean up the malformed doc");
+
+        // --- INFO-B 4b: an UNREADABLE policy store (a backend.kv read error) FAILS CLOSED before any
+        //     relay (parity with the M1 shed-on-unreadable discipline). A SECOND holder whose data-plane
+        //     KV errors on every `get` (so the policy SOURCE — `load_custom_authz_policy` — fails closed);
+        //     its relay client is wired to a throwaway, UNSERVED link that is never reached.
+        struct UnreadableKv;
+        #[async_trait::async_trait]
+        impl KvStore for UnreadableKv {
+            async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, KvError> {
+                Err(KvError::backend("control-plane KV unreachable (test)"))
+            }
+            async fn put(&self, _key: &str, _value: Vec<u8>) -> Result<(), KvError> {
+                Ok(())
+            }
+            async fn delete(&self, _key: &str) -> Result<(), KvError> {
+                Ok(())
+            }
+            async fn list_prefix(&self, _prefix: &str) -> Result<Vec<String>, KvError> {
+                Ok(Vec::new())
+            }
+        }
+        let (_dead_server_ep, dead_client_ep) = LinkEndpoint::socketpair().expect("socketpair");
+        let unreadable_handler = NodeServeHandler::new(
+            NodeServeRouter::new(
+                &gate,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::from([(HostAuthority::ControlAdminApi, "to-dead".to_string())]),
+            ),
+            NodeDataPlane::Deploy(DeployStore::new(
+                Arc::new(FsStorage::new(
+                    std::env::temp_dir().join("boatramp-p5-4-unreadable-policy-blobs"),
+                )),
+                Arc::new(UnreadableKv),
+            )),
+            None,
+            Some(ControlAuthorizeClient::new(
+                "to-dead".to_string(),
+                dead_client_ep,
+            )),
+        );
+        let (un_token, un_pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            15,
+            now,
+            (method, path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(unreadable_handler, &put_req(&un_token, 15, &un_pop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("operator authz policy"),
+            "an UNREADABLE custom-policy store must FAIL CLOSED before any relay (503), got:\n{resp}"
+        );
+        // `_dead_server_ep` is never served — the policy source fails closed before any relay I/O, so
+        // the client link end is never read/written (held to scope end only so it is not EOF'd early).
 
         // --- NEGATIVE 7: a relay to a NON-GRAMMAR endpoint — control.admin-api reachable ONLY over a
         //     splice (not in the control-authorize map) ⇒ the router REFUSES it (never a bare socket) ⇒
