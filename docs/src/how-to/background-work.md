@@ -245,6 +245,25 @@ published onto that topic for a consumer to process:
   websocket: true, publish_topic: "bus:chat.in" ),
 ```
 
+**Allow a cross-origin browser app:** a native (host-served) stream has no guest to
+emit `Access-Control-*`, so a cross-origin `EventSource` / `fetch` to the route is
+blocked by default (same-origin only). List the calling origins in
+`cors_allowed_origins` to let a browser app on another origin read the stream:
+
+```ron
+( route: "/live/inbox", topics: ["bus:inbox.presence"],
+  cors_allowed_origins: ["https://app.example.com"] ),
+```
+
+Each entry is an exact `scheme://host[:port]` origin. The host answers the preflight
+`OPTIONS` itself and echoes `Access-Control-Allow-Origin` for a **matched** origin
+only (a non-allowlisted origin gets nothing), always with `Vary: Origin` so a cache
+never serves one origin's response to another. `Access-Control-Allow-Credentials` is
+**never** set (stream auth is a bearer token, not a cookie), and a single `"*"` entry
+permits any origin but is still echoed back specifically — never literal `*`-with-
+credentials. The allowlist is config, never request-derived. Empty (the default) ⇒
+no CORS headers at all, so an existing deploy is byte-for-byte unchanged.
+
 ### Per-subscriber scoped streams (`authz`)
 
 By default a `stream` broadcasts its fixed `topics` to **every** connection. For a multi-scope feed —
@@ -327,6 +346,219 @@ one connection out. Omit it for **unlimited** (the default — existing deploys 
 | A resumable, bidirectional channel that runs *your* code per inbound frame (agent UIs, chat with tool calls) | **`session`** (see [Build a duplex agent session](./sessions.md)) | Yes — re-entered per frame |
 
 [SSE]: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events
+
+## Consume the bus from outside the sandbox (non-wasm clients)
+
+A [wasm consumer](#declare-a-consumer) is the in-sandbox way to process a topic. To
+drain a project-bus topic from an **off-node, authenticated client** — a worker in
+another language, a serverless function, a partner system — boatramp exposes the bus
+over the **control-plane API**, on three consumer-selectable transports that all ride
+the **same** durable claim/lease/ack/nack/redelivery/DLQ core a wasm consumer uses.
+There is no new durability model and no new credential type: a client authenticates
+with an ordinary boatramp token, fenced by the dedicated [`Messaging`
+right](../reference/rbac.md#resources) — `Messaging·Read` on `<project>/<topic>` to
+consume, `Messaging·Admin` on `<project>` to register a webhook sink.
+
+> **Grant a consumer `Messaging·Read` on `<project>/*`.** A functioning consumer
+> must `ack`/`nack`, and those carry the topic in the opaque handle (not the path),
+> so they authorize against the project **wildcard** `<project>/*`, not a single
+> topic. A per-topic `Messaging·Read` on `<project>/<topic>` alone lets a client
+> `claim`/`subscribe` but **not settle** — grant `<project>/*`. By default only the
+> global `admin` role carries `Messaging` at all; an operator grants a consumer its
+> right through the [RBAC policy](../reference/rbac.md#the-policy-document). (A
+> dedicated `messaging_consumer` default role is under consideration and **may** ship
+> in a later release; today, author the grant in policy.)
+
+The topic rides the URL **path** (a slashed topic like `orders/created` works as a
+path tail), and every transport is confined to the project in the path — a token
+scoped to project P reaches only P's bus. All three endpoints share one `ack` / `nack`
+side-channel and one opaque **handle**: `claim` and each stream frame hand you a
+handle, and you present it back to settle the message.
+
+### (a) Long-poll claim
+
+`POST /api/projects/{project}/bus/claim/{*topic}` leases a batch of messages,
+**parking** for up to `wait_ms` on a publish wake (no busy-poll) and returning the
+first non-empty batch, or an empty batch at the deadline:
+
+```sh
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+  "$NODE/api/projects/acme/bus/claim/orders/created?wait_ms=25000&max=16&group=fulfil"
+```
+
+| Query param | Meaning |
+| --- | --- |
+| `wait_ms` | Long-poll timeout (ms); hang up to this long for a message, else return `[]`. Absent/`0` ⇒ return immediately. Clamped to 5 min. |
+| `lease_ms` | Visibility lease per claimed message (server default if absent). |
+| `max` | Max messages to lease this claim (default lease-one; clamped to the batch ceiling). |
+| `max_attempts` | Dead-letter threshold. |
+| `group` | Consumer group (empty ⇒ the competing-consumer work-queue). |
+| `start` | `latest` \| `earliest` — where a **new** group starts. |
+
+The response is a batch; each message carries its id, the bare topic, the delivery
+`attempts` (from 1), the **base64** payload, and the opaque `handle`:
+
+```json
+{ "messages": [
+  { "id": "1700000000123-a1b2", "topic": "orders/created", "attempts": 1,
+    "payload_b64": "eyJvcmRlciI6N30=", "handle": "<opaque>" }
+] }
+```
+
+Settle each message with the shared side-channel (both are `Messaging·Read` on
+`<project>/*`):
+
+```sh
+# Done with it — delete for good:
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"handle":"<opaque>"}' "$NODE/api/projects/acme/bus/ack"
+# Failed — redeliver now, or after a backoff:
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"handle":"<opaque>","delay_ms":5000}' "$NODE/api/projects/acme/bus/nack"
+```
+
+`nack` preserves the attempt count, so a message still dead-letters after
+`max_attempts`. An un-settled (still-leased) message redelivers on lease expiry — so a
+crashed client loses nothing.
+
+### (b) Durable streaming subscription
+
+`GET /api/projects/{project}/bus/subscribe/{*topic}` holds a **long-lived**
+subscription on a durable consumer `group`, pushing each message as it arrives. It is
+**SSE** by default, or a **WebSocket** when the request carries an `Upgrade` header:
+
+```js
+const es = new EventSource(
+  `${NODE}/api/projects/acme/bus/subscribe/orders/created?group=fulfil&max_ack_pending=32`);
+es.addEventListener("message", (e) => {
+  const m = JSON.parse(e.data);          // { id, topic, attempts, payload_b64, handle }
+  process(m);
+  fetch(`${NODE}/api/projects/acme/bus/ack`, {            // settle out-of-band (SSE)
+    method: "POST", headers: { Authorization: `Bearer ${TOKEN}` },
+    body: JSON.stringify({ handle: m.handle }) });
+});
+```
+
+| Query param | Meaning |
+| --- | --- |
+| `group` | Durable fan-out lane (own cursor / lease / retry / DLQ). Empty ⇒ the work-queue shared with `claim`. |
+| `start` | `latest` \| `earliest` for a new group (ignored once the group exists — its cursor wins). |
+| `lease_ms` | Visibility lease each delivered-but-unacked message holds before redelivery. |
+| `max_ack_pending` | Back-pressure: the most leased-but-unacked messages this connection may hold at once (absent ⇒ bounded only by the per-claim batch). At the cap the server stops claiming until an `ack` frees a slot. |
+| `max_attempts` | Dead-letter threshold. |
+| `max` | Max messages leased per underlying claim (the per-tick batch). |
+
+The delivery frame is the same JSON shape as a claim message (base64 payload + opaque
+handle). **Acking differs by transport:**
+
+- **SSE** — ack/nack out-of-band via the shared `POST …/bus/ack` / `…/bus/nack`
+  side-channel (as above). Each SSE frame's `id:` is the durable message id, so an
+  `EventSource` that drops and reconnects resumes naturally — a still-leased message
+  redelivers on lease expiry regardless, so resume loses nothing.
+- **WebSocket** — ack/nack **inline** on the same socket with a text frame
+  `{"ack":"<handle>"}` or `{"nack":"<handle>","delay_ms":5000}`. An inline ack is
+  confined to the connection's own subscribe topic (a handle naming any other topic is
+  dropped), so a WS connection needs only `Messaging·Read` on its exact
+  `<project>/<topic>`.
+
+Redelivery-on-lease-expiry and dead-lettering at `max_attempts` are the durable core's
+behavior, unchanged. Because delivery rides the leader-serialized grouped claim, the
+stream is **cluster-correct with no extra fan-out machinery**.
+
+### (d) Webhook sink (host-run signed delivery)
+
+A **webhook sink** turns a bus topic into an outbound **signed POST** to your
+endpoint — a host-run pseudo-consumer you register once, with no long-poll loop or
+open socket of your own to keep alive. It needs `Messaging·Admin` on the project.
+Because the destination URL and HMAC key are **sealed project secrets**, seal them
+first (the register call `400`s if either is not already a sealed `boatramp:<name>`
+reference), then register the sink:
+
+```sh
+# 1. Seal the destination URL and the HMAC signing key as project secrets.
+printf '%s' "https://hooks.example.com/orders" | boatramp secrets set orders-url --stdin
+printf '%s' "$HMAC_KEY"                         | boatramp secrets set orders-sign --stdin
+
+# 2. Register the sink (Messaging·Admin). {name} comes from the path.
+curl -sS -X PUT -H "Authorization: Bearer $TOKEN" "$NODE/api/projects/acme/bus/sinks/orders" \
+  -d '{ "topic": "orders/created", "group": "webhook",
+        "url_secret": "boatramp:orders-url", "sign_secret": "boatramp:orders-sign",
+        "egress_allow": ["hooks.example.com:443"], "max_attempts": 8 }'
+
+# Remove it later:
+curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" "$NODE/api/projects/acme/bus/sinks/orders"
+```
+
+boatramp drains the topic and delivers each message as a POST whose **raw body is the
+message payload**. An HTTP **2xx** acks the message; any non-2xx, timeout, or
+SSRF-floor refusal nacks it with a backoff (`backoff_ms × attempts`, floored so a
+failing endpoint can't be hot-looped), and it dead-letters at `max_attempts`.
+
+Every POST is **HMAC-SHA256 signed** with the sink's `sign_secret`. The signature
+covers a versioned preimage — the scheme tag, then the message id, attempt, timestamp,
+topic, and body, newline-separated:
+
+```text
+boatramp-webhook-v1\n{id}\n{attempt}\n{timestamp}\n{topic}\n{raw-body}
+```
+
+and rides these request headers (so a receiver verifies the body **and** these fields,
+and has a replay window via the timestamp):
+
+| Header | Value |
+| --- | --- |
+| `X-Boatramp-Signature` | lowercase-hex HMAC-SHA256 over the preimage above |
+| `X-Boatramp-Timestamp` | unix seconds (authenticated) |
+| `X-Boatramp-Message-Id` | the message id |
+| `X-Boatramp-Message-Attempt` | the delivery attempt (from 1) |
+| `X-Boatramp-Topic` | the sink's topic |
+
+**The destination can never be an internal address.** It is held to an SSRF floor —
+**https-only**, every resolved address must be globally routable (`is_global_ip`: a
+loopback / RFC-1918 / link-local / cloud-metadata address is refused), and the name is
+resolved once and pinned against DNS-rebinding — enforced **both** at register time (a
+bad destination is refused before the sink is stored) **and** on every delivery. There
+is deliberately no `allow_private` escape hatch on a sink (relaxing the floor is an
+operator-only posture, never consumer-settable). On top of the floor, the per-sink
+`egress_allow` is a `host-glob:port` allowlist the resolved destination must match;
+it is **HTTPS-only**, names only (an IP literal never matches), and **empty ⇒
+deny-all** — so a sink must name at least one destination explicitly.
+
+For the full `WebhookSink` record and every field, see
+[`webhook_sinks`](../reference/routing.md#webhook_sinks).
+
+#### Declare a sink in config instead
+
+A sink can also be declared in `project.cfg` routing, folded into the deployment
+manifest atomically with your content, instead of (or alongside) the runtime API:
+
+```ron
+routing: (
+    webhook_sinks: [
+        ( name: "orders", topic: "orders/created", group: "webhook",
+          url_secret: "boatramp:orders-url", sign_secret: "boatramp:orders-sign",
+          egress_allow: ["hooks.example.com:443"], max_attempts: 8 ),
+    ],
+),
+```
+
+Two behaviors to know when you mix the two surfaces:
+
+- **SSRF floor at apply vs. delivery (N1).** A config sink's *static* validation
+  (name / topic / group / secret-ref / egress-glob syntax) always runs at
+  `apply`/`validate`. The *destination* floor (resolve the sealed URL → `is_global_ip`
+  + the allowlist — the same check the runtime `PUT` runs) needs the node secret
+  store, so it runs at **activation** when a secret store is wired (a bad-destination
+  config sink is then refused loudly there); on a node with **no** secret store at the
+  apply phase it falls back to flooring on **every delivery** instead. So a
+  bad-destination config sink is caught at activation where the store exists, else at
+  first delivery — never silently.
+- **A runtime sink is an overlay (N4).** A config-declared and a runtime-registered
+  sink of the **same name** merge, with the runtime record winning. `DELETE
+  …/bus/sinks/{name}` removes only the **runtime overlay** — if a same-named sink is
+  also declared in config, it becomes the active sink again on the next reconcile. To
+  retire a config-declared sink for good, remove it from `routing.webhook_sinks` and
+  redeploy.
 
 ## Operate the dead-letter queue
 

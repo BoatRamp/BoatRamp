@@ -34,6 +34,7 @@ project.cfg: routing OK (2 redirects, 1 handler)
 | `proxy_allow` | list\<string\> | `[]` | Allowed upstream hosts for proxy rewrites — see [below](#proxy_allow). |
 | `handlers` | list\<HandlerConfig\> | `[]` | WebAssembly request handlers, matched after redirects, before static lookup. |
 | `consumers` | list\<ConsumerConfig\> | `[]` | Message-consumer components, invoked per message on a topic. |
+| `webhook_sinks` | list\<WebhookSink\> | `[]` | Host-run webhook sinks — drain a project-bus topic and deliver each message as a signed, SSRF-confined outbound POST. See [below](#webhook_sinks). |
 | `crons` | list\<CronConfig\> | `[]` | Scheduled handler invocations. |
 | `streams` | list\<StreamConfig\> | `[]` | Host-level SSE / WebSocket endpoints fanning out topics. |
 | `sessions` | list\<SessionConfig\> | `[]` | Duplex, resumable session routes served by a guest `session-handler` — see [`sessions`](#sessions). |
@@ -473,6 +474,47 @@ A component invoked once per message on a topic. See
 | `tenancy` | Tenancy? | In-site [tenancy decision](./siteconfig.md#handlerstenancy) for this consumer's `sql`/`orm` when a drained message is processed — the async-lane analog of a function's tenancy. Typically resolves from the `signed_context` source the producer stamped, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "signed_context")], read: "own", write: "own")`. Absent ⇒ *undeclared* (refused under `multi-tenant`, `disabled` under single-tenant/dev). |
 | `token_claims` | HandlerGraphqlTokenClaims? | JWKS/issuer config verifying an app bearer for a `token` tenant source (rare on the async lane, but supported when a consumer is invoked with a forwarded bearer). Absent ⇒ the `token` source can't verify (fail-closed). |
 
+## `webhook_sinks`
+
+A **webhook sink** is a host-run pseudo-consumer that drains a project-bus topic and
+delivers each message as a **signed, SSRF-confined outbound POST** — the no-code way
+to push bus events to an external endpoint, riding the same durable
+claim/lease/ack/nack/redelivery/DLQ core a [consumer](#consumers) uses (an HTTP 2xx
+acks the message; a non-2xx / timeout / floor-refusal nacks it with a backoff and it
+dead-letters at `max_attempts`). The **same** `WebhookSink` record is declared here in
+config *or* registered at runtime via `PUT /api/projects/{project}/bus/sinks/{name}`
+(`Messaging·Admin`); both run the same validation. For the delivery flow, the HMAC
+signature scheme, and the config-vs-runtime interaction, see
+[Consume the bus from outside the sandbox](../how-to/background-work.md#d-webhook-sink-host-run-signed-delivery).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | — | Sink name — a valid resource slug, unique within the project. (On the runtime surface the `{name}` path segment is authoritative.) |
+| `topic` | string | — | The project-bus topic to drain (`"orders/created"`). Namespaced host-side to `{project}/bus/<topic>`; no leading `/` and no `.`/`..` segments. |
+| `group` | string | `""` | Durable fan-out lane (own cursor / lease / DLQ). Empty ⇒ the default competing-consumer work-queue. A non-empty group must be a single clean segment. |
+| `url_secret` | string | — | **Sealed** `boatramp:<name>` reference to the destination URL in the project secret store. Never a plaintext URL (the raw URL never rides config or a request body, and is never logged). Must resolve to an **https** URL. |
+| `sign_secret` | string | — | **Sealed** `boatramp:<name>` reference to the per-sink HMAC-SHA256 signing key the POST body + headers are signed with. |
+| `egress_allow` | list\<string\> | — | Per-sink egress allowlist: `host-glob:port` entries the resolved destination must match (register-time **and** delivery-time). HTTPS-only, names only (an IP literal never matches), **empty ⇒ deny-all** — so at least one entry is required. |
+| `lease_ms` | u64? | server default | Visibility lease (ms) per claimed message. |
+| `max_attempts` | u32? | server default | Dead-letter threshold. |
+| `backoff_ms` | u64? | — | Linear redelivery backoff base (ms): a failed delivery is held `backoff_ms × attempts`. Floored to a minimum server backoff so a `0`/unset sink can't hot-loop a failing endpoint. |
+| `max_ack_pending` | usize? | — | Max leased-but-unacked messages outstanding at once (back-pressure). |
+
+Secret names are `[A-Za-z0-9._-]` (no `/`). Both `url_secret` and `sign_secret` must
+be **sealed before** a runtime `PUT` registers the sink — an unresolved/plaintext
+reference is a `400`. The destination is held to an SSRF floor (https-only, every
+resolved address globally routable, DNS-rebind-pinned) at register **and** every
+delivery; there is deliberately no `allow_private` field — relaxing the floor is
+operator-only, never consumer-settable. A project may hold at most **256** sinks.
+
+```ron
+webhook_sinks: [
+    ( name: "orders", topic: "orders/created", group: "webhook",
+      url_secret: "boatramp:orders-url", sign_secret: "boatramp:orders-sign",
+      egress_allow: ["hooks.example.com:443"], max_attempts: 8 ),
+],
+```
+
 ## `crons`
 
 A scheduled invocation of a declared handler route.
@@ -494,6 +536,11 @@ A host-level endpoint that fans out messaging topics to connected clients.
 | `websocket` | bool | `false` | Serve as a WebSocket instead of SSE (adds a client→server direction). |
 | `publish_topic` | string? | — | For a WebSocket, the topic client→server messages publish to. Omitted = receive-only. |
 | `authz` | StreamAuthz? | `None` (open broadcast) | **Per-connection authorization.** Absent ⇒ the fixed `topics` broadcast to every connection. Present ⇒ each connection is authorized before it attaches and subscribes only the topics it is authorized for. Capture the scope in `route` with `:name` and reference it in `topics` with `{name}`. Two forms: `scoped(token_claims, membership: [claim(param, claim) \| sql(source?, query)])` (host-resolved — verify the bearer, check each membership, subscribe only the resolved topics; deny-by-default AND) or `guest_mediated(token_claims?, handler)` (a guest function returns the topic set, confined to the declared `topics` templates). For `guest_mediated`, `handler` is the **bare name of a deployed top-level function** (the per-subscribe invoke target — `boatramp function deploy <name> …`, or a top-level `functions:` entry), **not** a route path and **not** `<site>/<name>`; deploy that authorizer function **before** activating the stream (activation refuses a stream whose `handler` resolves to no function). Confinement matches a `{name}` template **whole-segment only** — a partial-segment template like `shared/mbx-{mailbox}/events` is treated as a literal and parameterizes nothing. Optional `max_topics_per_connection: <n>` caps how many confined topics one connection may be granted (a larger return refuses the connection with a `502`); omit for unlimited (default), `0` is rejected at validate. See [Per-subscriber scoped streams](../how-to/background-work.md#per-subscriber-scoped-streams-authz). |
+| `cors_allowed_origins` | list\<string\> | `[]` | **Operator CORS allowlist** for this host-served stream — the origins a cross-origin browser `EventSource` / `fetch` may read it from. A native stream has no guest to emit `Access-Control-*`, so a cross-origin request is blocked unless its origin is listed here. Each entry is an exact `scheme://host[:port]` origin; a single `"*"` permits any origin (still echoed back specifically, never literal `*`). The host answers the preflight `OPTIONS` and echoes `Access-Control-Allow-Origin` for a **matched** origin only, always with `Vary: Origin`; `Access-Control-Allow-Credentials` is **never** set (bearer auth, not cookies). The allowlist is config, never request-derived. Empty (default) ⇒ no CORS headers at all (same-origin only) — an existing deploy is byte-for-byte unchanged. See [Push events to browsers over SSE](../how-to/background-work.md#push-events-to-browsers-over-sse-streams). |
+
+`StreamConfig` is `#[non_exhaustive]`: a library consumer constructs it with
+`..Default::default()` rather than an exhaustive struct literal, so a field added in a
+later release stays non-breaking. (RON authoring in `project.cfg` is unaffected.)
 
 ## `sessions`
 
