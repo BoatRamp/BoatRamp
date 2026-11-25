@@ -524,6 +524,11 @@ pub struct WorkerConfig {
     /// `env` to the guest init (empty ⇒ none). See [`crate::config::env_cmdline_fragment`].
     #[serde(default)]
     pub env_cmdline: String,
+    /// The ` boatramp.tmpfs=<hex>` cmdline fragment declaring the workload's **ephemeral
+    /// mounts** — a per-workload, size-capped `tmpfs` at each declared path the guest init
+    /// mounts (empty ⇒ none). See [`crate::config::tmpfs_cmdline_fragment`].
+    #[serde(default)]
+    pub tmpfs_cmdline: String,
     /// The pre-created host tap to attach to (parent enslaves it to the bridge).
     pub tap_name: String,
     /// The guest's static IP (kernel `ip=` autoconfig; also derives the MAC).
@@ -767,8 +772,9 @@ pub fn run_jailed_worker(cfg: WorkerConfig) -> Result<(), String> {
             .clone()
             .unwrap_or_else(|| default_cmdline(&cfg.guest_ip, &cfg.gateway));
         // Append the runtime-env fragment (`vminit` decodes + merges it over the baked
-        // env) — the launch-time env channel for microVMs.
-        let cmdline = format!("{base} {mmio}{}", cfg.env_cmdline);
+        // env) + the ephemeral-mount fragment (`vminit` mounts a sized tmpfs at each path) —
+        // the launch-time channels for microVMs.
+        let cmdline = format!("{base} {mmio}{}{}", cfg.env_cmdline, cfg.tmpfs_cmdline);
 
         let vmm = EmbeddedVmm::with_irqchip(u64::from(cfg.mem_mib) * MIB, cfg.vcpus)
             .map_err(|e| format!("create vm: {e}"))?;
@@ -970,6 +976,10 @@ impl ComputeBackend for EmbeddedVmmBackend {
             cmdline_override: req.spec.kernel_cmdline.clone(),
             env_cmdline: crate::config::env_cmdline_fragment_bounded(&req.spec.env)
                 .map_err(BackendError::Launch)?,
+            tmpfs_cmdline: crate::config::tmpfs_cmdline_fragment_bounded(
+                &req.spec.ephemeral_mounts,
+            )
+            .map_err(BackendError::Launch)?,
             tap_name: tap.tap_name.clone(),
             guest_ip: ip.to_string(),
             gateway: self.gateway.clone(),

@@ -200,7 +200,7 @@ impl SandboxPlan {
         uid: u32,
         gid: u32,
     ) -> Self {
-        let mounts = vec![
+        let mut mounts = vec![
             Mount::virt("proc", "/proc", "proc", &["nosuid", "nodev", "noexec"]),
             Mount::virt(
                 "sysfs",
@@ -216,6 +216,26 @@ impl SandboxPlan {
             // and init fails. Mirrors the docker backend's `mode=1777` `/run` tmpfs.
             Mount::virt("tmpfs", "/run", "tmpfs", &["nosuid", "nodev", "mode=1777"]),
         ];
+        // Declared per-workload **ephemeral** mounts: a sized `tmpfs` at each requested path
+        // (e.g. `/cache`), so a workload gets a writable scratch/cache dir on the hardened
+        // read-only root WITHOUT a persistent volume. Added AFTER the standard mounts and as
+        // their own tmpfs mounts, so — exactly like `/tmp` — they stay writable even when the
+        // backend remounts the container root read-only. The worker `create_dir_all`s each
+        // target before mounting, so an arbitrary path works. Each is `nosuid,nodev` + a
+        // `size=<N>m` cap (the tmpfs limit); `size_mib` is validated at set time
+        // (`ComputeSpec::validate_ephemeral_mounts`) so it is always bounded here. Honored
+        // under ANY isolation posture — a per-workload, size-capped tmpfs in the workload's own
+        // mount namespace is multi-tenant-SAFE (unlike `writable_root`, which the backend
+        // strips under the multi-tenant guard).
+        for em in &spec.ephemeral_mounts {
+            let size_opt = format!("size={}m", em.size_mib.max(1));
+            mounts.push(Mount::virt(
+                "tmpfs",
+                &em.mount,
+                "tmpfs",
+                &["nosuid", "nodev", &size_opt],
+            ));
+        }
         let cgroup = CgroupLimits {
             cpu_max: Some(format!(
                 "{} {CPU_PERIOD_US}",
@@ -507,6 +527,48 @@ mod tests {
         let back: SandboxPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back, plan);
         assert_eq!(back.volumes[0].mount, "/data");
+    }
+
+    #[test]
+    fn ephemeral_mounts_become_sized_tmpfs_mounts_and_survive_a_readonly_root() {
+        use boatramp_types::compute::EphemeralMount;
+        let mut s = spec(1, 128);
+        s.ephemeral_mounts = vec![
+            EphemeralMount::new("/cache", 128),
+            EphemeralMount::new("/var/scratch", 64),
+        ];
+        let plan = SandboxPlan::for_spec(&s, "/r", "h", 1000, 1000);
+        let cache = plan
+            .mounts
+            .iter()
+            .find(|m| m.target == "/cache")
+            .expect("ephemeral /cache is a mount");
+        assert_eq!(cache.fstype, "tmpfs");
+        assert_eq!(cache.source, "tmpfs");
+        assert!(cache.flags.iter().any(|f| f == "nosuid"));
+        assert!(cache.flags.iter().any(|f| f == "nodev"));
+        assert!(
+            cache.flags.iter().any(|f| f == "size=128m"),
+            "the tmpfs carries its size cap: {:?}",
+            cache.flags
+        );
+        let scratch = plan
+            .mounts
+            .iter()
+            .find(|m| m.target == "/var/scratch")
+            .expect("ephemeral /var/scratch is a mount");
+        assert!(scratch.flags.iter().any(|f| f == "size=64m"));
+        // They are declared AFTER the standard mounts, so they are set up as their own
+        // writable tmpfs — like `/tmp`, they outlive a read-only-root remount of `/`.
+        let std_count = plan
+            .mounts
+            .iter()
+            .filter(|m| ["/proc", "/sys", "/dev", "/tmp", "/run"].contains(&m.target.as_str()))
+            .count();
+        assert_eq!(std_count, 5, "the five standard mounts are still present");
+        // No ephemeral mounts ⇒ only the standard five.
+        let bare = SandboxPlan::for_spec(&spec(1, 128), "/r", "h", 0, 0);
+        assert_eq!(bare.mounts.len(), 5, "no ephemeral mounts by default");
     }
 
     // ---- U23: resolve a bare entrypoint against the CONTAINER's PATH ----

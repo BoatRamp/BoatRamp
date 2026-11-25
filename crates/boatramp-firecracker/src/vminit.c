@@ -73,6 +73,10 @@ static long sys(long n, long a, long b, long c, long d, long e) {
 /* openat/mkdirat resolve a relative path against the cwd when dirfd is AT_FDCWD;
  * we always pass absolute paths, so it is just the "no dir fd" sentinel. */
 #define AT_FDCWD -100
+/* mount(2) flags for an ephemeral tmpfs: no setuid bits honored, no device nodes —
+ * a non-escalating scratch mount (matches the container backend's tmpfs flags). */
+#define MS_NOSUID 2
+#define MS_NODEV 4
 
 static int slen(const char *s) {
     int n = 0;
@@ -148,6 +152,17 @@ static void mount_fs(const char *src, const char *target, const char *fstype) {
     sys(SYS_mount, (long)src, (long)target, (long)fstype, 0, 0); /* best-effort */
 }
 
+/* Mount a sized, non-escalating ephemeral tmpfs at `target` with the `data` option
+ * (e.g. "size=64m"). Best-effort: `mkdirat` is a no-op if the dir exists and fails on a
+ * read-only root for an absent one, in which case the mount is skipped — exactly the
+ * best-effort semantics of the persistent-volume mounts below (the mount point must exist
+ * in the image). */
+static void mount_tmpfs(const char *target, const char *data) {
+    sys(SYS_mkdirat, AT_FDCWD, (long)target, 0755, 0, 0); /* no-op if it exists */
+    sys(SYS_mount, (long)"tmpfs", (long)target, (long)"tmpfs", MS_NOSUID | MS_NODEV,
+        (long)data);
+}
+
 /* .bss (zeroed by the kernel at load); kept off the stack. */
 static char argv_buf[8192];
 static char env_buf[8192];
@@ -155,9 +170,11 @@ static char cwd_buf[1024];
 static char mounts_buf[2048];
 static char cmdline_buf[16384];
 static char renv_buf[8192];
+static char tmpfs_buf[2048];
 static char *argv[256];
 static char *envp[256];
 static char *mounts[128];
+static char *tmpfs[256];
 
 void _start(void) {
     mount_fs("proc", "/proc", "proc");
@@ -199,6 +216,22 @@ void _start(void) {
             }
         }
     }
+    /* Declared ephemeral mounts from the kernel cmdline
+     * (boatramp.tmpfs=<hex NUL-joined target\0size=<N>m>) — a per-workload, size-capped
+     * tmpfs at each path, set up fresh each boot and never persisted. Decoded as
+     * target\0opts pairs; each is mounted best-effort (mount point must exist on the
+     * read-only root, like the persistent-volume mounts above). */
+    if (cml > 0) {
+        char *p = find_sub(cmdline_buf, cml, "boatramp.tmpfs=");
+        if (p) {
+            p += slen("boatramp.tmpfs=");
+            int tl = hexdec(p, cmdline_buf + cml, tmpfs_buf, sizeof tmpfs_buf);
+            split_nul(tmpfs_buf, tl, tmpfs, 256);
+            for (int i = 0; tmpfs[i] && tmpfs[i + 1]; i += 2)
+                mount_tmpfs(tmpfs[i], tmpfs[i + 1]);
+        }
+    }
+
     /* Baked image env, appended after the runtime entries. */
     int el = read_file("/etc/boatramp/env", env_buf, sizeof env_buf);
     if (el < 0) el = 0;

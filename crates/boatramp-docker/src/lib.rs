@@ -1109,8 +1109,9 @@ fn hardened_host_config(
     restart: RestartPolicy,
     writable_root: bool,
     cap_add: &[String],
+    ephemeral_mounts: &[boatramp_core::compute::EphemeralMount],
 ) -> HostConfig {
-    let tmpfs = std::collections::HashMap::from([
+    let mut tmpfs = std::collections::HashMap::from([
         (
             "/tmp".to_string(),
             "rw,noexec,nosuid,size=64m,mode=1777".to_string(),
@@ -1120,6 +1121,17 @@ fn hardened_host_config(
             "rw,noexec,nosuid,size=16m,mode=1777".to_string(),
         ),
     ]);
+    // Declared per-workload ephemeral mounts: a sized `tmpfs` at each requested path, so a
+    // workload gets a writable scratch/cache dir on the hardened read-only root WITHOUT a
+    // persistent volume. `nosuid,nodev` + the validated `size=<N>m` cap (bounded at set time),
+    // so the mount is non-escalating and bounded — multi-tenant-SAFE and honored under ANY
+    // posture (unlike `writable_root`/`cap_add`, which the caller gates to single-tenant).
+    for em in ephemeral_mounts {
+        tmpfs.insert(
+            em.mount.clone(),
+            format!("rw,nosuid,nodev,size={}m", em.size_mib.max(1)),
+        );
+    }
     HostConfig {
         memory: Some(i64::from(mem_mib) * 1024 * 1024),
         nano_cpus: Some(i64::from(vcpus.max(1)) * 1_000_000_000),
@@ -1270,6 +1282,7 @@ impl ComputeBackend for DockerBackend {
             req.spec.restart,
             writable_root,
             cap_add,
+            &req.spec.ephemeral_mounts,
         );
         // `host.docker.internal:host-gateway` (see `docker_binding_reachability`) — so a bridged
         // workload resolves the host from any per-project network to reach its compute shims.
@@ -1796,7 +1809,7 @@ impl ComputeBackend for DockerBackend {
         // Hardened one-shot: dropped caps, read-only root, no-new-privileges, PID cap,
         // auto-removed on exit, and NO published port — it only needs network egress to
         // reach the database, which the daemon bridge NATs out of the box.
-        let mut host_config = hardened_host_config(512, 1, RestartPolicy::Never, false, &[]);
+        let mut host_config = hardened_host_config(512, 1, RestartPolicy::Never, false, &[], &[]);
         host_config.auto_remove = Some(true);
 
         // CONSUME the reserved per-project-network hint (see `EPHEMERAL_NETWORK_ENV`): a managed-DB
@@ -3009,7 +3022,7 @@ mod tests {
 
     #[test]
     fn host_config_is_hardened_by_default() {
-        let hc = hardened_host_config(256, 2, RestartPolicy::Never, false, &[]);
+        let hc = hardened_host_config(256, 2, RestartPolicy::Never, false, &[], &[]);
         // Resource limits still applied.
         assert_eq!(hc.memory, Some(256 * 1024 * 1024));
         assert_eq!(hc.nano_cpus, Some(2_000_000_000));
@@ -3033,14 +3046,44 @@ mod tests {
         assert!(tmpfs.get("/tmp").is_some_and(|o| o.contains("mode=1777")));
         // At least one vCPU even when the spec asks for zero.
         assert_eq!(
-            hardened_host_config(64, 0, RestartPolicy::Never, false, &[]).nano_cpus,
+            hardened_host_config(64, 0, RestartPolicy::Never, false, &[], &[]).nano_cpus,
             Some(1_000_000_000)
         );
     }
 
     #[test]
+    fn ephemeral_mounts_become_sized_tmpfs_in_the_host_config() {
+        use boatramp_core::compute::EphemeralMount;
+        let mounts = [
+            EphemeralMount::new("/cache", 256),
+            EphemeralMount::new("/var/scratch", 64),
+        ];
+        let hc = hardened_host_config(256, 2, RestartPolicy::Never, false, &[], &mounts);
+        let tmpfs = hc.tmpfs.expect("tmpfs mounts present");
+        // The standard scratch mounts are still there…
+        assert!(tmpfs.contains_key("/tmp") && tmpfs.contains_key("/run"));
+        // …plus a sized, hardened tmpfs for each declared ephemeral mount.
+        let cache = tmpfs.get("/cache").expect("/cache tmpfs");
+        assert!(cache.contains("size=256m"), "{cache}");
+        assert!(
+            cache.contains("nosuid") && cache.contains("nodev"),
+            "{cache}"
+        );
+        assert!(
+            tmpfs
+                .get("/var/scratch")
+                .is_some_and(|o| o.contains("size=64m"))
+        );
+        // No ephemeral mounts ⇒ only the two standard scratch mounts.
+        let bare = hardened_host_config(256, 2, RestartPolicy::Never, false, &[], &[])
+            .tmpfs
+            .unwrap();
+        assert_eq!(bare.len(), 2);
+    }
+
+    #[test]
     fn writable_root_relaxes_only_the_read_only_root() {
-        let hc = hardened_host_config(256, 2, RestartPolicy::Never, true, &[]);
+        let hc = hardened_host_config(256, 2, RestartPolicy::Never, true, &[], &[]);
         // The one relaxation.
         assert_eq!(hc.readonly_rootfs, Some(false));
         // Every other hardening still applies.
@@ -3056,7 +3099,7 @@ mod tests {
     #[test]
     fn cap_add_adds_back_only_the_allowlist() {
         let caps = ["CHOWN".to_string(), "SETUID".to_string()];
-        let hc = hardened_host_config(256, 2, RestartPolicy::Never, false, &caps);
+        let hc = hardened_host_config(256, 2, RestartPolicy::Never, false, &caps, &[]);
         // The allowlist is added back on top of the retained drop-ALL.
         assert_eq!(hc.cap_drop.as_deref(), Some(["ALL".to_string()].as_slice()));
         assert_eq!(hc.cap_add.as_deref(), Some(caps.as_slice()));

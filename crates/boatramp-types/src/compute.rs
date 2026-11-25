@@ -238,6 +238,96 @@ impl VolumeRef {
     }
 }
 
+/// A **per-workload ephemeral writable mount** — a sized `tmpfs` at a declared in-guest
+/// path, reclaimed when the workload stops. The cheap, throwaway counterpart to a
+/// [`VolumeRef`]: where a volume is blob-snapshotted for durability (heavy for a scratch /
+/// cache dir), an ephemeral mount is just RAM-backed scratch space the backend sets up fresh
+/// for each replica and never persists.
+///
+/// ## Why this is a distinct type (not a [`VolumeRef`] flag)
+///
+/// An ephemeral tmpfs shares nothing operationally with a persistent volume — no durable
+/// backing image, no name, no blob snapshot, no cross-restart identity, and (critically) a
+/// DIFFERENT capability/tenancy profile: it needs no `persistent_volumes` backend support and
+/// is safe under the **multi-tenant** posture (a per-workload, size-capped tmpfs inside the
+/// workload's own mount namespace can never reach another tenant). Folding it into
+/// [`ComputeSpec::volumes`] would force every persistent-volume consumer (staging, ownership
+/// derivation, reclaim, the eligibility gate) to special-case "skip if ephemeral", so it lives
+/// on its own [`ComputeSpec::ephemeral_mounts`] list instead — modelled explicitly, exactly
+/// like [`RootSource`]'s typed variants.
+///
+/// ## Isolation + the DoS bound
+///
+/// The tmpfs is mounted in the workload's own mount namespace (container) or guest
+/// (micro-VM), `nosuid,nodev`, and sized: [`size_mib`](Self::size_mib) becomes the tmpfs
+/// `size=` limit, so the mount can never grow without bound. A tmpfs's pages are charged to
+/// the faulting memory cgroup (container) / bounded by guest RAM (micro-VM), so the mount is
+/// doubly bounded — the explicit `size=` AND the workload's memory ceiling. The declarative
+/// surface clamps `size_mib` to [`MAX_EPHEMERAL_MOUNT_MIB`] and rejects `0`, so an uncapped or
+/// absurd tmpfs can never be requested (the memory-exhaustion guard).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct EphemeralMount {
+    /// Absolute in-guest mount point for the tmpfs (e.g. `/cache`). Must be absolute with no
+    /// `..` component and must not collide with the backend's standard mounts (see
+    /// [`RESERVED_EPHEMERAL_MOUNTS`]).
+    pub mount: String,
+    /// The tmpfs size cap in MiB — enforced as the tmpfs `size=` option. Must be in
+    /// `1..=`[`MAX_EPHEMERAL_MOUNT_MIB`]; a caller that omits it should default to
+    /// [`DEFAULT_EPHEMERAL_MOUNT_MIB`] before building the spec (the CLI does).
+    pub size_mib: u32,
+}
+
+impl EphemeralMount {
+    /// An ephemeral tmpfs mount of `size_mib` MiB at `mount`. The supported constructor —
+    /// `EphemeralMount` is `#[non_exhaustive]`, so downstream crates construct it here rather
+    /// than with a struct literal (any field added later stays non-breaking). The public
+    /// fields remain settable.
+    pub fn new(mount: impl Into<String>, size_mib: u32) -> Self {
+        Self {
+            mount: mount.into(),
+            size_mib,
+        }
+    }
+}
+
+/// The default size (MiB) for an ephemeral mount whose caller omits an explicit cap — a
+/// modest scratch allowance. The CLI applies this when `--mount <path>` carries no `:<size>`.
+pub const DEFAULT_EPHEMERAL_MOUNT_MIB: u32 = 64;
+
+/// The maximum size (MiB) a single ephemeral mount may request — the memory-exhaustion /
+/// DoS bound on the declarative surface (8 GiB). A tmpfs counts against the workload's memory,
+/// so the surface refuses an absurd `size_mib` fail-closed rather than letting a spec request a
+/// tmpfs larger than any sane scratch dir. (The workload's own memory cgroup / guest RAM is the
+/// hard ceiling regardless; this keeps the *request* legible and bounded.)
+pub const MAX_EPHEMERAL_MOUNT_MIB: u32 = 8192;
+
+/// The maximum number of ephemeral mounts one workload may declare — a modest cap so a spec
+/// cannot enumerate an unbounded mount list (each mount is a separate tmpfs setup).
+pub const MAX_EPHEMERAL_MOUNTS: usize = 16;
+
+/// Mount points an ephemeral tmpfs may NOT target: the backends' own standard mounts +
+/// pseudo-filesystems. Overlaying one of these with a tenant-sized tmpfs would shadow a mount
+/// the sandbox relies on (`/proc`, `/sys`, `/dev`) or a backend-managed scratch (`/tmp`,
+/// `/run`), so the surface refuses it — an ephemeral mount must name a DISTINCT path.
+pub const RESERVED_EPHEMERAL_MOUNTS: &[&str] = &["/", "/proc", "/sys", "/dev", "/tmp", "/run"];
+
+/// Whether `path` is an acceptable ephemeral/volume mount point: absolute, every component a
+/// plain name (no `.`/`..`/prefix), i.e. the same shape the backends validate before a
+/// `mount(2)`. Shared by the ephemeral-mount validator; pure so the set-time gate and a test
+/// agree on one rule.
+fn is_clean_absolute_mount(path: &str) -> bool {
+    use std::path::{Component, Path};
+    let p = Path::new(path);
+    p.is_absolute()
+        && p.components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+        // Reject a bare "/" (only a RootDir component) — it is in the reserved set anyway, but
+        // this keeps the shape check self-contained.
+        && p.components().any(|c| matches!(c, Component::Normal(_)))
+}
+
 /// The generic default startup grace (seconds) for a compute workload — the window a
 /// freshly launched replica has to become healthy before the reconcile loop treats a
 /// still-unhealthy one as a broken launch. Generic compute + micro-VM workloads use
@@ -298,6 +388,15 @@ pub struct ComputeSpec {
     /// Persistent volumes (opt-in).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeRef>,
+    /// **Ephemeral writable mounts** (opt-in) — a per-workload, size-capped `tmpfs` at each
+    /// declared path, set up fresh per replica and reclaimed on stop (never blob-snapshotted;
+    /// see [`EphemeralMount`]). The cheap scratch/cache counterpart to a [`VolumeRef`], and
+    /// the multi-tenant-SAFE way to get a writable path on the hardened read-only root
+    /// (unlike [`writable_root`](Self::writable_root), which is stripped under the multi-tenant
+    /// guard). Empty ⇒ omitted from the wire + the content hash (back-compat / schema stays
+    /// v1), exactly like [`volumes`](Self::volumes) / [`cap_add`](Self::cap_add).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ephemeral_mounts: Vec<EphemeralMount>,
     /// Allow a writable root filesystem instead of the hardened read-only-root
     /// default. Opt-in and honored **only under the single-tenant isolation
     /// posture** (a backend forces read-only root under the multi-tenant guard).
@@ -586,6 +685,62 @@ impl ComputeSpec {
         sha256_hex(&canonical)
     }
 
+    /// Validate the [`ephemeral_mounts`](Self::ephemeral_mounts) declared on this spec — the
+    /// single pure rule the set-time choke points (the server's `put_compute`, and the CLI's
+    /// fail-fast) share, so a direct API call, an `apply` manifest, and `compute set` all get
+    /// the same fail-closed verdict. Enforces, per the [`EphemeralMount`] contract:
+    ///
+    /// - a bounded size: `1..=`[`MAX_EPHEMERAL_MOUNT_MIB`] (rejects `0` and an absurd tmpfs —
+    ///   the memory-exhaustion / DoS guard);
+    /// - a clean absolute path with no `..`, not one of the [`RESERVED_EPHEMERAL_MOUNTS`]
+    ///   (never shadow a standard sandbox mount);
+    /// - no duplicate ephemeral mount point, and no collision with a persistent
+    ///   [`volumes`](Self::volumes) mount (two mounts fighting over one path);
+    /// - at most [`MAX_EPHEMERAL_MOUNTS`] mounts.
+    ///
+    /// Returns a human-readable reason on the first violation (surfaced as a `400`), else `Ok`.
+    pub fn validate_ephemeral_mounts(&self) -> Result<(), String> {
+        if self.ephemeral_mounts.len() > MAX_EPHEMERAL_MOUNTS {
+            return Err(format!(
+                "too many ephemeral mounts: {} (max {MAX_EPHEMERAL_MOUNTS})",
+                self.ephemeral_mounts.len()
+            ));
+        }
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let volume_mounts: std::collections::BTreeSet<&str> =
+            self.volumes.iter().map(|v| v.mount.as_str()).collect();
+        for m in &self.ephemeral_mounts {
+            if m.size_mib == 0 || m.size_mib > MAX_EPHEMERAL_MOUNT_MIB {
+                return Err(format!(
+                    "ephemeral mount {:?} has an invalid size {} MiB: must be 1..={MAX_EPHEMERAL_MOUNT_MIB}",
+                    m.mount, m.size_mib
+                ));
+            }
+            if !is_clean_absolute_mount(&m.mount) {
+                return Err(format!(
+                    "ephemeral mount {:?} is not a clean absolute path (must be absolute with no `..`)",
+                    m.mount
+                ));
+            }
+            if RESERVED_EPHEMERAL_MOUNTS.contains(&m.mount.as_str()) {
+                return Err(format!(
+                    "ephemeral mount {:?} is a reserved mount point (one of {RESERVED_EPHEMERAL_MOUNTS:?}); choose a distinct path",
+                    m.mount
+                ));
+            }
+            if volume_mounts.contains(m.mount.as_str()) {
+                return Err(format!(
+                    "ephemeral mount {:?} collides with a persistent volume at the same path",
+                    m.mount
+                ));
+            }
+            if !seen.insert(m.mount.as_str()) {
+                return Err(format!("duplicate ephemeral mount point {:?}", m.mount));
+            }
+        }
+        Ok(())
+    }
+
     /// Start building a spec from its required core — the root source + sizing + listen
     /// port. Every other field defaults (empty / `None` / the policy default) and is set with
     /// the returned [`ComputeSpecBuilder`]'s `with_*` methods. This is the supported
@@ -626,6 +781,7 @@ impl ComputeSpec {
                 startup_grace_secs: default_startup_grace_secs(),
                 scale_to_zero: false,
                 volumes: Vec::new(),
+                ephemeral_mounts: Vec::new(),
                 writable_root: false,
                 cap_add: Vec::new(),
                 user: None,
@@ -703,6 +859,12 @@ impl ComputeSpecBuilder {
     #[must_use]
     pub fn volumes(mut self, volumes: Vec<VolumeRef>) -> Self {
         self.inner.volumes = volumes;
+        self
+    }
+    /// Set the ephemeral (tmpfs) mounts.
+    #[must_use]
+    pub fn ephemeral_mounts(mut self, ephemeral_mounts: Vec<EphemeralMount>) -> Self {
+        self.inner.ephemeral_mounts = ephemeral_mounts;
         self
     }
     /// Allow a writable root filesystem (single-tenant only).
@@ -1626,6 +1788,7 @@ mod tests {
             startup_grace_secs: 30,
             scale_to_zero: true,
             volumes: vec![],
+            ephemeral_mounts: vec![],
             writable_root: false,
             cap_add: Vec::new(),
             user: None,
@@ -1637,6 +1800,94 @@ mod tests {
             post_launch: vec![],
             pull_policy: Default::default(),
         }
+    }
+
+    #[test]
+    fn empty_ephemeral_mounts_do_not_change_the_spec_hash() {
+        // A spec that declares no ephemeral mounts serializes without the field, so it hashes
+        // identically to a pre-ephemeral spec (back-compat / schema stays v1) — the same
+        // zero-churn pattern as volumes / writable_root / post_launch.
+        let a = spec();
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("ephemeral_mounts"),
+            "empty ephemeral_mounts are omitted: {json}"
+        );
+
+        // Declaring one is recorded, round-trips, and CHANGES the content hash (it is part of
+        // the workload's identity — it changes the materialized sandbox).
+        let mut b = spec();
+        b.ephemeral_mounts = vec![EphemeralMount::new("/cache", 128)];
+        assert_ne!(a.id(), b.id(), "a declared ephemeral mount changes the id");
+        let json_b = serde_json::to_string(&b).unwrap();
+        assert!(json_b.contains("ephemeral_mounts"));
+        let round: ComputeSpec = serde_json::from_str(&json_b).unwrap();
+        assert_eq!(
+            round.ephemeral_mounts,
+            vec![EphemeralMount::new("/cache", 128)]
+        );
+    }
+
+    #[test]
+    fn ephemeral_mount_validation_enforces_size_path_and_uniqueness() {
+        // A clean, sized, distinct set validates.
+        let mut ok = spec();
+        ok.ephemeral_mounts = vec![
+            EphemeralMount::new("/cache", 128),
+            EphemeralMount::new("/var/scratch", DEFAULT_EPHEMERAL_MOUNT_MIB),
+        ];
+        assert!(ok.validate_ephemeral_mounts().is_ok());
+
+        // Size 0 (unbounded tmpfs request) is refused — the DoS guard.
+        let mut zero = spec();
+        zero.ephemeral_mounts = vec![EphemeralMount::new("/cache", 0)];
+        assert!(zero.validate_ephemeral_mounts().is_err());
+
+        // A size over the hard cap is refused.
+        let mut huge = spec();
+        huge.ephemeral_mounts = vec![EphemeralMount::new("/cache", MAX_EPHEMERAL_MOUNT_MIB + 1)];
+        assert!(huge.validate_ephemeral_mounts().is_err());
+
+        // A relative path / `..` escape is refused.
+        for bad in ["relative/path", "/var/../etc", "/", ".."] {
+            let mut s = spec();
+            s.ephemeral_mounts = vec![EphemeralMount::new(bad, 64)];
+            assert!(
+                s.validate_ephemeral_mounts().is_err(),
+                "path {bad:?} must be refused"
+            );
+        }
+
+        // A reserved mount point (would shadow a standard sandbox mount) is refused.
+        for reserved in RESERVED_EPHEMERAL_MOUNTS {
+            let mut s = spec();
+            s.ephemeral_mounts = vec![EphemeralMount::new(*reserved, 64)];
+            assert!(
+                s.validate_ephemeral_mounts().is_err(),
+                "reserved {reserved:?} must be refused"
+            );
+        }
+
+        // A duplicate ephemeral mount point is refused.
+        let mut dup = spec();
+        dup.ephemeral_mounts = vec![
+            EphemeralMount::new("/cache", 64),
+            EphemeralMount::new("/cache", 128),
+        ];
+        assert!(dup.validate_ephemeral_mounts().is_err());
+
+        // A collision with a persistent volume at the same path is refused.
+        let mut clash = spec();
+        clash.volumes = vec![VolumeRef::new("/data", "db", 512)];
+        clash.ephemeral_mounts = vec![EphemeralMount::new("/data", 64)];
+        assert!(clash.validate_ephemeral_mounts().is_err());
+
+        // Too many mounts is refused.
+        let mut many = spec();
+        many.ephemeral_mounts = (0..=MAX_EPHEMERAL_MOUNTS)
+            .map(|i| EphemeralMount::new(format!("/scratch{i}"), 8))
+            .collect();
+        assert!(many.validate_ephemeral_mounts().is_err());
     }
 
     #[test]
