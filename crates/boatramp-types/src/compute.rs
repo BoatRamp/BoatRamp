@@ -307,6 +307,27 @@ pub const MAX_EPHEMERAL_MOUNT_MIB: u32 = 8192;
 /// cannot enumerate an unbounded mount list (each mount is a separate tmpfs setup).
 pub const MAX_EPHEMERAL_MOUNTS: usize = 16;
 
+/// The maximum length (bytes) of a single ephemeral-mount path. A sanity bound so an absurd
+/// path cannot bloat the micro-VM `boatramp.tmpfs=` kernel cmdline (the hex of the NUL-joined
+/// `target\0size=…` pairs) toward the guest's `COMMAND_LINE_SIZE`: with [`MAX_EPHEMERAL_MOUNTS`]
+/// it keeps the fragment bounded on EVERY backend, so the external-firecracker and macOS-vz
+/// paths (which build the fragment without their own length check) fail-fast at set-time with a
+/// clear 400 rather than at guest boot. (The embedded VMM path additionally caps the whole
+/// fragment fail-closed.)
+pub const MAX_EPHEMERAL_MOUNT_PATH_LEN: usize = 256;
+
+/// The maximum AGGREGATE length (bytes) of all ephemeral-mount paths in one spec. This is the
+/// bound that actually keeps the micro-VM `boatramp.tmpfs=` cmdline fragment within the guest
+/// kernel's budget on EVERY backend: the fragment is the hex (2×) of the NUL-joined
+/// `target\0size=<N>m\0` pairs, so with ≤[`MAX_EPHEMERAL_MOUNTS`] mounts a 320-byte path budget
+/// keeps the fragment ≤1024 bytes — the same ceiling the embedded VMM path enforces
+/// (`MAX_TMPFS_CMDLINE_LEN`). Enforcing it here, at the single `put_compute` validation choke
+/// point, means the external-firecracker and macOS-vz paths (which build the fragment without
+/// their own bound) are bounded by construction — an over-large list is a clean set-time 400,
+/// not a cryptic guest boot failure. A per-mount cap ([`MAX_EPHEMERAL_MOUNT_PATH_LEN`]) still
+/// catches a single absurd path early.
+pub const MAX_EPHEMERAL_MOUNT_PATHS_TOTAL_LEN: usize = 320;
+
 /// Mount points an ephemeral tmpfs may NOT target: the backends' own standard mounts +
 /// pseudo-filesystems. Overlaying one of these with a tenant-sized tmpfs would shadow a mount
 /// the sandbox relies on (`/proc`, `/sys`, `/dev`) or a backend-managed scratch (`/tmp`,
@@ -319,13 +340,30 @@ pub const RESERVED_EPHEMERAL_MOUNTS: &[&str] = &["/", "/proc", "/sys", "/dev", "
 /// agree on one rule.
 fn is_clean_absolute_mount(path: &str) -> bool {
     use std::path::{Component, Path};
+    // Reject any ASCII control character (NUL, newline, …): such a byte has no place in a
+    // mount path and would corrupt the micro-VM `boatramp.tmpfs=` NUL-joined cmdline blob
+    // (a NUL desyncs the `target\0size=…` framing in `vminit`).
+    if path.bytes().any(|b| b.is_ascii_control()) {
+        return false;
+    }
     let p = Path::new(path);
-    p.is_absolute()
+    let shape_ok = p.is_absolute()
         && p.components()
             .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
         // Reject a bare "/" (only a RootDir component) — it is in the reserved set anyway, but
         // this keeps the shape check self-contained.
-        && p.components().any(|c| matches!(c, Component::Normal(_)))
+        && p.components().any(|c| matches!(c, Component::Normal(_)));
+    if !shape_ok {
+        return false;
+    }
+    // Require the CANONICAL spelling: the stored string must equal the path rebuilt from its
+    // components (single separators, no trailing slash, no `.` segment). Otherwise the
+    // reserved-path, volume-collision, and dedup checks — which compare the raw string — are
+    // bypassable by a normalization-equivalent form such as `/proc/`, `//proc`, `/proc/.`, or
+    // `/data/` (vs a `/data` volume). With this check the raw string the guards compare is the
+    // one the kernel resolves, so those string comparisons are sound.
+    let canonical: std::path::PathBuf = p.components().collect();
+    canonical.to_str() == Some(path)
 }
 
 /// The generic default startup grace (seconds) for a compute workload — the window a
@@ -716,9 +754,16 @@ impl ComputeSpec {
                     m.mount, m.size_mib
                 ));
             }
+            if m.mount.len() > MAX_EPHEMERAL_MOUNT_PATH_LEN {
+                return Err(format!(
+                    "ephemeral mount {:?} path is too long: {} bytes (max {MAX_EPHEMERAL_MOUNT_PATH_LEN})",
+                    m.mount,
+                    m.mount.len()
+                ));
+            }
             if !is_clean_absolute_mount(&m.mount) {
                 return Err(format!(
-                    "ephemeral mount {:?} is not a clean absolute path (must be absolute with no `..`)",
+                    "ephemeral mount {:?} is not a clean absolute path (must be absolute, canonical, with no `..`)",
                     m.mount
                 ));
             }
@@ -737,6 +782,14 @@ impl ComputeSpec {
             if !seen.insert(m.mount.as_str()) {
                 return Err(format!("duplicate ephemeral mount point {:?}", m.mount));
             }
+        }
+        let paths_total: usize = self.ephemeral_mounts.iter().map(|m| m.mount.len()).sum();
+        if paths_total > MAX_EPHEMERAL_MOUNT_PATHS_TOTAL_LEN {
+            return Err(format!(
+                "ephemeral mount paths are too long in aggregate: {paths_total} bytes (max \
+                 {MAX_EPHEMERAL_MOUNT_PATHS_TOTAL_LEN}); the micro-VM kernel cmdline fragment must \
+                 stay bounded"
+            ));
         }
         Ok(())
     }
@@ -1888,6 +1941,91 @@ mod tests {
             .map(|i| EphemeralMount::new(format!("/scratch{i}"), 8))
             .collect();
         assert!(many.validate_ephemeral_mounts().is_err());
+
+        // A NON-CANONICAL spelling of a reserved mount must NOT slip past the reserved-path
+        // guard (the raw string is compared, so `/proc/`, `//proc`, `/proc/.` must be rejected
+        // at the shape check before they ever reach the `== "/proc"` test).
+        for bypass in [
+            "/proc/", "//proc", "/proc/.", "/proc//", "/./proc", "/dev/", "/sys/", "/tmp/", "/run/",
+        ] {
+            let mut s = spec();
+            s.ephemeral_mounts = vec![EphemeralMount::new(bypass, 64)];
+            assert!(
+                s.validate_ephemeral_mounts().is_err(),
+                "non-canonical reserved bypass {bypass:?} must be refused"
+            );
+        }
+
+        // A non-canonical spelling must NOT bypass the persistent-volume collision guard.
+        let mut clash2 = spec();
+        clash2.volumes = vec![VolumeRef::new("/data", "db", 512)];
+        clash2.ephemeral_mounts = vec![EphemeralMount::new("/data/", 64)];
+        assert!(
+            clash2.validate_ephemeral_mounts().is_err(),
+            "`/data/` must collide with the `/data` volume"
+        );
+
+        // A non-canonical spelling must NOT bypass the dedup guard.
+        let mut dup2 = spec();
+        dup2.ephemeral_mounts = vec![
+            EphemeralMount::new("/cache", 64),
+            EphemeralMount::new("/cache/", 128),
+        ];
+        assert!(
+            dup2.validate_ephemeral_mounts().is_err(),
+            "`/cache` and `/cache/` are the same mount"
+        );
+
+        // A control character (NUL, newline) in the path is refused.
+        for bad in ["/cache\0evil", "/ca\nche", "/cache\t"] {
+            let mut s = spec();
+            s.ephemeral_mounts = vec![EphemeralMount::new(bad, 64)];
+            assert!(
+                s.validate_ephemeral_mounts().is_err(),
+                "control-char path {bad:?} must be refused"
+            );
+        }
+
+        // An over-long path is refused; one at the cap is accepted.
+        let mut long = spec();
+        long.ephemeral_mounts = vec![EphemeralMount::new(
+            format!("/{}", "a".repeat(MAX_EPHEMERAL_MOUNT_PATH_LEN)),
+            64,
+        )];
+        assert!(
+            long.validate_ephemeral_mounts().is_err(),
+            "a path over the length cap must be refused"
+        );
+        let mut at_cap = spec();
+        at_cap.ephemeral_mounts = vec![EphemeralMount::new(
+            format!("/{}", "a".repeat(MAX_EPHEMERAL_MOUNT_PATH_LEN - 1)),
+            64,
+        )];
+        assert!(
+            at_cap.validate_ephemeral_mounts().is_ok(),
+            "a path at the length cap is fine"
+        );
+
+        // Several individually-fine paths whose AGGREGATE length exceeds the total cap are
+        // refused — this is the bound that keeps the micro-VM cmdline fragment bounded on the
+        // external-firecracker / vz paths.
+        let mut aggregate = spec();
+        aggregate.ephemeral_mounts = vec![
+            EphemeralMount::new(format!("/{}", "a".repeat(200)), 64),
+            EphemeralMount::new(format!("/{}", "b".repeat(200)), 64),
+        ];
+        assert!(
+            aggregate.validate_ephemeral_mounts().is_err(),
+            "paths over the aggregate length cap must be refused"
+        );
+
+        // A dot WITHIN a path component (a real name, not a `.` segment) is still accepted.
+        let mut dotted = spec();
+        dotted.ephemeral_mounts = vec![EphemeralMount::new("/var/sc.ratch", 64)];
+        assert!(
+            dotted.validate_ephemeral_mounts().is_ok(),
+            "a dot inside a component name is a valid path"
+        );
     }
 
     #[test]
