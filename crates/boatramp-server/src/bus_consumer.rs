@@ -321,6 +321,15 @@ fn handle_to_message(project: &ProjectContext, handle: &str) -> Result<ClaimedMe
     if let Err(e) = validate_object_key(&decoded.topic) {
         return Err((StatusCode::BAD_REQUEST, format!("invalid topic: {e}\n")).into_response());
     }
+    // M-A (authoritative surface backstop): the consumer `group` rides INSIDE the opaque, forgeable
+    // handle, so it is re-validated HERE — the single choke point every ack/nack transport funnels
+    // through (the `bus_ack`/`bus_nack` side-channel AND the inline `handle_ws_ack` WS frame) — BEFORE
+    // it is ever composed into `mqgstate/{topic}/{group}` by `messaging.ack`/`nack` on EITHER backend.
+    // A `/`-bearing group would collide a victim group's per-topic keyspace (message loss / lease
+    // reset) and cross the per-topic authz grain; empty ⇒ the default work-queue (allowed). This
+    // closes the exploit backend-agnostically, above the per-impl `check_group` defense-in-depth, so a
+    // WS consumer scoped to one topic can no longer forge a `group:"other/evil"` inline-ack.
+    reject_bad_group(&decoded.group)?;
     let full_key = bus_namespace(&project.as_ref(), &decoded.topic);
     Ok(decoded.into_message(full_key))
 }
@@ -1649,5 +1658,44 @@ mod tests {
             decoded_foreign.topic, "orders/created",
             "a foreign-topic handle is rejected by the inline-ack confinement"
         );
+    }
+
+    /// GATE (M-A authoritative surface) — the shared ack/nack choke point `handle_to_message`
+    /// re-validates the consumer `group` that rides INSIDE the opaque, FORGEABLE handle. A forged
+    /// `/`-bearing group is REFUSED before it can key `mqgstate/{topic}/{group}` via `messaging.ack`/
+    /// `nack`, so a consumer scoped to one topic cannot forge `group:"created/evil"` to corrupt a
+    /// victim group's state. This one place is reached by `bus_ack`, `bus_nack`, AND `handle_ws_ack`,
+    /// so it closes the exploit for BOTH backends backend-agnostically. The empty (default work-queue)
+    /// and a clean single-segment group still pass.
+    #[test]
+    fn surface_handle_to_message_rejects_a_forged_slash_group() {
+        let project = ProjectContext("acme".to_string());
+        let forged = ClaimedMessage {
+            id: "01HSOMEID".to_string(),
+            topic: "acme/bus/orders/created".to_string(),
+            payload: Vec::new(),
+            attempts: 1,
+            group: "created/evil".to_string(),
+            signed_context: None,
+            inline: false,
+        };
+        // The handle is minted over the BARE topic; the forged group is carried inside it.
+        let bad = AckHandle::encode("orders/created", &forged);
+        assert!(
+            handle_to_message(&project, &bad).is_err(),
+            "a forged '/'-group ack/nack handle must be refused at the shared surface (400)"
+        );
+        // A clean group and the empty work-queue group both pass the guard.
+        for group in ["created", ""] {
+            let ok_msg = ClaimedMessage {
+                group: group.to_string(),
+                ..forged.clone()
+            };
+            let ok = AckHandle::encode("orders/created", &ok_msg);
+            assert!(
+                handle_to_message(&project, &ok).is_ok(),
+                "a clean/empty group ({group:?}) passes the surface guard"
+            );
+        }
     }
 }

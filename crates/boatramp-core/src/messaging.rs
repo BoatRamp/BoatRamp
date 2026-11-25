@@ -1384,8 +1384,10 @@ pub fn gstate_key(topic: &str, group: &str) -> String {
 /// grain, so it is refused and the op errors. The empty group (the default work-queue) is handled by
 /// each caller BEFORE this and never reaches it. Reuses the one shared
 /// [`validate_consumer_group`](crate::project::validate_consumer_group) rule (a `/`-group is also
-/// refused loudly-early at the registration surfaces).
-fn check_group(group: &str) -> Result<(), MessagingError> {
+/// refused loudly-early at the registration surfaces). `pub` so the cluster backend `RaftMessaging`
+/// (in `boatramp-cluster`) reuses the IDENTICAL backstop — the M-A invariant must hold on single-node
+/// and cluster alike (single/cluster parity).
+pub fn check_group(group: &str) -> Result<(), MessagingError> {
     crate::project::validate_consumer_group(group).map_err(|reason| {
         MessagingError::Backend(format!("invalid consumer group {group:?}: {reason}"))
     })
@@ -3040,6 +3042,9 @@ impl Messaging for LogMessaging {
     }
 
     async fn group_lag(&self, topic: &str, group: &str) -> Result<usize, MessagingError> {
+        // M-A invariant: every grouped-op path that builds `mqgstate/{topic}/{group}` validates the
+        // group (consistency with `claim`/`ack`/`nack`; the operator surface is already authz'd).
+        check_group(group)?;
         let Some(state) = self.get_group_state(topic, group).await? else {
             return Ok(0);
         };
@@ -3726,6 +3731,8 @@ impl Messaging for LogMessaging {
         group: &str,
         start: StartPosition,
     ) -> Result<(), MessagingError> {
+        // M-A invariant: validate the group before it keys `mqgstate/{topic}/{group}` (consistency).
+        check_group(group)?;
         // Serialize with claim/ack — it replaces the group's compact state.
         let _guard = self.claim_lock.lock().await;
         if self.get_group_state(topic, group).await?.is_none() {
@@ -3745,6 +3752,8 @@ impl Messaging for LogMessaging {
     }
 
     async fn delete_group(&self, topic: &str, group: &str) -> Result<(), MessagingError> {
+        // M-A invariant: validate the group before it keys `mqgstate/{topic}/{group}` (consistency).
+        check_group(group)?;
         let _guard = self.claim_lock.lock().await;
         // Delete this group's dead-letters, then its state. The shared retained log/payloads it pinned
         // are reclaimed by the retention sweep once no remaining group needs them.

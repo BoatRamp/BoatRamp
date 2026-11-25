@@ -1643,6 +1643,16 @@ impl WebhookSink {
                 self.name
             )));
         }
+        // N3 (belt-and-suspenders): the topic is echoed into the `X-Boatramp-Topic` delivery header. A
+        // control character (e.g. `\n`) cannot currently be injected — the header is set from this
+        // already-validated value — but reject it here for cleanliness so a malformed topic never
+        // reaches the wire.
+        if let Some(bad) = topic.chars().find(|c| c.is_control()) {
+            return Err(ConfigError::parse(format!(
+                "webhook sink {:?} topic {topic:?} must not contain control characters (found {bad:?})",
+                self.name
+            )));
+        }
         // M-A (N6): the fan-out group (empty ⇒ the default work-queue) keys the per-topic group state,
         // so validate it as a single clean key segment here — refused LOUDLY at register/apply, never
         // a silent cross-topic keyspace collision at drain.
@@ -3452,6 +3462,10 @@ mod tests {
             "traversal topic"
         );
         assert!(bad(&|s| s.topic = String::new()).is_err(), "empty topic");
+        assert!(
+            bad(&|s| s.topic = "orders\ncreated".into()).is_err(),
+            "N3: a control character (e.g. a newline bound for the X-Boatramp-Topic header) is refused"
+        );
         assert!(
             bad(&|s| s.url_secret = "https://evil.example/x".into()).is_err(),
             "a plaintext URL (non-sealed ref) is refused — secrets must be sealed"

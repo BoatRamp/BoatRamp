@@ -976,6 +976,12 @@ impl Messaging for RaftMessaging {
         if group.is_empty() {
             return self.claim(topic, lease, max_batch, max_attempts).await;
         }
+        // M-A (single/cluster parity): a non-empty group MUST be a single clean key segment — fail
+        // closed BEFORE it is ever composed into `gstate_key`/proposed, so a `/`-bearing group can
+        // neither collide another group's per-topic keyspace nor cross the per-topic authz grain. The
+        // IDENTICAL backstop `LogMessaging` applies; a backstop in one posture and not the other is a
+        // security bug.
+        messaging::check_group(group)?;
         // Flow control (P2): a paused topic delivers nothing to any group.
         if self.is_paused(topic).await? {
             return Ok(Vec::new());
@@ -1025,6 +1031,9 @@ impl Messaging for RaftMessaging {
         // A grouped ack drops only this group's in-flight entry (the retained
         // payload stays for the other groups until the sweep reclaims it).
         if !msg.group.is_empty() {
+            // M-A (single/cluster parity): fail closed on a `/`-bearing group reconstructed from a
+            // forged handle before it keys the group state — identical to `LogMessaging::ack`.
+            messaging::check_group(&msg.group)?;
             self.propose(WriteOp::MqAckGrouped {
                 topic: msg.topic.clone(),
                 group: msg.group.clone(),
@@ -1071,6 +1080,9 @@ impl Messaging for RaftMessaging {
             now_unix_ms().saturating_add(delay_ms)
         };
         if !msg.group.is_empty() {
+            // M-A (single/cluster parity): fail closed on a `/`-bearing group reconstructed from a
+            // forged handle before it keys the group state — identical to `LogMessaging::nack_after`.
+            messaging::check_group(&msg.group)?;
             self.propose(WriteOp::MqNackGrouped {
                 topic: msg.topic.clone(),
                 group: msg.group.clone(),
@@ -1147,6 +1159,9 @@ impl Messaging for RaftMessaging {
     }
 
     async fn group_lag(&self, topic: &str, group: &str) -> Result<usize, MessagingError> {
+        // M-A invariant: every grouped-op path that builds `mqgstate/{topic}/{group}` validates the
+        // group (consistency with `claim`/`ack`/`nack`; the operator surface is already authz'd).
+        messaging::check_group(group)?;
         let Some(raw) = self.state.get(&messaging::gstate_key(topic, group)).await else {
             return Ok(0);
         };
@@ -1608,6 +1623,8 @@ impl Messaging for RaftMessaging {
         group: &str,
         start: messaging::StartPosition,
     ) -> Result<(), MessagingError> {
+        // M-A invariant: validate the group before it keys `mqgstate/{topic}/{group}` (consistency).
+        messaging::check_group(group)?;
         // Refuse an unknown group (read from applied state); the apply recomputes hwm deterministically
         // from `start` so every replica lands the same cursor.
         if self
@@ -1630,6 +1647,8 @@ impl Messaging for RaftMessaging {
     }
 
     async fn delete_group(&self, topic: &str, group: &str) -> Result<(), MessagingError> {
+        // M-A invariant: validate the group before it keys `mqgstate/{topic}/{group}` (consistency).
+        messaging::check_group(group)?;
         self.propose(WriteOp::MqDeleteGroup {
             topic: topic.to_string(),
             group: group.to_string(),
@@ -3572,6 +3591,97 @@ mod tests {
         assert_conformance(mqs[&leader].as_ref(), "conformance/topic").await;
         shutdown(rafts).await;
         println!("MESSAGING WQ DLQ MATRIX OK [cluster]");
+    }
+
+    /// M-A (single/cluster PARITY): the fail-closed `/`-group backstop the single-node `LogMessaging`
+    /// carries (`grouped_ops_reject_a_slash_bearing_group` + `slash_group_cannot_collide_a_victim_group_keyspace`)
+    /// MUST also hold on the cluster `RaftMessaging` backend — a security backstop present in one
+    /// posture but not the other reopens M-A. The exploit: a WS consumer scoped to topic `orders`
+    /// forges an inline-ack with `group:"created/evil"` + a victim in-flight id to corrupt a victim
+    /// consumer's `orders/created` group state (message loss / lease reset). This mirrors the
+    /// single-node collision test for the cluster path: the forged `/`-group claim/ack/nack are
+    /// REFUSED before any key is composed, and the victim's group state is byte-identical afterward.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_slash_group_is_refused_and_cannot_collide_a_victim_keyspace() {
+        use boatramp_core::messaging::{StartPosition, gstate_key};
+        let (rafts, mqs) = cluster_mq(1).await;
+        let mq = mqs[&1].clone();
+
+        // Register the VICTIM group `created` on topic `orders`, publish, then claim one (left
+        // in-flight, unacked) so `mqgstate/orders/created` holds real state.
+        let _ = mq
+            .claim_grouped("orders", "created", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        mq.publish("orders", b"legit").await.unwrap();
+        let v = mq
+            .claim_grouped("orders", "created", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(v.len(), 1, "victim claims its one message");
+        let victim_key = gstate_key("orders", "created");
+        let before = mq.state.get(&victim_key).await;
+        assert!(before.is_some(), "victim group state exists");
+
+        // --- core parity: `RaftMessaging::claim_grouped` refuses a `/`-bearing group ---
+        assert!(
+            mq.claim_grouped(
+                "orders",
+                "created/evil",
+                StartPosition::Earliest,
+                LEASE,
+                10,
+                5
+            )
+            .await
+            .is_err(),
+            "RaftMessaging::claim_grouped must refuse a '/'-bearing group"
+        );
+
+        // --- the surface-fix shape: a forged inline-ack/nack handle reconstructs a `/`-group over a
+        //     REAL victim in-flight id; ack / nack / nack_after must refuse it before it keys state ---
+        let forged = ClaimedMessage {
+            id: v[0].id.clone(),
+            topic: "orders".into(),
+            payload: Vec::new(),
+            attempts: 1,
+            group: "created/evil".into(),
+            signed_context: None,
+            inline: false,
+        };
+        assert!(
+            mq.ack(&forged).await.is_err(),
+            "RaftMessaging::ack must refuse a '/'-group"
+        );
+        assert!(
+            mq.nack(&forged).await.is_err(),
+            "RaftMessaging::nack must refuse a '/'-group"
+        );
+        assert!(
+            mq.nack_after(&forged, 1000).await.is_err(),
+            "RaftMessaging::nack_after must refuse a '/'-group"
+        );
+
+        // The victim's group state is byte-identical — the exploit never touched it.
+        let after = mq.state.get(&victim_key).await;
+        assert_eq!(before, after, "the victim group state is untouched");
+
+        // The empty (work-queue) group and a clean group are still accepted.
+        assert!(
+            mq.claim_grouped("orders", "", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .is_ok(),
+            "the default work-queue (empty group) is unaffected"
+        );
+        assert!(
+            mq.claim_grouped("orders", "created", StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .is_ok(),
+            "a clean single-segment group is accepted"
+        );
+
+        shutdown(rafts).await;
     }
 
     fn payloads(msgs: &[ClaimedMessage]) -> Vec<Vec<u8>> {

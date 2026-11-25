@@ -656,8 +656,10 @@ pub(crate) struct AckHandle {
     /// The BARE topic (re-authorized on ack/nack; the full key is recomposed from the scope/path).
     pub(crate) topic: String,
     /// The consumer group ([`ClaimedMessage::group`]) — `""` for the default work queue; `ack`/
-    /// `nack` branch on it.
-    group: String,
+    /// `nack` branch on it. `pub(crate)` so the shared ack/nack surface (`handle_to_message`) can
+    /// re-validate it (M-A): the group rides inside this FORGEABLE handle, so it is screened as a
+    /// single clean key segment before it can key `mqgstate/{topic}/{group}` on either backend.
+    pub(crate) group: String,
     /// Whether the payload was inlined in the index record ([`ClaimedMessage::inline`]) — `ack`
     /// skips the object-store delete + adjusts the inline byte budget when set.
     inline: bool,
