@@ -3279,6 +3279,36 @@ jobs:
             || { echo "::error::rls_session adoption gate did not run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
           grep -q 'RLS ADOPT EXISTING DB OK \[postgres\]' rls-adopt.log \
             || { echo "::error::rls_session adoption invariant never reached its marker (the app role was not reconciled onto the existing DB, data did not survive, serving did not switch to the non-superuser app role / isolation broke, or the base credential was rotated)" >&2; exit 1; }
+      - name: rls_session ENGAGE on the SERVE path on a real Postgres (v0.72.1)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # v0.72.1 — the `rls_session` ENGAGE-on-serve fix (the lighthouse repro follow-up to the
+          # v0.71.1 adoption fix). Adopting the app role on an already-provisioned cell was not enough
+          # to actually SERVE under it, so two serve-path gaps stayed live: (A) a cold-boot ordering
+          # window where the serve listener binds before the detached reconcile provisions the app
+          # role — the serve path must PROVISION-THEN-SERVE (create the app role in place, fail-closed,
+          # BEFORE binding to it); and (b1) a live `apply` flip of rls_session -> on left the running
+          # node serving on its WARM cached bootstrap-SUPERUSER backend (RLS silently OFF until the
+          # pods cycled) — the adoption success path must INVALIDATE the serving-backend cache
+          # (`invalidate_serving_backend` -> a `sql_binding_epochs` bump) so the next request REBUILDS
+          # as the restricted app role, engaging RLS live with NO restart. This node gate drives BOTH
+          # through the REAL serving resolvers (NodeTenantSqlResolver + NodeDeclaredDbResolver) against
+          # a real PG, each with an invariant + a MUTATION witness (the stale-warm-cache hit), asserting
+          # never-serve-as-superuser-while-rls-on throughout (current_user is the non-superuser app role,
+          # the non-privilege probe reads 0, RLS binds with ZERO foreign rows). The BOATRAMP_TEST_PG_URL
+          # user is a superuser (CREATE DATABASE / ROLE / EVENT TRIGGER). A silent skip (URL unset) still
+          # prints `test result: ok`, so gate on BOTH markers, each of which prints ONLY after every
+          # engage + isolation assertion for its arm held.
+          cargo test -p boatramp-node --features sql-postgres \
+            --test rls_engage_live -- --ignored --test-threads=1 --nocapture 2>&1 | tee rls-engage.log
+          grep -qE 'test result: ok\. 2 passed' rls-engage.log \
+            || { echo "::error::rls_session engage-on-serve gates did not both run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
+          grep -q 'RLS ENGAGE LIVE OK \[provision-then-serve\]' rls-engage.log \
+            || { echo "::error::rls_session provision-then-serve (A) invariant never reached its marker (the cold-boot serve path did not create+bind the non-superuser app role before serving, the first query failed closed, or RLS/isolation broke)" >&2; exit 1; }
+          grep -q 'RLS ENGAGE LIVE OK \[live-apply\]' rls-engage.log \
+            || { echo "::error::rls_session live-apply (b1) engage invariant never reached its marker (the serving-backend cache was not invalidated on the rls-on flip, so RLS stayed silently off on the warm superuser backend without a restart)" >&2; exit 1; }
       - name: Owner-gated schema-migration owner-role confinement on a real Postgres (v0.4.25)
         env:
           BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp

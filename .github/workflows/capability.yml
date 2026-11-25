@@ -506,6 +506,48 @@ jobs:
           grep -q 'RLS ADOPT EXISTING DB OK \[postgres\]' rls-adopt.log \
             || { echo "::error::rls_session adoption invariant never reached the success marker (silent skip — pg/docker absent — or the app role was not reconciled onto the existing DB / data did not survive / serving did not switch to the non-superuser app role / the base credential was rotated)" >&2; exit 1; }
 
+      - name: rls_session ENGAGE on the SERVE path holds live (hard gate — the v0.72.1 fix)
+        run: |
+          set -o pipefail
+          # The load-bearing proof of the v0.72.1 `rls_session` ENGAGE-on-serve fix (the lighthouse
+          # repro follow-up to the v0.71.1 adoption fix): adopting the non-superuser app role on an
+          # already-provisioned cell was not enough to actually SERVE under it. Two serve-path gaps
+          # stayed live: (A) a cold-boot ordering window — the serve listener binds ~82ms before the
+          # detached reconcile's first tick, so a cold boot of an rls-on cell whose app role is not yet
+          # present could route to an absent role; the serve path now PROVISIONS-THEN-SERVES (creates
+          # the app role in place, fail-closed, BEFORE binding to it). (b1) a live `apply` flip of
+          # rls_session -> on left the running node serving on its WARM cached bootstrap-SUPERUSER
+          # backend (RLS silently OFF until the pods cycled); the adoption success path now INVALIDATES
+          # the serving-backend cache (a sql_binding_epochs bump) so the next request REBUILDS as the
+          # restricted app role, engaging RLS live with NO restart. This node gate drives BOTH through
+          # the REAL serving resolvers (NodeTenantSqlResolver + NodeDeclaredDbResolver) against a stock
+          # pgvector reached by its container IP as the SUPERUSER (needs CREATE DATABASE/ROLE + CREATE
+          # EVENT TRIGGER), each with an invariant + a MUTATION witness (the stale-warm-cache hit), and
+          # asserts never-serve-as-superuser-while-rls-on throughout (current_user is the non-superuser
+          # app role, the non-privilege probe reads 0, RLS binds with ZERO foreign rows). A silent skip
+          # (pg/docker absent) still prints `test result: ok`, so gate on BOTH markers, each of which
+          # prints ONLY after every engage + isolation assertion for its arm held.
+          docker rm -f rls-engage-pg >/dev/null 2>&1 || true
+          docker run -d --name rls-engage-pg -e POSTGRES_PASSWORD=postgres \
+            pgvector/pgvector:pg16 >/dev/null
+          for i in $(seq 1 60); do
+            docker exec rls-engage-pg pg_isready -U postgres >/dev/null 2>&1 && break
+            sleep 2
+          done
+          PGIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' rls-engage-pg)"
+          echo "pgvector bridge IP: $PGIP"
+          BOATRAMP_TEST_PG_URL="postgres://postgres:postgres@${PGIP}:5432/postgres" \
+            timeout -k 30 600 cargo test -p boatramp-node --features sql-postgres \
+            --test rls_engage_live \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee rls-engage.log
+          docker rm -f rls-engage-pg >/dev/null 2>&1 || true
+          grep -qE 'test result: ok' rls-engage.log \
+            || { echo "::error::rls_session engage-on-serve gate did not pass" >&2; exit 1; }
+          grep -q 'RLS ENGAGE LIVE OK \[provision-then-serve\]' rls-engage.log \
+            || { echo "::error::rls_session provision-then-serve (A) invariant never reached the success marker (silent skip — pg/docker absent — or the cold-boot serve path did not create+bind the non-superuser app role before serving / the first query failed closed / RLS isolation broke)" >&2; exit 1; }
+          grep -q 'RLS ENGAGE LIVE OK \[live-apply\]' rls-engage.log \
+            || { echo "::error::rls_session live-apply (b1) engage invariant never reached the success marker (silent skip — pg/docker absent — or the serving-backend cache was not invalidated on the rls-on flip, so RLS stayed silently off on the warm superuser backend without a restart)" >&2; exit 1; }
+
       - name: Single-mode per-tenant volume isolation holds live (hard gate — the v0.3.11 fix)
         run: |
           set -o pipefail
