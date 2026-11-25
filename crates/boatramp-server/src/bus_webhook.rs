@@ -73,11 +73,29 @@ pub const WEBHOOK_DRAIN_TICK: Duration = Duration::from_millis(1000);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Request headers carried on every signed webhook POST, so the receiver can verify the body and
-/// dedupe/observe a redelivery.
+/// dedupe/observe a redelivery. (N3) The signature now authenticates the id/attempt/timestamp/topic
+/// headers too, not just the body — see [`sign_webhook`] for the exact preimage.
 const HEADER_MESSAGE_ID: &str = "X-Boatramp-Message-Id";
 const HEADER_ATTEMPT: &str = "X-Boatramp-Message-Attempt";
 const HEADER_TOPIC: &str = "X-Boatramp-Topic";
 const HEADER_SIGNATURE: &str = "X-Boatramp-Signature";
+/// N3: the delivery timestamp (unix seconds), authenticated by the signature so a receiver has a
+/// replay window (reject a POST whose timestamp is too old).
+const HEADER_TIMESTAMP: &str = "X-Boatramp-Timestamp";
+
+/// N2: the minimum redelivery backoff (ms) a webhook sink's failed delivery is held for, regardless of
+/// the sink's configured `backoff_ms`. A sink with `backoff_ms: 0` (or unset ⇒ 0) would otherwise
+/// nack-to-NOW on every failure and hot-loop the delivery against a persistently-failing endpoint —
+/// hammering both the endpoint and the leader-serialized claim plane. The effective hold is
+/// `max(backoff_ms, MIN_WEBHOOK_BACKOFF_MS) × attempts`, so even an unconfigured sink spaces its
+/// retries. Applied in [`run_webhook_sink`] (the production drain path).
+const MIN_WEBHOOK_BACKOFF_MS: u64 = 250;
+
+/// N2: the effective per-sink redelivery backoff base — the sink's configured value floored to
+/// [`MIN_WEBHOOK_BACKOFF_MS`], so `backoff_ms: 0` cannot cause immediate-redelivery churn.
+fn webhook_backoff_ms(configured: u64) -> u64 {
+    configured.max(MIN_WEBHOOK_BACKOFF_MS)
+}
 
 // The KV-backed registry of runtime-registered sinks lives in
 // [`boatramp_core::webhook_sink::WebhookSinkStore`] (alongside the other project-record stores); the
@@ -129,14 +147,58 @@ async fn resolve_sink_url(
     Ok(SealedWebhookUrl::seal(url.to_string()))
 }
 
-/// Lowercase-hex HMAC-SHA256 of `body` under `key` (the per-sink signing key).
-fn hmac_sha256_hex(key: &[u8], body: &[u8]) -> String {
+/// N3 signing scheme tag — the first line of the HMAC preimage (see [`sign_webhook`]). Versioned so a
+/// future scheme change is unambiguous on the wire.
+const SIGN_SCHEME_TAG: &str = "boatramp-webhook-v1";
+
+/// Lowercase-hex HMAC-SHA256 **webhook signature** over the full, versioned preimage (N3):
+///
+/// ```text
+/// boatramp-webhook-v1\n{message-id}\n{attempt}\n{timestamp}\n{topic}\n{raw-body}
+/// ```
+///
+/// — the scheme tag then FOUR newline-terminated header fields (none of which contains a `\n`:
+/// `message-id` is `{millis}-{hex}`, `attempt`/`timestamp` are decimals, `topic` is a bus topic),
+/// followed by the raw payload bytes verbatim. So unlike the earlier body-only HMAC, the id
+/// ([`HEADER_MESSAGE_ID`]), attempt ([`HEADER_ATTEMPT`]), timestamp ([`HEADER_TIMESTAMP`], unix
+/// seconds) and topic ([`HEADER_TOPIC`]) headers are all AUTHENTICATED, and the timestamp gives a
+/// receiver a replay window. The field count is fixed, so a receiver splits off exactly 4 header
+/// lines after the tag and treats the remainder as the body — unambiguous even for a body containing
+/// `\n`. Emitted in [`HEADER_SIGNATURE`]. There are no receivers yet, so this defines the COMPLETE
+/// scheme now (the preimage + header names are the wire contract).
+fn sign_webhook(
+    key: &[u8],
+    id: &str,
+    attempt: u32,
+    timestamp: u64,
+    topic: &str,
+    body: &[u8],
+) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     // HMAC accepts a key of any length — `new_from_slice` is infallible for `Hmac`.
     let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(SIGN_SCHEME_TAG.as_bytes());
+    mac.update(b"\n");
+    mac.update(id.as_bytes());
+    mac.update(b"\n");
+    mac.update(attempt.to_string().as_bytes());
+    mac.update(b"\n");
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b"\n");
+    mac.update(topic.as_bytes());
+    mac.update(b"\n");
     mac.update(body);
     hex::encode(mac.finalize().into_bytes())
+}
+
+/// The current delivery timestamp in unix SECONDS (the value signed into the preimage + emitted as
+/// [`HEADER_TIMESTAMP`]).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The register-time SSRF-floor DECISION for a sink: unseal its URL (and require its sign secret to
@@ -162,7 +224,8 @@ pub(crate) async fn validate_sink_destination(
 /// Deliver ONE claimed message as a signed POST to the sink's destination — the per-message action of
 /// the pseudo-consumer. Unseal the URL + the HMAC key, run the destination through the SHARED SSRF
 /// floor + the per-sink `egress_allow` ([`ssrf_floored_post`]), and POST the RAW payload body signed
-/// with the per-sink key and carrying the message id + attempt count. `Ok(())` iff the sink returns
+/// with the per-sink key over the N3 preimage (see [`sign_webhook`] — the id / attempt / timestamp /
+/// topic headers are authenticated, not just the body). `Ok(())` iff the sink returns
 /// HTTP 2xx (the caller acks); any non-2xx / timeout / floor-refusal is a redacted `Err` (the caller
 /// nacks-with-backoff). `allow_loopback_http` is a live-gate fixture (`false` in all production wiring)
 /// that lets the runtime gate reach a loopback mock sink.
@@ -175,7 +238,19 @@ pub(crate) async fn deliver_webhook_message(
 ) -> Result<(), String> {
     let url = resolve_sink_url(secret_store, project, sink).await?;
     let sign_key = resolve_sealed_ref(secret_store, project, &sink.sign_secret).await?;
-    let signature = hmac_sha256_hex(&sign_key, &msg.payload);
+
+    // N3: sign the FULL preimage (scheme tag + id + attempt + timestamp + topic + body), not just the
+    // body — so the id/attempt/timestamp/topic headers are authenticated and the timestamp gives a
+    // receiver a replay window.
+    let timestamp = now_unix_secs();
+    let signature = sign_webhook(
+        &sign_key,
+        &msg.id,
+        msg.attempts,
+        timestamp,
+        &sink.topic,
+        &msg.payload,
+    );
 
     // `allow_private` is operator-only and ABSENT from a sink record, so the only relaxation of the
     // floor is the mutation seam (`false` in a shipped build) — a consumer can NEVER widen it.
@@ -184,6 +259,7 @@ pub(crate) async fn deliver_webhook_message(
     let body = msg.payload.clone();
     let id = msg.id.clone();
     let attempt = msg.attempts.to_string();
+    let timestamp_hdr = timestamp.to_string();
     let topic = sink.topic.clone();
 
     let resp = ssrf_floored_post(
@@ -194,6 +270,7 @@ pub(crate) async fn deliver_webhook_message(
         move |rb| {
             rb.header(HEADER_MESSAGE_ID, id)
                 .header(HEADER_ATTEMPT, attempt)
+                .header(HEADER_TIMESTAMP, timestamp_hdr)
                 .header(HEADER_TOPIC, topic)
                 .header(HEADER_SIGNATURE, signature)
                 .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -269,6 +346,9 @@ async fn run_webhook_sink(
 ) {
     let key = bus_namespace(&ProjectRef::new(&project), &sink.topic);
     let sub = sink.subscription().resolve();
+    // N2: floor the redelivery backoff so a `backoff_ms: 0` (or unset) sink can't hot-loop its
+    // redeliveries against a failing endpoint / the leader-serialized claim plane.
+    let backoff_ms = webhook_backoff_ms(sub.backoff_ms);
     let wake = messaging.wake_handle();
     loop {
         let batch = match crate::bus_consumer::pump_until_batch(
@@ -291,7 +371,7 @@ async fn run_webhook_sink(
             let outcome =
                 deliver_webhook_message(&secret_store, &project, &sink, msg, allow_loopback_http)
                     .await;
-            settle_delivery(messaging.as_ref(), &sink, msg, sub.backoff_ms, outcome).await;
+            settle_delivery(messaging.as_ref(), &sink, msg, backoff_ms, outcome).await;
         }
     }
 }
@@ -841,24 +921,114 @@ mod tests {
             reqs[0].body, b"order-42",
             "the raw payload is the POST body"
         );
-        let expect_sig = hmac_sha256_hex(b"topsecret-hmac-key", b"order-42");
+        // N3: the signature covers the FULL preimage (scheme tag + id + attempt + timestamp + topic +
+        // body), so recompute it from the headers the POST actually carried and assert it matches —
+        // proving the id/attempt/timestamp/topic headers are all authenticated, not just the body.
+        let h = &reqs[0].headers;
+        let id = h.get("x-boatramp-message-id").expect("message-id header");
+        let attempt: u32 = h
+            .get("x-boatramp-message-attempt")
+            .expect("attempt header")
+            .parse()
+            .expect("attempt is a number");
+        let timestamp: u64 = h
+            .get("x-boatramp-timestamp")
+            .expect("timestamp header (N3)")
+            .parse()
+            .expect("timestamp is a number");
+        let topic = h.get("x-boatramp-topic").expect("topic header");
+        assert_eq!(attempt, 1, "the POST must carry the attempt count");
+        let expect_sig = sign_webhook(
+            b"topsecret-hmac-key",
+            id,
+            attempt,
+            timestamp,
+            topic,
+            b"order-42",
+        );
         assert_eq!(
-            reqs[0].headers.get("x-boatramp-signature"),
+            h.get("x-boatramp-signature"),
             Some(&expect_sig),
-            "the POST must carry the per-sink HMAC-SHA256 of the body"
+            "the signature must be the per-sink HMAC-SHA256 over the full N3 preimage"
+        );
+        // Flipping any authenticated field changes the signature (the headers are bound, not just the
+        // body): a signature computed with the WRONG attempt must not match.
+        let wrong = sign_webhook(
+            b"topsecret-hmac-key",
+            id,
+            attempt + 1,
+            timestamp,
+            topic,
+            b"order-42",
+        );
+        assert_ne!(
+            h.get("x-boatramp-signature"),
+            Some(&wrong),
+            "the signature must bind the attempt header (a different attempt → a different signature)"
+        );
+    }
+
+    // N2: the redelivery backoff is floored to `MIN_WEBHOOK_BACKOFF_MS`, so a `backoff_ms: 0` (or
+    // unset) sink cannot hot-loop its redeliveries; a configured value above the floor is unchanged.
+    #[test]
+    fn webhook_backoff_is_floored() {
+        assert_eq!(
+            webhook_backoff_ms(0),
+            MIN_WEBHOOK_BACKOFF_MS,
+            "0 is floored"
         );
         assert_eq!(
-            reqs[0]
-                .headers
-                .get("x-boatramp-message-attempt")
-                .map(String::as_str),
-            Some("1"),
-            "the POST must carry the attempt count"
+            webhook_backoff_ms(MIN_WEBHOOK_BACKOFF_MS / 2),
+            MIN_WEBHOOK_BACKOFF_MS,
+            "a sub-floor value is raised to the floor"
         );
-        assert!(
-            reqs[0].headers.contains_key("x-boatramp-message-id"),
-            "the POST must carry the message id"
+        let big = MIN_WEBHOOK_BACKOFF_MS * 40;
+        assert_eq!(
+            webhook_backoff_ms(big),
+            big,
+            "a value above the floor is unchanged"
         );
+    }
+
+    // N3: the signature is a deterministic HMAC over the FULL preimage and is sensitive to EVERY
+    // authenticated field (id / attempt / timestamp / topic / body) — flipping any one changes it.
+    #[test]
+    fn webhook_signature_binds_every_preimage_field() {
+        let key = b"k";
+        let base = sign_webhook(key, "1-ab", 1, 1_700_000_000, "orders/created", b"body");
+        assert_eq!(
+            base,
+            sign_webhook(key, "1-ab", 1, 1_700_000_000, "orders/created", b"body"),
+            "deterministic for identical inputs"
+        );
+        for (label, sig) in [
+            (
+                "id",
+                sign_webhook(key, "2-cd", 1, 1_700_000_000, "orders/created", b"body"),
+            ),
+            (
+                "attempt",
+                sign_webhook(key, "1-ab", 2, 1_700_000_000, "orders/created", b"body"),
+            ),
+            (
+                "timestamp",
+                sign_webhook(key, "1-ab", 1, 1_700_000_001, "orders/created", b"body"),
+            ),
+            (
+                "topic",
+                sign_webhook(key, "1-ab", 1, 1_700_000_000, "orders/other", b"body"),
+            ),
+            (
+                "body",
+                sign_webhook(key, "1-ab", 1, 1_700_000_000, "orders/created", b"body2"),
+            ),
+            (
+                "key",
+                sign_webhook(b"k2", "1-ab", 1, 1_700_000_000, "orders/created", b"body"),
+            ),
+        ] {
+            assert_ne!(base, sig, "changing the {label} must change the signature");
+        }
     }
 
     /// RUNTIME GATE D (non-2xx ⇒ redeliver with `backoff_ms × attempts`, then DLQ) — a sink that
@@ -1025,7 +1195,13 @@ mod tests {
     /// pointed at the cloud-metadata endpoint, an RFC1918 address, or loopback is refused by the
     /// allowlist + the `is_global_ip` floor at register-time (`validate_sink_destination`) AND at
     /// delivery-time (`deliver_webhook_message`), with production flags (no loopback-http, no bypass).
+    ///
+    /// Serialized on the SAME `health_alert_mutation` key as the bypass-seam gate: both read the
+    /// process-global `ssrf_bypass_active` (an env var the bypass gate sets/clears), so without this
+    /// they can overlap and the armed bypass would transiently admit the internal URL this test
+    /// expects refused (a pre-existing cross-test env-var race).
     #[tokio::test]
+    #[serial_test::serial(health_alert_mutation)]
     async fn gate_d_internal_url_refused_at_register_and_delivery() {
         let m = substrate();
         for target in [

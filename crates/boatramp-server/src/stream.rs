@@ -31,6 +31,32 @@ pub(super) const DEFAULT_STREAM_CONNECTIONS: u32 = 256;
 #[cfg(feature = "handlers")]
 const MAX_STREAMS_PER_IP: u32 = 8;
 
+/// The shared WebSocket **proactive-ping** interval both WS serve loops use (the configured-stream
+/// `serve_ws_stream` and the durable bus-consumer `serve_bus_ws`). A half-open WS — the peer gone but
+/// the TCP connection not yet torn down — would otherwise hold its connection permit + task until the
+/// OS eventually reaps the socket. Firing a `Ping` every [`STREAM_HEARTBEAT`] detects it: a dead TCP
+/// errors the `sink.send`, and a silent peer that answers nothing trips the idle close
+/// ([`ws_idle_deadline`]) when no inbound frame (a pong counts) arrives within [`STREAM_IDLE_TIMEOUT`].
+/// The first tick is one interval out (not immediate), so a freshly-opened socket is not pinged before
+/// it has done anything.
+#[cfg(feature = "handlers")]
+pub(super) fn ws_ping_interval() -> tokio::time::Interval {
+    let period = STREAM_HEARTBEAT;
+    let mut iv = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    iv
+}
+
+/// The shared WS **idle deadline**: the instant a WS connection is closed if no inbound frame has
+/// arrived since (a client data/ack frame, or a pong answering our [`ws_ping_interval`] ping). Both WS
+/// loops seed one at accept and push it out ([`ws_idle_deadline`] again) on every inbound frame; the
+/// ping-tick arm closes the socket once `now >= deadline`. Reuses the SAME [`STREAM_IDLE_TIMEOUT`] the
+/// SSE path closes a quiet stream after, so all stream transports share one idle bound.
+#[cfg(feature = "handlers")]
+pub(super) fn ws_idle_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT
+}
+
 /// Whether a config route pattern matches `request_path` (leading-slash
 /// normalised), mirroring [`route::match_handler`]'s path handling.
 #[cfg(feature = "handlers")]
@@ -1197,6 +1223,10 @@ pub(super) async fn serve_ws_stream(
         // they drop (releasing the slot) when this task ends.
         let _permits = (site_permit, ip_guard);
         let (mut sink, mut incoming) = socket.split();
+        // #7: proactive ping + idle close, so a half-open WS does not hold its permit+task until TCP
+        // teardown. Any inbound frame (data OR a pong) pushes the idle deadline out.
+        let mut ping = ws_ping_interval();
+        let mut idle_deadline = ws_idle_deadline();
         loop {
             tokio::select! {
                 // Forward a subscription payload to the client (binary frame).
@@ -1208,22 +1238,34 @@ pub(super) async fn serve_ws_stream(
                     }
                     None => break, // all topics ended
                 },
-                // Publish a client message upstream; close on disconnect.
-                msg = incoming.next() => match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Some(topic) = &publish_topic {
-                            let _ = messaging.publish(topic, text.as_bytes()).await;
+                // Publish a client message upstream; close on disconnect. Any inbound frame is activity.
+                msg = incoming.next() => {
+                    idle_deadline = ws_idle_deadline();
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Some(topic) = &publish_topic {
+                                let _ = messaging.publish(topic, text.as_bytes()).await;
+                            }
                         }
-                    }
-                    Some(Ok(Message::Binary(bytes))) => {
-                        if let Some(topic) = &publish_topic {
-                            let _ = messaging.publish(topic, &bytes).await;
+                        Some(Ok(Message::Binary(bytes))) => {
+                            if let Some(topic) = &publish_topic {
+                                let _ = messaging.publish(topic, &bytes).await;
+                            }
                         }
+                        // Ping/Pong/Close: tungstenite auto-answers pings; ignore the rest.
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {}
                     }
-                    // Ping/Pong/Close: tungstenite auto-answers pings; ignore the rest.
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(_)) => {}
                 },
+                // Proactive ping; close if the peer has been silent past the idle deadline (half-open).
+                _ = ping.tick() => {
+                    if tokio::time::Instant::now() >= idle_deadline {
+                        break;
+                    }
+                    if sink.send(Message::Ping(Vec::new())).await.is_err() {
+                        break; // dead TCP
+                    }
+                }
             }
         }
     });

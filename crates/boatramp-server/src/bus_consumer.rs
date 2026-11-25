@@ -41,6 +41,25 @@ use crate::project_scope::ProjectContext;
 /// while keeping idle connections bounded.
 const MAX_WAIT_MS: u64 = 300_000;
 
+/// Validate a request-supplied consumer `group` query param as a single clean key segment (M-A, N6):
+/// a non-empty group that is not a clean segment is refused with a clear `400` HERE — the loud-early
+/// surface over the fail-closed durable-core backstop. Empty ⇒ the default work-queue (allowed). A
+/// `/`-bearing group would key `mqgstate/{topic}/{group}` so as to collide a victim group's per-topic
+/// keyspace / cross the per-topic authz grain, so it never reaches the claim.
+#[cfg(feature = "handlers")]
+fn reject_bad_group(group: &str) -> Result<(), Response> {
+    if group.is_empty() {
+        return Ok(());
+    }
+    boatramp_core::project::validate_consumer_group(group).map_err(|reason| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid group {group:?}: {reason}\n"),
+        )
+            .into_response()
+    })
+}
+
 /// Query params for `POST …/bus/claim/{*topic}` — the [`Messaging::claim_grouped`] knobs plus the
 /// long-poll `wait_ms`. All optional; absent ⇒ the server defaults. `max` is clamped to
 /// `[1, `[`SubscriptionParams::MAX_BATCH`]`]` and `wait_ms` to `[0, `[`MAX_WAIT_MS`]`]`, EXACTLY as
@@ -202,22 +221,66 @@ pub(crate) async fn bus_claim(
     Extension(project): Extension<ProjectContext>,
     Path((_project_seg, topic)): Path<(String, String)>,
     Query(q): Query<ClaimQuery>,
+    request: Request,
 ) -> Response {
     let messaging = match messaging_or_unavailable(&handlers) {
         Ok(m) => m,
         Err(resp) => return resp,
+    };
+    // L-3: the long-poll must take a per-scope + per-IP concurrency permit (like the stream path),
+    // so an authenticated consumer can't hold unbounded concurrent long-polls, each up to MAX_WAIT_MS.
+    // Reuse the shared stream-permit pools (same `{project}/bus/<topic>` scope as the durable stream).
+    let Some(inner) = handlers.inner.as_ref() else {
+        return not_found();
     };
     // Screen the topic (traversal / control bytes / reserved namespace) BEFORE composing the key —
     // the SAME fail-closed screen the shim's claim runs, so a `..`/absolute topic can't escape the bus.
     if let Err(e) = validate_object_key(&topic) {
         return (StatusCode::BAD_REQUEST, format!("invalid topic: {e}\n")).into_response();
     }
+    // M-A (N6): refuse a `/`-bearing (or otherwise non-segment) group with a clear 400 before claiming.
+    let group = q.group.clone().unwrap_or_default();
+    if let Err(resp) = reject_bad_group(&group) {
+        return resp;
+    }
     let key = bus_namespace(&project.as_ref(), &topic);
+
+    // L-3: cap the long-poll on the shared per-scope + per-IP stream pools (deny before the hang),
+    // keyed by the full `{project}/bus/<topic>` so bus and configured-stream scopes never collide.
+    let client_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip())
+        .unwrap_or(IpAddr::from([0u8, 0, 0, 0]));
+    let _site_permit = match crate::stream::acquire_stream_permit_capped(
+        inner,
+        &key,
+        crate::stream::DEFAULT_STREAM_CONNECTIONS,
+    ) {
+        Ok(p) => p,
+        Err(()) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bus claim connection limit reached\n",
+            )
+                .into_response();
+        }
+    };
+    let _ip_guard = match crate::stream::acquire_stream_ip_slot(inner, &key, client_ip) {
+        Ok(g) => g,
+        Err(()) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "per-client bus claim connection limit reached\n",
+            )
+                .into_response();
+        }
+    };
 
     // Clamp exactly as the messaging-shim's claim handler: batch default = lease-ONE, capped to
     // MAX_BATCH; lease/attempts to the server defaults; wait_ms to a bounded max (no unbounded hang).
     let params = SubscriptionParams {
-        group: q.group.unwrap_or_default(),
+        group,
         start: q.start.unwrap_or_default(),
         lease_ms: q.lease_ms,
         max_attempts: q.max_attempts,
@@ -229,6 +292,7 @@ pub(crate) async fn bus_claim(
     let sub = params.resolve_with_default_batch(SubscriptionParams::DEFAULT_CLAIM_BATCH);
     let wait = Duration::from_millis(q.wait_ms.unwrap_or(0).min(MAX_WAIT_MS));
 
+    // The permit + IP guard are held for the whole (possibly long) claim, released on return.
     match long_poll_claim(messaging.as_ref(), &key, &sub, wait).await {
         Ok(claimed) => {
             let messages = claimed
@@ -478,12 +542,18 @@ pub(crate) async fn bus_subscribe(
     if let Err(e) = validate_object_key(&topic) {
         return (StatusCode::BAD_REQUEST, format!("invalid topic: {e}\n")).into_response();
     }
+    // M-A (N6): refuse a `/`-bearing (or otherwise non-segment) group with a clear 400 before the
+    // subscription opens (loud-early over the fail-closed core backstop).
+    let group = q.group.clone().unwrap_or_default();
+    if let Err(resp) = reject_bad_group(&group) {
+        return resp;
+    }
     let key = bus_namespace(&project.as_ref(), &topic);
 
     // Resolve the subscription knobs with the STREAM batch default (16, per-tick), clamped identically
     // to the shim/claim (lease/attempts/batch caps + `MAX_BATCH`).
     let params = SubscriptionParams {
-        group: q.group.unwrap_or_default(),
+        group,
         start: q.start.unwrap_or_default(),
         lease_ms: q.lease_ms,
         max_attempts: q.max_attempts,
@@ -734,20 +804,31 @@ async fn serve_bus_ws(
         let socket =
             tokio_tungstenite::WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
         let (mut sink, mut incoming) = socket.split();
+        // #7: proactive ping + idle close, so a half-open WS does not hold its permit + pump task
+        // until TCP teardown. Any inbound frame (an ack/nack, or a pong) is activity and pushes the
+        // idle deadline out. The idle close aborts the pump (below) — but that is a CONNECTION close,
+        // not an inbound ack cancelling an in-flight claim: the pump runs as its OWN task, so an
+        // inbound ack never cancels a claim (at-least-once holds); a dropped in-flight claim on close
+        // simply redelivers on lease expiry.
+        let mut ping = crate::stream::ws_ping_interval();
+        let mut idle_deadline = crate::stream::ws_idle_deadline();
         loop {
             tokio::select! {
                 biased;
                 // Inbound ack/nack frames FIRST (biased), so acks stay prompt and back-pressure drains.
-                msg = incoming.next() => match msg {
-                    Some(Ok(Message::Text(t))) => {
-                        handle_ws_ack(messaging.as_ref(), &project, &topic, t.as_bytes()).await;
+                msg = incoming.next() => {
+                    idle_deadline = crate::stream::ws_idle_deadline();
+                    match msg {
+                        Some(Ok(Message::Text(t))) => {
+                            handle_ws_ack(messaging.as_ref(), &project, &topic, t.as_bytes()).await;
+                        }
+                        Some(Ok(Message::Binary(b))) => {
+                            handle_ws_ack(messaging.as_ref(), &project, &topic, &b).await;
+                        }
+                        // Close / error / end-of-stream: tungstenite auto-answers pings; stop otherwise.
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {}
                     }
-                    Some(Ok(Message::Binary(b))) => {
-                        handle_ws_ack(messaging.as_ref(), &project, &topic, &b).await;
-                    }
-                    // Close / error / end-of-stream: tungstenite auto-answers pings; stop otherwise.
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(_)) => {}
                 },
                 // A durable delivery → one Text frame carrying the opaque handle.
                 delivered = rx.recv() => match delivered {
@@ -760,6 +841,15 @@ async fn serve_bus_ws(
                     }
                     None => break, // pump ended (backend fault)
                 },
+                // Proactive ping; close if the peer has been silent past the idle deadline (half-open).
+                _ = ping.tick() => {
+                    if tokio::time::Instant::now() >= idle_deadline {
+                        break;
+                    }
+                    if sink.send(Message::Ping(Vec::new())).await.is_err() {
+                        break; // dead TCP
+                    }
+                }
             }
         }
         pump_task.abort();
@@ -1110,6 +1200,66 @@ mod tests {
             (2..=5).contains(&claims_used),
             "expected a small constant number of claim calls (initial empty + post-wake); \
              got {claims_used} — a busy-poll would be hundreds"
+        );
+    }
+
+    /// L-2 GATE — the node wake is MULTI-WAITER: two concurrent long-polls (distinct fan-out groups on
+    /// one topic) BOTH wake on a SINGLE publish and each delivers the message. Before the fix, the
+    /// single `AtomicWaker` let the second long-poll's registration overwrite the first's, so only one
+    /// woke on the publish and the other fell to its deadline (returning empty).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn two_long_polls_both_wake_on_one_publish() {
+        let (_counting, m) = substrate();
+        let key = "acme/bus/orders/created".to_string();
+        let mk_sub = |group: &str| {
+            SubscriptionParams {
+                group: group.to_string(),
+                start: StartPosition::Earliest,
+                ..Default::default()
+            }
+            .resolve_with_default_batch(SubscriptionParams::DEFAULT_CLAIM_BATCH)
+        };
+        // Two fan-out groups: each independently receives every message on the topic.
+        let (m1, m2) = (m.clone(), m.clone());
+        let (k1, k2) = (key.clone(), key.clone());
+        let (s1, s2) = (mk_sub("g1"), mk_sub("g2"));
+        let a = tokio::spawn(async move {
+            long_poll_claim(m1.as_ref(), &k1, &s1, Duration::from_secs(5)).await
+        });
+        let b = tokio::spawn(async move {
+            long_poll_claim(m2.as_ref(), &k2, &s2, Duration::from_secs(5)).await
+        });
+        // Let both long-polls do their initial (empty) claim and PARK on the shared node wake.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // ONE publish → ONE node wake pulse. Both parked long-polls must wake and claim.
+        m.publish(&key, b"fanout").await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(3), async {
+            (a.await.unwrap().unwrap(), b.await.unwrap().unwrap())
+        })
+        .await
+        .expect("both long-polls must wake on the single publish (not fall to the 5s deadline)");
+        assert_eq!(got.0.len(), 1, "group g1 woke and claimed the message");
+        assert_eq!(got.1.len(), 1, "group g2 woke and claimed the message");
+        assert_eq!(got.0[0].payload, b"fanout");
+        assert_eq!(got.1[0].payload, b"fanout");
+    }
+
+    /// M-A (N6) surface: the long-poll / stream group-param guard refuses a `/`-bearing (or otherwise
+    /// non-segment) group, while the empty group (default work-queue) and a clean segment pass. (The
+    /// handlers return this as a 400; the guard is the unit under test.)
+    #[test]
+    fn surface_group_guard_rejects_bad_groups() {
+        assert!(reject_bad_group("").is_ok(), "empty = default work-queue");
+        assert!(reject_bad_group("fulfillment").is_ok(), "a clean segment");
+        assert!(
+            reject_bad_group("created/evil").is_err(),
+            "a '/'-group is refused"
+        );
+        assert!(reject_bad_group("..").is_err(), "traversal is refused");
+        assert!(
+            reject_bad_group("with space").is_err(),
+            "whitespace is refused"
         );
     }
 

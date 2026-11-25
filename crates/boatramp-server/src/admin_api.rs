@@ -217,6 +217,37 @@ pub(super) async fn activate_deployment(
                 )
                     .into_response();
             }
+            // N1: a config-declared `routing.webhook_sinks` sink gets the register-time SSRF floor
+            // HERE, at apply (activate) — the same floor the runtime `PUT .../bus/sinks/{name}` surface
+            // runs — so a sink pointed at an internal/metadata/loopback address fails LOUD at activation
+            // instead of silently dead-lettering at delivery. Needs the secret store (to unseal the
+            // destination); when it is unwired the sink keeps only its delivery-time floor (the
+            // asymmetry is documented on `DeployConfig::webhook_sinks`). DNS resolution here mirrors the
+            // runtime PUT, so an unresolvable destination fails activation the same way.
+            #[cfg(feature = "handlers")]
+            if !manifest.config.webhook_sinks.is_empty()
+                && let Some(secret_store) = handlers.secret_store()
+            {
+                for sink in &manifest.config.webhook_sinks {
+                    if let Err(reason) = crate::bus_webhook::validate_sink_destination(
+                        secret_store.as_ref(),
+                        &project.0,
+                        sink,
+                    )
+                    .await
+                    {
+                        tracing::warn!(site, id, sink = %sink.name, reason, "activation refused: webhook sink destination");
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            format!(
+                                "webhook sink {:?} destination refused: {reason}\n",
+                                sink.name
+                            ),
+                        )
+                            .into_response();
+                    }
+                }
+            }
         }
         // A missing manifest falls through; `activate` returns the NotFound error.
         Ok(None) => {}
