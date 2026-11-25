@@ -5865,6 +5865,284 @@ fn base64_encode_bytes(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+// ---- CORS for native (host-served) SSE streams (StreamConfig::cors_allowed_origins) ----
+//
+// A native stream has no guest to emit `Access-Control-*`, so the host wires CORS onto the serving
+// path itself: it answers the preflight `OPTIONS` and echoes `Access-Control-Allow-Origin` (for an
+// allowlisted origin only) onto the SSE response — reusing the control-plane allowlist machinery.
+
+#[cfg(feature = "handlers")]
+const STREAM_CORS_ORIGIN: &str = "https://app.example.com";
+
+/// Build a router serving an SSE stream at `/_sites/blog/events` over `orders/created`, with the
+/// given per-stream CORS `allowlist`. Returns the app (one-shot) plus the `LogMessaging` handle so a
+/// test can publish into the fan-out. Mirrors `stream_route_fans_out_text_and_binary_events`.
+#[cfg(feature = "handlers")]
+async fn stream_cors_app(
+    allowlist: &[&str],
+) -> (
+    axum::Router,
+    std::sync::Arc<boatramp_core::messaging::LogMessaging>,
+) {
+    use boatramp_core::config::{HandlersSiteConfig, StreamConfig};
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let manifest = Manifest {
+        files: BTreeMap::new(),
+        config: DeployConfig {
+            streams: vec![StreamConfig {
+                route: "/events".to_string(),
+                topics: vec!["orders/created".to_string()],
+                cors_allowed_origins: allowlist.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "blog",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let log = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+    let messaging: Arc<dyn Messaging> = log.clone();
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, None, Some(messaging));
+    let app = router(deploy, Auth::disabled(), runtime);
+    (app, log)
+}
+
+#[cfg(feature = "handlers")]
+fn stream_cors_conn(mut req: Request<Body>) -> Request<Body> {
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    req
+}
+
+#[cfg(feature = "handlers")]
+fn stream_cors_vary_has_origin(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all(header::VARY)
+        .iter()
+        .any(|v| v.as_bytes().eq_ignore_ascii_case(b"origin"))
+}
+
+/// A preflight `OPTIONS` from an allowed origin is answered by the host (the stream dispatch only
+/// serves GET/POST, so without this it would 404): `204` + echoed origin, the stream allow-methods
+/// (`GET, POST, OPTIONS`), the echoed request headers, `Max-Age`, and `Vary: Origin`.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_cors_preflight_from_allowed_origin() {
+    let (app, _log) = stream_cors_app(&[STREAM_CORS_ORIGIN]).await;
+
+    let req = stream_cors_conn(
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/_sites/blog/events")
+            .header(header::ORIGIN, STREAM_CORS_ORIGIN)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "last-event-id")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let headers = resp.headers();
+    assert_eq!(
+        headers[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        STREAM_CORS_ORIGIN
+    );
+    assert_eq!(
+        headers[header::ACCESS_CONTROL_ALLOW_METHODS],
+        "GET, POST, OPTIONS"
+    );
+    assert_eq!(
+        headers[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "last-event-id"
+    );
+    assert!(headers.contains_key(header::ACCESS_CONTROL_MAX_AGE));
+    assert!(stream_cors_vary_has_origin(headers));
+}
+
+/// A preflight from a NON-allowlisted origin is answered (allowlist is configured) but carries **no**
+/// `Access-Control-*` headers — so the browser blocks the cross-origin stream.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_cors_preflight_from_disallowed_origin_gets_no_headers() {
+    let (app, _log) = stream_cors_app(&[STREAM_CORS_ORIGIN]).await;
+
+    let req = stream_cors_conn(
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/_sites/blog/events")
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !resp
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    );
+}
+
+/// The actual SSE `GET` from an allowed origin echoes `Access-Control-Allow-Origin` + `Vary: Origin`,
+/// and the stream still works (a published event is framed verbatim) — CORS doesn't disturb the SSE
+/// body.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_cors_sse_get_echoes_allowed_origin_and_streams() {
+    use std::time::Duration;
+    let (app, log) = stream_cors_app(&[STREAM_CORS_ORIGIN]).await;
+
+    let req = stream_cors_conn(
+        Request::builder()
+            .method("GET")
+            .uri("/_sites/blog/events")
+            .header(header::ORIGIN, STREAM_CORS_ORIGIN)
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let response = app.oneshot(req).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("text/event-stream"))
+    );
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        STREAM_CORS_ORIGIN
+    );
+    assert!(stream_cors_vary_has_origin(response.headers()));
+
+    // SSE framing is intact: a publish reaches the connection as a verbatim event.
+    use boatramp_core::messaging::Messaging;
+    let mut body = response.into_body().into_data_stream();
+    log.publish("default/blog/orders/created", b"hello")
+        .await
+        .unwrap();
+    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("timed out waiting for event")
+        .expect("stream ended")
+        .expect("body error");
+    let text = String::from_utf8_lossy(&chunk);
+    assert!(text.contains("event: orders/created"), "got: {text:?}");
+    assert!(text.contains("data: hello"), "got: {text:?}");
+}
+
+/// An SSE `GET` from a NON-allowlisted origin gets no `Access-Control-Allow-Origin` (the browser
+/// blocks it) — the host never reflects an unmatched origin.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_cors_sse_get_from_disallowed_origin_gets_no_headers() {
+    let (app, _log) = stream_cors_app(&[STREAM_CORS_ORIGIN]).await;
+
+    let req = stream_cors_conn(
+        Request::builder()
+            .method("GET")
+            .uri("/_sites/blog/events")
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let response = app.oneshot(req).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("text/event-stream"))
+    );
+    assert!(
+        !response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    );
+}
+
+/// With NO allowlist configured (the default), the SSE stream is served with no `Access-Control-*`
+/// headers at all — the same-origin default is unchanged — and a preflight `OPTIONS` is NOT
+/// short-circuited (it is not a stream method, so it falls through, unchanged).
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_cors_off_by_default_no_headers() {
+    // GET with an Origin but no allowlist → served, no CORS headers.
+    let (app, _log) = stream_cors_app(&[]).await;
+    let req = stream_cors_conn(
+        Request::builder()
+            .method("GET")
+            .uri("/_sites/blog/events")
+            .header(header::ORIGIN, STREAM_CORS_ORIGIN)
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("text/event-stream"))
+    );
+    assert!(
+        !response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    );
+
+    // OPTIONS preflight with no allowlist → not short-circuited (no CORS headers).
+    let (app2, _log2) = stream_cors_app(&[]).await;
+    let req2 = stream_cors_conn(
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/_sites/blog/events")
+            .header(header::ORIGIN, STREAM_CORS_ORIGIN)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp2 = app2.oneshot(req2).await.unwrap();
+    assert!(
+        !resp2
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    );
+}
+
 /// #14 — the host `stream` subscription scope is project-qualified, so (a) a publish at the
 /// PROJECT-QUALIFIED scope `default/blog/<topic>` — exactly where a deployed handler's
 /// `wasi:messaging` binding lands (`ProjectRef::qualified`) — DOES fan out to the subscriber (the
@@ -6267,6 +6545,7 @@ async fn websocket_stream_fans_out_and_publishes() {
                 websocket: true,
                 publish_topic: Some("ingest".to_string()),
                 authz: None,
+                ..Default::default()
             }],
             ..Default::default()
         },

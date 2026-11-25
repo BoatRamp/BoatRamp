@@ -3500,12 +3500,83 @@ const CORS_ALLOW_METHODS: &str = "GET, POST, PUT, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "authorization, content-type";
 /// How long a browser may cache a preflight result (seconds).
 const CORS_MAX_AGE: &str = "600";
+/// Methods a native (host-served) stream route exposes; advertised in its
+/// preflight response. A stream serves a `GET` (SSE, or a WebSocket upgrade) and
+/// a Connect/gRPC-web server-stream `POST`; `OPTIONS` is the preflight itself.
+/// Only the `handlers`-gated stream serving path consumes it.
+#[cfg(feature = "handlers")]
+pub(crate) const CORS_STREAM_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 
 /// Whether `origin` is permitted by the configured allowlist. `*` allows any
 /// origin (the specific origin is still echoed back, with `Vary: Origin`);
 /// otherwise the match is an exact `scheme://host[:port]` comparison.
 fn cors_origin_allowed(allowed: &[String], origin: &str) -> bool {
     allowed.iter().any(|a| a == "*" || a == origin)
+}
+
+/// The request's `Origin` iff the allowlist permits it — the single matching
+/// seam shared by the control-plane middleware and the native-stream serving
+/// path. Returns `None` for an absent or non-allowlisted origin (so neither
+/// path ever reflects an unmatched origin, and `*` echoes the specific origin,
+/// never literal `*`).
+pub(crate) fn cors_matched_origin(allowed: &[String], req_headers: &HeaderMap) -> Option<String> {
+    req_headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .filter(|o| cors_origin_allowed(allowed, o))
+        .map(str::to_string)
+}
+
+/// Echo `Access-Control-Allow-Origin` (+ append `Vary: Origin`) onto an actual
+/// (non-preflight) response for a `cors_matched_origin`. `None` ⇒ nothing is set,
+/// so a disallowed/absent origin gets no `Access-Control-*` header and the
+/// browser blocks the cross-origin read. Never emits `*` and never sets
+/// `Access-Control-Allow-Credentials`.
+pub(crate) fn cors_apply_actual(response: &mut Response, origin: Option<&str>) {
+    if let Some(origin) = origin {
+        let headers = response.headers_mut();
+        set_header(headers, header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        // `Vary: Origin` so a shared cache can't serve one origin's CORS
+        // response to another; appended so any existing `Vary` is preserved.
+        if let Ok(value) = HeaderValue::from_str("Origin") {
+            headers.append(header::VARY, value);
+        }
+    }
+}
+
+/// Build a CORS preflight (`OPTIONS`) response for `allowed` + the request headers,
+/// advertising `allow_methods`. For an allowlisted `Origin` it echoes
+/// `Access-Control-Allow-Origin` + `Vary: Origin` + the allow-methods/-headers +
+/// max-age; a disallowed/absent origin gets a bare `204` with **no**
+/// `Access-Control-*` headers. Shared by the control-plane middleware and the
+/// native-stream serving path so there is one audited preflight builder.
+pub(crate) fn cors_preflight_response(
+    allowed: &[String],
+    req_headers: &HeaderMap,
+    allow_methods: &str,
+) -> Response {
+    let origin = cors_matched_origin(allowed, req_headers);
+    // Echo the browser's requested headers when present, else our known set.
+    let allow_headers = req_headers
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| CORS_ALLOW_HEADERS.to_string());
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    if let Some(origin) = origin {
+        let headers = response.headers_mut();
+        set_header(headers, header::ACCESS_CONTROL_ALLOW_ORIGIN, &origin);
+        set_header(headers, header::VARY, "Origin");
+        set_header(headers, header::ACCESS_CONTROL_ALLOW_METHODS, allow_methods);
+        set_header(
+            headers,
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            &allow_headers,
+        );
+        set_header(headers, header::ACCESS_CONTROL_MAX_AGE, CORS_MAX_AGE);
+    }
+    response
 }
 
 /// Opt-in CORS for the control-plane `/api/*` routes (see
@@ -3519,55 +3590,17 @@ async fn cors(
     request: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let origin = request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .filter(|o| cors_origin_allowed(&allowed.0, o))
-        .map(str::to_string);
     // A CORS preflight is an OPTIONS carrying `Access-Control-Request-Method`.
     let is_preflight = request.method() == Method::OPTIONS
         && request
             .headers()
             .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
     if is_preflight {
-        // Echo the browser's requested headers when present, else our known set.
-        let allow_headers = request
-            .headers()
-            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .unwrap_or_else(|| CORS_ALLOW_HEADERS.to_string());
-        let mut response = Response::new(Body::empty());
-        *response.status_mut() = StatusCode::NO_CONTENT;
-        if let Some(origin) = origin {
-            let headers = response.headers_mut();
-            set_header(headers, header::ACCESS_CONTROL_ALLOW_ORIGIN, &origin);
-            set_header(headers, header::VARY, "Origin");
-            set_header(
-                headers,
-                header::ACCESS_CONTROL_ALLOW_METHODS,
-                CORS_ALLOW_METHODS,
-            );
-            set_header(
-                headers,
-                header::ACCESS_CONTROL_ALLOW_HEADERS,
-                &allow_headers,
-            );
-            set_header(headers, header::ACCESS_CONTROL_MAX_AGE, CORS_MAX_AGE);
-        }
-        return response;
+        return cors_preflight_response(&allowed.0, request.headers(), CORS_ALLOW_METHODS);
     }
+    let origin = cors_matched_origin(&allowed.0, request.headers());
     let mut response = next.run(request).await;
-    if let Some(origin) = origin {
-        let headers = response.headers_mut();
-        set_header(headers, header::ACCESS_CONTROL_ALLOW_ORIGIN, &origin);
-        // `Vary: Origin` so a shared cache can't serve one origin's CORS
-        // response to another; appended so any existing `Vary` is preserved.
-        if let Ok(value) = HeaderValue::from_str("Origin") {
-            headers.append(header::VARY, value);
-        }
-    }
+    cors_apply_actual(&mut response, origin.as_deref());
     response
 }
 
@@ -7265,6 +7298,7 @@ mod tests {
                     claim: "mailboxes".into(),
                 }],
             }),
+            ..Default::default()
         };
         let authorize = |path: &'static str, bearer: Option<String>| {
             let stream = stream.clone();
@@ -7417,6 +7451,7 @@ mod tests {
                             .into(),
                 }],
             }),
+            ..Default::default()
         };
         let authorize = |path: &'static str, bearer: Option<String>| {
             let stream = stream.clone();
@@ -7547,6 +7582,7 @@ mod tests {
                 handler: "stream-authz".into(),
                 max_topics_per_connection: None,
             }),
+            ..Default::default()
         };
 
         // (1) Real resolution + confinement: the guest grants three topics; only the one matching the

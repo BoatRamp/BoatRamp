@@ -1263,6 +1263,7 @@ mod tests {
                 websocket: false,
                 publish_topic: None,
                 authz: None,
+                ..Default::default()
             }],
             ..Default::default()
         };

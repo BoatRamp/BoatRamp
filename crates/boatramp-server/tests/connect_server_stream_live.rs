@@ -84,6 +84,7 @@ async fn live_app() -> (axum::Router, Arc<LogMessaging>) {
                 websocket: false,
                 publish_topic: None,
                 authz: None,
+                ..Default::default()
             },
             // Scoped server-stream: authz must gate the Connect path (401 without a bearer).
             StreamConfig {
@@ -102,6 +103,7 @@ async fn live_app() -> (axum::Router, Arc<LogMessaging>) {
                         claim: "rooms".to_string(),
                     }],
                 }),
+                ..Default::default()
             },
         ],
         ..Default::default()
