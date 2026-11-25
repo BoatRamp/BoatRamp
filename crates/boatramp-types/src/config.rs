@@ -1781,6 +1781,18 @@ pub struct StreamConfig {
     /// topics that match a declared template (a compromised guest can't invent a new topic namespace).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authz: Option<StreamAuthz>,
+    /// **Operator-declared CORS origin allowlist for this (host-served) stream.** A native stream has
+    /// no guest to emit `Access-Control-*`, so a cross-origin browser `EventSource`/`fetch` to this
+    /// route is blocked unless the operator lists the calling origins here. Each entry is an exact
+    /// `scheme://host[:port]` origin; a single `"*"` entry permits any origin (still echoed back
+    /// specifically, never literal `*`, and always `Vary: Origin` — so it stays cache-safe). Empty
+    /// (the default) ⇒ **no CORS headers at all** (same-origin only), so an existing deploy is
+    /// byte-for-byte unchanged. The host answers the preflight `OPTIONS` itself and echoes
+    /// `Access-Control-Allow-Origin` for a matched origin ONLY — a non-allowlisted origin gets
+    /// nothing, and `Access-Control-Allow-Credentials` is never set (bearer-token auth, not cookies).
+    /// The allowlist is config, never request-derived.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 /// Per-connection authorization strategy for a host [`StreamConfig`] (#11).
@@ -4015,6 +4027,7 @@ mod tests {
             websocket: false,
             publish_topic: None,
             authz: Some(authz),
+            ..Default::default()
         };
 
         // Valid: scoped with claim + sql membership, param declared in the route.
@@ -4157,6 +4170,7 @@ mod tests {
                         claim: "mailboxes".into(),
                     }],
                 }),
+                ..Default::default()
             })
             .is_err(),
             "an ungated topic-template route param is rejected"
@@ -4181,6 +4195,7 @@ mod tests {
                     },
                 ],
             }),
+            ..Default::default()
         })
         .expect("gating every topic param passes");
 
@@ -4198,6 +4213,7 @@ mod tests {
                         claim: "mailboxes".into(),
                     }],
                 }),
+                ..Default::default()
             })
             .is_err(),
             "an ungated publish_topic route param is rejected"
@@ -4216,6 +4232,7 @@ mod tests {
                     handler: "authz".into(),
                     max_topics_per_connection: None,
                 }),
+                ..Default::default()
             })
             .is_err(),
             "a guest-mediated templated publish_topic is rejected"
@@ -4236,6 +4253,7 @@ mod tests {
                         claim: "mailboxes".into(),
                     }],
                 }),
+                ..Default::default()
             })
             .is_err(),
             "scoped token_claims with no JWKS source is rejected"

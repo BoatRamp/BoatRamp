@@ -1208,6 +1208,30 @@ async fn serve_resolved(
                 &vary,
             );
         }
+        // Native (host-served) stream CORS preflight: the method gate below serves only GET/POST, so
+        // an `OPTIONS` preflight for a stream route would fall through to 404 — and a host-served
+        // stream has no guest to emit `Access-Control-*`. Answer the preflight HERE for a stream route
+        // that declares a `cors_allowed_origins` allowlist (empty ⇒ not short-circuited, so the
+        // same-origin default is byte-for-byte unchanged). Reuses the control-plane allowlist
+        // machinery (`cors_preflight_response`): explicit allowlist, never `*`-with-credentials, only a
+        // matched origin echoed, always `Vary: Origin`.
+        if request.method() == Method::OPTIONS
+            && request
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+            && let Some(stream) = manifest.config.streams.iter().find(|s| {
+                !s.cors_allowed_origins.is_empty() && route_matches(&s.route, request_path)
+            })
+        {
+            return apply_vary(
+                cors_preflight_response(
+                    &stream.cors_allowed_origins,
+                    request.headers(),
+                    CORS_STREAM_ALLOW_METHODS,
+                ),
+                &vary,
+            );
+        }
         // No handler matched: a configured stream route fans out its messaging topics. A GET is
         // SSE (or a WebSocket on upgrade); a Connect/gRPC-web **server-stream** RPC (PLAN §7 / IU-4)
         // arrives as a POST carrying an enveloped streaming content-type (`application/connect+*`
@@ -1229,6 +1253,11 @@ async fn serve_resolved(
                 .iter()
                 .find(|s| route_matches(&s.route, request_path))
         {
+            // Capture the CORS-allowlisted origin (if any) BEFORE the request is consumed by the serve
+            // path, so the long-lived stream response can echo `Access-Control-Allow-Origin`
+            // (+ `Vary: Origin`) for an allowlisted cross-origin browser client. `None` (empty
+            // allowlist, or a non-allowlisted/absent origin) ⇒ no CORS headers (unchanged).
+            let cors_origin = cors_matched_origin(&stream.cors_allowed_origins, request.headers());
             if let (Some(inner), Some(site_handlers)) = (
                 handlers.inner.as_ref(),
                 site_config
@@ -1249,21 +1278,20 @@ async fn serve_resolved(
                     && request.method() == Method::GET
                     && is_upgrade_request(request.headers())
                 {
-                    return apply_vary(
-                        serve_ws_stream(
-                            inner,
-                            stream_project,
-                            site,
-                            site_handlers,
-                            stream,
-                            request,
-                            request_path,
-                            client_ip,
-                            preview,
-                        )
-                        .await,
-                        &vary,
-                    );
+                    let mut response = serve_ws_stream(
+                        inner,
+                        stream_project,
+                        site,
+                        site_handlers,
+                        stream,
+                        request,
+                        request_path,
+                        client_ip,
+                        preview,
+                    )
+                    .await;
+                    cors_apply_actual(&mut response, cors_origin.as_deref());
+                    return apply_vary(response, &vary);
                 }
                 // Pull the owned bits the serve + authz need from the request: `&Request` is not
                 // `Send` (the body isn't `Sync`), so nothing borrowed from it is held across the
@@ -1289,23 +1317,22 @@ async fn serve_resolved(
                 if connect_stream_wire.is_some() {
                     let _ = axum::body::to_bytes(request.into_body(), 1 << 20).await;
                 }
-                return apply_vary(
-                    serve_stream(
-                        inner,
-                        stream_project,
-                        site,
-                        site_handlers,
-                        stream,
-                        after,
-                        request_path,
-                        bearer.as_deref(),
-                        client_ip,
-                        preview,
-                        connect_stream_wire,
-                    )
-                    .await,
-                    &vary,
-                );
+                let mut response = serve_stream(
+                    inner,
+                    stream_project,
+                    site,
+                    site_handlers,
+                    stream,
+                    after,
+                    request_path,
+                    bearer.as_deref(),
+                    client_ip,
+                    preview,
+                    connect_stream_wire,
+                )
+                .await;
+                cors_apply_actual(&mut response, cors_origin.as_deref());
+                return apply_vary(response, &vary);
             }
             // A stream route on a site with handlers disabled / no runtime
             // is not served (deny by default).
