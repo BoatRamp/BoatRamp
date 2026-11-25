@@ -55,9 +55,10 @@ versions.
 - **`boatramp-types`: new `Resource::Messaging` enum variant.** Downstream crates (uchron/luigi)
   that `match` on `Resource` exhaustively without a wildcard arm must add a `Messaging` (or `_`) arm;
   `Resource::ALL` grows 10 → 11. Only the global `admin` role carries the new right by default.
-- **`boatramp-types`: `StreamConfig` is now `#[non_exhaustive]`.** Construct it with
-  `..Default::default()` rather than an exhaustive struct literal. (It also gained the
-  `cors_allowed_origins` field.)
+- **`boatramp-types`: `StreamConfig` gained a `cors_allowed_origins` field.** Downstream code that
+  constructs it with a fully-exhaustive struct literal must add the field or use
+  `..Default::default()` (serde/`Default` round-trips are unaffected). (Sealing it `#[non_exhaustive]`
+  is deferred to a later release, to land with a builder.)
 
 ## [0.73.1] — 2026-11-25
 

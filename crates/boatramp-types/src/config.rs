@@ -1820,7 +1820,9 @@ impl CronRunAs {
 /// A host-level SSE (or WebSocket) endpoint fanning out messaging topics.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[non_exhaustive] // published-crate struct that grows (v0.74.0 added `cors_allowed_origins`); construct via `..Default::default()`
+// NOTE: not yet `#[non_exhaustive]`. v0.74.0 added `cors_allowed_origins`; sealing this
+// long-published struct is a retrofit (itself breaking: forbids cross-crate struct literals even
+// with `..Default`), deferred to v0.75.0 to land with a builder + the construction-site migration.
 pub struct StreamConfig {
     /// Route the SSE (or WebSocket) endpoint is served at.
     pub route: String,
