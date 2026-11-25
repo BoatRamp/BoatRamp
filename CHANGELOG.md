@@ -23,17 +23,19 @@ versions.
   the file reads, the RPK-identity load/generate, the Raft store open, join/dial, the ACME renewal
   loop, and the serve loop; it calls the lifted helpers to *build* the config. Behaviour-preserving
   (a pure move); `cluster` / `tls` feature-gated (`cluster` implies `tls`).
-- **Gateway `buffer_requests`: opt-in per-upstream request buffering to front a container registry
-  over HTTP/2 (Caddy `request_buffers` parity).** A new per-upstream `buffer_requests` flag
+- **Gateway `buffer_requests`: opt-in per-upstream request-body buffering (Caddy `request_buffers`
+  parity).** A new per-upstream `buffer_requests` flag
   (`boatramp gateway upstream add --buffer-requests`, default **off**) makes the reverse-proxy
   forward leg read a **length-unknown** request body (an HTTP/2 `END_STREAM`-delimited body, or an
   inbound `Transfer-Encoding: chunked` body) to a **bounded, per-request unnamed temp file**
   (`tempfile::tempfile_in`, unlinked at creation — no reachable/guessable path, no symlink/TOCTOU
   target, reclaimed on every exit path incl. 413, I/O error, panic), establish its length, and
-  forward it with a `Content-Length` instead of chunked. This fixes fronting a **Docker/OCI
-  container registry** (Gitea, Harbor, Distribution), whose blob `PUT` rejects a chunked upload with
-  `400 missing content-length header` — so a `docker push` over the edge's HTTP/2 (no inbound
-  `Content-Length`) previously 400-looped. The buffer is hard-capped by a per-upstream
+  forward it with a `Content-Length` instead of chunked. This is for a strict upstream that rejects a
+  **length-less request body** and demands a declared `Content-Length`. (Note: a normal `docker push`
+  is **not** such a case — its blob `PUT` carries a `Content-Length`, which the proxy preserves
+  unchanged across h1/h2; the blob-`HEAD` `Content-Length` issue some registries hit on older edges
+  was a separate **response-path bug fixed in v0.70.0**, unrelated to this flag.) The buffer is
+  hard-capped by a per-upstream
   `max_buffer_bytes` (default **1 GiB**, checked before every write → `413 Payload Too Large`), so
   buffering can never grow memory unbounded (RSS stays flat; the body lives on disk, not in a `Vec`)
   or fill the disk. A body that already declares a `Content-Length` is never buffered (it forwards
