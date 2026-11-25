@@ -319,14 +319,16 @@ pub const MAX_EPHEMERAL_MOUNT_PATH_LEN: usize = 256;
 /// The maximum AGGREGATE length (bytes) of all ephemeral-mount paths in one spec. This is the
 /// bound that actually keeps the micro-VM `boatramp.tmpfs=` cmdline fragment within the guest
 /// kernel's budget on EVERY backend: the fragment is the hex (2×) of the NUL-joined
-/// `target\0size=<N>m\0` pairs, so with ≤[`MAX_EPHEMERAL_MOUNTS`] mounts a 320-byte path budget
-/// keeps the fragment ≤1024 bytes — the same ceiling the embedded VMM path enforces
-/// (`MAX_TMPFS_CMDLINE_LEN`). Enforcing it here, at the single `put_compute` validation choke
+/// `target\0size=<N>m\0` pairs, so with ≤[`MAX_EPHEMERAL_MOUNTS`] mounts a 300-byte path budget
+/// keeps the WHOLE ` boatramp.tmpfs=<hex>` fragment (16-byte prefix included) ≤1024 bytes — the
+/// same ceiling the embedded VMM path enforces against the full fragment (`MAX_TMPFS_CMDLINE_LEN`),
+/// so a spec that passes `put_compute` always launches on the embedded backend too. Enforcing it
+/// here, at the single `put_compute` validation choke
 /// point, means the external-firecracker and macOS-vz paths (which build the fragment without
 /// their own bound) are bounded by construction — an over-large list is a clean set-time 400,
 /// not a cryptic guest boot failure. A per-mount cap ([`MAX_EPHEMERAL_MOUNT_PATH_LEN`]) still
 /// catches a single absurd path early.
-pub const MAX_EPHEMERAL_MOUNT_PATHS_TOTAL_LEN: usize = 320;
+pub const MAX_EPHEMERAL_MOUNT_PATHS_TOTAL_LEN: usize = 300;
 
 /// Mount points an ephemeral tmpfs may NOT target: the backends' own standard mounts +
 /// pseudo-filesystems. Overlaying one of these with a tenant-sized tmpfs would shadow a mount
