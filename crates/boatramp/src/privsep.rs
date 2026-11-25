@@ -5505,8 +5505,9 @@ mod instance_serve {
         ///    required control-plane [`Right`] for the op's target (the node's REAL RBAC — the policy
         ///    loaded from the held control-plane KV, else the default; fail-closed on a malformed policy).
         ///    No matching grant ⇒ 503.
-        /// 5. **`backend.kv` write.** Apply the deploy/routing-store mutation and CONFIRM it landed
-        ///    (read-back) before replying 200 — the write lands under the `backend.kv` Landlock profile.
+        /// 5. **`backend.kv` write.** Apply the control-plane-store mutation (a routing upsert/delete, or
+        ///    a token revocation) and CONFIRM it landed before replying 200 (or 404 for a token id that
+        ///    matched nothing) — the write lands under the `backend.kv` Landlock profile.
         async fn serve_control_mutation(
             &self,
             mutation: ControlMutation,
@@ -5626,12 +5627,12 @@ mod instance_serve {
                 }
             };
 
-            // (5) `backend.kv` WRITE: apply the deploy/routing-store mutation + confirm it landed.
+            // (5) `backend.kv` WRITE: apply the control-plane-store mutation + confirm it landed.
             match self.data_plane.apply_control_op(&op).await {
-                Ok(summary) => {
+                Ok(ApplyOutcome::Applied(summary)) => {
                     tracing::info!(
                         %host, principal = %principal_label,
-                        "[privsep] node-self-host control mutation SERVED: authorized deploy/routing \
+                        "[privsep] node-self-host control mutation SERVED: authorized control-plane \
                          write landed under the backend.kv Landlock profile ({summary})"
                     );
                     boatramp_http::response(
@@ -5643,10 +5644,21 @@ mod instance_serve {
                         .into_bytes(),
                     )
                 }
+                // A resource the authorized mutation named does not exist (e.g. an unknown token id):
+                // `404`, mirroring the monolith — NOT a fail-closed refuse (the principal WAS authorized
+                // and the write path WAS reached).
+                Ok(ApplyOutcome::NotFound(reason)) => {
+                    tracing::info!(%host, principal = %principal_label, "[privsep] node-self-host control mutation: authorized, but the named resource does not exist ({reason})");
+                    boatramp_http::response(
+                        404,
+                        format!("boatramp privsep node-self-host control plane: {reason}\n")
+                            .into_bytes(),
+                    )
+                }
                 Err(why) => {
                     tracing::warn!(%host, reason = %why, "[privsep] node-self-host control mutation: the authorized write failed — refusing fail-closed");
                     fail_closed_response(&format!(
-                        "control-plane mutation refused: the authorized deploy/routing write failed \
+                        "control-plane mutation refused: the authorized control-plane write failed \
                          ({why})"
                     ))
                 }
@@ -6206,13 +6218,19 @@ mod instance_serve {
             }
         }
 
-        /// Apply an AUTHORIZED deploy/routing-store mutation (P5-3-serve step 5) and CONFIRM it landed
-        /// (read-back), returning a non-secret summary for the log / response. The write goes through the
-        /// held [`DeployStore`] typed API (a REAL control-plane routing mutation, under the `backend.kv`
-        /// Landlock profile), so the P5-2 read plane resolves (upsert) / stops resolving (delete) the
-        /// host afterwards. Only the recognized routing ops reach here (the handler refuses an unmapped /
-        /// mint op before authorization); any other op is a defensive `Err`.
-        pub(super) async fn apply_control_op(&self, op: &ControlOp) -> Result<String, String> {
+        /// Apply an AUTHORIZED control-plane-store mutation (P5-3-serve step 5) and CONFIRM it landed,
+        /// returning a typed [`ApplyOutcome`] (applied / not-found) or an `Err` (a genuine store failure
+        /// ⇒ fail-closed 503). Every arm goes through the held [`DeployStore`] typed API (a REAL
+        /// control-plane mutation, under the `backend.kv` Landlock profile) — REUSING the exact write
+        /// path the monolith runs (no duplicated authority/write logic): a routing mutation via
+        /// `set_site_config` (the P2 read plane then resolves / stops resolving the host), a token
+        /// revocation via [`DeployStore::revoke_token`](boatramp_core::deploy::DeployStore::revoke_token).
+        /// Only the recognized served ops reach here (the handler refuses an unmapped / mint op before
+        /// authorization); any other op is a defensive `Err`.
+        pub(super) async fn apply_control_op(
+            &self,
+            op: &ControlOp,
+        ) -> Result<ApplyOutcome, String> {
             let store = match self {
                 Self::Deploy(store) => store,
                 Self::Refusing => {
@@ -6240,7 +6258,9 @@ mod instance_serve {
                         .map_err(|e| format!("registering the routing entry: {e}"))?;
                     // Read-back CONFIRM: the host now resolves to an owner (the write landed durably).
                     match store.resolve_site_by_host(host).await {
-                        Ok(Some(_)) => Ok(format!("routing upsert {host} -> {project}/{site}")),
+                        Ok(Some(_)) => Ok(ApplyOutcome::Applied(format!(
+                            "routing upsert {host} -> {project}/{site}"
+                        ))),
                         Ok(None) => Err(format!(
                             "routing upsert for {host} did not resolve on read-back (write not durable?)"
                         )),
@@ -6266,14 +6286,40 @@ mod instance_serve {
                         .map_err(|e| format!("removing the routing entry: {e}"))?;
                     // Read-back CONFIRM: the host no longer resolves to THIS owner.
                     match store.resolve_site_by_host(host).await {
-                        Ok(None) => Ok(format!("routing delete {host} from {project}/{site}")),
+                        Ok(None) => Ok(ApplyOutcome::Applied(format!(
+                            "routing delete {host} from {project}/{site}"
+                        ))),
                         Ok(Some(owner)) if owner.project != *project || owner.site != *site => {
-                            Ok(format!("routing delete {host} from {project}/{site}"))
+                            Ok(ApplyOutcome::Applied(format!(
+                                "routing delete {host} from {project}/{site}"
+                            )))
                         }
                         Ok(Some(_)) => Err(format!(
                             "routing delete for {host} still resolves to {project}/{site} on read-back"
                         )),
                         Err(e) => Err(format!("confirming the routing delete: {e}")),
+                    }
+                }
+                ControlOp::TokenRevoke { id } => {
+                    // REUSE the monolith's EXACT revoke write path: `revoke_token` resolves the unique
+                    // id (by prefix) and writes the `authz/revoked/<id>` marker via
+                    // `put_durable_checkpointed` (the crown-jewel C2 durability the monolith relies on —
+                    // frontier-synced BEFORE return, so the marker cannot be lost to a self-heal
+                    // trailing-tail quarantine) + drops the token metadata. The durable checkpoint IS the
+                    // landing confirm (strictly stronger than routing's post-write read-back, which could
+                    // not re-resolve a token by prefix without re-running the same list); a store error
+                    // ⇒ `Err` ⇒ fail-closed 503. A no-match ⇒ `NotFound` (404), mirroring the monolith's
+                    // `token rm` of an unknown id — NOT a fail-closed refuse (the principal WAS authorized
+                    // and the write path WAS reached), and revocation is idempotent-safe.
+                    match store.revoke_token(id).await {
+                        Ok(true) => Ok(ApplyOutcome::Applied(format!(
+                            "token revoke: wrote the durable authz/revoked marker for the token matching \
+                             id {id:?} (+ dropped its metadata)"
+                        ))),
+                        Ok(false) => Ok(ApplyOutcome::NotFound(format!(
+                            "token revoke: no issued token matches id {id:?}"
+                        ))),
+                        Err(e) => Err(format!("revoking the token matching id {id:?}: {e}")),
                     }
                 }
                 ControlOp::CrownMint | ControlOp::Unsupported => Err(format!(
@@ -6282,6 +6328,19 @@ mod instance_serve {
                 )),
             }
         }
+    }
+
+    /// The typed outcome of an AUTHORIZED [`NodeDataPlane::apply_control_op`] — distinct from an `Err`
+    /// (a genuine store failure ⇒ fail-closed 503). Keeps the serve path's status vocabulary faithful to
+    /// the monolith: a mutation that applied is a `200`, one that addressed a non-existent resource is a
+    /// `404` (idempotent-safe, NOT a fail-closed refuse — the principal WAS authorized and the write path
+    /// WAS reached). Carries only a NON-SECRET summary / reason.
+    pub(super) enum ApplyOutcome {
+        /// The mutation applied + confirmed durable — a `200` with this non-secret summary.
+        Applied(String),
+        /// The mutation named a resource that does not exist (e.g. revoking an unknown token id) — a
+        /// `404` with this non-secret reason. Mirrors the monolith; not a fail-closed refuse.
+        NotFound(String),
     }
 
     /// The per-authority SUB-OPERATIONS a request decomposes into (P5-2 review INFO-2). A request may
@@ -6326,10 +6385,16 @@ mod instance_serve {
     }
 
     /// The recognized `/api/*` control-plane operation a mutation names (requirement #3 — the
-    /// method/path → operation map). Deliberately NARROW for the P5-3-serve first piece: the
-    /// deploy/routing-store create/update/delete, plus a mint/sign SHAPE recognizer (not served). The
-    /// full `/api/*` surface + the Cedar policy-doc overlay + the other authority-state mutations
-    /// (`backend.sql`/`blob`/`messaging`, `acme.dns-control`) are the surfaced remaining work.
+    /// method/path → operation map). Still NARROW, but it now covers TWO authority-state mutation
+    /// families served through the SAME relay: the deploy/routing-store create/update/delete (the
+    /// `Site·Write`, per-project family — P5-3) AND token REVOCATION (the `Tokens·Admin`, NODE-GLOBAL
+    /// authz family — this increment: `DELETE /api/tokens/<id>` writes the `authz/revoked/<id>` marker
+    /// the serve path ALREADY enforces on every read). Both are pure `backend.kv` control-plane-store
+    /// mutations — no new egress, no new held authority. A mint/sign SHAPE is recognized but NOT served
+    /// (the crown-jewel relay is cross-repo-blocked). The full `/api/*` surface + the Cedar policy-doc
+    /// overlay + the backend-DATA-plane families that entangle a new egress / sealed credential
+    /// (`backend.sql`/managed-db, `blob`, `messaging`, `acme.dns-control`) are the surfaced remaining
+    /// work (each needs an owner/Security trust decision — see the `serve_control_mutation` note).
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) enum ControlOp {
         /// Create/update a host→`(project, site)` routing entry:
@@ -6346,6 +6411,22 @@ mod instance_serve {
             site: String,
             host: String,
         },
+        /// Revoke an issued API token by its revocation id (or a unique id prefix):
+        /// `DELETE /api/tokens/<id>`. The authorized write this increment serves — a pure `backend.kv`
+        /// control-plane-store mutation ([`DeployStore::revoke_token`](boatramp_core::deploy::DeployStore::revoke_token)):
+        /// it writes the durable `authz/revoked/<id>` marker (+ drops the token's metadata) that the
+        /// serve path's OWN revocation gate ([`NodeDataPlane::revocation_status`] / [`check_revocation`])
+        /// reads on EVERY mutation — so this closes the loop (the node that ENFORCES revocation can now
+        /// also EFFECT it, under the same authorize relay). Distinct from the `CrownMint` mint shape: a
+        /// revoke needs NO signer key — only a KV marker write — so it is servable NOW without the
+        /// cross-repo-blocked crown-jewel relay. NODE-GLOBAL (`Tokens·Admin`), unlike routing's
+        /// per-project `Site·Write` — so it exercises the authorize relay + `rights_for` decision for a
+        /// node-global admin right, not just a per-tenant one (see [`Self::required_right`]).
+        TokenRevoke {
+            /// The token revocation id (or a unique prefix of it) from the request PATH — the PoP binds
+            /// the full path, so a relay cannot swap the targeted token (requirement #1).
+            id: String,
+        },
         /// A recognized mint/sign-SHAPED op (e.g. `POST /api/tokens`) — adds the crown-jewel `mint`
         /// sub-op to the decomposition (requirement #3). NOT served this cut (the crown-jewel relay
         /// client is P5-4); it is classified so the decomposition + INFO-1 routing are exercised.
@@ -6356,37 +6437,30 @@ mod instance_serve {
     }
 
     impl ControlOp {
-        /// The `(project, site)` routing target this op mutates, when it is a routing op.
-        fn routing_target(&self) -> Option<(&str, &str, &str)> {
-            match self {
-                Self::RoutingUpsert {
-                    project,
-                    site,
-                    host,
-                }
-                | Self::RoutingDelete {
-                    project,
-                    site,
-                    host,
-                } => Some((project.as_str(), site.as_str(), host.as_str())),
-                Self::CrownMint | Self::Unsupported => None,
-            }
-        }
-
         /// The control-plane [`Right`] the verified end principal MUST hold for this op (the
         /// `control.admin-api` authorize decision — DEFAULT-DENY). A routing mutation requires
-        /// `Site·Write` scoped to the `<project>/<site>` target; an unmapped / mint op has no served
-        /// right here (it fails closed before the authz check). This is the node's REAL RBAC `Right`
-        /// shape ([`boatramp_core::authz`]); the full Cedar policy-doc decision is the surfaced remaining
-        /// binding.
+        /// `Site·Write` scoped to the `<project>/<site>` target (the per-project family); a token
+        /// revocation requires NODE-GLOBAL `Tokens·Admin` (target-less — the exact right the monolith's
+        /// `Right::required("DELETE", "/api/tokens/<id>")` yields, so a per-tenant principal holding only
+        /// a `Site·*` grant is DENIED, never allowed to revoke another principal's token). An unmapped /
+        /// mint op has no served right here (it fails closed before the authz check). This is the node's
+        /// REAL RBAC `Right` shape ([`boatramp_core::authz`]) — the SAME value the LOCAL
+        /// ([`NodeServeHandler::authorize_local`]) and the RELAYED ([`ControlAuthorizer::authorize`],
+        /// which re-derives it from the PoP-bound method+path) decisions use, so they agree; the full
+        /// Cedar policy-doc decision is the surfaced remaining binding.
         fn required_right(&self) -> Option<Right> {
-            self.routing_target().map(|(project, site, _host)| {
-                Right::new(
+            match self {
+                Self::RoutingUpsert { project, site, .. }
+                | Self::RoutingDelete { project, site, .. } => Some(Right::new(
                     Resource::Site,
                     Some(format!("{project}/{site}")),
                     Action::Write,
-                )
-            })
+                )),
+                // Token revocation is a NODE-GLOBAL admin op (no per-project target) — matches the
+                // monolith's `/api/tokens/*` gate (`Resource::Tokens`, `None`, `Action::Admin`).
+                Self::TokenRevoke { .. } => Some(Right::new(Resource::Tokens, None, Action::Admin)),
+                Self::CrownMint | Self::Unsupported => None,
+            }
         }
     }
 
@@ -6394,8 +6468,9 @@ mod instance_serve {
     /// [`ControlOp`]. A safe method (`GET`/`HEAD`) is a single-sub-op `backend.kv` READ; a mutating
     /// method maps its `/api/*` path to a [`ControlOp`] and decomposes into `control.admin-api`
     /// authorize + `backend.kv` write (+ a crown-jewel `mint` sub-op for a mint/sign op — requirement
-    /// #3), per INFO-2. The method/path map is NARROW (the deploy/routing create/update/delete + a mint
-    /// shape); an unmapped mutation is [`ControlOp::Unsupported`] (default-deny). Pure (host-testable).
+    /// #3), per INFO-2. The method/path map is NARROW (the deploy/routing create/update/delete, token
+    /// revocation, + a mint shape); an unmapped mutation is [`ControlOp::Unsupported`] (default-deny).
+    /// Pure (host-testable).
     pub(super) fn classify_request(req: &boatramp_http::Request) -> RequestPlan {
         let method = req.method().as_str();
         if matches!(method, "GET" | "HEAD") {
@@ -6411,10 +6486,14 @@ mod instance_serve {
     }
 
     /// Map a mutating `(method, path)` to its [`ControlOp`] + optional crown-jewel `mint` sub-op. The
-    /// deploy/routing map: `PUT`/`POST /api/routing/<project>/<site>/<host>` ⇒ upsert, `DELETE` ⇒
-    /// delete; a mint/sign shape (`POST /api/tokens`) ⇒ [`ControlOp::CrownMint`] + a `token.signer`
-    /// sub-op; everything else ⇒ [`ControlOp::Unsupported`] (default-deny). Segments are percent-literal
-    /// (no decode) and must be non-empty. Pure (host-testable).
+    /// map: `PUT`/`POST /api/routing/<project>/<site>/<host>` ⇒ routing upsert, `DELETE` ⇒ routing
+    /// delete; `DELETE /api/tokens/<id>` ⇒ [`ControlOp::TokenRevoke`] (the token-revocation family — a
+    /// pure `backend.kv` marker write, NO mint sub-op); a mint/sign shape (`POST /api/tokens`) ⇒
+    /// [`ControlOp::CrownMint`] + a `token.signer` sub-op; everything else ⇒ [`ControlOp::Unsupported`]
+    /// (default-deny). The `POST /api/tokens` (mint) and `DELETE /api/tokens/<id>` (revoke) cases are
+    /// disjoint — a different method AND a different segment count — so revoke never collides with the
+    /// crown-jewel mint shape. Segments are percent-literal (no decode) and must be non-empty. Pure
+    /// (host-testable).
     fn classify_control_op(method: &str, path: &str) -> (ControlOp, Option<HostAuthority>) {
         let segs: Vec<&str> = path
             .trim_matches('/')
@@ -6452,6 +6531,20 @@ mod instance_serve {
         // `token.signer` crown-jewel sub-op (requirement #3). Not served this cut (relay client = P5-4).
         if method == "POST" && matches!(segs.as_slice(), ["api", "tokens"]) {
             return (ControlOp::CrownMint, Some(HostAuthority::TokenSigner));
+        }
+        // Token REVOCATION: `DELETE /api/tokens/<id>` writes the `authz/revoked/<id>` marker — a pure
+        // `backend.kv` control-plane-store mutation (NO signer key, so NO crown-jewel `mint` sub-op),
+        // served through the SAME authorize relay as routing. The `<id>` is the revocation id (or a
+        // unique prefix) the PoP binds via the path. Disjoint from the `POST /api/tokens` mint above.
+        if method == "DELETE"
+            && let ["api", "tokens", id] = segs.as_slice()
+        {
+            return (
+                ControlOp::TokenRevoke {
+                    id: (*id).to_string(),
+                },
+                None,
+            );
         }
         (ControlOp::Unsupported, None)
     }
@@ -9089,6 +9182,33 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
             "POST /api/tokens adds the token.signer crown-jewel sub-op to the decomposition"
         );
 
+        // Token REVOCATION: `DELETE /api/tokens/<id>` ⇒ TokenRevoke, decomposed into authorize + write
+        // with NO crown-jewel mint sub-op (a revoke needs no signer key — just a backend.kv marker).
+        assert_eq!(
+            classify("DELETE", "/api/tokens/abc123def"),
+            RequestPlan::ControlMutation(ControlMutation {
+                authorize: HostAuthority::ControlAdminApi,
+                write: HostAuthority::BackendKv,
+                mint: None,
+                op: ControlOp::TokenRevoke {
+                    id: "abc123def".into(),
+                },
+            }),
+            "DELETE /api/tokens/<id> is a token revocation (authorize + backend.kv write, NO mint)"
+        );
+        // The mint shape and the revoke shape are DISJOINT: `POST /api/tokens/<id>` is NOT a revoke
+        // (wrong method) and NOT the mint shape (wrong segment count) ⇒ Unsupported (default-deny).
+        assert_eq!(
+            classify("POST", "/api/tokens/abc123def"),
+            RequestPlan::ControlMutation(ControlMutation {
+                authorize: HostAuthority::ControlAdminApi,
+                write: HostAuthority::BackendKv,
+                mint: None,
+                op: ControlOp::Unsupported,
+            }),
+            "POST /api/tokens/<id> is neither the mint shape nor a revoke ⇒ Unsupported"
+        );
+
         // An unmapped mutating path ⇒ Unsupported (default-deny — never guessed into a write).
         assert_eq!(
             classify("POST", "/"),
@@ -9920,6 +10040,425 @@ CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
                 && resp.contains("neither held nor reachable over a sound link"),
             "a control.admin-api reachable only over a splice must be REFUSED (no bare-socket relay), \
              got:\n{resp}"
+        );
+    }
+
+    /// **P5-4 `/api/*` map — the token-REVOCATION family (LOCAL serve).** The NEXT authority-state
+    /// mutation family wired through the SAME P5-3/P5-4 relay: `DELETE /api/tokens/<id>` writes the
+    /// durable `authz/revoked/<id>` marker the serve path ALREADY enforces on every read — a pure
+    /// `backend.kv` control-plane-store mutation (NO signer key, NO egress, NOT a crown-jewel mint). A
+    /// `control.admin-api` + `backend.kv` holder serves it LOCALLY. Proves:
+    /// - **POSITIVE:** an authorized NODE-GLOBAL `admin` principal revokes a seeded token ⇒ 200, the
+    ///   `authz/revoked/<id>` marker LANDS durably, and the token metadata is dropped.
+    /// - **404:** that same admin revoking an UNKNOWN id ⇒ 404 (idempotent-safe, mirrors the monolith —
+    ///   authorized + write-path-reached, NOT a fail-closed refuse).
+    /// - **NEGATIVES (503):** a FORGED principal (non-trust-root key), a MISSING PoP, a principal with
+    ///   only a per-project `publisher@acme/blog` grant (the "cross-tenant" analogue — it lacks the
+    ///   node-global `Tokens·Admin`, so it CANNOT revoke another principal's token), and a REVOKED
+    ///   principal (the revocation gate fires before the authz allow).
+    ///
+    /// Same discipline + chain as `p5_3_serve_…` — this exercises the authz LOGIC for a node-global
+    /// right; the Landlock mutation-syscall surface (durable put + delete + list) is the SAME one the
+    /// `#[ignore]` write-plane / control-mutation live gates already prove, so this adds no new gate.
+    #[cfg(all(unix, feature = "fs"))]
+    #[tokio::test]
+    async fn p5_4_token_revoke_family_serves_and_fail_closes() {
+        use std::sync::Arc;
+
+        use boatramp_core::authz::{GrantedRole, TokenMeta, revoked_key, token_meta_key};
+        use boatramp_core::cose::{
+            AuthorityPopBinding, Claims, KIND_ROLE, LocalSigner, Signer, TokenAlg,
+            mint_authority_pop, mint_delegatable, verify_credential,
+        };
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_core::time::now_unix;
+        use boatramp_server::privsep_authority::{
+            CONTROL_MUTATION_POP_OP, ContextVerifier, control_mutation_pop_bytes,
+        };
+        use boatramp_storage::FsStorage;
+
+        use super::instance_serve::{
+            NodeDataPlane, NodeServeHandler, NodeServeRouter, SelfHostControlPlane,
+        };
+
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let now = now_unix();
+
+        // A `control.admin-api` + `backend.kv` holder: serves the revoke LOCALLY (both sub-ops held).
+        let gate =
+            MaterializationGate::new(&[HostAuthority::BackendKv, HostAuthority::ControlAdminApi]);
+        let kv = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(
+            Arc::new(FsStorage::new(
+                std::env::temp_dir().join("boatramp-p5-4-revoke-local-blobs"),
+            )),
+            kv.clone(),
+        );
+        // Seed an issued-token's metadata so `revoke_token` has a real id to resolve + revoke.
+        let revocation_id = "deadbeef01";
+        let meta: TokenMeta = serde_json::from_value(serde_json::json!({
+            "label": "seeded-for-revoke",
+            "roles": [],
+            "created_at": now,
+            "revocation_id": revocation_id,
+        }))
+        .expect("build a seeded token meta");
+        store
+            .put_token_meta(&meta)
+            .await
+            .expect("seed the token metadata into the held backend.kv");
+        let control = SelfHostControlPlane::new(ContextVerifier::new(root.public_key()));
+        let handler = NodeServeHandler::new(
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
+            NodeDataPlane::Deploy(store),
+            Some(control),
+            None,
+        );
+
+        let method = "DELETE";
+        let transport_host = "node-admin";
+        // A revoke carries NO body — the token id rides the PATH (the PoP binds it).
+        let del_req = |path: &str, token: &str, nonce: u128, pop: &str| -> Vec<u8> {
+            format!(
+                "DELETE {path} HTTP/1.1\r\nHost: {transport_host}\r\nauthorization: Bearer {token}\r\n\
+                 boatramp-privsep-nonce: {nonce}\r\nboatramp-privsep-pop: {pop}\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        };
+        async fn mint_cred(
+            signer: &LocalSigner,
+            holder: &LocalSigner,
+            role: GrantedRole,
+            nonce: u128,
+            now: u64,
+            req: (&str, &str, &str),
+        ) -> (String, String) {
+            let (method, path, host) = req;
+            let claims = Claims {
+                roles: vec![role],
+                kind: KIND_ROLE.to_string(),
+                ttl_secs: Some(300),
+                now_unix: now,
+            };
+            let token = mint_delegatable(&claims, &holder.public_key(), signer)
+                .await
+                .expect("mint the role token");
+            let req_bytes = control_mutation_pop_bytes(method, path, host);
+            let binding = AuthorityPopBinding {
+                op: CONTROL_MUTATION_POP_OP,
+                context_token: &token,
+                nonce,
+                request_bytes: &req_bytes,
+            };
+            let pop = mint_authority_pop(&binding, holder, now)
+                .await
+                .expect("mint the PoP");
+            (token, pop)
+        }
+
+        let path = format!("/api/tokens/{revocation_id}");
+
+        // --- POSITIVE: a NODE-GLOBAL `admin` principal revokes the seeded token (200) + the marker lands.
+        let (token, pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::global("admin"),
+            1,
+            now,
+            (method, &path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &del_req(&path, &token, 1, &pop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.contains("authorized mutation served"),
+            "an AUTHORIZED (Tokens·Admin) revoke must serve (200), got:\n{resp}"
+        );
+        // The write LANDED: the authz/revoked/<id> marker is present + the token metadata is gone.
+        assert!(
+            kv.get(&revoked_key(revocation_id))
+                .await
+                .expect("read the revocation marker")
+                .is_some(),
+            "the authorized revoke must write the durable authz/revoked marker"
+        );
+        assert!(
+            kv.get(&token_meta_key(revocation_id))
+                .await
+                .expect("read the token meta key")
+                .is_none(),
+            "the authorized revoke must drop the token metadata"
+        );
+
+        // --- 404: the same admin revoking an UNKNOWN id ⇒ 404 (authorized, but nothing to revoke).
+        let unknown_path = "/api/tokens/nosuchtoken";
+        let (token_u, pop_u) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::global("admin"),
+            2,
+            now,
+            (method, unknown_path, transport_host),
+        )
+        .await;
+        let resp =
+            p5_2_roundtrip(handler.clone(), &del_req(unknown_path, &token_u, 2, &pop_u)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 404") && resp.contains("no issued token matches"),
+            "revoking an unknown token id must be 404 (authorized + reached, not a fail-closed refuse), \
+             got:\n{resp}"
+        );
+
+        // --- NEGATIVE 1: a FORGED principal (token signed by a non-trust-root key) ⇒ 503.
+        let forger = LocalSigner::generate(TokenAlg::Es256);
+        let (ftoken, fpop) = mint_cred(
+            &forger,
+            &holder,
+            GrantedRole::global("admin"),
+            3,
+            now,
+            (method, &path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &del_req(&path, &ftoken, 3, &fpop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("end-principal verification failed"),
+            "a forged principal must fail closed (503), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 2: a MISSING PoP header ⇒ 503 (default-deny).
+        let (token2, _pop2) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::global("admin"),
+            4,
+            now,
+            (method, &path, transport_host),
+        )
+        .await;
+        let no_pop = format!(
+            "DELETE {path} HTTP/1.1\r\nHost: {transport_host}\r\nauthorization: Bearer {token2}\r\n\
+             boatramp-privsep-nonce: 4\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let resp = p5_2_roundtrip(handler.clone(), &no_pop).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("no end-principal credential"),
+            "a missing PoP must fail closed (503, default-deny), got:\n{resp}"
+        );
+
+        // --- NEGATIVE 3: an INSUFFICIENT-PRIVILEGE principal (the "cross-tenant" analogue for a
+        //     NODE-GLOBAL op): a valid `publisher@acme/blog` token holds `Site·*` for ONE project but NOT
+        //     `Tokens·Admin`, so it CANNOT revoke a token ⇒ 503 (default-deny). A per-tenant principal
+        //     must never be able to revoke another principal's token.
+        let (ptoken, ppop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            5,
+            now,
+            (method, &path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &del_req(&path, &ptoken, 5, &ppop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("not authorized"),
+            "a per-project principal lacking Tokens·Admin must be DENIED the node-global revoke (503), \
+             got:\n{resp}"
+        );
+
+        // --- NEGATIVE 4: a REVOKED principal — an admin whose OWN token's cti is marked revoked ⇒ 503
+        //     (the revocation gate fires BEFORE the authz allow decision, M1 parity).
+        let (rtoken, rpop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::global("admin"),
+            6,
+            now,
+            (method, &path, transport_host),
+        )
+        .await;
+        let rcti = verify_credential(&rtoken, &root.public_key(), now)
+            .expect("the revoked-negative token verifies")
+            .cti;
+        kv.put(&revoked_key(&rcti), Vec::new())
+            .await
+            .expect("write the end-principal's revocation marker into the held backend.kv");
+        let resp = p5_2_roundtrip(handler.clone(), &del_req(&path, &rtoken, 6, &rpop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("revoked"),
+            "a revoked end-principal must fail closed (503) before the write, got:\n{resp}"
+        );
+    }
+
+    /// **P5-4 `/api/*` map — the token-REVOCATION family (CROSS-INSTANCE relay).** The same revoke op,
+    /// but served by a `backend.kv` holder that does NOT hold `control.admin-api`: the authorize sub-op
+    /// RELAYS to a split authorizer over a real `socketpair` (the SAME `serve_control_authorize_link`
+    /// the live gate runs), which re-validates the end principal + re-derives the required `Right` from
+    /// the PoP-bound method+path (`Tokens·Admin`) and decides under the operator policy. Proves the
+    /// NODE-GLOBAL right flows through the P5-4 relay and the revoke write LANDS at the backend.kv holder
+    /// after a relayed ALLOW; an insufficient-privilege principal is DENIED at the destination.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn p5_4_token_revoke_relays_cross_instance() {
+        use std::sync::Arc;
+
+        use boatramp_core::authz::{
+            AuthzPolicy, GrantedRole, TokenMeta, revoked_key, token_meta_key,
+        };
+        use boatramp_core::cose::{
+            AuthorityPopBinding, Claims, KIND_ROLE, LocalSigner, Signer, TokenAlg,
+            mint_authority_pop, mint_delegatable,
+        };
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        use boatramp_core::time::now_unix;
+        use boatramp_server::privsep_authority::{
+            CONTROL_MUTATION_POP_OP, ContextVerifier, ReplayCache, control_mutation_pop_bytes,
+        };
+        use boatramp_server::privsep_link::LinkEndpoint;
+        use boatramp_storage::FsStorage;
+
+        use super::instance_serve::{
+            ControlAuthorizeClient, ControlAuthorizer, NodeDataPlane, NodeServeHandler,
+            NodeServeRouter, serve_control_authorize_link,
+        };
+
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let now = now_unix();
+
+        // The SPLIT authorizer (holds control.admin-api, NO backend.kv), served over a real socketpair.
+        let (server_ep, client_ep) = LinkEndpoint::socketpair().expect("socketpair");
+        let authorizer = ControlAuthorizer::new(
+            ContextVerifier::new(root.public_key()),
+            Arc::new(ReplayCache::with_defaults()),
+            Arc::new(AuthzPolicy::default_policy()),
+        );
+        std::thread::spawn(move || {
+            serve_control_authorize_link("control", "to-control", &server_ep, &authorizer);
+        });
+
+        // The SERVING backend.kv holder: `authorize` (control.admin-api, NOT held) routes to the
+        // control-authorize grammar endpoint; `write` (backend.kv, HELD) is Local.
+        let gate = MaterializationGate::new(&[HostAuthority::BackendKv]);
+        let kv = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(
+            Arc::new(FsStorage::new(
+                std::env::temp_dir().join("boatramp-p5-4-revoke-relay-blobs"),
+            )),
+            kv.clone(),
+        );
+        let revocation_id = "feedface02";
+        let meta: TokenMeta = serde_json::from_value(serde_json::json!({
+            "label": "seeded-for-revoke-relay",
+            "roles": [],
+            "created_at": now,
+            "revocation_id": revocation_id,
+        }))
+        .expect("build a seeded token meta");
+        store
+            .put_token_meta(&meta)
+            .await
+            .expect("seed the token metadata into the held backend.kv");
+        let control_authorize =
+            BTreeMap::from([(HostAuthority::ControlAdminApi, "to-control".to_string())]);
+        let client = ControlAuthorizeClient::new("to-control".to_string(), client_ep);
+        let handler = NodeServeHandler::new(
+            NodeServeRouter::new(&gate, BTreeMap::new(), BTreeMap::new(), control_authorize),
+            NodeDataPlane::Deploy(store),
+            None,
+            Some(client),
+        );
+
+        let method = "DELETE";
+        let transport_host = "node-admin";
+        let path = format!("/api/tokens/{revocation_id}");
+        let del_req = |path: &str, token: &str, nonce: u128, pop: &str| -> Vec<u8> {
+            format!(
+                "DELETE {path} HTTP/1.1\r\nHost: {transport_host}\r\nauthorization: Bearer {token}\r\n\
+                 boatramp-privsep-nonce: {nonce}\r\nboatramp-privsep-pop: {pop}\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        };
+        async fn mint_cred(
+            signer: &LocalSigner,
+            holder: &LocalSigner,
+            role: GrantedRole,
+            nonce: u128,
+            now: u64,
+            req: (&str, &str, &str),
+        ) -> (String, String) {
+            let (method, path, host) = req;
+            let claims = Claims {
+                roles: vec![role],
+                kind: KIND_ROLE.to_string(),
+                ttl_secs: Some(300),
+                now_unix: now,
+            };
+            let token = mint_delegatable(&claims, &holder.public_key(), signer)
+                .await
+                .expect("mint the role token");
+            let req_bytes = control_mutation_pop_bytes(method, path, host);
+            let binding = AuthorityPopBinding {
+                op: CONTROL_MUTATION_POP_OP,
+                context_token: &token,
+                nonce,
+                request_bytes: &req_bytes,
+            };
+            let pop = mint_authority_pop(&binding, holder, now)
+                .await
+                .expect("mint the PoP");
+            (token, pop)
+        }
+
+        // --- POSITIVE: a NODE-GLOBAL admin revokes cross-instance (the relay ALLOWS) ⇒ 200 + marker lands.
+        let (token, pop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::global("admin"),
+            1,
+            now,
+            (method, &path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &del_req(&path, &token, 1, &pop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.contains("authorized mutation served"),
+            "an AUTHORIZED cross-instance revoke must serve (200), got:\n{resp}"
+        );
+        assert!(
+            kv.get(&revoked_key(revocation_id))
+                .await
+                .expect("read the revocation marker")
+                .is_some()
+                && kv
+                    .get(&token_meta_key(revocation_id))
+                    .await
+                    .expect("read the token meta key")
+                    .is_none(),
+            "the cross-instance-authorized revoke must write the marker + drop the metadata"
+        );
+
+        // --- NEGATIVE: an insufficient-privilege principal (publisher@acme/blog lacks Tokens·Admin) is
+        //     DENIED by the cross-instance authorizer ⇒ 503 (default-deny, decided at the destination).
+        let (ptoken, ppop) = mint_cred(
+            &root,
+            &holder,
+            GrantedRole::scoped("publisher", "acme/blog"),
+            2,
+            now,
+            (method, &path, transport_host),
+        )
+        .await;
+        let resp = p5_2_roundtrip(handler.clone(), &del_req(&path, &ptoken, 2, &ppop)).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 503") && resp.contains("not authorized"),
+            "a principal lacking Tokens·Admin must be DENIED the node-global revoke by the cross-instance \
+             authorizer (503), got:\n{resp}"
         );
     }
 
