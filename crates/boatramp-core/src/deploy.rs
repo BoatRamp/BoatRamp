@@ -573,6 +573,24 @@ pub(crate) mod keys {
         format!("project/{project}/email/")
     }
 
+    /// A project-scoped **webhook sink** registration (PLAN-messaging-consumer-delivery, increment
+    /// d): `project/<proj>/bus-webhook-sink/<name>` → the JSON `WebhookSink` record. The
+    /// RUNTIME-registered half of the sink's two registration paths (the other is the
+    /// config-declared `routing.webhook_sinks` block folded into the manifest). Project-scoped so a
+    /// `Messaging·Admin`-on-`<proj>` grant reaches ONLY its own project's sinks, and so
+    /// `purge_project`'s residual sweep clears them when the project is torn down. The sink's URL +
+    /// HMAC secrets are NOT here — they are sealed `boatramp:<name>` references into the project
+    /// secret store, resolved host-side at delivery time.
+    pub fn bus_webhook_sink(project: ProjectRef<'_>, name: &str) -> String {
+        format!("project/{project}/bus-webhook-sink/{name}")
+    }
+
+    /// The prefix listing a project's runtime-registered webhook sinks; the `strip_prefix` tail is a
+    /// single `<name>`.
+    pub fn bus_webhook_sink_prefix(project: ProjectRef<'_>) -> String {
+        format!("project/{project}/bus-webhook-sink/")
+    }
+
     /// A project-scoped config object: `project/<proj>/config/<key>` → JSON body. Project-scoped
     /// (not per-site) host-held config; the first `key` is `tenancy` (the [`TenancySchema`] — the
     /// per-table tenant-key map the scope injector consults, PLAN-tenancy-principal D2).

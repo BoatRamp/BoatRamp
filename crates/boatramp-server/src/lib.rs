@@ -249,6 +249,18 @@ pub(crate) use operator::{
 mod bus_consumer;
 #[cfg(feature = "handlers")]
 pub(crate) use bus_consumer::{bus_ack, bus_claim, bus_nack, bus_subscribe};
+// The project-bus WEBHOOK SINK (PLAN-messaging-consumer-delivery, increment d): a host-run
+// pseudo-consumer that drains a sink's topic and delivers each message as an outbound signed POST to a
+// sealed, SSRF-confined destination. Two registration surfaces (runtime `PUT/DELETE .../bus/sinks/{name}`
+// + the config-declared `routing.webhook_sinks` block) converge on ONE `WebhookSink` record; the
+// drainer loop drives both, reusing the shared durable `pump_until_batch` core from increment (b).
+// `handlers`-gated like the rest of the consumer surface.
+#[cfg(feature = "handlers")]
+mod bus_webhook;
+#[cfg(feature = "handlers")]
+pub use bus_webhook::{WEBHOOK_DRAIN_TICK, spawn_bus_webhook_drainer};
+#[cfg(feature = "handlers")]
+pub(crate) use bus_webhook::{bus_sink_delete, bus_sink_put};
 mod proxy;
 pub use proxy::spawn_compute_reconcile;
 pub(crate) use proxy::{
@@ -1727,6 +1739,17 @@ impl HandlerRuntime {
         self.inner
             .as_ref()
             .and_then(|inner| inner.messaging.clone())
+    }
+
+    /// The node secret store (the SAME `Arc` set via [`Self::set_secret_store`]), if wired. Backs the
+    /// project-bus **webhook sink** ([`crate::bus_webhook`]): a sink's sealed `boatramp:<name>`
+    /// url/sign secrets are resolved against it under the sink's PROJECT at register + delivery time.
+    /// `None` ⇒ no `[secrets]` envelope wired, so a sink's destination cannot be unsealed (fail-closed).
+    #[cfg(feature = "handlers")]
+    pub(crate) fn secret_store(&self) -> Option<Arc<boatramp_core::secret_store::SecretStore>> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.secret_store.get().cloned())
     }
 
     /// The RAW (undecorated) DEFAULT-project blob backend, for the store-migration data-aware

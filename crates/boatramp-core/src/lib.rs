@@ -104,6 +104,8 @@ pub mod storage_conformance;
 pub mod target_sql;
 /// The one canonical wall-clock read for native crates (`now_unix`/`now_unix_ms`).
 pub mod time;
+/// The KV-backed registry of runtime-registered webhook sinks (PLAN-messaging-consumer-delivery, d).
+pub mod webhook_sink;
 
 // The shared wasm-clean layer lives in `boatramp-types`; re-export it so the
 // `boatramp_core::config`/`::route`/`::matcher`/`::domain_verify`/… paths are

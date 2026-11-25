@@ -48,8 +48,11 @@ use crate::CronLeaderGate;
 // ---------------------------------------------------------------------------
 
 /// Whether the SSRF-floor BYPASS mutation is armed (the webhook then accepts any target,
-/// so the webhook-SSRF gate goes RED). Always `false` in a shipped build.
-fn ssrf_bypass_active() -> bool {
+/// so the webhook-SSRF gate goes RED). Always `false` in a shipped build. `pub(crate)` so the
+/// project-bus **webhook sink** ([`crate::bus_webhook`]), which shares this SSRF floor via
+/// [`ssrf_floored_resolve`]/[`ssrf_floored_post`], proves its own floor load-bearing with the SAME
+/// seam.
+pub(crate) fn ssrf_bypass_active() -> bool {
     #[cfg(any(test, feature = "health-alert-ssrf-gate-mutation"))]
     {
         std::env::var("BOATRAMP_HEALTHALERT_MUTATION").as_deref() == Ok("ssrf_bypass")
@@ -93,7 +96,14 @@ fn sealed_leak_active() -> bool {
 pub(crate) struct SealedWebhookUrl(String);
 
 impl SealedWebhookUrl {
-    fn as_str(&self) -> &str {
+    /// Seal a resolved (already-unsealed) webhook URL into the redacting newtype. `pub(crate)` so the
+    /// project-bus webhook sink can construct one from its OWN (project-scoped) sealed URL secret and
+    /// share the same never-logged egress path.
+    pub(crate) fn seal(url: String) -> Self {
+        Self(url)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -377,37 +387,70 @@ async fn resolve_webhook_url(
     }
 }
 
-/// Deliver one event to the webhook: unseal the URL, run it through the SSRF floor
-/// ([`crate::ssrf::resolve_pin`] — https-only, userinfo-rejected, `is_global_ip` required
-/// unless the operator set `allow_private`), pin the resolved address, and POST the JSON.
-/// The URL is NEVER logged (held in [`SealedWebhookUrl`]); only a redacted outcome is.
-async fn deliver_webhook(
-    secret_store: Option<&SecretStore>,
-    cfg: &WebhookConfig,
-    event: &AlertEvent,
-) -> Result<(), String> {
-    let url = resolve_webhook_url(secret_store, cfg).await?;
-
-    // The GATE SEAM: when the SSRF-bypass mutation is armed the floor is dropped (every
-    // target is allowed), so the webhook-SSRF gate goes RED — proving the floor is
-    // load-bearing. Dormant everywhere else: the operator's `allow_private` is the only
-    // relaxation in a real build.
-    let allow_non_global = cfg.allow_private || ssrf_bypass_active();
-
-    let (host, addr) = crate::ssrf::resolve_pin(url.as_str(), allow_non_global, false)
-        .await
-        .ok_or_else(|| {
-            // No URL in the message — only the SSRF verdict.
-            "webhook target refused by the SSRF floor (not https, userinfo, or a \
+/// The SSRF-floor DECISION for a sealed webhook destination — the single choke point shared by the
+/// node-health webhook ([`deliver_webhook`]) and the project-bus webhook sink
+/// ([`crate::bus_webhook`]). Resolves + pins the URL through [`crate::ssrf::resolve_pin`] (https-only,
+/// userinfo-rejected, every resolved address globally routable unless `allow_non_global`), then — when
+/// an `egress_allow` allowlist is supplied (the sink) — requires the resolved `host:port` to match it
+/// (**empty ⇒ deny-all**). Returns `(host, pinned_addr)` or a REDACTED refusal (never the URL). Run at
+/// BOTH register-time (decision only) and delivery-time (before the POST), so the floor is identical
+/// on both.
+///
+/// `allow_non_global` is the operator-posture seam (`allow_private` on the node-health webhook; always
+/// the mutation seam [`ssrf_bypass_active`] for a sink, which has no consumer-settable relaxation);
+/// `allow_loopback_http` is a live-gate fixture (`false` in a shipped build) that permits an `http`
+/// loopback mock.
+pub(crate) async fn ssrf_floored_resolve(
+    url: &SealedWebhookUrl,
+    allow_non_global: bool,
+    allow_loopback_http: bool,
+    egress_allow: Option<&[String]>,
+) -> Result<(String, std::net::SocketAddr), String> {
+    let (host, addr) =
+        crate::ssrf::resolve_pin(url.as_str(), allow_non_global, allow_loopback_http)
+            .await
+            .ok_or_else(|| {
+                // No URL in the message — only the SSRF verdict.
+                "webhook target refused by the SSRF floor (not https, userinfo, or a \
              non-global address without allow_private)"
-                .to_string()
-        })?;
-    let client = crate::ssrf::pinned_client(&host, addr, true)
+                    .to_string()
+            })?;
+    // The per-sink destination allowlist (empty ⇒ deny-all). The resolved port is the URL's port
+    // (`resolve_pin` pins `port_or_known_default`), so the allowlist gates the exact dialed host:port.
+    if let Some(allow) = egress_allow
+        && !boatramp_core::config::egress_host_allowed(allow, &host, addr.port())
+    {
+        return Err(
+            "webhook target refused by the per-sink egress allowlist (no `host-glob:port` match; \
+             an IP-literal or off-list destination is denied)"
+                .to_string(),
+        );
+    }
+    Ok((host, addr))
+}
+
+/// Resolve + SSRF-floor a sealed webhook destination, then POST a caller-built request to it. The
+/// shared delivery choke point: the URL is NEVER logged (held in [`SealedWebhookUrl`]; a
+/// `reqwest::Error` has its embedded URL stripped by `without_url()`), redirects are refused by the
+/// pinned client, and the resolved address is pinned (DNS-rebind choke). `build` customizes the
+/// request (body, headers, timeout) so the node-health webhook (`.json(event)`) and the webhook sink
+/// (signed raw body) share ONE floored path. `https_only` is enforced except under the
+/// `allow_loopback_http` live-gate fixture.
+pub(crate) async fn ssrf_floored_post<F>(
+    url: &SealedWebhookUrl,
+    allow_non_global: bool,
+    allow_loopback_http: bool,
+    egress_allow: Option<&[String]>,
+    build: F,
+) -> Result<reqwest::Response, String>
+where
+    F: FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+{
+    let (host, addr) =
+        ssrf_floored_resolve(url, allow_non_global, allow_loopback_http, egress_allow).await?;
+    let client = crate::ssrf::pinned_client(&host, addr, !allow_loopback_http)
         .ok_or_else(|| "failed to build the pinned webhook client".to_string())?;
-    let resp = client
-        .post(url.as_str())
-        .json(event)
-        .timeout(std::time::Duration::from_secs(15))
+    build(client.post(url.as_str()))
         .send()
         .await
         // SECRET-LEAK FIX (Security MEDIUM): a `reqwest::Error`'s Display embeds the request
@@ -423,7 +466,30 @@ async fn deliver_webhook(
             } else {
                 format!("webhook POST failed: {}", e.without_url())
             }
-        })?;
+        })
+}
+
+/// Deliver one event to the webhook: unseal the URL, run it through the shared SSRF floor
+/// ([`ssrf_floored_post`] — https-only, userinfo-rejected, `is_global_ip` required unless the operator
+/// set `allow_private`), pin the resolved address, and POST the JSON. The URL is NEVER logged (held in
+/// [`SealedWebhookUrl`]); only a redacted outcome is.
+async fn deliver_webhook(
+    secret_store: Option<&SecretStore>,
+    cfg: &WebhookConfig,
+    event: &AlertEvent,
+) -> Result<(), String> {
+    let url = resolve_webhook_url(secret_store, cfg).await?;
+
+    // The GATE SEAM: when the SSRF-bypass mutation is armed the floor is dropped (every
+    // target is allowed), so the webhook-SSRF gate goes RED — proving the floor is
+    // load-bearing. Dormant everywhere else: the operator's `allow_private` is the only
+    // relaxation in a real build. No per-sink allowlist here (node-health has a single
+    // operator-sealed URL, not a consumer-declared destination set).
+    let allow_non_global = cfg.allow_private || ssrf_bypass_active();
+    let resp = ssrf_floored_post(&url, allow_non_global, false, None, |rb| {
+        rb.json(event).timeout(std::time::Duration::from_secs(15))
+    })
+    .await?;
     if resp.status().is_success() {
         Ok(())
     } else {

@@ -776,6 +776,15 @@ pub fn router_with_fast(
         )
         .route("/api/projects/{project}/bus/ack", post(bus_ack))
         .route("/api/projects/{project}/bus/nack", post(bus_nack))
+        // (d) webhook sink registration (PLAN-messaging-consumer-delivery): register/remove a
+        // host-run pseudo-consumer that delivers a project-bus topic as a signed, SSRF-confined POST.
+        // The `sinks` verb is an EGRESS grant → `Messaging·Admin` on `<project>` (the keystone's authz
+        // arm — strictly higher than the `Messaging·Read` the claim/ack/nack verbs need). The `{name}`
+        // tail names the sink; the record converges with the config-declared `routing.webhook_sinks`.
+        .route(
+            "/api/projects/{project}/bus/sinks/{name}",
+            put(bus_sink_put).delete(bus_sink_delete),
+        )
         // Captured guest logs for a function — symmetric to the per-site logs endpoint,
         // reading the same store under the function's project-qualified scope. Project-
         // owned read (the `/api/functions/*` authz mapping), so a project token reaches

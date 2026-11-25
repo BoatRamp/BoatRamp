@@ -1259,6 +1259,31 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             )
         });
 
+    // Project-bus WEBHOOK SINK drainer (PLAN-messaging-consumer-delivery, increment d): a periodic
+    // loop that drains every registered sink (runtime-registered KV + config-declared
+    // `routing.webhook_sinks`) and delivers each message as a signed, SSRF-confined POST. NOT
+    // leader-gated — a webhook sink is a consumer and the durable `claim_grouped` is leader-serialized,
+    // so every node may drain and at-least-once still holds (the wasm consumer model). Wired only when a
+    // messaging substrate + a secret store + a KV are all present (a sink's sealed URL/HMAC cannot
+    // resolve without the secret store, and there is nothing to drain without messaging). Off otherwise,
+    // so a node with no bus/secrets is byte-for-byte unchanged.
+    #[cfg(feature = "handlers")]
+    let bus_webhook_drainer: Option<tokio::task::JoinHandle<()>> =
+        match (handlers.messaging(), secret_store.clone(), handlers.kv()) {
+            (Some(messaging), Some(secret_store), Some(kv)) => {
+                Some(boatramp_server::spawn_bus_webhook_drainer(
+                    messaging,
+                    secret_store,
+                    kv,
+                    deploy.clone(),
+                    boatramp_server::WEBHOOK_DRAIN_TICK,
+                ))
+            }
+            _ => None,
+        };
+    #[cfg(not(feature = "handlers"))]
+    let bus_webhook_drainer: Option<tokio::task::JoinHandle<()>> = None;
+
     // Domain-verify auto-complete: periodically re-check every site's pending
     // ownership challenges and attach any that now pass — a published token (e.g.
     // via `domain add --provider`) converges without a manual `domain verify`.
@@ -1426,6 +1451,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     }
     if let Some(alerts) = health_alert_loop {
         reconcile.push(alerts);
+    }
+    if let Some(drainer) = bus_webhook_drainer {
+        reconcile.push(drainer);
     }
 
     Ok(RunningNode {

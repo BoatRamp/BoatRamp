@@ -58,6 +58,14 @@ pub struct DeployConfig {
     /// Message-consumer components, invoked per message on a topic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumers: Vec<ConsumerConfig>,
+    /// **Webhook sinks** (PLAN-messaging-consumer-delivery, increment d): host-run pseudo-consumers
+    /// that drain a project-bus topic and deliver each message as an outbound signed POST to a
+    /// sealed, SSRF-confined destination. The config-declared half of a sink's two registration
+    /// paths — activated on deploy, folded into the manifest (atomic with the content) — sharing the
+    /// SAME [`WebhookSink`] record + [`WebhookSink::validate`] as the runtime
+    /// `PUT /api/projects/{proj}/bus/sinks/{name}` surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webhook_sinks: Vec<WebhookSink>,
     /// Scheduled handler invocations (cron).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crons: Vec<CronConfig>,
@@ -113,6 +121,7 @@ impl Default for DeployConfig {
             proxy_allow: Vec::new(),
             handlers: Vec::new(),
             consumers: Vec::new(),
+            webhook_sinks: Vec::new(),
             crons: Vec::new(),
             streams: Vec::new(),
             sessions: Vec::new(),
@@ -257,6 +266,21 @@ impl DeployConfig {
             // BR-REQ-2: lint the consumer lane's dynamic egress host syntax (the consumer lane HONORS
             // the field, same as a handler).
             validate_dynamic_egress_hosts(&consumer.dynamic_egress_hosts)?;
+        }
+        // Webhook sinks (PLAN-messaging-consumer-delivery, increment d): the config-declared half of a
+        // sink's two registration paths runs the SAME `WebhookSink::validate` the runtime
+        // `PUT .../bus/sinks/{name}` surface runs (one record, one validation) — fail LOUD at
+        // apply/validate on a bad name/topic/secret-ref/egress-glob, never a silent dead sink. A
+        // duplicate sink name is refused (the drainer would otherwise drain one of two colliding keys).
+        let mut seen_sinks: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for sink in &self.webhook_sinks {
+            sink.validate()?;
+            if !seen_sinks.insert(sink.name.as_str()) {
+                return Err(ConfigError::parse(format!(
+                    "duplicate webhook sink name {:?} — each sink name must be unique",
+                    sink.name
+                )));
+            }
         }
         for cron in &self.crons {
             check_cron_schedule(&cron.schedule)?;
@@ -1478,6 +1502,194 @@ pub struct ResolvedSubscription {
     pub backoff_ms: u64,
     /// Fan-out retention, milliseconds.
     pub retention_ms: u64,
+}
+
+/// A **webhook sink** (PLAN-messaging-consumer-delivery, increment d): a host-run pseudo-consumer
+/// that drains a project-bus topic and delivers each message as an outbound **signed POST** to a
+/// sealed, SSRF-confined destination. The POST IS the delivery — an HTTP `2xx` acks the message
+/// (deleted for good), a non-`2xx` / timeout nacks it (held `backoff_ms × attempts` before
+/// redelivery), and `max_attempts` dead-letters it: the SAME durable claim / lease / ack / nack / DLQ
+/// core every consumer rides ([`crate::messaging`-less here, but the server's `Messaging` trait]),
+/// with no new durability primitive.
+///
+/// **ONE record type, TWO registration paths** (owner decision): a runtime
+/// `PUT`/`DELETE /api/projects/{proj}/bus/sinks/{name}` (`Messaging·Admin`-gated) persisted in the
+/// control-plane KV, AND a config-declared [`DeployConfig::webhook_sinks`] block activated on deploy.
+/// Both deserialize into THIS type and run the SAME [`Self::validate`] — the logic is never
+/// duplicated.
+///
+/// **Secrets never inline.** `url_secret` / `sign_secret` are sealed `boatramp:<name>` references into
+/// the sink's PROJECT secret store, resolved host-side at delivery time; the raw URL never rides a
+/// request body and is never logged. There is deliberately **no `allow_private`** field — relaxing
+/// the SSRF floor is an operator-only posture (as on the node-health webhook), never consumer-settable,
+/// so a sink can NEVER be pointed at a private / loopback / cloud-metadata address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSink {
+    /// The sink name — a valid resource slug, unique within the project. Authoritative from the URL
+    /// path on the runtime surface; the record key on the config surface.
+    pub name: String,
+    /// The project-bus topic to drain (`"<topic>"`, or a slashed `"orders/created"`). Namespaced to
+    /// `{project}/bus/<topic>` host-side from the TRUSTED project, never a client-supplied project.
+    pub topic: String,
+    /// Durable fan-out lane (own cursor / lease / DLQ). Empty ⇒ the default competing-consumer
+    /// work-queue.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// Sealed `boatramp:<name>` reference resolving to the destination URL in the project secret
+    /// store. NEVER a plaintext URL (the raw URL never lands in config or a request body, and is
+    /// never logged).
+    pub url_secret: String,
+    /// Per-sink egress allowlist: `host-glob:port` entries the RESOLVED destination MUST match
+    /// (register-time AND delivery-time). Modeled on `ConsumerConfig.dynamic_egress_hosts` — HTTPS
+    /// only, SSRF-floored, **empty ⇒ deny-all**. An IP-literal destination never matches (names only),
+    /// so `169.254.169.254` / RFC1918 / loopback fail the allowlist AND the `is_global_ip` floor.
+    pub egress_allow: Vec<String>,
+    /// Sealed `boatramp:<name>` reference to the HMAC key the POST body is signed with (per-sink).
+    pub sign_secret: String,
+    /// Visibility lease (ms) per claimed message. `None` ⇒ the server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// Dead-letter threshold. `None` ⇒ the server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    /// Linear redelivery backoff base (ms): a failed delivery is held `backoff_ms × attempts` before
+    /// it is claimable again — the SAME backoff the wasm consumer uses. `None`/`0` ⇒ immediate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
+    /// Max leased-but-unacked messages outstanding at once (back-pressure, reusing the dispatcher's
+    /// `in_flight_count` gate). `None` ⇒ bounded only by the per-claim batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ack_pending: Option<usize>,
+}
+
+impl WebhookSink {
+    /// The sealed-secret reference scheme a sink's `url_secret` / `sign_secret` must use (a project
+    /// secret, sealed at rest — never a plaintext URL or a host-env ref).
+    pub const SEALED_REF_PREFIX: &'static str = "boatramp:";
+
+    /// Validate the record — the SINGLE validation both registration paths run (one record, one
+    /// check). Fail-closed on a bad name / topic / secret ref / egress glob, so a misconfigured sink
+    /// is a LOUD error at register / apply, never a silent dead or over-broad sink.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !crate::project::is_valid_resource_slug(&self.name) {
+            return Err(ConfigError::parse(format!(
+                "webhook sink name {:?} is invalid — {}",
+                self.name,
+                crate::project::INVALID_NAME_REASON
+            )));
+        }
+        let topic = self.topic.trim();
+        if topic.is_empty() {
+            return Err(ConfigError::parse(format!(
+                "webhook sink {:?} has an empty topic",
+                self.name
+            )));
+        }
+        // The bus key is `{project}/bus/<topic>`; a `..`-traversal or absolute topic must never escape
+        // that prefix (the server re-screens with `validate_object_key`, but catch it loud at apply).
+        if topic.starts_with('/') || topic.split('/').any(|seg| seg == ".." || seg == ".") {
+            return Err(ConfigError::parse(format!(
+                "webhook sink {:?} topic {topic:?} must be a relative bus topic (no leading '/', no \
+                 '.'/'..' segments)",
+                self.name
+            )));
+        }
+        for (field, value) in [
+            ("url_secret", &self.url_secret),
+            ("sign_secret", &self.sign_secret),
+        ] {
+            let v = value.trim();
+            if v.is_empty() {
+                return Err(ConfigError::parse(format!(
+                    "webhook sink {:?} needs a non-empty {field} (a sealed `{}<name>` project secret \
+                     reference)",
+                    self.name,
+                    Self::SEALED_REF_PREFIX
+                )));
+            }
+            match v.strip_prefix(Self::SEALED_REF_PREFIX) {
+                Some(name) if !name.trim().is_empty() => {}
+                _ => {
+                    return Err(ConfigError::parse(format!(
+                        "webhook sink {:?} {field} {v:?} must be a sealed `{}<name>` project-secret \
+                         reference (never a plaintext URL/secret)",
+                        self.name,
+                        Self::SEALED_REF_PREFIX
+                    )));
+                }
+            }
+        }
+        // Empty `egress_allow` ⇒ deny-all, which would make the sink deliver NOTHING — a silent dead
+        // sink. Require at least one `host-glob:port` destination so the operator declares reach
+        // explicitly, then lint each entry's syntax (the SAME lint the consumer `dynamic_egress_hosts`
+        // lane runs, so a typo fails loud here, not as a silent never-match at delivery).
+        if self.egress_allow.is_empty() {
+            return Err(ConfigError::parse(format!(
+                "webhook sink {:?} egress_allow is empty (deny-all) — declare at least one \
+                 `host-glob:port` destination the sink may POST to",
+                self.name
+            )));
+        }
+        validate_dynamic_egress_hosts(&self.egress_allow)?;
+        Ok(())
+    }
+
+    /// The shared, delivery-transport-agnostic subscription knobs this sink drains with — the SAME
+    /// [`SubscriptionParams`] the wasm consumer, long-poll (a), and stream (b) consume, so the sink is
+    /// consumer-type-agnostic over the one durable core.
+    pub fn subscription(&self) -> SubscriptionParams {
+        SubscriptionParams {
+            group: self.group.clone(),
+            start: StartPosition::default(),
+            lease_ms: self.lease_ms,
+            max_attempts: self.max_attempts,
+            max_batch: None,
+            max_ack_pending: self.max_ack_pending,
+            backoff_ms: self.backoff_ms,
+            retention_ms: None,
+        }
+    }
+}
+
+/// Whether a RESOLVED webhook destination `host:port` is permitted by a `host-glob:port` allowlist —
+/// the register-time AND delivery-time allowlist leg of the webhook-sink SSRF confinement (increment
+/// d). **Empty ⇒ deny-all** (fail-closed). An IP-literal host NEVER matches (names only — the list can
+/// never widen reach to a raw IP; a raw internal IP is refused here AND by the `is_global_ip` floor).
+///
+/// Mirrors the runtime semantics of the consumer `dynamic_egress_hosts` matcher
+/// (`boatramp_handlers::engine::dynamic_egress_host_allowed`) — the SAME `host-glob:port` parse the
+/// co-located [`validate_dynamic_egress_entry`] lints — reusing [`crate::gateway::gateway_host_matches`]
+/// for the glob (case-insensitive exact / `*.suffix` single-label / `**.suffix` or bare `**`
+/// any-suffix). Re-stated at this layer (rather than shared as one fn with the handler engine) because
+/// `boatramp-handlers` does not depend on `boatramp-types`.
+pub fn egress_host_allowed(entries: &[String], host: &str, port: u16) -> bool {
+    // An IP literal never name-matches (names only; brackets tolerated on an IPv6 literal).
+    let host_raw = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host_raw.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let host_norm = host_raw.trim_end_matches('.').to_ascii_lowercase();
+    if host_norm.is_empty() {
+        return false;
+    }
+    for entry in entries {
+        // Split the REQUIRED trailing `:<port>` on the LAST colon; a missing / non-numeric port is
+        // malformed ⇒ never matches (and is rejected at deploy by `validate_dynamic_egress_entry`).
+        let Some((glob, port_s)) = entry.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(entry_port) = port_s.trim().parse::<u16>() else {
+            continue;
+        };
+        if entry_port != port {
+            continue;
+        }
+        if crate::gateway::gateway_host_matches(glob, &host_norm) {
+            return true;
+        }
+    }
+    false
 }
 
 /// A scheduled invocation of a declared handler route.
@@ -3132,6 +3344,125 @@ mod tests {
             .is_err(),
             "a malformed session dynamic_egress_hosts entry must fail the lint"
         );
+    }
+
+    #[test]
+    fn webhook_sink_validate_and_both_registration_paths_share_one_record() {
+        // PLAN-messaging-consumer-delivery (d): the ONE record + ONE validation both the runtime
+        // `PUT .../bus/sinks/{name}` surface and the config-declared `routing.webhook_sinks` block run.
+        let ok = WebhookSink {
+            name: "orders-fulfillment".into(),
+            topic: "orders/created".into(),
+            group: "fulfillment".into(),
+            url_secret: "boatramp:webhook/fulfillment-url".into(),
+            egress_allow: vec!["*.fulfillment.example.com:443".into()],
+            sign_secret: "boatramp:webhook/fulfillment-hmac".into(),
+            lease_ms: Some(30000),
+            max_attempts: Some(5),
+            backoff_ms: Some(2000),
+            max_ack_pending: Some(64),
+        };
+        ok.validate().expect("a well-formed sink validates");
+
+        // Each fail-closed check fires.
+        let bad = |mutate: &dyn Fn(&mut WebhookSink)| {
+            let mut s = ok.clone();
+            mutate(&mut s);
+            s.validate()
+        };
+        assert!(
+            bad(&|s| s.name = "bad name!".into()).is_err(),
+            "invalid name"
+        );
+        assert!(bad(&|s| s.topic = "/abs".into()).is_err(), "absolute topic");
+        assert!(
+            bad(&|s| s.topic = "a/../b".into()).is_err(),
+            "traversal topic"
+        );
+        assert!(bad(&|s| s.topic = String::new()).is_err(), "empty topic");
+        assert!(
+            bad(&|s| s.url_secret = "https://evil.example/x".into()).is_err(),
+            "a plaintext URL (non-sealed ref) is refused — secrets must be sealed"
+        );
+        assert!(
+            bad(&|s| s.sign_secret = String::new()).is_err(),
+            "empty sign secret"
+        );
+        assert!(
+            bad(&|s| s.egress_allow = vec![]).is_err(),
+            "empty egress_allow (deny-all) is a loud error, not a silent dead sink"
+        );
+        assert!(
+            bad(&|s| s.egress_allow = vec!["no-port-here".into()]).is_err(),
+            "a malformed host-glob:port entry fails the shared lint"
+        );
+
+        // Both registration paths converge: the config block runs the SAME validate via compile_check,
+        // and a duplicate name is refused.
+        let cfg = DeployConfig::from_ron(
+            r#"( webhook_sinks: [ ( name: "s1", topic: "orders/created",
+                 url_secret: "boatramp:u", egress_allow: ["*.example.com:443"], sign_secret: "boatramp:k" ) ] )"#,
+        )
+        .expect("a well-formed config-declared webhook sink validates");
+        assert_eq!(cfg.webhook_sinks.len(), 1);
+        cfg.compile_check().expect("idempotent re-validate");
+        assert!(
+            DeployConfig::from_ron(
+                r#"( webhook_sinks: [ ( name: "dup", topic: "t", url_secret: "boatramp:u",
+                     egress_allow: ["*.example.com:443"], sign_secret: "boatramp:k" ),
+                   ( name: "dup", topic: "t2", url_secret: "boatramp:u",
+                     egress_allow: ["*.example.com:443"], sign_secret: "boatramp:k" ) ] )"#,
+            )
+            .is_err(),
+            "a duplicate webhook sink name must fail compile_check"
+        );
+        assert!(
+            DeployConfig::from_ron(
+                r#"( webhook_sinks: [ ( name: "bad", topic: "t", url_secret: "plain-not-sealed",
+                     egress_allow: ["*.example.com:443"], sign_secret: "boatramp:k" ) ] )"#,
+            )
+            .is_err(),
+            "a non-sealed url_secret must fail compile_check (secrets must be sealed)"
+        );
+    }
+
+    #[test]
+    fn egress_host_allowed_matches_names_floors_ip_literals_and_denies_empty() {
+        // Names match the glob at the declared port; a different port/host does not.
+        let allow = vec![
+            "*.fulfillment.example.com:443".to_string(),
+            "hooks.acme.test:8443".to_string(),
+        ];
+        assert!(egress_host_allowed(
+            &allow,
+            "api.fulfillment.example.com",
+            443
+        ));
+        assert!(egress_host_allowed(&allow, "hooks.acme.test", 8443));
+        assert!(
+            !egress_host_allowed(&allow, "api.fulfillment.example.com", 8443),
+            "wrong port"
+        );
+        assert!(
+            !egress_host_allowed(&allow, "evil.example.com", 443),
+            "off-list host"
+        );
+        assert!(
+            !egress_host_allowed(&allow, "a.b.fulfillment.example.com", 443),
+            "*. is single-label"
+        );
+        // An IP literal NEVER matches (names only — can't widen reach to a raw IP), even if listed.
+        assert!(!egress_host_allowed(
+            &["169.254.169.254:443".to_string()],
+            "169.254.169.254",
+            443
+        ));
+        assert!(
+            !egress_host_allowed(&["**:443".to_string()], "10.0.0.1", 443),
+            "** never matches an IP"
+        );
+        // Empty ⇒ deny-all (fail-closed).
+        assert!(!egress_host_allowed(&[], "anything.example.com", 443));
     }
 
     #[test]
