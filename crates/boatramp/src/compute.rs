@@ -17,8 +17,8 @@
 use std::collections::BTreeMap;
 
 use boatramp_core::compute::{
-    BindingKind, ComputeBinding, ComputeSpec, IsolationRequirement, PlacementConstraints,
-    PullPolicy as SpecPullPolicy, RestartPolicy, RootSource,
+    BindingKind, ComputeBinding, ComputeSpec, EphemeralMount, IsolationRequirement,
+    PlacementConstraints, PullPolicy as SpecPullPolicy, RestartPolicy, RootSource,
 };
 use clap::Subcommand;
 use serde::Serialize;
@@ -154,6 +154,17 @@ enum ComputeCommand {
         /// volume — no added capabilities. Honored under any posture.
         #[arg(long)]
         user: Option<String>,
+        /// Declare an **ephemeral writable mount** (repeatable): `<path>[:<size_mib>]`, e.g.
+        /// `--mount /cache` or `--mount /cache:256`. A per-workload, size-capped `tmpfs` at
+        /// `<path>`, set up fresh per replica and reclaimed on stop (never persisted — the
+        /// cheap scratch/cache counterpart to a persistent volume). This is the multi-tenant-SAFE
+        /// way to get a writable path on the hardened read-only root (unlike `--writable-root`,
+        /// which is honored only single-tenant). Size defaults to 64 MiB and is capped at 8 GiB;
+        /// the path must be absolute, distinct, and not a reserved mount (`/`, `/proc`, `/sys`,
+        /// `/dev`, `/tmp`, `/run`). Container backends honor any path; on a micro-VM the mount
+        /// point must already exist in the image (best-effort).
+        #[arg(long = "mount")]
+        mount: Vec<String>,
         /// Isolation the workload requires (`trusted` allows containers;
         /// `untrusted` forces a microVM / managed platform).
         #[arg(long, value_enum, default_value_t = Isolation::Trusted)]
@@ -1281,6 +1292,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
             writable_root,
             cap_add,
             user,
+            mount,
             isolation,
             regions,
             bind,
@@ -1337,6 +1349,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 writable_root,
                 cap_add,
                 user,
+                parse_ephemeral_mounts(&mount)?,
                 isolation,
                 parse_bindings(&bind)?,
                 pull_secret,
@@ -1447,6 +1460,9 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<ComputeOut
                 writable_root,
                 cap_add,
                 user,
+                // `compute build` exposes no `--mount`; ephemeral mounts are a `compute set`
+                // surface (added to the stored spec there).
+                Vec::new(),
                 isolation,
                 parse_bindings(&bind)?,
                 // A `compute build` workload is a locally-built rootfs micro-VM, not a
@@ -2152,6 +2168,7 @@ fn build_spec(
     writable_root: bool,
     cap_add: Vec<String>,
     user: Option<String>,
+    ephemeral_mounts: Vec<EphemeralMount>,
     isolation: Isolation,
     bindings: Vec<ComputeBinding>,
     pull_secret: Option<String>,
@@ -2166,7 +2183,7 @@ fn build_spec(
             .ok_or_else(|| Error::BadEnv(pair.clone()))?;
         env_map.insert(k.to_string(), v.to_string());
     }
-    Ok(ComputeSpec::builder(root, vcpus, mem_mib, port)
+    let spec = ComputeSpec::builder(root, vcpus, mem_mib, port)
         .kernel(kernel)
         .entrypoint(entrypoint)
         .env(env_map)
@@ -2180,13 +2197,55 @@ fn build_spec(
         .writable_root(writable_root)
         .cap_add(cap_add)
         .user(user)
+        .ephemeral_mounts(ephemeral_mounts)
         .isolation(isolation.into())
         .prefer_backend(prefer_backend)
         .require_backend(require_backend)
         .pull_secret(pull_secret)
         .pull_policy(pull_policy)
         .bindings(bindings)
-        .build())
+        .build();
+    // Fail-fast on a bad ephemeral mount set (bad size/path/duplicate) BEFORE the request
+    // leaves the host — the same pure rule the server enforces authoritatively.
+    spec.validate_ephemeral_mounts().map_err(Error::Args)?;
+    Ok(spec)
+}
+
+/// Parse `--mount <path>[:<size_mib>]` flags into [`EphemeralMount`]s. The size defaults to
+/// [`DEFAULT_EPHEMERAL_MOUNT_MIB`](boatramp_core::compute::DEFAULT_EPHEMERAL_MOUNT_MIB) when
+/// omitted, so the stored spec always carries an explicit, bounded size (content-hash honest).
+/// Only shape (a well-formed `path[:size]`) is parsed here; the full rule — absolute path, no
+/// reserved mount, no duplicate/volume collision, size within the cap — is enforced server-side
+/// by `ComputeSpec::validate_ephemeral_mounts` (the single fail-closed choke point).
+fn parse_ephemeral_mounts(flags: &[String]) -> Result<Vec<EphemeralMount>> {
+    flags
+        .iter()
+        .map(|raw| {
+            // Split on the LAST `:` so an absolute path (which never contains `:`) plus an
+            // optional trailing `:<size>` parses unambiguously.
+            let (path, size) = match raw.rsplit_once(':') {
+                // A trailing numeric segment is the size; the head is the path (an empty head
+                // — e.g. `:128` — is caught by the emptiness check below). A non-numeric tail
+                // (e.g. a path that contains a `:` but no numeric suffix) is part of the path.
+                Some((p, s)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) => {
+                    let mib: u32 = s.parse().map_err(|_| {
+                        Error::Args(format!("invalid ephemeral mount size in {raw:?}"))
+                    })?;
+                    (p, mib)
+                }
+                _ => (
+                    raw.as_str(),
+                    boatramp_core::compute::DEFAULT_EPHEMERAL_MOUNT_MIB,
+                ),
+            };
+            if path.is_empty() {
+                return Err(Error::Args(format!(
+                    "invalid --mount {raw:?}: expected <path>[:<size_mib>]"
+                )));
+            }
+            Ok(EphemeralMount::new(path, size))
+        })
+        .collect()
 }
 
 /// Parse `--bind <kind>[:<name>]` flags into [`ComputeBinding`]s. `sql` binds the
@@ -2371,6 +2430,65 @@ mod tests {
         let cli = Cli::try_parse_from(std::iter::once("boatramp").chain(argv.iter().copied()))?;
         let Cmd::Compute(args) = cli.cmd;
         Ok(args.command)
+    }
+
+    #[test]
+    fn parse_ephemeral_mounts_grammar_and_default_size() {
+        // `<path>` ⇒ the default size; `<path>:<size>` ⇒ the explicit cap.
+        let got = parse_ephemeral_mounts(&["/cache".to_string(), "/var/scratch:256".to_string()])
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                EphemeralMount::new(
+                    "/cache",
+                    boatramp_core::compute::DEFAULT_EPHEMERAL_MOUNT_MIB
+                ),
+                EphemeralMount::new("/var/scratch", 256),
+            ]
+        );
+        // A non-numeric trailing segment is treated as part of the path, not a size.
+        assert_eq!(
+            parse_ephemeral_mounts(&["/weird:dir".to_string()]).unwrap(),
+            vec![EphemeralMount::new(
+                "/weird:dir",
+                boatramp_core::compute::DEFAULT_EPHEMERAL_MOUNT_MIB
+            )]
+        );
+        // Empty path is rejected.
+        assert!(parse_ephemeral_mounts(&[":128".to_string()]).is_err());
+        assert!(parse_ephemeral_mounts(&[String::new()]).is_err());
+    }
+
+    #[test]
+    fn compute_set_mount_flag_parses_and_threads_through() {
+        match parse(&[
+            "compute",
+            "set",
+            "web",
+            "--image",
+            "img",
+            "--port",
+            "8080",
+            "--mount",
+            "/cache:128",
+            "--mount",
+            "/var/scratch",
+        ]) {
+            Ok(ComputeCommand::Set { mount, .. }) => {
+                assert_eq!(
+                    mount,
+                    vec!["/cache:128".to_string(), "/var/scratch".to_string()]
+                );
+                let parsed = parse_ephemeral_mounts(&mount).unwrap();
+                assert_eq!(parsed[0], EphemeralMount::new("/cache", 128));
+                assert_eq!(
+                    parsed[1].size_mib,
+                    boatramp_core::compute::DEFAULT_EPHEMERAL_MOUNT_MIB
+                );
+            }
+            other => panic!("expected compute set, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2661,6 +2779,7 @@ mod tests {
             false,
             vec![],
             None,
+            vec![],
             Isolation::Trusted,
             vec![],
             None,
@@ -2684,6 +2803,7 @@ mod tests {
             false,
             vec![],
             None,
+            vec![],
             Isolation::Trusted,
             vec![],
             None,

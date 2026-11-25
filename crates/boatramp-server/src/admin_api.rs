@@ -1276,6 +1276,16 @@ pub(super) async fn put_compute(
         )
             .into_response();
     }
+    // Ephemeral (tmpfs) mounts: validate the declared set fail-closed at this single choke
+    // point (CLI, apply manifest, direct API all share it) — a bounded size
+    // (1..=MAX_EPHEMERAL_MOUNT_MIB, the memory-exhaustion guard), a clean absolute path that
+    // is not a reserved sandbox mount, no duplicate, and no collision with a persistent
+    // volume. A per-workload, size-capped tmpfs in the workload's own mount namespace is
+    // multi-tenant-SAFE, so (unlike writable_root/cap_add) it is NOT posture-gated — it is
+    // simply validated here and honored on every backend.
+    if let Err(reason) = request.spec.validate_ephemeral_mounts() {
+        return (StatusCode::BAD_REQUEST, format!("{reason}\n")).into_response();
+    }
     // A kernel applies only to the micro-VM source (`RootSource::Rootfs` boots
     // `vmlinux` + a rootfs image). For an OCI image (docker/cloudflare) or a tar
     // rootfs (native container) the kernel is ignored, so we neither require nor

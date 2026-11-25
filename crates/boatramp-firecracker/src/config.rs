@@ -154,6 +154,61 @@ pub(crate) fn env_cmdline_fragment_bounded(
     Ok(frag)
 }
 
+/// Encode a workload's declared **ephemeral mounts** as a ` boatramp.tmpfs=<hex>`
+/// kernel-cmdline fragment the guest init (`vminit`) decodes and mounts: a per-workload,
+/// size-capped `tmpfs` at each declared path (the micro-VM analogue of the container
+/// backend's ephemeral tmpfs mounts). The payload is the hex of the NUL-joined
+/// `target\0size=<N>m\0…` pairs — a target followed by its `mount(2)` data option, so
+/// `vminit` passes the option verbatim with no integer formatting in freestanding C. Hex
+/// avoids cmdline quoting. Empty ⇒ empty string (no fragment).
+///
+/// The mount is best-effort in the guest (like the persistent-volume mounts there): the
+/// mount point must exist on the read-only root, so this targets a path already present in
+/// the image. The tmpfs is `nosuid,nodev` + the `size=` cap, so it is bounded and
+/// non-escalating — multi-tenant-safe inside the guest.
+pub(crate) fn tmpfs_cmdline_fragment(mounts: &[boatramp_types::compute::EphemeralMount]) -> String {
+    if mounts.is_empty() {
+        return String::new();
+    }
+    let mut blob = Vec::new();
+    for m in mounts {
+        blob.extend_from_slice(m.mount.as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(format!("size={}m", m.size_mib.max(1)).as_bytes());
+        blob.push(0);
+    }
+    let mut hex = String::with_capacity(blob.len() * 2);
+    for b in blob {
+        hex.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
+        hex.push(char::from_digit(u32::from(b & 0xf), 16).unwrap());
+    }
+    format!(" boatramp.tmpfs={hex}")
+}
+
+/// The maximum length (bytes) of the ` boatramp.tmpfs=<hex>` cmdline fragment. Shares the
+/// kernel `COMMAND_LINE_SIZE` budget with [`MAX_ENV_CMDLINE_LEN`]; cap it the same so a huge
+/// ephemeral-mount list fails FAST at launch with a clear error rather than silently
+/// overflowing the cmdline into a cryptic boot failure.
+pub(crate) const MAX_TMPFS_CMDLINE_LEN: usize = 1024;
+
+/// Build the ` boatramp.tmpfs=<hex>` fragment and **reject** it if it exceeds
+/// [`MAX_TMPFS_CMDLINE_LEN`]. The embedded VMM launch path uses this so an over-large mount
+/// list surfaces as a clean launch error, not a silent guest boot failure.
+pub(crate) fn tmpfs_cmdline_fragment_bounded(
+    mounts: &[boatramp_types::compute::EphemeralMount],
+) -> Result<String, String> {
+    let frag = tmpfs_cmdline_fragment(mounts);
+    if frag.len() > MAX_TMPFS_CMDLINE_LEN {
+        return Err(format!(
+            "workload ephemeral mounts are too large for the kernel cmdline: the \
+             `boatramp.tmpfs=` fragment is {} bytes (max {MAX_TMPFS_CMDLINE_LEN}); reduce the \
+             number or path length of ephemeral mounts",
+            frag.len()
+        ));
+    }
+    Ok(frag)
+}
+
 /// The conventional gateway for a `/24`: the `.1` of the guest's network.
 fn gateway_ip(guest_ip: &str) -> String {
     match guest_ip.rsplit_once('.') {
@@ -170,11 +225,12 @@ impl FcMachine {
     /// or a sane default that brings up the guest IP.
     pub fn from_spec(spec: &ComputeSpec, resources: &MachineResources) -> Self {
         let boot_args = format!(
-            "{}{}",
+            "{}{}{}",
             spec.kernel_cmdline
                 .clone()
                 .unwrap_or_else(|| default_cmdline(&resources.guest_ip)),
             env_cmdline_fragment(&spec.env),
+            tmpfs_cmdline_fragment(&spec.ephemeral_mounts),
         );
         Self {
             boot_source: BootSource {
@@ -297,6 +353,54 @@ mod tests {
         let big = BTreeMap::from([("BIG".to_string(), "x".repeat(MAX_ENV_CMDLINE_LEN))]);
         assert!(env_cmdline_fragment(&big).len() > MAX_ENV_CMDLINE_LEN);
         assert!(env_cmdline_fragment_bounded(&big).is_err());
+    }
+
+    #[test]
+    fn ephemeral_mounts_append_a_tmpfs_cmdline_fragment() {
+        use boatramp_types::compute::EphemeralMount;
+        // Empty ⇒ no fragment (the cmdline is unchanged / byte-identical to before).
+        assert_eq!(tmpfs_cmdline_fragment(&[]), "");
+        let mut s = spec();
+        s.kernel_cmdline = Some("base".into());
+        assert_eq!(
+            FcMachine::from_spec(&s, &resources()).boot_source.boot_args,
+            "base"
+        );
+
+        // `/x\0size=8m\0` ⇒ the init decodes back to a mount of `tmpfs` at `/x` with `size=8m`.
+        s.ephemeral_mounts = vec![EphemeralMount::new("/x", 8)];
+        let args = FcMachine::from_spec(&s, &resources()).boot_source.boot_args;
+        let expect_hex = {
+            let mut blob = Vec::new();
+            blob.extend_from_slice(b"/x");
+            blob.push(0);
+            blob.extend_from_slice(b"size=8m");
+            blob.push(0);
+            blob.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        assert_eq!(args, format!("base boatramp.tmpfs={expect_hex}"));
+
+        // Both env + tmpfs fragments coexist on the cmdline.
+        s.env = BTreeMap::from([("K".to_string(), "v".to_string())]);
+        let args2 = FcMachine::from_spec(&s, &resources()).boot_source.boot_args;
+        assert!(args2.contains("boatramp.env="));
+        assert!(args2.contains("boatramp.tmpfs="));
+    }
+
+    #[test]
+    fn tmpfs_cmdline_fragment_is_length_bounded() {
+        use boatramp_types::compute::EphemeralMount;
+        let small = [EphemeralMount::new("/cache", 64)];
+        assert_eq!(
+            tmpfs_cmdline_fragment_bounded(&small).unwrap(),
+            tmpfs_cmdline_fragment(&small)
+        );
+        // A mount list whose hex fragment blows past the cap is REFUSED (fail fast).
+        let big: Vec<EphemeralMount> = (0..200)
+            .map(|i| EphemeralMount::new(format!("/scratch/long/path/number/{i}"), 8))
+            .collect();
+        assert!(tmpfs_cmdline_fragment(&big).len() > MAX_TMPFS_CMDLINE_LEN);
+        assert!(tmpfs_cmdline_fragment_bounded(&big).is_err());
     }
 
     #[test]

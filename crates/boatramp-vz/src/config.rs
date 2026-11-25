@@ -29,6 +29,11 @@ pub struct WorkerConfig {
     /// runtime `env` to the guest init (empty ⇒ none). See [`env_cmdline_fragment`].
     #[serde(default)]
     pub env_cmdline: String,
+    /// The ` boatramp.tmpfs=<hex>` cmdline fragment declaring the workload's
+    /// **ephemeral mounts** — a per-workload, size-capped `tmpfs` at each declared path
+    /// the guest init mounts (empty ⇒ none). See [`tmpfs_cmdline_fragment`].
+    #[serde(default)]
+    pub tmpfs_cmdline: String,
     /// The guest's static IPv4 (kernel `ip=` autoconfig; also derives the MAC).
     pub guest_ip: String,
     /// The vmnet gateway the guest routes through (the `.1` of the subnet).
@@ -116,15 +121,43 @@ pub fn env_cmdline_fragment(env: &BTreeMap<String, String>) -> String {
     format!(" boatramp.env={hex}")
 }
 
+/// Encode a workload's declared **ephemeral mounts** as a ` boatramp.tmpfs=<hex>`
+/// kernel-cmdline fragment the guest init (`vminit`) decodes and mounts: a per-workload,
+/// size-capped `tmpfs` at each declared path. The payload is the hex of the NUL-joined
+/// `target\0size=<N>m\0…` pairs — a target followed by its `mount(2)` data option. Empty ⇒
+/// empty string.
+///
+/// Bit-for-bit identical to the firecracker crate's `tmpfs_cmdline_fragment`, so the **same
+/// guest init** decodes it on either substrate (the uniform-UX invariant, matching
+/// [`env_cmdline_fragment`]).
+pub fn tmpfs_cmdline_fragment(mounts: &[boatramp_core::compute::EphemeralMount]) -> String {
+    if mounts.is_empty() {
+        return String::new();
+    }
+    let mut blob = Vec::new();
+    for m in mounts {
+        blob.extend_from_slice(m.mount.as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(format!("size={}m", m.size_mib.max(1)).as_bytes());
+        blob.push(0);
+    }
+    let mut hex = String::with_capacity(blob.len() * 2);
+    for b in blob {
+        hex.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
+        hex.push(char::from_digit(u32::from(b & 0xf), 16).unwrap());
+    }
+    format!(" boatramp.tmpfs={hex}")
+}
+
 /// Assemble the full guest cmdline for `cfg`: the base (override or default) plus
-/// the runtime-env fragment. The one place both the worker and the tests agree on
-/// the exact string the VM boots with.
+/// the runtime-env fragment and the ephemeral-mount fragment. The one place both the
+/// worker and the tests agree on the exact string the VM boots with.
 pub fn full_cmdline(cfg: &WorkerConfig) -> String {
     let base = cfg
         .cmdline_override
         .clone()
         .unwrap_or_else(|| default_cmdline(&cfg.guest_ip, &cfg.gateway, cfg.writable_root));
-    format!("{base}{}", cfg.env_cmdline)
+    format!("{base}{}{}", cfg.env_cmdline, cfg.tmpfs_cmdline)
 }
 
 #[cfg(test)]
@@ -179,6 +212,7 @@ mod tests {
             kernel_path: "/x/vmlinux".into(),
             cmdline_override: None,
             env_cmdline: env_cmdline_fragment(&env),
+            tmpfs_cmdline: String::new(),
             guest_ip: "10.0.0.5".into(),
             gateway: "10.0.0.1".into(),
             writable_root: false,
@@ -194,12 +228,51 @@ mod tests {
     }
 
     #[test]
+    fn tmpfs_fragment_matches_firecracker_encoding_and_appends_to_cmdline() {
+        use boatramp_core::compute::EphemeralMount;
+        assert_eq!(tmpfs_cmdline_fragment(&[]), "");
+        // `/x\0size=8m\0` → the same hex the firecracker crate emits, so the shared vminit
+        // decodes it identically on either substrate.
+        let mounts = [EphemeralMount::new("/x", 8)];
+        let expect = {
+            let mut blob = Vec::new();
+            blob.extend_from_slice(b"/x");
+            blob.push(0);
+            blob.extend_from_slice(b"size=8m");
+            blob.push(0);
+            format!(
+                " boatramp.tmpfs={}",
+                blob.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            )
+        };
+        assert_eq!(tmpfs_cmdline_fragment(&mounts), expect);
+
+        let cfg = WorkerConfig {
+            rootfs_path: "/x/rootfs.ext4".into(),
+            kernel_path: "/x/vmlinux".into(),
+            cmdline_override: None,
+            env_cmdline: String::new(),
+            tmpfs_cmdline: tmpfs_cmdline_fragment(&mounts),
+            guest_ip: "10.0.0.5".into(),
+            gateway: "10.0.0.1".into(),
+            writable_root: false,
+            mem_mib: 256,
+            vcpus: 1,
+            volumes: vec![],
+            restore_path: None,
+            machine_id: None,
+        };
+        assert!(full_cmdline(&cfg).ends_with(&expect));
+    }
+
+    #[test]
     fn full_cmdline_honors_override() {
         let cfg = WorkerConfig {
             rootfs_path: "/x/rootfs.ext4".into(),
             kernel_path: "/x/vmlinux".into(),
             cmdline_override: Some("custom root=/dev/vda ro".into()),
             env_cmdline: String::new(),
+            tmpfs_cmdline: String::new(),
             guest_ip: "10.0.0.5".into(),
             gateway: "10.0.0.1".into(),
             writable_root: false,
@@ -219,6 +292,7 @@ mod tests {
             kernel_path: "/data/compute/kernels/def".into(),
             cmdline_override: None,
             env_cmdline: " boatramp.env=413d6200".into(),
+            tmpfs_cmdline: String::new(),
             guest_ip: "10.0.0.7".into(),
             gateway: "10.0.0.1".into(),
             writable_root: false,
