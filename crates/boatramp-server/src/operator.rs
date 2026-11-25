@@ -590,14 +590,15 @@ fn dlq_namespace(
 /// the project (see `handler_dispatch`'s `project.qualified("bus")`). An operator token scoped to
 /// project P thus only ever touches P's bus.
 #[cfg(feature = "handlers")]
-fn bus_namespace(project: &ProjectRef<'_>, topic: &str) -> String {
+pub(crate) fn bus_namespace(project: &ProjectRef<'_>, topic: &str) -> String {
     project.qualified(&format!("bus/{topic}"))
 }
 
 /// The `messaging` backend, or the shared "not configured" 503 the DLQ/queue endpoints all return
-/// when no bus is wired — hoisted so the site and project-bus handlers share one guard.
+/// when no bus is wired — hoisted so the site, project-bus operator, and external bus-consumer
+/// ([`crate::bus_consumer`]) handlers share one guard.
 #[cfg(feature = "handlers")]
-fn messaging_or_unavailable(
+pub(crate) fn messaging_or_unavailable(
     handlers: &HandlerRuntime,
 ) -> Result<&std::sync::Arc<dyn boatramp_core::messaging::Messaging>, Response> {
     let Some(inner) = handlers.inner.as_ref() else {

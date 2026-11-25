@@ -288,6 +288,7 @@ fn resource_type(resource: Resource) -> &'static str {
         Resource::Cache => "Cache",
         Resource::System => "System",
         Resource::Overlay => "Overlay",
+        Resource::Messaging => "Messaging",
     }
 }
 
@@ -335,7 +336,15 @@ fn principal_entity(
 fn resource_entity(required: &Right) -> Result<(EntityUid, Entity), Box<dyn Error>> {
     let ty = resource_type(required.resource);
     let (id, attrs) = match required.resource {
-        Resource::Site => {
+        // `Site` is keyed by its full `"<project>/<site>"` target with both `name` (for a site
+        // grant's `RoleTarget` guard) and `project` (for a project-wildcard grant's guard).
+        // `Messaging` is hierarchical the SAME way — its target is the project-qualified topic key
+        // `"<project>/<topic>"` (or the project-wildcard `"<project>/*"` for ack/nack) — so it carries
+        // the identical `name` + `project` attributes. Today only `admin` grants `Messaging` (an
+        // `AnyTarget` permit with no guard), but keying it here means a future project-wildcard
+        // `Messaging·Read` grant (a per-project consumer role) authorizes correctly via the
+        // `resource.project` guard, exactly as a project role's site-wildcard does.
+        Resource::Site | Resource::Messaging => {
             let name = required.target.clone().unwrap_or_default();
             let project = boatramp_types::authz::project_of(&name).to_string();
             let mut a = HashMap::new();

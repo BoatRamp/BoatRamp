@@ -643,12 +643,18 @@ struct ClaimResponse {
 /// (so `ack`'s inline byte-budget accounting is exact). It is NOT a bearer credential — the
 /// `Authorization` token is the authority; a self-contained handle keeps the shim stateless (no
 /// claimed-message map to GC or lose across a restart).
+///
+/// `pub(crate)` + its methods are REUSED by the external project-bus consumer surface
+/// ([`crate::bus_consumer`], PLAN-messaging-consumer-delivery): the long-poll claim / durable
+/// stream / webhook sink all frame the SAME opaque handle so one shared `ack`/`nack` side-channel
+/// serves every transport. There too the project is taken from the request PATH (never the handle),
+/// so a tampered handle can only ever name a topic WITHIN the already-authorized project.
 #[derive(Debug, Serialize, Deserialize)]
-struct AckHandle {
+pub(crate) struct AckHandle {
     /// The substrate message id ([`ClaimedMessage::id`]).
     id: String,
-    /// The BARE topic (re-authorized on ack/nack; the full key is recomposed from the scope).
-    topic: String,
+    /// The BARE topic (re-authorized on ack/nack; the full key is recomposed from the scope/path).
+    pub(crate) topic: String,
     /// The consumer group ([`ClaimedMessage::group`]) — `""` for the default work queue; `ack`/
     /// `nack` branch on it.
     group: String,
@@ -667,7 +673,7 @@ struct AckHandle {
 impl AckHandle {
     /// Encode a claimed message (keyed on the consumer's BARE `topic`) into its opaque wire
     /// handle.
-    fn encode(bare_topic: &str, msg: &ClaimedMessage) -> String {
+    pub(crate) fn encode(bare_topic: &str, msg: &ClaimedMessage) -> String {
         let h = Self {
             id: msg.id.clone(),
             topic: bare_topic.to_string(),
@@ -682,7 +688,7 @@ impl AckHandle {
     }
 
     /// Decode an opaque wire handle, or `None` when it is malformed (→ 400, never a panic).
-    fn decode(handle: &str) -> Option<Self> {
+    pub(crate) fn decode(handle: &str) -> Option<Self> {
         let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(handle)
             .ok()?;
@@ -692,7 +698,7 @@ impl AckHandle {
     /// Reconstruct the [`ClaimedMessage`] the trait acks/nacks, given the FULL namespaced topic
     /// key (recomposed from the re-authorized scope). The payload is decoded back to bytes so
     /// `ack`'s inline accounting is exact.
-    fn into_message(self, full_key: String) -> ClaimedMessage {
+    pub(crate) fn into_message(self, full_key: String) -> ClaimedMessage {
         ClaimedMessage {
             id: self.id,
             topic: full_key,

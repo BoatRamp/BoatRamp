@@ -1378,6 +1378,108 @@ pub fn is_default_start(s: &StartPosition) -> bool {
     *s == StartPosition::default()
 }
 
+/// The shared, host-internal per-consumer **subscription knobs** — the delivery-transport-agnostic
+/// parameter set every non-wasm bus-consumer transport consumes (PLAN-messaging-consumer-delivery §2):
+/// long-poll claim (a), durable stream (b), and webhook sink (d). Factored out of the per-consumer
+/// fields [`ConsumerConfig`] already carries (`lease_ms` / `max_attempts` / `max_batch` /
+/// `max_ack_pending` / `backoff_ms` / `group` / `start` / `retention_ms`) so every transport clamps
+/// and defaults IDENTICALLY — that is what makes the external consumer surface consumer-type-agnostic.
+/// Every field is request-/config-supplied and OPTIONAL; [`resolve`](Self::resolve) applies the
+/// server caps + defaults (the SAME `MAX`/`DEFAULT_*` the messaging-shim's claim handler applies) to
+/// produce a concrete [`ResolvedSubscription`]. The wasm PUSH consumer keeps its existing
+/// `ConsumerConfig`-driven dispatch untouched; this type is additive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubscriptionParams {
+    /// Consumer **group**: empty = the competing-consumer work-queue; a non-empty name = a durable
+    /// fan-out subscriber (own cursor / lease / DLQ). Same meaning as [`ConsumerConfig::group`].
+    pub group: String,
+    /// Where a non-empty `group` starts on first subscription. Ignored for the default work-queue.
+    pub start: StartPosition,
+    /// Visibility lease (ms) a claimed-but-unacked message stays invisible before redelivery.
+    /// `None` ⇒ [`Self::DEFAULT_LEASE_MS`].
+    pub lease_ms: Option<u64>,
+    /// Max delivery attempts before a message is dead-lettered. `None` ⇒ [`Self::DEFAULT_MAX_ATTEMPTS`].
+    pub max_attempts: Option<u32>,
+    /// Max messages leased per claim (the pull batch). `None` ⇒ the transport's default, clamped to
+    /// `[1, `[`Self::MAX_BATCH`]`]`.
+    pub max_batch: Option<usize>,
+    /// Most leased-but-unacked messages a connection may hold at once (back-pressure for a slow
+    /// consumer — used by (b)/(d)). `None` ⇒ unbounded (only `max_batch` per claim bounds it).
+    pub max_ack_pending: Option<usize>,
+    /// Redelivery backoff (ms) held between explicit-nack retries (`backoff_ms × attempts`). `None`/`0`
+    /// ⇒ immediate redelivery.
+    pub backoff_ms: Option<u64>,
+    /// Retention (ms) a grouped topic's fan-out log is kept for slow/absent groups. `None` ⇒
+    /// [`Self::DEFAULT_RETENTION_MS`]. Only meaningful for a grouped consumer.
+    pub retention_ms: Option<u64>,
+}
+
+impl SubscriptionParams {
+    /// Default visibility lease (ms) — mirrors the messaging-shim's `DEFAULT_LEASE_MS`.
+    pub const DEFAULT_LEASE_MS: u64 = 30_000;
+    /// Default dead-letter threshold — mirrors the messaging-shim's `DEFAULT_MAX_ATTEMPTS`.
+    pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+    /// Default per-claim batch for a STREAM/SINK (per-tick) transport — mirrors [`ConsumerConfig`]'s
+    /// `max_batch` default.
+    pub const DEFAULT_MAX_BATCH: usize = 16;
+    /// Default per-claim batch for a PULL transport (long-poll claim / the shim's claim): lease ONE —
+    /// mirrors the messaging-shim's `DEFAULT_CLAIM_MAX`.
+    pub const DEFAULT_CLAIM_BATCH: usize = 1;
+    /// Hard cap on a single claim's batch size — mirrors the messaging-shim's `MAX_CLAIM_MAX`, so a
+    /// greedy/buggy consumer cannot pull an unbounded response body in one call.
+    pub const MAX_BATCH: usize = 1024;
+    /// Default fan-out retention (ms): 24 h — mirrors [`ConsumerConfig`]'s `retention_ms` default.
+    pub const DEFAULT_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+    /// Resolve with the STREAM/SINK batch default ([`Self::DEFAULT_MAX_BATCH`]).
+    pub fn resolve(&self) -> ResolvedSubscription {
+        self.resolve_with_default_batch(Self::DEFAULT_MAX_BATCH)
+    }
+
+    /// Resolve the raw, optional knobs into concrete values, applying the server caps + defaults.
+    /// `default_batch` is the batch used when `max_batch` is absent (a PULL transport passes
+    /// [`Self::DEFAULT_CLAIM_BATCH`]; a per-tick transport passes [`Self::DEFAULT_MAX_BATCH`]); the
+    /// resolved batch is ALWAYS clamped to `[1, `[`Self::MAX_BATCH`]`]`, exactly as the shim clamps.
+    pub fn resolve_with_default_batch(&self, default_batch: usize) -> ResolvedSubscription {
+        ResolvedSubscription {
+            group: self.group.clone(),
+            start: self.start,
+            lease_ms: self.lease_ms.unwrap_or(Self::DEFAULT_LEASE_MS),
+            max_batch: self
+                .max_batch
+                .unwrap_or(default_batch)
+                .clamp(1, Self::MAX_BATCH),
+            max_attempts: self.max_attempts.unwrap_or(Self::DEFAULT_MAX_ATTEMPTS),
+            max_ack_pending: self.max_ack_pending,
+            backoff_ms: self.backoff_ms.unwrap_or(0),
+            retention_ms: self.retention_ms.unwrap_or(Self::DEFAULT_RETENTION_MS),
+        }
+    }
+}
+
+/// The concrete, server-clamped subscription knobs [`SubscriptionParams::resolve`] produces — every
+/// field is a definite value (no `Option`), ready to drive `Messaging::claim_grouped` / `ack` /
+/// `nack_after`. `lease_ms` is milliseconds (the transport converts to a `Duration` at the call).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSubscription {
+    /// The consumer group (`""` = the default work-queue).
+    pub group: String,
+    /// New-group start cursor.
+    pub start: StartPosition,
+    /// Visibility lease, milliseconds.
+    pub lease_ms: u64,
+    /// Messages leased per claim (clamped to `[1, MAX_BATCH]`).
+    pub max_batch: usize,
+    /// Dead-letter threshold.
+    pub max_attempts: u32,
+    /// Outstanding-unacked cap per connection (`None` = unbounded), for (b)/(d) back-pressure.
+    pub max_ack_pending: Option<usize>,
+    /// Explicit-nack redelivery backoff, milliseconds (`0` = immediate).
+    pub backoff_ms: u64,
+    /// Fan-out retention, milliseconds.
+    pub retention_ms: u64,
+}
+
 /// A scheduled invocation of a declared handler route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

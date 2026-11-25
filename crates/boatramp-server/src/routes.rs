@@ -751,6 +751,24 @@ pub fn router_with_fast(
             "/api/projects/{project}/_boatramp/bus/queue/policy",
             post(operator_bus_queue_policy),
         )
+        // The EXTERNAL project-bus CONSUMER surface (PLAN-messaging-consumer-delivery): an
+        // authenticated off-node client consumes its own project's `{project}/bus/<topic>` topics
+        // over THIS control-plane router (never the in-cluster messaging-shim). DISTINCT from the
+        // `_boatramp/bus` OPERATOR surface above — gated by the dedicated `Resource::Messaging` right
+        // (`authz::Right::required`'s `bus` arm): `Messaging·Read` on `<project>/<topic>` for
+        // claim/ack/nack (NOT a project admin), so a routine data-plane consumer stays least-
+        // privilege. Like `_boatramp`, `bus` is NOT a `PROJECT_SCOPED_FAMILIES` member, so
+        // `project_scope` tags the request with its `ProjectContext` but does NOT rewrite the path;
+        // the handlers namespace the bus from that trusted context, and authz sees the original
+        // project-qualified path. Verb-prefixed `{*topic}` tail (mirroring the shim) so a topic with
+        // `/` rides the path without colliding with the `ack`/`nack` verbs.
+        // (a) long-poll claim; the shared ack/nack side-channel is reused by increments b/d.
+        .route(
+            "/api/projects/{project}/bus/claim/{*topic}",
+            post(bus_claim),
+        )
+        .route("/api/projects/{project}/bus/ack", post(bus_ack))
+        .route("/api/projects/{project}/bus/nack", post(bus_nack))
         // Captured guest logs for a function — symmetric to the per-site logs endpoint,
         // reading the same store under the function's project-qualified scope. Project-
         // owned read (the `/api/functions/*` authz mapping), so a project token reaches

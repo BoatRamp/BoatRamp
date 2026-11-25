@@ -86,11 +86,22 @@ pub enum Resource {
     /// bound PUBLISH capability (self-serve `boatramp expose --server`) — strictly higher, because
     /// publishing CLAIMS a service name that cluster-side forward clients trust and pin.
     Overlay,
+    /// The **project-bus consumer surface** (PLAN-messaging-consumer-delivery): the external,
+    /// authenticated long-poll / durable-stream / webhook delivery of a project's `{project}/bus/`
+    /// topics. Two tiers: `Messaging·Read` on `"<project>/<topic>"` (or the project-wildcard
+    /// `"<project>/*"`) gates claim / subscribe / ack / nack — a DATA-plane consumer, deliberately
+    /// NOT a project admin; `Messaging·Admin` on `"<project>"` gates webhook-sink registration (a
+    /// sink is an egress grant, strictly higher). Target-scoped on the project-qualified topic key
+    /// (`"<project>/<topic>"`), parsed from the `{proj}` request-path segment — so a token scoped to
+    /// project P reaches ONLY P's bus (fail-closed; `Right::satisfies` does wildcard-or-equal target
+    /// matching). Separate from [`Resource::Project`] (the `_boatramp/bus` OPERATOR surface uses
+    /// `Project·Admin`): a routine consumer must never hold project-admin.
+    Messaging,
 }
 
 impl Resource {
     /// Every resource variant — used to expand the `admin` role to "all rights".
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Site,
         Self::Project,
         Self::Secrets,
@@ -101,6 +112,7 @@ impl Resource {
         Self::Cache,
         Self::System,
         Self::Overlay,
+        Self::Messaging,
     ];
 
     /// The serde term for this resource (matches `rename_all`).
@@ -116,6 +128,7 @@ impl Resource {
             Self::Cache => "cache",
             Self::System => "system",
             Self::Overlay => "overlay",
+            Self::Messaging => "messaging",
         }
     }
 }
@@ -551,6 +564,31 @@ impl Right {
                 Some((&"clone", _)) => {
                     Self::new(Resource::Project, Some(proj.to_string()), Action::Admin)
                 }
+                // The EXTERNAL project-bus CONSUMER surface (`/api/projects/<proj>/bus/…`,
+                // PLAN-messaging-consumer-delivery): the authenticated long-poll / durable-stream /
+                // webhook delivery of the shared project bus (`{project}/bus/{topic}`), DISTINCT from
+                // the `_boatramp/bus` operator surface above. Gated with the DEDICATED
+                // `Resource::Messaging` — NEVER the deploy-grade publisher right the general
+                // project-owned catch-all below would grant (a routine data-plane consumer must not be
+                // able to ship code, and must not be a project admin). Verb-prefixed, mirroring the
+                // messaging-shim's `{*topic}` tail so a topic containing `/` (e.g. `orders/created`)
+                // rides the path without colliding with the `ack`/`nack`/`sinks` verbs:
+                //   - `claim`/`subscribe` carry the topic in the PATH tail → `Messaging·Read` on the
+                //     exact `"<project>/<topic>"` key (fail-closed: no `Messaging·Read` on that key ⇒
+                //     refused; a project-wide `"<project>/*"` grant or global `admin` satisfies it).
+                //   - `ack`/`nack` carry the topic in the OPAQUE handle (body), NOT the path, so the
+                //     route cannot bind an exact topic — they require `Messaging·Read` on the
+                //     project-wildcard `"<project>/*"` (a project-wide consumer grant, or `admin`).
+                //     The handler recomposes the full key from THIS path's project (never the handle),
+                //     so a tampered/stale handle can never reach another project; the full token
+                //     verify + revocation + right check runs on EVERY ack/nack via `require_auth`.
+                //   - `sinks` (webhook registration, increment d) is an EGRESS grant → `Messaging·Admin`
+                //     on `"<project>"`, strictly higher. (Reserved here; the sink route is increment d.)
+                // The `proj` segment is the tenant boundary (parsed via the shared `project_api_path`),
+                // so a token scoped to project P reaches ONLY P's bus. An UNMAPPED bus subpath (or a
+                // verb with no topic) falls through to the deny-safe `System·Admin` default — never a
+                // silent allow. Gated explicitly, ABOVE the general project-owned catch-all.
+                Some((&"bus", tail)) => messaging_consumer_right(proj, get, tail),
                 // Project-owned resources (functions/compute/workflows/config/…):
                 // read with `Project·Read`, mutate with `Project·Deploy`.
                 Some(_) => Self::new(
@@ -970,6 +1008,52 @@ fn site_subpath_action(method: &str, get: bool, sub: &[&str]) -> Option<Action> 
             }
         }
         _ => None,
+    }
+}
+
+/// The required [`Right`] for a `/api/projects/<proj>/bus/<verb>[/<topic…>]` EXTERNAL consumer
+/// request (PLAN-messaging-consumer-delivery). `tail` is the path after the `bus` segment (the verb
+/// and, for `claim`/`subscribe`, the topic). The ENFORCED mapping, fail-closed:
+/// - `claim` / `subscribe` → `Messaging·Read` on the exact `"<project>/<topic>"` key (the topic is
+///   the path tail after the verb — it may contain `/`, e.g. `orders/created`). A verb with NO topic
+///   is malformed → the deny-safe `System·Admin` default.
+/// - `ack` / `nack` → `Messaging·Read` on the project-wildcard `"<project>/*"` (the topic rides the
+///   opaque handle, not the path, so the route cannot bind an exact topic; a project-wide consumer
+///   grant — or global `admin` — satisfies it, and the handler recomposes the key from THIS project).
+/// - `sinks` → `Messaging·Admin` on `"<project>"` (webhook registration is an egress grant, strictly
+///   higher; the sink route is increment d — the mapping is reserved here).
+/// - any OTHER (unmapped) verb → the deny-safe node-global `System·Admin`, never a silent allow.
+///
+/// `get` is unused for now (every consumer verb is a POST — `claim`/`ack`/`nack` lease or mutate; a
+/// future read-only introspection verb would branch on it) but kept in the signature for symmetry
+/// with [`site_subpath_action`].
+fn messaging_consumer_right(proj: &str, _get: bool, tail: &[&str]) -> Right {
+    let deny_safe = || Right::new(Resource::System, None, Action::Admin);
+    match tail.split_first() {
+        Some((&"claim", topic_segs)) | Some((&"subscribe", topic_segs)) => {
+            let topic = topic_segs.join("/");
+            if topic.is_empty() {
+                // A `claim`/`subscribe` with no topic in the path is malformed → deny-safe.
+                deny_safe()
+            } else {
+                Right::new(
+                    Resource::Messaging,
+                    Some(format!("{proj}/{topic}")),
+                    Action::Read,
+                )
+            }
+        }
+        // ack/nack: the topic is in the opaque handle (body), not the path — require a project-wide
+        // `Messaging·Read` (`"<project>/*"`); the handler re-binds the exact topic under THIS project.
+        Some((&"ack", _)) | Some((&"nack", _)) => {
+            Right::new(Resource::Messaging, Some(format!("{proj}/*")), Action::Read)
+        }
+        // Webhook-sink registration (increment d): an egress grant → `Messaging·Admin` on the project.
+        Some((&"sinks", _)) => {
+            Right::new(Resource::Messaging, Some(proj.to_string()), Action::Admin)
+        }
+        // No verb, or an unmapped one → deny-safe (never a silent allow).
+        _ => deny_safe(),
     }
 }
 
@@ -3843,5 +3927,153 @@ mod tests {
             Some(Right::new(Resource::Overlay, None, Action::Admin)),
             "the sibling pair-code MINT path must stay Overlay·Admin",
         );
+    }
+
+    // ---- PLAN-messaging-consumer-delivery: the `Resource::Messaging` right -----------------------
+
+    #[test]
+    fn messaging_is_in_resource_all_for_admin() {
+        // The global `admin` role must reach every `Messaging·*` via `Resource::ALL` (10→11).
+        assert!(
+            Resource::ALL.contains(&Resource::Messaging),
+            "Messaging must be in Resource::ALL so `admin` expands to it",
+        );
+        let admin = AuthzPolicy::default_policy().rights_for(&[GrantedRole::global("admin")]);
+        for action in [Action::Read, Action::Write, Action::Deploy, Action::Admin] {
+            assert!(
+                admin.allows(&Right::new(
+                    Resource::Messaging,
+                    Some("acme/orders/created".to_string()),
+                    action,
+                )),
+                "admin must reach Messaging·{action:?} on any topic",
+            );
+        }
+    }
+
+    #[test]
+    fn messaging_consumer_right_mapping() {
+        // claim → Messaging·Read on the EXACT `<project>/<topic>` (a slashed topic rides the path).
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/bus/claim/orders/created"),
+            Some(Right::new(
+                Resource::Messaging,
+                Some("acme/orders/created".to_string()),
+                Action::Read,
+            )),
+        );
+        // A single-segment topic is a conforming `<project>/<topic>` target.
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/bus/claim/deliver"),
+            Some(Right::new(
+                Resource::Messaging,
+                Some("acme/deliver".to_string()),
+                Action::Read,
+            )),
+        );
+        // subscribe (increment b) → the SAME Read mapping (topic in the path).
+        assert_eq!(
+            Right::required("GET", "/api/projects/acme/bus/subscribe/orders/created"),
+            Some(Right::new(
+                Resource::Messaging,
+                Some("acme/orders/created".to_string()),
+                Action::Read,
+            )),
+        );
+        // ack / nack → Messaging·Read on the project-WILDCARD (the topic is in the opaque handle,
+        // not the path, so the route can't bind an exact topic; the handler re-binds under the path's
+        // project).
+        for path in ["/api/projects/acme/bus/ack", "/api/projects/acme/bus/nack"] {
+            assert_eq!(
+                Right::required("POST", path),
+                Some(Right::new(
+                    Resource::Messaging,
+                    Some("acme/*".to_string()),
+                    Action::Read,
+                )),
+                "{path} must require Messaging·Read on the project wildcard",
+            );
+        }
+        // sinks (increment d) → Messaging·Admin on the project (egress grant, strictly higher).
+        assert_eq!(
+            Right::required("PUT", "/api/projects/acme/bus/sinks/orders-fulfillment"),
+            Some(Right::new(
+                Resource::Messaging,
+                Some("acme".to_string()),
+                Action::Admin,
+            )),
+        );
+    }
+
+    #[test]
+    fn messaging_consumer_unmapped_subpath_is_deny_safe() {
+        // An UNMAPPED bus verb falls through to the deny-safe node-global System·Admin — never a
+        // silent allow (the fail-closed default the whole `/api/*` table shares).
+        let deny_safe = Some(Right::new(Resource::System, None, Action::Admin));
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/bus/frobnicate"),
+            deny_safe,
+            "an unmapped bus verb must be deny-safe",
+        );
+        // A claim/subscribe with NO topic in the path is malformed → deny-safe.
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/bus/claim"),
+            deny_safe,
+            "a claim with no topic must be deny-safe",
+        );
+        assert_eq!(
+            Right::required("GET", "/api/projects/acme/bus/subscribe"),
+            deny_safe,
+        );
+        // Bare `/api/projects/acme/bus` (no verb) is likewise deny-safe.
+        assert_eq!(Right::required("POST", "/api/projects/acme/bus"), deny_safe);
+    }
+
+    #[test]
+    fn messaging_consumer_grant_is_project_and_topic_scoped_fail_closed() {
+        let read = |t: &str| Right::new(Resource::Messaging, Some(t.to_string()), Action::Read);
+        let claim_acme_orders =
+            Right::required("POST", "/api/projects/acme/bus/claim/orders/created")
+                .expect("claim maps to a right");
+
+        // A PROJECT-WIDE consumer grant (`acme/*`) reaches every topic in acme …
+        let project_wide: RightSet = [read("acme/*")].into_iter().collect();
+        assert!(project_wide.allows(&claim_acme_orders));
+        assert!(project_wide.allows(&read("acme/anything/else")));
+        assert!(
+            project_wide.allows(&Right::required("POST", "/api/projects/acme/bus/ack").unwrap()),
+            "a project-wide grant must satisfy the ack side-channel (project wildcard)",
+        );
+        // … but NEVER another project's bus (the `{proj}` path segment is the tenant boundary).
+        let other_project = Right::required("POST", "/api/projects/other/bus/claim/orders/created")
+            .expect("other project's claim maps to a right");
+        assert!(
+            !project_wide.allows(&other_project),
+            "a token scoped to project `acme` must not reach project `other`'s bus",
+        );
+        // A reader can consume but NOT register a sink (sinks need Messaging·Admin — strictly higher).
+        let sinks = Right::required("PUT", "/api/projects/acme/bus/sinks/x").unwrap();
+        assert!(
+            !project_wide.allows(&sinks),
+            "a Messaging·Read consumer must not reach the Admin-gated sink registration",
+        );
+
+        // A SINGLE-SEGMENT per-topic grant is expressible (`acme/deliver`) and confined to that topic.
+        let one_topic: RightSet = [read("acme/deliver")].into_iter().collect();
+        assert!(
+            one_topic
+                .allows(&Right::required("POST", "/api/projects/acme/bus/claim/deliver").unwrap())
+        );
+        assert!(
+            !one_topic.allows(&read("acme/other")),
+            "a single-topic grant must not reach a sibling topic",
+        );
+        // A global `admin` (Messaging·Admin, target None) reaches everything.
+        let admin: RightSet = [Right::new(Resource::Messaging, None, Action::Admin)]
+            .into_iter()
+            .collect();
+        assert!(admin.allows(&claim_acme_orders));
+        assert!(admin.allows(&sinks));
+        assert!(admin.allows(&other_project));
     }
 }

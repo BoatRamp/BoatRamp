@@ -241,6 +241,14 @@ pub(crate) use operator::{
     operator_queue_groups, operator_queue_pause, operator_queue_peek, operator_queue_policy,
     operator_queue_replay,
 };
+// The external, authenticated project-bus CONSUMER surface (PLAN-messaging-consumer-delivery):
+// long-poll claim (increment a) + the shared ack/nack side-channel, mounted on the control-plane
+// API router behind `require_auth`. Entirely handler-runtime-driven, so `handlers`-gated like the
+// `_boatramp/bus` operator surface.
+#[cfg(feature = "handlers")]
+mod bus_consumer;
+#[cfg(feature = "handlers")]
+pub(crate) use bus_consumer::{bus_ack, bus_claim, bus_nack};
 mod proxy;
 pub use proxy::spawn_compute_reconcile;
 pub(crate) use proxy::{
