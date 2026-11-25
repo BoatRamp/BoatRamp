@@ -5,6 +5,60 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.74.0] — 2026-11-25
+
+### Added
+
+- **Non-wasm bus-consumer delivery — external clients can consume their own project/site topics
+  without busy-polling.** Three consumer-selectable transports over the existing durable
+  claim/ack/nack lease + redelivery + DLQ core, on a new authenticated control-plane surface (NOT
+  the in-cluster shim), tenant-fenced by a new `Messaging` right:
+  - **Long-poll** — `POST /api/projects/{project}/bus/claim/{*topic}?wait_ms&lease_ms&max&group&…`:
+    the claim parks on a publish wake (zero busy-poll, bounded by `wait_ms`) and returns a batch, or
+    empty at the deadline; `POST …/bus/ack` / `POST …/bus/nack` settle via the opaque handle.
+  - **Durable stream** — `GET /api/projects/{project}/bus/subscribe/{*topic}?group&start&lease_ms&max_ack_pending`
+    (SSE, or WebSocket on `Upgrade`): a per-subscriber `group` lease with ack/nack (inline WS
+    frames, or the shared ack side-channel for SSE), `max_ack_pending` back-pressure, resume,
+    redelivery on lease expiry, and DLQ at `max_attempts`. Delivery rides the leader-serialized
+    grouped claim, so it is cluster-correct with no extra fan-out.
+  - **Webhook sink** — a host-run signed-POST consumer, registered at runtime
+    (`PUT`/`DELETE /api/projects/{project}/bus/sinks/{name}`, `Messaging·Admin`) or declaratively
+    (`routing.webhook_sinks`): HTTP 2xx = ack, non-2xx/timeout = `nack_after(backoff × attempts)`,
+    DLQ at `max_attempts`. Each POST is HMAC-SHA256-signed over `id + attempt + timestamp + topic +
+    body` (`X-Boatramp-Signature` + `X-Boatramp-Timestamp`); the destination is a sealed secret,
+    SSRF-floored (https-only, `is_global_ip`, DNS-rebind-pinned) at both register and delivery, with
+    a per-sink `egress_allow` allowlist (empty ⇒ deny-all).
+  - A new `Resource::Messaging` right fences consumers to their own project (`Messaging·Read` on
+    `<project>/<topic>` for claim/subscribe/ack/nack; `Messaging·Admin` on `<project>` for sinks).
+- **Native (host-served) SSE/WebSocket stream routes support CORS.** A per-stream
+  `cors_allowed_origins` allowlist on `StreamConfig` answers the `OPTIONS` preflight and echoes the
+  matched origin (never `*`-with-credentials, never `Allow-Credentials`; off by default =
+  same-origin only), so a browser app on an allowed origin can read a host-served stream.
+- **Compute workloads can declare ephemeral tmpfs scratch mounts.** `ComputeSpec.ephemeral_mounts`
+  (`boatramp compute set --mount <path>[:<size_mib>]`) mounts a sized, RAM-backed, per-workload
+  tmpfs at a declared path on the container, Docker, and micro-VM backends — `nosuid,nodev`,
+  size-capped (charged to the workload's own memory), content-hash-neutral when unset, and
+  multi-tenant-safe without posture-gating (never shared across workloads, never snapshotted).
+
+### Security
+
+- The messaging consumer surface is fail-closed and tenant-fenced: the project is taken
+  structurally from the request path (never a client field or the opaque ack handle); the consumer
+  `group` is validated as a single segment at the core and at every surface (a `/`-bearing group can
+  no longer collide another topic's group-state keyspace to cause cross-topic message loss); `ack`
+  accounts inline-budget bytes from the authoritative stored record, not the client-supplied handle;
+  and the subscription knobs (`lease_ms`, `max_attempts`, `max_ack_pending`), per-project sink count,
+  and retry backoff are all clamped as DoS bounds.
+
+### Breaking
+
+- **`boatramp-types`: new `Resource::Messaging` enum variant.** Downstream crates (uchron/luigi)
+  that `match` on `Resource` exhaustively without a wildcard arm must add a `Messaging` (or `_`) arm;
+  `Resource::ALL` grows 10 → 11. Only the global `admin` role carries the new right by default.
+- **`boatramp-types`: `StreamConfig` is now `#[non_exhaustive]`.** Construct it with
+  `..Default::default()` rather than an exhaustive struct literal. (It also gained the
+  `cors_allowed_origins` field.)
+
 ## [0.73.1] — 2026-11-25
 
 ### Fixed
