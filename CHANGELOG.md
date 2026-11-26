@@ -40,6 +40,19 @@ versions.
   - **Operator integration (replace-set)** — the overlay IS the registered set: register = a PUT
     adding the `host:port`; de-register = a PUT omitting it. Re-registering a present host is a
     byte-identical no-op; drift self-heals to the last PUT.
+- **Host-mediated guest egress self-register capability (`boatramp:handlers/egress-register`).** The
+  guest-facing companion to the control-plane edit above, so a workload can self-manage the hosts it
+  dials from INSIDE its guest (e.g. a mailroom fetch handler replace-sets its own IMAP/POP3 upstreams
+  each tick) with no control-plane token: `set-egress(hosts)` REPLACE-SETs the `host:port`s, written
+  to the SAME `handlers.egress_allow` overlay. **Self-scoped (load-bearing):** the guest passes ONLY
+  the host set — the HOST bakes the invocation's OWN per-workload key (the handler/cron `route`, the
+  consumer `topic`, the session route — the SAME key its dial reads, so write and read cannot drift),
+  so a guest can set ONLY its own workload's egress, never another's. Gated by a new node posture
+  **`allow_guest_egress_register`** (OFF by default in every profile; an operator opts in) + the
+  `egress-register` grant — deny-by-default at every layer. Every entry is grammar- + SSRF-floor-
+  validated at register (all-or-nothing); the dial-time floor stays authoritative. The persist is a
+  lock-atomic per-workload overlay write, so concurrent self-registers for different workloads
+  converge (no clobber). A self-register takes effect on the next dispatch (overlay binds at dispatch).
 
 ### Breaking
 
@@ -54,6 +67,10 @@ versions.
   `HandlersSiteConfig { … , ..Default::default() }`) no longer compiles; migrate to the builder (or,
   in-crate, `Default::default()` + field assignment). Sealing it makes every future field add — like
   `egress_allow` itself — a non-breaking change.
+- **Guest capability surface `HOST_HANDLERS_VERSION` 0.14.0 → 0.15.0** — a NEW
+  `boatramp:handlers/egress-register` import (additive: a pinned older guest that does not import it is
+  unaffected; a pre-#12 host rejects the unknown import at link). The guest-facing WIT is vendored into
+  `boatramp-uchron-shim` the same cycle (the new import off-by-default feature-gated).
 
 ## [0.74.0] — 2026-11-26
 

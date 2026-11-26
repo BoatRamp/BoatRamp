@@ -670,6 +670,19 @@ pub(super) async fn dispatch_session_post(
             return handler_unavailable();
         }
     };
+    // PLAN-egress-runtime-authz (#12, Surface 2): a session inherits its creating route's
+    // `egress-register` grant, BAKED to `session.route` — the SAME per-workload key
+    // `session_static_egress` above unioned (one source ⇒ no drift). Parity with the handler lane.
+    #[cfg(feature = "egress-register")]
+    let bindings = crate::egress_register::maybe_attach(
+        bindings,
+        inner,
+        project_ref,
+        site,
+        &session.route,
+        &session.imports,
+        &site_handlers.allow_imports,
+    );
 
     // The component `.wasm` is a content-addressed blob in the deployment.
     let Some(entry) = manifest.files.get(&session.component) else {

@@ -86,6 +86,13 @@ pub use bindings::dns_publish::{
 /// (implemented in boatramp-server with hickory) + its host-facing value types.
 #[cfg(feature = "tcp-egress")]
 pub use bindings::dns_resolve::{DnsResolveBinding, DnsResolveError, DnsResolver, MxRecord};
+/// The host-side egress SELF-REGISTER capability (PLAN-egress-runtime-authz #12, Surface 2): the
+/// injected [`EgressRegisterWriter`] backend (implemented in boatramp-server over the deploy store) +
+/// its host-facing binding/error types.
+#[cfg(feature = "egress-register")]
+pub use bindings::egress_register::{
+    EgressRegisterBinding, EgressRegisterHost, EgressRegisterWriteError, EgressRegisterWriter,
+};
 #[cfg(feature = "email")]
 pub use bindings::email::{EmailSpool, LettreBackend, OutboundEmail, SmtpBackend};
 #[cfg(feature = "graphql")]

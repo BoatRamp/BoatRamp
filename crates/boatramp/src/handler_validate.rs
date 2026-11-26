@@ -302,7 +302,18 @@ mod imp {
     /// interface, so the host advertises the `http-egress` feature only under the `tcp-egress` cargo
     /// feature and a pre-BR-REQ-3 host rejects the unknown import at link (the loud-fail the surface
     /// bump makes visible). HTTPS-only; response-size- and time-bounded; redirects not followed.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 14, 0);
+    ///
+    /// `0.15.0` (PLAN-egress-runtime-authz #12, Surface 2): a NEW `egress-register` interface — the
+    /// host-mediated guest egress self-register verb (`set-egress: func(hosts) -> result<_,
+    /// egress-register-error>`, replace-set). A guest REPLACE-SETs the `host:port`s its OWN workload
+    /// may dial, written to the SAME `handlers.egress_allow` overlay the control-plane
+    /// `HandlerPolicy·Write` PUT edits; the host bakes the invocation's OWN per-workload key (the guest
+    /// supplies only the host set), validates grammar + the SSRF floor at register, gated by the node
+    /// posture `allow_guest_egress_register` (OFF by default). A NEW interface (additive: a pinned
+    /// older guest that does not import it is unaffected); advertised only under the `egress-register`
+    /// cargo feature; a pre-#12 host rejects the unknown import at link (the loud-fail the bump makes
+    /// visible). The guest-facing WIT is vendored into `boatramp-uchron-shim` the same cycle.
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 15, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]

@@ -1085,6 +1085,21 @@ pub(super) async fn run_scheduler_tick(
                                     continue;
                                 }
                             };
+                            // PLAN-egress-runtime-authz (#12, Surface 2): attach the guest
+                            // `egress-register` self-register binding when granted, BAKED to
+                            // `consumer.topic` — the SAME per-workload key `effective_egress` above
+                            // unioned (one source ⇒ no drift). mailroom's fetch runs on this consumer
+                            // lane. (A `signed_context` per-message rebuild below is a parity follow-up.)
+                            #[cfg(feature = "egress-register")]
+                            let bindings = crate::egress_register::maybe_attach(
+                                bindings,
+                                inner,
+                                project,
+                                &site,
+                                &consumer.topic,
+                                &consumer.imports,
+                                &site_handlers.allow_imports,
+                            );
                             // R1 async lane: a consumer declaring `sources: [signed_context]` must resolve
                             // EACH message's sealed originator tenant, so its bindings are rebuilt per
                             // message from that message's envelope (the built-once `bindings` above can't
@@ -1593,6 +1608,20 @@ async fn fire_cron(
             return;
         }
     };
+    // PLAN-egress-runtime-authz (#12, Surface 2): a cron-fired handler gets the guest
+    // `egress-register` binding BAKED to `handler.route` — the SAME per-workload key `effective_egress`
+    // above unioned (NOT the tenant, which is `None` for a cron fire), so a cron-fired fetch handler's
+    // self-register and its own dial read the identical overlay key (drift-proof).
+    #[cfg(feature = "egress-register")]
+    let bindings = crate::egress_register::maybe_attach(
+        bindings,
+        inner,
+        project,
+        site,
+        &handler.route,
+        &handler.imports,
+        &site_handlers.allow_imports,
+    );
     let limits = effective_limits(site_handlers, handler);
     let request = match axum::http::Request::builder()
         .method("GET")

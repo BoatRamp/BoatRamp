@@ -698,6 +698,20 @@ pub(super) async fn dispatch_handler(
             return handler_unavailable();
         }
     };
+    // PLAN-egress-runtime-authz (#12, Surface 2): attach the guest `egress-register` self-register
+    // binding when granted, BAKED to `handler.route` — the SAME per-workload key `effective_egress`
+    // above unioned (one source ⇒ the self-register write and the dial read cannot drift). The host
+    // supplies the key; the guest sets only its own workload's overlay.
+    #[cfg(feature = "egress-register")]
+    let bindings = crate::egress_register::maybe_attach(
+        bindings,
+        inner,
+        boatramp_core::project::ProjectRef::new(project),
+        site,
+        &handler.route,
+        &handler.imports,
+        &site_handlers.allow_imports,
+    );
     // `bindings_us` = auth (JWKS/bearer verify) + tenancy-resolve + binding construction — there is no
     // standalone auth phase on the plain path; it all happens inside `build_bindings`.
     let bindings_us = t_bindings.elapsed().as_micros() as u64;

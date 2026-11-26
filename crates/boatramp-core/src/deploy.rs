@@ -1621,6 +1621,52 @@ impl DeployStore {
             .await
     }
 
+    /// Atomically REPLACE-SET one workload's runtime egress overlay
+    /// (`handlers.egress_allow[workload]`) — PLAN-egress-runtime-authz #12 Surface 2, the guest
+    /// `egress-register` persist path (and the control-plane analog for a targeted edit). The whole
+    /// read-modify-write runs UNDER the domain-claim lock (the SAME lock every site-config write
+    /// takes), so concurrent self-registers for DIFFERENT workloads each observe the prior's result and
+    /// BOTH land — convergent, with no last-writer-wins clobber of a sibling key (stronger than a
+    /// retry-on-conflict loop: the lock makes the RMW a single critical section, so no update is lost
+    /// and no retry is needed). `hosts` empty ⇒ **de-register** (clear this workload's entry); an empty
+    /// change (nothing to clear) is a no-op that writes nothing. The write is cooperative (preserves
+    /// runtime-managed domain aliases/contexts), exactly like [`set_site_config_cooperative`].
+    pub async fn update_handlers_egress_overlay(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        workload: &str,
+        hosts: Vec<String>,
+    ) -> Result<(), DeployError> {
+        let _claim = self.domain_claim_lock.lock().await;
+        // Read the CURRENT config inside the lock (get_site_config is lockless — it is also called by
+        // `set_site_config_locked` under this same held lock), so no concurrent write lands in the
+        // read→write window.
+        let mut config = self
+            .get_site_config(project, site)
+            .await?
+            .unwrap_or_default();
+        if hosts.is_empty() {
+            // De-register. Only write if there was actually an entry to remove (else no-op — never
+            // materialize a handlers block just to clear nothing).
+            let removed = config
+                .handlers
+                .as_mut()
+                .is_some_and(|h| h.egress_allow.remove(workload).is_some());
+            if !removed {
+                return Ok(());
+            }
+        } else {
+            config
+                .handlers
+                .get_or_insert_with(Default::default)
+                .egress_allow
+                .insert(workload.to_string(), hosts);
+        }
+        self.set_site_config_locked(project, site, &config, true)
+            .await
+    }
+
     /// [`set_site_config`](Self::set_site_config) assuming the domain-claim lock
     /// is **already held** — so [`attach_verified_domain`](Self::attach_verified_domain)
     /// can extend a config under the same lock without re-entering it (the lock
@@ -5261,6 +5307,67 @@ mod tests {
         store.clear_project_log_redaction(acme).await.unwrap();
         assert_eq!(store.get_project_log_redaction(acme).await.unwrap(), None);
         store.clear_project_log_redaction(acme).await.unwrap();
+    }
+
+    /// PLAN-egress-runtime-authz #12 Surface 2: `update_handlers_egress_overlay` is a per-workload,
+    /// lock-atomic replace-set — round-trips through `effective_egress_allowlist`, de-registers on an
+    /// empty set, and (refinement #1) CONVERGES two concurrent DIFFERENT-workload writes (both land —
+    /// no last-writer-wins clobber of a sibling key).
+    #[tokio::test]
+    async fn update_handlers_egress_overlay_replace_set_roundtrip_and_converges() {
+        use crate::kv::MemoryKv;
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let p = ProjectRef::new("acme");
+
+        // REGISTER (replace-set) a host for workload `/fetch`.
+        store
+            .update_handlers_egress_overlay(p, "web", "/fetch", vec!["imap.gstruct.com:993".into()])
+            .await
+            .unwrap();
+        let cfg = store.get_site_config(p, "web").await.unwrap().unwrap();
+        let h = cfg.handlers.as_ref().unwrap();
+        // ROUND-TRIP: the dispatch union reads exactly what was registered, scoped to `/fetch`.
+        assert_eq!(
+            h.effective_egress_allowlist("/fetch", &[]),
+            vec!["imap.gstruct.com:993".to_string()],
+            "a self-registered host is live for its OWN workload's next dial"
+        );
+        assert!(
+            h.effective_egress_allowlist("/other", &[]).is_empty(),
+            "the write is scoped to /fetch only — a sibling workload sees nothing"
+        );
+
+        // DE-REGISTER (empty set) clears the entry.
+        store
+            .update_handlers_egress_overlay(p, "web", "/fetch", vec![])
+            .await
+            .unwrap();
+        let cfg = store.get_site_config(p, "web").await.unwrap().unwrap();
+        assert!(
+            cfg.handlers
+                .as_ref()
+                .is_none_or(|h| !h.egress_allow.contains_key("/fetch")),
+            "an empty set de-registers the workload's overlay"
+        );
+
+        // CONVERGENCE: two concurrent self-registers for DIFFERENT workloads both land (the lock-atomic
+        // RMW reads the sibling's result inside the critical section — no clobber).
+        let (a, b) = tokio::join!(
+            store.update_handlers_egress_overlay(p, "web", "/a", vec!["a.example:993".into()]),
+            store.update_handlers_egress_overlay(p, "web", "/b", vec!["b.example:993".into()]),
+        );
+        a.unwrap();
+        b.unwrap();
+        let cfg = store.get_site_config(p, "web").await.unwrap().unwrap();
+        let h = cfg.handlers.as_ref().unwrap();
+        assert_eq!(
+            h.effective_egress_allowlist("/a", &[]),
+            vec!["a.example:993".to_string()]
+        );
+        assert_eq!(
+            h.effective_egress_allowlist("/b", &[]),
+            vec!["b.example:993".to_string()]
+        );
     }
 
     // The cluster-uniform "does this site belong to this project?" probe backing the standalone-

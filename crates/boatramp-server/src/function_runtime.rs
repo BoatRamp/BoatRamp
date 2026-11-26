@@ -1861,6 +1861,14 @@ pub(crate) struct FunctionInvoker {
 
 #[cfg(feature = "handlers")]
 impl FunctionInvoker {
+    /// The deploy store this invoker wraps — the per-runtime handle the `egress-register` capability's
+    /// host writer uses to persist a workload's `handlers.egress_allow` overlay (#12 Surface 2). Lives
+    /// on the invoker because it is the one runtime-scoped `DeployStore` set once at startup.
+    #[cfg(feature = "handlers")]
+    pub(crate) fn deploy_store(&self) -> &DeployStore {
+        &self.deploy
+    }
+
     pub(crate) fn new(deploy: DeployStore, runtime: std::sync::Weak<HandlerRuntimeInner>) -> Self {
         Self {
             deploy,

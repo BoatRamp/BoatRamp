@@ -329,6 +329,12 @@ pub mod dns_resolve;
 /// (mailroom cap-req #21 residual). ALWAYS compiled (the config rides in `[handlers]`, parsed in every
 /// build); the `tcp-egress` resolver consults it. OFF by default — absent ⇒ the system resolver.
 pub mod dns_resolve_override;
+/// The server-side wiring seam for the guest `egress-register` self-register capability
+/// (PLAN-egress-runtime-authz #12, Surface 2): the concrete deploy-store-backed writer (validate +
+/// lock-atomic overlay RMW) + `maybe_attach`, which bakes this invocation's OWN per-workload key.
+/// Fail-closed by default (ungranted / no deploy store ⇒ no binding ⇒ `access-denied`).
+#[cfg(feature = "egress-register")]
+pub mod egress_register;
 #[cfg(feature = "handlers")]
 mod function_runtime;
 /// The server-side owner-gated schema-migration orchestrator (function/sql/extension steps over the

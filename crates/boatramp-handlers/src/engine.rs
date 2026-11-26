@@ -591,6 +591,12 @@ pub struct HostState {
     /// under its egress posture (cap-req #24 WS3).
     #[cfg(feature = "dns-publish")]
     dns_publish_enabled: bool,
+    /// Whether this invocation's guest may SELF-REGISTER its OWN workload's egress overlay through the
+    /// `egress-register` capability (copied from the engine's `allow_egress_register` posture — the
+    /// `allow_guest_egress_register` flag, PLAN-egress-runtime-authz #12 Surface 2). `false` is the
+    /// deny-by-default; the binding fail-closes every `set-egress` to `access-denied` when off.
+    #[cfg(feature = "egress-register")]
+    egress_register_enabled: bool,
     /// Whether this invocation's guest may register/route a RUNTIME, host-sealed, per-tenant DNS-write
     /// credential (copied from the engine's `allow_dynamic_dns_publish` posture — the
     /// `allow_guest_dynamic_dns_publish` flag, cap-req #31). `false` is the deny-by-default; the binding
@@ -2005,6 +2011,14 @@ pub struct HandlerEngine {
     /// knobs — DNS write is a distinct authority gated separately.
     #[cfg_attr(not(feature = "dns-publish"), allow(dead_code))]
     allow_dns_publish: bool,
+    /// Whether the node posture allows a guest to SELF-REGISTER its OWN workload's egress overlay via
+    /// the `egress-register` capability (`allow_guest_egress_register`, OFF by default in every profile)
+    /// — PLAN-egress-runtime-authz #12 Surface 2. `false` (the default) fail-closes every `set-egress`
+    /// to `access-denied` regardless of grant; `true` lets a granted component replace-set its OWN
+    /// workload's overlay (still host-scoped to its baked key + register-time validated). Any single
+    /// wiring omission fails CLOSED.
+    #[cfg_attr(not(feature = "egress-register"), allow(dead_code))]
+    allow_egress_register: bool,
     /// Whether the node posture allows a guest to register a RUNTIME, host-sealed, per-tenant DNS-write
     /// credential and route writes through it (`allow_guest_dynamic_dns_publish`, cap-req #31) — the
     /// dynamic analogue of the operator serve-static `dns_providers` registry. OFF under multi-tenant
@@ -2268,6 +2282,7 @@ impl HandlerEngine {
             // Deny-by-default: DNS write is off until an operator opts the posture in via
             // `with_dns_publish`. A node that never calls it can never let a guest mutate DNS.
             allow_dns_publish: false,
+            allow_egress_register: false,
             // Deny-by-default: the runtime per-tenant DNS-credential path (cap-req #31) is off until an
             // operator opts the posture in via `with_dynamic_dns_publish`.
             allow_dynamic_dns_publish: false,
@@ -2839,6 +2854,19 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_dns_publish(mut self, allow: bool) -> Self {
         self.allow_dns_publish = allow;
+        self
+    }
+
+    /// Permit (or refuse) a guest to SELF-REGISTER its OWN workload's egress overlay through the
+    /// `egress-register` capability — the operator posture's `allow_guest_egress_register`
+    /// (PLAN-egress-runtime-authz #12 Surface 2). Default (`false`, off in every profile) fail-closes
+    /// every `set-egress` to `access-denied` regardless of grant; `true` lets a granted component
+    /// replace-set its OWN workload's overlay (host-scoped to its baked key, register-time validated).
+    /// Writes the SAME overlay the control-plane `HandlerPolicy·Write` PUT edits. Any single wiring
+    /// omission fails CLOSED.
+    #[must_use]
+    pub fn with_egress_register(mut self, allow: bool) -> Self {
+        self.allow_egress_register = allow;
         self
     }
 
@@ -4063,6 +4091,19 @@ impl HandlerEngine {
             // from the store-resident `HostState` exactly like `dns_publish_enabled`.
             .with_dynamic_posture(state.dynamic_dns_publish_enabled)
         })?;
+        // Host-mediated egress SELF-REGISTER (PLAN-egress-runtime-authz #12, Surface 2): the guest
+        // companion to the control-plane `HandlerPolicy·Write` overlay edit. Gated deny-by-default
+        // (binding `None` ⇒ `access-denied`) AND by the node posture `allow_egress_register`
+        // (`egress_register_enabled`, OFF by default); the host-held writer is baked to THIS
+        // invocation's OWN per-workload key, so a guest can set ONLY its own workload's overlay. The
+        // writer validates grammar + the SSRF floor at register; the dial-time floor stays authoritative.
+        #[cfg(feature = "egress-register")]
+        bindings::egress_register::add_to_linker(linker, |state: &mut HostState| {
+            bindings::egress_register::EgressRegisterHost::new(
+                state.bindings.egress_register(),
+                state.egress_register_enabled,
+            )
+        })?;
         Ok(())
     }
 
@@ -4229,6 +4270,8 @@ impl HandlerEngine {
             )),
             #[cfg(feature = "dns-publish")]
             dns_publish_enabled: self.allow_dns_publish,
+            #[cfg(feature = "egress-register")]
+            egress_register_enabled: self.allow_egress_register,
             #[cfg(feature = "dns-publish")]
             dynamic_dns_publish_enabled: self.allow_dynamic_dns_publish,
             #[cfg(feature = "dns-publish")]

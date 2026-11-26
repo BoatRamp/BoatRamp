@@ -544,10 +544,15 @@ const KNOWN_IMPORTS: &[&str] = &[
     // `allow_guest_dns_publish` (OFF by default) AND a non-empty per-handler `dns_publish_zones`
     // writable-zone allowlist — deny-by-default at every layer. Advertised Experimental.
     "dns-publish",
-    // NOTE (PLAN-egress-runtime-authz #12, Surface 2): the host-mediated `egress-register` capability
-    // import is added here in the SAME increment that wires its host linker (`EgressRegisterHost`) —
-    // declaring an import the host does not link would fail guest instantiation, so it is NOT listed
-    // until the binding lands.
+    // Host-mediated egress SELF-REGISTER capability (PLAN-egress-runtime-authz #12, Surface 2). A
+    // granted guest REPLACE-SETs the `host:port`s its OWN workload may dial, written to the SAME
+    // `handlers.egress_allow` overlay the control-plane `HandlerPolicy·Write` PUT edits; granting it
+    // here only lets a component DECLARE it. Reaching anything additionally needs the node posture
+    // `allow_guest_egress_register` (OFF by default); the host scopes every write to the guest's OWN
+    // per-workload key (it supplies only the host set, never a key), validates grammar + the SSRF floor
+    // at register, and the dial-time floor stays authoritative — deny-by-default at every layer.
+    // Advertised Experimental.
+    "egress-register",
 ];
 
 /// The import names a deploy may declare in a handler's `imports` (baseline WASI

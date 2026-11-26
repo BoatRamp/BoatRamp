@@ -387,10 +387,9 @@ gated above the base `Site·Write` the config PUT already maps to. The control-p
 `HandlerPolicy·Write` right on the **mandatory-facet** target `<project>/<site>/egress` (a grant must
 name the `egress` facet; a facet-less `HandlerPolicy` grant authorizes nothing, and only a deliberate
 project/global wildcard — i.e. `admin` — spans facets). A byte-identical re-PUT (no overlay change)
-needs only `Site·Write`, so a declarative re-apply by a non-policy principal still works. (A companion
-host-mediated guest capability lets a workload set its OWN overlay from inside its guest — gated by a
-node posture, off by default — writing this same overlay under the same SSRF floor; it is documented
-with the egress capability.)
+needs only `Site·Write`, so a declarative re-apply by a non-policy principal still works. (The same
+overlay can also be edited from inside a guest via the `egress-register` capability below — both
+surfaces write this one overlay, both held by the SSRF floor.)
 
 **Register / de-register (replace-set).** The overlay IS the registered set: register a host by
 PUTting a config that includes it; de-register by PUTting one that omits it. Re-registering a host
@@ -403,6 +402,33 @@ can safely re-sync the full desired set on every source change.
 # key = the workload's route (handler/cron) or topic (consumer)
 "/fetch" = ["imap.gstruct.com:993", "pop.gstruct.com:110"]
 ```
+
+### `egress-register` (host-mediated guest egress self-register)
+
+The runtime egress overlay above is edited by an **operator** through the control-plane PUT. A guest
+that imports the `egress-register` capability can instead set **its OWN workload's** overlay from
+inside its guest code — the guest-facing companion to that control-plane edit, for a workload that
+discovers its upstreams at runtime (e.g. a mailroom fetch handler that replace-sets its per-customer
+IMAP/POP3 hosts each tick before it dials). The guest calls:
+
+```wit
+set-egress: func(hosts: list<string>) -> result<_, egress-register-error>
+```
+
+It is **replace-set** (the argument IS the full set for the workload; an empty list de-registers), and
+writes the **same** `handlers.egress_allow` overlay the control-plane PUT edits — so a self-registered
+host is live for the workload's **next** dispatch.
+
+- **Self-scoped (host-forced):** the guest passes ONLY the host set — never a workload key. The host
+  scopes the write to the invocation's OWN per-workload key (its handler/cron `route`, its consumer
+  `topic`, or the session's creating route — the SAME key its own dial reads). A guest can set ONLY
+  its own workload's egress and can never name another workload's.
+- **Gated, deny-by-default:** reaching it needs the `egress-register` import granted (declared +
+  `allow_imports`) AND the node posture **`allow_guest_egress_register`** (OFF by default; an operator
+  opts in). Ungranted or posture-off ⇒ `access-denied`, nothing written.
+- **Validated + SSRF-floored:** every entry is grammar- + SSRF-floor-checked at register
+  (all-or-nothing — one bad or internal entry writes nothing); the dial-time `is_global_ip` floor
+  stays authoritative. No control-plane token is ever carried in the guest — the host applies the write.
 
 ### `dynamic_egress_hosts`
 
