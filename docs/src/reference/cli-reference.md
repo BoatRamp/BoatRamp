@@ -1123,6 +1123,38 @@ Turn off cookie session auth
 
 **Usage:** `boatramp handlers cookie-auth clear`
 
+### `boatramp handlers secrets`
+
+Manage the site's handler↔secret bindings (`[handlers].secrets`: ENV name → secret-ref) — config-only, no content redeploy
+
+**Usage:** `boatramp handlers secrets <COMMAND>`
+
+#### `boatramp handlers secrets list`
+
+Show the site's current ENV name → secret-ref bindings
+
+**Usage:** `boatramp handlers secrets list`
+
+#### `boatramp handlers secrets set`
+
+Set (insert or update) one or more `ENV_NAME=secret-ref` bindings
+
+**Usage:** `boatramp handlers secrets set <ENV=REF>`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `<ENV=REF>` | — | — | — | `ENV_NAME=secret-ref` pair, e.g. `API_KEY=boatramp:api-key`; repeatable |
+
+#### `boatramp handlers secrets unset`
+
+Remove one or more ENV name(s) from the bindings
+
+**Usage:** `boatramp handlers secrets unset <ENV>`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `<ENV>` | — | — | — | ENV name(s) to remove |
+
 ## `boatramp graphql`
 
 Manage a project's GraphQL admin (persisted-op safelist + federation subgraphs)

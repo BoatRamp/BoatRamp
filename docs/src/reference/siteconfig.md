@@ -83,7 +83,7 @@ entirely.
 | `max_timeout_ms` | u32? | — | Cap on per-handler wall-clock timeout (ms). |
 | `max_concurrency` | u32? | — | Cap on concurrent invocations for the site. |
 | `max_fuel` | u64? | — | Cap on per-handler CPU fuel; a handler's own `fuel` may only lower it. |
-| `secrets` | map\<string, string\> | `{}` | Env-var name → secret **reference** (a host env-var name, resolved server-side — never a literal secret). |
+| `secrets` | map\<string, string\> | `{}` | Env-var name → secret **reference** (a host env-var name, resolved server-side — never a literal secret). Set/unset a binding without redeploying via `boatramp handlers secrets set`/`unset`/`list` — see [Give handlers & functions secrets](../how-to/secrets.md). |
 | `background_aliases` | list\<string\> | `[]` | Named aliases (besides current) whose deployments also run consumers and crons. See [Run background work](../how-to/background-work.md). |
 | `max_stream_connections` | u32? | — | Cap on concurrent SSE/WebSocket connections for the site. |
 | `max_log_rate` | u32? | — | Cap on captured guest log lines per second (over-cap lines are dropped, counted). |
