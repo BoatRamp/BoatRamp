@@ -134,9 +134,6 @@ pub enum Metric {
     Cosine,
     /// Euclidean / L2 distance (`<->`).
     L2,
-    /// Negative inner product (`<#>`). The third float metric, firming the set before the
-    /// `orm-vector` surface graduates to Stable.
-    InnerProduct,
 }
 
 impl Metric {
@@ -148,18 +145,16 @@ impl Metric {
         match self {
             Self::Cosine => "<=>",
             Self::L2 => "<->",
-            Self::InnerProduct => "<#>",
         }
     }
 
     /// The pgvector index **operator class** for this metric (`hnsw`/`ivfflat`). Must pair with the
-    /// query [`operator`](Self::operator): `vector_cosine_ops`⇒`<=>`, `vector_l2_ops`⇒`<->`,
-    /// `vector_ip_ops`⇒`<#>`. Used by the [`crate::ddl`] `CreateIndex` emitter.
+    /// query [`operator`](Self::operator): `vector_cosine_ops`⇒`<=>`, `vector_l2_ops`⇒`<->`.
+    /// Used by the [`crate::ddl`] `CreateIndex` emitter.
     pub fn vector_opclass(self) -> &'static str {
         match self {
             Self::Cosine => "vector_cosine_ops",
             Self::L2 => "vector_l2_ops",
-            Self::InnerProduct => "vector_ip_ops",
         }
     }
 }

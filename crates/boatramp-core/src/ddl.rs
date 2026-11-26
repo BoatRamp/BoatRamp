@@ -46,6 +46,7 @@ const LEDGER_TABLE: &str = "schema_migrations";
 /// An error from building/emitting DDL. Every variant is a fail-closed refusal — the emitter never
 /// produces SQL it could not fully validate.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum DdlError {
     /// An identifier was not a plain `[A-Za-z_][A-Za-z0-9_]*` name (a dot — a schema-qualified name —
     /// is always rejected).
@@ -113,13 +114,20 @@ fn object_ident(name: &str) -> Result<&str, DdlError> {
     Ok(name)
 }
 
-/// Quote a string **value** as a SQL literal for safe inlining (a `DEFAULT`, an enum label, a GUC
-/// name). Postgres uses the backslash-safe `E'…'` form ([`pg_quote_literal`]); the portable dialects
-/// use standard single-quote doubling (safe under `standard_conforming_strings`-style semantics).
+/// Quote a string **value** as a SQL literal for safe inlining (a `DEFAULT`, an enum label).
+/// Dialect-aware, because the engines disagree on whether a backslash is an escape character inside
+/// a `'…'` string:
+/// - **Postgres** — the backslash-safe `E'…'` form ([`pg_quote_literal`]), robust under either
+///   `standard_conforming_strings` setting.
+/// - **MySQL** — its default `sql_mode` (no `NO_BACKSLASH_ESCAPES`) treats `\` as an escape, so a
+///   value ending in `\` could consume the closing quote; escape `\`→`\\` **and** double the quote.
+/// - **SQLite** — `\` is NOT special, so ONLY the quote is doubled (escaping `\` would corrupt the
+///   stored value by turning it into a literal double backslash).
 fn quote_str(dialect: Dialect, s: &str) -> String {
     match dialect {
         Dialect::Postgres => pg_quote_literal(s),
-        Dialect::Sqlite | Dialect::Mysql => format!("'{}'", s.replace('\'', "''")),
+        Dialect::Mysql => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
+        Dialect::Sqlite => format!("'{}'", s.replace('\'', "''")),
     }
 }
 
@@ -128,6 +136,7 @@ fn quote_str(dialect: Dialect, s: &str) -> String {
 /// A column type. The portable scalar subset renders on every dialect; the Postgres-specific types
 /// (`Serial`/`BigSerial`/`Uuid`/`Json`/`Jsonb`/`Enum`/`Vector`) fail closed elsewhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColumnType {
     SmallInt,
     Integer,
@@ -229,6 +238,7 @@ impl ColumnType {
 /// A column `DEFAULT`, as a **closed enum** — never a free-SQL string, so a default can't inject
 /// (the ORM's no-injection property, carried to DDL).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ScalarDefault {
     /// A typed scalar literal, inlined with strict per-type escaping. Only `Boolean`/`Integer`/
     /// `Real`/`Text` are admissible; a `Null`/`Blob`/`Json` literal (or a non-finite number) is
@@ -318,6 +328,7 @@ impl ColumnDef {
 /// A table-level constraint. Deliberately NOT free-form `CHECK` (deferred to raw SQL) — only the
 /// structural, identifier-safe keyed constraints.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TableConstraint {
     /// `PRIMARY KEY (col, …)`.
     PrimaryKey { columns: Vec<String> },
@@ -483,6 +494,7 @@ impl AddColumn {
 
 /// A pgvector index access method (`hnsw`/`ivfflat`) or a standard one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IndexMethod {
     Btree,
     Hash,
@@ -510,8 +522,8 @@ impl IndexMethod {
 }
 
 /// One indexed column. For a vector method (`hnsw`/`ivfflat`) the [`Metric`] is **required** and
-/// selects the operator class (`vector_cosine_ops`/`vector_l2_ops`/`vector_ip_ops`); for a
-/// non-vector method it must be absent.
+/// selects the operator class (`vector_cosine_ops`/`vector_l2_ops`); for a non-vector method it must
+/// be absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexColumn {
     /// The column name (validated plain identifier).
@@ -613,6 +625,7 @@ impl CreateIndex {
 
 /// The body of a `CREATE TYPE`. Enum-only in v1.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TypeBody {
     /// `AS ENUM ('a', 'b', …)` — the labels are string values, inlined as safely-quoted literals.
     Enum(Vec<String>),
@@ -824,6 +837,7 @@ impl RenameColumn {
 /// One typed DDL operation. [`emit`](Ddl::emit) turns it into a validated [`EmittedDdl`] for the
 /// owner-role migration seam.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Ddl {
     CreateTable(CreateTable),
     AddColumn(AddColumn),
@@ -1126,7 +1140,6 @@ mod tests {
         for (m, opclass, op) in [
             (Metric::Cosine, "vector_cosine_ops", "<=>"),
             (Metric::L2, "vector_l2_ops", "<->"),
-            (Metric::InnerProduct, "vector_ip_ops", "<#>"),
         ] {
             assert_eq!(m.vector_opclass(), opclass);
             assert_eq!(m.operator(), op);
@@ -1324,6 +1337,35 @@ mod tests {
                 "a {bad:?} literal default must be refused"
             );
         }
+    }
+
+    #[test]
+    fn text_default_quoting_is_dialect_correct_for_backslashes() {
+        // A value with a backslash AND a quote: `a\b'c`. MySQL's default sql_mode treats `\` as an
+        // escape, so it must be doubled (else a trailing `\` eats the closing quote); SQLite must NOT
+        // escape it (that would store a literal double-backslash). Both double the embedded quote.
+        let col = |v: &str| {
+            Ddl::AddColumn(AddColumn {
+                table: "t".into(),
+                column: ColumnDef {
+                    name: "c".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    default: Some(ScalarDefault::Literal(SqlValue::Text(v.into()))),
+                },
+                if_not_exists: false,
+            })
+        };
+        assert_eq!(
+            col("a\\b'c").emit(Dialect::Mysql).unwrap().sql,
+            "ALTER TABLE t ADD COLUMN c text DEFAULT 'a\\\\b''c'",
+            "MySQL must escape the backslash (\\ -> \\\\) and double the quote"
+        );
+        assert_eq!(
+            col("a\\b'c").emit(Dialect::Sqlite).unwrap().sql,
+            "ALTER TABLE t ADD COLUMN c text DEFAULT 'a\\b''c'",
+            "SQLite must NOT escape the backslash (only double the quote)"
+        );
     }
 
     #[test]

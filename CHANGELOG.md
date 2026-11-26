@@ -28,13 +28,14 @@ versions.
     (`literal` / `now()` / `null` / `gen_random_uuid()`), never a free-SQL string; the builder refuses
     the host-owned `boatramp_migrations`/`schema_migrations` ledger namespace; it **never** emits
     `CREATE EXTENSION` (that stays the operator-allowlisted `Extension` step). The vector
-    metric→opclass→query-operator coupling (`vector_cosine_ops`⇒`<=>`, `vector_l2_ops`⇒`<->`,
-    `vector_ip_ops`⇒`<#>`) is derived from one `Metric`, so an index and its kNN query can't drift;
-    `CONCURRENTLY` surfaces a `no_transaction` flag for the migration step.
-- **`orm-vector` graduated Experimental → Stable**, and the metric set firmed with **`inner-product`
-  (`<#>`, `vector_ip_ops`)** alongside cosine/L2 (an append-only addition to the WIT
-  `distance-metric` enum and `boatramp-core::orm::Metric`). The `vector-literal(string)` value
-  round-trip is unchanged (no new `value` variant).
+    metric→opclass→query-operator coupling (`vector_cosine_ops`⇒`<=>`, `vector_l2_ops`⇒`<->`) is
+    derived from one `Metric`, so an index and its kNN query can't drift; `CONCURRENTLY` surfaces a
+    `no_transaction` flag for the migration step.
+  - The public `ddl` enums (`Ddl`, `ColumnType`, `ScalarDefault`, `TableConstraint`, `TypeBody`,
+    `IndexMethod`, `DdlError`) are `#[non_exhaustive]`, so the specced growth (composite/domain/range
+    types, further operations) stays additive.
+- **`orm-vector` graduated Experimental → Stable** — the metric set (cosine `<=>` / L2 `<->`) and the
+  `vector-literal(string)` value round-trip are settled; no WIT or `value`-variant change.
 
 ## [0.74.0] — 2026-11-26
 

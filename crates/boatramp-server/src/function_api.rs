@@ -293,9 +293,9 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
         lifecycle: Stable,
     });
     // pgvector `distance` / `vector-literal` (Postgres-only, fail-closed elsewhere). GRADUATED to
-    // Stable (v0.75.0): the float-metric set is firm (cosine `<=>` / L2 `<->` / inner-product `<#>`)
-    // and the value round-trip (`vector-literal(string)`) is settled. The typed `ddl` builder emits
-    // matching `vector(N)` columns + hnsw/ivfflat opclass indexes on the owner-role migration seam.
+    // Stable (v0.75.0): the metric set (cosine `<=>` / L2 `<->`) and the value round-trip
+    // (`vector-literal(string)`) are settled. The typed `ddl` builder emits matching `vector(N)`
+    // columns + hnsw/ivfflat opclass indexes on the owner-role migration seam.
     f.push(CapabilityFeature {
         name: "orm-vector",
         lifecycle: Stable,
