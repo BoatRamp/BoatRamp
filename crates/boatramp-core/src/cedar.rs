@@ -1071,6 +1071,12 @@ mod tests {
             vec![GrantedRole::scoped("project_admin", "acme")],
             vec![GrantedRole::scoped("project_publisher", "acme")],
             vec![GrantedRole::scoped("project_viewer", "acme")],
+            // `messaging_consumer` (0.74.0): the project-wildcard scope on a NON-Site resource
+            // (`Messaging·Read` on `"acme/*"`). The differential gate proves the generated Cedar
+            // `resource.project` guard authorizes the consume surface (claim/subscribe/ack/nack, which
+            // match on the `project` segment) and denies everything else, exactly as the oracle does —
+            // confirming the Cedar mapping needs no change for the new role.
+            vec![GrantedRole::scoped("messaging_consumer", "acme")],
             vec![GrantedRole::global("project_admin")], // no target → contributes only Blobs
             // A project-qualified site role alongside a project role.
             vec![

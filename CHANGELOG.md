@@ -30,6 +30,11 @@ versions.
     a per-sink `egress_allow` allowlist (empty ⇒ deny-all).
   - A new `Resource::Messaging` right fences consumers to their own project (`Messaging·Read` on
     `<project>/<topic>` for claim/subscribe/ack/nack; `Messaging·Admin` on `<project>` for sinks).
+  - A new built-in **`messaging_consumer`** default role grants exactly `Messaging·Read` on the
+    project wildcard (`<project>/*`) — the least-privilege way to grant external bus-consume access
+    (claim/subscribe/ack/nack across every topic on one project's `{project}/bus/`) so a consumer
+    never needs global `admin` or a hand-authored policy; it does **not** grant webhook-sink
+    registration (`Messaging·Admin`) or any non-messaging right.
 - **Native (host-served) SSE/WebSocket stream routes support CORS.** A per-stream
   `cors_allowed_origins` allowlist on `StreamConfig` answers the `OPTIONS` preflight and echoes the
   matched origin (never `*`-with-credentials, never `Allow-Credentials`; off by default =

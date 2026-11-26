@@ -44,14 +44,14 @@ Five resources are target-scoped: `site` (target `<project>/<site>`), `project`
 | `cache` | global | Cache invalidation. |
 | `system` | global | Metrics, prune, scrub, site/project listing, cluster membership, authz policy. |
 | `overlay` | global | Overlay forward-flow discovery + capability minting (`/api/overlay/*`). Three tiers: `read` lists/resolves the service directory; `write` mints a holder-bound **dial** capability (self-serve `boatramp forward`); `admin` mints a holder-bound **publish** capability (self-serve `boatramp expose`) — strictly above `write`, because publishing claims a service name that forward clients trust and pin. Granted only via `admin` (or an explicit grant), never a default tenant role. **`admin` is coarse: it may mint a publish capability for ANY service name, and a live exposer shadows a static route of the same name — so an `overlay·admin` holder can reroute or capture any service's forward-client traffic. Treat it as near-admin trust and keep it admin-only until per-name publish scoping exists.** |
-| `messaging` | `<project>/<topic>` or `<project>` | The external, authenticated **project-bus consumer** surface (`/api/projects/<proj>/bus/*`): long-poll claim, durable SSE/WebSocket subscribe, ack/nack, and webhook-sink registration. Two tiers: `read` on `<project>/<topic>` consumes (claim/subscribe), and on the project-wildcard `<project>/*` settles (ack/nack — the topic rides the opaque handle, not the path); `admin` on `<project>` registers a webhook sink (an egress grant, strictly higher). Deliberately **not** `project` (a routine data-plane consumer must never hold project-admin). Only the global `admin` role carries it by default — grant a consumer its right in the policy (a dedicated `messaging_consumer` default role is under consideration and may ship later). Since 0.74.0. |
+| `messaging` | `<project>/<topic>` or `<project>` | The external, authenticated **project-bus consumer** surface (`/api/projects/<proj>/bus/*`): long-poll claim, durable SSE/WebSocket subscribe, ack/nack, and webhook-sink registration. Two tiers: `read` on `<project>/<topic>` consumes (claim/subscribe), and on the project-wildcard `<project>/*` settles (ack/nack — the topic rides the opaque handle, not the path); `admin` on `<project>` registers a webhook sink (an egress grant, strictly higher). Deliberately **not** `project` (a routine data-plane consumer must never hold project-admin). The dedicated [`messaging_consumer`](#default-roles) default role grants exactly this — `read` on the project wildcard `<project>/*` and nothing else — so a bus consumer never needs global `admin` or a hand-authored policy; the global `admin` role also carries it. Since 0.74.0. |
 
 ## Default roles
 
-The built-in policy defines eight roles. A grant marked *(site)* binds to the role
+The built-in policy defines nine roles. A grant marked *(site)* binds to the role
 instance's `<project>/<site>` target; *(project)* binds to its `<project>` target;
-*(project/\*)* is a wildcard over every site in the bound project; *(any)* is a
-global right.
+*(project/\*)* is a wildcard over every site (or, for `messaging`, every
+`<project>/<topic>`) in the bound project; *(any)* is a global right.
 
 | Role | Scoped | Grants |
 | --- | --- | --- |
@@ -63,6 +63,7 @@ global right.
 | `project_admin` | project | `admin` on `project` *(project)*; `admin` on `secrets` *(project)*; `admin` on `site` *(project/\*)*; `deploy` on `blobs` *(any)*. Full control of one project and everything it owns — including managing its sealed secrets and email profiles (a publisher can only *reference* a `boatramp:<name>`, not manage it). |
 | `project_publisher` | project | `read`, `write`, `deploy` on `project` *(project)* and on `site` *(project/\*)*; `deploy` on `blobs` *(any)*. Ships sites/functions/compute in the project; cannot admin the project entity. |
 | `project_viewer` | project | `read` on `project` *(project)* and on `site` *(project/\*)*. Read-only across one project. |
+| `messaging_consumer` | project | `read` on `messaging` *(project/\*)*. The least-privilege project-bus consume role: claim, subscribe, ack, and nack across **every** topic on one project's `{project}/bus/` — and nothing else. It does **not** grant webhook-sink registration (`messaging·admin`, an egress grant, strictly higher), any `project`/`site`/`secrets` right, or reach another project's bus. Grant it so a consumer never needs global `admin` or a hand-authored policy. |
 
 An unknown role name grants nothing — it is ignored, not an error.
 
@@ -80,6 +81,7 @@ suffix after the first `:` is the target; an empty suffix parses as global. A
 | `viewer:acme/docs` | `viewer` bound to site `docs` in project `acme`. |
 | `project_admin:acme` | `project_admin` bound to project `acme` (and every site it owns). |
 | `project_viewer:acme` | read-only across project `acme`. |
+| `messaging_consumer:acme` | consume project `acme`'s bus — claim/subscribe/ack/nack across all its `acme/bus/` topics, nothing else. |
 
 **Back-compat:** a legacy bare site target (`publisher:blog`, no project segment) is
 normalized to the reserved `default` project (`publisher:default/blog`) before the

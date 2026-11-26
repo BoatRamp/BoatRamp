@@ -1409,8 +1409,10 @@ impl Default for AuthzPolicy {
 }
 
 impl AuthzPolicy {
-    /// The built-in default policy: `admin`, `publisher`,
-    /// `deployer`, `viewer`, `operator`.
+    /// The built-in default policy: the site/global roles `admin`, `publisher`,
+    /// `deployer`, `viewer`, `operator`; the project tiers `project_admin`,
+    /// `project_publisher`, `project_viewer`; and the resource-scoped
+    /// `messaging_consumer` (least-privilege project-bus consume).
     pub fn default_policy() -> Self {
         let mut roles: BTreeMap<String, Vec<RightTemplate>> = BTreeMap::new();
 
@@ -1500,6 +1502,25 @@ impl AuthzPolicy {
                 RightTemplate::scoped(Resource::Project, Action::Read),
                 RightTemplate::project_wildcard(Resource::Site, Action::Read),
             ],
+        );
+
+        // messaging-consumer (project, resource-scoped) — the least-privilege way to grant
+        // external **project-bus consume** access: EXACTLY `Messaging·Read` over the project
+        // wildcard (`"<project>/*"`), and NOTHING else. Unlike the broad `project_*` tiers (which
+        // span Project/Site/Secrets/Blobs), this role is scoped to a SINGLE resource, so a holder can
+        // claim / subscribe / ack / nack EVERY topic on its own project's `{project}/bus/` — the
+        // `"<project>/*"` grain (not a per-exact-topic grant) is required because ack/nack reference
+        // the opaque lease handle, not a per-topic path — WITHOUT holding project-admin or the
+        // webhook-sink registration right (`Messaging·Admin`, an egress grant strictly higher). It
+        // reaches no non-messaging right and no other project's bus (the `{proj}` path segment is the
+        // tenant boundary). This is the first non-Site use of the project-wildcard scope; the Cedar
+        // mapping already keys `Messaging` with a `project` attribute, so it authorizes unchanged.
+        roles.insert(
+            "messaging_consumer".to_string(),
+            vec![RightTemplate::project_wildcard(
+                Resource::Messaging,
+                Action::Read,
+            )],
         );
 
         Self {
@@ -4075,5 +4096,119 @@ mod tests {
         assert!(admin.allows(&claim_acme_orders));
         assert!(admin.allows(&sinks));
         assert!(admin.allows(&other_project));
+    }
+
+    #[test]
+    fn messaging_consumer_role_grants_exactly_project_bus_read() {
+        let policy = AuthzPolicy::default_policy();
+
+        // The role expands to EXACTLY one right: `Messaging·Read` on the project wildcard
+        // (`"<project>/*"`), and nothing else — the least-privilege consume grant.
+        let rights = policy.rights_for(&[GrantedRole::scoped("messaging_consumer", "acme")]);
+        let expected: RightSet = [Right::new(
+            Resource::Messaging,
+            Some("acme/*".to_string()),
+            Action::Read,
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            rights, expected,
+            "messaging_consumer:acme must grant EXACTLY Messaging·Read on acme/*",
+        );
+
+        // It authorizes the whole consume surface on its OWN project: claim/subscribe on the exact
+        // `"<project>/<topic>"` key …
+        for path in [
+            "/api/projects/acme/bus/claim/orders/created",
+            "/api/projects/acme/bus/claim/deliver",
+        ] {
+            assert!(
+                rights.allows(&Right::required("POST", path).unwrap()),
+                "messaging_consumer must authorize claim ({path})",
+            );
+        }
+        assert!(
+            rights.allows(
+                &Right::required("GET", "/api/projects/acme/bus/subscribe/orders/created").unwrap()
+            ),
+            "messaging_consumer must authorize subscribe",
+        );
+        // … and the ack/nack side-channel on the project wildcard (the topic rides the opaque handle).
+        for path in ["/api/projects/acme/bus/ack", "/api/projects/acme/bus/nack"] {
+            assert!(
+                rights.allows(&Right::required("POST", path).unwrap()),
+                "messaging_consumer must authorize the ack/nack side-channel ({path})",
+            );
+        }
+
+        // It must NOT reach the Admin-gated webhook-sink registration (an egress grant, strictly
+        // higher — needs `Messaging·Admin`).
+        assert!(
+            !rights.allows(&Right::required("PUT", "/api/projects/acme/bus/sinks/x").unwrap()),
+            "messaging_consumer must NOT reach sink registration (needs Messaging·Admin)",
+        );
+
+        // It must NOT reach ANOTHER project's bus (the `{proj}` path segment is the tenant boundary).
+        assert!(
+            !rights.allows(
+                &Right::required("POST", "/api/projects/other/bus/claim/orders/created").unwrap()
+            ),
+            "messaging_consumer:acme must not reach another project's bus",
+        );
+
+        // And NOTHING outside the messaging family — no Project/Site/Secrets/System/… right, at any
+        // action or target (least-privilege: a bus consumer can do ONLY that).
+        for resource in Resource::ALL {
+            if resource == Resource::Messaging {
+                continue;
+            }
+            for action in [Action::Read, Action::Write, Action::Deploy, Action::Admin] {
+                for target in [
+                    None,
+                    Some("acme".to_string()),
+                    Some("acme/blog".to_string()),
+                ] {
+                    assert!(
+                        !rights.allows(&Right::new(resource, target.clone(), action)),
+                        "messaging_consumer must not grant {resource:?}·{action:?} on {target:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn messaging_consumer_does_not_widen_existing_roles() {
+        // Adding `messaging_consumer` must leave every OTHER default role's Messaging reach exactly
+        // where it was: only the global `admin` touches Messaging by default.
+        let policy = AuthzPolicy::default_policy();
+        let probe = Right::new(
+            Resource::Messaging,
+            Some("acme/orders".to_string()),
+            Action::Read,
+        );
+        for role in [
+            "publisher",
+            "deployer",
+            "viewer",
+            "operator",
+            "project_admin",
+            "project_publisher",
+            "project_viewer",
+        ] {
+            assert!(
+                !policy
+                    .rights_for(&[GrantedRole::scoped(role, "acme")])
+                    .allows(&probe),
+                "{role} must not grant Messaging·Read (only messaging_consumer + admin do)",
+            );
+        }
+        assert!(
+            policy
+                .rights_for(&[GrantedRole::global("admin")])
+                .allows(&probe),
+            "admin must still reach Messaging·Read",
+        );
     }
 }
