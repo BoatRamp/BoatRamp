@@ -190,6 +190,15 @@ dns-publish = [
   "dep:async-trait",
   "dep:serde_json",
 ]
+# The `egress-register` capability (host-mediated guest egress self-register, PLAN-egress-runtime-authz
+# #12, Surface 2): a granted, posture-ON guest REPLACE-SETs the `host:port`s its OWN workload may dial,
+# written to the SAME `handlers.egress_allow` site-config overlay the control-plane `HandlerPolicy·Write`
+# PUT edits. Self-scoped: the host bakes this invocation's per-workload key (the dial's own overlay key)
+# at `build_bindings`; the guest supplies only the host set, never a key. Gates the WIT
+# `egress-register-host` world + the `EgressRegisterHost` binding + linker. Off by default; provided
+# ONLY when the node posture `allow_guest_egress_register` is on AND the component was granted it. The
+# shipped binary turns it on via batteries-included. `dep:async-trait` for the object-safe writer seam.
+egress-register = ["engine", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true

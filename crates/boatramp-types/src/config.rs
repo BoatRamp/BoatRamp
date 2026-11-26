@@ -544,6 +544,10 @@ const KNOWN_IMPORTS: &[&str] = &[
     // `allow_guest_dns_publish` (OFF by default) AND a non-empty per-handler `dns_publish_zones`
     // writable-zone allowlist — deny-by-default at every layer. Advertised Experimental.
     "dns-publish",
+    // NOTE (PLAN-egress-runtime-authz #12, Surface 2): the host-mediated `egress-register` capability
+    // import is added here in the SAME increment that wires its host linker (`EgressRegisterHost`) —
+    // declaring an import the host does not link would fail guest instantiation, so it is NOT listed
+    // until the binding lands.
 ];
 
 /// The import names a deploy may declare in a handler's `imports` (baseline WASI

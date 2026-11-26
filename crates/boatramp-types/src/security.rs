@@ -112,6 +112,7 @@ impl SecurityProfile {
                 // A new egress surface (BR-REQ-2): off under multi-tenant until the operator opts in.
                 allow_guest_dynamic_egress: false,
                 allow_guest_tcp_listener: false,
+                allow_guest_egress_register: false,
                 allow_guest_dns_publish: false,
                 // A new, security-sensitive runtime zone-credential surface (cap-req #31): OFF under
                 // multi-tenant until the operator opts in. Its own Security review gates the default.
@@ -156,6 +157,7 @@ impl SecurityProfile {
                 allow_guest_tcp_listener: true,
                 // A new, security-sensitive zone-write surface: OFF even on single-tenant until the
                 // operator opts in explicitly (its Security review gates the broader default).
+                allow_guest_egress_register: false,
                 allow_guest_dns_publish: false,
                 // The RUNTIME per-tenant zone-credential path (cap-req #31): ON under single-tenant —
                 // the one tenant supplies its OWN provider token for its OWN zone (still fenced by the
@@ -203,6 +205,7 @@ impl SecurityProfile {
                 allow_guest_tcp_listener: true,
                 // Off even under dev — a guest `dns-publish` would mutate REAL external DNS (the
                 // provider credential is real); an operator opts in explicitly.
+                allow_guest_egress_register: false,
                 allow_guest_dns_publish: false,
                 // The RUNTIME per-tenant zone-credential path (cap-req #31): ON under dev (the dev
                 // operator supplies its own token for its own zone; still allowlist- + seal-fenced).
@@ -315,6 +318,14 @@ pub struct PostureOverrides {
     /// and keeps every existing egress guard (SSRF floor + the one-shot DNS-rebind choke). See
     /// [`SecurityPosture::allow_guest_dynamic_egress`].
     pub allow_guest_dynamic_egress: Option<bool>,
+    /// Permit a **guest** to SELF-REGISTER its OWN workload's runtime egress overlay via the
+    /// host-mediated `egress-register` capability (PLAN-egress-runtime-authz #12, Surface 2) — the
+    /// guest-facing analogue of the control-plane `HandlerPolicy·Write` overlay edit. **Off** in every
+    /// built-in profile (a new write surface onto the egress overlay — an operator opts in). The host
+    /// scopes every write to the guest's OWN per-workload key (it can never set another workload's
+    /// egress), validates each entry's grammar + the SSRF floor at register, and the UNCHANGED
+    /// dial-time floor stays authoritative. See [`SecurityPosture::allow_guest_egress_register`].
+    pub allow_guest_egress_register: Option<bool>,
     /// Permit host-owned inbound-TCP **listeners** to dispatch an accepted connection to a guest.
     /// Off under `multi-tenant`; on under `single-tenant`/`dev`. Independent of
     /// `allow_guest_tcp_egress` (inbound ≠ outbound). See
@@ -577,6 +588,11 @@ impl SecurityConfig {
             o.allow_guest_tcp_listener.is_some(),
         );
         row(
+            "allow_guest_egress_register",
+            p.allow_guest_egress_register.to_string(),
+            o.allow_guest_egress_register.is_some(),
+        );
+        row(
             "allow_guest_dns_publish",
             p.allow_guest_dns_publish.to_string(),
             o.allow_guest_dns_publish.is_some(),
@@ -800,6 +816,16 @@ pub struct SecurityPosture {
     /// default even on `single-tenant`/`dev` — an operator opts in explicitly. INDEPENDENT of every
     /// egress knob (DNS write is a distinct authority). Any single wiring omission fails CLOSED.
     pub allow_guest_dns_publish: bool,
+    /// Permit a **guest** to SELF-REGISTER its OWN workload's runtime egress overlay via the
+    /// host-mediated `egress-register` capability (PLAN-egress-runtime-authz #12, Surface 2). `false`
+    /// (every built-in profile) makes the `EgressRegisterHost` binding fail-closed to `access-denied`
+    /// for every call, regardless of grant. `true` lets a GRANTED component REPLACE-SET the `host:port`s
+    /// its OWN workload may dial — written to the SAME `handlers.egress_allow` overlay the control-plane
+    /// `HandlerPolicy·Write` PUT edits — host-scoped to the guest's own per-workload key (never another
+    /// workload's), grammar- + SSRF-floor-validated at register, and still held by the UNCHANGED
+    /// dial-time `is_global_ip` floor. A new write surface, so OFF by default even on
+    /// `single-tenant`/`dev` — an operator opts in explicitly. Any single wiring omission fails CLOSED.
+    pub allow_guest_egress_register: bool,
     /// Permit a **guest** to register a RUNTIME, host-sealed, per-tenant DNS-write credential and route
     /// `dns-publish` writes through it (cap-req #31): the tenant connects its OWN zone with its OWN
     /// provider API token; the host SEALS the token (the `[secrets]` key envelope), holds it keyed to
@@ -1001,6 +1027,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_tcp_listener {
         base.allow_guest_tcp_listener = v;
+    }
+    if let Some(v) = o.allow_guest_egress_register {
+        base.allow_guest_egress_register = v;
     }
     if let Some(v) = o.allow_guest_dns_publish {
         base.allow_guest_dns_publish = v;
