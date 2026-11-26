@@ -116,6 +116,28 @@ versions.
   unaffected; a pre-#12 host rejects the unknown import at link). The guest-facing WIT is vendored into
   `boatramp-uchron-shim` the same cycle (the new import off-by-default feature-gated).
 
+### Fixed
+
+- **HTTP/2 serving: a request carrying `Expect: 100-continue` no longer deadlocks.** boatramp
+  advertises h2-first in ALPN, so a client that negotiates HTTP/2 and sends its upload (e.g.
+  git-lfs doing a `PUT`) issues the request HEADERS with `expect: 100-continue` and then **waits**
+  for an interim `100 (Continue)` before sending any DATA. The h2 serving layer had no
+  `Expect: 100-continue` handling and never emitted that `100`, so a body-reading handler — a
+  reverse-proxy forward leg blocked on `data.next()` — hung waiting for a body the client was
+  withholding: zero bytes forwarded upstream, no response, the client timing out and retrying
+  forever (the h1 path already handled this). The h2 driver now emits a genuine **interim** `100`
+  (a `:status 100` HEADERS with **no** `END_STREAM`, so the stream stays open for the real final
+  response) **lazily, on the handler's first read of the request body** — matching Go's
+  `net/http2` server (`requestBody.Read` → `write100ContinueHeaders`) and a Go/Caddy reverse
+  proxy, which **terminate** the 100-continue handshake at the server leg (auto-send the `100`,
+  then forward the body) rather than relaying an upstream `100`. The `100` is sent at most once; a
+  client that ignores the handshake and streams its DATA without waiting still completes (a late,
+  harmless `100`, never a double-send), and a request without `Expect` is unchanged. A new
+  real-h2-stack regression gate (`boatramp-http/tests/h2_expect_continue.rs`, driven by the
+  reference `h2` client's `poll_informational` against `serve_connection_mux`) covers it: without
+  the fix the client's wait for the `100` deadlocks; with it the `100` arrives on the first body
+  read and the upload flows to completion.
+
 ### Security
 
 - **Runtime egress authorization is capability-grade — gated above a pure config edit, and
