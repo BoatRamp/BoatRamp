@@ -807,6 +807,56 @@ jobs:
             echo "session-egress mutation verified: 'drop_session_egress' fails the gate as expected."
           fi
 
+      # PLAN-egress-runtime-authz #12 OVERLAY-UNION GATE (markers `EGRESS-OVERLAY STATIC GATE OK` /
+      # `EGRESS-OVERLAY PLAINTEXT GATE OK`). The runtime-editable per-workload egress overlay
+      # (`HandlersSiteConfig.egress_allow` — BOTH the control-plane `HandlerPolicy·Write` PUT and the
+      # guest `egress-register` capability write it) is unioned onto the deploy allowlist at dispatch and
+      # fed to the UNCHANGED `resolve_and_gate_tcp_egress` gate: a runtime-added global host is reachable,
+      # a removed host is `RefusedByGate`, an internal/metadata overlay entry is STILL floored by
+      # `is_global_ip` (the overlay adds reach, never relaxes the floor), a plaintext POP3 host is
+      # reachable on `connect-plaintext`, and one site's overlay never leaks into another. Asserts BOTH
+      # markers + the pass count to catch a silent skip/rename.
+      - name: "egress overlay union gate (runtime overlay feeds the UNCHANGED dial gate + SSRF floor)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-handlers \
+            --features tcp-egress runtime_egress_overlay -- --nocapture 2>&1 | tee egress-overlay.log
+          grep -qE 'test result: ok\. 2 passed' egress-overlay.log \
+            || { echo "::error::egress-overlay union gate did not run both tests (silent skip or a failure)" >&2; exit 1; }
+          for marker in 'EGRESS-OVERLAY STATIC GATE OK' 'EGRESS-OVERLAY PLAINTEXT GATE OK'; do
+            grep -q "$marker" egress-overlay.log \
+              || { echo "::error::egress-overlay union gate never reached its marker: $marker" >&2; exit 1; }
+          done
+
+      # PLAN-egress-runtime-authz #12 Surface 2 EGRESS-REGISTER PER-WORKLOAD-SCOPE GATE (marker
+      # `EGRESS-REGISTER SCOPE GATE OK`). The host-mediated guest `egress-register` capability writes the
+      # SAME overlay but SELF-SCOPED: the host bakes THIS invocation's OWN per-workload key (the dial's
+      # own overlay key), so a guest's `set-egress` persists ONLY its own workload's `egress_allow` entry
+      # and can never reach another workload's. This step drives the writer's baked-key persist and
+      # asserts the write targets EXACTLY the baked key (+ marker + pass count catch a silent skip/rename).
+      # MUTATION-VERIFIED: re-run under `BOATRAMP_EGRESSREG_MUTATION=cross_workload`, which neuters the
+      # baked key so the write targets a DIFFERENT workload, and the gate MUST FAIL — proving the
+      # per-workload scope is load-bearing (a PASS-under-mutation = a hollow gate, fails the merge).
+      - name: "egress-register per-workload-scope gate (a guest sets ONLY its own workload's egress)"
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
+            --features egress-register per_workload_scope_write_targets_only_the_baked_key \
+            -- --nocapture 2>&1 | tee egress-register-scope.log
+          grep -qE 'test result: ok\. 1 passed' egress-register-scope.log \
+            || { echo "::error::egress-register scope gate did not run (silent skip or a failure)" >&2; exit 1; }
+          grep -q 'EGRESS-REGISTER SCOPE GATE OK' egress-register-scope.log \
+            || { echo "::error::egress-register scope gate never reached its marker (a per-workload-scope regression)" >&2; exit 1; }
+          # Mutation guard: neutering the baked key MUST fail the gate (the self-scope is load-bearing).
+          if BOATRAMP_EGRESSREG_MUTATION=cross_workload cargo-zigbuild test \
+            --target x86_64-unknown-linux-musl -p boatramp-server --features egress-register \
+            per_workload_scope_write_targets_only_the_baked_key -- --nocapture > egress-register-scope-mutation.log 2>&1; then
+            echo "::error::egress-register scope gate is HOLLOW — it passed under 'cross_workload' (a guest could set ANOTHER workload's egress; the per-workload scope is not enforced)" >&2
+            exit 1
+          else
+            echo "egress-register scope mutation verified: 'cross_workload' fails the gate as expected."
+          fi
+
       # PLAN-handler-tcp-egress TCP-EGRESS TLS-WRAP GATE (markers `TCP-EGRESS TLS WRAP OK` /
       # `TCP-EGRESS GATE REUSE OK` / `TCP-EGRESS GATE REUSE PLAINTEXT OK` / `TCP-EGRESS STARTTLS OK`
       # / `TCP-EGRESS STARTTLS OPPORTUNISTIC OK` / `TCP-EGRESS STARTTLS INJECTION SAFE`, mailroom

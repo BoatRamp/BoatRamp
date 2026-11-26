@@ -7,6 +7,86 @@ versions.
 
 ## [0.75.0] — 2026-11-26
 
+### Added
+
+- **New `boatramp handlers secrets` CLI verb — edit a site's handler↔secret bindings without a
+  content redeploy (roadmap #4).** `[handlers].secrets` (ENV name → secret-ref) lives in the site's
+  mutable config, not the deployment; folding a rotation into an `apply.cfg`
+  `config.handlers.secrets` block also deploys + activates the site's content — overkill for adding
+  or rotating one reference. The new verb edits just that map through the SAME site-config API
+  `apply`/`sync` use (a read-modify-write, config-only, no reactivate):
+  - `boatramp handlers secrets list <site>` — print the current ENV name → secret-ref bindings.
+  - `boatramp handlers secrets set <site> ENV_NAME=secret-ref …` — insert or update one or more
+    `ENV=reference` pairs (repeatable).
+  - `boatramp handlers secrets unset <site> ENV_NAME …` — remove the named ENV key(s) (an absent
+    name is a no-op, not an error).
+- **Runtime-editable handler egress authorization — widen a workload's outbound-TCP allowlist at
+  runtime, no redeploy (roadmap #12).** A handler / consumer / cron / session can now reach a
+  per-customer host known only at RUNTIME (e.g. `imap.gstruct.com:993`) by registering it in a new
+  runtime-editable overlay, instead of baking every host into the deploy manifest:
+  - **Shape** — a `handlers.egress_allow` map on the site config (`HandlersSiteConfig`, the
+    runtime-editable `handlers.secrets` analog), keyed by the workload's dispatch identity (a
+    handler/cron `route`, a consumer `topic`); its value is a list of ADDITIONAL static `host:port`
+    / `ip:port` / `CIDR:port` targets (the same grammar as the deploy `egress_allowlist`). Edited
+    via the EXISTING authenticated `PUT /api/sites/{site}/config` — the same path that edits
+    `handlers.secrets`, so no new endpoint. **Host-authoritative** (control-plane config, never
+    guest-supplied at dial). Each entry is validated fail-closed-loud at the PUT.
+  - **Semantics** — the overlay is **unioned** onto that workload's deploy-time `egress_allowlist`
+    at dispatch, then fed to the **UNCHANGED** dial-time gate. Strictly **additive — reach, not
+    authority**: it widens WHICH global `host:port`s a workload may reach; it does NOT grant
+    `wasi:sockets`, flip the node posture, or relax the `is_global_ip` SSRF floor — an
+    internal/metadata/RFC1918/loopback entry is still refused at dial. The static overlay is
+    consulted on BOTH the `connect-tls` (IMAPS) and `connect-plaintext` (POP3) legs. Empty overlay
+    ⇒ byte-identical to the deploy allowlist alone (`empty ⇒ deny-all` preserved). Cluster
+    propagation + TOCTOU safety ride the existing content-addressed site-config mechanism (no new
+    machinery), exactly as `handlers.secrets` does.
+  - **Operator integration (replace-set)** — the overlay IS the registered set: register = a PUT
+    adding the `host:port`; de-register = a PUT omitting it. Re-registering a present host is a
+    byte-identical no-op; drift self-heals to the last PUT.
+- **Host-mediated guest egress self-register capability (`boatramp:handlers/egress-register`).** The
+  guest-facing companion to the control-plane edit above, so a workload can self-manage the hosts it
+  dials from INSIDE its guest (e.g. a mailroom fetch handler replace-sets its own IMAP/POP3 upstreams
+  each tick) with no control-plane token: `set-egress(hosts)` REPLACE-SETs the `host:port`s, written
+  to the SAME `handlers.egress_allow` overlay. **Self-scoped (load-bearing):** the guest passes ONLY
+  the host set — the HOST bakes the invocation's OWN per-workload key (the handler/cron `route`, the
+  consumer `topic`, the session route — the SAME key its dial reads, so write and read cannot drift),
+  so a guest can set ONLY its own workload's egress, never another's. Gated by a new node posture
+  **`allow_guest_egress_register`** (OFF by default in every profile; an operator opts in) + the
+  `egress-register` grant — deny-by-default at every layer. Every entry is grammar- + SSRF-floor-
+  validated at register (all-or-nothing); the dial-time floor stays authoritative. The persist is a
+  lock-atomic per-workload overlay write, so concurrent self-registers for different workloads
+  converge (no clobber). A self-register takes effect on the next dispatch (overlay binds at dispatch).
+- **A broad typed DDL (schema-change) builder — `boatramp-core::ddl` (roadmap #13).** A pure AST →
+  validated-SQL emitter (the schema-creation counterpart to the `orm` query compiler: no I/O, no
+  credential, no authority), whose output runs **only** on the already-gated owner-role
+  `project migrate` seam (`Project·Admin`) — so it grants **zero new runtime authority**; it is pure
+  codegen that makes migration DDL typed and identifier-safe. v1 operation set:
+  - `CreateTable` — with a **tenant-scoped variant** that additionally emits the RLS policy (keyed on
+    the `rls_session` tenant-GUC convention, `USING`/`WITH CHECK current_setting(…)`) **and**
+    `ALTER TABLE … FORCE ROW LEVEL SECURITY`, so a builder-made tenant table can never ship RLS-less.
+  - `AddColumn`, `CreateIndex` (btree/hash/gin/gist/**hnsw/ivfflat**), `CreateType` (enum).
+  - `DropTable`/`DropColumn`/`DropIndex` + `AlterColumnType`/`RenameTable`/`RenameColumn`, each behind
+    an explicit `destructive: true` acknowledgement (a DX guard against accidental data loss — NOT a
+    new authority boundary; a raw `Sql` step can already `DROP` at the same owner altitude).
+  - Portable scalar column types + `jsonb`/`uuid`/**`vector(N)`** (the Postgres-specific types,
+    tenant RLS, indexes, and enum `CREATE TYPE` are Postgres-only and fail closed elsewhere).
+  - **No-injection by construction:** identifiers go through the shared `orm` ident rule and reject
+    any dot (so a schema-qualified name can never be emitted); defaults are a **closed enum**
+    (`literal` / `now()` / `null` / `gen_random_uuid()`), never a free-SQL string; the builder refuses
+    the host-owned `boatramp_migrations`/`schema_migrations` ledger namespace; it **never** emits
+    `CREATE EXTENSION` (that stays the operator-allowlisted `Extension` step). The vector
+    metric→opclass→query-operator coupling (`vector_cosine_ops`⇒`<=>`, `vector_l2_ops`⇒`<->`) is
+    derived from one `Metric`, so an index and its kNN query can't drift; `CONCURRENTLY` surfaces a
+    `no_transaction` flag for the migration step.
+  - The public `ddl` enums (`Ddl`, `ColumnType`, `ScalarDefault`, `TableConstraint`, `TypeBody`,
+    `IndexMethod`, `DdlError`) are `#[non_exhaustive]`, so the specced growth (composite/domain/range
+    types, further operations) stays additive.
+
+### Changed
+
+- **`orm-vector` graduated Experimental → Stable** — the metric set (cosine `<=>` / L2 `<->`) and the
+  `vector-literal(string)` value round-trip are settled; no WIT or `value`-variant change.
+
 ### Breaking
 
 - **`#[non_exhaustive]` + builder seal of `StreamConfig`** (deferred from v0.74.0, which added
@@ -20,6 +100,40 @@ versions.
   `..Default::default()` struct literal. Every in-tree cross-crate construction site (all in
   `boatramp-server` test code: `tests/conformance.rs`, `src/lib.rs`, `tests/connect_server_stream_live.rs`)
   is migrated.
+- **`HandlersSiteConfig` sealed `#[non_exhaustive]` + builder** — this long-published site-config
+  struct is now `#[non_exhaustive]` with a fluent `HandlersSiteConfig::builder()` covering every
+  field (including the new `egress_allow`). A cross-crate struct literal (even
+  `HandlersSiteConfig { … , ..Default::default() }`) no longer compiles; migrate to the builder (or,
+  in-crate, `Default::default()` + field assignment). Sealing it makes every future field add — like
+  `egress_allow` itself — a non-breaking change.
+- **New `Resource::HandlerPolicy` authz right** (roadmap #12): the grouped control-plane right that
+  gates runtime handler-policy facets (`<project>/<site>/<facet>`, facet ∈ {`egress`} today), carried
+  by the global `admin` role by default. `Resource::ALL` grows 11 → 12; downstream crates
+  (uchron/luigi) that match the `Resource` enum exhaustively or compile the Cedar closures must add
+  the new arm (the enum stays non-`#[non_exhaustive]`, so adding a variant is the relayed break).
+- **Guest capability surface `HOST_HANDLERS_VERSION` 0.14.0 → 0.15.0** — a NEW
+  `boatramp:handlers/egress-register` import (additive: a pinned older guest that does not import it is
+  unaffected; a pre-#12 host rejects the unknown import at link). The guest-facing WIT is vendored into
+  `boatramp-uchron-shim` the same cycle (the new import off-by-default feature-gated).
+
+### Security
+
+- **Runtime egress authorization is capability-grade — gated above a pure config edit, and
+  per-workload-scoped.** Editing the `handlers.egress_allow` overlay (adding OR removing a host)
+  changes an outbound network surface: deploy-grade authority a pure `Site·Write` holder (a console
+  config editor) must NOT wield. Any change to `egress_allow` vs the stored config requires the new
+  **`HandlerPolicy·Write`** right on the MANDATORY-FACET target `<project>/<site>/egress`; a
+  byte-identical re-PUT needs only the base `Site·Write` (so a declarative re-apply by a non-policy
+  principal still works). The facet segment is mandatory: a facet-less `HandlerPolicy` grant
+  authorizes nothing, a different facet never retroactively widens to egress, and only a deliberate
+  project/global wildcard (`admin`) spans facets. The guest `egress-register` capability writes the
+  SAME overlay but **self-scoped** — the host bakes the invocation's OWN per-workload key, so a guest
+  can set ONLY its own workload's egress, never another's — and is off by default (node posture
+  `allow_guest_egress_register` + the `egress-register` grant, deny-by-default at every layer). The
+  overlay is strictly **additive — reach, not authority**: it never grants `wasi:sockets`, flips the
+  node posture, or relaxes the dial-time `is_global_ip` SSRF floor, which stays authoritative on both
+  the `connect-tls` and `connect-plaintext` legs (an internal/metadata/RFC1918/loopback entry is
+  still refused at dial).
 
 ## [0.74.0] — 2026-11-26
 

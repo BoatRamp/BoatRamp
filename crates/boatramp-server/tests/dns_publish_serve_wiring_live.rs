@@ -143,11 +143,12 @@ async fn live_app() -> App {
             ProjectRef::DEFAULT,
             SITE,
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec!["dns-publish".to_string()],
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .allow_imports(vec!["dns-publish".to_string()])
+                        .build(),
+                ),
                 ..Default::default()
             },
         )

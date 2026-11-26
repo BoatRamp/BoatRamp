@@ -1315,10 +1315,7 @@ mod tests {
     #[test]
     fn referenced_boatramp_secrets_selects_only_sealed_refs() {
         use boatramp_core::config::{HandlersSiteConfig, SiteConfig};
-        let mut handlers = HandlersSiteConfig {
-            enabled: true,
-            ..Default::default()
-        };
+        let mut handlers = HandlersSiteConfig::builder().enabled(true).build();
         handlers
             .secrets
             .insert("STRIPE".into(), "boatramp:STRIPE_KEY".into());
@@ -1354,16 +1351,17 @@ mod tests {
     fn referenced_subgraphs_and_missing_refs_select_undeployed_subgraphs() {
         use boatramp_core::config::{HandlerGraphqlConfig, HandlersSiteConfig, SiteConfig};
         let cfg = SiteConfig {
-            handlers: Some(HandlersSiteConfig {
-                enabled: true,
-                graphql: Some(HandlerGraphqlConfig {
-                    enabled: true,
-                    federated: true,
-                    subgraphs: Some(vec!["pack-admin".into(), "catalog".into()]),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
+            handlers: Some(
+                HandlersSiteConfig::builder()
+                    .enabled(true)
+                    .graphql(Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        federated: true,
+                        subgraphs: Some(vec!["pack-admin".into(), "catalog".into()]),
+                        ..Default::default()
+                    }))
+                    .build(),
+            ),
             ..Default::default()
         };
         let referenced = referenced_subgraphs(&cfg);

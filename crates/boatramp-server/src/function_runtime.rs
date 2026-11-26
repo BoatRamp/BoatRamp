@@ -1861,6 +1861,14 @@ pub(crate) struct FunctionInvoker {
 
 #[cfg(feature = "handlers")]
 impl FunctionInvoker {
+    /// The deploy store this invoker wraps — the per-runtime handle the `egress-register` capability's
+    /// host writer uses to persist a workload's `handlers.egress_allow` overlay (#12 Surface 2). Lives
+    /// on the invoker because it is the one runtime-scoped `DeployStore` set once at startup.
+    #[cfg(feature = "handlers")]
+    pub(crate) fn deploy_store(&self) -> &DeployStore {
+        &self.deploy
+    }
+
     pub(crate) fn new(deploy: DeployStore, runtime: std::sync::Weak<HandlerRuntimeInner>) -> Self {
         Self {
             deploy,
@@ -3652,10 +3660,7 @@ mod blob_upload_function_tests {
                     ProjectRef::new(project),
                     site,
                     &SiteConfig {
-                        handlers: Some(HandlersSiteConfig {
-                            enabled: true,
-                            ..Default::default()
-                        }),
+                        handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                         ..Default::default()
                     },
                 )
@@ -3903,10 +3908,7 @@ mod blobstore_dimension0_tests {
                 ProjectRef::new(project),
                 site,
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        ..Default::default()
-                    }),
+                    handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                     ..Default::default()
                 },
             )
@@ -4289,11 +4291,10 @@ mod blobstore_dimension0_tests {
         // grants a capability only when BOTH the component imports it AND the site allows it (the same
         // least-privilege ceiling that gates `sql`/`wasi:messaging`). This is the one config addition
         // a site needs so its consumer may bind the shared blob container.
-        let site_cfg = HandlersSiteConfig {
-            enabled: true,
-            allow_imports: vec!["wasi:blobstore".to_string()],
-            ..Default::default()
-        };
+        let site_cfg = HandlersSiteConfig::builder()
+            .enabled(true)
+            .allow_imports(vec!["wasi:blobstore".to_string()])
+            .build();
 
         // The edge / `compute bind-blob --site mailroom --container mail` producer wrote the body
         // here — the exact key a JMAP/IMAP handler reads it back from.
@@ -4396,11 +4397,12 @@ mod blobstore_dimension0_tests {
                 project,
                 site,
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        allow_imports: vec!["wasi:blobstore".to_string()],
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .allow_imports(vec!["wasi:blobstore".to_string()])
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )

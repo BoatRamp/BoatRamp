@@ -44,6 +44,13 @@ pub mod dns_publish;
 /// story — rides the `tcp-egress` feature.
 #[cfg(feature = "tcp-egress")]
 pub mod dns_resolve;
+/// The host-side egress SELF-REGISTER binding (`boatramp:handlers/egress-register`,
+/// PLAN-egress-runtime-authz #12, Surface 2): a granted, posture-ON guest REPLACE-SETs the `host:port`s
+/// its OWN workload may dial, written to the SAME `handlers.egress_allow` overlay the control-plane
+/// `HandlerPolicy·Write` PUT edits, host-scoped to the invocation's own per-workload key. Its own
+/// off-by-default `egress-register` feature.
+#[cfg(feature = "egress-register")]
+pub mod egress_register;
 #[cfg(feature = "email")]
 pub mod email;
 #[cfg(feature = "graphql")]
@@ -226,6 +233,11 @@ pub struct Bindings {
     /// carried here. The guest never sees the provider credential.
     #[cfg(feature = "dns-publish")]
     dns_publish: Option<dns_publish::DnsPublishBinding>,
+    /// The `egress-register` grant (PLAN-egress-runtime-authz #12, Surface 2): the host-held writer
+    /// (baked to THIS invocation's per-workload key) + the node posture, store-resident so the per-call
+    /// `EgressRegisterHost` view borrows it. `None` ⇒ not granted (every `set-egress` ⇒ `access-denied`).
+    #[cfg(feature = "egress-register")]
+    egress_register: Option<egress_register::EgressRegisterBinding>,
     /// HOST-MEDIATED egress only (mailroom cap-req #19): when set, a non-empty `egress_allowlist`
     /// feeds ONLY the host-mediated `tcp-egress` binding (the host dials + terminates TLS), and
     /// `new_store` does NOT install the permissive GUEST `socket_addr_check` — so the guest's own
@@ -466,6 +478,28 @@ impl Bindings {
     #[cfg(feature = "dns-publish")]
     pub fn dns_publish(&self) -> Option<&dns_publish::DnsPublishBinding> {
         self.dns_publish.as_ref()
+    }
+
+    /// This invocation's `egress-register` grant (`None` ⇒ not granted). Read by the engine's
+    /// `build_linker` closure to build the per-invocation `EgressRegisterHost` (PLAN-egress-runtime-authz
+    /// #12, Surface 2).
+    #[cfg(feature = "egress-register")]
+    pub fn egress_register(&self) -> Option<&egress_register::EgressRegisterBinding> {
+        self.egress_register.as_ref()
+    }
+
+    /// Grant the `egress-register` capability (PLAN-egress-runtime-authz #12, Surface 2), backed by the
+    /// host-held `writer` (baked to THIS invocation's per-workload key by the server's `build_bindings`).
+    /// The guest supplies ONLY the host set — never a key — so it can set ONLY its own workload's
+    /// `egress_allow` overlay. The node posture (`allow_guest_egress_register`) is applied by the engine
+    /// from `HostState` at link, like `dns-publish`.
+    #[cfg(feature = "egress-register")]
+    pub fn with_egress_register(
+        mut self,
+        writer: std::sync::Arc<dyn egress_register::EgressRegisterWriter>,
+    ) -> Self {
+        self.egress_register = Some(egress_register::EgressRegisterBinding::new(writer));
+        self
     }
 
     /// Grant the `dns-publish` capability (cap-req #24 WS3), backed by the host-held `provider` writer

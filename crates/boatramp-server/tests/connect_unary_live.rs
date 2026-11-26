@@ -137,11 +137,12 @@ async fn live_app() -> axum::Router {
             ProjectRef::DEFAULT,
             SITE,
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec![],
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .allow_imports(vec![])
+                        .build(),
+                ),
                 // On-the-fly compression ON (min_size 0 ⇒ every eligible 200 is a candidate) so the
                 // gRPC-web case actively exercises the host residual's never-compress-framed-bodies
                 // guard rather than passing because compression was simply off.

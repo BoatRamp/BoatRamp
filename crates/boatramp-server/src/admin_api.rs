@@ -427,6 +427,8 @@ pub(super) async fn check_added_domains_verified(
 pub(super) async fn put_site_config(
     State(deploy): State<DeployStore>,
     Extension(project): axum::extract::Extension<ProjectContext>,
+    Extension(auth): Extension<crate::auth::Auth>,
+    principal: Option<Extension<crate::auth::VerifiedPrincipal>>,
     Path(site): Path<String>,
     Json(config): Json<SiteConfig>,
 ) -> Response {
@@ -440,6 +442,65 @@ pub(super) async fn put_site_config(
         }
         Err(err) => return deploy_error_response(err),
     }
+    // PLAN-egress-runtime-authz (#12): the runtime-editable per-workload egress overlay
+    // (`handlers.egress_allow`) rides THIS PUT (the `handlers.secrets` transport). Two fail-closed
+    // gates, both BEFORE the config is stored:
+    //   (1) VALIDATE every overlay entry's `host|ip|cidr:port` grammar — a malformed entry is a loud
+    //       400, never a silently-stored never-match (the `is_global_ip` SSRF floor remains the
+    //       dial-time authority; a syntactically-valid internal target is still refused at dial).
+    //   (2) FACET AUTHZ — EDITING the overlay (adding OR removing a host) changes an outbound network
+    //       surface: capability-grade authority a pure `Site·Write` holder (a console config editor)
+    //       must NOT wield. ANY change to `egress_allow` vs the stored config requires
+    //       `HandlerPolicy·Write` on the MANDATORY-FACET target `<project>/<site>/egress` (see
+    //       `Resource::HandlerPolicy`): a facet-less grant authorizes nothing, only a facet-specific
+    //       grant (or a deliberate project/global wildcard = admin) satisfies it. A PUT that leaves the
+    //       overlay BYTE-IDENTICAL to the stored one needs only the base `Site·Write` the route already
+    //       maps to — so a declarative re-apply by a non-policy principal still works. The required
+    //       right is built by one helper (`egress_overlay_edit_right`) + checked by one seam
+    //       (`require_egress_overlay_edit_right`).
+    // `expected_egress` = the stored overlay this request's change-detect + facet-authz decision was
+    // made against. It is passed as a PRECONDITION to the write below (LOW-3): the write lands only if
+    // the stored overlay is STILL this, re-checked under the deploy lock — closing the read→write TOCTOU
+    // (a stale authz decision, or clobbering a concurrent egress edit).
+    let expected_egress: std::collections::BTreeMap<String, Vec<String>> = {
+        let empty_overlay = std::collections::BTreeMap::new();
+        let next_overlay = config
+            .handlers
+            .as_ref()
+            .map_or(&empty_overlay, |h| &h.egress_allow);
+        if !next_overlay.is_empty()
+            && let Some(h) = config.handlers.as_ref()
+            && let Err(reason) = h.validate_egress_overlay()
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("site \"{site}\": {reason}\n"),
+            )
+                .into_response();
+        }
+        // Compare against the CURRENT stored overlay to detect an EDIT (add OR remove); fail-closed on
+        // a read error. One cache-backed read of the fresh pointer.
+        let current = match deploy.get_site_config(project.as_ref(), &site).await {
+            Ok(c) => c.unwrap_or_default(),
+            Err(err) => return deploy_error_response(err),
+        };
+        let current_overlay = current
+            .handlers
+            .as_ref()
+            .map_or(&empty_overlay, |h| &h.egress_allow);
+        if next_overlay != current_overlay
+            && let Some(resp) = require_egress_overlay_edit_right(
+                &auth,
+                principal.as_ref(),
+                project.as_ref().as_str(),
+                &site,
+            )
+            .await
+        {
+            return resp;
+        }
+        current_overlay.clone()
+    };
     // Per-site subgraph composition (S2b): a site's `graphql.subgraphs` include list is validated
     // fail-closed HERE, at the config-write chokepoint, against the live registry — an empty set, an
     // unregistered include, or an invalid Federation subset is a `400` and the config is NOT stored.
@@ -474,11 +535,88 @@ pub(super) async fn put_site_config(
     // `domains.contexts`/`aliases` the incoming config doesn't mention — so a declarative `apply`
     // (which calls this) can't wipe a tenant's runtime host routing. Removal stays via `domain rm`.
     match deploy
-        .set_site_config_cooperative(project.as_ref(), &site, &config)
+        .set_site_config_cooperative_if_egress_unchanged(
+            project.as_ref(),
+            &site,
+            &config,
+            &expected_egress,
+        )
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // LOW-3: a `Conflict` here is a concurrent egress-overlay edit in the read→write window; it
+        // maps to 409 (the client re-reads + retries) rather than clobbering under a stale authz view.
         Err(err) => deploy_error_response(err),
+    }
+}
+
+/// The capability-grade right required to EDIT a site's runtime egress overlay
+/// (PLAN-egress-runtime-authz #12): `HandlerPolicy·Write` on the **MANDATORY-FACET** target
+/// `"<project>/<site>/egress"`. The facet segment is required (see [`Resource::HandlerPolicy`]): a
+/// facet-less `HandlerPolicy` grant exact-matches this target nowhere, so it authorizes nothing; only
+/// a facet-specific grant — or a deliberate project (`"<project>/*"`) / global (`None`) wildcard, i.e.
+/// `admin` — satisfies it. The single construction point for the required right (so the facet is
+/// never dropped).
+fn egress_overlay_edit_right(proj: &str, site: &str) -> boatramp_core::authz::Right {
+    boatramp_core::authz::Right::new(
+        boatramp_core::authz::Resource::HandlerPolicy,
+        Some(format!("{proj}/{site}/egress")),
+        boatramp_core::authz::Action::Write,
+    )
+}
+
+/// PLAN-egress-runtime-authz (#12) — the authz seam for EDITING a site's runtime egress overlay.
+/// Returns `Some(response)` to REFUSE (403 / 503), `None` to allow. Editing the overlay (adding OR
+/// removing a host) changes an outbound network surface — capability-grade authority, parity with the
+/// deploy manifest's `egress_allowlist` — so it requires [`egress_overlay_edit_right`]
+/// (`HandlerPolicy·Write` on `"<project>/<site>/egress"`), re-checked against the caller's verified,
+/// normalized roles under the LIVE policy, fail-closed (the `put_compute` blob-site-share precedent).
+/// The base `Site·Write` the route maps to is deliberately NOT sufficient — a pure config-edit
+/// principal (a console editor) must never open a network path. Dev mode (`auth.is_disabled()`) is
+/// open, matching every other control-plane gate; auth enabled but no verified principal ⇒ fail
+/// CLOSED (should never happen behind `require_auth`). The dial-time `is_global_ip` SSRF floor is
+/// unchanged and authoritative regardless.
+async fn require_egress_overlay_edit_right(
+    auth: &crate::auth::Auth,
+    principal: Option<&Extension<crate::auth::VerifiedPrincipal>>,
+    proj: &str,
+    site: &str,
+) -> Option<Response> {
+    if auth.is_disabled() {
+        return None;
+    }
+    let required = egress_overlay_edit_right(proj, site);
+    let authorized = match principal {
+        Some(Extension(p)) => match auth.authorize_roles(&p.roles, &required, true).await {
+            Ok(v) => v,
+            // Policy store unreachable → shed (503), never a silent allow.
+            Err(_) => {
+                return Some(
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authz policy store unreachable; retry shortly\n",
+                    )
+                        .into_response(),
+                );
+            }
+        },
+        None => false,
+    };
+    if authorized {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "not authorized to edit site `{proj}/{site}`'s runtime egress overlay — adding or \
+                     removing a host:port changes an outbound network surface (capability-grade; \
+                     requires HandlerPolicy·Write on `{proj}/{site}/egress`). A pure Site·Write \
+                     (config-edit) right is not sufficient.\n"
+                ),
+            )
+                .into_response(),
+        )
     }
 }
 
@@ -6701,6 +6839,103 @@ pub(super) struct InvalidateRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_overlay_edit_requires_facet_qualified_handler_policy_right() {
+        // PLAN-egress-runtime-authz (#12): editing the overlay requires `HandlerPolicy·Write` on the
+        // MANDATORY-FACET target `<project>/<site>/egress` — the single required-right construction
+        // point. The facet segment must always be present (a facet-less requirement would let a
+        // facet-less grant catch-all).
+        use boatramp_core::authz::{Action, Resource, Right};
+        let required = egress_overlay_edit_right("acme", "web");
+        assert_eq!(required.resource, Resource::HandlerPolicy);
+        assert_eq!(required.action, Action::Write);
+        assert_eq!(required.target.as_deref(), Some("acme/web/egress"));
+
+        // Mandatory-facet / no-catch-all at the ORACLE match layer (the Cedar differential oracle):
+        // a facet-SPECIFIC grant satisfies its facet; a facet-LESS grant satisfies NOTHING; a
+        // DIFFERENT facet does not (no retroactive widening); only a project/global wildcard spans.
+        let facet_grant = Right::new(
+            Resource::HandlerPolicy,
+            Some("acme/web/egress".into()),
+            Action::Write,
+        );
+        assert!(
+            facet_grant.satisfies(&required),
+            "facet-specific grant authorizes its facet"
+        );
+
+        let facetless = Right::new(
+            Resource::HandlerPolicy,
+            Some("acme/web".into()),
+            Action::Write,
+        );
+        assert!(
+            !facetless.satisfies(&required),
+            "a facet-LESS HandlerPolicy grant authorizes NO facet edit (no catch-all)"
+        );
+
+        let other_facet = Right::new(
+            Resource::HandlerPolicy,
+            Some("acme/web/secrets".into()),
+            Action::Write,
+        );
+        assert!(
+            !other_facet.satisfies(&required),
+            "a DIFFERENT facet's grant never widens to egress (future-facet isolation)"
+        );
+
+        // Facet-spanning is the GLOBAL admin grant (target `None`, Admin action) — the one grant that
+        // deliberately spans facets. (A project-wildcard `acme/*` HandlerPolicy grant is NOT a
+        // supported v1 path: `/*` grant targets with `RoleTarget` scope diverge oracle-vs-Cedar for
+        // every resource, so it is never relied on — admin-global is the facet-spanning mechanism.)
+        let global = Right::new(Resource::HandlerPolicy, None, Action::Admin);
+        assert!(
+            global.satisfies(&required),
+            "a global admin grant spans facets"
+        );
+
+        // A HandlerPolicy grant on ANOTHER site never reaches this one (cross-site isolation).
+        let other_site = Right::new(
+            Resource::HandlerPolicy,
+            Some("acme/other/egress".into()),
+            Action::Write,
+        );
+        assert!(
+            !other_site.satisfies(&required),
+            "another site's facet grant does not match"
+        );
+    }
+
+    #[test]
+    fn egress_overlay_change_detection_gates_only_real_edits() {
+        // PLAN-egress-runtime-authz (#12): the facet authz fires on ANY overlay change (add OR
+        // remove) but NOT on a byte-identical re-PUT (so a declarative re-apply by a non-policy
+        // principal still works). Change detection is plain map inequality.
+        use std::collections::BTreeMap;
+        let m = |pairs: &[(&str, &[&str])]| -> BTreeMap<String, Vec<String>> {
+            pairs
+                .iter()
+                .map(|(k, hs)| (k.to_string(), hs.iter().map(ToString::to_string).collect()))
+                .collect()
+        };
+        let a = m(&[("fetch", &["imap.x:993"])]);
+        let a2 = m(&[("fetch", &["imap.x:993"])]);
+        let added = m(&[("fetch", &["imap.x:993", "pop.x:110"])]);
+        let removed = BTreeMap::new();
+        assert!(
+            a == a2,
+            "a byte-identical overlay is NOT a change (no extra authz)"
+        );
+        assert!(
+            a != added,
+            "adding a host IS a change (requires HandlerPolicy·Write)"
+        );
+        assert!(
+            a != removed,
+            "removing all hosts IS a change (requires HandlerPolicy·Write)"
+        );
+    }
 
     #[test]
     fn export_delta_query_parses_and_refuses_bad_combos() {

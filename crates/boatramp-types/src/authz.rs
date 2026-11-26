@@ -97,11 +97,27 @@ pub enum Resource {
     /// matching). Separate from [`Resource::Project`] (the `_boatramp/bus` OPERATOR surface uses
     /// `Project·Admin`): a routine consumer must never hold project-admin.
     Messaging,
+    /// **Runtime-editable handler-policy facets** (PLAN-egress-runtime-authz, #12): the
+    /// control-plane edit of a site's runtime handler policy that opens a capability-grade surface
+    /// but is NOT the full deploy manifest. The target is **facet-qualified and MANDATORY**:
+    /// `"<project>/<site>/<facet>"`, facet ∈ {`egress`} today (`secrets` / `imports` reserved for
+    /// later — NO new `Resource` variant needed). `HandlerPolicy·Write` on `"<project>/<site>/egress"`
+    /// gates editing the per-workload runtime egress overlay (`HandlersSiteConfig.egress_allow`),
+    /// which widens WHICH outbound `host:port`s a handler/consumer may dial — deploy-grade authority
+    /// (it is what the deploy manifest's `egress_allowlist` grants), so a pure `Site·Write` holder
+    /// (e.g. a console editor) must NOT be able to open a network path. **MANDATORY-FACET / no
+    /// catch-all:** a grant must name a specific facet to authorize that facet's edit (exact target
+    /// match); a facet-LESS `HandlerPolicy` grant (`"<project>/<site>"` / `"<project>"`) matches no
+    /// facet requirement, so it authorizes NOTHING; and a FUTURE facet never retroactively widens an
+    /// existing facet-specific grant (a different exact target). The ONLY grant that may span facets
+    /// is a deliberate project (`"<project>/*"`) or global (`None`) wildcard — i.e. `admin`. The
+    /// dial-time `is_global_ip` SSRF floor is unchanged and remains authoritative regardless.
+    HandlerPolicy,
 }
 
 impl Resource {
     /// Every resource variant — used to expand the `admin` role to "all rights".
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Site,
         Self::Project,
         Self::Secrets,
@@ -113,6 +129,7 @@ impl Resource {
         Self::System,
         Self::Overlay,
         Self::Messaging,
+        Self::HandlerPolicy,
     ];
 
     /// The serde term for this resource (matches `rename_all`).
@@ -129,6 +146,7 @@ impl Resource {
             Self::System => "system",
             Self::Overlay => "overlay",
             Self::Messaging => "messaging",
+            Self::HandlerPolicy => "handler_policy",
         }
     }
 }
@@ -1715,7 +1733,16 @@ mod tests {
     /// a required `Some("${PROJECT}")` (self-match) and authorize.
     #[test]
     fn nonconforming_grant_target_matches_nothing() {
-        for bad in ["${PROJECT}", "acme/../evil", "*", "a b", "acme/a/b", "café"] {
+        // NOTE: `acme/a/b` is NO LONGER non-conforming — a 3-segment `<project>/<site>/<facet>` is a
+        // valid facet-qualified target (PLAN-egress-runtime-authz #12). A 4-segment target still is.
+        for bad in [
+            "${PROJECT}",
+            "acme/../evil",
+            "*",
+            "a b",
+            "acme/a/b/c",
+            "café",
+        ] {
             let granted = Right::new(Resource::Site, Some(bad.to_string()), Action::Write);
             // Even a required right naming the exact same string does not match.
             let required_same = Right::new(Resource::Site, Some(bad.to_string()), Action::Write);
@@ -1751,7 +1778,16 @@ mod tests {
     #[test]
     fn conforming_role_target_grammar() {
         use crate::project::is_conforming_role_target;
-        for ok in ["acme", "acme/blog", "acme/*", "a", "a1_b-2/c-3_d"] {
+        // `acme/blog/egress` and the generic `a/b/c` triple are the facet-qualified form (#12).
+        for ok in [
+            "acme",
+            "acme/blog",
+            "acme/*",
+            "a",
+            "a1_b-2/c-3_d",
+            "acme/blog/egress",
+            "acme/a/b",
+        ] {
             assert!(is_conforming_role_target(ok), "{ok:?} should conform");
         }
         for bad in [
@@ -1760,7 +1796,8 @@ mod tests {
             "/blog",
             "acme/",
             "acme//blog",
-            "acme/a/b",
+            "acme/a/b/c",  // four segments ⇒ non-conforming (facet is the deepest level)
+            "acme/blog/*", // a site-wide-all-facets wildcard is NOT allowed (only project/global)
             "acme/../evil",
             "${PROJECT}",
             "{tenant}/blog",

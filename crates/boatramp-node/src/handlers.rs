@@ -234,6 +234,12 @@ pub async fn build_handler_runtime(
     // the `DnsPublishHost` binding fail-closed to `access-denied` for every call. INDEPENDENT of the
     // egress knobs (DNS write is a distinct authority).
     allow_guest_dns_publish: bool,
+    // Posture: whether a guest may SELF-REGISTER its OWN workload's runtime egress overlay through the
+    // `egress-register` capability (PLAN-egress-runtime-authz #12 Surface 2). OFF in every built-in
+    // profile; when off the engine makes the `EgressRegisterHost` binding fail-closed to
+    // `access-denied` for every call. Writes the SAME overlay the control-plane `HandlerPolicy·Write`
+    // PUT edits; host-scoped to the guest's OWN per-workload key.
+    allow_guest_egress_register: bool,
     // Posture: whether a guest may register a RUNTIME, host-sealed, per-tenant DNS-write credential and
     // route writes through it (cap-req #31). OFF under multi-tenant; when off the engine makes every
     // `register`/`unregister` `access-denied` and routes no record to a runtime credential. INDEPENDENT
@@ -529,6 +535,9 @@ pub async fn build_handler_runtime(
     // Posture gate for the guest `dns-publish` write capability (cap-req #24 WS3). OFF by default ⇒
     // fail-closed `access-denied`. INDEPENDENT of the egress knobs.
     .with_dns_publish(allow_guest_dns_publish)
+    // Posture gate for the guest `egress-register` self-register capability (#12 Surface 2). OFF by
+    // default ⇒ fail-closed `access-denied`. Writes the SAME overlay as the control-plane PUT.
+    .with_egress_register(allow_guest_egress_register)
     // Posture gate for the RUNTIME per-tenant DNS-credential path (cap-req #31). OFF under multi-tenant
     // ⇒ every register/route is fail-closed. INDEPENDENT of `with_dns_publish`.
     .with_dynamic_dns_publish(allow_guest_dynamic_dns_publish)
@@ -1108,6 +1117,10 @@ pub async fn build_handler_runtime(
     // (the caller passes the posture value unconditionally); a lean node has no guest `dns-publish` to
     // gate, so it is ignored.
     _allow_guest_dns_publish: bool,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single node.rs caller
+    // (the caller passes the posture value unconditionally); a lean node has no guest `egress-register`
+    // path to gate, so it is ignored (PLAN-egress-runtime-authz #12 Surface 2).
+    _allow_guest_egress_register: bool,
     // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature (cap-req #31); a lean node has
     // no guest `dns-publish` runtime path to gate, so it is ignored.
     _allow_guest_dynamic_dns_publish: bool,

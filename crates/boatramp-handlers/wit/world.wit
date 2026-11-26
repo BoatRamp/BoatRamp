@@ -2138,3 +2138,55 @@ interface dns-publish {
 world dns-publish-host {
   import dns-publish;
 }
+
+/// The host-mediated **egress self-register** capability (`boatramp:handlers/egress-register`,
+/// PLAN-egress-runtime-authz #12, Surface 2). The guest-facing analogue of the control-plane
+/// `HandlerPolicy·Write` edit: a GRANTED, posture-ON guest registers the outbound `host:port`s its OWN
+/// workload may dial, instead of an operator editing the site-config overlay out of band. The GUEST
+/// requests; the HOST applies + gates — no control-plane token ever crosses to the guest.
+///
+/// # Self-scoped, drift-proof (the load-bearing invariant)
+/// The guest passes ONLY the host set — NEVER a workload key. The host scopes the write to THIS
+/// invocation's own per-workload key (the handler/cron `route`, the consumer `topic`, the session's
+/// creating route) — the SAME key its OWN dial's egress-overlay union reads — baked in by the host at
+/// dispatch (`build_bindings`), exactly as the tenant is baked for other capabilities. So a guest can
+/// set ONLY its own workload's egress and can never name (or reach) another workload's overlay.
+///
+/// # Replace-set + fail-closed
+/// `set-egress` is REPLACE-SET: it sets the FULL host set for the workload (the overlay IS the
+/// registered set; re-set self-heals drift; an empty list de-registers). The host validates every
+/// entry's `host:port` grammar AND runs the SSRF floor at REGISTER time (fail loud, mirroring the
+/// webhook-sink register floor); the UNCHANGED dial-time `is_global_ip` floor stays authoritative. The
+/// write persists to the SAME `handlers.egress_allow` site-config overlay the control-plane PUT edits,
+/// so it binds at the NEXT dispatch (a self-register this tick takes effect next invocation).
+interface egress-register {
+  /// Why a `set-egress` was refused. Deliberately coarse — it never reveals another workload's state.
+  variant egress-register-error {
+    /// The node posture `allow_guest_egress_register` is off, or the component was not granted the
+    /// `egress-register` capability. Deny-by-default.
+    access-denied,
+    /// An entry is not a well-formed `host:port` / `ip:port` / `CIDR:port`, or it fails the SSRF floor
+    /// at register (a non-global / internal / metadata / RFC1918 / loopback target). Carries the
+    /// offending entry. Nothing is persisted (all-or-nothing on validation).
+    invalid-entry(string),
+    /// The host could not persist the overlay (a transient control-plane store error). Retryable;
+    /// nothing partial is written.
+    backend(string),
+  }
+
+  /// REPLACE-SET this workload's runtime egress overlay to EXACTLY `hosts` (each `host:port` /
+  /// `ip:port` / `CIDR:port`). The host scopes the write to THIS invocation's own workload key
+  /// (host-forced, never guest-supplied). An empty list de-registers (clears the workload's overlay).
+  /// Fail-closed + all-or-nothing on validation: every entry is grammar- + SSRF-floor-checked BEFORE
+  /// any is persisted, so one bad entry writes NOTHING. Idempotent: re-setting the same set converges.
+  set-egress: func(hosts: list<string>) -> result<_, egress-register-error>;
+}
+
+/// Import-only world for the `egress-register` host binding (the `EgressRegisterHost` Host impl). Off
+/// by default — feature-gated (`egress-register`) and provided ONLY when the node posture
+/// `allow_guest_egress_register` is on AND the component was granted the capability. A guest WIT
+/// addition ⇒ a shim rev + a `HOST_HANDLERS_VERSION` bump (additive: a pinned older guest that does
+/// not import it is unaffected).
+world egress-register-host {
+  import egress-register;
+}

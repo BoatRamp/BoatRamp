@@ -544,6 +544,15 @@ const KNOWN_IMPORTS: &[&str] = &[
     // `allow_guest_dns_publish` (OFF by default) AND a non-empty per-handler `dns_publish_zones`
     // writable-zone allowlist — deny-by-default at every layer. Advertised Experimental.
     "dns-publish",
+    // Host-mediated egress SELF-REGISTER capability (PLAN-egress-runtime-authz #12, Surface 2). A
+    // granted guest REPLACE-SETs the `host:port`s its OWN workload may dial, written to the SAME
+    // `handlers.egress_allow` overlay the control-plane `HandlerPolicy·Write` PUT edits; granting it
+    // here only lets a component DECLARE it. Reaching anything additionally needs the node posture
+    // `allow_guest_egress_register` (OFF by default); the host scopes every write to the guest's OWN
+    // per-workload key (it supplies only the host set, never a key), validates grammar + the SSRF floor
+    // at register, and the dial-time floor stays authoritative — deny-by-default at every layer.
+    // Advertised Experimental.
+    "egress-register",
 ];
 
 /// The import names a deploy may declare in a handler's `imports` (baseline WASI
@@ -771,6 +780,71 @@ pub fn validate_dynamic_egress_hosts(entries: &[String]) -> Result<(), ConfigErr
         validate_dynamic_egress_entry(entry)?;
     }
     Ok(())
+}
+
+/// A conservative hostname lint for a STATIC egress target: non-empty, ≤253 bytes, a trailing FQDN
+/// dot tolerated, each label 1..=63 bytes of `[A-Za-z0-9_-]` (underscore tolerated for internal
+/// SRV-style hosts), no leading/trailing hyphen. It is the "not an IP and not a CIDR" branch of
+/// [`validate_static_egress_entry`]; its purpose is to reject an obvious typo (whitespace, a stray
+/// `/`, an empty label) that would silently never-match at dial — the dial-time gate's SSRF floor +
+/// resolve-then-compare remain the security authority either way.
+fn is_hostlike(target: &str) -> bool {
+    let target = target.strip_suffix('.').unwrap_or(target); // tolerate a trailing FQDN dot
+    if target.is_empty() || target.len() > 253 {
+        return false;
+    }
+    target.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            && label.as_bytes().first() != Some(&b'-')
+            && label.as_bytes().last() != Some(&b'-')
+    })
+}
+
+/// Validate ONE runtime egress-overlay (and static `egress_allowlist`-grammar) entry's
+/// `host:port` / `ip:port` / `CIDR:port` syntax (PLAN-egress-runtime-authz #12), so a typo fails
+/// LOUD at the control-plane PUT instead of silently never-matching at dial. The grammar is the SAME
+/// one the static matcher `boatramp-handlers::engine::tcp_egress_allowed` consumes: split the
+/// REQUIRED trailing `:<port>` on the LAST colon (so an IPv6 literal/CIDR keeps its inner colons),
+/// require a numeric 1..=65535 port, and accept a target that is an IP literal, a CIDR, or a
+/// syntactically plausible hostname. (Re-stated here rather than shared with the engine because
+/// `boatramp-handlers` does not depend on `boatramp-types`; the two agree on the parse — a divergence
+/// would show as a lint accepting an entry the matcher silently drops.) This is a SYNTAX lint only —
+/// it never decides reachability: a globally-unroutable/internal target (`169.254.169.254:80`,
+/// `10.0.0.0/8:5432`, `127.0.0.1:993`) is valid SYNTAX yet is still REFUSED at dial by the unchanged
+/// `is_global_ip` SSRF floor (unless the separate node private-egress posture is on).
+pub fn validate_static_egress_entry(entry: &str) -> Result<(), ConfigError> {
+    let bad = |why: &str| {
+        ConfigError::parse(format!(
+            "egress entry {entry:?} is malformed ({why}); each entry is `<host|ip|cidr>:<port>`, \
+             e.g. `imap.example.com:993`, `93.184.216.34:443`, or `10.0.0.0/8:5432`"
+        ))
+    };
+    // Split the REQUIRED trailing `:<port>` on the LAST colon (same as the matcher).
+    let Some((target, port_s)) = entry.rsplit_once(':') else {
+        return Err(bad("missing the required `:<port>`"));
+    };
+    match port_s.trim().parse::<u16>() {
+        Ok(p) if p != 0 => {}
+        _ => return Err(bad("the port must be a number in 1..=65535")),
+    }
+    // Tolerate brackets on an IPv6 literal target (`[2001:db8::1]`), exactly as the matcher does.
+    let target = target.trim().trim_start_matches('[').trim_end_matches(']');
+    if target.is_empty() {
+        return Err(bad("the host/ip/cidr target is empty"));
+    }
+    // An IP literal or a CIDR block is accepted verbatim (the matcher compares the resolved peer IP /
+    // CIDR membership); otherwise it must be a plausible hostname (resolve-then-compare at dial).
+    if target.parse::<std::net::IpAddr>().is_ok()
+        || target.parse::<ipnet::IpNet>().is_ok()
+        || is_hostlike(target)
+    {
+        return Ok(());
+    }
+    Err(bad("the target is not a valid IP, CIDR, or hostname"))
 }
 
 /// The canonical standard HTTP verbs. Each is also a valid RFC 7230 `token`; they are
@@ -2243,8 +2317,16 @@ impl CompressionConfig {
 /// Site-scoped handler policy: the capability allowlist and resource caps that
 /// a deployment's requested handler config is intersected against at
 /// activation (deny by default).
+///
+/// `#[non_exhaustive]`: construct via [`HandlersSiteConfig::builder`] + the builder's setters (or,
+/// in-crate, `HandlersSiteConfig::default()` + field assignment) so a future field add stays
+/// non-breaking for downstream crates (the sibling [`StreamConfig`] / [`crate::compute::ComputeSpec`]
+/// follow the same contract). v0.75.0 added the runtime egress overlay (`egress_allow`); sealing this
+/// long-published struct is itself breaking (forbids cross-crate struct literals even with
+/// `..Default`), landed with the builder + the construction-site migration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct HandlersSiteConfig {
     /// Whether handlers run for this site at all.
     pub enabled: bool,
@@ -2338,6 +2420,216 @@ pub struct HandlersSiteConfig {
     /// site-level decision rather than route-by-route sprinkling.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_ceiling_exceptions: bool,
+    /// **Runtime-editable, operator-managed per-workload egress overlay** (PLAN-egress-runtime-authz,
+    /// roadmap #12). The `handlers.secrets` analog for outbound TCP: a per-workload set of ADDITIONAL
+    /// static `host:port` / `ip:port` / `CIDR:port` targets — the SAME grammar as
+    /// [`HandlerConfig::egress_allowlist`] — that are **unioned** onto that workload's deploy-time
+    /// `egress_allowlist` at dispatch, so a per-customer host known only at RUNTIME
+    /// (`imap.gstruct.com:993`) can be reached without a redeploy. The map key is the workload's
+    /// dispatch identity: a handler's (or cron-routed handler's) `route`, or a consumer's `topic`;
+    /// only the named workload gets the extra hosts (least-privilege parity with the per-handler
+    /// deploy field). Set via the authenticated control-plane `PUT /api/sites/{site}/config` — the
+    /// SAME path that edits `secrets` — so it is **host-authoritative, NEVER guest-supplied at dial**.
+    ///
+    /// **Additive-only / reach-not-authority.** The overlay only widens WHICH global `host:port`s an
+    /// already-granted, posture-ON workload may reach. It does NOT grant `wasi:sockets`, does NOT flip
+    /// the node posture, and does NOT relax the dial-time gate: every entry still passes the UNCHANGED
+    /// [`crate::access::is_global_ip`] SSRF floor + the resolve-then-compare-peer static matcher +
+    /// the DNS-rebind pin at dial, so an internal/metadata/RFC1918/loopback entry is still refused.
+    /// **Empty ⇒ no overlay** (byte-identical to the deploy allowlists alone; deny-all if those are
+    /// also empty — the union of two empty allowlists is empty). The matched entries feed only the
+    /// STATIC matcher, consulted on BOTH `connect-tls` AND `connect-plaintext` (so plaintext POP3 and
+    /// IMAPS are both covered); the dynamic/glob runtime-host path is unchanged (TLS-only, deploy-set).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub egress_allow: BTreeMap<String, Vec<String>>,
+}
+
+impl HandlersSiteConfig {
+    /// Start building a site handler policy. Every field defaults (handlers off, no caps, empty
+    /// allowlists/overlays) and is set with the returned [`HandlersSiteConfigBuilder`]'s methods.
+    /// This is the supported construction path now that `HandlersSiteConfig` is `#[non_exhaustive]`:
+    /// a downstream crate cannot use a struct literal (so a later field add stays non-breaking), and
+    /// in-crate code may still use `Default::default()` + field assignment.
+    ///
+    /// ```
+    /// use boatramp_types::config::HandlersSiteConfig;
+    ///
+    /// let cfg = HandlersSiteConfig::builder()
+    ///     .enabled(true)
+    ///     .allow_imports(vec!["wasi:keyvalue".into()])
+    ///     .build();
+    /// assert!(cfg.enabled);
+    /// assert!(cfg.egress_allow.is_empty());
+    /// ```
+    #[must_use]
+    pub fn builder() -> HandlersSiteConfigBuilder {
+        HandlersSiteConfigBuilder {
+            inner: Self::default(),
+        }
+    }
+
+    /// The EFFECTIVE static outbound-TCP allowlist for one workload: the deploy-time slice
+    /// (`deploy`) unioned with the runtime-editable overlay registered for `workload`
+    /// ([`Self::egress_allow`], PLAN-egress-runtime-authz #12). The union is the ONLY sound merge of
+    /// two allowlists — it preserves `empty ⇒ deny-all` (the union of two empties is empty) and is
+    /// strictly additive: it widens WHICH `host:port`s are reachable, never relaxes the dial-time gate
+    /// or the SSRF floor (the caller feeds the result to the UNCHANGED `resolve_and_gate_tcp_egress`).
+    ///
+    /// Host-authoritative: both inputs are control-plane config (the deploy manifest and the
+    /// authenticated site-config PUT) — never guest-supplied. **Absent or empty overlay ⇒ the deploy
+    /// slice verbatim** (byte-identical to pre-overlay behavior; the dispatch attach guard
+    /// `!allowlist.is_empty()` is unchanged). Deploy entries are preserved in order; overlay entries
+    /// not already present are appended (a duplicate is a harmless no-op the matcher dedups anyway).
+    #[must_use]
+    pub fn effective_egress_allowlist(&self, workload: &str, deploy: &[String]) -> Vec<String> {
+        let Some(extra) = self.egress_allow.get(workload).filter(|e| !e.is_empty()) else {
+            // No overlay for this workload ⇒ no change (byte-identical to the deploy slice).
+            return deploy.to_vec();
+        };
+        let mut effective = deploy.to_vec();
+        for host in extra {
+            if !effective.iter().any(|e| e == host) {
+                effective.push(host.clone());
+            }
+        }
+        effective
+    }
+
+    /// Validate every entry of the runtime egress overlay ([`Self::egress_allow`]) at the PUT
+    /// chokepoint, fail-closed-loud (PLAN-egress-runtime-authz #12, the `WebhookSink::validate`
+    /// discipline): a malformed `host:port` is a loud rejection, never a silently-stored
+    /// never-match. Each entry uses the SAME `host|ip|cidr:port` grammar the static matcher
+    /// (`boatramp-handlers::engine::tcp_egress_allowed`) consumes.
+    pub fn validate_egress_overlay(&self) -> Result<(), ConfigError> {
+        for (workload, hosts) in &self.egress_allow {
+            for entry in hosts {
+                if let Err(e) = validate_static_egress_entry(entry) {
+                    return Err(ConfigError::parse(format!(
+                        "handlers.egress_allow[{workload:?}]: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Fluent builder for a [`HandlersSiteConfig`] (`HandlersSiteConfig::builder()`). Every field has a
+/// setter and otherwise keeps its documented default; `build()` yields the config. The ergonomic
+/// construction path for downstream crates now that [`HandlersSiteConfig`] is `#[non_exhaustive]`.
+#[derive(Debug, Clone)]
+pub struct HandlersSiteConfigBuilder {
+    inner: HandlersSiteConfig,
+}
+
+impl HandlersSiteConfigBuilder {
+    /// Whether handlers run for this site at all.
+    #[must_use]
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.inner.enabled = enabled;
+        self
+    }
+    /// Interfaces handlers on this site may import (subset of `KNOWN_IMPORTS`).
+    #[must_use]
+    pub fn allow_imports(mut self, allow_imports: Vec<String>) -> Self {
+        self.inner.allow_imports = allow_imports;
+        self
+    }
+    /// Cap on per-handler memory (MiB).
+    #[must_use]
+    pub fn max_memory_mb(mut self, max_memory_mb: Option<u32>) -> Self {
+        self.inner.max_memory_mb = max_memory_mb;
+        self
+    }
+    /// Cap on per-handler timeout (ms).
+    #[must_use]
+    pub fn max_timeout_ms(mut self, max_timeout_ms: Option<u32>) -> Self {
+        self.inner.max_timeout_ms = max_timeout_ms;
+        self
+    }
+    /// Cap on concurrent invocations for the site.
+    #[must_use]
+    pub fn max_concurrency(mut self, max_concurrency: Option<u32>) -> Self {
+        self.inner.max_concurrency = max_concurrency;
+        self
+    }
+    /// Cap on per-handler CPU fuel.
+    #[must_use]
+    pub fn max_fuel(mut self, max_fuel: Option<u64>) -> Self {
+        self.inner.max_fuel = max_fuel;
+        self
+    }
+    /// Env-var name → secret reference, injected at instantiation.
+    #[must_use]
+    pub fn secrets(mut self, secrets: BTreeMap<String, String>) -> Self {
+        self.inner.secrets = secrets;
+        self
+    }
+    /// Named aliases (besides the live deployment) that also run background work.
+    #[must_use]
+    pub fn background_aliases(mut self, background_aliases: Vec<String>) -> Self {
+        self.inner.background_aliases = background_aliases;
+        self
+    }
+    /// Cap on concurrent SSE stream connections for the site.
+    #[must_use]
+    pub fn max_stream_connections(mut self, max_stream_connections: Option<u32>) -> Self {
+        self.inner.max_stream_connections = max_stream_connections;
+        self
+    }
+    /// Cap on captured guest log lines per second for the site.
+    #[must_use]
+    pub fn max_log_rate(mut self, max_log_rate: Option<u32>) -> Self {
+        self.inner.max_log_rate = max_log_rate;
+        self
+    }
+    /// Opt OUT of capturing the site's guest `stdout`/`stderr` + `wasi:logging`.
+    #[must_use]
+    pub fn disable_log_capture(mut self, disable_log_capture: bool) -> Self {
+        self.inner.disable_log_capture = disable_log_capture;
+        self
+    }
+    /// Edge response cache config.
+    #[must_use]
+    pub fn cache(mut self, cache: Option<HandlerCacheConfig>) -> Self {
+        self.inner.cache = cache;
+        self
+    }
+    /// GraphQL edge query-guard config.
+    #[must_use]
+    pub fn graphql(mut self, graphql: Option<HandlerGraphqlConfig>) -> Self {
+        self.inner.graphql = graphql;
+        self
+    }
+    /// Browser cookie session auth config.
+    #[must_use]
+    pub fn cookie_auth(mut self, cookie_auth: Option<CookieAuthConfig>) -> Self {
+        self.inner.cookie_auth = cookie_auth;
+        self
+    }
+    /// Site-level in-site tenancy ceiling (Dimension 0).
+    #[must_use]
+    pub fn tenancy(mut self, tenancy: Option<crate::tenancy::Tenancy>) -> Self {
+        self.inner.tenancy = tenancy;
+        self
+    }
+    /// Site-level enablement of per-route ceiling exceptions (task #470).
+    #[must_use]
+    pub fn allow_ceiling_exceptions(mut self, allow_ceiling_exceptions: bool) -> Self {
+        self.inner.allow_ceiling_exceptions = allow_ceiling_exceptions;
+        self
+    }
+    /// Runtime-editable per-workload egress overlay (PLAN-egress-runtime-authz #12).
+    #[must_use]
+    pub fn egress_allow(mut self, egress_allow: BTreeMap<String, Vec<String>>) -> Self {
+        self.inner.egress_allow = egress_allow;
+        self
+    }
+    /// Finish building the [`HandlersSiteConfig`].
+    #[must_use]
+    pub fn build(self) -> HandlersSiteConfig {
+        self.inner
+    }
 }
 
 /// Browser cookie session auth for a site (see [`HandlersSiteConfig::cookie_auth`]). boatramp
@@ -3512,6 +3804,146 @@ mod tests {
             .is_err(),
             "a malformed session dynamic_egress_hosts entry must fail the lint"
         );
+    }
+
+    #[test]
+    fn runtime_egress_overlay_union_validation_and_lifecycle() {
+        // PLAN-egress-runtime-authz (#12): the runtime-editable per-workload egress overlay on
+        // `HandlersSiteConfig` — union semantics, grammar validation, per-workload + cross-site
+        // isolation, and the mailroom replace-set register/de-register lifecycle.
+        use std::collections::BTreeMap;
+        let deploy = vec!["db.internal:5432".to_string()];
+
+        // (d) EMPTY overlay ⇒ byte-identical to the deploy slice (no change — invariant d).
+        let bare = HandlersSiteConfig::default();
+        assert_eq!(
+            bare.effective_egress_allowlist("fetch", &deploy),
+            deploy,
+            "an absent overlay must leave the deploy allowlist byte-identical"
+        );
+        assert!(
+            bare.effective_egress_allowlist("fetch", &[]).is_empty(),
+            "empty deploy + empty overlay ⇒ empty (deny-all preserved)"
+        );
+
+        // (1) REGISTER: add a runtime host:port for the `fetch` workload ⇒ unioned onto the deploy
+        // slice; a DIFFERENT workload on the SAME site is unaffected (per-workload isolation, inv e).
+        let mut site_a = HandlersSiteConfig::default();
+        site_a.egress_allow.insert(
+            "fetch".to_string(),
+            vec!["imap.gstruct.com:993".to_string()],
+        );
+        let eff = site_a.effective_egress_allowlist("fetch", &deploy);
+        assert!(
+            eff.contains(&"db.internal:5432".to_string()),
+            "deploy entry preserved"
+        );
+        assert!(
+            eff.contains(&"imap.gstruct.com:993".to_string()),
+            "overlay host unioned in"
+        );
+        assert_eq!(
+            site_a.effective_egress_allowlist("other", &deploy),
+            deploy,
+            "a workload with no overlay key is unaffected (per-workload least-privilege)"
+        );
+
+        // Idempotent register: re-registering a host already present ⇒ no duplicate (dedup).
+        let eff2 =
+            site_a.effective_egress_allowlist("fetch", &["imap.gstruct.com:993".to_string()]);
+        assert_eq!(
+            eff2.iter().filter(|e| *e == "imap.gstruct.com:993").count(),
+            1,
+            "a host present in BOTH deploy and overlay appears once (dedup, idempotent)"
+        );
+
+        // (e) CROSS-SITE isolation: a SEPARATE site's config holds no overlay for `fetch`, so site
+        // A's overlay never leaks into site B's effective egress.
+        let site_b = HandlersSiteConfig::default();
+        assert!(
+            !site_b
+                .effective_egress_allowlist("fetch", &deploy)
+                .contains(&"imap.gstruct.com:993".to_string()),
+            "one site's overlay must not leak into another site's egress"
+        );
+
+        // (7) DE-REGISTER via REPLACE-SET: a PUT that omits the host (the overlay IS the registered
+        // set) ⇒ it is gone from the effective list; a PUT removing the whole key likewise.
+        let mut narrowed = site_a.clone();
+        narrowed
+            .egress_allow
+            .insert("fetch".to_string(), Vec::new());
+        assert!(
+            !narrowed
+                .effective_egress_allowlist("fetch", &deploy)
+                .contains(&"imap.gstruct.com:993".to_string()),
+            "a replace-set to the empty set de-registers the host"
+        );
+        narrowed.egress_allow.remove("fetch");
+        assert_eq!(
+            narrowed.effective_egress_allowlist("fetch", &deploy),
+            deploy,
+            "removing the whole key self-heals to the deploy slice"
+        );
+
+        // VALIDATION: valid host/ip/cidr entries accepted; an internal/metadata entry is valid
+        // SYNTAX (the SSRF floor refuses it at dial, not here); malformed shapes are a LOUD error.
+        for good in [
+            "imap.gstruct.com:993",
+            "93.184.216.34:443",
+            "10.0.0.0/8:5432",
+            "[2001:db8::1]:993",
+            "169.254.169.254:80", // valid syntax; refused at dial by the SSRF floor
+            "pop.example.com.:110",
+        ] {
+            validate_static_egress_entry(good)
+                .unwrap_or_else(|e| panic!("{good:?} must be valid syntax: {e}"));
+        }
+        for bad in [
+            "no-port-here",
+            "host:0",
+            "host:70000",
+            ":443",
+            "has space:443",
+            "/8:5432",
+        ] {
+            assert!(
+                validate_static_egress_entry(bad).is_err(),
+                "{bad:?} must be rejected as malformed"
+            );
+        }
+        // The whole-overlay validator surfaces the offending workload + reason, fail-closed.
+        let mut malformed = HandlersSiteConfig::default();
+        malformed
+            .egress_allow
+            .insert("fetch".to_string(), vec!["no-port".to_string()]);
+        assert!(
+            malformed.validate_egress_overlay().is_err(),
+            "a malformed overlay entry must fail validation (not silently stored)"
+        );
+        let mut clean = HandlersSiteConfig::default();
+        clean.egress_allow.insert(
+            "fetch".to_string(),
+            vec!["imap.gstruct.com:993".to_string()],
+        );
+        clean
+            .validate_egress_overlay()
+            .expect("a well-formed overlay validates");
+
+        // SERDE: the overlay round-trips; an empty overlay is omitted (non-breaking default).
+        let json = serde_json::to_string(&clean).unwrap();
+        assert!(
+            json.contains("egress_allow"),
+            "non-empty overlay serializes"
+        );
+        let back: HandlersSiteConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.egress_allow, clean.egress_allow);
+        let empty_json = serde_json::to_string(&HandlersSiteConfig::default()).unwrap();
+        assert!(
+            !empty_json.contains("egress_allow"),
+            "an empty overlay is skipped (byte-identical to pre-overlay configs)"
+        );
+        let _ = BTreeMap::<String, Vec<String>>::new();
     }
 
     #[test]

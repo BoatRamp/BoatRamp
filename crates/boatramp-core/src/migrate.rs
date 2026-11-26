@@ -2880,10 +2880,11 @@ mod tests {
     /// Seed a DEFAULT-project site `site` (the colliding resource) with a stored `SiteConfig`: its
     /// handler-capability ceiling is `handlers` (`None` ⇒ handlers disabled). Backs feature-A tests.
     async fn seed_default_site_config(kv: &MemoryKv, site: &str, handlers: Option<&[&str]>) {
-        let hcfg = handlers.map(|imports| crate::config::HandlersSiteConfig {
-            enabled: true,
-            allow_imports: imports.iter().copied().map(String::from).collect(),
-            ..Default::default()
+        let hcfg = handlers.map(|imports| {
+            crate::config::HandlersSiteConfig::builder()
+                .enabled(true)
+                .allow_imports(imports.iter().copied().map(String::from).collect())
+                .build()
         });
         let cfg = crate::config::SiteConfig {
             handlers: hcfg,

@@ -610,8 +610,14 @@ pub(super) async fn dispatch_session_post(
     // plain `..Default::default()` would silently drop both into deny-all — the no-op this wiring
     // resolves. `session_egress_fields` carries them through, and its MUTATION seam (`drop_session_egress`,
     // test/gate only) re-introduces the drop so the CI gate proves this threading is load-bearing.
+    // PLAN-egress-runtime-authz (#12): a session inherits its creating route's runtime egress overlay —
+    // UNION it (keyed by `session.route`, set via the authenticated site-config PUT, host-authoritative)
+    // onto the session's deploy-time static allowlist before the UNCHANGED dial-time gate. Additive-only;
+    // empty overlay ⇒ byte-identical. (The dynamic/runtime-host path stays deploy-set, TLS-only.)
+    let session_static_egress =
+        site_handlers.effective_egress_allowlist(&session.route, &session.egress_allowlist);
     let (egress_allowlist, dynamic_egress_hosts) =
-        session_egress_fields(&session.egress_allowlist, &session.dynamic_egress_hosts);
+        session_egress_fields(&session_static_egress, &session.dynamic_egress_hosts);
     let fn_config = boatramp_core::function::FunctionConfig {
         imports: session.imports.clone(),
         limits: session.limits.clone(),
@@ -664,6 +670,19 @@ pub(super) async fn dispatch_session_post(
             return handler_unavailable();
         }
     };
+    // PLAN-egress-runtime-authz (#12, Surface 2): a session inherits its creating route's
+    // `egress-register` grant, BAKED to `session.route` — the SAME per-workload key
+    // `session_static_egress` above unioned (one source ⇒ no drift). Parity with the handler lane.
+    #[cfg(feature = "egress-register")]
+    let bindings = crate::egress_register::maybe_attach(
+        bindings,
+        inner,
+        project_ref,
+        site,
+        &session.route,
+        &session.imports,
+        &site_handlers.allow_imports,
+    );
 
     // The component `.wasm` is a content-addressed blob in the deployment.
     let Some(entry) = manifest.files.get(&session.component) else {

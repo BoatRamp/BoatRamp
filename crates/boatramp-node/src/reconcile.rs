@@ -1212,11 +1212,12 @@ mod tests {
         };
         f(&mut gql);
         let site_config = SiteConfig {
-            handlers: Some(boatramp_core::config::HandlersSiteConfig {
-                enabled: true,
-                graphql: Some(gql),
-                ..Default::default()
-            }),
+            handlers: Some(
+                boatramp_core::config::HandlersSiteConfig::builder()
+                    .enabled(true)
+                    .graphql(Some(gql))
+                    .build(),
+            ),
             ..Default::default()
         };
         ApplySite {

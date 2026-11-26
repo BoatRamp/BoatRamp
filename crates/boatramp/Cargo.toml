@@ -77,6 +77,7 @@ default = [
   "tcp-listener",
   "tcp-egress",
   "dns-publish",
+  "egress-register",
   "cluster",
   "operator",
   "k8s-backend",
@@ -320,6 +321,12 @@ tcp-egress = ["handlers", "boatramp-server/tcp-egress"]
 # `allow_guest_dns_publish` is off by default AND a per-handler `dns_publish_zones` allowlist + an
 # installed provider source are required), so compiling it in grants nothing by itself.
 dns-publish = ["handlers", "boatramp-server/dns-publish"]
+# Host-mediated guest egress self-register (`boatramp:handlers/egress-register`, PLAN-egress-runtime-authz
+# #12, Surface 2): forwards to the server `egress-register` wiring + host binding. Experimental;
+# batteries-included in the default build (runtime-opt-in via the OFF-by-default posture
+# `allow_guest_egress_register` + a declared `egress-register` import), so compiling it in enables it
+# for no one by itself. Writes the SAME overlay the control-plane `HandlerPolicy·Write` PUT edits.
+egress-register = ["handlers", "boatramp-server/egress-register"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /
 # RaftMessaging serving facades. Pulls boatramp-cluster +

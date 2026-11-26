@@ -113,11 +113,12 @@ async fn live_app() -> (axum::Router, Arc<LogMessaging>) {
             ProjectRef::DEFAULT,
             SITE,
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec![],
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .allow_imports(vec![])
+                        .build(),
+                ),
                 // Compression ON (min_size 0) so the gRPC-web case actively exercises the host
                 // residual's never-compress-a-framed-body guard on the fan-out path.
                 compression: CompressionConfig {

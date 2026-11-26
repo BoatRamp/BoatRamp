@@ -122,10 +122,7 @@ async fn live_runtime_with_posture(
             ProjectRef::DEFAULT,
             SITE,
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    ..Default::default()
-                }),
+                handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                 ..Default::default()
             },
         )
@@ -1045,10 +1042,7 @@ async fn live_runtime_egress(
             ProjectRef::DEFAULT,
             SITE,
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    ..Default::default()
-                }),
+                handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                 ..Default::default()
             },
         )

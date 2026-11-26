@@ -329,6 +329,12 @@ pub mod dns_resolve;
 /// (mailroom cap-req #21 residual). ALWAYS compiled (the config rides in `[handlers]`, parsed in every
 /// build); the `tcp-egress` resolver consults it. OFF by default — absent ⇒ the system resolver.
 pub mod dns_resolve_override;
+/// The server-side wiring seam for the guest `egress-register` self-register capability
+/// (PLAN-egress-runtime-authz #12, Surface 2): the concrete deploy-store-backed writer (validate +
+/// lock-atomic overlay RMW) + `maybe_attach`, which bakes this invocation's OWN per-workload key.
+/// Fail-closed by default (ungranted / no deploy store ⇒ no binding ⇒ `access-denied`).
+#[cfg(feature = "egress-register")]
+pub mod egress_register;
 #[cfg(feature = "handlers")]
 mod function_runtime;
 /// The server-side owner-gated schema-migration orchestrator (function/sql/extension steps over the
@@ -4995,9 +5001,9 @@ mod tests {
 
         let deploy_env = std::collections::BTreeMap::new();
         // One shared 2-entry pool for BOTH guests on the site.
-        let site_handlers = HandlersSiteConfig {
-            enabled: true,
-            secrets: std::collections::BTreeMap::from([
+        let site_handlers = HandlersSiteConfig::builder()
+            .enabled(true)
+            .secrets(std::collections::BTreeMap::from([
                 (
                     "SECRET_A".to_string(),
                     "env:BOATRAMP_TEST_ALLOWLIST_A".to_string(),
@@ -5006,9 +5012,8 @@ mod tests {
                     "SECRET_B".to_string(),
                     "env:BOATRAMP_TEST_ALLOWLIST_B".to_string(),
                 ),
-            ]),
-            ..Default::default()
-        };
+            ]))
+            .build();
 
         // Guest A: allowlist grants ONLY SECRET_A → SECRET_B must be filtered out.
         let a = resolve_env(
@@ -5064,9 +5069,9 @@ mod tests {
             ("GREETING".to_string(), "hi".to_string()),
             ("OVERRIDE_ME".to_string(), "static".to_string()),
         ]);
-        let site_handlers = HandlersSiteConfig {
-            enabled: true,
-            secrets: std::collections::BTreeMap::from([
+        let site_handlers = HandlersSiteConfig::builder()
+            .enabled(true)
+            .secrets(std::collections::BTreeMap::from([
                 // guest var <- host env var holding the value
                 (
                     "SECRET_TOKEN".to_string(),
@@ -5080,9 +5085,8 @@ mod tests {
                     "MISSING".to_string(),
                     "BOATRAMP_TEST_NOT_SET_VAR".to_string(),
                 ),
-            ]),
-            ..Default::default()
-        };
+            ]))
+            .build();
         // Single-tenant / dev: host-env secret refs are permitted (the operator
         // authors the site config), so this resolves exactly as before.
         let env = resolve_env(
@@ -5121,14 +5125,13 @@ mod tests {
         let env_source =
             boatramp_core::env::MapEnv::new().with("BOATRAMP_TEST_OTHER_TENANT_SECRET", "leak-me");
         let deploy_env = std::collections::BTreeMap::new();
-        let bare = HandlersSiteConfig {
-            enabled: true,
-            secrets: std::collections::BTreeMap::from([(
+        let bare = HandlersSiteConfig::builder()
+            .enabled(true)
+            .secrets(std::collections::BTreeMap::from([(
                 "STOLEN".to_string(),
                 "BOATRAMP_TEST_OTHER_TENANT_SECRET".to_string(),
-            )]),
-            ..Default::default()
-        };
+            )]))
+            .build();
         let err = resolve_env(
             "evil",
             boatramp_core::project::ProjectRef::DEFAULT,
@@ -5155,14 +5158,13 @@ mod tests {
         );
 
         // The explicit `env:` scheme is refused identically.
-        let explicit = HandlersSiteConfig {
-            enabled: true,
-            secrets: std::collections::BTreeMap::from([(
+        let explicit = HandlersSiteConfig::builder()
+            .enabled(true)
+            .secrets(std::collections::BTreeMap::from([(
                 "STOLEN".to_string(),
                 "env:BOATRAMP_TEST_OTHER_TENANT_SECRET".to_string(),
-            )]),
-            ..Default::default()
-        };
+            )]))
+            .build();
         assert!(
             resolve_env(
                 "evil",
@@ -5179,14 +5181,13 @@ mod tests {
         );
 
         // A reserved-but-unimplemented scheme is also refused (no silent fall-through).
-        let reserved = HandlersSiteConfig {
-            enabled: true,
-            secrets: std::collections::BTreeMap::from([(
+        let reserved = HandlersSiteConfig::builder()
+            .enabled(true)
+            .secrets(std::collections::BTreeMap::from([(
                 "TOKEN".to_string(),
                 "vault:kv/data/app#token".to_string(),
-            )]),
-            ..Default::default()
-        };
+            )]))
+            .build();
         let err = resolve_env(
             "evil",
             boatramp_core::project::ProjectRef::DEFAULT,
@@ -5204,14 +5205,13 @@ mod tests {
         // The rule is provider-neutral: ANY value with a colon is a scheme, so an
         // un-enumerated one (a cloud secret manager) is refused too — never misread
         // as a bare host var literally named "aws:sm/prod/apikey".
-        let arbitrary = HandlersSiteConfig {
-            enabled: true,
-            secrets: std::collections::BTreeMap::from([(
+        let arbitrary = HandlersSiteConfig::builder()
+            .enabled(true)
+            .secrets(std::collections::BTreeMap::from([(
                 "KEY".to_string(),
                 "aws:sm/prod/apikey".to_string(),
-            )]),
-            ..Default::default()
-        };
+            )]))
+            .build();
         let err = resolve_env(
             "evil",
             boatramp_core::project::ProjectRef::DEFAULT,
@@ -6105,11 +6105,12 @@ mod tests {
                 ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        allow_imports: vec!["wasi:keyvalue".into()],
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .allow_imports(vec!["wasi:keyvalue".into()])
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -6274,11 +6275,12 @@ mod tests {
                 ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        allow_imports: vec!["wasi:keyvalue".into()],
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .allow_imports(vec!["wasi:keyvalue".into()])
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -6721,11 +6723,12 @@ mod tests {
                 ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        allow_imports: vec!["wasi:keyvalue".into()],
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .allow_imports(vec!["wasi:keyvalue".into()])
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -9264,11 +9267,12 @@ mod tests {
                 ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        allow_imports: vec!["wasi:keyvalue".into()],
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .allow_imports(vec!["wasi:keyvalue".into()])
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -9456,11 +9460,12 @@ mod tests {
                 ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        allow_imports: vec!["wasi:keyvalue".into()],
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .allow_imports(vec!["wasi:keyvalue".into()])
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -9568,12 +9573,15 @@ mod tests {
         // The site exposes the default + two named databases — the ceiling. It declares tenancy
         // Disabled (this test is about named-sql dispatch, not tenancy) so the fail-closed
         // default posture (require a declaration) admits it.
-        let site = HandlersSiteConfig {
-            enabled: true,
-            allow_imports: vec!["sql".into(), "sql:product".into(), "sql:privileged".into()],
-            tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
-            ..Default::default()
-        };
+        let site = HandlersSiteConfig::builder()
+            .enabled(true)
+            .allow_imports(vec![
+                "sql".into(),
+                "sql:product".into(),
+                "sql:privileged".into(),
+            ])
+            .tenancy(Some(boatramp_core::tenancy::Tenancy::Disabled))
+            .build();
         let env = std::collections::BTreeMap::new();
         let build = |imports: &[&str]| {
             let imports: Vec<String> = imports.iter().copied().map(String::from).collect();
@@ -9729,12 +9737,11 @@ mod tests {
             let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
             let rt = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
             let inner = rt.inner.as_ref().unwrap();
-            let site = HandlersSiteConfig {
-                enabled: true,
-                allow_imports: vec!["sql".into()],
-                tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
-                ..Default::default()
-            };
+            let site = HandlersSiteConfig::builder()
+                .enabled(true)
+                .allow_imports(vec!["sql".into()])
+                .tenancy(Some(boatramp_core::tenancy::Tenancy::Disabled))
+                .build();
             let imports = vec!["sql".to_string()];
             let env = std::collections::BTreeMap::new();
             let r = build_bindings(
@@ -9920,12 +9927,10 @@ mod tests {
             unscoped_writes: Vec::new(),
             on_unresolved: boatramp_core::tenancy::OnUnresolved::Deny,
         };
-        let site = HandlersSiteConfig {
-            enabled: true,
-            allow_imports: vec!["sql".into()],
-            // No site-level tenancy ceiling; the per-consumer decision is the whole story here.
-            ..Default::default()
-        };
+        let site = HandlersSiteConfig::builder()
+            .enabled(true)
+            .allow_imports(vec!["sql".into()])
+            .build();
         let imports = vec!["sql".to_string()];
         let rebuild = ConsumerRebuild {
             inner,

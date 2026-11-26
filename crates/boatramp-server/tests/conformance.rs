@@ -1985,24 +1985,27 @@ async fn handler_route_dispatches_through_engine() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec!["wasi:keyvalue".to_string()],
-                    max_memory_mb: None,
-                    max_timeout_ms: None,
-                    max_concurrency: None,
-                    max_fuel: None,
-                    secrets: BTreeMap::new(),
-                    background_aliases: Vec::new(),
-                    max_stream_connections: None,
-                    max_log_rate: None,
-                    disable_log_capture: false,
-                    cache: None,
-                    graphql: None,
-                    cookie_auth: None,
-                    tenancy: None,
-                    allow_ceiling_exceptions: false,
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .egress_allow(BTreeMap::new())
+                        .enabled(true)
+                        .allow_imports(vec!["wasi:keyvalue".to_string()])
+                        .max_memory_mb(None)
+                        .max_timeout_ms(None)
+                        .max_concurrency(None)
+                        .max_fuel(None)
+                        .secrets(BTreeMap::new())
+                        .background_aliases(Vec::new())
+                        .max_stream_connections(None)
+                        .max_log_rate(None)
+                        .disable_log_capture(false)
+                        .cache(None)
+                        .graphql(None)
+                        .cookie_auth(None)
+                        .tenancy(None)
+                        .allow_ceiling_exceptions(false)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -2151,11 +2154,12 @@ async fn perf_host_await_overlap_repro() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec!["wasi:keyvalue".to_string()],
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .allow_imports(vec!["wasi:keyvalue".to_string()])
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -2377,11 +2381,12 @@ async fn serve_admission_gate_bounds_concurrency() {
                 ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        allow_imports: vec!["wasi:keyvalue".to_string()],
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .allow_imports(vec!["wasi:keyvalue".to_string()])
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -2601,13 +2606,12 @@ async fn latency_floor_repro() {
                 ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        // The site secret POOL `resolve_env` resolves on every serve (one store.get
-                        // per entry, serially).
-                        secrets: site_secrets,
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .secrets(site_secrets)
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -2818,11 +2822,12 @@ async fn secret_resolution_floor_gate() {
                 ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        secrets: site_secrets,
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .secrets(site_secrets)
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -2979,14 +2984,15 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
             ProjectRef::DEFAULT,
             "app",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    cookie_auth: Some(CookieAuthConfig {
-                        cookie_name: "session".to_string(),
-                        allowed_origins: vec!["https://app.example.com".to_string()],
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .cookie_auth(Some(CookieAuthConfig {
+                            cookie_name: "session".to_string(),
+                            allowed_origins: vec!["https://app.example.com".to_string()],
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -3043,14 +3049,15 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
             ProjectRef::DEFAULT,
             "app",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    cookie_auth: Some(CookieAuthConfig {
-                        cookie_name: "session".to_string(),
-                        allowed_origins: Vec::new(),
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .cookie_auth(Some(CookieAuthConfig {
+                            cookie_name: "session".to_string(),
+                            allowed_origins: Vec::new(),
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -4625,24 +4632,27 @@ async fn activation_during_traffic_drops_no_requests() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec!["wasi:keyvalue".to_string()],
-                    max_memory_mb: None,
-                    max_timeout_ms: None,
-                    max_concurrency: None,
-                    max_fuel: None,
-                    secrets: BTreeMap::new(),
-                    background_aliases: Vec::new(),
-                    max_stream_connections: None,
-                    max_log_rate: None,
-                    disable_log_capture: false,
-                    cache: None,
-                    graphql: None,
-                    cookie_auth: None,
-                    tenancy: None,
-                    allow_ceiling_exceptions: false,
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .egress_allow(BTreeMap::new())
+                        .enabled(true)
+                        .allow_imports(vec!["wasi:keyvalue".to_string()])
+                        .max_memory_mb(None)
+                        .max_timeout_ms(None)
+                        .max_concurrency(None)
+                        .max_fuel(None)
+                        .secrets(BTreeMap::new())
+                        .background_aliases(Vec::new())
+                        .max_stream_connections(None)
+                        .max_log_rate(None)
+                        .disable_log_capture(false)
+                        .cache(None)
+                        .graphql(None)
+                        .cookie_auth(None)
+                        .tenancy(None)
+                        .allow_ceiling_exceptions(false)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -4780,24 +4790,27 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                     primary: Some("blog.local".into()),
                     ..Default::default()
                 },
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec!["wasi:keyvalue".to_string()],
-                    max_memory_mb: None,
-                    max_timeout_ms: None,
-                    max_concurrency: None,
-                    max_fuel: None,
-                    secrets: BTreeMap::new(),
-                    background_aliases: Vec::new(),
-                    max_stream_connections: None,
-                    max_log_rate: None,
-                    disable_log_capture: false,
-                    cache: None,
-                    graphql: None,
-                    cookie_auth: None,
-                    tenancy: None,
-                    allow_ceiling_exceptions: false,
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .egress_allow(BTreeMap::new())
+                        .enabled(true)
+                        .allow_imports(vec!["wasi:keyvalue".to_string()])
+                        .max_memory_mb(None)
+                        .max_timeout_ms(None)
+                        .max_concurrency(None)
+                        .max_fuel(None)
+                        .secrets(BTreeMap::new())
+                        .background_aliases(Vec::new())
+                        .max_stream_connections(None)
+                        .max_log_rate(None)
+                        .disable_log_capture(false)
+                        .cache(None)
+                        .graphql(None)
+                        .cookie_auth(None)
+                        .tenancy(None)
+                        .allow_ceiling_exceptions(false)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -4911,24 +4924,27 @@ async fn activation_refuses_broken_component() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: Vec::new(),
-                    max_memory_mb: None,
-                    max_timeout_ms: None,
-                    max_concurrency: None,
-                    max_fuel: None,
-                    secrets: BTreeMap::new(),
-                    background_aliases: Vec::new(),
-                    max_stream_connections: None,
-                    max_log_rate: None,
-                    disable_log_capture: false,
-                    cache: None,
-                    graphql: None,
-                    cookie_auth: None,
-                    tenancy: None,
-                    allow_ceiling_exceptions: false,
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .egress_allow(BTreeMap::new())
+                        .enabled(true)
+                        .allow_imports(Vec::new())
+                        .max_memory_mb(None)
+                        .max_timeout_ms(None)
+                        .max_concurrency(None)
+                        .max_fuel(None)
+                        .secrets(BTreeMap::new())
+                        .background_aliases(Vec::new())
+                        .max_stream_connections(None)
+                        .max_log_rate(None)
+                        .disable_log_capture(false)
+                        .cache(None)
+                        .graphql(None)
+                        .cookie_auth(None)
+                        .tenancy(None)
+                        .allow_ceiling_exceptions(false)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -5037,24 +5053,27 @@ async fn activation_refuses_a_non_consumer_component() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: Vec::new(),
-                    max_memory_mb: None,
-                    max_timeout_ms: None,
-                    max_concurrency: None,
-                    max_fuel: None,
-                    secrets: BTreeMap::new(),
-                    background_aliases: Vec::new(),
-                    max_stream_connections: None,
-                    max_log_rate: None,
-                    disable_log_capture: false,
-                    cache: None,
-                    graphql: None,
-                    cookie_auth: None,
-                    tenancy: None,
-                    allow_ceiling_exceptions: false,
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .egress_allow(BTreeMap::new())
+                        .enabled(true)
+                        .allow_imports(Vec::new())
+                        .max_memory_mb(None)
+                        .max_timeout_ms(None)
+                        .max_concurrency(None)
+                        .max_fuel(None)
+                        .secrets(BTreeMap::new())
+                        .background_aliases(Vec::new())
+                        .max_stream_connections(None)
+                        .max_log_rate(None)
+                        .disable_log_capture(false)
+                        .cache(None)
+                        .graphql(None)
+                        .cookie_auth(None)
+                        .tenancy(None)
+                        .allow_ceiling_exceptions(false)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -5164,24 +5183,27 @@ async fn activation_refuses_disallowed_import() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: Vec::new(),
-                    max_memory_mb: None,
-                    max_timeout_ms: None,
-                    max_concurrency: None,
-                    max_fuel: None,
-                    secrets: BTreeMap::new(),
-                    background_aliases: Vec::new(),
-                    max_stream_connections: None,
-                    max_log_rate: None,
-                    disable_log_capture: false,
-                    cache: None,
-                    graphql: None,
-                    cookie_auth: None,
-                    tenancy: None,
-                    allow_ceiling_exceptions: false,
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .egress_allow(BTreeMap::new())
+                        .enabled(true)
+                        .allow_imports(Vec::new())
+                        .max_memory_mb(None)
+                        .max_timeout_ms(None)
+                        .max_concurrency(None)
+                        .max_fuel(None)
+                        .secrets(BTreeMap::new())
+                        .background_aliases(Vec::new())
+                        .max_stream_connections(None)
+                        .max_log_rate(None)
+                        .disable_log_capture(false)
+                        .cache(None)
+                        .graphql(None)
+                        .cookie_auth(None)
+                        .tenancy(None)
+                        .allow_ceiling_exceptions(false)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -5278,24 +5300,27 @@ async fn activation_refuses_oversized_component() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec!["wasi:keyvalue".to_string()],
-                    max_memory_mb: None,
-                    max_timeout_ms: None,
-                    max_concurrency: None,
-                    max_fuel: None,
-                    secrets: BTreeMap::new(),
-                    background_aliases: Vec::new(),
-                    max_stream_connections: None,
-                    max_log_rate: None,
-                    disable_log_capture: false,
-                    cache: None,
-                    graphql: None,
-                    cookie_auth: None,
-                    tenancy: None,
-                    allow_ceiling_exceptions: false,
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .egress_allow(BTreeMap::new())
+                        .enabled(true)
+                        .allow_imports(vec!["wasi:keyvalue".to_string()])
+                        .max_memory_mb(None)
+                        .max_timeout_ms(None)
+                        .max_concurrency(None)
+                        .max_fuel(None)
+                        .secrets(BTreeMap::new())
+                        .background_aliases(Vec::new())
+                        .max_stream_connections(None)
+                        .max_log_rate(None)
+                        .disable_log_capture(false)
+                        .cache(None)
+                        .graphql(None)
+                        .cookie_auth(None)
+                        .tenancy(None)
+                        .allow_ceiling_exceptions(false)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -5394,25 +5419,27 @@ async fn handler_route_with_sql_dispatches_through_engine() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec!["sql".to_string()],
-                    max_memory_mb: None,
-                    max_timeout_ms: None,
-                    max_concurrency: None,
-                    max_fuel: None,
-                    secrets: BTreeMap::new(),
-                    background_aliases: Vec::new(),
-                    max_stream_connections: None,
-                    max_log_rate: None,
-                    disable_log_capture: false,
-                    cache: None,
-                    graphql: None,
-                    cookie_auth: None,
-                    // A sql importer declares tenancy (this test isn't about tenancy).
-                    tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
-                    allow_ceiling_exceptions: false,
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .egress_allow(BTreeMap::new())
+                        .enabled(true)
+                        .allow_imports(vec!["sql".to_string()])
+                        .max_memory_mb(None)
+                        .max_timeout_ms(None)
+                        .max_concurrency(None)
+                        .max_fuel(None)
+                        .secrets(BTreeMap::new())
+                        .background_aliases(Vec::new())
+                        .max_stream_connections(None)
+                        .max_log_rate(None)
+                        .disable_log_capture(false)
+                        .cache(None)
+                        .graphql(None)
+                        .cookie_auth(None)
+                        .tenancy(Some(boatramp_core::tenancy::Tenancy::Disabled))
+                        .allow_ceiling_exceptions(false)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -5536,19 +5563,17 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    // The site EXPOSES all three, but the handler only gets the two it requested.
-                    allow_imports: vec![
-                        "sql".into(),
-                        "sql:product".into(),
-                        "sql:privileged".into(),
-                    ],
-                    // A sql importer must declare tenancy under the fail-closed default posture;
-                    // this test is about named-sql least-privilege, not tenancy.
-                    tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .allow_imports(vec![
+                            "sql".into(),
+                            "sql:product".into(),
+                            "sql:privileged".into(),
+                        ])
+                        .tenancy(Some(boatramp_core::tenancy::Tenancy::Disabled))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -5674,24 +5699,27 @@ async fn per_site_timeout_cap_applies() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: Vec::new(),
-                    max_memory_mb: None,
-                    max_timeout_ms: Some(50), // far below the engine's 10s default
-                    max_concurrency: None,
-                    max_fuel: None,
-                    secrets: BTreeMap::new(),
-                    background_aliases: Vec::new(),
-                    max_stream_connections: None,
-                    max_log_rate: None,
-                    disable_log_capture: false,
-                    cache: None,
-                    graphql: None,
-                    cookie_auth: None,
-                    tenancy: None,
-                    allow_ceiling_exceptions: false,
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .egress_allow(BTreeMap::new())
+                        .enabled(true)
+                        .allow_imports(Vec::new())
+                        .max_memory_mb(None)
+                        .max_timeout_ms(Some(50))
+                        .max_concurrency(None)
+                        .max_fuel(None)
+                        .secrets(BTreeMap::new())
+                        .background_aliases(Vec::new())
+                        .max_stream_connections(None)
+                        .max_log_rate(None)
+                        .disable_log_capture(false)
+                        .cache(None)
+                        .graphql(None)
+                        .cookie_auth(None)
+                        .tenancy(None)
+                        .allow_ceiling_exceptions(false)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -5789,10 +5817,7 @@ async fn stream_route_fans_out_text_and_binary_events() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    ..Default::default()
-                }),
+                handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                 ..Default::default()
             },
         )
@@ -5915,10 +5940,7 @@ async fn stream_cors_app(
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    ..Default::default()
-                }),
+                handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                 ..Default::default()
             },
         )
@@ -6184,10 +6206,7 @@ async fn stream_scope_is_project_qualified_and_isolates_foreign_tenants() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    ..Default::default()
-                }),
+                handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                 ..Default::default()
             },
         )
@@ -6338,16 +6357,15 @@ async fn graphql_subscription_scope_is_project_qualified_and_isolates_foreign_te
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    // A plain (non-federated) graphql edge: a subscription op is framed as a
-                    // graphql-sse stream off its root-field topic.
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -6469,11 +6487,12 @@ async fn stream_per_site_connection_cap_returns_503() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    max_stream_connections: Some(1),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .max_stream_connections(Some(1))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -6560,10 +6579,7 @@ async fn websocket_stream_fans_out_and_publishes() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    ..Default::default()
-                }),
+                handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                 ..Default::default()
             },
         )
@@ -6640,10 +6656,7 @@ async fn operator_dlq_endpoint_redrives_and_purges() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    ..Default::default()
-                }),
+                handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                 ..Default::default()
             },
         )
@@ -6842,11 +6855,12 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec!["wasi:keyvalue".to_string()],
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .allow_imports(vec!["wasi:keyvalue".to_string()])
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -6996,10 +7010,7 @@ async fn guest_logs_captured_and_served() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    ..Default::default()
-                }),
+                handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                 ..Default::default()
             },
         )
@@ -7141,11 +7152,12 @@ async fn guest_logs_suppressed_when_capture_disabled() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    disable_log_capture: true, // opt out
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .disable_log_capture(true)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -7348,10 +7360,7 @@ async fn handler_env_injected_host_env_not_inherited() {
             ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    ..Default::default()
-                }),
+                handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                 ..Default::default()
             },
         )
@@ -7499,11 +7508,12 @@ async fn handler_secret_allowlist_scopes_the_site_pool_end_to_end() {
             .set_site_config(
                 ProjectRef::DEFAULT,
                 s,
-                &site(Some(HandlersSiteConfig {
-                    enabled: true,
-                    secrets: pool(),
-                    ..Default::default()
-                })),
+                &site(Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .secrets(pool())
+                        .build(),
+                )),
             )
             .await
             .unwrap();
@@ -9086,11 +9096,12 @@ async fn mesh_dispatch(
             ProjectRef::DEFAULT,
             "orch",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports,
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .allow_imports(allow_imports)
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -9283,15 +9294,16 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
             ProjectRef::DEFAULT,
             "gw",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        federated: true,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            federated: true,
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -9478,15 +9490,16 @@ async fn gateway_admission_gate_bounds_concurrency() {
                 ProjectRef::DEFAULT,
                 "gw",
                 &SiteConfig {
-                    handlers: Some(HandlersSiteConfig {
-                        enabled: true,
-                        graphql: Some(HandlerGraphqlConfig {
-                            enabled: true,
-                            federated: true,
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
+                    handlers: Some(
+                        HandlersSiteConfig::builder()
+                            .enabled(true)
+                            .graphql(Some(HandlerGraphqlConfig {
+                                enabled: true,
+                                federated: true,
+                                ..Default::default()
+                            }))
+                            .build(),
+                    ),
                     ..Default::default()
                 },
             )
@@ -9635,15 +9648,16 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
             ProjectRef::DEFAULT,
             "gw",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        federated: true,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            federated: true,
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -9781,16 +9795,17 @@ async fn graphql_edge_is_scoped_to_the_endpoint_route_not_the_whole_site() {
             ProjectRef::DEFAULT,
             "gw",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        graphiql: true,
-                        // `route` defaults to `/graphql`, so the edge is scoped there.
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            graphiql: true,
+                            // `route` defaults to `/graphql`, so the edge is scoped there.
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -9878,15 +9893,16 @@ async fn graphql_edge_is_scoped_to_the_endpoint_route_not_the_whole_site() {
             ProjectRef::DEFAULT,
             "gw2",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        graphiql: true,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            graphiql: true,
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -10021,15 +10037,16 @@ async fn edge_visibility_hides_an_internal_op_from_the_external_edge() {
             ProjectRef::DEFAULT,
             "gw",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        federated: true,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            federated: true,
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -10276,15 +10293,16 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
             ProjectRef::DEFAULT,
             "shop",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        data: Some(data_cfg),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            data: Some(data_cfg),
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -10520,15 +10538,16 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
             ProjectRef::DEFAULT,
             "widgets",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        data: Some(data_cfg),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            data: Some(data_cfg),
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -10681,15 +10700,16 @@ async fn graphql_data_connector_mutations_write_with_row_isolation() {
             ProjectRef::DEFAULT,
             "store",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        data: Some(data_cfg),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            data: Some(data_cfg),
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -10892,15 +10912,16 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
             ProjectRef::DEFAULT,
             "gw",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        federated: true,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            federated: true,
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -11054,15 +11075,16 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
             ProjectRef::DEFAULT,
             "gw",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        federated: true,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            federated: true,
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -11354,15 +11376,16 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
             ProjectRef::DEFAULT,
             "app",
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    graphql: Some(HandlerGraphqlConfig {
-                        enabled: true,
-                        data: Some(data_cfg),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .graphql(Some(HandlerGraphqlConfig {
+                            enabled: true,
+                            data: Some(data_cfg),
+                            ..Default::default()
+                        }))
+                        .build(),
+                ),
                 ..Default::default()
             },
         )
@@ -11606,11 +11629,12 @@ async fn verify_caller_forwards_verified_sub_and_fails_closed_before_guest() {
                     ProjectRef::DEFAULT,
                     site,
                     &SiteConfig {
-                        handlers: Some(HandlersSiteConfig {
-                            enabled: true,
-                            allow_imports: vec!["wasi:keyvalue".to_string()],
-                            ..Default::default()
-                        }),
+                        handlers: Some(
+                            HandlersSiteConfig::builder()
+                                .enabled(true)
+                                .allow_imports(vec!["wasi:keyvalue".to_string()])
+                                .build(),
+                        ),
                         ..Default::default()
                     },
                 )
@@ -11817,10 +11841,7 @@ async fn verify_caller_strip_and_forward_are_visible_to_the_guest() {
                     ProjectRef::DEFAULT,
                     site,
                     &SiteConfig {
-                        handlers: Some(HandlersSiteConfig {
-                            enabled: true,
-                            ..Default::default()
-                        }),
+                        handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
                         ..Default::default()
                     },
                 )

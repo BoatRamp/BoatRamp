@@ -262,6 +262,12 @@ dns-publish = [
   "boatramp-acme/hetzner",
   "boatramp-acme/ns1",
 ]
+# Host-mediated guest egress self-register capability (`boatramp:handlers/egress-register`,
+# PLAN-egress-runtime-authz #12, Surface 2): the server writer (validate + lock-atomic overlay RMW via
+# the deploy store) + `maybe_attach` + the `boatramp-handlers/egress-register` host binding. Writes the
+# SAME `handlers.egress_allow` overlay the control-plane `HandlerPolicy·Write` PUT edits. Fail-closed by
+# default (OFF node posture `allow_guest_egress_register`). Implies `handlers`. Experimental.
+egress-register = ["handlers", "boatramp-handlers/egress-register"]
 
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via

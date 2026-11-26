@@ -51,6 +51,16 @@ pub enum CedarError {
     /// The generated policy text failed to parse — an internal generator bug.
     #[error("policy generation failed: {0}")]
     Policy(String),
+    /// A single role combines target-scoped (`RoleTarget`) templates for TWO resources that share the
+    /// 3-segment `_sites` grain — `BlobUpload` (`<project>/<site>/<container>`) and `HandlerPolicy`
+    /// (`<project>/<site>/<facet>`) — so a grant could alias across them (a blob container named
+    /// `egress` ≡ the `egress` facet). Rejected on compile, deny-safe (PLAN-egress-runtime-authz #12
+    /// review LOW-4). Split the role so each keeps its own `_sites` set.
+    #[error(
+        "role {0:?} combines target-scoped BlobUpload and HandlerPolicy templates, which share the \
+         3-segment target grain and could alias a grant across resources — split them into two roles"
+    )]
+    AliasedGrain(String),
 }
 
 /// A richer authorization outcome than a bare `bool`: the allow/deny decision plus
@@ -160,6 +170,23 @@ impl CompiledCedar {
         for name in policy.roles.keys() {
             if !is_safe_ident(name) {
                 return Err(CedarError::RoleName(name.clone()));
+            }
+        }
+        // LOW-4 (cross-resource 3-segment grain): the per-role `<role>_sites` set is SHARED across the
+        // role's `RoleTarget` templates, and BlobUpload (`<project>/<site>/<container>`) and
+        // HandlerPolicy (`<project>/<site>/<facet>`) BOTH exact-match a 3-segment `name` — so a single
+        // role granting a `RoleTarget` template for BOTH could alias a grant across them (a blob
+        // container named `egress` ≡ the `egress` facet). Reject that combination at authoring
+        // (fail-closed-loud); a role that genuinely needs both must split so each keeps its own
+        // `_sites`. Not reachable in the default policy (BlobUpload is admin-only / AnyTarget there).
+        for (name, templates) in &policy.roles {
+            let roletarget = |res: Resource| {
+                templates
+                    .iter()
+                    .any(|t| t.resource == res && matches!(t.scope, TargetScope::RoleTarget))
+            };
+            if roletarget(Resource::BlobUpload) && roletarget(Resource::HandlerPolicy) {
+                return Err(CedarError::AliasedGrain(name.clone()));
             }
         }
         let text = generate_policy_text(policy);
@@ -289,6 +316,7 @@ fn resource_type(resource: Resource) -> &'static str {
         Resource::System => "System",
         Resource::Overlay => "Overlay",
         Resource::Messaging => "Messaging",
+        Resource::HandlerPolicy => "HandlerPolicy",
     }
 }
 
@@ -344,7 +372,13 @@ fn resource_entity(required: &Right) -> Result<(EntityUid, Entity), Box<dyn Erro
         // `AnyTarget` permit with no guard), but keying it here means a future project-wildcard
         // `Messaging·Read` grant (a per-project consumer role) authorizes correctly via the
         // `resource.project` guard, exactly as a project role's site-wildcard does.
-        Resource::Site | Resource::Messaging => {
+        // `HandlerPolicy` is hierarchical the SAME way but ONE level deeper — its target is the
+        // facet-qualified `"<project>/<site>/<facet>"` (PLAN-egress-runtime-authz #12). It carries the
+        // identical `name` (full facet target, for a facet-specific `RoleTarget` grant's exact-match
+        // guard) + `project` (first segment, for the project-wildcard `"<project>/*"` admin span). A
+        // facet-less grant string never equals a 3-segment `name` ⇒ inert; a different facet is a
+        // different `name` ⇒ no retroactive widening — the mandatory-facet / no-catch-all invariant.
+        Resource::Site | Resource::Messaging | Resource::HandlerPolicy => {
             let name = required.target.clone().unwrap_or_default();
             let project = boatramp_types::authz::project_of(&name).to_string();
             let mut a = HashMap::new();
@@ -999,6 +1033,12 @@ mod tests {
             Some("acme/blog".to_string()),
             Some("acme/shop".to_string()),
             Some("other/blog".to_string()),
+            // Facet-qualified handler-policy targets (PLAN-egress-runtime-authz #12): the 3-segment
+            // `<project>/<site>/<facet>` form. Both engines must agree that a facet-specific grant
+            // matches only its exact facet, a facet-LESS grant matches no facet requirement, and only
+            // a project/global wildcard spans facets.
+            Some("acme/blog/egress".to_string()),
+            Some("acme/blog/secrets".to_string()),
             // A literal `*` target: the wildcard is the *absence* of a target
             // (`None`), so a grant/required of the string `*` must be treated
             // literally by both engines (a resource named `*` can't be created).
@@ -1135,6 +1175,17 @@ mod tests {
                 RightTemplate::any(Resource::Certs, Action::Admin),
             ],
         );
+        // A facet-scoped handler-policy role (PLAN-egress-runtime-authz #12): `HandlerPolicy·Write`
+        // bound to the facet-qualified `<project>/<site>/egress` target. The differential gate proves
+        // Cedar authorizes exactly the facet target the grant names (and nothing else) — the
+        // mandatory-facet / no-catch-all invariant holding identically in both engines.
+        roles.insert(
+            "egress_editor".to_string(),
+            vec![RightTemplate::scoped(
+                Resource::HandlerPolicy,
+                Action::Write,
+            )],
+        );
         let policy = AuthzPolicy {
             version: boatramp_types::SCHEMA_VERSION,
             roles,
@@ -1154,6 +1205,18 @@ mod tests {
                 GrantedRole::scoped("sitelead", "shop"),
                 GrantedRole::scoped("editor", "blog"),
             ],
+            // Facet-qualified HandlerPolicy grant (#12): authorizes HandlerPolicy·Write on EXACTLY
+            // `acme/blog/egress` and nothing else (not `acme/blog`, not `acme/blog/secrets`, not
+            // another site) — both engines must agree across every (resource, action, target).
+            vec![GrantedRole::scoped("egress_editor", "acme/blog/egress")],
+            // A FACET-LESS HandlerPolicy grant: conforming syntax, but it exact-matches no facet
+            // requirement (the seam only ever requires 3-segment `<p>/<s>/<facet>`), so it authorizes
+            // no facet edit (no catch-all) — oracle and Cedar agree. (Facet-spanning is reserved for
+            // the GLOBAL `admin` grant — target `None`, AnyTarget — exercised by the default policy's
+            // `admin` roleset; a project-wildcard `<p>/*` HandlerPolicy grant is NOT a supported path:
+            // `RoleTarget`-scoped `/*` grant targets diverge between the engines for every resource —
+            // a pre-existing property, not used by any role — so it is deliberately not exercised.)
+            vec![GrantedRole::scoped("egress_editor", "acme/blog")],
         ];
         assert_faithful(&policy, &rolesets);
     }
@@ -1183,6 +1246,56 @@ mod tests {
                     Err(CedarError::RoleName(_))
                 ),
                 "expected rejection of role name {bad:?}"
+            );
+        }
+    }
+
+    /// LOW-4 (cross-resource 3-segment grain): a role combining a `RoleTarget` `BlobUpload` template
+    /// AND a `RoleTarget` `HandlerPolicy` template is REJECTED at compile (they share the per-role
+    /// `_sites` grain, so a `<p>/<s>/<container>` grant could alias a `<p>/<s>/<facet>` requirement).
+    /// Either resource ALONE, or either combined with a non-grain resource, is fine.
+    #[test]
+    fn compile_rejects_blobupload_handlerpolicy_grain_alias() {
+        let role = |templates: Vec<RightTemplate>| {
+            let mut roles: BTreeMap<String, Vec<RightTemplate>> = BTreeMap::new();
+            roles.insert("r".to_string(), templates);
+            AuthzPolicy {
+                version: boatramp_types::SCHEMA_VERSION,
+                roles,
+            }
+        };
+        // The forbidden combination ⇒ rejected.
+        assert!(
+            matches!(
+                CompiledCedar::compile(&role(vec![
+                    RightTemplate::scoped(Resource::BlobUpload, Action::Write),
+                    RightTemplate::scoped(Resource::HandlerPolicy, Action::Write),
+                ])),
+                Err(CedarError::AliasedGrain(_))
+            ),
+            "a role combining RoleTarget BlobUpload + HandlerPolicy must be rejected"
+        );
+        // Each alone compiles; HandlerPolicy + a non-grain Site RoleTarget compiles (no shared grain).
+        for ok in [
+            vec![RightTemplate::scoped(
+                Resource::HandlerPolicy,
+                Action::Write,
+            )],
+            vec![RightTemplate::scoped(Resource::BlobUpload, Action::Write)],
+            vec![
+                RightTemplate::scoped(Resource::HandlerPolicy, Action::Write),
+                RightTemplate::scoped(Resource::Site, Action::Write),
+            ],
+            // BlobUpload as an AnyTarget (admin-style) alongside HandlerPolicy RoleTarget is fine —
+            // only a TARGET-scoped BlobUpload shares the grain.
+            vec![
+                RightTemplate::any(Resource::BlobUpload, Action::Write),
+                RightTemplate::scoped(Resource::HandlerPolicy, Action::Write),
+            ],
+        ] {
+            assert!(
+                CompiledCedar::compile(&role(ok)).is_ok(),
+                "a role without BOTH RoleTarget BlobUpload AND HandlerPolicy must compile"
             );
         }
     }
