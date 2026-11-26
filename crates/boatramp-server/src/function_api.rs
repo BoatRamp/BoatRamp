@@ -281,6 +281,10 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
                 && name != "tcp-listener"
                 && name != "dns-resolve"
                 && name != "dns-publish"
+                // `egress-register` (guest egress self-register, PLAN-egress-runtime-authz #12 Surface 2)
+                // is likewise Experimental + cargo-gated below (advertised iff the `egress-register`
+                // feature is on) — not Stable, and not advertised unconditionally.
+                && name != "egress-register"
         })
         .map(|&name| CapabilityFeature {
             name,
@@ -491,6 +495,23 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     if cfg!(feature = "dns-publish") {
         f.push(CapabilityFeature {
             name: "dns-publish",
+            lifecycle: Experimental,
+        });
+    }
+    // The host-mediated egress SELF-REGISTER capability (PLAN-egress-runtime-authz #12, Surface 2): a
+    // granted guest REPLACE-SETs the `host:port`s its OWN workload may dial, written to the SAME
+    // `handlers.egress_allow` overlay the control-plane `HandlerPolicy·Write` PUT edits. Cargo-gated on
+    // `egress-register` (which pulls the `boatramp-handlers/egress-register` host binding + the server
+    // writer/`maybe_attach` wiring); deny-by-default at RUNTIME — the node posture
+    // `allow_guest_egress_register` (OFF by default) + the per-workload host-forced scope. Its OWN grant
+    // token (`egress-register`, a KNOWN_IMPORT — declarable offline), but advertised ONLY when the
+    // feature is compiled: a guest declares `requires = ["egress-register"]` (mailroom's fetch.wasm) so a
+    // deploy against a host that cannot serve it (feature off, or predating #12) is refused cleanly
+    // instead of failing to instantiate. Registering it here is what makes it appear in `boatramp
+    // capabilities` and pass `capabilities --check`/`sync` admission. Experimental until the shape settles.
+    if cfg!(feature = "egress-register") {
+        f.push(CapabilityFeature {
+            name: "egress-register",
             lifecycle: Experimental,
         });
     }
@@ -1063,6 +1084,15 @@ mod tests {
         // instantiate. Its ABSENCE from the advertisement (it was auto-mapped Stable+always off
         // KNOWN_IMPORTS before WS3b) was a fail-OPEN admission gap — GATE.
         assert_eq!(host.contains(&"dns-publish"), cfg!(feature = "dns-publish"));
+        // The `egress-register` (host-mediated guest egress self-register, PLAN-egress-runtime-authz #12
+        // Surface 2) capability is cargo-gated: advertised iff this build enabled the `egress-register`
+        // feature. A lean host that cannot serve it must NOT advertise it, so a guest's
+        // `requires = ["egress-register"]` (mailroom's fetch.wasm) fails loud on a pre-feature host and
+        // is admitted on a supporting one — its absence would be a fail-OPEN admission gap (GATE).
+        assert_eq!(
+            host.contains(&"egress-register"),
+            cfg!(feature = "egress-register")
+        );
         // The gated `wasi:sockets` outbound-TCP capability (PLAN-handler-tcp-egress) is advertised
         // whenever handlers are compiled (the socket host is always linked), so a guest's
         // `requires = ["wasi:sockets"]` is admitted on a supporting host and refused cleanly on one
@@ -1106,6 +1136,12 @@ mod tests {
         assert_eq!(
             lifecycle("dns-publish"),
             cfg!(feature = "dns-publish").then_some(super::Lifecycle::Experimental)
+        );
+        // `egress-register` is a KNOWN_IMPORT but, when advertised (feature on), it is Experimental —
+        // NOT the blanket-Stable auto-map lifecycle. Feature off ⇒ absent (`None`).
+        assert_eq!(
+            lifecycle("egress-register"),
+            cfg!(feature = "egress-register").then_some(super::Lifecycle::Experimental)
         );
         // The admission filter keeps only requirements the host cannot satisfy.
         let unmet: Vec<&str> = ["sql", "streaming", "quantum-teleport", "warp-drive"]

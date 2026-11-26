@@ -168,6 +168,16 @@ mod imp {
             // runtime; the host advertises the feature only under the `dns-publish` cargo feature, so a
             // guest `requires = ["dns-publish"]` fails loud on a pre-feature host.
             ("boatramp:handlers", "dns-publish") => Some("dns-publish"),
+            // The host-mediated egress SELF-REGISTER capability (PLAN-egress-runtime-authz #12,
+            // Surface 2): a guest REPLACE-SETs the `host:port`s its OWN workload may dial, written to
+            // the SAME `handlers.egress_allow` overlay the control-plane `HandlerPolicy·Write` PUT edits
+            // (the guest never carries a control-plane token). Its OWN declarable grant token
+            // `egress-register`, matching `KNOWN_IMPORTS`. The single interface carries the one
+            // `set-egress` verb (no `-types` sibling), so this one arm covers it. Posture-gated by
+            // `allow_guest_egress_register` (off by default) at runtime; the host advertises the feature
+            // only under the `egress-register` cargo feature, so a guest `requires = ["egress-register"]`
+            // fails loud on a pre-feature host.
+            ("boatramp:handlers", "egress-register") => Some("egress-register"),
             // `orm` is a **typed view of the same `sql` capability** — it runs on the
             // same per-invocation SQL session/backend and `use`s `sql-types`. So it
             // is the `sql` token: declaring `sql` grants orm (and inherits the
@@ -816,6 +826,7 @@ mod imp {
                 ),
                 ("dns-resolve", "boatramp:handlers", "dns-resolve"),
                 ("dns-publish", "boatramp:handlers", "dns-publish"),
+                ("egress-register", "boatramp:handlers", "egress-register"),
             ];
             // Each representative interface maps to exactly its grant token.
             for &(token, pkg, iface) in reps {
