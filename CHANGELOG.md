@@ -5,6 +5,22 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.75.0] — 2026-11-26
+
+### Breaking
+
+- **`#[non_exhaustive]` + builder seal of `StreamConfig`** (deferred from v0.74.0, which added
+  `cors_allowed_origins`: a bare seal there broke a cross-crate struct literal, even one using
+  `..Default::default()` — sealing a struct forbids a struct literal from outside its defining
+  crate regardless of `..Default`). `boatramp_types::config::StreamConfig` is now
+  `#[non_exhaustive]`, so a later field add stays non-breaking for downstream crates (uchron,
+  luigi). **Downstream construction must migrate**: build via
+  `StreamConfig::builder(route).topics(..).websocket(..).publish_topic(..).authz(..).cors_allowed_origins(..).build()`,
+  or `StreamConfig::default()` followed by field assignment — never an exhaustive or
+  `..Default::default()` struct literal. Every in-tree cross-crate construction site (all in
+  `boatramp-server` test code: `tests/conformance.rs`, `src/lib.rs`, `tests/connect_server_stream_live.rs`)
+  is migrated.
+
 ## [0.74.0] — 2026-11-26
 
 ### Added

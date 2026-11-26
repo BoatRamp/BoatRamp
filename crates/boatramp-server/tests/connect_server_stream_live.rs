@@ -78,21 +78,13 @@ async fn live_app() -> (axum::Router, Arc<LogMessaging>) {
     let config = DeployConfig {
         streams: vec![
             // Broadcast (unauthenticated) server-stream: the framing proof.
-            StreamConfig {
-                route: TICKER_ROUTE.to_string(),
-                topics: vec![TICKER_TOPIC.to_string()],
-                websocket: false,
-                publish_topic: None,
-                authz: None,
-                ..Default::default()
-            },
+            StreamConfig::builder(TICKER_ROUTE)
+                .topics(vec![TICKER_TOPIC.to_string()])
+                .build(),
             // Scoped server-stream: authz must gate the Connect path (401 without a bearer).
-            StreamConfig {
-                route: SECURE_ROUTE.to_string(),
-                topics: vec!["secure/{room}/events".to_string()],
-                websocket: false,
-                publish_topic: None,
-                authz: Some(StreamAuthz::Scoped {
+            StreamConfig::builder(SECURE_ROUTE)
+                .topics(vec!["secure/{room}/events".to_string()])
+                .authz(Some(StreamAuthz::Scoped {
                     token_claims: HandlerGraphqlTokenClaims {
                         issuer: "https://idp.example".to_string(),
                         jwks_env: Some("IDP_JWKS".to_string()),
@@ -102,9 +94,8 @@ async fn live_app() -> (axum::Router, Arc<LogMessaging>) {
                         param: "room".to_string(),
                         claim: "rooms".to_string(),
                     }],
-                }),
-                ..Default::default()
-            },
+                }))
+                .build(),
         ],
         ..Default::default()
     };
