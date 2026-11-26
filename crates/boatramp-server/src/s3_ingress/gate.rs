@@ -667,10 +667,7 @@ mod battery {
         let shop = ProjectRef::new("shop");
         let other = ProjectRef::new("other");
         let cfg = SiteConfig {
-            handlers: Some(HandlersSiteConfig {
-                enabled: true,
-                ..Default::default()
-            }),
+            handlers: Some(HandlersSiteConfig::builder().enabled(true).build()),
             ..Default::default()
         };
         // `blog` exists in `shop`; `evil` exists ONLY in `other` (the cross-project decoy).

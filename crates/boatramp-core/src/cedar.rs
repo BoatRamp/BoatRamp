@@ -289,6 +289,7 @@ fn resource_type(resource: Resource) -> &'static str {
         Resource::System => "System",
         Resource::Overlay => "Overlay",
         Resource::Messaging => "Messaging",
+        Resource::HandlerPolicy => "HandlerPolicy",
     }
 }
 
@@ -344,7 +345,13 @@ fn resource_entity(required: &Right) -> Result<(EntityUid, Entity), Box<dyn Erro
         // `AnyTarget` permit with no guard), but keying it here means a future project-wildcard
         // `Messaging·Read` grant (a per-project consumer role) authorizes correctly via the
         // `resource.project` guard, exactly as a project role's site-wildcard does.
-        Resource::Site | Resource::Messaging => {
+        // `HandlerPolicy` is hierarchical the SAME way but ONE level deeper — its target is the
+        // facet-qualified `"<project>/<site>/<facet>"` (PLAN-egress-runtime-authz #12). It carries the
+        // identical `name` (full facet target, for a facet-specific `RoleTarget` grant's exact-match
+        // guard) + `project` (first segment, for the project-wildcard `"<project>/*"` admin span). A
+        // facet-less grant string never equals a 3-segment `name` ⇒ inert; a different facet is a
+        // different `name` ⇒ no retroactive widening — the mandatory-facet / no-catch-all invariant.
+        Resource::Site | Resource::Messaging | Resource::HandlerPolicy => {
             let name = required.target.clone().unwrap_or_default();
             let project = boatramp_types::authz::project_of(&name).to_string();
             let mut a = HashMap::new();
@@ -999,6 +1006,12 @@ mod tests {
             Some("acme/blog".to_string()),
             Some("acme/shop".to_string()),
             Some("other/blog".to_string()),
+            // Facet-qualified handler-policy targets (PLAN-egress-runtime-authz #12): the 3-segment
+            // `<project>/<site>/<facet>` form. Both engines must agree that a facet-specific grant
+            // matches only its exact facet, a facet-LESS grant matches no facet requirement, and only
+            // a project/global wildcard spans facets.
+            Some("acme/blog/egress".to_string()),
+            Some("acme/blog/secrets".to_string()),
             // A literal `*` target: the wildcard is the *absence* of a target
             // (`None`), so a grant/required of the string `*` must be treated
             // literally by both engines (a resource named `*` can't be created).
@@ -1135,6 +1148,17 @@ mod tests {
                 RightTemplate::any(Resource::Certs, Action::Admin),
             ],
         );
+        // A facet-scoped handler-policy role (PLAN-egress-runtime-authz #12): `HandlerPolicy·Write`
+        // bound to the facet-qualified `<project>/<site>/egress` target. The differential gate proves
+        // Cedar authorizes exactly the facet target the grant names (and nothing else) — the
+        // mandatory-facet / no-catch-all invariant holding identically in both engines.
+        roles.insert(
+            "egress_editor".to_string(),
+            vec![RightTemplate::scoped(
+                Resource::HandlerPolicy,
+                Action::Write,
+            )],
+        );
         let policy = AuthzPolicy {
             version: boatramp_types::SCHEMA_VERSION,
             roles,
@@ -1154,6 +1178,18 @@ mod tests {
                 GrantedRole::scoped("sitelead", "shop"),
                 GrantedRole::scoped("editor", "blog"),
             ],
+            // Facet-qualified HandlerPolicy grant (#12): authorizes HandlerPolicy·Write on EXACTLY
+            // `acme/blog/egress` and nothing else (not `acme/blog`, not `acme/blog/secrets`, not
+            // another site) — both engines must agree across every (resource, action, target).
+            vec![GrantedRole::scoped("egress_editor", "acme/blog/egress")],
+            // A FACET-LESS HandlerPolicy grant: conforming syntax, but it exact-matches no facet
+            // requirement (the seam only ever requires 3-segment `<p>/<s>/<facet>`), so it authorizes
+            // no facet edit (no catch-all) — oracle and Cedar agree. (Facet-spanning is reserved for
+            // the GLOBAL `admin` grant — target `None`, AnyTarget — exercised by the default policy's
+            // `admin` roleset; a project-wildcard `<p>/*` HandlerPolicy grant is NOT a supported path:
+            // `RoleTarget`-scoped `/*` grant targets diverge between the engines for every resource —
+            // a pre-existing property, not used by any role — so it is deliberately not exercised.)
+            vec![GrantedRole::scoped("egress_editor", "acme/blog")],
         ];
         assert_faithful(&policy, &rolesets);
     }

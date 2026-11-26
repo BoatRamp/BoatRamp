@@ -998,6 +998,15 @@ pub(super) async fn run_scheduler_tick(
                                 }
                                 &wasm_cache[&entry.hash]
                             };
+                            // PLAN-egress-runtime-authz (#12): UNION this consumer's runtime egress
+                            // overlay (keyed by its `topic`, set via the authenticated site-config
+                            // PUT — host-authoritative) onto its DEPLOY-time static allowlist before
+                            // the UNCHANGED dial-time gate. This is the lane mailroom's fetch runs on
+                            // as a consumer. Additive-only; empty overlay ⇒ byte-identical.
+                            let effective_egress = site_handlers.effective_egress_allowlist(
+                                &consumer.topic,
+                                &consumer.egress_allowlist,
+                            );
                             let bindings = match build_bindings(
                                 inner,
                                 project,
@@ -1018,8 +1027,9 @@ pub(super) async fn run_scheduler_tick(
                                 &consumer.upload_containers,
                                 // The consumer's plain-`wasi:blobstore` allowlist (host-enforced tenant confinement).
                                 &consumer.blobstore_containers,
-                                // The consumer's outbound-TCP `egress_allowlist` (gated `wasi:sockets`): empty ⇒ deny-all.
-                                &consumer.egress_allowlist,
+                                // The consumer's outbound-TCP allowlist (gated `wasi:sockets`): the DEPLOY
+                                // slice unioned with the runtime egress overlay for this topic (#12); empty ⇒ deny-all.
+                                &effective_egress,
                                 // The consumer's DYNAMIC egress host allowlist (runtime-resolved host, BR-REQ-2).
                                 &consumer.dynamic_egress_hosts,
                                 // The consumer's `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
@@ -1508,6 +1518,11 @@ async fn fire_cron(
             true
         }
     };
+    // PLAN-egress-runtime-authz (#12): a cron-fired handler inherits the SAME per-route runtime egress
+    // overlay as its HTTP dispatch (keyed by `handler.route`), unioned onto the deploy allowlist before
+    // the UNCHANGED dial-time gate. Additive-only; empty overlay ⇒ byte-identical.
+    let effective_egress =
+        site_handlers.effective_egress_allowlist(&handler.route, &handler.egress_allowlist);
     let bindings = match build_bindings(
         inner,
         project,
@@ -1527,8 +1542,9 @@ async fn fire_cron(
         &handler.upload_containers,
         // A cron-triggered handler inherits the matched handler's plain-`wasi:blobstore` allowlist.
         &handler.blobstore_containers,
-        // A cron-triggered handler inherits the matched handler's outbound-TCP `egress_allowlist`.
-        &handler.egress_allowlist,
+        // A cron-triggered handler's outbound-TCP allowlist: the DEPLOY slice unioned with the runtime
+        // egress overlay for this route (#12); empty ⇒ deny-all.
+        &effective_egress,
         // …and its DYNAMIC egress host allowlist for the runtime-resolved-host dial (BR-REQ-2).
         &handler.dynamic_egress_hosts,
         // …and its `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.

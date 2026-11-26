@@ -791,19 +791,17 @@ mod tests {
     #[test]
     fn config_for_is_off_unless_enabled() {
         assert!(config_for(&HandlersSiteConfig::default()).is_none());
-        let disabled = HandlersSiteConfig {
-            cache: Some(HandlerCacheConfig::default()), // enabled = false
-            ..Default::default()
-        };
+        let disabled = HandlersSiteConfig::builder()
+            .cache(Some(HandlerCacheConfig::default()))
+            .build();
         assert!(config_for(&disabled).is_none());
-        let on = HandlersSiteConfig {
-            cache: Some(HandlerCacheConfig {
+        let on = HandlersSiteConfig::builder()
+            .cache(Some(HandlerCacheConfig {
                 enabled: true,
                 max_entry_bytes: Some(1024),
                 max_ttl_secs: Some(90),
-            }),
-            ..Default::default()
-        };
+            }))
+            .build();
         let cfg = config_for(&on).expect("enabled");
         assert!(cfg.enabled);
         assert_eq!(cfg.max_entry_bytes, 1024);

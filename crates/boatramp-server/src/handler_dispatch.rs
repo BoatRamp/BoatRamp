@@ -611,6 +611,14 @@ pub(super) async fn dispatch_handler(
         headers: request.headers().clone(),
         path: Some(request.uri().path().to_owned()),
     };
+    // PLAN-egress-runtime-authz (#12): UNION this handler's runtime-editable egress overlay (keyed by
+    // its `route`, set via the authenticated `put_site_config` PUT — host-authoritative, never
+    // guest-supplied) onto its DEPLOY-time static allowlist BEFORE it feeds the UNCHANGED dial-time
+    // gate. Additive-only — widens WHICH global host:ports are reachable; it does NOT grant
+    // `wasi:sockets`, flip posture, or relax the `is_global_ip` SSRF floor. Empty overlay ⇒
+    // byte-identical to `handler.egress_allowlist`.
+    let effective_egress =
+        site_handlers.effective_egress_allowlist(&handler.route, &handler.egress_allowlist);
     let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -628,8 +636,9 @@ pub(super) async fn dispatch_handler(
         &handler.upload_containers,
         // Per-component plain-`wasi:blobstore` container allowlist (host-enforced tenant confinement).
         &handler.blobstore_containers,
-        // Per-handler outbound-TCP allowlist for the gated `wasi:sockets` capability: empty ⇒ deny-all.
-        &handler.egress_allowlist,
+        // Per-handler outbound-TCP allowlist (gated `wasi:sockets`): the DEPLOY slice unioned with the
+        // runtime egress overlay for this route (#12); empty ⇒ deny-all.
+        &effective_egress,
         // Per-handler DYNAMIC egress host allowlist for the runtime-resolved-host dial (BR-REQ-2).
         &handler.dynamic_egress_hosts,
         // Per-handler `dns-publish` writable-zone allowlist (cap-req #24 WS3): empty ⇒ deny-all.
@@ -3306,10 +3315,11 @@ pub(super) async fn build_bindings(
     // store zero times per serve.
     let no_secret_cfg;
     let effective_site_handlers = if no_secrets {
-        no_secret_cfg = boatramp_core::config::HandlersSiteConfig {
-            secrets: std::collections::BTreeMap::new(),
-            ..site_handlers.clone()
-        };
+        // `HandlersSiteConfig` is `#[non_exhaustive]` (v0.75.0 seal): a cross-crate functional-update
+        // literal is forbidden, so clone the site config and clear its secret pool by assignment.
+        let mut c = site_handlers.clone();
+        c.secrets = std::collections::BTreeMap::new();
+        no_secret_cfg = c;
         &no_secret_cfg
     } else {
         site_handlers
@@ -5141,12 +5151,11 @@ mod consumer_dns_resolve_tests {
         let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
         let rt = crate::HandlerRuntime::new(engine, kv, storage, None, None);
         let inner = rt.inner.as_ref().unwrap();
-        let site = HandlersSiteConfig {
-            enabled: true,
-            allow_imports: imports.iter().map(|s| (*s).to_string()).collect(),
-            tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
-            ..Default::default()
-        };
+        let site = HandlersSiteConfig::builder()
+            .enabled(true)
+            .allow_imports(imports.iter().map(|s| (*s).to_string()).collect())
+            .tenancy(Some(boatramp_core::tenancy::Tenancy::Disabled))
+            .build();
         let imports: Vec<String> = imports.iter().map(|s| (*s).to_string()).collect();
         let allow: Vec<String> = egress_allowlist.iter().map(|s| (*s).to_string()).collect();
         let env = std::collections::BTreeMap::new();

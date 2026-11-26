@@ -110,11 +110,12 @@ async fn live_app() -> axum::Router {
             ProjectRef::DEFAULT,
             SITE,
             &SiteConfig {
-                handlers: Some(HandlersSiteConfig {
-                    enabled: true,
-                    allow_imports: vec![],
-                    ..Default::default()
-                }),
+                handlers: Some(
+                    HandlersSiteConfig::builder()
+                        .enabled(true)
+                        .allow_imports(vec![])
+                        .build(),
+                ),
                 compression: CompressionConfig {
                     enabled: true,
                     min_size: 0,

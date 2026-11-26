@@ -517,11 +517,12 @@ mod tests {
         ));
         // An unknown/typo'd capability name in the import allowlist is rejected before storage.
         let bad = SiteConfig {
-            handlers: Some(boatramp_core::config::HandlersSiteConfig {
-                enabled: true,
-                allow_imports: vec!["wasi:filesystem".into()],
-                ..Default::default()
-            }),
+            handlers: Some(
+                boatramp_core::config::HandlersSiteConfig::builder()
+                    .enabled(true)
+                    .allow_imports(vec!["wasi:filesystem".into()])
+                    .build(),
+            ),
             ..Default::default()
         };
         let bad_json = serde_json::to_string(&bad).unwrap();

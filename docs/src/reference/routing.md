@@ -356,6 +356,54 @@ the SSRF floor unless the posture also allows private egress. Only consulted whe
 handlers: [ (route: "/api", component: "api.wasm", imports: ["wasi:sockets"], egress_allowlist: ["db.internal:5432"]) ],
 ```
 
+### Runtime egress overlay (`handlers.egress_allow`)
+
+`egress_allowlist` is **deploy-time** — it changes only by redeploying the manifest. When a handler
+must reach a host known only at **runtime** (a per-customer IMAP/POP3 server, say), register that
+host in the **runtime-editable egress overlay** instead of baking it into the manifest. The overlay
+lives on the **site config** (`[handlers].egress_allow` in `boatramp.cfg` / `HandlersSiteConfig`),
+edited through the same authenticated `PUT /api/sites/{site}/config` that edits `[handlers].secrets`
+— so it is **host-authoritative** (control-plane config, never guest-supplied at dial) and rides the
+site config's existing cluster propagation with no redeploy.
+
+The overlay is a map **keyed by the workload's dispatch identity** — a handler's (or cron-routed
+handler's) `route`, or a consumer's `topic` — whose value is a list of additional `host:port` /
+`ip:port` / `CIDR:port` targets in the **same grammar** as `egress_allowlist`. At dispatch those
+entries are **unioned** onto that workload's deploy-time `egress_allowlist` and fed to the **same**
+dial-time gate. The overlay is strictly **additive — it adds reach, never authority**:
+
+- It only widens *which* global `host:port`s an already-granted, posture-on workload may reach. It
+  does **not** grant the `wasi:sockets` capability, does **not** flip the node posture, and does
+  **not** relax the SSRF floor — an internal / metadata / RFC1918 / loopback entry is still refused
+  at dial (`is_global_ip`), even though it is in the overlay.
+- It feeds the **static** matcher (resolve-then-compare-peer), consulted on **both** the `connect-tls`
+  (IMAPS) and `connect-plaintext` (POP3) legs — so a plaintext host works with no extra mechanism.
+  (The glob [`dynamic_egress_hosts`](#dynamic_egress_hosts) path stays deploy-set and TLS-only.)
+- **Empty overlay ⇒ no change** (deny-all is preserved: the union of two empty allowlists is empty).
+
+**Authz.** Editing the overlay (adding **or** removing a host) changes an outbound network surface —
+capability-grade authority, the same thing the deploy manifest's `egress_allowlist` grants — so it is
+gated above the base `Site·Write` the config PUT already maps to. The control-plane edit requires the
+`HandlerPolicy·Write` right on the **mandatory-facet** target `<project>/<site>/egress` (a grant must
+name the `egress` facet; a facet-less `HandlerPolicy` grant authorizes nothing, and only a deliberate
+project/global wildcard — i.e. `admin` — spans facets). A byte-identical re-PUT (no overlay change)
+needs only `Site·Write`, so a declarative re-apply by a non-policy principal still works. (A companion
+host-mediated guest capability lets a workload set its OWN overlay from inside its guest — gated by a
+node posture, off by default — writing this same overlay under the same SSRF floor; it is documented
+with the egress capability.)
+
+**Register / de-register (replace-set).** The overlay IS the registered set: register a host by
+PUTting a config that includes it; de-register by PUTting one that omits it. Re-registering a host
+already present is a byte-identical no-op, and any drift self-heals to the last PUT — so an operator
+can safely re-sync the full desired set on every source change.
+
+```ron
+# boatramp.cfg — site config (edited via PUT /api/sites/{site}/config)
+[handlers.egress_allow]
+# key = the workload's route (handler/cron) or topic (consumer)
+"/fetch" = ["imap.gstruct.com:993", "pop.gstruct.com:110"]
+```
+
 ### `dynamic_egress_hosts`
 
 The deny-by-default allowlist for a **runtime-resolved host** the guest dials by NAME

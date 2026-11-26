@@ -5,6 +5,56 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.75.0]
+
+### Added
+
+- **Runtime-editable handler egress authorization — widen a workload's outbound-TCP allowlist at
+  runtime, no redeploy (roadmap #12).** A handler / consumer / cron / session can now reach a
+  per-customer host known only at RUNTIME (e.g. `imap.gstruct.com:993`) by registering it in a new
+  runtime-editable overlay, instead of baking every host into the deploy manifest:
+  - **Shape** — a `handlers.egress_allow` map on the site config (`HandlersSiteConfig`, the
+    runtime-editable `handlers.secrets` analog), keyed by the workload's dispatch identity (a
+    handler/cron `route`, a consumer `topic`); its value is a list of ADDITIONAL static `host:port`
+    / `ip:port` / `CIDR:port` targets (the same grammar as the deploy `egress_allowlist`). Edited
+    via the EXISTING authenticated `PUT /api/sites/{site}/config` — the same path that edits
+    `handlers.secrets`, so no new endpoint. **Host-authoritative** (control-plane config, never
+    guest-supplied at dial). Each entry is validated fail-closed-loud at the PUT.
+  - **Semantics** — the overlay is **unioned** onto that workload's deploy-time `egress_allowlist`
+    at dispatch, then fed to the **UNCHANGED** dial-time gate. Strictly **additive — reach, not
+    authority**: it widens WHICH global `host:port`s a workload may reach; it does NOT grant
+    `wasi:sockets`, flip the node posture, or relax the `is_global_ip` SSRF floor — an
+    internal/metadata/RFC1918/loopback entry is still refused at dial. The static overlay is
+    consulted on BOTH the `connect-tls` (IMAPS) and `connect-plaintext` (POP3) legs. Empty overlay
+    ⇒ byte-identical to the deploy allowlist alone (`empty ⇒ deny-all` preserved). Cluster
+    propagation + TOCTOU safety ride the existing content-addressed site-config mechanism (no new
+    machinery), exactly as `handlers.secrets` does.
+  - **Authz (control-plane edit)** — EDITING the overlay (adding OR removing a host) changes an
+    outbound network surface: capability-grade authority a pure `Site·Write` holder (a console config
+    editor) must NOT wield. Any change to `egress_allow` vs the stored config requires the new
+    **`HandlerPolicy·Write`** right on the MANDATORY-FACET target `<project>/<site>/egress`; a
+    byte-identical re-PUT needs only the base `Site·Write` (so a declarative re-apply by a non-policy
+    principal still works). The facet segment is mandatory: a facet-less `HandlerPolicy` grant
+    authorizes nothing, a different facet never retroactively widens to egress, and only a deliberate
+    project/global wildcard (`admin`) spans facets.
+  - **Operator integration (replace-set)** — the overlay IS the registered set: register = a PUT
+    adding the `host:port`; de-register = a PUT omitting it. Re-registering a present host is a
+    byte-identical no-op; drift self-heals to the last PUT.
+
+### Breaking
+
+- **New `Resource::HandlerPolicy` authz right** (roadmap #12): the grouped control-plane right that
+  gates runtime handler-policy facets (`<project>/<site>/<facet>`, facet ∈ {`egress`} today), carried
+  by the global `admin` role by default. `Resource::ALL` grows 11 → 12; downstream crates
+  (uchron/luigi) that match the `Resource` enum exhaustively or compile the Cedar closures must add
+  the new arm (the enum stays non-`#[non_exhaustive]`, so adding a variant is the relayed break).
+- **`HandlersSiteConfig` sealed `#[non_exhaustive]` + builder** — this long-published site-config
+  struct is now `#[non_exhaustive]` with a fluent `HandlersSiteConfig::builder()` covering every
+  field (including the new `egress_allow`). A cross-crate struct literal (even
+  `HandlersSiteConfig { … , ..Default::default() }`) no longer compiles; migrate to the builder (or,
+  in-crate, `Default::default()` + field assignment). Sealing it makes every future field add — like
+  `egress_allow` itself — a non-breaking change.
+
 ## [0.74.0] — 2026-11-26
 
 ### Added

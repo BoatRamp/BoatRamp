@@ -133,24 +133,43 @@ pub fn is_valid_resource_slug(value: &str) -> bool {
 }
 
 /// Whether a **token role target** conforms to the v0.7.0 grammar and every segment is
-/// a valid slug: a bare `<project>`, a `<project>/<site>`, or a project wildcard
-/// `<project>/*`. Exactly one `/` is permitted (and only as the segment separator or
-/// the wildcard delimiter); every non-wildcard segment must satisfy
-/// [`is_valid_resource_slug`].
+/// a valid slug: a bare `<project>`, a `<project>/<site>`, a `<project>/<site>/<facet>`
+/// (the facet-qualified handler-policy target, PLAN-egress-runtime-authz #12), or a project
+/// wildcard `<project>/*`. Non-wildcard targets carry one, two, or three slug segments;
+/// every non-wildcard segment must satisfy [`is_valid_resource_slug`].
 ///
 /// This is the **fail-closed authz-match backstop** predicate (audit A8): a token role
 /// scope is `<role>:<target>`, and the `<target>` string contains a `/` for site /
-/// wildcard scopes, so it must NOT be run through [`is_valid_resource_slug`] whole
+/// wildcard / facet scopes, so it must NOT be run through [`is_valid_resource_slug`] whole
 /// (that rejects `/`). The four mint feeders reject a non-conforming target at issue
 /// time, but a token minted before v0.7.0 — or offline — carries an unvalidated target;
 /// `authz::target_matches` calls this so such a target matches NOTHING.
+///
+/// The three-segment form is the ONLY one above two segments: a `<project>/<site>/<facet>/…`
+/// (four+ segments) is non-conforming, and a `<project>/<site>/*` (a site-wide-all-facets
+/// wildcard) is deliberately NOT conforming — the only facet-spanning scopes are the project
+/// (`<project>/*`) and global (`None`) wildcards (the deliberate `admin` span, #12). Target
+/// MATCHING stays EXACT per segment, so a facet-qualified grant authorizes only that facet.
 pub fn is_conforming_role_target(target: &str) -> bool {
     match target.split_once('/') {
         // A project wildcard `<project>/*`: the project segment must be a valid slug.
         Some((project, "*")) => is_valid_resource_slug(project),
-        // A `<project>/<site>`: both segments valid slugs, and no further `/`.
-        Some((project, site)) => {
-            !site.contains('/') && is_valid_resource_slug(project) && is_valid_resource_slug(site)
+        // `<project>/<site>` or `<project>/<site>/<facet>`.
+        Some((project, rest)) => {
+            is_valid_resource_slug(project)
+                && match rest.split_once('/') {
+                    // `<project>/<site>`: a valid site slug, no further `/`.
+                    None => is_valid_resource_slug(rest),
+                    // `<project>/<site>/<facet>`: both valid slugs, and NO deeper nesting
+                    // (a 4th segment ⇒ non-conforming; `<facet>` of `*` ⇒ non-conforming, so a
+                    // site-wide `<project>/<site>/*` wildcard is rejected — only project/global
+                    // wildcards span facets).
+                    Some((site, facet)) => {
+                        !facet.contains('/')
+                            && is_valid_resource_slug(site)
+                            && is_valid_resource_slug(facet)
+                    }
+                }
         }
         // A bare `<project>`: a valid slug.
         None => is_valid_resource_slug(target),
@@ -413,6 +432,24 @@ impl<'de> Deserialize<'de> for DomainOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conforming_role_target_accepts_facet_and_rejects_overreach() {
+        // PLAN-egress-runtime-authz (#12): the facet-qualified `<project>/<site>/<facet>` target is
+        // conforming (so a facet grant enters the authz match set), alongside the pre-existing
+        // `<project>`, `<project>/<site>`, and `<project>/*` forms.
+        assert!(is_conforming_role_target("acme"));
+        assert!(is_conforming_role_target("acme/web"));
+        assert!(is_conforming_role_target("acme/*"));
+        assert!(is_conforming_role_target("acme/web/egress"));
+        // Rejected: a 4th segment, a site-wide-all-facets `<p>/<s>/*` wildcard (only project/global
+        // wildcards span facets), an invalid slug anywhere, and the non-conforming backstop strings.
+        assert!(!is_conforming_role_target("acme/web/egress/extra"));
+        assert!(!is_conforming_role_target("acme/web/*"));
+        assert!(!is_conforming_role_target("acme/../egress"));
+        assert!(!is_conforming_role_target("acme//egress"));
+        assert!(!is_conforming_role_target("${PROJECT}"));
+    }
 
     fn sample() -> Project {
         Project {

@@ -258,17 +258,26 @@ pub fn validate_role_target(target: &str) -> Result<(), InvalidResourceName> {
     match target.split_once('/') {
         // `<project>/*` — the project wildcard: validate the project segment only.
         Some((project, "*")) => validate_resource_name("project", project),
-        // `<project>/<site>` — reject a second `/` (three-segment target), then both.
-        Some((project, site)) => {
-            if site.contains('/') {
-                return reject(
-                    target,
-                    "must be `<project>`, `<project>/<site>`, or `<project>/*` \
-                     (at most one '/')",
-                );
-            }
+        // `<project>/<site>` or `<project>/<site>/<facet>` (the facet-qualified handler-policy
+        // target, PLAN-egress-runtime-authz #12). Validate each segment; reject a FOURTH segment.
+        Some((project, rest)) => {
             validate_resource_name("project", project)?;
-            validate_resource_name("site", site)
+            match rest.split_once('/') {
+                // `<project>/<site>`.
+                None => validate_resource_name("site", rest),
+                // `<project>/<site>/<facet>` — reject a deeper nesting (a fourth '/').
+                Some((site, facet)) => {
+                    if facet.contains('/') {
+                        return reject(
+                            target,
+                            "must be `<project>`, `<project>/<site>`, \
+                             `<project>/<site>/<facet>`, or `<project>/*` (at most two '/')",
+                        );
+                    }
+                    validate_resource_name("site", site)?;
+                    validate_resource_name("facet", facet)
+                }
+            }
         }
         // A bare `<project>` target.
         None => validate_resource_name("project", target),
@@ -460,6 +469,28 @@ mod object_key_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_role_target_accepts_facet_and_rejects_overreach() {
+        // PLAN-egress-runtime-authz (#12): the facet-qualified `<project>/<site>/<facet>` target is
+        // accepted at the token-mint authoring boundary (so a facet grant is mintable), alongside the
+        // pre-existing `<project>`, `<project>/<site>`, and `<project>/*` forms. A fourth segment and
+        // any invalid slug are rejected loud (fail-closed).
+        for ok in ["acme", "acme/web", "acme/*", "acme/web/egress"] {
+            assert!(validate_role_target(ok).is_ok(), "{ok:?} must validate");
+        }
+        for bad in [
+            "acme/web/egress/extra",
+            "acme//egress",
+            "acme/web/eg ress",
+            "",
+        ] {
+            assert!(
+                validate_role_target(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn project_ref_default_and_wrap() {
