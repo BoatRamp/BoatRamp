@@ -1,11 +1,19 @@
 //! The `handlers` subcommand: manage a site's **handler policy** — the
 //! `SiteConfig.handlers` gate (`enabled` + the `allow_imports` allowlist + resource
-//! caps) that activation prechecks a handler-shipping deployment against. Edits the
-//! site's `SiteConfig.handlers` via the control-plane API (the same `PUT
-//! /api/sites/:site/config` the console form and `apply` use).
+//! caps + the `secrets` ENV-name → secret-ref pool) that activation prechecks a
+//! handler-shipping deployment against. Edits the site's `SiteConfig.handlers` via
+//! the control-plane API (the same `PUT /api/sites/:site/config` the console form
+//! and `apply` use).
 //!
 //! A deployment that ships handlers is refused at activation unless the site is
 //! `enabled` and its `allow_imports` is a superset of every handler's declared imports.
+//!
+//! `handlers secrets` is the config-only counterpart to a `sites:` block's
+//! `handlers.secrets` map: it read-modify-writes just that map (via the same
+//! `get`/`put` site-config round trip every other `handlers` subcommand uses), so a
+//! handler↔secret binding can be changed without redeploying the site's content.
+
+use std::collections::BTreeMap;
 
 use boatramp_core::config::{CookieAuthConfig, HandlerCacheConfig, HandlersSiteConfig};
 use clap::Subcommand;
@@ -19,6 +27,9 @@ pub enum Error {
     /// Resolving the target or talking to the control plane failed.
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
+    /// A `secrets set` argument was not `ENV=secret-ref` (or had an empty ENV name).
+    #[error("invalid secrets binding {0:?}: expected ENV=secret-ref")]
+    InvalidSecretBinding(String),
 }
 
 /// `handlers` module result; `Err` is [`Error`].
@@ -87,6 +98,12 @@ enum HandlersCommand {
         #[command(subcommand)]
         command: CookieAuthCommand,
     },
+    /// Manage the site's handler↔secret bindings (`[handlers].secrets`: ENV name →
+    /// secret-ref) — config-only, no content redeploy.
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -117,6 +134,24 @@ enum CookieAuthCommand {
     },
     /// Turn off cookie session auth.
     Clear,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretsCommand {
+    /// Show the site's current ENV name → secret-ref bindings.
+    List,
+    /// Set (insert or update) one or more `ENV_NAME=secret-ref` bindings.
+    Set {
+        /// `ENV_NAME=secret-ref` pair, e.g. `API_KEY=boatramp:api-key`; repeatable.
+        #[arg(required = true, value_name = "ENV=REF")]
+        bindings: Vec<String>,
+    },
+    /// Remove one or more ENV name(s) from the bindings.
+    Unset {
+        /// ENV name(s) to remove.
+        #[arg(required = true, value_name = "ENV")]
+        names: Vec<String>,
+    },
 }
 
 /// The result of a `handlers` subcommand, rendered by [`crate::output`].
@@ -151,6 +186,17 @@ pub enum HandlersOutput {
     CookieAuthSet { site: String, cookie_name: String },
     /// Cookie session auth was turned off.
     CookieAuthCleared { site: String },
+    /// `handlers secrets list` — the site's current ENV name → secret-ref bindings.
+    SecretsList {
+        site: String,
+        secrets: BTreeMap<String, String>,
+    },
+    /// The handler secret bindings were updated (`secrets set` / `secrets unset`) —
+    /// carries the resulting bindings.
+    Secrets {
+        site: String,
+        secrets: BTreeMap<String, String>,
+    },
 }
 
 impl crate::output::Rendered for HandlersOutput {
@@ -182,6 +228,8 @@ impl crate::output::Rendered for HandlersOutput {
             Self::CookieAuthCleared { site } => {
                 writeln!(w, "cookie auth disabled for {site}")
             }
+            Self::SecretsList { site, secrets } => write_secrets(w, site, secrets),
+            Self::Secrets { site, secrets } => write_secrets(w, site, secrets),
         }
     }
 }
@@ -201,6 +249,19 @@ pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<HandlersO
             site,
             handlers: site_config.handlers.clone(),
         });
+    }
+    if matches!(
+        args.command,
+        HandlersCommand::Secrets {
+            command: SecretsCommand::List
+        }
+    ) {
+        let secrets = site_config
+            .handlers
+            .as_ref()
+            .map(|h| h.secrets.clone())
+            .unwrap_or_default();
+        return Ok(HandlersOutput::SecretsList { site, secrets });
     }
 
     let handlers = site_config
@@ -302,6 +363,28 @@ pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<HandlersO
                 HandlersOutput::CookieAuthCleared { site: site.clone() }
             }
         },
+        HandlersCommand::Secrets { command } => match command {
+            SecretsCommand::List => unreachable!("handled above"),
+            SecretsCommand::Set { bindings } => {
+                for binding in &bindings {
+                    let (env, secret_ref) = parse_secret_binding(binding)?;
+                    handlers.secrets.insert(env, secret_ref);
+                }
+                HandlersOutput::Secrets {
+                    site: site.clone(),
+                    secrets: handlers.secrets.clone(),
+                }
+            }
+            SecretsCommand::Unset { names } => {
+                for name in &names {
+                    handlers.secrets.remove(name);
+                }
+                HandlersOutput::Secrets {
+                    site: site.clone(),
+                    secrets: handlers.secrets.clone(),
+                }
+            }
+        },
     };
 
     cp.put_site_config(&site, &site_config).await?;
@@ -322,6 +405,43 @@ fn dedup(imports: Vec<String>) -> Vec<String> {
 /// Render a string list as `[a, b]` or `[]`.
 fn fmt_list(list: &[String]) -> String {
     format!("[{}]", list.join(", "))
+}
+
+/// Render a secrets map as `{a=1, b=2}` or `{}` (iteration order is the
+/// `BTreeMap`'s sorted key order, so this is deterministic).
+fn fmt_secrets(secrets: &BTreeMap<String, String>) -> String {
+    let entries: Vec<String> = secrets.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    format!("{{{}}}", entries.join(", "))
+}
+
+/// Parse a `secrets set ENV=secret-ref` argument, erroring on a missing `=` or an
+/// empty ENV name. Mirrors `sync`'s `--tag key=value` parsing.
+fn parse_secret_binding(pair: &str) -> Result<(String, String)> {
+    let (env, secret_ref) = pair
+        .split_once('=')
+        .ok_or_else(|| Error::InvalidSecretBinding(pair.to_string()))?;
+    let env = env.trim();
+    if env.is_empty() {
+        return Err(Error::InvalidSecretBinding(pair.to_string()));
+    }
+    Ok((env.to_string(), secret_ref.to_string()))
+}
+
+/// Write a site's handler secret bindings for `secrets list` / `secrets set` /
+/// `secrets unset`.
+fn write_secrets(
+    w: &mut dyn std::io::Write,
+    site: &str,
+    secrets: &BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    if secrets.is_empty() {
+        return writeln!(w, "secrets: none set for {site}");
+    }
+    writeln!(w, "secrets for {site}:")?;
+    for (env, secret_ref) in secrets {
+        writeln!(w, "  {env} = {secret_ref}")?;
+    }
+    Ok(())
 }
 
 /// Write the site's handler policy for `handlers show`.
@@ -353,6 +473,9 @@ fn write_policy(
             if let Some(v) = h.max_fuel {
                 writeln!(w, "  max_fuel: {v}")?;
             }
+            if !h.secrets.is_empty() {
+                writeln!(w, "  secrets: {}", fmt_secrets(&h.secrets))?;
+            }
         }
     }
     Ok(())
@@ -361,6 +484,7 @@ fn write_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::Rendered;
 
     #[test]
     fn dedup_preserves_first_occurrence_order() {
@@ -395,5 +519,106 @@ mod tests {
         // disable keeps the allowlist
         h.enabled = false;
         assert_eq!(h.allow_imports, vec!["sql", "invoke"]);
+    }
+
+    #[test]
+    fn parse_secret_binding_splits_on_first_equals() {
+        let (env, secret_ref) = parse_secret_binding("API_KEY=boatramp:api-key").unwrap();
+        assert_eq!(env, "API_KEY");
+        assert_eq!(secret_ref, "boatramp:api-key");
+        // Only the first `=` splits, so a ref may itself contain `=`.
+        let (env, secret_ref) = parse_secret_binding("TOKEN=env:SOME=THING").unwrap();
+        assert_eq!(env, "TOKEN");
+        assert_eq!(secret_ref, "env:SOME=THING");
+    }
+
+    #[test]
+    fn parse_secret_binding_trims_the_env_name() {
+        let (env, secret_ref) = parse_secret_binding(" API_KEY =boatramp:api-key").unwrap();
+        assert_eq!(env, "API_KEY");
+        assert_eq!(secret_ref, "boatramp:api-key");
+    }
+
+    #[test]
+    fn parse_secret_binding_rejects_missing_equals_and_empty_env() {
+        assert!(matches!(
+            parse_secret_binding("no-equals-sign"),
+            Err(Error::InvalidSecretBinding(_))
+        ));
+        assert!(matches!(
+            parse_secret_binding("=boatramp:api-key"),
+            Err(Error::InvalidSecretBinding(_))
+        ));
+        assert!(matches!(
+            parse_secret_binding("   =boatramp:api-key"),
+            Err(Error::InvalidSecretBinding(_))
+        ));
+    }
+
+    #[test]
+    fn secrets_set_and_unset_mutate_the_pool_read_modify_write() {
+        // The pure mutation `secrets set` / `secrets unset` apply, exercised on a
+        // fresh policy — no content redeploy, just the `[handlers].secrets` map.
+        let mut h = HandlersSiteConfig::default();
+        assert!(h.secrets.is_empty());
+        // secrets set API_KEY=boatramp:api-key DB_URL=env:DATABASE_URL
+        for pair in ["API_KEY=boatramp:api-key", "DB_URL=env:DATABASE_URL"] {
+            let (env, secret_ref) = parse_secret_binding(pair).unwrap();
+            h.secrets.insert(env, secret_ref);
+        }
+        assert_eq!(
+            h.secrets.get("API_KEY").map(String::as_str),
+            Some("boatramp:api-key")
+        );
+        assert_eq!(
+            h.secrets.get("DB_URL").map(String::as_str),
+            Some("env:DATABASE_URL")
+        );
+        // secrets set API_KEY=boatramp:api-key-v2 (update, not duplicate)
+        let (env, secret_ref) = parse_secret_binding("API_KEY=boatramp:api-key-v2").unwrap();
+        h.secrets.insert(env, secret_ref);
+        assert_eq!(h.secrets.len(), 2);
+        assert_eq!(
+            h.secrets.get("API_KEY").map(String::as_str),
+            Some("boatramp:api-key-v2")
+        );
+        // secrets unset DB_URL
+        h.secrets.remove("DB_URL");
+        assert_eq!(h.secrets.len(), 1);
+        assert!(!h.secrets.contains_key("DB_URL"));
+        // unsetting an absent name is a no-op, not an error
+        h.secrets.remove("NEVER_SET");
+        assert_eq!(h.secrets.len(), 1);
+    }
+
+    #[test]
+    fn secrets_output_renders_human_and_json() {
+        let secrets = BTreeMap::from([("API_KEY".to_string(), "boatramp:api-key".to_string())]);
+        let out = HandlersOutput::Secrets {
+            site: "demo".to_string(),
+            secrets: secrets.clone(),
+        };
+        let mut buf = Vec::new();
+        out.render_human(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("demo"));
+        assert!(text.contains("API_KEY = boatramp:api-key"));
+
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["result"], "secrets");
+        assert_eq!(json["site"], "demo");
+        assert_eq!(json["secrets"]["API_KEY"], "boatramp:api-key");
+
+        // An empty pool renders a clear "none set" line, not a blank body.
+        let empty = HandlersOutput::SecretsList {
+            site: "demo".to_string(),
+            secrets: BTreeMap::new(),
+        };
+        let mut buf = Vec::new();
+        empty.render_human(&mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "secrets: none set for demo\n"
+        );
     }
 }

@@ -20,6 +20,29 @@ secrets: {
 The guest sees `STRIPE_KEY` / `DATABASE_URL` in its environment; the config only
 ever carries the left-hand names and the right-hand **reference**.
 
+## Bind an ENV name to a reference, without redeploying
+
+The map above lives in the **site's** mutable config
+(`SiteConfig.handlers.secrets` — see the [SiteConfig
+reference](../reference/siteconfig.md#handlers)), not in the deployment. Folding
+it into an `apply.cfg` `config.handlers.secrets` block works, but `apply` also
+deploys + activates the site's content — overkill for rotating one reference or
+adding a binding. `boatramp handlers secrets` edits just this map (a
+read-modify-write through the same site-config API `apply` and `sync` use), so a
+handler↔secret binding changes without touching the deployed content:
+
+```sh
+boatramp handlers secrets set my-site \
+    STRIPE_KEY=boatramp:stripe-key \
+    DATABASE_URL=env:DATABASE_URL
+boatramp handlers secrets list my-site
+boatramp handlers secrets unset my-site DATABASE_URL
+```
+
+`set` inserts or updates each `ENV=reference` pair; `unset` removes the named
+ENV key(s) (an absent name is a no-op, not an error); `list` prints the current
+bindings. None of the three redeploy or reactivate the site.
+
 ## The reference schemes
 
 A `secrets` value is parsed by its scheme (the part before the first `:`); a
