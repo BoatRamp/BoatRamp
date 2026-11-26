@@ -458,7 +458,11 @@ pub(super) async fn put_site_config(
     //       maps to — so a declarative re-apply by a non-policy principal still works. The required
     //       right is built by one helper (`egress_overlay_edit_right`) + checked by one seam
     //       (`require_egress_overlay_edit_right`).
-    {
+    // `expected_egress` = the stored overlay this request's change-detect + facet-authz decision was
+    // made against. It is passed as a PRECONDITION to the write below (LOW-3): the write lands only if
+    // the stored overlay is STILL this, re-checked under the deploy lock — closing the read→write TOCTOU
+    // (a stale authz decision, or clobbering a concurrent egress edit).
+    let expected_egress: std::collections::BTreeMap<String, Vec<String>> = {
         let empty_overlay = std::collections::BTreeMap::new();
         let next_overlay = config
             .handlers
@@ -495,7 +499,8 @@ pub(super) async fn put_site_config(
         {
             return resp;
         }
-    }
+        current_overlay.clone()
+    };
     // Per-site subgraph composition (S2b): a site's `graphql.subgraphs` include list is validated
     // fail-closed HERE, at the config-write chokepoint, against the live registry — an empty set, an
     // unregistered include, or an invalid Federation subset is a `400` and the config is NOT stored.
@@ -530,10 +535,17 @@ pub(super) async fn put_site_config(
     // `domains.contexts`/`aliases` the incoming config doesn't mention — so a declarative `apply`
     // (which calls this) can't wipe a tenant's runtime host routing. Removal stays via `domain rm`.
     match deploy
-        .set_site_config_cooperative(project.as_ref(), &site, &config)
+        .set_site_config_cooperative_if_egress_unchanged(
+            project.as_ref(),
+            &site,
+            &config,
+            &expected_egress,
+        )
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // LOW-3: a `Conflict` here is a concurrent egress-overlay edit in the read→write window; it
+        // maps to 409 (the client re-reads + retries) rather than clobbering under a stale authz view.
         Err(err) => deploy_error_response(err),
     }
 }

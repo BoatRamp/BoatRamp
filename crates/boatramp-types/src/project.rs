@@ -150,6 +150,13 @@ pub fn is_valid_resource_slug(value: &str) -> bool {
 /// wildcard) is deliberately NOT conforming — the only facet-spanning scopes are the project
 /// (`<project>/*`) and global (`None`) wildcards (the deliberate `admin` span, #12). Target
 /// MATCHING stays EXACT per segment, so a facet-qualified grant authorizes only that facet.
+///
+/// GRAIN NOTE (#12 review LOW-4): this 3-segment form is shared by BOTH `Resource::HandlerPolicy`
+/// (`<project>/<site>/<facet>`) and `Resource::BlobUpload` (`<project>/<site>/<container>`), and the
+/// Cedar authorizer keys target-scoped grants in a per-role `_sites` set SHARED across the role's
+/// resources — so a single role combining `RoleTarget` templates for BOTH could alias a grant across
+/// them. That combination is rejected at policy compile (`boatramp_core::cedar::CompiledCedar::compile`
+/// → `CedarError::AliasedGrain`); this predicate itself stays resource-agnostic.
 pub fn is_conforming_role_target(target: &str) -> bool {
     match target.split_once('/') {
         // A project wildcard `<project>/*`: the project segment must be a valid slug.

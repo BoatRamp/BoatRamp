@@ -51,6 +51,16 @@ pub enum CedarError {
     /// The generated policy text failed to parse — an internal generator bug.
     #[error("policy generation failed: {0}")]
     Policy(String),
+    /// A single role combines target-scoped (`RoleTarget`) templates for TWO resources that share the
+    /// 3-segment `_sites` grain — `BlobUpload` (`<project>/<site>/<container>`) and `HandlerPolicy`
+    /// (`<project>/<site>/<facet>`) — so a grant could alias across them (a blob container named
+    /// `egress` ≡ the `egress` facet). Rejected on compile, deny-safe (PLAN-egress-runtime-authz #12
+    /// review LOW-4). Split the role so each keeps its own `_sites` set.
+    #[error(
+        "role {0:?} combines target-scoped BlobUpload and HandlerPolicy templates, which share the \
+         3-segment target grain and could alias a grant across resources — split them into two roles"
+    )]
+    AliasedGrain(String),
 }
 
 /// A richer authorization outcome than a bare `bool`: the allow/deny decision plus
@@ -160,6 +170,23 @@ impl CompiledCedar {
         for name in policy.roles.keys() {
             if !is_safe_ident(name) {
                 return Err(CedarError::RoleName(name.clone()));
+            }
+        }
+        // LOW-4 (cross-resource 3-segment grain): the per-role `<role>_sites` set is SHARED across the
+        // role's `RoleTarget` templates, and BlobUpload (`<project>/<site>/<container>`) and
+        // HandlerPolicy (`<project>/<site>/<facet>`) BOTH exact-match a 3-segment `name` — so a single
+        // role granting a `RoleTarget` template for BOTH could alias a grant across them (a blob
+        // container named `egress` ≡ the `egress` facet). Reject that combination at authoring
+        // (fail-closed-loud); a role that genuinely needs both must split so each keeps its own
+        // `_sites`. Not reachable in the default policy (BlobUpload is admin-only / AnyTarget there).
+        for (name, templates) in &policy.roles {
+            let roletarget = |res: Resource| {
+                templates
+                    .iter()
+                    .any(|t| t.resource == res && matches!(t.scope, TargetScope::RoleTarget))
+            };
+            if roletarget(Resource::BlobUpload) && roletarget(Resource::HandlerPolicy) {
+                return Err(CedarError::AliasedGrain(name.clone()));
             }
         }
         let text = generate_policy_text(policy);
@@ -1219,6 +1246,56 @@ mod tests {
                     Err(CedarError::RoleName(_))
                 ),
                 "expected rejection of role name {bad:?}"
+            );
+        }
+    }
+
+    /// LOW-4 (cross-resource 3-segment grain): a role combining a `RoleTarget` `BlobUpload` template
+    /// AND a `RoleTarget` `HandlerPolicy` template is REJECTED at compile (they share the per-role
+    /// `_sites` grain, so a `<p>/<s>/<container>` grant could alias a `<p>/<s>/<facet>` requirement).
+    /// Either resource ALONE, or either combined with a non-grain resource, is fine.
+    #[test]
+    fn compile_rejects_blobupload_handlerpolicy_grain_alias() {
+        let role = |templates: Vec<RightTemplate>| {
+            let mut roles: BTreeMap<String, Vec<RightTemplate>> = BTreeMap::new();
+            roles.insert("r".to_string(), templates);
+            AuthzPolicy {
+                version: boatramp_types::SCHEMA_VERSION,
+                roles,
+            }
+        };
+        // The forbidden combination ⇒ rejected.
+        assert!(
+            matches!(
+                CompiledCedar::compile(&role(vec![
+                    RightTemplate::scoped(Resource::BlobUpload, Action::Write),
+                    RightTemplate::scoped(Resource::HandlerPolicy, Action::Write),
+                ])),
+                Err(CedarError::AliasedGrain(_))
+            ),
+            "a role combining RoleTarget BlobUpload + HandlerPolicy must be rejected"
+        );
+        // Each alone compiles; HandlerPolicy + a non-grain Site RoleTarget compiles (no shared grain).
+        for ok in [
+            vec![RightTemplate::scoped(
+                Resource::HandlerPolicy,
+                Action::Write,
+            )],
+            vec![RightTemplate::scoped(Resource::BlobUpload, Action::Write)],
+            vec![
+                RightTemplate::scoped(Resource::HandlerPolicy, Action::Write),
+                RightTemplate::scoped(Resource::Site, Action::Write),
+            ],
+            // BlobUpload as an AnyTarget (admin-style) alongside HandlerPolicy RoleTarget is fine —
+            // only a TARGET-scoped BlobUpload shares the grain.
+            vec![
+                RightTemplate::any(Resource::BlobUpload, Action::Write),
+                RightTemplate::scoped(Resource::HandlerPolicy, Action::Write),
+            ],
+        ] {
+            assert!(
+                CompiledCedar::compile(&role(ok)).is_ok(),
+                "a role without BOTH RoleTarget BlobUpload AND HandlerPolicy must compile"
             );
         }
     }

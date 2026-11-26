@@ -224,6 +224,8 @@ mod tests {
             key, "/fetch",
             "the write must target ONLY the baked workload key"
         );
+        // Marker the CI gate greps for, to catch a silent skip/rename (ignore-gated-tests ≠ evidence).
+        println!("EGRESS-REGISTER SCOPE GATE OK");
     }
 
     /// The register-time gate: an invalid entry (grammar or SSRF floor) refuses the WHOLE set — nothing

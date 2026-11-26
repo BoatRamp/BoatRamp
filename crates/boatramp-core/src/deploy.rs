@@ -1597,7 +1597,7 @@ impl DeployStore {
         config: &SiteConfig,
     ) -> Result<(), DeployError> {
         let _claim = self.domain_claim_lock.lock().await;
-        self.set_site_config_locked(project, site, config, false)
+        self.set_site_config_locked(project, site, config, false, None)
             .await
     }
 
@@ -1617,7 +1617,28 @@ impl DeployStore {
         config: &SiteConfig,
     ) -> Result<(), DeployError> {
         let _claim = self.domain_claim_lock.lock().await;
-        self.set_site_config_locked(project, site, config, true)
+        self.set_site_config_locked(project, site, config, true, None)
+            .await
+    }
+
+    /// [`set_site_config_cooperative`](Self::set_site_config_cooperative) with an egress-overlay
+    /// PRECONDITION (PLAN-egress-runtime-authz #12, review LOW-3): the whole-config write lands ONLY if
+    /// the stored `handlers.egress_allow` still equals `expected` — read INSIDE the domain-claim lock,
+    /// so there is no read→write TOCTOU. The control-plane `put_site_config` makes its egress change-
+    /// detect + facet-authz decision against the overlay it read, then passes that overlay here; a
+    /// concurrent edit that changed the stored overlay in the window makes this return
+    /// [`DeployError::Conflict`] (the caller re-reads + retries) instead of silently clobbering the
+    /// concurrent edit or writing under a stale authz decision. A non-egress concurrent edit does not
+    /// change `egress_allow`, so it never conflicts here.
+    pub async fn set_site_config_cooperative_if_egress_unchanged(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        config: &SiteConfig,
+        expected: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<(), DeployError> {
+        let _claim = self.domain_claim_lock.lock().await;
+        self.set_site_config_locked(project, site, config, true, Some(expected))
             .await
     }
 
@@ -1663,7 +1684,7 @@ impl DeployStore {
                 .egress_allow
                 .insert(workload.to_string(), hosts);
         }
-        self.set_site_config_locked(project, site, &config, true)
+        self.set_site_config_locked(project, site, &config, true, None)
             .await
     }
 
@@ -1677,6 +1698,11 @@ impl DeployStore {
         site: &str,
         config: &SiteConfig,
         cooperative: bool,
+        // PLAN-egress-runtime-authz #12 (review LOW-3): when `Some`, a precondition — the stored
+        // `handlers.egress_allow` (read below, under the lock) MUST still equal this, else
+        // [`DeployError::Conflict`]. Closes the control-plane put_site_config read→write TOCTOU on the
+        // egress overlay (a stale authz decision / a clobbered concurrent egress edit). `None` ⇒ no check.
+        expected_egress: Option<&std::collections::BTreeMap<String, Vec<String>>>,
     ) -> Result<(), DeployError> {
         // Validate the gateway on EVERY write, not just the CLI `gateway`/`apply` paths: a raw
         // operator-API PUT or a guest `admin:site` write must not persist a gateway a `gateway apply`
@@ -1691,6 +1717,24 @@ impl DeployStore {
         // by `get_site_config`). Reused for the context base, the alias oracle, and the
         // stale-domain-key deletes below.
         let old = self.get_site_config(project, site).await?;
+
+        // LOW-3 egress precondition: fail-closed CONFLICT if the stored egress overlay changed since the
+        // caller read it (under THIS lock, so the check + the write are one critical section). Only the
+        // control-plane `put_site_config` passes `Some` (with the overlay its authz decision used).
+        if let Some(expected) = expected_egress {
+            let empty = BTreeMap::new();
+            let stored = old
+                .as_ref()
+                .and_then(|o| o.handlers.as_ref())
+                .map_or(&empty, |h| &h.egress_allow);
+            if stored != expected {
+                return Err(DeployError::Conflict(
+                    "the site's runtime egress overlay (handlers.egress_allow) changed since it was \
+                     read; re-read the site config and retry the write"
+                        .to_string(),
+                ));
+            }
+        }
 
         // --- contexts: authoritative in their OWN store, never clobbered by a whole-config PUT
         // (v0.4.23). A domain→tenant binding is imperatively-written runtime state (tenants
@@ -3156,7 +3200,7 @@ impl DeployStore {
         // Entry-level write (attach a verified domain): non-cooperative — this path already
         // read-modified-write the full config, so a merge would be redundant, and it must be able
         // to reflect the exact `config` it computed.
-        self.set_site_config_locked(project, site.as_str(), &config, false)
+        self.set_site_config_locked(project, site.as_str(), &config, false, None)
             .await?;
         Ok(config)
     }
@@ -3200,7 +3244,7 @@ impl DeployStore {
         // its effective context map is now the host-free store, so the host's routing-index value
         // is re-stamped without the tag. If the site has no config, just drop cached resolutions.
         if let Some(cfg) = self.get_site_config(project, site).await? {
-            self.set_site_config_locked(project, site, &cfg, false)
+            self.set_site_config_locked(project, site, &cfg, false, None)
                 .await?;
         } else {
             self.bump_domain_epoch();
@@ -5367,6 +5411,70 @@ mod tests {
         assert_eq!(
             h.effective_egress_allowlist("/b", &[]),
             vec!["b.example:993".to_string()]
+        );
+    }
+
+    /// PLAN-egress-runtime-authz #12 review LOW-3: the control-plane put precondition —
+    /// `set_site_config_cooperative_if_egress_unchanged` writes ONLY if the stored overlay still
+    /// equals what the caller's authz decision was made against; a concurrent overlay change in the
+    /// read→write window yields `Conflict` instead of a silent clobber / stale-authz write.
+    #[tokio::test]
+    async fn set_site_config_if_egress_unchanged_precondition() {
+        use crate::config::{HandlersSiteConfig, SiteConfig};
+        use crate::kv::MemoryKv;
+        use std::collections::BTreeMap;
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let p = ProjectRef::new("acme");
+        let cfg = |overlay: &[(&str, &[&str])]| SiteConfig {
+            handlers: Some(
+                HandlersSiteConfig::builder()
+                    .enabled(true)
+                    .egress_allow(
+                        overlay
+                            .iter()
+                            .map(|(k, hs)| {
+                                (k.to_string(), hs.iter().map(ToString::to_string).collect())
+                            })
+                            .collect(),
+                    )
+                    .build(),
+            ),
+            ..Default::default()
+        };
+
+        // Seed the stored overlay = {fetch: [x]}.
+        store
+            .set_site_config(p, "web", &cfg(&[("fetch", &["x:993"])]))
+            .await
+            .unwrap();
+
+        // A write whose precondition MATCHES the stored overlay lands.
+        let mut expected: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        expected.insert("fetch".into(), vec!["x:993".into()]);
+        store
+            .set_site_config_cooperative_if_egress_unchanged(
+                p,
+                "web",
+                &cfg(&[("fetch", &["x:993", "y:993"])]),
+                &expected,
+            )
+            .await
+            .expect("matching precondition ⇒ write lands");
+
+        // A STALE precondition (stored is now {fetch:[x,y]}, we still claim {fetch:[x]}) ⇒ Conflict,
+        // not a silent clobber of the concurrent edit.
+        let err = store
+            .set_site_config_cooperative_if_egress_unchanged(
+                p,
+                "web",
+                &cfg(&[("fetch", &["z:993"])]),
+                &expected,
+            )
+            .await
+            .expect_err("stale precondition ⇒ Conflict");
+        assert!(
+            matches!(err, DeployError::Conflict(_)),
+            "stale egress precondition ⇒ Conflict"
         );
     }
 

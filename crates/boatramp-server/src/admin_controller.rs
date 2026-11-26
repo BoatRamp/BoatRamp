@@ -366,6 +366,15 @@ impl AdminController for ServerAdminController {
         // (defense-in-depth; the effective grant is still manifest imports ∩ this ∩ posture).
         next.validate_allow_imports()
             .map_err(|e| AdminError::InvalidInput(e.to_string()))?;
+        // PLAN-egress-runtime-authz #12 (review LOW-2(b)): validate the runtime egress overlay on THIS
+        // write path too — the guest `admin` `site-config-put`, symmetric to the HTTP `put_site_config`
+        // gate — so neither path can store a malformed `host:port` entry that would become a silent
+        // never-match at dial. Fail-closed-loud.
+        #[cfg(feature = "handlers")]
+        if let Some(h) = next.handlers.as_ref() {
+            h.validate_egress_overlay()
+                .map_err(|e| AdminError::InvalidInput(format!("site {site:?}: {e}")))?;
+        }
         // The routing-hijack guard: a config write can't attach an unverified domain.
         match check_added_domains_verified(&self.deploy, self.project(), site, &next)
             .await

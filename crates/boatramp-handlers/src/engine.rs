@@ -5144,6 +5144,8 @@ mod tests {
             .await,
             "one site's overlay must not widen another site's egress (cross-tenant isolation)"
         );
+        // Marker the CI gate greps for, to catch a silent skip/rename (ignore-gated-tests ≠ evidence).
+        println!("EGRESS-OVERLAY STATIC GATE OK");
     }
 
     /// PLAN-egress-runtime-authz (#12): the overlay union feeds the FULL resolve+gate
@@ -5194,6 +5196,8 @@ mod tests {
             Err(TcpEgressResolveError::RefusedByGate),
             "a non-allowlisted global host is still refused (the overlay is a strict allowlist)"
         );
+        // Marker the CI gate greps for, to catch a silent skip/rename (ignore-gated-tests ≠ evidence).
+        println!("EGRESS-OVERLAY PLAINTEXT GATE OK");
     }
 
     /// BR-REQ-2 — the dynamic (runtime-resolved-host) NAME allowlist matcher: `host-glob:port` with
