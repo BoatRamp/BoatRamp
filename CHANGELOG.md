@@ -5,6 +5,37 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.75.0]
+
+### Added
+
+- **A broad typed DDL (schema-change) builder — `boatramp-core::ddl`.** A pure AST → validated-SQL
+  emitter (the schema-creation counterpart to the `orm` query compiler: no I/O, no credential, no
+  authority), whose output runs **only** on the already-gated owner-role `project migrate` seam
+  (`Project·Admin`) — so it grants **zero new runtime authority**; it is pure codegen that makes
+  migration DDL typed and identifier-safe. v1 operation set:
+  - `CreateTable` — with a **tenant-scoped variant** that additionally emits the RLS policy (keyed on
+    the `rls_session` tenant-GUC convention, `USING`/`WITH CHECK current_setting(…)`) **and**
+    `ALTER TABLE … FORCE ROW LEVEL SECURITY`, so a builder-made tenant table can never ship RLS-less.
+  - `AddColumn`, `CreateIndex` (btree/hash/gin/gist/**hnsw/ivfflat**), `CreateType` (enum).
+  - `DropTable`/`DropColumn`/`DropIndex` + `AlterColumnType`/`RenameTable`/`RenameColumn`, each behind
+    an explicit `destructive: true` acknowledgement (a DX guard against accidental data loss — NOT a
+    new authority boundary; a raw `Sql` step can already `DROP` at the same owner altitude).
+  - Portable scalar column types + `jsonb`/`uuid`/**`vector(N)`** (the Postgres-specific types,
+    tenant RLS, indexes, and enum `CREATE TYPE` are Postgres-only and fail closed elsewhere).
+  - **No-injection by construction:** identifiers go through the shared `orm` ident rule and reject
+    any dot (so a schema-qualified name can never be emitted); defaults are a **closed enum**
+    (`literal` / `now()` / `null` / `gen_random_uuid()`), never a free-SQL string; the builder refuses
+    the host-owned `boatramp_migrations`/`schema_migrations` ledger namespace; it **never** emits
+    `CREATE EXTENSION` (that stays the operator-allowlisted `Extension` step). The vector
+    metric→opclass→query-operator coupling (`vector_cosine_ops`⇒`<=>`, `vector_l2_ops`⇒`<->`,
+    `vector_ip_ops`⇒`<#>`) is derived from one `Metric`, so an index and its kNN query can't drift;
+    `CONCURRENTLY` surfaces a `no_transaction` flag for the migration step.
+- **`orm-vector` graduated Experimental → Stable**, and the metric set firmed with **`inner-product`
+  (`<#>`, `vector_ip_ops`)** alongside cosine/L2 (an append-only addition to the WIT
+  `distance-metric` enum and `boatramp-core::orm::Metric`). The `vector-literal(string)` value
+  round-trip is unchanged (no new `value` variant).
+
 ## [0.74.0] — 2026-11-26
 
 ### Added

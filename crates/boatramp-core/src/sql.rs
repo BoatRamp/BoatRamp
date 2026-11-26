@@ -255,7 +255,8 @@ pub fn render_set_local_gucs(gucs: &[(String, SqlValue)]) -> Option<(String, Vec
 /// ([`render_begin_with_gucs_pg`]); callers pass only host-controlled, validated inputs (the operator's
 /// fixed GUC names and host-resolved, path-segment-safe tenant/session ids that never legitimately
 /// contain `'` or `\`), never guest text — so this escaping is defense-in-depth over that invariant.
-fn pg_quote_literal(s: &str) -> String {
+/// Also reused by the typed [`crate::ddl`] builder to inline a scalar `DEFAULT` / RLS-GUC literal.
+pub(crate) fn pg_quote_literal(s: &str) -> String {
     format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
 }
 

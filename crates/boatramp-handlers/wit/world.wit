@@ -132,8 +132,10 @@ interface orm {
   enum cmp-op { eq, ne, lt, le, gt, ge }
   enum join-kind { inner, left-join }
   enum direction { asc, desc }
-  // `pgvector` distance metric (Postgres-only): cosine `<=>` / L2 `<->`.
-  enum distance-metric { cosine, l2 }
+  // `pgvector` distance metric (Postgres-only): cosine `<=>` / L2 `<->` / inner-product `<#>`.
+  // Append-only — `inner-product` is the third float metric; an old host simply never receives it,
+  // a guest that emits it declares `requires = ["orm-vector"]` (checked at deploy, not by version).
+  enum distance-metric { cosine, l2, inner-product }
 
   // ---- expression arena ----------------------------------------------------
   // Recursive scalar expressions cross the WIT boundary as a flat arena: an `expr-node`'s

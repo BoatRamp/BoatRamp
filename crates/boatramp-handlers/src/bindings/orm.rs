@@ -650,6 +650,7 @@ fn to_core_metric(m: wit::DistanceMetric) -> core::Metric {
     match m {
         wit::DistanceMetric::Cosine => core::Metric::Cosine,
         wit::DistanceMetric::L2 => core::Metric::L2,
+        wit::DistanceMetric::InnerProduct => core::Metric::InnerProduct,
     }
 }
 
