@@ -3528,6 +3528,38 @@ jobs:
             || { echo "::error::MySQL executable-comment guard test did not pass (a /*! */ evasion regression)" >&2; exit 1; }
           grep -q 'postgres_treats_executable_comment_syntax_as_inert ... ok' migrate-guard-unit.log \
             || { echo "::error::Postgres executable-comment inertness test did not pass (a PG guard regression)" >&2; exit 1; }
+      - name: Typed DDL builder tenant-scoped vector is correct on a real pgvector (roadmap #13)
+        run: |
+          set -o pipefail
+          # The runtime half of the typed `boatramp-core::ddl` builder (#13): the compile-time
+          # byte-for-byte equality to the hand-written DDL is the pure unit battery, this proves the
+          # builder's OUTPUT on a REAL engine. The job's `postgres:16-alpine` service has NO pgvector,
+          # so bring up a stock `pgvector/pgvector:pg16` on a distinct host port (5456) and drive the
+          # REAL three-identity owner-role model (provision_ddl + grant_app_role_ddl) against it as
+          # the SUPERUSER. It proves: (1) the builder's tenant-scoped CreateTable emits an RLS policy
+          # + FORCE RLS such that a kNN over a SHARED two-tenant vector keyspace (the other tenant's
+          # rows placed NEAREST the probe) run as the NON-superuser runtime role returns ZERO foreign
+          # rows (and an unset tenant GUC fails closed); (2) the builder's hnsw `vector_cosine_ops`
+          # index is USED (EXPLAIN shows an Index Scan, never a Seq Scan — a metric/opclass mismatch
+          # would be unusable). A silent skip (pg/docker absent) still prints `test result: ok`, so
+          # gate on BOTH markers, which print ONLY after every isolation + index-use assertion held.
+          docker rm -f ddl-pgvector >/dev/null 2>&1 || true
+          docker run -d --name ddl-pgvector -e POSTGRES_PASSWORD=postgres \
+            -p 5456:5432 pgvector/pgvector:pg16 >/dev/null
+          for i in $(seq 1 60); do
+            docker exec ddl-pgvector pg_isready -U postgres >/dev/null 2>&1 && break
+            sleep 2
+          done
+          BOATRAMP_TEST_PG_URL="postgres://postgres:postgres@localhost:5456/postgres" \
+            cargo test -p boatramp-storage --features sql-postgres \
+            --test ddl_builder_sqlx_live -- --nocapture --test-threads=1 2>&1 | tee ddl-builder.log
+          docker rm -f ddl-pgvector >/dev/null 2>&1 || true
+          grep -qE 'test result: ok\. 1 passed' ddl-builder.log \
+            || { echo "::error::DDL builder pgvector gate did not run (a silent skip — pg/docker absent — or a failure)" >&2; exit 1; }
+          grep -q 'DDL BUILDER TENANT-SCOPED KNN OK \[postgres\]' ddl-builder.log \
+            || { echo "::error::DDL builder tenant-scoped kNN never reached its marker (silent skip, or the emitted RLS policy leaked a foreign row across the shared vector keyspace / an unset GUC did not fail closed)" >&2; exit 1; }
+          grep -q 'DDL BUILDER HNSW INDEX SCAN OK \[postgres\]' ddl-builder.log \
+            || { echo "::error::DDL builder hnsw index never reached its marker (silent skip, or the emitted hnsw vector_cosine_ops index was not used — a metric/opclass coupling regression — and the kNN seq-scanned)" >&2; exit 1; }
 
   # ============================================================================================
   # kv-sql backend family (v0.12.0): the SQL-backed control-plane KvStore + multi-writer `shared`

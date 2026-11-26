@@ -38,6 +38,9 @@ pub mod overlay_policy;
 /// A typed query AST + injection-safe `?N` SQL compiler backing the `orm` handler binding.
 pub mod claim_extract;
 pub mod compute;
+/// A pure, typed DDL (schema-change) AST → validated-SQL emitter — the create-table/column/index/
+/// type builder for the owner-role `project migrate` seam. No I/O, no authority (mirrors [`orm`]).
+pub mod ddl;
 pub mod deploy;
 /// Per-project SMTP email-profile store (sealed password) backing the `email`
 /// guest capability — credentials host-held, config admin-reconfigurable.

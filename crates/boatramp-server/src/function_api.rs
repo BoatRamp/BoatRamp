@@ -292,11 +292,13 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
         name: "sql-json",
         lifecycle: Stable,
     });
-    // pgvector `distance` is new and Postgres-only (fail-closed elsewhere); the vector surface is
-    // the most likely to grow more operators/index hints — flagged experimental until it settles.
+    // pgvector `distance` / `vector-literal` (Postgres-only, fail-closed elsewhere). GRADUATED to
+    // Stable (v0.75.0): the metric set (cosine `<=>` / L2 `<->`) and the value round-trip
+    // (`vector-literal(string)`) are settled. The typed `ddl` builder emits matching `vector(N)`
+    // columns + hnsw/ivfflat opclass indexes on the owner-role migration seam.
     f.push(CapabilityFeature {
         name: "orm-vector",
-        lifecycle: Experimental,
+        lifecycle: Stable,
     });
     // The `is_own()` / `own_first()` own-vs-base ranking (base-vs-override reads). Always compiled
     // (a pure AST lowering into CASE, no deps); experimental until the shape settles.
@@ -1083,10 +1085,8 @@ mod tests {
         };
         assert_eq!(lifecycle("sql"), Some(super::Lifecycle::Stable));
         assert_eq!(lifecycle("sql-json"), Some(super::Lifecycle::Stable));
-        assert_eq!(
-            lifecycle("orm-vector"),
-            Some(super::Lifecycle::Experimental)
-        );
+        // Graduated Experimental→Stable in v0.75.0 (the float-metric set + value round-trip settled).
+        assert_eq!(lifecycle("orm-vector"), Some(super::Lifecycle::Stable));
         assert_eq!(
             lifecycle("orm-own-pref"),
             Some(super::Lifecycle::Experimental)

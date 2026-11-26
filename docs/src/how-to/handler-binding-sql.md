@@ -292,9 +292,9 @@ portable function set; `RETURNING`; `ON CONFLICT` upserts; `UNION`; `CASE` (and 
 extract, a bound-key `->>`, and jsonb `||` merge; a narrow correlated roll-up
 (`related-aggregate`), a narrow scalar subquery, and an `IN`-subquery (all single-named-table,
 behind the `orm-subquery` capability); `INSERT … SELECT`; pgvector distance/`ORDER BY`
-nearest-neighbour (the experimental `orm-vector` capability, Postgres-only); and an **own-vs-base
-preference** for base-vs-override reads — `own_first()` / `is_own()` (the experimental `orm-own-pref`
-capability, see below). Every value is a bound parameter and every
+nearest-neighbour (the `orm-vector` capability — cosine `<=>` / L2 `<->`, Postgres-only); and an
+**own-vs-base preference** for base-vs-override reads — `own_first()` / `is_own()` (the experimental
+`orm-own-pref` capability, see below). Every value is a bound parameter and every
 identifier is validated, so a query **cannot** construct an injection; an unbounded `UPDATE`/`DELETE`
 (no filter, no tenant scope) is refused. Reach for raw `sql` only for what the builder still doesn't
 model — CTEs, window functions, open/free-form nested subqueries.

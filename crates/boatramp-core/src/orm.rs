@@ -137,10 +137,24 @@ pub enum Metric {
 }
 
 impl Metric {
-    fn operator(self) -> &'static str {
+    /// The kNN query operator for this metric. Load-bearing coupling: a `CREATE INDEX` built with
+    /// [`vector_opclass`](Self::vector_opclass) is only used by a query whose operator matches here
+    /// (a mismatch is a silent seq-scan, not an error) — the typed [`crate::ddl`] builder derives
+    /// both from the one [`Metric`], so they can never drift.
+    pub fn operator(self) -> &'static str {
         match self {
             Self::Cosine => "<=>",
             Self::L2 => "<->",
+        }
+    }
+
+    /// The pgvector index **operator class** for this metric (`hnsw`/`ivfflat`). Must pair with the
+    /// query [`operator`](Self::operator): `vector_cosine_ops`⇒`<=>`, `vector_l2_ops`⇒`<->`.
+    /// Used by the [`crate::ddl`] `CreateIndex` emitter.
+    pub fn vector_opclass(self) -> &'static str {
+        match self {
+            Self::Cosine => "vector_cosine_ops",
+            Self::L2 => "vector_l2_ops",
         }
     }
 }
@@ -1797,17 +1811,22 @@ fn basewrite_mutation() -> Option<String> {
 /// The compiled statement: `?N` SQL plus its bound parameters, in placeholder order.
 pub type Compiled = (String, Vec<SqlValue>);
 
+/// Whether `s` is a single plain SQL identifier — `[A-Za-z_][A-Za-z0-9_]*`, no dot. The one
+/// character rule shared by the `orm` [`ident`] validator (qualified names split on `.` into two
+/// plain halves) and the typed [`crate::ddl`] builder (which rejects any dot, so it can never emit
+/// a schema-qualified name). Centralising it keeps the two surfaces from drifting.
+pub(crate) fn plain_ident_ok(s: &str) -> bool {
+    let mut cs = s.chars();
+    matches!(cs.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && s.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
 /// Validate a plain identifier or a `table.column` qualified one. Emitted unquoted, so this
 /// is the *only* thing standing between a caller-supplied name and the SQL text.
 fn ident(name: &str) -> Result<&str, OrmError> {
-    let ok = |s: &str| {
-        let mut cs = s.chars();
-        matches!(cs.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
-            && s.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
-    };
     let valid = match name.split_once('.') {
-        Some((t, c)) => !t.is_empty() && !c.is_empty() && ok(t) && ok(c),
-        None => ok(name),
+        Some((t, c)) => !t.is_empty() && !c.is_empty() && plain_ident_ok(t) && plain_ident_ok(c),
+        None => plain_ident_ok(name),
     };
     if valid {
         Ok(name)
