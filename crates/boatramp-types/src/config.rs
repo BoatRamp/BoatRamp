@@ -1818,11 +1818,13 @@ impl CronRunAs {
 }
 
 /// A host-level SSE (or WebSocket) endpoint fanning out messaging topics.
+///
+/// `#[non_exhaustive]`: construct via [`StreamConfig::builder`] + the builder's setters (or
+/// `StreamConfig::default()` + field assignment) so a future field add stays non-breaking for
+/// downstream crates (the sibling [`crate::compute::ComputeSpec`] follows the same contract).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-// NOTE: not yet `#[non_exhaustive]`. v0.74.0 added `cors_allowed_origins`; sealing this
-// long-published struct is a retrofit (itself breaking: forbids cross-crate struct literals even
-// with `..Default`), deferred to v0.75.0 to land with a builder + the construction-site migration.
+#[non_exhaustive]
 pub struct StreamConfig {
     /// Route the SSE (or WebSocket) endpoint is served at.
     pub route: String,
@@ -1865,6 +1867,88 @@ pub struct StreamConfig {
     /// The allowlist is config, never request-derived.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cors_allowed_origins: Vec<String>,
+}
+
+impl StreamConfig {
+    /// Start building a stream config from its required core — the route it is served at.
+    /// Every other field defaults (no topics, SSE not WebSocket, no `publish_topic`, no
+    /// `authz`, no CORS allowlist) and is set with the returned [`StreamConfigBuilder`]'s
+    /// methods. This is the supported construction path: `StreamConfig` is
+    /// `#[non_exhaustive]`, so a downstream crate cannot (and need not) use a struct literal,
+    /// and a field added in a later release stays a non-breaking change.
+    ///
+    /// ```
+    /// use boatramp_types::config::StreamConfig;
+    ///
+    /// // A downstream crate builds a stream with NO struct literal (so a future field add is
+    /// // non-breaking). Only the deviations from the defaults are set.
+    /// let stream = StreamConfig::builder("/events/:room")
+    ///     .topics(vec!["room/{room}/events".into()])
+    ///     .build();
+    /// assert_eq!(stream.route, "/events/:room");
+    /// assert!(!stream.websocket);
+    /// assert!(stream.authz.is_none());
+    /// ```
+    #[must_use]
+    pub fn builder(route: impl Into<String>) -> StreamConfigBuilder {
+        StreamConfigBuilder {
+            inner: Self {
+                route: route.into(),
+                topics: Vec::new(),
+                websocket: false,
+                publish_topic: None,
+                authz: None,
+                cors_allowed_origins: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Fluent builder for a [`StreamConfig`] (`StreamConfig::builder(route)`). The route is taken
+/// at construction; every other field has a setter and otherwise keeps its documented default.
+/// `build()` yields the config. The ergonomic construction path for downstream crates now that
+/// [`StreamConfig`] is `#[non_exhaustive]`.
+#[derive(Debug, Clone)]
+pub struct StreamConfigBuilder {
+    inner: StreamConfig,
+}
+
+impl StreamConfigBuilder {
+    /// Set the topics broadcast to connected clients (server→client).
+    #[must_use]
+    pub fn topics(mut self, topics: Vec<String>) -> Self {
+        self.inner.topics = topics;
+        self
+    }
+    /// Serve this route as a WebSocket instead of SSE.
+    #[must_use]
+    pub fn websocket(mut self, websocket: bool) -> Self {
+        self.inner.websocket = websocket;
+        self
+    }
+    /// Set the client→server publish topic (WebSocket only). `None` ⇒ receive-only.
+    #[must_use]
+    pub fn publish_topic(mut self, publish_topic: Option<String>) -> Self {
+        self.inner.publish_topic = publish_topic;
+        self
+    }
+    /// Set the per-connection authorization strategy. `None` ⇒ unauthenticated broadcast.
+    #[must_use]
+    pub fn authz(mut self, authz: Option<StreamAuthz>) -> Self {
+        self.inner.authz = authz;
+        self
+    }
+    /// Set the operator-declared CORS origin allowlist.
+    #[must_use]
+    pub fn cors_allowed_origins(mut self, cors_allowed_origins: Vec<String>) -> Self {
+        self.inner.cors_allowed_origins = cors_allowed_origins;
+        self
+    }
+    /// Finish building the [`StreamConfig`].
+    #[must_use]
+    pub fn build(self) -> StreamConfig {
+        self.inner
+    }
 }
 
 /// Per-connection authorization strategy for a host [`StreamConfig`] (#11).

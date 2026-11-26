@@ -7313,12 +7313,9 @@ mod tests {
         ));
         let inner = rt.inner.as_ref().unwrap();
 
-        let stream = StreamConfig {
-            route: "/events/shared/:mailbox".into(),
-            topics: vec!["shared/{mailbox}/events".into()],
-            websocket: false,
-            publish_topic: None,
-            authz: Some(StreamAuthz::Scoped {
+        let stream = StreamConfig::builder("/events/shared/:mailbox")
+            .topics(vec!["shared/{mailbox}/events".into()])
+            .authz(Some(StreamAuthz::Scoped {
                 token_claims: HandlerGraphqlTokenClaims {
                     issuer: "https://idp.example".into(),
                     jwks_env: Some("IDP_JWKS".into()),
@@ -7328,9 +7325,8 @@ mod tests {
                     param: "mailbox".into(),
                     claim: "mailboxes".into(),
                 }],
-            }),
-            ..Default::default()
-        };
+            }))
+            .build();
         let authorize = |path: &'static str, bearer: Option<String>| {
             let stream = stream.clone();
             async move {
@@ -7464,12 +7460,9 @@ mod tests {
         ));
         let inner = rt.inner.as_ref().unwrap();
 
-        let stream = StreamConfig {
-            route: "/events/shared/:mailbox".into(),
-            topics: vec!["shared/{mailbox}/events".into()],
-            websocket: false,
-            publish_topic: None,
-            authz: Some(StreamAuthz::Scoped {
+        let stream = StreamConfig::builder("/events/shared/:mailbox")
+            .topics(vec!["shared/{mailbox}/events".into()])
+            .authz(Some(StreamAuthz::Scoped {
                 token_claims: HandlerGraphqlTokenClaims {
                     issuer: "https://idp.example".into(),
                     jwks_env: Some("IDP_JWKS".into()),
@@ -7481,9 +7474,8 @@ mod tests {
                         "SELECT 1 FROM mailbox_members WHERE mailbox = $mailbox AND subject = $sub"
                             .into(),
                 }],
-            }),
-            ..Default::default()
-        };
+            }))
+            .build();
         let authorize = |path: &'static str, bearer: Option<String>| {
             let stream = stream.clone();
             async move {
@@ -7603,18 +7595,14 @@ mod tests {
         rt.set_invoker(deploy.clone());
         let inner = rt.inner.as_ref().unwrap();
 
-        let stream = StreamConfig {
-            route: "/events/shared/:mailbox".into(),
-            topics: vec!["shared/{mailbox}/events".into()],
-            websocket: false,
-            publish_topic: None,
-            authz: Some(StreamAuthz::GuestMediated {
+        let stream = StreamConfig::builder("/events/shared/:mailbox")
+            .topics(vec!["shared/{mailbox}/events".into()])
+            .authz(Some(StreamAuthz::GuestMediated {
                 token_claims: None,
                 handler: "stream-authz".into(),
                 max_topics_per_connection: None,
-            }),
-            ..Default::default()
-        };
+            }))
+            .build();
 
         // (1) Real resolution + confinement: the guest grants three topics; only the one matching the
         // declared template survives. If the confinement filter were dropped, this would be 3 topics.
@@ -7663,8 +7651,9 @@ mod tests {
 
         // (2b) A `token_claims`-bearing guest-mediated stream with NO bearer is 401 BEFORE the guest
         // is ever invoked (the host verifies the principal first).
-        let stream_tok = StreamConfig {
-            authz: Some(StreamAuthz::GuestMediated {
+        let stream_tok = {
+            let mut s = stream.clone();
+            s.authz = Some(StreamAuthz::GuestMediated {
                 token_claims: Some(HandlerGraphqlTokenClaims {
                     issuer: "https://idp.example".into(),
                     jwks_env: Some("IDP_JWKS".into()),
@@ -7672,8 +7661,8 @@ mod tests {
                 }),
                 handler: "stream-authz".into(),
                 max_topics_per_connection: None,
-            }),
-            ..stream.clone()
+            });
+            s
         };
         let err = crate::stream::authorize_stream_topics(
             inner,
@@ -7693,19 +7682,20 @@ mod tests {
 
         // (3) Deploy-order gate (FIX-B): activating a guest-mediated stream whose `handler` names no
         // resolvable function is refused LOUDLY — not a silent per-subscribe 503.
-        let manifest = |handler: &str| Manifest {
-            config: DeployConfig {
-                streams: vec![StreamConfig {
-                    authz: Some(StreamAuthz::GuestMediated {
-                        token_claims: None,
-                        handler: handler.into(),
-                        max_topics_per_connection: None,
-                    }),
-                    ..stream.clone()
-                }],
+        let manifest = |handler: &str| {
+            let mut s = stream.clone();
+            s.authz = Some(StreamAuthz::GuestMediated {
+                token_claims: None,
+                handler: handler.into(),
+                max_topics_per_connection: None,
+            });
+            Manifest {
+                config: DeployConfig {
+                    streams: vec![s],
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
+            }
         };
         // A missing authorizer (a typo, or a routed-handler name with no function record) ⇒ refusal.
         let refusal = rt
@@ -7745,13 +7735,14 @@ mod tests {
         // (4) Opt-in per-connection topic cap (review N1): a cap of N enforced AFTER confinement.
         // The guest's `count<N>` mode returns N DISTINCT in-template topics, so the confined set size
         // is exactly N — exercising the cap boundary directly.
-        let stream_capped = StreamConfig {
-            authz: Some(StreamAuthz::GuestMediated {
+        let stream_capped = {
+            let mut s = stream.clone();
+            s.authz = Some(StreamAuthz::GuestMediated {
                 token_claims: None,
                 handler: "stream-authz".into(),
                 max_topics_per_connection: Some(3),
-            }),
-            ..stream.clone()
+            });
+            s
         };
         // (4a) cap = 3, guest returns 3 confined topics → the stream opens.
         let (capped_ok, _p) = crate::stream::authorize_stream_topics(

@@ -5770,11 +5770,11 @@ async fn stream_route_fans_out_text_and_binary_events() {
     let manifest = Manifest {
         files: BTreeMap::new(),
         config: DeployConfig {
-            streams: vec![StreamConfig {
-                route: "/events".to_string(),
-                topics: vec!["orders/created".to_string()],
-                ..Default::default()
-            }],
+            streams: vec![
+                StreamConfig::builder("/events")
+                    .topics(vec!["orders/created".to_string()])
+                    .build(),
+            ],
             ..Default::default()
         },
         ..Default::default()
@@ -5895,12 +5895,12 @@ async fn stream_cors_app(
     let manifest = Manifest {
         files: BTreeMap::new(),
         config: DeployConfig {
-            streams: vec![StreamConfig {
-                route: "/events".to_string(),
-                topics: vec!["orders/created".to_string()],
-                cors_allowed_origins: allowlist.iter().map(|s| (*s).to_string()).collect(),
-                ..Default::default()
-            }],
+            streams: vec![
+                StreamConfig::builder("/events")
+                    .topics(vec!["orders/created".to_string()])
+                    .cors_allowed_origins(allowlist.iter().map(|s| (*s).to_string()).collect())
+                    .build(),
+            ],
             ..Default::default()
         },
         ..Default::default()
@@ -6165,11 +6165,11 @@ async fn stream_scope_is_project_qualified_and_isolates_foreign_tenants() {
     let manifest = Manifest {
         files: BTreeMap::new(),
         config: DeployConfig {
-            streams: vec![StreamConfig {
-                route: "/events".to_string(),
-                topics: vec!["orders/created".to_string()],
-                ..Default::default()
-            }],
+            streams: vec![
+                StreamConfig::builder("/events")
+                    .topics(vec!["orders/created".to_string()])
+                    .build(),
+            ],
             ..Default::default()
         },
         ..Default::default()
@@ -6450,11 +6450,11 @@ async fn stream_per_site_connection_cap_returns_503() {
     let manifest = Manifest {
         files: BTreeMap::new(),
         config: DeployConfig {
-            streams: vec![StreamConfig {
-                route: "/events".to_string(),
-                topics: vec!["orders/created".to_string()],
-                ..Default::default()
-            }],
+            streams: vec![
+                StreamConfig::builder("/events")
+                    .topics(vec!["orders/created".to_string()])
+                    .build(),
+            ],
             ..Default::default()
         },
         ..Default::default()
@@ -6539,14 +6539,13 @@ async fn websocket_stream_fans_out_and_publishes() {
     let manifest = Manifest {
         files: BTreeMap::new(),
         config: DeployConfig {
-            streams: vec![StreamConfig {
-                route: "/ws".to_string(),
-                topics: vec!["events".to_string()],
-                websocket: true,
-                publish_topic: Some("ingest".to_string()),
-                authz: None,
-                ..Default::default()
-            }],
+            streams: vec![
+                StreamConfig::builder("/ws")
+                    .topics(vec!["events".to_string()])
+                    .websocket(true)
+                    .publish_topic(Some("ingest".to_string()))
+                    .build(),
+            ],
             ..Default::default()
         },
         ..Default::default()
