@@ -152,6 +152,20 @@ pub enum ConfigError {
         /// A trailing remediation hint (empty unless there is a concrete cure to point at).
         cure: &'static str,
     },
+    /// A `[serve]` operational limit is nonsensical — e.g. `max_concurrent_buffering: 0`, which would
+    /// mean "no buffering slots" (an operator who writes `0` means "unlimited", not "none"), so it is
+    /// refused at config load (fail-closed, boot-LOUD) rather than silently clamped to 1 and
+    /// near-serializing node buffering. Mirrors the gateway validator's rejection of a `0`
+    /// `max_buffer_bytes`.
+    #[error("serve limit `{field}`: {reason}{cure}")]
+    InvalidServeLimit {
+        /// The offending `[serve]` field name.
+        field: &'static str,
+        /// Why it was rejected.
+        reason: &'static str,
+        /// A trailing remediation hint.
+        cure: &'static str,
+    },
     /// The layered config pipeline failed to resolve/extract the merged config (a bad
     /// numeric/addr env value that figment's lossy coercion rejects, a `[cluster]` missing
     /// its required `listen`, etc.). The figment error is rendered to a string so
@@ -425,6 +439,7 @@ impl ServerConfig {
         config.validate_blob_backend_projects()?;
         config.validate_listeners()?;
         config.validate_control_plane_tls()?;
+        config.validate_serve_limits()?;
         Ok(config)
     }
 
@@ -772,6 +787,29 @@ impl ServerConfig {
             // is connect-only + SSRF-floored (the SAME gate as a request handler's egress). Entries
             // are validated (and rejected) at that runtime gate, mirroring the handler/function
             // allowlist, so no config-load format check here.
+        }
+        Ok(())
+    }
+
+    /// Validate `[serve]` operational limits that have no sensible `0` value. Today: a configured
+    /// `max_concurrent_buffering` of `0` is refused — an operator who writes `0` means "unlimited",
+    /// but the node-wide gateway-buffering semaphore cannot be removed (it is a DoS bound), so `0`
+    /// would be clamped to 1 and near-serialize node buffering, giving the operator self-inflicted
+    /// `503`s instead of the unlimited they intended. Refuse it at load (fail-closed, boot-LOUD),
+    /// consistent with the gateway validator's rejection of a `0` `max_buffer_bytes`. The server
+    /// runtime keeps a `≥ 1` clamp as defense-in-depth. Runs on the fully merged (file + env + flag)
+    /// config.
+    fn validate_serve_limits(&self) -> Result<(), ConfigError> {
+        let Some(serve) = self.serve.as_ref() else {
+            return Ok(());
+        };
+        if serve.max_concurrent_buffering == Some(0) {
+            return Err(ConfigError::InvalidServeLimit {
+                field: "max_concurrent_buffering",
+                reason: "must be > 0 — the node-wide gateway-buffering concurrency cap cannot be \
+                         disabled (it is a DoS bound)",
+                cure: " — omit it for the built-in default (128), or set a positive slot count",
+            });
         }
         Ok(())
     }
@@ -2906,6 +2944,11 @@ pub struct ServeConfig {
     pub upload_idle_timeout_secs: Option<u64>,
     /// Cap on simultaneous blob uploads.
     pub max_concurrent_uploads: Option<usize>,
+    /// Node-wide cap on simultaneous gateway request-buffering operations (the `buffer_requests`
+    /// spill path). `None` ⇒ the built-in default (128). A configured `0` is REJECTED at load (the
+    /// cap is a DoS bound and cannot be disabled — omit it for the default instead); see
+    /// `ServerConfig::validate_serve_limits`.
+    pub max_concurrent_buffering: Option<usize>,
     /// In a TLS mode, bind this plain-HTTP address on a second listener that
     /// redirects to HTTPS (dual-listener). Only read in `tls` builds.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
@@ -5893,6 +5936,36 @@ mod tests {
         );
     }
 
+    /// LOW-3 (Security re-review): a configured `[serve] max_concurrent_buffering: 0` is REJECTED at
+    /// config load — the node-wide gateway-buffering cap is a DoS bound that cannot be disabled, and
+    /// silently clamping `0` to `1` would near-serialize node buffering (an operator who writes `0`
+    /// means "unlimited" and would get self-inflicted 503s). A positive value, and an UNSET value
+    /// (the default 128), both parse. Consistent with the gateway validator's rejection of a `0`
+    /// `max_buffer_bytes`.
+    #[test]
+    fn rejects_zero_max_concurrent_buffering() {
+        let err = ServerConfig::parse(r#"( serve: ( max_concurrent_buffering: 0 ) )"#)
+            .expect_err("max_concurrent_buffering: 0 must be refused at config load");
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidServeLimit {
+                    field: "max_concurrent_buffering",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // A positive value parses.
+        let ok = ServerConfig::parse(r#"( serve: ( max_concurrent_buffering: 8 ) )"#)
+            .expect("a positive max_concurrent_buffering is valid");
+        assert_eq!(ok.serve.and_then(|s| s.max_concurrent_buffering), Some(8));
+        // Unset ⇒ the built-in default (no field), so it parses with `None`.
+        let dflt = ServerConfig::parse(r#"( serve: ( ) )"#)
+            .expect("an unset max_concurrent_buffering is valid (uses the default)");
+        assert_eq!(dflt.serve.and_then(|s| s.max_concurrent_buffering), None);
+    }
+
     #[test]
     fn listener_env_covers_every_scalar_field() {
         // Forgot-a-knob guard (mirrors the blob-backend guard): every SCALAR field of `ListenerConfig`
@@ -6872,6 +6945,10 @@ pub(crate) mod figment_resolve {
             &["serve", "max_concurrent_uploads"],
         ),
         (
+            "BOATRAMP_MAX_CONCURRENT_BUFFERING",
+            &["serve", "max_concurrent_buffering"],
+        ),
+        (
             "BOATRAMP_HTTP_REDIRECT_ADDR",
             &["serve", "http_redirect_addr"],
         ),
@@ -7517,6 +7594,7 @@ pub(crate) mod figment_resolve {
         cfg.validate_sql_db_names()?;
         cfg.validate_blob_backend_projects()?;
         cfg.validate_listeners()?;
+        cfg.validate_serve_limits()?;
         Ok(cfg)
     }
 
@@ -7547,6 +7625,7 @@ pub(crate) mod figment_resolve {
         cfg.validate_sql_db_names()?;
         cfg.validate_blob_backend_projects()?;
         cfg.validate_listeners()?;
+        cfg.validate_serve_limits()?;
         Ok(cfg)
     }
 

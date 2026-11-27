@@ -656,6 +656,15 @@ pub struct ServeArgs {
     #[arg(long, env = "BOATRAMP_MAX_CONCURRENT_UPLOADS")]
     max_concurrent_uploads: Option<usize>,
 
+    /// Node-wide cap on simultaneous gateway request-BUFFERING operations (the `buffer_requests`
+    /// spill path, distinct from `--max-concurrent-uploads`); further buffering gets 503 until a
+    /// slot frees (default 128). Each in-flight buffered body holds up to its upstream's
+    /// `--max-buffer-bytes` of temp spill, so this bounds worst-case node spill at
+    /// `limit × max-buffer-bytes`. Must be > 0 (the cap is a DoS bound and cannot be disabled; `0`
+    /// is rejected — omit it for the default). Flag/env > `serve.max_concurrent_buffering`.
+    #[arg(long, env = "BOATRAMP_MAX_CONCURRENT_BUFFERING")]
+    max_concurrent_buffering: Option<usize>,
+
     /// In a TLS mode, also bind this plain-HTTP address (e.g. `0.0.0.0:80`) on a
     /// second listener that 308-redirects every request to HTTPS. Flag/env >
     /// `serve.http_redirect_addr`. Ignored when `--tls off`.
@@ -786,6 +795,7 @@ fn server_limits(
             .upload_idle_timeout_secs
             .map(std::time::Duration::from_secs),
         max_concurrent_uploads: serve_cfg.max_concurrent_uploads,
+        max_concurrent_buffering: serve_cfg.max_concurrent_buffering,
     }
 }
 

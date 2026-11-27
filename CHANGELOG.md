@@ -232,6 +232,57 @@ versions.
     downstream exhaustive `match` on `HandlerError` — such a match must add a wildcard `_ =>` arm
     (which also absorbs every future variant). Relay to uchron / luigi before they bump.
 
+### Changed
+
+- **Gateway request-buffering (`buffer_requests`) slow-client guard is now throughput-aware
+  instead of a flat wall-clock cap — a steadily-progressing large upload no longer
+  false-`408`s.** The v0.73.0 buffering guard aborted a length-unknown upload once total
+  buffering time crossed a flat ~120 s whole-phase budget, regardless of progress — so a large
+  upload that was merely slow (a 1 GiB layer trickling at a legitimate 5 MB/s takes ~200 s)
+  was wrongly cut with `408 Request Timeout` (the latent secondary behind the tokenfield
+  git-LFS incident; the active cause, an h2 `Expect: 100-continue` deadlock, was fixed in
+  v0.75.0). The guard is now three parts, each aborting with `408`:
+  - **read-idle** (`--buffer-read-timeout-ms` / `buffer_read_timeout_ms`, default 30 s) —
+    unchanged; catches a fully-stalled client.
+  - **minimum-throughput floor** (NEW `--buffer-min-rate-bytes-per-sec` /
+    `buffer_min_rate_bytes_per_sec`, default **1024** = 1 KiB/s, averaged over the NEW
+    `--buffer-min-rate-window-ms` / `buffer_min_rate_window_ms`, default **30 s**) — replaces
+    the flat whole-phase cap as the primary backstop. It cuts a stalled OR a drip-feed
+    slow-loris that never idles, while letting a steadily-progressing upload of **any** total
+    size finish as long as it clears the floor. Set the floor to `0` to disable it (rely on
+    read-idle only); a positive floor below the **64 B/s minimum-effective** threshold is treated as
+    *near-disabling* (too low to cut a drip) and follows the same rule as a disabled floor — see the
+    validation note below.
+  - **absolute ceiling** (`--buffer-total-timeout-ms` / `buffer_total_timeout_ms`, now default
+    **1 hour, ON**) — a hard per-connection upper bound on total buffering time regardless of
+    throughput. The throughput floor alone leaves a residual gap: a client dripping just over the
+    floor clears the rate check AND never idles, so with no ceiling it could hold a connection slot +
+    up to `max_buffer_bytes` of temp spill for `max_buffer_bytes ÷ floor` (≈ 12 days at the 1 GiB +
+    1 KiB/s defaults) before the `413` cap fires. The 1 h default is anchored to a realistic minimum
+    legitimate rate (~291 KiB/s to fill 1 GiB in an hour — no real registry push is that slow), so it
+    does not false-`408` a legitimate upload the way the old flat 120 s cap did. Set
+    `--buffer-total-timeout-ms 0` to DISABLE it (opt-out for a rare genuinely-huge/slow-link
+    upstream) — permitted only while the throughput floor stays on.
+  - **node-wide buffering-concurrency cap** (NEW `--max-concurrent-buffering` /
+    `BOATRAMP_MAX_CONCURRENT_BUFFERING` / `[serve] max_concurrent_buffering`, default **128**) — the
+    structural total-exposure bound. Gateway buffering does not go through `max_concurrent_uploads`
+    (that gates only the blob/storage path), so a process-wide semaphore now caps simultaneous
+    buffering operations across all listeners/upstreams; beyond the cap, further buffering fails fast
+    with `503 Service Unavailable` (a local pre-dial refusal — it never contacts a backend, so it does
+    not affect passive health / eject a backend). Worst-case node temp spill is bounded at
+    `limit × max_buffer_bytes`. A configured `max_concurrent_buffering: 0` is **rejected at config
+    load** (the cap is a DoS bound and cannot be disabled — omit it for the default instead); the
+    runtime keeps a `≥ 1` clamp as defense-in-depth.
+
+  Default-off upstreams are unchanged (the new config fields are skipped when unset, so stored
+  gateways are byte-identical). Declare-time validation rejects a buffering knob set without
+  `buffer_requests`, a zero read-idle / window, and — to disable OR near-disable the throughput floor
+  (`buffer_min_rate_bytes_per_sec: 0`, or a positive value below the 64 B/s minimum-effective floor) —
+  requires an explicit positive absolute ceiling, so the floor and the ceiling can never both be off
+  (that would leave buffering bounded only by the per-read idle timeout, letting a ~1 B/s drip hold a
+  slot for years). A zero absolute ceiling (`buffer_total_timeout_ms: 0`) means "ceiling disabled"
+  (the opt-out), not an error.
+
 ## [0.75.0] — 2026-11-26
 
 ### Added
