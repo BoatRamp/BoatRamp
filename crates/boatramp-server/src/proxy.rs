@@ -211,16 +211,31 @@ const DEFAULT_MAX_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
 /// `buffer_read_timeout_ms`.
 const DEFAULT_BUFFER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default wall-clock budget for the WHOLE buffering phase of one length-unknown request body: the
-/// longest buffering may run end-to-end before it is aborted (`408 Request Timeout`), regardless of
-/// how the body is paced. This is the backstop the per-read idle timeout cannot provide — a
+/// Default minimum sustained inbound throughput for a buffered (length-unknown) request body, in
+/// bytes/sec. This is the throughput-aware backstop the per-read idle timeout cannot provide — a
 /// slow-loris that trickles JUST often enough to keep resetting the read-idle timer (e.g. one byte
-/// every few seconds) never idles, so only a total-time bound can stop it holding a connection slot
-/// and a growing temp file. 120 s comfortably covers a large registry layer spilled at any
-/// reasonable rate while bounding a single buffered upload's slot-hold; an operator fronting
-/// unusually large layers over slow links raises it per upstream (`buffer_total_timeout_ms`), a
-/// space/time-tight node lowers it.
-const DEFAULT_BUFFER_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// every few seconds) never idles, but it also cannot sustain this floor, so the rate check cuts it
+/// (`408 Request Timeout`). Crucially, unlike the flat whole-phase wall-clock budget it replaces, a
+/// throughput floor lets a steadily-progressing upload of ANY total size finish: the old flat 120 s
+/// cap falsely `408`'d a 1 GiB layer trickling at a legitimate-but-slow 5 MB/s (~200 s > 120 s),
+/// implying an ~8.5 MB/s floor just to complete. 1 KiB/s is ~7× below a 56k dial-up link yet far
+/// above any byte-trickle, so it discriminates a drip from a slow-but-real upload. Per-upstream
+/// overridable via `buffer_min_rate_bytes_per_sec`; `0` disables the floor (read-idle only).
+const DEFAULT_BUFFER_MIN_RATE_BYTES_PER_SEC: u64 = 1024;
+
+/// Default trailing window over which [`DEFAULT_BUFFER_MIN_RATE_BYTES_PER_SEC`] is averaged. The
+/// rate check fires once per elapsed window: a body that failed to deliver `floor × window` bytes in
+/// the just-elapsed window is below the floor and aborted. 30 s smooths over a brief pause (a legit
+/// upload that stutters then catches up averages out) while reacting to a sustained rate drop within
+/// ~1–2 windows. Per-upstream overridable via `buffer_min_rate_window_ms`.
+const DEFAULT_BUFFER_MIN_RATE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Default for the OPTIONAL absolute whole-phase wall-clock ceiling: `None` — no ceiling. The
+/// throughput floor (above) is the primary slow-client backstop, and a flat cap false-positives a
+/// slow-but-progressing large upload (the bug this replaces), so it is OFF by default. An operator
+/// may set one per upstream (`buffer_total_timeout_ms`) as blunt defense-in-depth against a
+/// pathological-but-above-floor client — set HIGH enough never to cut a legitimate upload.
+const DEFAULT_BUFFER_TOTAL_TIMEOUT: Option<Duration> = None;
 
 /// Pool key for pinned upstream connections: the pinned resolution plus the per-upstream
 /// options that determine how a connection is dialed (so a TLS and a plaintext connection,
@@ -311,11 +326,13 @@ enum UpstreamError {
     /// A buffered (length-unknown) request body exceeded the upstream's `max_buffer_bytes`
     /// → `413 Payload Too Large`. Only reachable on a `buffer_requests` upstream.
     PayloadTooLarge,
-    /// The inbound body read stalled while buffering a length-unknown request body — a single read
-    /// idled past the upstream's `buffer_read_timeout_ms`, or the whole buffering phase exceeded its
-    /// `buffer_total_timeout_ms` (a slow-trickle / slow-loris client). Mapped to `408 Request
-    /// Timeout` — a 4xx, so (unlike a `504`) it is NOT recorded as a backend health failure: the
-    /// fault is the client's, not the upstream's. Only reachable on a `buffer_requests` upstream.
+    /// The inbound body read stalled or trickled while buffering a length-unknown request body — a
+    /// single read idled past the upstream's `buffer_read_timeout_ms`, the body's sustained
+    /// throughput fell below `buffer_min_rate_bytes_per_sec` over its window, or (if set) the
+    /// optional `buffer_total_timeout_ms` absolute ceiling elapsed (a slow-trickle / slow-loris
+    /// client). Mapped to `408 Request Timeout` — a 4xx, so (unlike a `504`) it is NOT recorded as a
+    /// backend health failure: the fault is the client's, not the upstream's. Only reachable on a
+    /// `buffer_requests` upstream.
     RequestBodyTimeout,
 }
 
@@ -410,6 +427,27 @@ enum BodyPlan {
 /// for `Fixed`/`Chunked` plans (never for the retryable `None` path).
 type BodyData = Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>;
 
+/// Time + throughput guards for buffering one length-unknown request body, all derived from the
+/// per-upstream config (or the server defaults). Only consulted on the `buffer_requests` path.
+#[derive(Clone, Copy)]
+struct BufferGuards {
+    /// Read-idle timeout: the longest a single inbound body read may stall before buffering aborts
+    /// (`408`). Correctly catches a FULLY-stalled client (a read that never yields).
+    read_idle: Duration,
+    /// Minimum sustained inbound throughput (bytes/sec): if the body's average rate over a trailing
+    /// [`BufferGuards::rate_window`] falls below this, buffering aborts (`408`). `0` DISABLES the
+    /// floor (rely on `read_idle` only). This — not a flat wall-clock cap — is what lets a
+    /// steadily-progressing upload of any size finish while still cutting a sub-floor drip-feed that
+    /// never idles.
+    min_rate_bytes_per_sec: u64,
+    /// The trailing window over which `min_rate_bytes_per_sec` is averaged.
+    rate_window: Duration,
+    /// OPTIONAL absolute whole-phase wall-clock ceiling (defense-in-depth). `None` = no ceiling (the
+    /// throughput floor is the backstop). When `Some`, a hard upper bound on total buffering time,
+    /// regardless of throughput — set high enough never to cut a legitimate upload.
+    abs_ceiling: Option<Duration>,
+}
+
 /// A pinned upstream client: a handle over the shared connection pool for one upstream
 /// identity. Cheap to clone (just the key); the connections live in [`POOL`].
 #[derive(Clone)]
@@ -422,25 +460,23 @@ struct UpstreamClient {
     buffer_requests: bool,
     /// Hard cap (bytes) on a buffered body before `413`; only read when `buffer_requests`.
     max_buffer_bytes: u64,
-    /// Read-idle timeout: the longest a single inbound body read may stall while buffering a
-    /// length-unknown body before buffering aborts (`408`). Only read when `buffer_requests`.
-    buffer_read_timeout: Duration,
-    /// Wall-clock budget for the whole buffering phase of one body before buffering aborts (`408`).
-    /// Only read when `buffer_requests`. The backstop a per-read timeout cannot provide (a trickle
-    /// that never idles).
-    buffer_total_timeout: Duration,
+    /// Time + throughput guards for the buffering phase; only read when `buffer_requests`.
+    buffer_guards: BufferGuards,
 }
 
 impl UpstreamClient {
     /// Turn request buffering on (or off) for this handle, with optional per-upstream overrides for
-    /// the byte cap, the read-idle timeout, and the whole-phase wall-clock budget (each `None` keeps
-    /// the server default). A no-op when `enabled` is false — the handle keeps today's streaming
-    /// semantics, and the timeouts are only consulted on the buffering path.
+    /// the byte cap, the read-idle timeout, the throughput floor + its window, and the optional
+    /// absolute whole-phase ceiling (each `None` keeps the server default; a `0` throughput floor
+    /// explicitly DISABLES the floor). A no-op when `enabled` is false — the handle keeps today's
+    /// streaming semantics, and the guards are only consulted on the buffering path.
     fn with_buffering(
         mut self,
         enabled: bool,
         max_bytes: Option<u64>,
         read_timeout_ms: Option<u64>,
+        min_rate_bytes_per_sec: Option<u64>,
+        min_rate_window_ms: Option<u64>,
         total_timeout_ms: Option<u64>,
     ) -> Self {
         self.buffer_requests = enabled;
@@ -448,10 +484,18 @@ impl UpstreamClient {
             self.max_buffer_bytes = n;
         }
         if let Some(ms) = read_timeout_ms {
-            self.buffer_read_timeout = Duration::from_millis(ms);
+            self.buffer_guards.read_idle = Duration::from_millis(ms);
         }
+        if let Some(bps) = min_rate_bytes_per_sec {
+            self.buffer_guards.min_rate_bytes_per_sec = bps;
+        }
+        if let Some(ms) = min_rate_window_ms {
+            self.buffer_guards.rate_window = Duration::from_millis(ms);
+        }
+        // `None` keeps the server default (no ceiling); `Some(ms)` sets a hard ceiling. There is no
+        // way to CLEAR a ceiling back to `None` here, since the default is already `None`.
         if let Some(ms) = total_timeout_ms {
-            self.buffer_total_timeout = Duration::from_millis(ms);
+            self.buffer_guards.abs_ceiling = Some(Duration::from_millis(ms));
         }
         self
     }
@@ -536,18 +580,18 @@ impl UpstreamClient {
                         first,
                         &mut data,
                         self.max_buffer_bytes,
-                        self.buffer_read_timeout,
-                        self.buffer_total_timeout,
+                        self.buffer_guards,
                         &std::env::temp_dir(),
                     )
                     .await
                     {
                         Ok(buffered) => buffered,
                         Err(BufferError::TooLarge) => return Err(UpstreamError::PayloadTooLarge),
-                        // A slow-trickle / stalled client (read-idle or whole-phase budget elapsed):
-                        // buffering is aborted, `data` + the (unlinked) temp file drop here, the
-                        // connection slot is released, and the client gets `408` (not a `504`, so a
-                        // healthy upstream is never ejected for a client-side stall).
+                        // A slow-trickle / stalled client (read idled, throughput fell below the
+                        // floor, or the optional absolute ceiling elapsed): buffering is aborted,
+                        // `data` + the (unlinked) temp file drop here, the connection slot is
+                        // released, and the client gets `408` (not a `504`, so a healthy upstream is
+                        // never ejected for a client-side stall).
                         Err(BufferError::Timeout) => return Err(UpstreamError::RequestBodyTimeout),
                         Err(BufferError::Io) => return Err(UpstreamError::Failed),
                     };
@@ -742,8 +786,10 @@ fn empty_body_data() -> BodyData {
 enum BufferError {
     /// The body exceeded the upstream's `max_buffer_bytes` → `413 Payload Too Large`.
     TooLarge,
-    /// The inbound body read stalled: a single read idled past `read_idle`, or the whole buffering
-    /// phase exceeded `total_budget` (a slow-trickle / slow-loris client) → `408 Request Timeout`.
+    /// The inbound body read stalled or trickled below the throughput floor: a single read idled
+    /// past `read_idle`, the sustained rate fell below `min_rate_bytes_per_sec` over its window, or
+    /// (if set) the optional absolute ceiling elapsed (a slow-trickle / slow-loris client) → `408
+    /// Request Timeout`.
     Timeout,
     /// A temp-file I/O error (create/write/seek) or an inbound body-read error → `502 Bad Gateway`.
     Io,
@@ -772,13 +818,25 @@ enum BufferError {
 ///   handle and drops after the forward), on the `413` / `408` / I/O-error returns here (the local
 ///   `file` drops), and on a panic or task-cancel (drop still runs). There is no unlink step to
 ///   forget on an error path, so no leak is possible.
-/// - **Time-bounded.** The inbound body read is NOT bounded by `request_timeout_ms` (which wraps
-///   only the upstream write + response head, AFTER buffering) nor by the connection idle timeout
-///   (which never fires on an actively-trickling stream). So this bounds the read itself: each
-///   `data.next()` may idle at most `read_idle`, and the whole loop at most `total_budget`, after
-///   which buffering is aborted ([`BufferError::Timeout`] → `408`) — closing a slow-loris that
-///   would otherwise hold a connection slot + this temp file indefinitely by trickling the body.
-///   Both bounds are enforced on the SAME read, so they cover both the HTTP/2 END_STREAM-delimited
+/// - **Time + throughput bounded.** The inbound body read is NOT bounded by `request_timeout_ms`
+///   (which wraps only the upstream write + response head, AFTER buffering) nor by the connection
+///   idle timeout (which never fires on an actively-trickling stream). So this bounds the read
+///   itself, with three independent guards ([`BufferGuards`]), each ending buffering at
+///   [`BufferError::Timeout`] → `408`:
+///   1. **Read-idle** — each `data.next()` may stall at most `read_idle`. Catches a FULLY-stalled
+///      client (a read that never yields).
+///   2. **Minimum throughput** — the body's average inbound rate over a trailing `rate_window` must
+///      stay at or above `min_rate_bytes_per_sec`. Catches the slow-loris the read-idle guard alone
+///      cannot: a drip-feed that trickles just often enough to keep resetting the idle timer never
+///      idles, but it also cannot sustain the floor. Crucially, this is a RATE bound, not a flat
+///      wall-clock cap, so a steadily-progressing upload of ANY total size finishes as long as it
+///      clears the floor — a 1 GiB layer at a slow-but-real 5 MB/s is fine, where a flat 120 s cap
+///      would falsely `408` it. `min_rate_bytes_per_sec == 0` disables this guard (read-idle only).
+///   3. **Optional absolute ceiling** — if `abs_ceiling` is `Some`, a hard upper bound on total
+///      buffering time regardless of throughput, as blunt defense-in-depth. `None` (the default) =
+///      no ceiling, so it never false-positives a legitimate upload.
+///
+///   All three are enforced on the SAME reads, so they cover both the HTTP/2 END_STREAM-delimited
 ///   and the inbound-`chunked` body (both reach here through the one buffering loop).
 ///
 /// NOTE: the spill store is `std::env::temp_dir()` in production. If an operator points that at a
@@ -788,8 +846,7 @@ async fn buffer_body_to_length_in(
     first: Bytes,
     data: &mut BodyData,
     max: u64,
-    read_idle: Duration,
-    total_budget: Duration,
+    guards: BufferGuards,
     dir: &std::path::Path,
 ) -> Result<(u64, BodyData), BufferError> {
     use futures::StreamExt;
@@ -799,10 +856,16 @@ async fn buffer_body_to_length_in(
     let std_file = tempfile::tempfile_in(dir).map_err(|_| BufferError::Io)?;
     let mut file = tokio::fs::File::from_std(std_file);
     let mut total: u64 = 0u64;
-    // The whole-phase deadline, measured from the first spilled byte (buffering start). Each read
-    // is bounded by whichever is sooner: this deadline, or the per-read idle timeout — so a trickle
-    // that keeps resetting the idle timer is still stopped when the overall budget runs out.
-    let phase_deadline = tokio::time::Instant::now() + total_budget;
+    // The OPTIONAL absolute whole-phase ceiling, measured from buffering start (defense-in-depth;
+    // `None` by default). The throughput floor — not this — is the primary slow-client backstop.
+    let start = tokio::time::Instant::now();
+    let abs_deadline = guards.abs_ceiling.map(|c| start + c);
+    // Trailing-window anchor for the throughput floor: the time + byte count at the start of the
+    // current window. Each time a full `rate_window` elapses we require that at least
+    // `min_rate_bytes_per_sec × elapsed` bytes arrived in it, then slide the anchor forward.
+    let rate_floor_on = guards.min_rate_bytes_per_sec > 0;
+    let mut window_anchor_time = start;
+    let mut window_anchor_bytes: u64 = 0;
 
     // Spill `first`, then each subsequent chunk, enforcing the cap BEFORE each write so the temp
     // file never grows past `max` even by one chunk, and bounding every inbound read in time.
@@ -814,11 +877,34 @@ async fn buffer_body_to_length_in(
             .ok_or(BufferError::TooLarge)?;
         file.write_all(&chunk).await.map_err(|_| BufferError::Io)?;
         total = would_be;
-        // Bound the next read by the sooner of the per-read idle timeout and the whole-phase
-        // deadline. On elapse, the pending `data.next()` future is dropped and we return — `file`
+        // Throughput floor (tumbling window): once a full window has elapsed since the anchor, the
+        // body must have delivered at least `floor × elapsed` bytes within it — otherwise its
+        // sustained rate is below the floor (a drip-feed that never idles) and buffering aborts.
+        // Checked here, after a chunk lands, so a client that stops delivering is caught by the
+        // read-idle guard below instead. The anchor then slides forward to start the next window.
+        if rate_floor_on {
+            let now = tokio::time::Instant::now();
+            let elapsed = now.duration_since(window_anchor_time);
+            if elapsed >= guards.rate_window {
+                let got = u128::from(total - window_anchor_bytes);
+                let required =
+                    u128::from(guards.min_rate_bytes_per_sec) * elapsed.as_millis() / 1000;
+                if got < required {
+                    return Err(BufferError::Timeout);
+                }
+                window_anchor_time = now;
+                window_anchor_bytes = total;
+            }
+        }
+        // Bound the next read by the sooner of the per-read idle timeout and (if set) the absolute
+        // ceiling. On elapse, the pending `data.next()` future is dropped and we return — `file`
         // (the unlinked temp inode) drops with the stack, so the spill is reclaimed and the slot
         // released.
-        let read_deadline = (tokio::time::Instant::now() + read_idle).min(phase_deadline);
+        let idle_deadline = tokio::time::Instant::now() + guards.read_idle;
+        let read_deadline = match abs_deadline {
+            Some(abs) => idle_deadline.min(abs),
+            None => idle_deadline,
+        };
         match tokio::time::timeout_at(read_deadline, data.next()).await {
             Ok(Some(Ok(next))) => chunk = next,
             Ok(Some(Err(_))) => return Err(BufferError::Io),
@@ -974,8 +1060,12 @@ fn cached_client(
         // and the absolute-URL `proxy` path, which has no per-upstream config — is unchanged).
         buffer_requests: false,
         max_buffer_bytes: DEFAULT_MAX_BUFFER_BYTES,
-        buffer_read_timeout: DEFAULT_BUFFER_READ_TIMEOUT,
-        buffer_total_timeout: DEFAULT_BUFFER_TOTAL_TIMEOUT,
+        buffer_guards: BufferGuards {
+            read_idle: DEFAULT_BUFFER_READ_TIMEOUT,
+            min_rate_bytes_per_sec: DEFAULT_BUFFER_MIN_RATE_BYTES_PER_SEC,
+            rate_window: DEFAULT_BUFFER_MIN_RATE_WINDOW,
+            abs_ceiling: DEFAULT_BUFFER_TOTAL_TIMEOUT,
+        },
     })
 }
 
@@ -1596,12 +1686,15 @@ async fn proxy_upstream(
     };
     // Opt this upstream into request buffering when configured (registry-fronting parity): a
     // length-unknown body is spilled to a bounded temp file and forwarded with a Content-Length,
-    // with the inbound read bounded in time (read-idle + whole-phase budget) so a slow-trickle
-    // client cannot pin a connection slot + its temp file.
+    // with the inbound read bounded by a read-idle timeout + a minimum-throughput floor (and an
+    // optional absolute ceiling) so a stalled or drip-feed client cannot pin a connection slot + its
+    // temp file, while a steadily-progressing upload of any size still completes.
     let client = client.with_buffering(
         upstream.buffer_requests,
         upstream.max_buffer_bytes,
         upstream.buffer_read_timeout_ms,
+        upstream.buffer_min_rate_bytes_per_sec,
+        upstream.buffer_min_rate_window_ms,
         upstream.buffer_total_timeout_ms,
     );
 
@@ -2811,7 +2904,7 @@ Connection: close\r\n\r\n";
         let (addr, rx) = capture_upstream(OK).await;
         let client = cached_client("127.0.0.1", addr, None, None, false, None, false)
             .unwrap()
-            .with_buffering(true, Some(16 * 1024 * 1024), None, None);
+            .with_buffering(true, Some(16 * 1024 * 1024), None, None, None, None);
         let uri = format!(
             "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/u4",
             addr.port()
@@ -2864,7 +2957,7 @@ Connection: close\r\n\r\n";
         let (addr, _rx) = capture_upstream(OK).await;
         let client = cached_client("127.0.0.1", addr, None, None, false, None, false)
             .unwrap()
-            .with_buffering(true, Some(8), None, None); // 8-byte cap
+            .with_buffering(true, Some(8), None, None, None, None); // 8-byte cap
         let uri = format!(
             "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/u5",
             addr.port()
@@ -2907,16 +3000,10 @@ Connection: close\r\n\r\n";
             Ok(Bytes::from_static(b"world")),
         ];
         let mut data: BodyData = Box::pin(futures::stream::iter(rest));
-        let (len, replay) = buffer_body_to_length_in(
-            first,
-            &mut data,
-            1024,
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            tmp.path(),
-        )
-        .await
-        .expect("an under-cap body buffers");
+        let (len, replay) =
+            buffer_body_to_length_in(first, &mut data, 1024, permissive_guards(), tmp.path())
+                .await
+                .expect("an under-cap body buffers");
         assert_eq!(len, b"hello brave world".len() as u64);
         // Unlinked at creation — the dir shows no entry even while the handle is live.
         assert_eq!(
@@ -2942,16 +3029,9 @@ Connection: close\r\n\r\n";
         let first = Bytes::from_static(b"0123456789");
         let rest: Vec<Result<Bytes, axum::Error>> = vec![Ok(Bytes::from_static(b"abcdef"))];
         let mut data: BodyData = Box::pin(futures::stream::iter(rest));
-        let err = buffer_body_to_length_in(
-            first,
-            &mut data,
-            12,
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-            tmp.path(),
-        )
-        .await
-        .err();
+        let err = buffer_body_to_length_in(first, &mut data, 12, permissive_guards(), tmp.path())
+            .await
+            .err();
         assert!(
             matches!(err, Some(BufferError::TooLarge)),
             "an over-cap body is rejected with TooLarge"
@@ -2963,22 +3043,36 @@ Connection: close\r\n\r\n";
         );
     }
 
-    // --- request-buffering slow-loris: the inbound body read is time-bounded (v0.73.0) -----
+    // --- request-buffering slow-client guards: read-idle + throughput floor + optional ceiling ----
     //
     // The `buffer_requests` loop reads an untrusted body to a temp file BEFORE the upstream
     // write, so it is bounded by neither `request_timeout_ms` (which wraps only `attempt`, after
     // buffering) nor the connection idle timeout (which never fires on an actively-trickling
     // stream). A 1-byte-per-few-seconds trickle therefore held a connection slot + a growing temp
-    // file indefinitely (live-gate: >160 s, no timeout). The fix bounds every inbound read by a
-    // per-read idle timeout AND a whole-phase wall-clock budget; on either, buffering aborts
-    // (`BufferError::Timeout` → `UpstreamError::RequestBodyTimeout` → `408`), dropping the temp
-    // file and releasing the slot. `408` is a 4xx, so passive health never ejects the (healthy)
-    // backend for a client-side stall.
+    // file indefinitely (live-gate: >160 s, no timeout). The guard is three-part: a per-read idle
+    // timeout (a fully-stalled client), a MINIMUM-THROUGHPUT floor over a trailing window (a
+    // drip-feed that never idles — AND, unlike the flat wall-clock cap it replaces, one that does
+    // NOT false-`408` a slow-but-steadily-progressing large upload), and an OPTIONAL absolute
+    // ceiling (blunt defense-in-depth, off by default). Any of the three aborts with
+    // `BufferError::Timeout` → `UpstreamError::RequestBodyTimeout` → `408` (a 4xx, so passive health
+    // never ejects the healthy backend for a client-side stall), dropping the temp file.
+
+    /// Permissive guards for the direct-helper unit tests: a long read-idle, throughput floor OFF,
+    /// no absolute ceiling — so a test that is not about timing never trips one, and a test that IS
+    /// overrides only the single guard it exercises.
+    fn permissive_guards() -> BufferGuards {
+        BufferGuards {
+            read_idle: Duration::from_secs(30),
+            min_rate_bytes_per_sec: 0,
+            rate_window: Duration::from_secs(30),
+            abs_ceiling: None,
+        }
+    }
 
     /// A single inbound read that STALLS (never yields the next chunk) past the read-idle timeout
     /// aborts buffering with `Timeout` — and, because the temp inode is unlinked at creation, the
-    /// spill dir is left empty (no leak). The whole-phase budget is large here, so it is provably
-    /// the per-read idle timeout that fires.
+    /// spill dir is left empty (no leak). Throughput floor off + no ceiling, so it is provably the
+    /// per-read idle timeout that fires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn buffer_body_to_length_in_aborts_on_read_idle_stall() {
         fn dir_entry_count(dir: &std::path::Path) -> usize {
@@ -2992,9 +3086,13 @@ Connection: close\r\n\r\n";
         let err = buffer_body_to_length_in(
             first,
             &mut data,
-            1 << 30,                   // 1 GiB cap — not the bound under test
-            Duration::from_millis(60), // read-idle: the bound under test
-            Duration::from_secs(30),   // whole-phase budget: large, must not be what fires
+            1 << 30, // 1 GiB cap — not the bound under test
+            BufferGuards {
+                read_idle: Duration::from_millis(60), // the bound under test
+                min_rate_bytes_per_sec: 0,            // floor off — isolate read-idle
+                rate_window: Duration::from_secs(30),
+                abs_ceiling: None,
+            },
             tmp.path(),
         )
         .await
@@ -3005,7 +3103,7 @@ Connection: close\r\n\r\n";
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "the read-idle timeout (60ms), not the 30s whole-phase budget, must have fired"
+            "the read-idle timeout (60ms) must have fired promptly"
         );
         assert_eq!(
             dir_entry_count(tmp.path()),
@@ -3014,42 +3112,155 @@ Connection: close\r\n\r\n";
         );
     }
 
-    /// A body that trickles steadily — each read well within the read-idle timeout, but the whole
-    /// buffering phase running past the wall-clock budget — aborts with `Timeout`. This is the
-    /// slow-loris the per-read timeout alone cannot stop (it never idles); only the whole-phase
-    /// budget catches it. The temp file is dropped, leaving the spill dir empty.
+    /// A body that trickles steadily BELOW the throughput floor — each read well within the
+    /// read-idle timeout (it never idles), but its sustained rate under the floor — aborts with
+    /// `Timeout`. This is the slow-loris the per-read timeout alone cannot stop; the throughput
+    /// floor catches it, with NO flat wall-clock cap in play. The temp file is dropped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn buffer_body_to_length_in_aborts_on_whole_phase_budget() {
+    async fn buffer_body_to_length_in_aborts_on_sub_floor_drip() {
         fn dir_entry_count(dir: &std::path::Path) -> usize {
             std::fs::read_dir(dir).unwrap().count()
         }
         let tmp = tempfile::tempdir().unwrap();
-        // A chunk every 20ms, forever — never idles (20ms ≪ the 5s read-idle below), but makes
-        // negligible progress, exactly the trickle that evades a per-read timeout.
+        // ~1 byte / 20ms ≈ 50 B/s — never idles (20ms ≪ the 5s read-idle), but far below the
+        // 10 KiB/s floor: exactly the trickle that evades a per-read timeout.
         let trickle = futures::stream::unfold(0u32, |i| async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             Some((Ok::<Bytes, axum::Error>(Bytes::from_static(b"x")), i + 1))
         });
         let first = Bytes::from_static(b"start");
         let mut data: BodyData = Box::pin(trickle);
+        let started = std::time::Instant::now();
         let err = buffer_body_to_length_in(
             first,
             &mut data,
-            1 << 30,                    // 1 GiB cap — never reached at 1 byte/20ms
-            Duration::from_secs(5),     // read-idle: never fires (each read is ~20ms)
-            Duration::from_millis(150), // whole-phase budget: the bound under test
+            1 << 30, // 1 GiB cap — never reached at this trickle
+            BufferGuards {
+                read_idle: Duration::from_secs(5), // never fires (each read ~20ms)
+                min_rate_bytes_per_sec: 10_000,    // 10 KiB/s floor — the bound under test
+                rate_window: Duration::from_millis(100), // short window so the test is quick
+                abs_ceiling: None,                 // no flat cap — the floor alone must cut it
+            },
             tmp.path(),
         )
         .await
         .err();
         assert!(
             matches!(err, Some(BufferError::Timeout)),
-            "a trickle that never idles must still abort once the whole-phase budget elapses, got {err:?}"
+            "a sub-floor drip must abort via the throughput floor, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the throughput floor (one ~100ms window), not a long wall-clock cap, must have fired"
         );
         assert_eq!(
             dir_entry_count(tmp.path()),
             0,
-            "the whole-phase-timeout path drops the temp file — no leak"
+            "the throughput-floor abort path drops the temp file — no leak"
+        );
+    }
+
+    /// REGRESSION (the v0.73.0 false-positive this fix closes): a slow-but-STEADILY-PROGRESSING
+    /// upload that stays ABOVE the throughput floor COMPLETES, even though it spans many rate
+    /// windows — where the old flat whole-phase wall-clock cap would have `408`'d it the moment
+    /// total buffering time crossed the cap, regardless of its steady progress. The body buffers
+    /// intact and the computed length is exact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffer_body_to_length_in_completes_slow_but_steady_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 8 chunks of 2 KiB, one every 50ms ≈ 40 KiB/s — comfortably above the 2 KiB/s floor, but
+        // running ~400ms across ~4 of the 100ms rate windows, so the throughput guard is actually
+        // exercised (and passes) on each window boundary rather than never firing.
+        const CHUNK: usize = 2000;
+        const N: usize = 8;
+        let steady = futures::stream::unfold(0usize, |i| async move {
+            if i >= N {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Some((
+                Ok::<Bytes, axum::Error>(Bytes::from(vec![b'y'; CHUNK])),
+                i + 1,
+            ))
+        });
+        let first = Bytes::from(vec![b's'; CHUNK]);
+        let mut data: BodyData = Box::pin(steady);
+        let (len, replay) = buffer_body_to_length_in(
+            first,
+            &mut data,
+            1 << 30, // generous cap — not the point
+            BufferGuards {
+                read_idle: Duration::from_secs(2), // never fires (each read ~50ms)
+                min_rate_bytes_per_sec: 2000,      // 2 KiB/s floor — the body clears it
+                rate_window: Duration::from_millis(100), // multiple windows elapse over the upload
+                abs_ceiling: None,                 // no flat cap (that was the bug)
+            },
+            tmp.path(),
+        )
+        .await
+        .expect("a steady above-floor upload must complete, not 408");
+        let expected = (CHUNK * (N + 1)) as u64;
+        assert_eq!(
+            len, expected,
+            "the computed Content-Length covers the whole body"
+        );
+        let buffered = axum::body::to_bytes(Body::from_stream(replay), 1 << 24)
+            .await
+            .unwrap();
+        assert_eq!(
+            buffered.len() as u64,
+            expected,
+            "the slow-but-steady body replays intact"
+        );
+    }
+
+    /// The OPTIONAL absolute ceiling (defense-in-depth): when an operator sets it, it caps total
+    /// buffering time regardless of throughput — even a fast, non-idling upload is cut once the
+    /// ceiling elapses. Throughput floor off here, so it is provably the ceiling that fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffer_body_to_length_in_absolute_ceiling_aborts() {
+        fn dir_entry_count(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir).unwrap().count()
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        // A brisk stream (a chunk every 40ms, forever) that never idles and would clear any floor —
+        // only the absolute ceiling can stop it.
+        let brisk = futures::stream::unfold(0u32, |i| async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Some((
+                Ok::<Bytes, axum::Error>(Bytes::from_static(b"chunk")),
+                i + 1,
+            ))
+        });
+        let first = Bytes::from_static(b"start");
+        let mut data: BodyData = Box::pin(brisk);
+        let started = std::time::Instant::now();
+        let err = buffer_body_to_length_in(
+            first,
+            &mut data,
+            1 << 30,
+            BufferGuards {
+                read_idle: Duration::from_secs(5), // never fires (each read ~40ms)
+                min_rate_bytes_per_sec: 0,         // floor off — isolate the ceiling
+                rate_window: Duration::from_secs(30),
+                abs_ceiling: Some(Duration::from_millis(100)), // the bound under test
+            },
+            tmp.path(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(err, Some(BufferError::Timeout)),
+            "the absolute ceiling must abort even a brisk upload, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the 100ms ceiling, not the 5s read-idle, must have fired"
+        );
+        assert_eq!(
+            dir_entry_count(tmp.path()),
+            0,
+            "the ceiling abort path drops the temp file — no leak"
         );
     }
 
@@ -3066,8 +3277,9 @@ Connection: close\r\n\r\n";
         let (addr, _rx) = capture_upstream(OK).await;
         let client = cached_client("127.0.0.1", addr, None, None, false, None, false)
             .unwrap()
-            // short read-idle so the stall trips quickly; default whole-phase budget.
-            .with_buffering(true, Some(16 * 1024 * 1024), Some(60), None);
+            // Short read-idle so the fully-stalled body trips quickly; throughput floor disabled
+            // (`Some(0)`) and no absolute ceiling, so this isolates the read-idle guard.
+            .with_buffering(true, Some(16 * 1024 * 1024), Some(60), Some(0), None, None);
         let uri = format!(
             "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/u6",
             addr.port()

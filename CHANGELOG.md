@@ -5,6 +5,37 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Changed
+
+- **Gateway request-buffering (`buffer_requests`) slow-client guard is now throughput-aware
+  instead of a flat wall-clock cap — a steadily-progressing large upload no longer
+  false-`408`s.** The v0.73.0 buffering guard aborted a length-unknown upload once total
+  buffering time crossed a flat ~120 s whole-phase budget, regardless of progress — so a large
+  upload that was merely slow (a 1 GiB layer trickling at a legitimate 5 MB/s takes ~200 s)
+  was wrongly cut with `408 Request Timeout` (the latent secondary behind the tokenfield
+  git-LFS incident; the active cause, an h2 `Expect: 100-continue` deadlock, was fixed in
+  v0.75.0). The guard is now three parts, each aborting with `408`:
+  - **read-idle** (`--buffer-read-timeout-ms` / `buffer_read_timeout_ms`, default 30 s) —
+    unchanged; catches a fully-stalled client.
+  - **minimum-throughput floor** (NEW `--buffer-min-rate-bytes-per-sec` /
+    `buffer_min_rate_bytes_per_sec`, default **1024** = 1 KiB/s, averaged over the NEW
+    `--buffer-min-rate-window-ms` / `buffer_min_rate_window_ms`, default **30 s**) — replaces
+    the flat whole-phase cap as the primary backstop. It cuts a stalled OR a drip-feed
+    slow-loris that never idles, while letting a steadily-progressing upload of **any** total
+    size finish as long as it clears the floor. Set the floor to `0` to disable it (rely on
+    read-idle only).
+  - **optional absolute ceiling** (`--buffer-total-timeout-ms` / `buffer_total_timeout_ms`,
+    now default **off**, previously 120 s) — the former flat whole-phase cap, kept only as an
+    opt-in hard upper bound for defense-in-depth; set it high enough never to cut a legitimate
+    upload.
+
+  Default-off upstreams are unchanged (the new config fields are skipped when unset, so stored
+  gateways are byte-identical). Declare-time validation rejects a buffering knob set without
+  `buffer_requests` and a zero read-idle / window / ceiling (a zero throughput floor is the
+  documented "disable" value and is allowed).
+
 ## [0.75.0] — 2026-11-26
 
 ### Added

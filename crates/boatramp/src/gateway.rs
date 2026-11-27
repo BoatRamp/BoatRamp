@@ -254,15 +254,29 @@ enum UpstreamCommand {
         max_buffer_bytes: Option<u64>,
         /// With `--buffer-requests`: read-idle timeout (ms) while buffering — the longest a single
         /// inbound body read may stall before the upload is aborted with 408 (default 30000). Bounds
-        /// the body read (which `--request-timeout-ms` does not), so a stalled client cannot pin a
-        /// connection slot + its temp file. A real upload streams continuously and never idles this
+        /// the body read (which `--request-timeout-ms` does not), so a fully-stalled client cannot pin
+        /// a connection slot + its temp file. A real upload streams continuously and never idles this
         /// long.
         #[arg(long, requires = "buffer_requests")]
         buffer_read_timeout_ms: Option<u64>,
-        /// With `--buffer-requests`: whole-phase wall-clock budget (ms) for buffering one body before
-        /// it is aborted with 408 (default 120000), regardless of pacing. The backstop the read-idle
-        /// timeout cannot provide against a slow trickle that never idles. Raise it for very large
-        /// layers over slow links; lower it on a space/time-tight node.
+        /// With `--buffer-requests`: minimum sustained inbound throughput (bytes/sec) a buffered body
+        /// must hold — if its average rate over the trailing `--buffer-min-rate-window-ms` window
+        /// drops below this, it is aborted with 408 (default 1024 = 1 KiB/s). This is the throughput
+        /// backstop the read-idle timeout cannot provide: it cuts a drip-feed that never idles, while
+        /// letting a steadily-progressing upload of ANY size finish (a flat time cap wrongly 408s a
+        /// slow-but-large upload). Set `0` to disable it (rely on read-idle only).
+        #[arg(long, requires = "buffer_requests")]
+        buffer_min_rate_bytes_per_sec: Option<u64>,
+        /// With `--buffer-requests`: the trailing window (ms) over which
+        /// `--buffer-min-rate-bytes-per-sec` is averaged (default 30000). A longer window tolerates
+        /// burstier uploads; a shorter one reacts to a rate drop sooner.
+        #[arg(long, requires = "buffer_requests")]
+        buffer_min_rate_window_ms: Option<u64>,
+        /// With `--buffer-requests`: an OPTIONAL absolute whole-phase wall-clock ceiling (ms) — a hard
+        /// cap on total buffering time regardless of throughput, as defense-in-depth (default: none).
+        /// The throughput floor is the primary slow-client guard; set this only as a blunt catch-all,
+        /// and HIGH enough never to cut a legitimate upload (at the floor rate a body up to
+        /// `--max-buffer-bytes` can legitimately take a long time).
         #[arg(long, requires = "buffer_requests")]
         buffer_total_timeout_ms: Option<u64>,
         /// For `--lb nearest`: the request header carrying the client's region
@@ -417,6 +431,8 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<GatewayOut
             buffer_requests,
             max_buffer_bytes,
             buffer_read_timeout_ms,
+            buffer_min_rate_bytes_per_sec,
+            buffer_min_rate_window_ms,
             buffer_total_timeout_ms,
             client_region_header,
             regions,
@@ -477,6 +493,8 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<GatewayOut
                     buffer_requests,
                     max_buffer_bytes,
                     buffer_read_timeout_ms,
+                    buffer_min_rate_bytes_per_sec,
+                    buffer_min_rate_window_ms,
                     buffer_total_timeout_ms,
                     regions: region_tags,
                     client_region_header,
@@ -652,8 +670,18 @@ fn write_gateway(gateway: &GatewayConfig, w: &mut dyn std::io::Write) -> std::io
             if let Some(ms) = up.buffer_read_timeout_ms {
                 parts.push(format!("read_timeout={ms}ms"));
             }
+            if let Some(bps) = up.buffer_min_rate_bytes_per_sec {
+                parts.push(if bps == 0 {
+                    "min_rate=off".to_string()
+                } else {
+                    format!("min_rate={bps}B/s")
+                });
+            }
+            if let Some(ms) = up.buffer_min_rate_window_ms {
+                parts.push(format!("rate_window={ms}ms"));
+            }
             if let Some(ms) = up.buffer_total_timeout_ms {
-                parts.push(format!("total_timeout={ms}ms"));
+                parts.push(format!("max_total={ms}ms"));
             }
             notes.push(if parts.is_empty() {
                 "buffer_requests".to_string()
