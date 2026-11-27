@@ -1869,6 +1869,14 @@ impl Messaging for RaftMessaging {
         // partial purge: an interruption after some batches leaves the rest in applied state, and the
         // next sweep re-enumerates + re-proposes them (the caller deletes the run-state record only
         // after this returns Ok).
+        //
+        // TRANSIENT (Security P3 LOW, accepted): freeing payloads before the index delete means the
+        // index momentarily references freed payloads, so a reader that races in between the reclaim's
+        // no-live-attacher decision and this purge sees a dangling-payload (truncated/errored) stream
+        // rather than a clean index-miss. Bounded — purge runs only on a reclaimable, no-live-attacher
+        // run — non-leaking, and self-heals on the next sweep; free-first remains the correct trade (a
+        // permanent payload orphan on a propose-failure is worse than a transient read error on an
+        // already-abandoned run).
         const PURGE_MAX_BATCH: usize = 1024;
         let mut deletes: Vec<WriteOp> = Vec::new();
         // Work-queue meta records (`mq/{topic}/{id}`) + collect ids for their object-store payloads.

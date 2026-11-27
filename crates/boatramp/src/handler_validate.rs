@@ -323,7 +323,7 @@ mod imp {
     /// older guest that does not import it is unaffected); advertised only under the `egress-register`
     /// cargo feature; a pre-#12 host rejects the unknown import at link (the loud-fail the bump makes
     /// visible). The guest-facing WIT is vendored into `boatramp-uchron-shim` the same cycle.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 15, 0);
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 16, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]

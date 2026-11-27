@@ -5,7 +5,7 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [Unreleased]
+## [0.76.0] — 2026-11-27
 
 ### Added
 
@@ -170,7 +170,7 @@ versions.
   OFF-by-default posture `allow_guest_run_streaming` (+ the `run-streaming` cargo feature) as P1/P2.
   - **Authz = the guest-resolver path (D2-A), not a new credential.** The host resolves the
     SUBSCRIBER's own-tenant from the request bearer under the site's `/graphql` tenancy declaration
-    (the SAME resolution the guest `run.create` door uses) and attaches under `run_grant_scope` —
+    (the same gateway caller-facts resolution the guest `run.create` door uses for a bearer `token`/`domain` tenant — but NOT the extra `session_cookie`/`signed_context`/`sealed_state`/`preauth` sources `build_bindings` also accepts, so a run created under one of THOSE resolves to None or a different scope and is simply not attachable via this face ⇒ `404`, always fail-closed, never a cross-tenant read) and attaches under `run_grant_scope` —
     fail-closed exactly like the guest door: a subscription can NEVER attach a run outside its own
     tenant (a foreign-tenant id composes a different key ⇒ `404`), and an untenanted subscription under
     a multi-tenant posture is REFUSED. Within a tenant the guest resolver's START decision + the
@@ -198,6 +198,8 @@ versions.
   MEDIUM-1 CHANGELOG note: on the IDLE→cancel→reclaim path a purge that then fails leaves a now-terminal
   run that re-reclaims via the terminal arm only after the ~24 h terminal-retention window, not on the
   next tick.
+
+- **Operator work-queue reclaim — `queue purge` + a subscriber-aware orphan signal (#15).** Recovery for the ungrouped work-queue (competing-consumer, delete-on-ack) backlog that otherwise grows without bound when a topic has NO consumer. (1) A new `Messaging::purge_work_queue(topic)` drops every live `mq/{topic}/{id}` record + its payload + the per-topic ready marker — scoped to the topic's OWN work-queue (direct children only), never the dead-letter store nor any grouped fan-out state; single-node deletes locally, the cluster impl routes an EXPLICIT replicated delete proposal through the leader (mirroring `gc_grouped` / `purge_dead_letters`). Exposed as two fail-closed operator endpoints — site-scoped `POST /api/sites/{site}/_boatramp/queue/purge` (`Site·Write`) and bus-scoped `POST /api/projects/{project}/_boatramp/bus/queue/purge` (`Project·Admin`) — plus a typed response, a `queue purge` CLI command, and a client method. (2) The scheduler's orphaned-ready signal (the `boatramp_orphaned_ready_topic` gauge + warn) is now subscriber-aware: a work-queue topic drained by an externally-registered consumer group (a durable SSE/WS subscriber) or a webhook sink is no longer false-flagged as orphaned. See `crates/boatramp-core/DESIGN-workqueue-retention.md`.
 
 ### Security
 

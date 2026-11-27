@@ -71,6 +71,10 @@ pub(crate) fn subscription_run_binding(
         return None; // no declared run-attach fields ⇒ never a run subscription
     }
     let doc = async_graphql_parser::parse_query(query).ok()?;
+    // For a MULTI-operation document the inspected subscription op follows the parser's map iteration
+    // order, which may not equal the client's `operationName` (Security P3 INFO — mirrors the
+    // `subscription_topic` detection). Not security-relevant: the guest executes the resolver, and both
+    // the run-attach and topic paths are posture-gated + tenancy-fenced regardless of which op wins.
     let ops: Vec<&OperationDefinition> = match &doc.operations {
         DocumentOperations::Single(op) => vec![&op.node],
         DocumentOperations::Multiple(map) => map.values().map(|op| &op.node).collect(),
