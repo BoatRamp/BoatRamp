@@ -412,6 +412,20 @@ impl Right {
             return Some(Self::new(Resource::System, None, Action::Admin));
         }
 
+        // The EXTERNAL run door's token-authenticated ATTACH + CANCEL (PLAN-run-streaming P2):
+        // `GET /api/projects/<p>/runs/<id>/events` and `POST /api/projects/<p>/runs/<id>/cancel` are
+        // authenticated by a RUN-SCOPED capability token the handler verifies fail-closed (fleet-signed,
+        // bound to EXACTLY this run + tenant + the needed right) — NOT a project RBAC right — exactly
+        // like the single-use `/api/cluster/join` / `/api/overlay/enroll` tokens above. So they are
+        // UNGATED at the RBAC layer (`None`): `require_auth` only confirms a bearer is present, and the
+        // handler is the sole authority on the run token. START (`POST /api/projects/<p>/runs`) is NOT
+        // matched here — creating a run INVOKES the target, so it falls through to the project-scoped
+        // `runs` arm below (`Project·Deploy` — the invoke right). The exact-shape match can never widen
+        // another `runs` subpath.
+        if is_run_token_path(&m, path) {
+            return None;
+        }
+
         // Project-scoped endpoints: `/api/projects/<proj>/<rest...>` (0.2.0). Parsed
         // through the shared `project_api_path` so this and the request-scoping
         // middleware agree on the tenant segment.
@@ -607,6 +621,20 @@ impl Right {
                 // verb with no topic) falls through to the deny-safe `System·Admin` default — never a
                 // silent allow. Gated explicitly, ABOVE the general project-owned catch-all.
                 Some((&"bus", tail)) => messaging_consumer_right(proj, get, tail),
+                // The EXTERNAL run door's START (`POST /api/projects/<proj>/runs`, PLAN-run-streaming
+                // P2): creating a run INVOKES the target agent — a deploy-grade act — so it gates with
+                // `Project·Deploy` on THIS project (the invoke right, the SAME as
+                // `/api/functions/<name>/invoke`), never a project admin. The token-authenticated
+                // ATTACH/CANCEL subpaths (`runs/<id>/events`, `runs/<id>/cancel`) returned `None` at the
+                // top of `required_for` (handler-verified run token), so they never reach here — this
+                // arm sees only START (a `GET …/runs` read, if ever added, is deny-safe `Project·Read`).
+                // Placed ABOVE the `Some(_)` catch-all (which resolves the SAME `Project·Deploy` for a
+                // POST) as a visibility/intent pin — not a behavior change for START.
+                Some((&"runs", _)) => Self::new(
+                    Resource::Project,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Deploy },
+                ),
                 // Project-owned resources (functions/compute/workflows/config/…):
                 // read with `Project·Read`, mutate with `Project·Deploy`.
                 Some(_) => Self::new(
@@ -1108,6 +1136,29 @@ pub fn project_from_query(query: Option<&str>) -> Option<&str> {
 pub fn project_api_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("/api/projects/")?;
     Some(rest.split_once('/').unwrap_or((rest, "")))
+}
+
+/// Whether `method`+`path` is the external run door's token-authenticated ATTACH
+/// (`GET /api/projects/<p>/runs/<id>/events`) or CANCEL (`POST /api/projects/<p>/runs/<id>/cancel`)
+/// (PLAN-run-streaming P2). These two routes are authenticated by a RUN-SCOPED capability token the
+/// handler verifies fail-closed — bound to EXACTLY this run + tenant + the needed right — NOT a
+/// project RBAC right, so [`Right::required_for`] returns `None` for them (like `/api/cluster/join`).
+/// START (`POST /api/projects/<p>/runs`) is deliberately NOT matched here: it keeps the project-scoped
+/// invoke right. The exact-shape match (`runs/<id>/events` GET / `runs/<id>/cancel` POST) can never
+/// widen another `runs` subpath to ungated.
+fn is_run_token_path(method: &str, path: &str) -> bool {
+    let Some((proj, sub)) = project_api_path(path) else {
+        return false;
+    };
+    if proj.is_empty() {
+        return false;
+    }
+    let segs: Vec<&str> = sub.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.as_slice() {
+        ["runs", _id, "events"] => method == "GET",
+        ["runs", _id, "cancel"] => method == "POST",
+        _ => false,
+    }
 }
 
 /// Whether `path` targets the node-global persistent-**volume** management surface
@@ -2520,6 +2571,85 @@ mod tests {
         // A node admin (global) satisfies both, as for every project resource.
         let node_admin = policy.rights_for(&[GrantedRole::global("admin")]);
         assert!(node_admin.allows(&purge) && node_admin.allows(&peek));
+    }
+
+    /// The external RUN door's authz mapping (PLAN-run-streaming P2): START gates with the project
+    /// INVOKE right (`Project·Deploy`), while token-authenticated ATTACH/CANCEL are UNGATED at the RBAC
+    /// layer (`None`) — the handler verifies the run-scoped capability token instead.
+    #[test]
+    fn run_door_authz_mapping() {
+        let deploy = |p: &str| Right::new(Resource::Project, Some(p.to_string()), Action::Deploy);
+
+        // START (`POST …/runs`) = invoke rights on the target → `Project·Deploy` on the project — the
+        // SAME grade as `/api/functions/<name>/invoke`, never a project admin.
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/runs"),
+            Some(deploy("acme")),
+            "START must gate with Project·Deploy (the invoke right)"
+        );
+        assert_eq!(
+            Right::required("POST", "/api/functions/handler/invoke"),
+            Some(Right::new(
+                Resource::Project,
+                Some(crate::project::DEFAULT_PROJECT.to_string()),
+                Action::Deploy
+            )),
+            "START's grade matches the function invoke right"
+        );
+
+        // ATTACH + CANCEL carry the RUN-SCOPED token (verified in-handler) → UNGATED (`None`), exactly
+        // like `/api/cluster/join`. If this regressed to a project right, an external MCP client holding
+        // only the run token would be rejected by the RBAC middleware before the handler ran.
+        assert_eq!(
+            Right::required("GET", "/api/projects/acme/runs/1700-abc/events"),
+            None,
+            "ATTACH is ungated at the RBAC layer (handler verifies the run token)"
+        );
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/runs/1700-abc/cancel"),
+            None,
+            "CANCEL is ungated at the RBAC layer (handler verifies the run token)"
+        );
+
+        // A topic/run id containing `-`/digits is matched exactly; a DIFFERENT run subpath is NOT
+        // ungated (it falls to the `runs` arm / catch-all), so the `None` can never widen.
+        assert_eq!(
+            Right::required("GET", "/api/projects/acme/runs/rid/status"),
+            Some(Right::new(
+                Resource::Project,
+                Some("acme".into()),
+                Action::Read
+            )),
+            "an unknown runs subpath keeps a project right, never ungated"
+        );
+        // The WRONG method on an attach/cancel shape is not silently ungated either.
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/runs/rid/events"),
+            Some(deploy("acme")),
+            "a non-GET on the events shape keeps the project right (not ungated)"
+        );
+
+        // Cross-tenant isolation of START: a token scoped to another project can never START on acme.
+        let policy = AuthzPolicy::default_policy();
+        let start = Right::required("POST", "/api/projects/acme/runs").unwrap();
+        assert!(
+            policy
+                .rights_for(&[GrantedRole::scoped("project_publisher", "acme")])
+                .allows(&start),
+            "a deploy-grade publisher on acme can START (it holds the invoke right)"
+        );
+        assert!(
+            !policy
+                .rights_for(&[GrantedRole::scoped("project_viewer", "acme")])
+                .allows(&start),
+            "a read-only viewer cannot START (no invoke right)"
+        );
+        assert!(
+            !policy
+                .rights_for(&[GrantedRole::scoped("project_admin", "other")])
+                .allows(&start),
+            "a DIFFERENT project's admin cannot START on acme"
+        );
     }
 
     #[test]

@@ -89,6 +89,12 @@ const CLAIM_OVERLAY_SCOPE: &str = "br_ovscope";
 /// is CLOSED: a token whose `br_ovrole` is any other value is rejected on verify (fail-closed), so a
 /// corrupt/unknown role never degrades to a weaker-but-accepted one.
 const CLAIM_OVERLAY_ROLE: &str = "br_ovrole";
+/// Text claim key for the **run-scoped capability scope** ([`KIND_RUN_CAP`], PLAN-run-streaming P2) —
+/// a CBOR map holding the host-stamped `{run_id, scope, rights}` the token authorizes. The full scope
+/// lives in the SIGNED payload so an external client can never widen it (the URL/headers are never
+/// consulted for scope): a token for run A can never attach run B, and a token for tenant X's scope
+/// composes X's key and so can never reach tenant Y's run.
+const CLAIM_RUN: &str = "br_run";
 
 /// Bounds on the opaque app-context (R6): a capability may carry at most this many entries, and its
 /// keys+values may total at most this many bytes. Enforced at mint so a guest can't inflate a token.
@@ -161,6 +167,16 @@ pub const KIND_CAPABILITY: &str = "capability";
 /// context/session token, and none of those can be redeemed as an S3 session (the `br_kind` check is
 /// exact on both mint and verify).
 pub const KIND_S3_SESSION: &str = "s3-session";
+/// Token kind: a **run-scoped capability** (PLAN-run-streaming P2) — the ATTACH/CANCEL bearer an
+/// external (non-guest) client presents to the run front door. A `COSE_Sign1` CWT signed by the fleet
+/// `Signer`, carrying a host-stamped scope (`br_run` = `{run_id, scope, rights}`), the redeeming
+/// project as `aud`, a **mandatory** `exp`, and a `cti`. The door verifies it (signature + expiry +
+/// audience + `br_kind == "run-cap"` + the scope) on every attach/cancel and authorizes ONLY the
+/// exact run named in the signed scope — never one taken from the URL. **Domain-separated** and far
+/// NARROWER than any RBAC bearer: it is good for exactly one run's attach/cancel, never broad creds,
+/// and can never be redeemed as a role/capability/s3/overlay token (the `br_kind` check is exact on
+/// both mint and verify).
+pub const KIND_RUN_CAP: &str = "run-cap";
 /// Token kind: an **overlay-dial capability** (boatramp overlay fabric) — a holder-key-bound,
 /// offline-verifiable CWT authorizing the holder identity to dial a scoped in-cluster service over
 /// the overlay. A relay/egress verifies it (signature + expiry + `br_kind == "overlay-dial"`) and
@@ -2066,6 +2082,222 @@ pub fn verify_s3_session(
     Ok(S3Session { scope, cti, exp })
 }
 
+// ---- run-scoped capability token (PLAN-run-streaming P2) -------------------------------------
+//
+// The ATTACH/CANCEL bearer an EXTERNAL (non-guest) client presents to the run front door. Minted at
+// START (`POST …/runs`) and handed back as `attach_token`; the door verifies it on every attach/cancel
+// and acts ONLY on the one run named in the SIGNED scope. Domain-separated from every other token kind
+// (the exact `br_kind` check), and far narrower than any RBAC bearer — good for one run only, never
+// broad creds. It mirrors the S3-ingress session token (host-stamped scope in the signed payload, a
+// mandatory `exp`, audience-bound) rather than inventing a new token format.
+
+/// A single permitted run operation a [`RunCapScope`] grants. A deliberately tiny, explicit set —
+/// a run capability never grants emit (only the target agent emits) or any broad authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RunRight {
+    /// Attach to the run's event stream (`GET …/runs/{id}/events`).
+    Attach,
+    /// Cancel the run (`POST …/runs/{id}/cancel`).
+    Cancel,
+}
+
+impl RunRight {
+    /// The stable wire term (CBOR + greppable).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attach => "attach",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    /// Parse a wire term back; unknown ⇒ `None` (dropped on decode, never a panic on a hostile token).
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "attach" => Some(Self::Attach),
+            "cancel" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
+/// The full host-stamped scope a [`KIND_RUN_CAP`] token carries. `run_id` + the tenancy `scope`
+/// segment are resolved by the HOST at START (never client-supplied), so a capability is structurally
+/// confined to exactly one run under one tenant: a token for run A composes A's key and can never
+/// attach run B, and a token minted under tenant X's `scope` composes X's key and so can never reach
+/// tenant Y's run (whose key is under Y's `scope`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunCapScope {
+    /// The one run this capability is good for (the server-minted run id).
+    pub run_id: String,
+    /// The tenancy scope segment of the run topic (`boatramp_core::run::run_scope_segment` —
+    /// `t_{tenant}` or the untenanted `u`). The door builds its run engine from THIS scope, so the
+    /// tenant fence is carried by the signed token, never re-derived from the request.
+    pub scope: String,
+    /// The permitted operations (a non-empty set; attach/cancel only).
+    pub rights: Vec<RunRight>,
+}
+
+impl RunCapScope {
+    /// Whether this scope grants `right`.
+    #[must_use]
+    pub fn allows(&self, right: RunRight) -> bool {
+        self.rights.contains(&right)
+    }
+
+    /// Encode as a deterministic CBOR map for the signed payload. Rights are sorted+deduped so the
+    /// encoding is canonical.
+    fn to_cbor(&self) -> CborValue {
+        let mut rights: Vec<RunRight> = self.rights.clone();
+        rights.sort_unstable();
+        rights.dedup();
+        CborValue::Map(vec![
+            (
+                CborValue::Text("run_id".into()),
+                CborValue::Text(self.run_id.clone()),
+            ),
+            (
+                CborValue::Text("scope".into()),
+                CborValue::Text(self.scope.clone()),
+            ),
+            (
+                CborValue::Text("rights".into()),
+                CborValue::Array(
+                    rights
+                        .iter()
+                        .map(|r| CborValue::Text(r.as_str().into()))
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+
+    /// Decode from the CBOR produced by [`to_cbor`](Self::to_cbor). Fails closed (`None`) on a missing
+    /// `run_id`/`scope` or an empty right set — a hostile/garbled scope never yields a usable (and
+    /// therefore never a widened) grant. Unknown keys and unknown right terms are ignored.
+    fn from_cbor(value: &CborValue) -> Option<Self> {
+        let CborValue::Map(entries) = value else {
+            return None;
+        };
+        let mut run_id = None;
+        let mut scope = None;
+        let mut rights: Vec<RunRight> = Vec::new();
+        for (k, v) in entries {
+            let CborValue::Text(name) = k else { continue };
+            match (name.as_str(), v) {
+                ("run_id", CborValue::Text(s)) => run_id = Some(s.clone()),
+                ("scope", CborValue::Text(s)) => scope = Some(s.clone()),
+                ("rights", CborValue::Array(items)) => {
+                    for item in items {
+                        if let CborValue::Text(r) = item
+                            && let Some(right) = RunRight::from_str(r)
+                        {
+                            rights.push(right);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        rights.sort_unstable();
+        rights.dedup();
+        if rights.is_empty() {
+            return None;
+        }
+        Some(Self {
+            run_id: run_id?,
+            scope: scope?,
+            rights,
+        })
+    }
+}
+
+/// A verified run-scoped capability: the carried [`RunCapScope`], its revocation id (`cti`), and its
+/// effective (mandatory) expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunCap {
+    /// The host-stamped scope this capability authorizes.
+    pub scope: RunCapScope,
+    /// The revocation id (hex of `cti`).
+    pub cti: String,
+    /// The (mandatory) expiry, Unix seconds.
+    pub exp: u64,
+}
+
+/// Mint a **run-scoped capability token** ([`KIND_RUN_CAP`]): a `COSE_Sign1` CWT carrying the full
+/// host-stamped `scope` as `br_run`, the redeeming project as `aud`, `iat = now`, a mandatory
+/// `exp = now + ttl_secs`, and a random `cti`, signed by the fleet `Signer`. Returns the base64url
+/// token — the `attach_token` START hands back. Verified with [`verify_run_cap`]; a forged/expired/
+/// wrong-audience/wrong-kind token never verifies, and the scope can only be READ from the signed
+/// payload (never widened by the client). Requires an ISSUING node (one with a fleet signer).
+pub async fn mint_run_cap(
+    scope: &RunCapScope,
+    audience: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .audience(audience.to_string())
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_RUN_CAP.to_string()),
+        )
+        .text_claim(CLAIM_RUN.to_string(), scope.to_cbor())
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify a run-scoped capability token against the fleet public key at `now_unix`, requiring the
+/// carried audience to equal `expected_audience` (the redeeming project). Checks the COSE signature,
+/// a MANDATORY expiry, `br_kind == "run-cap"`, and the audience, then returns the [`RunCap`]. Any
+/// tampering — a forged run id/scope, an altered/expired envelope, a wrong kind, or a different
+/// audience (a token minted for project X presented at project Y) — fails closed. The caller still
+/// checks the carried `run_id` against the request path and the required [`RunRight`].
+pub fn verify_run_cap(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+    expected_audience: &str,
+) -> Result<RunCap, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    let cti = claim_cti(&claims)?;
+    // A run capability crosses to an external, non-guest client, so its expiry is a HARD invariant:
+    // an `exp`-less capability would never expire. `check_exp` treats an absent `exp` as "no expiry"
+    // (fine for other kinds), so require its presence here regardless of who minted the token.
+    let exp = check_exp(&claims, now_unix)?
+        .ok_or_else(|| TokenError::Claims("run-cap has no expiry (exp is mandatory)".into()))?;
+    // Audience binding: redeemable ONLY at the project it names — never replayed across projects.
+    if claims.audience.as_deref() != Some(expected_audience) {
+        return Err(TokenError::Claims(
+            "run-cap audience does not match this project".into(),
+        ));
+    }
+    let mut kind = None;
+    let mut scope = None;
+    for (name, value) in &claims.rest {
+        let coset::cwt::ClaimName::Text(t) = name else {
+            continue;
+        };
+        match (t.as_str(), value) {
+            (CLAIM_KIND, CborValue::Text(k)) => kind = Some(k.clone()),
+            (CLAIM_RUN, m @ CborValue::Map(_)) => scope = RunCapScope::from_cbor(m),
+            _ => {}
+        }
+    }
+    if kind.as_deref() != Some(KIND_RUN_CAP) {
+        return Err(TokenError::Claims("not a run-cap token".into()));
+    }
+    let scope =
+        scope.ok_or_else(|| TokenError::Claims("run-cap scope is missing/malformed".into()))?;
+    Ok(RunCap { scope, cti, exp })
+}
+
 /// The canonical bytes a joiner signs with its mesh private key to **prove
 /// possession** of the key it presents when redeeming join token `jti`. Bound to
 /// the token (`jti`), the presented key (`mesh_pubkey_hex`), and a fresh timestamp
@@ -3733,6 +3965,178 @@ mod tests {
         raw[mid] ^= 0x01;
         let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
         assert!(verify_s3_session(&tampered, &public, NOW + 1).is_err());
+    }
+
+    // ---- run-scoped capability token (KIND_RUN_CAP, PLAN-run-streaming P2) ----------------------
+
+    fn run_scope() -> RunCapScope {
+        RunCapScope {
+            run_id: "1700000000000-0123456789abcdef0123456789abcdef".into(),
+            scope: "t_firm-a".into(),
+            rights: vec![RunRight::Attach, RunRight::Cancel],
+        }
+    }
+
+    #[tokio::test]
+    async fn run_cap_round_trips_the_full_scope_bound_to_the_project() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        let scope = run_scope();
+        let token = mint_run_cap(&scope, "acme", 300, NOW, &signer)
+            .await
+            .unwrap();
+        let v = verify_run_cap(&token, &public, NOW + 60, "acme").unwrap();
+        assert_eq!(
+            v.scope, scope,
+            "the verified scope must equal what was minted"
+        );
+        assert_eq!(v.exp, NOW + 300);
+        assert!(!v.cti.is_empty());
+        assert!(v.scope.allows(RunRight::Attach));
+        assert!(v.scope.allows(RunRight::Cancel));
+    }
+
+    #[tokio::test]
+    async fn run_cap_is_bound_to_its_audience_project() {
+        // A capability minted for project X must NOT verify when presented at project Y (no replay
+        // across projects) — the audience binding, exactly like a target capability / s3 session.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        let token = mint_run_cap(&run_scope(), "acme", 300, NOW, &signer)
+            .await
+            .unwrap();
+        assert!(verify_run_cap(&token, &public, NOW + 1, "acme").is_ok());
+        assert!(matches!(
+            verify_run_cap(&token, &public, NOW + 1, "other-project"),
+            Err(TokenError::Claims(_)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_cap_rejects_expired_and_a_foreign_signer() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        let token = mint_run_cap(&run_scope(), "acme", 300, NOW, &signer)
+            .await
+            .unwrap();
+        // Expired (verifying past `exp`) fails closed.
+        assert!(matches!(
+            verify_run_cap(&token, &public, NOW + 301, "acme"),
+            Err(TokenError::Expired),
+        ));
+        // A different fleet key cannot verify it (signature check — the fleet trust root is authority).
+        let stranger = LocalSigner::generate(TokenAlg::Es256).public_key();
+        assert!(matches!(
+            verify_run_cap(&token, &stranger, NOW + 1, "acme"),
+            Err(TokenError::Invalid(_)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_cap_requires_a_mandatory_exp() {
+        // Hand-build a KIND_RUN_CAP claim set with NO expiry; verify must refuse it (an expiry is
+        // mandatory for an external-client capability, regardless of who minted the token).
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        let claims = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(NOW as i64))
+            .cwt_id(random_cti().unwrap())
+            .audience("acme".to_string())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_RUN_CAP.to_string()),
+            )
+            .text_claim(CLAIM_RUN.to_string(), run_scope().to_cbor())
+            .build();
+        let token = sign_claims(claims, &signer).await.unwrap();
+        assert!(matches!(
+            verify_run_cap(&token, &public, NOW + 1, "acme"),
+            Err(TokenError::Claims(_)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_cap_scope_is_tamper_evident() {
+        // Flipping a byte of the signed token (which carries run_id/scope/rights) breaks the
+        // signature — an external client cannot edit the carried run id, tenant scope, or rights.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        let token = mint_run_cap(&run_scope(), "acme", 300, NOW, &signer)
+            .await
+            .unwrap();
+        let mut raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(boatramp_cwt::strip_token_prefix(&token))
+            .unwrap();
+        let mid = raw.len() / 2;
+        raw[mid] ^= 0x01;
+        let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
+        assert!(verify_run_cap(&tampered, &public, NOW + 1, "acme").is_err());
+    }
+
+    #[tokio::test]
+    async fn run_cap_is_domain_separated_from_every_other_kind() {
+        // A run-cap must not verify as any other kind, and no other kind may verify as a run-cap —
+        // the exact `br_kind` check on both sides is the whole isolation guarantee.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let public = signer.public_key();
+        let run = mint_run_cap(&run_scope(), "acme", 300, NOW, &signer)
+            .await
+            .unwrap();
+        assert!(
+            matches!(verify(&run, &public, NOW + 1), Err(TokenError::Claims(_))),
+            "a run-cap must be refused by the role verifier (domain separation)"
+        );
+        assert!(verify_capability(&run, &public, NOW + 1, "acme").is_err());
+        assert!(verify_s3_session(&run, &public, NOW + 1).is_err());
+        // And a role / s3 / capability token all fail the run-cap kind check.
+        let role = mint(&claims(), &signer).await.unwrap();
+        assert!(matches!(
+            verify_run_cap(&role, &public, NOW + 1, "acme"),
+            Err(TokenError::Claims(_)),
+        ));
+        let s3 = mint_s3_session(&s3_scope_key(), 300, NOW, &signer)
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_run_cap(&s3, &public, NOW + 1, "acme"),
+            Err(TokenError::Claims(_)),
+        ));
+    }
+
+    #[test]
+    fn run_scope_from_cbor_fails_closed_on_malformed_shapes() {
+        // Empty right set ⇒ None (a capability that authorizes nothing is refused, not "allow").
+        let no_rights = CborValue::Map(vec![
+            (
+                CborValue::Text("run_id".into()),
+                CborValue::Text("r".into()),
+            ),
+            (CborValue::Text("scope".into()), CborValue::Text("u".into())),
+            (CborValue::Text("rights".into()), CborValue::Array(vec![])),
+        ]);
+        assert!(RunCapScope::from_cbor(&no_rights).is_none());
+        // Unknown right terms are dropped; an all-unknown set ⇒ empty ⇒ None (never a silent allow).
+        let unknown = CborValue::Map(vec![
+            (
+                CborValue::Text("run_id".into()),
+                CborValue::Text("r".into()),
+            ),
+            (CborValue::Text("scope".into()), CborValue::Text("u".into())),
+            (
+                CborValue::Text("rights".into()),
+                CborValue::Array(vec![CborValue::Text("emit".into())]),
+            ),
+        ]);
+        assert!(RunCapScope::from_cbor(&unknown).is_none());
+        // Missing run_id ⇒ None.
+        let no_run = CborValue::Map(vec![
+            (CborValue::Text("scope".into()), CborValue::Text("u".into())),
+            (
+                CborValue::Text("rights".into()),
+                CborValue::Array(vec![CborValue::Text("attach".into())]),
+            ),
+        ]);
+        assert!(RunCapScope::from_cbor(&no_run).is_none());
     }
 
     #[tokio::test]

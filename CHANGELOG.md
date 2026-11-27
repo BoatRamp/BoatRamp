@@ -56,6 +56,40 @@ versions.
     cleanup** — the fresh consumer group each `attach` opens is deleted on stream end/drop, so repeated
     attach/detach no longer leaks group state. (The terminal+idle-run TTL/sweep remains a tracked P2
     enable-precondition.)
+- **Scoped run streaming — the external front door + run-scoped token (P2).** A NON-GUEST client (an
+  MCP app, a third-party GraphQL client) can now START a run, ATTACH to its event stream, and CANCEL
+  it over authenticated control-plane HTTP — a thin new transport onto P1's transport-agnostic
+  `RunEngine` (no new durability or scope primitive; it reuses the SAME SSE/WS/permit machinery the
+  project-bus consumer surface rides). Behind the SAME OFF-by-default posture `allow_guest_run_streaming`
+  as P1 (+ the `run-streaming` cargo feature); every door returns `403` until an operator opts in.
+  - **Routes.** `POST /api/projects/{project}/runs` — START: body `{ target, input }`; authorizes the
+    caller `Project·Deploy` (invoke rights on the target, the same grade as `/api/functions/{n}/invoke`)
+    + a host-resolved tenant (P1's `run_grant_scope` fence — a run with no resolved tenant under a
+    multi-tenant posture is REFUSED, identical to the guest door); creates the run in the caller's
+    tenant; dispatches a start-message tagged with the `run_id` to the target's `{project}/bus/<target>`
+    topic (the existing publish seam — the target emits to the run via P1's `run.emit`); returns
+    `{ run_id, attach_token }`. `GET …/runs/{run_id}/events` — ATTACH: SSE (default) / WebSocket (on
+    `Upgrade`) / long-poll (`?wait_ms`), resumable by `?after_seq` or `Last-Event-ID`, streaming the
+    typed envelope and ending on the terminal. `POST …/runs/{run_id}/cancel` — explicit CANCEL →
+    the terminal `cancelled`.
+  - **Run-scoped capability token (attach/cancel auth).** START mints a COSE/CWT token
+    (`KIND_RUN_CAP`, reusing boatramp's one capability-token machinery — no new format) scoped to
+    EXACTLY `{run_id, tenant-scope, rights ⊆ attach|cancel}`, fleet-signed, audience-bound to the
+    project, TTL-bound (1 h). An external client presents it as `Authorization: Bearer <token>`;
+    ATTACH/CANCEL verify it FAIL-CLOSED (fleet signature vs the trust root, not expired, audience ==
+    this project, `br_kind == run-cap`, the carried `run_id` equals the path, the scope grants the
+    needed right), then build the run engine from the token's VERIFIED tenant scope — so a token for
+    run A can never attach run B, and a token minted under tenant X's scope composes X's key and so can
+    never reach tenant Y's run. These two routes are therefore UNGATED at the RBAC layer (handler-
+    verified, like `/api/cluster/join`); START keeps its project invoke right. Minting needs an ISSUING
+    node (a fleet signer) — a non-issuing node returns `501` at START.
+  - **Drop-cancel on disconnect.** An SSE/WS attacher that drops before a terminal event cancels the
+    run (when the run armed drop-cancel), so a dropped external watcher stops the target; the ephemeral
+    per-attach consumer group is cleaned up on every teardown. Long-poll does not drop-cancel (a poll
+    gap is not a disconnect). The terminal/idle-run TTL sweep stays the tracked enable-precondition for
+    flipping the posture on — unchanged by P2.
+  - **INFO-1 doc fix.** Corrected a dangling symbol in `boatramp-core::run`'s security-invariant
+    comment (`MessagingHost::resolve_topic` → the real `MessagingBinding::namespace`).
 
 ## [0.75.0] — 2026-11-26
 

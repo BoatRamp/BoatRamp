@@ -256,6 +256,13 @@ pub(crate) use bus_consumer::{bus_ack, bus_claim, bus_nack, bus_subscribe};
 mod run_stream;
 #[cfg(feature = "run-streaming")]
 pub(crate) use run_stream::{RunEngine, RunStoreImpl};
+// The EXTERNAL run front door (PLAN-run-streaming P2): the authenticated control-plane HTTP routes
+// (start / attach-SSE-WS-longpoll / cancel) onto the transport-agnostic `RunEngine`, for non-guest
+// clients, with the run-scoped capability token for attach/cancel auth. OFF-by-default posture-gated.
+#[cfg(feature = "run-streaming")]
+mod run_door;
+#[cfg(feature = "run-streaming")]
+pub(crate) use run_door::{run_cancel, run_events, run_start};
 // The project-bus WEBHOOK SINK (PLAN-messaging-consumer-delivery, increment d): a host-run
 // pseudo-consumer that drains a sink's topic and delivers each message as an outbound signed POST to a
 // sealed, SSRF-confined destination. Two registration surfaces (runtime `PUT/DELETE .../bus/sinks/{name}`

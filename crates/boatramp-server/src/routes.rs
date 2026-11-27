@@ -863,6 +863,27 @@ pub fn router_with_fast(
         // whose `graphql.subgraphs` names an unregistered subgraph and DEFER it to `deploy:apply`.
         .route("/api/graphql/subgraphs", get(list_graphql_subgraphs))
         .route("/api/graphql/supergraph", get(get_graphql_supergraph));
+    // The EXTERNAL run front door (PLAN-run-streaming P2): START (`POST …/runs`, authorized
+    // `Project·Deploy` — invoke rights on the target — by the project-scoped `runs` arm of
+    // `Right::required_for`); ATTACH (`GET …/runs/{id}/events`, SSE/WS/long-poll, resumable) and
+    // CANCEL (`POST …/runs/{id}/cancel`), both authenticated by the RUN-SCOPED capability token the
+    // handler verifies (ungated at the RBAC layer — `required_for` returns `None` for them, exactly
+    // like `/api/cluster/join`). The whole surface is OFF-by-default (the `allow_guest_run_streaming`
+    // posture, checked in the handlers) and registered only with the `run-streaming` feature (which
+    // pulls the engine + the host run binding). The `project_scope` layer tags the request with its
+    // trusted `ProjectContext` but does NOT rewrite these paths (like the `bus` surface), so authz
+    // sees the original project-qualified path.
+    #[cfg(feature = "run-streaming")]
+    let api = api
+        .route("/api/projects/{project}/runs", post(run_start))
+        .route(
+            "/api/projects/{project}/runs/{run_id}/events",
+            get(run_events),
+        )
+        .route(
+            "/api/projects/{project}/runs/{run_id}/cancel",
+            post(run_cancel),
+        );
     // An `Auth` clone for the `/mcp` channel gate (captured before `auth` is moved
     // into the API's `require_auth` layer below) + the node's canonical origin, for
     // scoping the `/mcp` anti-DNS-rebinding host allowlist to the operator's domain.

@@ -25,7 +25,7 @@
 //!   prefix + opaque-key** invariant — NOT an object-key check. The host prepends a host-chosen root
 //!   to every guest topic (`{project}/bus/` for a `bus:<topic>`, else the component-private
 //!   `{project}/{site}/`) and the guest's string rides only as an opaque SUFFIX (see
-//!   `MessagingHost::resolve_topic` in `boatramp-handlers`). The guest controls neither the leading
+//!   `MessagingBinding::namespace` in `boatramp-handlers`). The guest controls neither the leading
 //!   project segment nor the root segment after it (always `bus` or a `{site}` slug — a strict slug
 //!   that can NEVER begin with `.`, see
 //!   [`validate_resource_name`](crate::project::validate_resource_name)), so a guest topic composes
