@@ -137,6 +137,10 @@ pub fn router_with_fast(
     let record_probe: Arc<dyn boatramp_core::record_verify::RecordProbe> = options
         .record_probe
         .unwrap_or_else(|| Arc::new(domain_verify::ServerRecordProbe::new()));
+    // Apply the node-wide gateway request-buffering concurrency cap (HIGH-2) to the process-wide
+    // buffering semaphore ONCE here at router build, before any request is served (read before
+    // `options.limits` is moved into the upload guard below). `None` keeps the built-in default.
+    crate::proxy::set_buffering_concurrency_limit(options.limits.max_concurrent_buffering);
     let upload_guard = Arc::new(UploadGuard::new(options.limits));
     // Rate-limit backend: a cluster-wide KV fixed-window when configured, else
     // the per-node in-process token buckets.

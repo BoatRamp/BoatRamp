@@ -2906,6 +2906,9 @@ pub struct ServeConfig {
     pub upload_idle_timeout_secs: Option<u64>,
     /// Cap on simultaneous blob uploads.
     pub max_concurrent_uploads: Option<usize>,
+    /// Node-wide cap on simultaneous gateway request-buffering operations (the `buffer_requests`
+    /// spill path). `None` ⇒ the built-in default (128).
+    pub max_concurrent_buffering: Option<usize>,
     /// In a TLS mode, bind this plain-HTTP address on a second listener that
     /// redirects to HTTPS (dual-listener). Only read in `tls` builds.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
@@ -6870,6 +6873,10 @@ pub(crate) mod figment_resolve {
         (
             "BOATRAMP_MAX_CONCURRENT_UPLOADS",
             &["serve", "max_concurrent_uploads"],
+        ),
+        (
+            "BOATRAMP_MAX_CONCURRENT_BUFFERING",
+            &["serve", "max_concurrent_buffering"],
         ),
         (
             "BOATRAMP_HTTP_REDIRECT_ADDR",

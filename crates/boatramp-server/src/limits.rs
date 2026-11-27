@@ -28,6 +28,14 @@ pub struct ServerLimits {
     /// Cap on simultaneous in-flight blob uploads; further uploads get 503 until
     /// a slot frees. `None` = unbounded.
     pub max_concurrent_uploads: Option<usize>,
+    /// Node-wide cap on simultaneous gateway request-BUFFERING operations (the `buffer_requests`
+    /// spill path — distinct from `max_concurrent_uploads`, which gates the blob/storage path).
+    /// Each in-flight buffered body holds up to its upstream's `max_buffer_bytes` of temp spill, so
+    /// this bounds worst-case node spill at `limit × max_buffer_bytes`; further buffering fails fast
+    /// with `503`. `None` = the built-in default (128); applied process-wide at serve startup via
+    /// [`crate::proxy::set_buffering_concurrency_limit`]. Cannot be removed entirely (a value is
+    /// clamped to ≥ 1) — it is a DoS bound that must always exist.
+    pub max_concurrent_buffering: Option<usize>,
 }
 
 impl ServerLimits {

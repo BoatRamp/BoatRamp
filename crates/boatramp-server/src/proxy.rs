@@ -105,13 +105,18 @@ pub(super) async fn proxy(
         }
         Err(UpstreamError::Failed) => (StatusCode::BAD_GATEWAY, "upstream error\n").into_response(),
         // Unreachable on the absolute-URL path (buffering is never enabled on `pinned_client`),
-        // but mapped for exhaustiveness and so the shared `send` seam has one 413/408 contract.
+        // but mapped for exhaustiveness and so the shared `send` seam has one 413/408/503 contract.
         Err(UpstreamError::PayloadTooLarge) => {
             (StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n").into_response()
         }
         Err(UpstreamError::RequestBodyTimeout) => {
             (StatusCode::REQUEST_TIMEOUT, "request body read timed out\n").into_response()
         }
+        Err(UpstreamError::BufferingOverloaded) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node buffering capacity reached\n",
+        )
+            .into_response(),
     }
 }
 
@@ -230,12 +235,71 @@ const DEFAULT_BUFFER_MIN_RATE_BYTES_PER_SEC: u64 = 1024;
 /// ~1–2 windows. Per-upstream overridable via `buffer_min_rate_window_ms`.
 const DEFAULT_BUFFER_MIN_RATE_WINDOW: Duration = Duration::from_secs(30);
 
-/// Default for the OPTIONAL absolute whole-phase wall-clock ceiling: `None` — no ceiling. The
-/// throughput floor (above) is the primary slow-client backstop, and a flat cap false-positives a
-/// slow-but-progressing large upload (the bug this replaces), so it is OFF by default. An operator
-/// may set one per upstream (`buffer_total_timeout_ms`) as blunt defense-in-depth against a
-/// pathological-but-above-floor client — set HIGH enough never to cut a legitimate upload.
-const DEFAULT_BUFFER_TOTAL_TIMEOUT: Option<Duration> = None;
+/// Default for the absolute whole-phase wall-clock ceiling: **`Some(1 hour)` — ON**. The throughput
+/// floor (above) is the primary slow-client backstop, but on its own it leaves a residual TIME bound
+/// gap: a client that drips at just over the floor (e.g. ~1.1 KiB/s) clears the rate check AND never
+/// trips the read-idle timer, so with no ceiling it could hold a connection slot + up to
+/// `max_buffer_bytes` of temp spill for `max_buffer_bytes ÷ floor` ≈ **12 days** (1 GiB ÷ 1 KiB/s)
+/// before the `413` cap finally fires. A sane default ceiling restores a per-connection time bound.
+///
+/// The ceiling is anchored to a REALISTIC minimum legitimate rate, NOT to the floor: at 1 h with the
+/// 1 GiB cap a legitimate upload only false-`408`s if it sustains below ~291 KiB/s for a FULL hour —
+/// no real registry push does (a 1 GiB layer at 1 MB/s finishes in ~18 min). This is far less
+/// aggressive than the v0.73.0 flat 120 s cap it effectively restores (which false-positived a 5 MB/s
+/// 1 GiB upload at ~200 s); 1 h does not. An operator may raise, lower, or explicitly DISABLE it per
+/// upstream via `buffer_total_timeout_ms` (`0` → off) — see [`UpstreamClient::with_buffering`].
+/// Disabling it is an opt-in choice for a rare genuinely-huge/slow-link upstream, and it re-exposes
+/// the drip-holds-a-slot-for-days window above, so it may only be done alongside the throughput floor
+/// (the config validator refuses "floor disabled + ceiling off").
+const DEFAULT_BUFFER_TOTAL_TIMEOUT: Option<Duration> = Some(Duration::from_secs(3600));
+
+/// Default node-wide cap on CONCURRENT request-buffering operations (across every listener and
+/// upstream). This is the structural total-exposure bound the per-request guards cannot provide:
+/// each in-flight buffered upload holds up to `max_buffer_bytes` of temp spill, so without a node
+/// aggregate cap the only ceiling on simultaneous buffering is the listener `max_conns` — worst-case
+/// spill would be `max_conns × max_buffer_bytes`. With this cap, worst-case spill is bounded by
+/// `limit × max_buffer_bytes` and further buffering fails fast with `503 Service Unavailable` (a
+/// LOCAL pre-dial refusal — it never contacts a backend, so it does not touch passive health). The
+/// blob/storage upload path has its own `max_concurrent_uploads` ([`crate::limits`]); this is the
+/// independent gateway-buffering analog. 128 is a defensible default: at the 1 GiB cap default it
+/// bounds node spill at ~128 GiB worst case, while being far above any realistic concurrent-registry-
+/// push count. Operator-overridable via `serve.max_concurrent_buffering` (see
+/// [`set_buffering_concurrency_limit`]).
+const DEFAULT_MAX_CONCURRENT_BUFFERING: usize = 128;
+
+/// The configured node-wide buffering-concurrency limit, read ONCE when [`BUFFER_SLOTS`] is first
+/// initialized (the first buffering request). [`set_buffering_concurrency_limit`] stores the operator
+/// value here at serve startup, before any request is served.
+static BUFFER_SLOTS_LIMIT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_CONCURRENT_BUFFERING);
+
+/// Process-wide semaphore bounding concurrent request-buffering operations, shared across every
+/// listener and upstream (like [`POOL`]). A buffering request acquires an OWNED permit BEFORE it
+/// spills (before any pool checkout / dial) and holds it for the whole buffering + forward phase, so
+/// the permit — and thus the temp spill it represents — is released on EVERY exit path by RAII drop
+/// (success, every `408`/`413` abort, dial failure, client disconnect, panic). Sized from
+/// [`BUFFER_SLOTS_LIMIT`] at first use.
+static BUFFER_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            BUFFER_SLOTS_LIMIT
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1),
+        ))
+    });
+
+/// Set the node-wide buffering-concurrency cap from the operator config. Call ONCE at serve startup,
+/// before any request is served (buffering only happens while serving a request, so the cap is in
+/// place before [`BUFFER_SLOTS`] is first read). `None` keeps the built-in default
+/// ([`DEFAULT_MAX_CONCURRENT_BUFFERING`]); `Some(n)` sets `n` (clamped to ≥ 1 — the cap can be raised
+/// or lowered, but never removed: it is a DoS bound that must always exist). A call after the
+/// semaphore has already been initialized has no effect on the live count (logged), since the slot
+/// count is fixed at first use.
+pub(crate) fn set_buffering_concurrency_limit(limit: Option<usize>) {
+    if let Some(n) = limit {
+        BUFFER_SLOTS_LIMIT.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Pool key for pinned upstream connections: the pinned resolution plus the per-upstream
 /// options that determine how a connection is dialed (so a TLS and a plaintext connection,
@@ -334,7 +398,22 @@ enum UpstreamError {
     /// backend health failure: the fault is the client's, not the upstream's. Only reachable on a
     /// `buffer_requests` upstream.
     RequestBodyTimeout,
+    /// The node-wide buffering-concurrency cap ([`BUFFER_SLOTS`]) is saturated — too many request
+    /// bodies are already being buffered node-wide. Mapped to `503 Service Unavailable`. This is a
+    /// LOCAL pre-dial refusal (raised BEFORE any pool checkout or dial), so it never contacts a
+    /// backend and must NOT be recorded against passive health (carried out of the gateway path via
+    /// [`LocalPreDialOverload`]). Only reachable on a `buffer_requests` upstream.
+    BufferingOverloaded,
 }
+
+/// Internal, NEVER-serialized marker on a gateway response that reflects a LOCAL pre-dial condition
+/// (node-wide buffering saturation → `503`). The gateway dispatch checks for it and SKIPS the
+/// passive-health `record` for this request: no connection to the selected backend was ever
+/// attempted, so the refusal is the node's, not the backend's, and must not count toward ejecting a
+/// healthy backend. Lives only in the in-process `Response::extensions`; it is dropped before the
+/// response is written to the client.
+#[derive(Clone, Copy)]
+struct LocalPreDialOverload;
 
 /// An idle keep-alive upstream connection plus when it went idle (for the reap bound).
 struct IdleConn {
@@ -442,9 +521,11 @@ struct BufferGuards {
     min_rate_bytes_per_sec: u64,
     /// The trailing window over which `min_rate_bytes_per_sec` is averaged.
     rate_window: Duration,
-    /// OPTIONAL absolute whole-phase wall-clock ceiling (defense-in-depth). `None` = no ceiling (the
-    /// throughput floor is the backstop). When `Some`, a hard upper bound on total buffering time,
-    /// regardless of throughput — set high enough never to cut a legitimate upload.
+    /// Absolute whole-phase wall-clock ceiling (defense-in-depth): a hard upper bound on total
+    /// buffering time regardless of throughput. `None` = no ceiling (explicitly disabled); `Some` =
+    /// the bound. The server default is now `Some(1 h)` (ON) — see [`DEFAULT_BUFFER_TOTAL_TIMEOUT`]
+    /// for why — so this restores a per-connection time bound the throughput floor alone cannot. It
+    /// is set high enough never to cut a legitimate upload.
     abs_ceiling: Option<Duration>,
 }
 
@@ -462,14 +543,21 @@ struct UpstreamClient {
     max_buffer_bytes: u64,
     /// Time + throughput guards for the buffering phase; only read when `buffer_requests`.
     buffer_guards: BufferGuards,
+    /// The node-wide buffering-concurrency semaphore. Every handle built by [`cached_client`] clones
+    /// the ONE process-wide [`BUFFER_SLOTS`] (so the cap is shared across all listeners/upstreams);
+    /// the buffering path acquires an owned permit from it before spilling. Carried as a field (not
+    /// read from the global directly in `send`) only so a test can inject a small semaphore.
+    buffer_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl UpstreamClient {
     /// Turn request buffering on (or off) for this handle, with optional per-upstream overrides for
-    /// the byte cap, the read-idle timeout, the throughput floor + its window, and the optional
-    /// absolute whole-phase ceiling (each `None` keeps the server default; a `0` throughput floor
-    /// explicitly DISABLES the floor). A no-op when `enabled` is false — the handle keeps today's
-    /// streaming semantics, and the guards are only consulted on the buffering path.
+    /// the byte cap, the read-idle timeout, the throughput floor + its window, and the absolute
+    /// whole-phase ceiling. Each `None` keeps the server default. A `0` throughput floor explicitly
+    /// DISABLES the floor; a `0` absolute ceiling explicitly DISABLES the ceiling (the server default
+    /// ceiling is now ON at 1 h, so `0` is the opt-out — see [`DEFAULT_BUFFER_TOTAL_TIMEOUT`]). A
+    /// no-op when `enabled` is false — the handle keeps today's streaming semantics, and the guards
+    /// are only consulted on the buffering path.
     fn with_buffering(
         mut self,
         enabled: bool,
@@ -492,11 +580,23 @@ impl UpstreamClient {
         if let Some(ms) = min_rate_window_ms {
             self.buffer_guards.rate_window = Duration::from_millis(ms);
         }
-        // `None` keeps the server default (no ceiling); `Some(ms)` sets a hard ceiling. There is no
-        // way to CLEAR a ceiling back to `None` here, since the default is already `None`.
-        if let Some(ms) = total_timeout_ms {
-            self.buffer_guards.abs_ceiling = Some(Duration::from_millis(ms));
+        // `None` keeps the server default (now `Some(1 h)`, ON); `Some(0)` explicitly DISABLES the
+        // ceiling (the opt-out for a rare genuinely-huge/slow-link upstream); `Some(ms>0)` sets a
+        // hard ceiling of that many ms.
+        match total_timeout_ms {
+            None => {}
+            Some(0) => self.buffer_guards.abs_ceiling = None,
+            Some(ms) => self.buffer_guards.abs_ceiling = Some(Duration::from_millis(ms)),
         }
+        self
+    }
+
+    /// TEST-ONLY: inject a specific buffering-concurrency semaphore in place of the shared
+    /// process-wide [`BUFFER_SLOTS`], so a test can drive saturation + the permit-release-on-abort
+    /// paths against a small, isolated semaphore without perturbing the global one.
+    #[cfg(test)]
+    fn with_buffer_slots(mut self, slots: Arc<tokio::sync::Semaphore>) -> Self {
+        self.buffer_slots = slots;
         self
     }
 
@@ -543,6 +643,13 @@ impl UpstreamClient {
         // Decide request-body framing. A declared length forwards the stream fixed; no
         // length peeks the body — empty ⇒ no body (a GET), non-empty ⇒ chunked.
         let mut data: BodyData = Box::pin(body.into_data_stream());
+        // Node-wide buffering-concurrency permit (HIGH-2). Acquired below ONLY on the
+        // `buffer_requests` spill path, BEFORE any pool checkout / dial, and held in this `send`
+        // scope through the whole buffering + replay-forward phase. It is released by RAII drop on
+        // EVERY exit — the `?`/`return` abort paths below, a dial failure, a client disconnect, or a
+        // panic/cancel that unwinds this frame — so a temp-spill slot is never leaked. `None` on the
+        // non-buffering path (no permit taken).
+        let mut _buffer_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
         let plan = match declared_len {
             // A client-declared *zero*-length body. Re-emit the explicit `Content-Length: 0`
             // that was stripped above: a well-behaved upstream treats a missing length on a
@@ -576,6 +683,19 @@ impl UpstreamClient {
                     // chunked`. Bounded + spilled to disk (see `buffer_body_to_length_in`), so an
                     // untrusted upload can neither exhaust memory nor the disk — over the cap it is
                     // rejected `413`.
+                    //
+                    // FIRST claim a node-wide buffering slot (HIGH-2), BEFORE spilling and before any
+                    // pool checkout / dial. When the node is already buffering its cap worth of
+                    // uploads, fail fast with `503` (BufferingOverloaded) rather than pile on another
+                    // `max_buffer_bytes` of temp spill. The owned permit is held in `_buffer_permit`
+                    // for the rest of `send` (buffering + the replay forward), so the slot — and the
+                    // spill it represents — is released by drop on every exit path.
+                    _buffer_permit = Some(
+                        self.buffer_slots
+                            .clone()
+                            .try_acquire_owned()
+                            .map_err(|_| UpstreamError::BufferingOverloaded)?,
+                    );
                     let (len, replay) = match buffer_body_to_length_in(
                         first,
                         &mut data,
@@ -1066,6 +1186,8 @@ fn cached_client(
             rate_window: DEFAULT_BUFFER_MIN_RATE_WINDOW,
             abs_ceiling: DEFAULT_BUFFER_TOTAL_TIMEOUT,
         },
+        // Share the ONE process-wide buffering-concurrency semaphore across every handle.
+        buffer_slots: BUFFER_SLOTS.clone(),
     })
 }
 
@@ -1345,12 +1467,21 @@ pub(super) async fn dispatch_gateway(
             posture,
         )
         .await;
-        state.record(
-            target,
-            !response.status().is_server_error(),
-            upstream.passive_health,
-            now,
-        );
+        // A node-wide buffering-overload `503` is a LOCAL pre-dial refusal (no backend was
+        // contacted), so it must not count against this backend's passive health. Every other
+        // outcome feeds passive health as before.
+        if response
+            .extensions()
+            .get::<LocalPreDialOverload>()
+            .is_none()
+        {
+            state.record(
+                target,
+                !response.status().is_server_error(),
+                upstream.passive_health,
+                now,
+            );
+        }
         return response;
     }
 
@@ -1373,6 +1504,17 @@ pub(super) async fn dispatch_gateway(
             posture,
         )
         .await;
+        // A node-wide buffering-overload `503` is a LOCAL pre-dial refusal — don't fault the backend
+        // and don't advance to the next candidate (the node, not this backend, is saturated). In
+        // practice this never fires on the retry path (it is reached only for body-less idempotent
+        // requests, which are never buffered), but guard it for correctness.
+        if response
+            .extensions()
+            .get::<LocalPreDialOverload>()
+            .is_some()
+        {
+            return response;
+        }
         let ok = !response.status().is_server_error();
         state.record(target, ok, upstream.passive_health, now);
         if ok {
@@ -1798,6 +1940,20 @@ async fn proxy_upstream(
         Err(UpstreamError::RequestBodyTimeout) => {
             tracing::warn!(%host, "gateway upstream request body read timed out while buffering (slow client)");
             (StatusCode::REQUEST_TIMEOUT, "request body read timed out\n").into_response()
+        }
+        // Node-wide buffering saturation: a LOCAL pre-dial refusal (no backend was contacted). Tag
+        // it so `dispatch_gateway` skips the passive-health record — a `503` here must never eject a
+        // healthy backend (unlike a backend-origin `503`, which flows through the `Ok` arm above and
+        // IS counted).
+        Err(UpstreamError::BufferingOverloaded) => {
+            tracing::warn!(%host, "gateway refused request buffering: node-wide buffering-concurrency cap reached");
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "node buffering capacity reached; retry shortly\n",
+            )
+                .into_response();
+            resp.extensions_mut().insert(LocalPreDialOverload);
+            resp
         }
     }
 }
@@ -3300,6 +3456,164 @@ Connection: close\r\n\r\n";
             Ok(_) => panic!("a stalled buffered body must be rejected, not forwarded"),
             Err(e) => panic!("expected RequestBodyTimeout, got {e:?}"),
         }
+    }
+
+    // --- node-wide buffering-concurrency semaphore (HIGH-2) --------------------------------
+    //
+    // The gateway buffering path does NOT go through `max_concurrent_uploads` (that gates only the
+    // blob/storage path), so without a node aggregate cap the only bound on concurrent buffering was
+    // the listener `max_conns` — worst-case spill = `max_conns × max_buffer_bytes`. A process-wide
+    // semaphore ([`BUFFER_SLOTS`]) now bounds concurrent buffering: a request acquires an OWNED permit
+    // BEFORE spilling (before any dial) and holds it for the whole buffering + forward phase; when
+    // saturated, buffering fails fast with `503` (`BufferingOverloaded`). The permit MUST be released
+    // on EVERY exit (success, 413, 408, dial failure, disconnect, panic) via RAII drop — these tests
+    // drive a small injected semaphore to prove saturation → 503 and no-leak on each abort path.
+
+    /// Build a length-unknown (no `Content-Length`) streamed `PUT` request — the body shape that
+    /// takes the `buffer_requests` spill path.
+    fn streamed_put(uri: &str, chunks: Vec<&'static [u8]>) -> Request<Body> {
+        let parts: Vec<Result<Bytes, std::io::Error>> = chunks
+            .into_iter()
+            .map(|c| Ok(Bytes::from_static(c)))
+            .collect();
+        Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .body(Body::from_stream(futures::stream::iter(parts)))
+            .unwrap()
+    }
+
+    /// When the node-wide buffering semaphore is saturated, a further buffering request fails fast
+    /// with `BufferingOverloaded` (→ `503`) BEFORE any dial — and once a slot frees, the next request
+    /// is admitted and forwarded normally (the permit is reusable).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_buffering_cap_503_when_saturated_then_reusable() {
+        const OK: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, _rx) = capture_upstream(OK).await;
+        // A single-slot semaphore, with its only permit held — simulating a concurrent buffering op.
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = sem.clone().try_acquire_owned().expect("the one slot");
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false)
+            .unwrap()
+            .with_buffering(true, Some(16 * 1024 * 1024), None, None, None, None)
+            .with_buffer_slots(sem.clone());
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/sat",
+            addr.port()
+        );
+
+        // Saturated → fail fast with 503, before the body is spilled or any dial happens.
+        match client.send(streamed_put(&uri, vec![b"layer"])).await {
+            Err(UpstreamError::BufferingOverloaded) => {}
+            Ok(_) => panic!("a saturated buffering path must 503, not forward"),
+            Err(e) => panic!("expected BufferingOverloaded, got {e:?}"),
+        }
+
+        // Free the slot; the next buffering request is admitted and forwarded (the capture upstream
+        // accepts exactly this one connection and answers 201).
+        drop(held);
+        assert_eq!(sem.available_permits(), 1, "the freed slot is back");
+        let resp = client
+            .send(streamed_put(&uri, vec![b"layer-", b"payload"]))
+            .await
+            .expect("an admitted buffering request forwards");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let _ = axum::body::to_bytes(Body::from_stream(resp.into_body()), 1 << 20)
+            .await
+            .unwrap();
+        // The permit was released after the forward completed — the slot is free again.
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the buffering permit is released on the success path"
+        );
+    }
+
+    /// The buffering permit is released on EVERY abort path — `413` (over-cap), `408` (read-idle),
+    /// and the success path — so a slot is never leaked. After each, the single-slot semaphore is
+    /// back to one permit and the slot is reusable (a held permit then forces the next request to
+    /// `503`, proving the count is genuinely restored).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_buffering_permit_released_on_every_abort_path() {
+        const OK: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        // One bound upstream; the 413/408 abort paths never dial it, so the one-accept limit is fine.
+        let (addr, _rx) = capture_upstream(OK).await;
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+
+        // --- 413 over-cap: aborts BEFORE dial; the permit drops on the early return ---
+        let over_cap = cached_client("127.0.0.1", addr, None, None, false, None, false)
+            .unwrap()
+            .with_buffering(true, Some(8), None, None, None, None) // 8-byte cap
+            .with_buffer_slots(sem.clone());
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/big",
+            addr.port()
+        );
+        match over_cap
+            .send(streamed_put(&uri, vec![b"aaaaa", b"bbbbb", b"ccccc"]))
+            .await
+        {
+            Err(UpstreamError::PayloadTooLarge) => {}
+            Ok(_) => panic!("an over-cap buffered body must 413, not forward"),
+            Err(e) => panic!("expected PayloadTooLarge, got {e:?}"),
+        }
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit is released on the 413 over-cap abort path"
+        );
+
+        // --- 408 read-idle: a stalled body aborts; the permit drops on the early return ---
+        let stalls = cached_client("127.0.0.1", addr, None, None, false, None, false)
+            .unwrap()
+            // 60ms read-idle; floor off + ceiling default — isolate the read-idle abort.
+            .with_buffering(
+                true,
+                Some(16 * 1024 * 1024),
+                Some(60),
+                Some(0),
+                None,
+                Some(0),
+            )
+            .with_buffer_slots(sem.clone());
+        let stalled_body = futures::stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"trickle-start"))
+        })
+        .chain(futures::stream::pending::<Result<Bytes, std::io::Error>>());
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .body(Body::from_stream(stalled_body))
+            .unwrap();
+        match stalls.send(req).await {
+            Err(UpstreamError::RequestBodyTimeout) => {}
+            Ok(_) => panic!("a stalled buffered body must 408, not forward"),
+            Err(e) => panic!("expected RequestBodyTimeout, got {e:?}"),
+        }
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit is released on the 408 read-idle abort path"
+        );
+
+        // --- reusable: the restored permit really is a working slot. Hold it, and the next buffering
+        // request must 503 (saturated); release it and the count returns. ---
+        let held = sem.clone().try_acquire_owned().expect("the restored slot");
+        let saturated = cached_client("127.0.0.1", addr, None, None, false, None, false)
+            .unwrap()
+            .with_buffering(true, Some(16 * 1024 * 1024), None, None, None, None)
+            .with_buffer_slots(sem.clone());
+        match saturated.send(streamed_put(&uri, vec![b"x"])).await {
+            Err(UpstreamError::BufferingOverloaded) => {}
+            Ok(_) => panic!("a saturated buffering path must 503 once the slot is held"),
+            Err(e) => panic!("expected BufferingOverloaded once the slot is held, got {e:?}"),
+        }
+        drop(held);
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the slot frees again after release"
+        );
     }
 
     // --- interim 1xx / Expect double-negotiation (response-desync class) -------------------

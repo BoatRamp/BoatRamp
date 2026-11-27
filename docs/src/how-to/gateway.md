@@ -203,17 +203,33 @@ boatramp gateway route add /v2/** registry --site registry.example.com
     it bounds the **rate**, a steadily-progressing upload of **any total size** finishes as
     long as it clears the floor — the default 1 KiB/s is ~7× below a dial-up link yet far
     above a byte-trickle. Set `--buffer-min-rate-bytes-per-sec 0` to disable the floor
-    (rely on the read-idle timeout alone).
-  - an **optional absolute ceiling**, `--buffer-total-timeout-ms` (default **off**) — a hard
-    cap on total buffering time regardless of throughput, as blunt defense-in-depth. The
-    throughput floor is the primary slow-client guard; set a ceiling only as a catch-all, and
-    **high enough never to cut a legitimate upload** (at the floor rate a body up to
-    `--max-buffer-bytes` can legitimately take a long time, so keep any ceiling above
-    `max-buffer-bytes ÷ min-rate`).
+    (rely on the read-idle timeout alone) — permitted **only** alongside an explicit positive
+    `--buffer-total-timeout-ms` (disabling both the floor and the ceiling is refused at declare).
+  - an **absolute ceiling**, `--buffer-total-timeout-ms` (default **3600000 = 1 hour, ON**) — a
+    hard per-connection cap on total buffering time regardless of throughput. This restores a time
+    bound the throughput floor alone cannot: a client dripping just over the floor clears the rate
+    check and never idles, so with no ceiling it could hold a connection slot + up to
+    `--max-buffer-bytes` of spill for `max-buffer-bytes ÷ min-rate` (≈ 12 days at the 1 GiB +
+    1 KiB/s defaults). The 1 h default is anchored to a realistic minimum rate (~291 KiB/s to fill
+    1 GiB in an hour), so it does not cut a legitimate upload — set it **high enough never to cut a
+    legitimate upload** (keep any explicit ceiling above `max-buffer-bytes ÷ min-rate`). Set
+    `--buffer-total-timeout-ms 0` to **disable** it for a rare genuinely-huge or slow-link upstream;
+    disabling it re-exposes the drip-holds-a-slot window, so it is allowed only while the throughput
+    floor stays on.
 
   These bound the body read, which the per-upstream `--request-timeout-ms` does not (that
   applies only to the upstream write and response). A normal upload streams continuously and
   clears the floor with room to spare.
+- **Node-wide concurrency cap (aggregate-spill bound).** Gateway buffering is *not* gated by
+  `--max-concurrent-uploads` (that caps the blob/storage path). A separate node knob,
+  `--max-concurrent-buffering` (`BOATRAMP_MAX_CONCURRENT_BUFFERING` / `[serve]
+  max_concurrent_buffering`, default **128**), caps how many request bodies may be buffering at once
+  across every listener and upstream. Beyond the cap, further buffering is refused immediately with
+  `503 Service Unavailable` (a local refusal — no backend is contacted, so it never counts against a
+  backend's health). This is the structural total-exposure bound: worst-case node temp spill is
+  `max-concurrent-buffering × max-buffer-bytes`, so size the two together against the spill store's
+  free space. It is a node resource bound resolved at startup (not a live-reloadable override) and is
+  always on — a configured value is clamped to at least 1.
 
 > **Security:** `--buffer-requests` buffers an untrusted upload body. It is an explicit,
 > per-upstream opt-in, hard-bounded by `--max-buffer-bytes` (size) and the

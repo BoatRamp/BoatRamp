@@ -264,7 +264,9 @@ enum UpstreamCommand {
         /// drops below this, it is aborted with 408 (default 1024 = 1 KiB/s). This is the throughput
         /// backstop the read-idle timeout cannot provide: it cuts a drip-feed that never idles, while
         /// letting a steadily-progressing upload of ANY size finish (a flat time cap wrongly 408s a
-        /// slow-but-large upload). Set `0` to disable it (rely on read-idle only).
+        /// slow-but-large upload). Set `0` to disable it — permitted ONLY alongside an explicit
+        /// positive `--buffer-total-timeout-ms` (disabling both the floor and the ceiling is refused
+        /// at declare: it would leave buffering bounded only by the read-idle timeout).
         #[arg(long, requires = "buffer_requests")]
         buffer_min_rate_bytes_per_sec: Option<u64>,
         /// With `--buffer-requests`: the trailing window (ms) over which
@@ -272,11 +274,14 @@ enum UpstreamCommand {
         /// burstier uploads; a shorter one reacts to a rate drop sooner.
         #[arg(long, requires = "buffer_requests")]
         buffer_min_rate_window_ms: Option<u64>,
-        /// With `--buffer-requests`: an OPTIONAL absolute whole-phase wall-clock ceiling (ms) — a hard
-        /// cap on total buffering time regardless of throughput, as defense-in-depth (default: none).
-        /// The throughput floor is the primary slow-client guard; set this only as a blunt catch-all,
-        /// and HIGH enough never to cut a legitimate upload (at the floor rate a body up to
-        /// `--max-buffer-bytes` can legitimately take a long time).
+        /// With `--buffer-requests`: the absolute whole-phase wall-clock ceiling (ms) — a hard cap on
+        /// total buffering time regardless of throughput, as defense-in-depth (default 3600000 = 1 h,
+        /// ON). Restores a per-connection time bound the throughput floor alone cannot (a client
+        /// dripping just over the floor never idles, so with no ceiling it could hold a slot + its
+        /// spill for days). Set `0` to DISABLE it (opt-out for a rare genuinely-huge/slow-link
+        /// upstream) — permitted only while the throughput floor stays on. Set HIGH enough never to
+        /// cut a legitimate upload (at the floor rate a body up to `--max-buffer-bytes` can
+        /// legitimately take a long time).
         #[arg(long, requires = "buffer_requests")]
         buffer_total_timeout_ms: Option<u64>,
         /// For `--lb nearest`: the request header carrying the client's region
@@ -681,7 +686,11 @@ fn write_gateway(gateway: &GatewayConfig, w: &mut dyn std::io::Write) -> std::io
                 parts.push(format!("rate_window={ms}ms"));
             }
             if let Some(ms) = up.buffer_total_timeout_ms {
-                parts.push(format!("max_total={ms}ms"));
+                parts.push(if ms == 0 {
+                    "max_total=off".to_string()
+                } else {
+                    format!("max_total={ms}ms")
+                });
             }
             notes.push(if parts.is_empty() {
                 "buffer_requests".to_string()

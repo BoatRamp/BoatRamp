@@ -371,13 +371,14 @@ fn check_upstream_buffering(name: &str, up: &Upstream) -> Result<(), crate::Conf
             )));
         }
     }
-    // Zero is a mistake for a timeout or a window (a zero read-idle 408s instantly; a zero absolute
-    // ceiling 408s instantly; a zero rate-window divides nothing) — but NOT for the rate floor,
-    // where zero is the documented "disable the throughput check" value.
+    // Zero is a mistake for the read-idle timeout or the rate window (a zero read-idle 408s
+    // instantly; a zero rate-window divides nothing) — but NOT for the rate floor, where zero is the
+    // documented "disable the throughput check" value, NOR for the absolute ceiling, where zero is
+    // the documented "disable the ceiling" value (the server default ceiling is now ON at 1 h, so
+    // `0` is the opt-out).
     for (field, value) in [
         ("buffer_read_timeout_ms", up.buffer_read_timeout_ms),
         ("buffer_min_rate_window_ms", up.buffer_min_rate_window_ms),
-        ("buffer_total_timeout_ms", up.buffer_total_timeout_ms),
     ] {
         if value == Some(0) {
             return Err(crate::ConfigError::parse(format!(
@@ -385,6 +386,26 @@ fn check_upstream_buffering(name: &str, up: &Upstream) -> Result<(), crate::Conf
                  body with 408; set a positive value or leave it unset for the default"
             )));
         }
+    }
+    // The throughput floor may be disabled (`buffer_min_rate_bytes_per_sec: 0`) ONLY when a hard
+    // absolute ceiling is ALSO set EXPLICITLY (`buffer_total_timeout_ms` > 0). Disabling the floor
+    // removes the only progress-based backstop; with the ceiling also off (`buffer_total_timeout_ms:
+    // 0`) — or merely left to the default — buffering would be bounded solely by the per-read idle
+    // timeout, so a client dripping one byte just inside each idle window (e.g. 1 byte / 29 s) holds
+    // a connection slot + its temp spill indefinitely. Refuse the combination at declare: to disable
+    // the floor you must pin an explicit positive ceiling. (This holds even when the ceiling is left
+    // unset to fall back on the default — the dangerous choice must be made explicitly, not inherited
+    // from a default that could change.)
+    if up.buffer_min_rate_bytes_per_sec == Some(0)
+        && !matches!(up.buffer_total_timeout_ms, Some(ms) if ms > 0)
+    {
+        return Err(crate::ConfigError::parse(format!(
+            "gateway upstream `{name}` disables the buffering throughput floor \
+             (`buffer_min_rate_bytes_per_sec: 0`) without a hard absolute ceiling — set a positive \
+             `buffer_total_timeout_ms` alongside it, or raise the floor above 0. Disabling both the \
+             throughput floor and the absolute ceiling leaves a slow drip bounded only by the \
+             per-read idle timeout (effectively unbounded)."
+        )));
     }
     Ok(())
 }
@@ -753,7 +774,10 @@ pub struct Upstream {
     /// second) a length-unknown body must maintain while buffering — if the body's average rate over
     /// a trailing [`Upstream::buffer_min_rate_window_ms`] window falls below this floor, buffering is
     /// aborted with `408 Request Timeout`. `None` → the server default (1 KiB/s); `Some(0)` →
-    /// **disabled** (rely on the read-idle timeout alone). This is the throughput-aware backstop that
+    /// **disabled** — permitted ONLY alongside an explicit positive
+    /// [`Upstream::buffer_total_timeout_ms`] ceiling (declare-time validation refuses disabling both
+    /// the floor and the ceiling, which would leave buffering bounded only by the per-read idle
+    /// timeout). This is the throughput-aware backstop that
     /// [`Upstream::buffer_read_timeout_ms`] cannot provide: a slow-loris that trickles just often
     /// enough to keep resetting the read-idle timer never idles, but it also cannot sustain the floor,
     /// so the rate check cuts it — while a steadily-progressing upload of ANY total size, however
@@ -770,16 +794,22 @@ pub struct Upstream {
     /// when the throughput floor is disabled (`buffer_min_rate_bytes_per_sec: 0`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_min_rate_window_ms: Option<u64>,
-    /// With [`Upstream::buffer_requests`]: an **optional absolute whole-phase wall-clock ceiling**
-    /// (ms) — a hard upper bound on how long buffering one body may run end-to-end, regardless of
-    /// throughput, as defense-in-depth. `None` → the server default (**no ceiling**; the
-    /// throughput floor is the backstop). This is NOT the primary slow-client guard (that is the
-    /// throughput floor, which lets a steadily-progressing large upload finish); it is a blunt
-    /// catch-all for a pathological-but-above-floor client holding a slot far too long. Set it only
-    /// as a hard cap, and HIGH enough never to cut a legitimate upload — at the floor rate a body up
-    /// to `max_buffer_bytes` can legitimately take a long time, so a ceiling below
-    /// `max_buffer_bytes / buffer_min_rate_bytes_per_sec` risks a false `408`. Ignored unless
-    /// `buffer_requests` is set.
+    /// With [`Upstream::buffer_requests`]: the **absolute whole-phase wall-clock ceiling** (ms) — a
+    /// hard upper bound on how long buffering one body may run end-to-end, regardless of throughput,
+    /// as defense-in-depth. `None` → the server default (**1 hour, ON**); `Some(0)` → **disabled**
+    /// (no ceiling — the opt-out); `Some(ms)` → a ceiling of that many ms. The default is ON because
+    /// the throughput floor alone leaves a residual gap: a client dripping just over the floor clears
+    /// the rate check and never idles, so with no ceiling it could hold a slot + up to
+    /// `max_buffer_bytes` of spill for ~`max_buffer_bytes / buffer_min_rate_bytes_per_sec` (≈ 12 days
+    /// at the 1 GiB + 1 KiB/s defaults). The 1 h default is anchored to a realistic minimum rate
+    /// (~291 KiB/s to fill 1 GiB in an hour), well below any real upload, so it does not false-`408`
+    /// a legitimate push. This is NOT the primary slow-client guard (the throughput floor is); it is
+    /// a blunt per-connection time bound. Set it HIGH enough never to cut a legitimate upload — at
+    /// the floor rate a body up to `max_buffer_bytes` can legitimately take a long time, so a ceiling
+    /// below `max_buffer_bytes / buffer_min_rate_bytes_per_sec` risks a false `408`. **Disabling it
+    /// (`0`)** re-exposes the drip-holds-a-slot window, so it is permitted only when the throughput
+    /// floor stays ON (declare-time validation refuses "floor disabled + ceiling off"). Ignored
+    /// unless `buffer_requests` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_total_timeout_ms: Option<u64>,
     /// Header rewrites applied to the request before forwarding.
@@ -1234,7 +1264,9 @@ mod tests {
             assert!(validate_site_gateway(&cfg).is_err());
         }
 
-        // A zero timeout / window would 408 everything — refused.
+        // A zero read-idle timeout / rate window would 408 everything — refused. (NOTE:
+        // `buffer_total_timeout_ms: 0` is NOT here — zero now means "disable the ceiling", a valid
+        // opt-out; see `validate_ceiling_off_and_floor_ceiling_interaction` below.)
         for zero_timeout in [
             Upstream {
                 target: "http://x".into(),
@@ -1248,12 +1280,6 @@ mod tests {
                 buffer_min_rate_window_ms: Some(0),
                 ..Default::default()
             },
-            Upstream {
-                target: "http://x".into(),
-                buffer_requests: true,
-                buffer_total_timeout_ms: Some(0),
-                ..Default::default()
-            },
         ] {
             let cfg = GatewayConfig {
                 upstreams: BTreeMap::from([("u".to_string(), zero_timeout)]),
@@ -1262,21 +1288,23 @@ mod tests {
             assert!(validate_site_gateway(&cfg).is_err());
         }
 
-        // A zero throughput FLOOR is NOT a mistake — it disables the rate check (rely on read-idle
-        // only) — so it validates when buffering is on.
-        let floor_disabled = GatewayConfig {
+        // A zero throughput FLOOR disables the rate check (rely on read-idle only). It is valid ONLY
+        // alongside an explicit positive absolute ceiling (see MEDIUM-1 /
+        // `validate_ceiling_off_and_floor_ceiling_interaction`); with a ceiling it validates.
+        let floor_disabled_with_ceiling = GatewayConfig {
             upstreams: BTreeMap::from([(
                 "u".to_string(),
                 Upstream {
                     target: "http://x".into(),
                     buffer_requests: true,
                     buffer_min_rate_bytes_per_sec: Some(0),
+                    buffer_total_timeout_ms: Some(600_000),
                     ..Default::default()
                 },
             )]),
             ..Default::default()
         };
-        assert!(validate_site_gateway(&floor_disabled).is_ok());
+        assert!(validate_site_gateway(&floor_disabled_with_ceiling).is_ok());
 
         // The intended shape (buffering on, positive or default cap) validates.
         let ok = GatewayConfig {
@@ -1319,6 +1347,42 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_site_gateway(&ok_timeouts).is_ok());
+    }
+
+    /// MEDIUM-1 (Security review): the throughput floor may be disabled only alongside an explicit
+    /// positive absolute ceiling; disabling both (or disabling the floor and relying on the default
+    /// ceiling) leaves buffering bounded only by the per-read idle timeout and is refused. Also
+    /// covers HIGH-1's new `buffer_total_timeout_ms: 0` = "ceiling off" opt-out (valid while the
+    /// floor stays on).
+    #[test]
+    fn validate_ceiling_off_and_floor_ceiling_interaction() {
+        let site = |up: Upstream| GatewayConfig {
+            upstreams: BTreeMap::from([("u".to_string(), up)]),
+            ..Default::default()
+        };
+        let buffering = |floor: Option<u64>, ceiling: Option<u64>| Upstream {
+            target: "http://x".into(),
+            buffer_requests: true,
+            buffer_min_rate_bytes_per_sec: floor,
+            buffer_total_timeout_ms: ceiling,
+            ..Default::default()
+        };
+
+        // Floor disabled + ceiling UNSET (relies on the default) → REFUSED: the dangerous choice must
+        // be explicit, not inherited from a default that could change.
+        assert!(validate_site_gateway(&site(buffering(Some(0), None))).is_err());
+        // Floor disabled + ceiling explicitly OFF (`0`) → REFUSED: only the read-idle timeout would
+        // remain, so a 1-byte-per-idle-window drip is effectively unbounded.
+        assert!(validate_site_gateway(&site(buffering(Some(0), Some(0)))).is_err());
+        // Floor disabled + an explicit POSITIVE ceiling → OK: a hard wall-clock cap replaces the
+        // floor's progress-based bound.
+        assert!(validate_site_gateway(&site(buffering(Some(0), Some(300_000)))).is_ok());
+
+        // Ceiling OFF (`0`) while the floor stays ON (default via unset, or an explicit positive
+        // value) → OK: the HIGH-1 opt-out for a rare genuinely-huge/slow-link upstream. The floor is
+        // still the backstop.
+        assert!(validate_site_gateway(&site(buffering(None, Some(0)))).is_ok());
+        assert!(validate_site_gateway(&site(buffering(Some(2048), Some(0)))).is_ok());
     }
 
     #[test]

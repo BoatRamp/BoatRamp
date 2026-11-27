@@ -26,15 +26,32 @@ versions.
     slow-loris that never idles, while letting a steadily-progressing upload of **any** total
     size finish as long as it clears the floor. Set the floor to `0` to disable it (rely on
     read-idle only).
-  - **optional absolute ceiling** (`--buffer-total-timeout-ms` / `buffer_total_timeout_ms`,
-    now default **off**, previously 120 s) — the former flat whole-phase cap, kept only as an
-    opt-in hard upper bound for defense-in-depth; set it high enough never to cut a legitimate
-    upload.
+  - **absolute ceiling** (`--buffer-total-timeout-ms` / `buffer_total_timeout_ms`, now default
+    **1 hour, ON**) — a hard per-connection upper bound on total buffering time regardless of
+    throughput. The throughput floor alone leaves a residual gap: a client dripping just over the
+    floor clears the rate check AND never idles, so with no ceiling it could hold a connection slot +
+    up to `max_buffer_bytes` of temp spill for `max_buffer_bytes ÷ floor` (≈ 12 days at the 1 GiB +
+    1 KiB/s defaults) before the `413` cap fires. The 1 h default is anchored to a realistic minimum
+    legitimate rate (~291 KiB/s to fill 1 GiB in an hour — no real registry push is that slow), so it
+    does not false-`408` a legitimate upload the way the old flat 120 s cap did. Set
+    `--buffer-total-timeout-ms 0` to DISABLE it (opt-out for a rare genuinely-huge/slow-link
+    upstream) — permitted only while the throughput floor stays on.
+  - **node-wide buffering-concurrency cap** (NEW `--max-concurrent-buffering` /
+    `BOATRAMP_MAX_CONCURRENT_BUFFERING` / `[serve] max_concurrent_buffering`, default **128**) — the
+    structural total-exposure bound. Gateway buffering does not go through `max_concurrent_uploads`
+    (that gates only the blob/storage path), so a process-wide semaphore now caps simultaneous
+    buffering operations across all listeners/upstreams; beyond the cap, further buffering fails fast
+    with `503 Service Unavailable` (a local pre-dial refusal — it never contacts a backend, so it does
+    not affect passive health / eject a backend). Worst-case node temp spill is bounded at
+    `limit × max_buffer_bytes`.
 
   Default-off upstreams are unchanged (the new config fields are skipped when unset, so stored
   gateways are byte-identical). Declare-time validation rejects a buffering knob set without
-  `buffer_requests` and a zero read-idle / window / ceiling (a zero throughput floor is the
-  documented "disable" value and is allowed).
+  `buffer_requests`, a zero read-idle / window, and — to disable the throughput floor
+  (`buffer_min_rate_bytes_per_sec: 0`) — requires an explicit positive absolute ceiling, so the floor
+  and the ceiling can never both be off (that would leave buffering bounded only by the per-read idle
+  timeout). A zero absolute ceiling (`buffer_total_timeout_ms: 0`) now means "ceiling disabled" (the
+  opt-out), not an error.
 
 ## [0.75.0] — 2026-11-26
 
