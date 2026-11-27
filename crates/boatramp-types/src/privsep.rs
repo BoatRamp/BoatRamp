@@ -526,10 +526,16 @@ pub struct PrivsepConfig {
     /// [`NodeServeMode::GuestWorkloads`] (the Phase-1..4 WIRED behavior; the struct-level
     /// `#[serde(default)]` supplies it, so every pre-Phase-5 composition is byte-unchanged).
     /// [`NodeServeMode::NodeSelfHost`] asks the node to serve its OWN control-plane/data-plane app
-    /// router under the privsep composition; it is NOT WIRED ([`NodeServeMode::is_wired`] is `false`)
-    /// and the root refuses it fail-closed BEFORE any spawn (Phase-5, pending its own Security
-    /// review). WS-A carries the vocabulary + the gate; the self-hosting serve path is the Phase-5
-    /// workstream. CONSULTED only by the root's self-host gate, never by a guest.
+    /// router under the privsep composition. As of P5-2..P5-4 it is ADMITTED for the increments built
+    /// so far (the read data plane + the control-plane mutation SURFACE), with `backend.*`
+    /// data-holders confined to the lightweight shared-net substrates (`os-process`/`container`) and
+    /// a `backend.*` data-holder on `substrate: vm` refused fail-closed. [`NodeServeMode::is_wired`]
+    /// stays `false`: it tracks the FULL self-host serve path (the SERVED client mutation, the
+    /// gateway, the node-own handler engine, any VM/net-ns data-reach — P5-3-serve..P5-6), which is
+    /// not yet wired, so every surface the composition cannot yet serve is refused fail-closed PER
+    /// REQUEST, never served from a stub. CONSULTED only by the root's self-host gate
+    /// (`check_node_self_host_gate` in `boatramp`), never by a guest. The flip of `is_wired` to
+    /// `true` is the Phase-5 P5-6 step, gated on each increment's Security review.
     pub node_serve: NodeServeMode,
 }
 
@@ -862,10 +868,15 @@ impl InstanceSubstrate {
 /// - [`NodeSelfHost`](NodeServeMode::NodeSelfHost) — the Phase-5 TARGET: the node's OWN serve path
 ///   (control-plane/admin API, the gateway, the handler engine, the managed-DB/KV/blob backends)
 ///   served UNDER the privsep composition, each instance running only the authority-scoped slice its
-///   held [`HostAuthority`] set permits. **NOT WIRED** — [`is_wired`](NodeServeMode::is_wired) is
-///   `false`, and the root REFUSES it fail-closed before any spawn (Phase-5, pending its own
-///   Security review). Selecting it today is a loud, fail-closed refusal, never a silent downgrade to
-///   the stubbed serve.
+///   held [`HostAuthority`] set permits. **PARTIALLY built, not yet fully wired.** The root ADMITS it
+///   for the increments landed so far (the P5-2 read data plane + the P5-3/P5-4 control-plane mutation
+///   SURFACE), confining `backend.*` data-holders to the lightweight shared-net substrates and
+///   refusing a `backend.*` data-holder on `substrate: vm` fail-closed.
+///   [`is_wired`](NodeServeMode::is_wired) stays `false` — it tracks the FULL serve path (the served
+///   client mutation, the gateway, the node-own handler engine, any VM/net-ns data-reach), which is
+///   not yet wired — so every surface the composition cannot yet serve is refused fail-closed PER
+///   REQUEST, never silently downgraded to a stub. The `is_wired` flip is the Phase-5 P5-6 step, gated
+///   on each increment's Security review.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -874,8 +885,11 @@ pub enum NodeServeMode {
     /// real app router is not yet composed under privsep. Byte-unchanged for every pre-Phase-5 config.
     #[default]
     GuestWorkloads,
-    /// The Phase-5 target: the node's OWN serve path runs under the privsep composition. NOT WIRED —
-    /// refused fail-closed by the root until the self-hosting serve path + its Security review land.
+    /// The Phase-5 target: the node's OWN serve path runs under the privsep composition. ADMITTED for
+    /// the increments built so far (P5-2 read + P5-3/P5-4 control-plane data-plane shape, data-holders
+    /// on the lightweight shared-net substrates; a VM data-holder stays refused fail-closed).
+    /// [`is_wired`](Self::is_wired) stays `false` — it tracks the FULL serve path, which is not yet
+    /// wired, so every unbuilt surface is refused fail-closed per request. The flip is Phase-5 P5-6.
     NodeSelfHost,
 }
 
@@ -888,11 +902,14 @@ impl NodeServeMode {
         }
     }
 
-    /// Whether this mode's serve path is WIRED. Only [`GuestWorkloads`](Self::GuestWorkloads) (the
-    /// Phase-1..4 behavior) is wired; [`NodeSelfHost`](Self::NodeSelfHost) is the Phase-5 target and
-    /// is refused fail-closed by the root until its serve path + Security review land. Mirrors
-    /// [`InstanceSubstrate::is_wired`] — a new WIRED mode is an explicit, Security-reviewed flip of
-    /// this arm, never a silent default.
+    /// Whether this mode's FULL serve path is WIRED. Only [`GuestWorkloads`](Self::GuestWorkloads)
+    /// (the Phase-1..4 behavior) is wired. For [`NodeSelfHost`](Self::NodeSelfHost) this stays `false`
+    /// even though the mode is ADMITTED for the increments built so far (P5-2..P5-4): it tracks the
+    /// FULL self-host serve path (the served client mutation, the gateway, the node-own handler
+    /// engine, any VM/net-ns data-reach), so while it is `false` every surface the composition cannot
+    /// yet serve is refused fail-closed per request. Mirrors [`InstanceSubstrate::is_wired`] — the
+    /// flip to `true` (Phase-5 P5-6) is an explicit, Security-reviewed change of this arm, never a
+    /// silent default.
     pub const fn is_wired(self) -> bool {
         matches!(self, Self::GuestWorkloads)
     }

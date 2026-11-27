@@ -282,16 +282,65 @@ frontend — all-listener — on `vm`), so no new gate is needed.
   This cut proves the engine STANDS UP under the sandbox; it does not yet serve a node-own function.
 - **The persistent `wasmtime-cache` Landlock grant** — `backend_state_subdir(ExecWasmtime)` is `None`,
   so an `exec.wasmtime` instance is NOT granted `<data_dir>/wasmtime-cache` RW; the engine's persisted
-  AOT cache (executable native artifacts, `0o700`) therefore degrades to no-cache under the sandbox
+  compile cache (executable native artifacts, `0o700`) therefore degrades to no-cache under the sandbox
   (cold cranelift compile each boot — a perf, not a correctness, gap, since the cache is best-effort).
-  Granting it is a NEW FS trust decision (its own independent review): an `exec.wasmtime` instance
-  already runs native code in-process (a JIT escape "lands in this instance's authority set"), so RW to
-  its OWN executable-artifact cache subtree within its OWN `data_dir` does not widen its blast radius,
-  and the subtree is disjoint from every backend's state dir (the cross-authority leak check stays
-  live) and MAC-gated on the AOT-deserialize path (`boatramp-server::aot`). Wiring it means extending
-  the authority→state-dir grant machinery (`instance_backend_state_grants` / `backend_authority_state_dirs`
-  / the root grant-disjointness check) to cover `exec.wasmtime`, and pre-creating the dir before the
-  ruleset (mirroring `kv-slate`).
+
+  **The local compile cache's integrity model (corrected — it is NOT content-MAC'd).** An earlier
+  draft of this bullet called the cache "MAC-gated on the AOT-deserialize path (`boatramp-server::aot`)."
+  That conflated two DISTINCT artifact sources and is wrong. There are two deserialize paths, and only
+  one is HMAC-gated:
+  1. **The cluster-distributed AOT artifact path** (`boatramp-server::aot` → `hydrate_request_artifact`):
+     a precompiled `Component` fetched from the SHARED blob store (`aot/<fingerprint>/<wasm-hash>`, which
+     other principals can write) IS framed with an HMAC keyed by a cluster-shared secret and verified in
+     constant time BEFORE `Component::deserialize`. The MAC exists precisely because that source is
+     attacker-writable. This path does NOT touch the local on-disk `wasmtime-cache`.
+  2. **The local on-disk compile cache** (`wasmtime::Cache`, `<data_dir>/wasmtime-cache`, written/read
+     transparently by wasmtime during a cranelift compile — `boatramp-handlers::engine::build_persistent_cache`):
+     has **NO cryptographic integrity**. Its entries are addressed by a content-HASH KEY of the compile
+     inputs (the module bytes + the engine's compiler/version config — wasmtime's `ModuleCacheEntry` /
+     `HashedEngineCompileEnv`), and the deserialize path validates only a wasmtime VERSION string + a
+     compiler-config *compatibility* check (`ModuleVersionStrategy`, default = the wasmtime crate version;
+     wasmtime 50 `engine/serialization.rs`). That is a **compatibility KEY, not a MAC over the cache
+     contents**: wasmtime documents `Component::deserialize` as unsafe / trusted-input-only — a crafted
+     *same-version* blob is "trivially … arbitrary code execution". The cache's only integrity defense
+     today is filesystem: the dir is created `0o700` (so no OTHER local principal can plant a forged
+     entry), which `build_persistent_cache` itself notes ("it is not content-MAC'd").
+
+  **What this implies for P5-6 (why the grant must be EXCLUSIVE + node-own-WRITES-only).** Because the
+  local cache is NOT integrity-protected, a POISONED cache entry = native-code execution on the next
+  `deserialize` of that entry. So the grant cannot simply be "RW to the `exec.wasmtime` holder": the
+  cache subtree must be Landlock-**EXCLUSIVE** to the node-own `exec.wasmtime` instance (disjoint from
+  every OTHER instance's grants) and **writable ONLY by it** (every other instance ro or — preferably —
+  none). A SHARED or attacker-writable cache would let a lower-authority instance plant an entry the
+  node-own engine then loads as host code — a cache-poisoning → RCE path. This is exactly the blast the
+  HMAC gate neutralizes for the cluster/blob source (path 1) but which has NO equivalent for the local
+  cache (path 2); the Landlock exclusivity is what substitutes for the missing MAC. (It remains true that
+  an `exec.wasmtime` instance already runs native code in-process, so RW to its OWN cache does not widen
+  *its own* blast radius — the new risk is entirely about OTHER instances being able to write it.)
+
+  **Safe groundwork landed on this sub-branch (`privsep-p5-6-preconds`) — grant stays refused.** The
+  disjointness precondition is now locked in the composition layer without granting anything live:
+  `boatramp_server::sandbox::NODE_OWN_EXEC_CACHE_SUBDIR` / `node_own_exec_cache_dir` name the reserved
+  subtree (single source of truth, cross-referenced to `build_persistent_cache`), and
+  `check_grant_disjointness` gained a fail-closed tripwire + `CompositionGrantError::BackendCollidesWithReservedExecCache`
+  guaranteeing a backend's state subtree can NEVER collide with the reserved cache subtree (inert today —
+  no backend maps to it — since the eventual exclusive RW grant is a sibling subtree that must not overlap
+  any backend-state grant). This is pure/unit-tested and changes NO live grant; `is_wired(NodeSelfHost)`
+  stays `false`.
+
+  **What remains OWNER-GATED (cannot be cleanly separated from the flip — do NOT build silently).**
+  Wiring the actual grant means threading `node_serve = node-self-host` + a node-own-vs-guest ROLE into
+  the grant-derivation — adding `node_own_exec_cache_dir` to the node-own instance's `base_read_write`
+  (`build_instance_sandbox_inputs`) and pre-creating it before the ruleset (mirroring `kv-slate` in
+  `install_privsep_instance_profile`) — but ONLY for the node-own holder, never for a guest per-tenant
+  `exec.wasmtime` template. The grant layer does NOT model that role today (`instance_backend_state_grants`
+  keys on the held authority set alone; both node-own and guest exec holders hold exactly
+  `{exec.wasmtime}`), and it interacts with an owner design decision — **do guest per-tenant `exec.wasmtime`
+  templates get a persisted compile cache at all, and if so WHERE?** A cache SHARED across tenants is a
+  cross-tenant cache-poisoning vector; a per-tenant cache multiplies the disjointness surface. Settling
+  that + deciding which of the node's own surfaces are functions (the §2 node-own-serve-routing scoping)
+  is a precondition to the grant. The grant itself is therefore part of the P5-6 flip (its own independent
+  FS-trust Security review), not this safe-groundwork cut.
 - **The gateway (`listen.gateway`) reverse-proxy serve surface** — `listen.gateway` has no dedicated
   bound listener fd yet (`instance_listener_addr` binds only `listen.public-tls`/`listen.http-parse`; the
   other listener binds are a documented follow-on), and the reverse-proxy's upstream DIAL is a real

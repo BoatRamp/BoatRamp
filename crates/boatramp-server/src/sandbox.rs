@@ -2214,6 +2214,46 @@ pub const fn backend_state_subdir(authority: HostAuthority) -> Option<&'static s
     }
 }
 
+/// The node-own `exec.wasmtime` **compile-cache** subtree name under `data_dir` (privsep **Phase-5
+/// P5-6** — the owner-gated self-host flip; see `crates/boatramp/DESIGN-privsep-phase5-selfhost.md`
+/// §2 P5-6). This is the on-disk persistent wasmtime compile cache that
+/// `boatramp_handlers::engine`'s `build_persistent_cache` creates at `<data_dir>/wasmtime-cache`
+/// (mode `0o700`).
+///
+/// It is deliberately **NOT** a [`backend_state_subdir`] entry — it is an EXEC (group-D) authority's
+/// subtree, not a backend-state one — and it is **NOT granted to any instance today**: granting it is
+/// the P5-6 increment, which stays refused behind `NodeServeMode::is_wired(NodeSelfHost) == false`. It
+/// is named here, beside the backend-state layout, for ONE property the composition-layer disjointness
+/// check ([`check_grant_disjointness`]) enforces NOW as a P5-6 precondition.
+///
+/// WHY it is a grant precondition, not a perf detail: the cache holds EXECUTABLE native artifacts that
+/// `wasmtime::component::Component::deserialize` loads as host code with only a version-string +
+/// compiler-config *compatibility* check (`ModuleVersionStrategy`, wasmtime's `engine/serialization.rs`)
+/// — **NOT** a cryptographic MAC over the cache contents. (The cluster-distributed AOT artifact path's
+/// HMAC gate in [`crate::aot`] authenticates a DIFFERENT source — blobs fetched from the shared blob
+/// store — and does NOT cover this local on-disk cache.) A crafted same-version entry is "trivially …
+/// arbitrary code execution", so an attacker-WRITABLE cache entry is a cache-poisoning → RCE vector.
+/// The only integrity defense today is filesystem perms (`0o700`); under self-hosting the eventual
+/// grant MUST additionally be Landlock-EXCLUSIVE to the node-own `exec.wasmtime` instance and writable
+/// ONLY by it. A necessary precondition for that exclusivity is that this subtree never COLLIDES with
+/// any backend's state subtree — else granting it read-write to the node-own instance would overlap a
+/// backend-state grant and silently share a state root across the wall. [`check_grant_disjointness`]
+/// refuses that collision fail-closed; this const is the single source of truth it reserves.
+///
+/// NB: the literal must stay in lockstep with `boatramp_handlers::engine::build_persistent_cache`'s
+/// `data_dir.join("wasmtime-cache")` — that crate is a layer DOWN (`boatramp-server` → `boatramp-handlers`)
+/// and cannot name this const.
+pub const NODE_OWN_EXEC_CACHE_SUBDIR: &str = "wasmtime-cache";
+
+/// The node-own `exec.wasmtime` compile-cache directory under `data_dir` (see
+/// [`NODE_OWN_EXEC_CACHE_SUBDIR`]). A PURE path helper: it neither creates nor grants the directory
+/// (both are the owner-gated Phase-5 P5-6 flip). Used by [`check_grant_disjointness`] to reserve the
+/// subtree and by the eventual P5-6 grant-derivation as the single source of truth for WHAT it grants.
+#[must_use]
+pub fn node_own_exec_cache_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(NODE_OWN_EXEC_CACHE_SUBDIR)
+}
+
 /// The full per-backend-authority state map under `data_dir` — EVERY group-B authority's state
 /// subtree. This is what an instance passes as [`SandboxDerivationInputs::authority_state_dirs`]
 /// so [`derive_profile`]'s cross-authority leak check is not inert (Contract #2). `data_dir` must
@@ -2273,6 +2313,27 @@ pub enum CompositionGrantError {
         /// The hosted backend authority missing from the layout.
         authority: HostAuthority,
     },
+    /// A hosted backend authority's state subtree COLLIDES with the reserved node-own
+    /// `exec.wasmtime` compile-cache subtree ([`NODE_OWN_EXEC_CACHE_SUBDIR`]). The cache is not a
+    /// backend-state grant, but it IS a sibling subtree under `data_dir` that the owner-gated
+    /// **Phase-5 P5-6** self-host flip will grant read-write EXCLUSIVELY to the node-own exec
+    /// instance. If a backend's state subtree ever shared that path, granting the cache RW would
+    /// overlap the backend-state grant and silently defeat the isolation wall — and because the
+    /// cache is loaded as executable code WITHOUT a content MAC, that overlap is a
+    /// cache-poisoning → RCE seam. Keep the reserved subtree disjoint from every backend-state
+    /// subtree. (Inert today — no backend maps to it — a fail-closed tripwire against a future
+    /// [`backend_state_subdir`] mis-edit.)
+    #[error(
+        "privsep composition refused: hosted backend authority {authority} is mapped onto the \
+         reserved node-own exec.wasmtime compile-cache subtree {reserved:?} — a backend's state \
+         subtree must never collide with the (Phase-5 P5-6) node-own exec cache grant"
+    )]
+    BackendCollidesWithReservedExecCache {
+        /// The offending backend authority.
+        authority: HostAuthority,
+        /// The reserved node-own exec-cache subtree it collides with.
+        reserved: PathBuf,
+    },
 }
 
 /// The composition-layer grant check (**WS-C CONTRACT #2**), run IN THE ROOT, fail-closed, BEFORE
@@ -2290,10 +2351,26 @@ pub fn check_grant_disjointness(
     data_dir: &Path,
 ) -> Result<(), CompositionGrantError> {
     // Coverage: every hosted backend authority must have a layout entry (else the map is inert).
+    // Phase-5 P5-6 precondition (SAME pass): a backend's state subtree must never collide with the
+    // reserved node-own exec.wasmtime compile-cache subtree the owner-gated self-host flip will grant
+    // RW EXCLUSIVELY to the node-own exec instance. Inert today — no backend maps to it
+    // ([`backend_state_subdir`] has no exec entry) — a fail-closed tripwire that keeps the future
+    // exclusive cache grant from ever overlapping a backend-state grant (which, because the cache is
+    // loaded as executable code without a content MAC, would be a cache-poisoning → RCE seam).
+    let reserved_cache = node_own_exec_cache_dir(data_dir);
     for caps in instances.values() {
         for a in caps.iter().copied().filter(|a| a.is_backend()) {
-            if backend_state_subdir(a).is_none() {
+            let Some(sub) = backend_state_subdir(a) else {
                 return Err(CompositionGrantError::UncoveredBackendAuthority { authority: a });
+            };
+            let backend_dir = data_dir.join(sub);
+            if path_contains(&backend_dir, &reserved_cache)
+                || path_contains(&reserved_cache, &backend_dir)
+            {
+                return Err(CompositionGrantError::BackendCollidesWithReservedExecCache {
+                    authority: a,
+                    reserved: reserved_cache,
+                });
             }
         }
     }
@@ -3938,6 +4015,67 @@ mod privsep_derivation_tests {
             err,
             CompositionGrantError::OverlappingGrants { .. }
         ));
+    }
+
+    // Phase-5 P5-6 precondition (owner-gated grant, NOT wired): the node-own `exec.wasmtime`
+    // compile-cache subtree the self-host flip will grant RW EXCLUSIVELY to the node-own exec
+    // instance must stay disjoint from EVERY backend-state subtree. If it ever collided, granting it
+    // RW would overlap a backend-state grant and silently share a state root across the wall — and
+    // because the cache is loaded as executable code WITHOUT a content MAC (the `aot` HMAC gate covers
+    // only the cluster/blob path, not this local cache), that overlap is a cache-poisoning → RCE seam.
+    #[test]
+    fn reserved_exec_cache_subtree_is_disjoint_from_every_backend_state_grant_and_ungranted_today() {
+        let data = Path::new("/data");
+        let reserved = node_own_exec_cache_dir(data);
+        assert_eq!(
+            reserved,
+            data.join("wasmtime-cache"),
+            "the reserved subtree must stay in lockstep with build_persistent_cache's literal"
+        );
+
+        // The reserved cache subtree collides with NO backend's state subtree (the invariant the
+        // disjointness tripwire protects), and NO exec authority owns a backend-state subtree — so
+        // the cache stays UNGRANTED today (the grant is the owner-gated P5-6 flip).
+        for a in HostAuthority::ALL.iter().copied() {
+            match backend_state_subdir(a) {
+                Some(sub) => {
+                    let backend_dir = data.join(sub);
+                    assert!(
+                        !path_contains(&backend_dir, &reserved)
+                            && !path_contains(&reserved, &backend_dir),
+                        "backend {} state subtree {backend_dir:?} collides with reserved exec cache {reserved:?}",
+                        a.tag()
+                    );
+                }
+                None => assert!(
+                    !a.is_backend(),
+                    "backend {} lacks a state-dir layout entry",
+                    a.tag()
+                ),
+            }
+        }
+        assert_eq!(
+            backend_state_subdir(HostAuthority::ExecWasmtime),
+            None,
+            "exec.wasmtime holds no backend-state subtree — the cache grant is the P5-6 flip, not a live grant"
+        );
+
+        // The tripwire is INERT for a real all-backends composition (the one that also holds
+        // exec.wasmtime on a sibling frontend), so this safe groundwork regresses no composition.
+        let mut clean = BTreeMap::new();
+        clean.insert("storage".to_string(), storage());
+        clean.insert("edge".to_string(), frontend());
+        check_grant_disjointness(&clean, data)
+            .expect("the reserved exec-cache tripwire is inert for the canonical backend layout");
+
+        // The tripwire's predicate DOES fire for a (hypothetical) backend mapped onto the reserved
+        // name — exercising the exact `path_contains` condition the check evaluates per backend.
+        let hypothetical_collision = data.join(NODE_OWN_EXEC_CACHE_SUBDIR);
+        assert!(
+            path_contains(&hypothetical_collision, &reserved)
+                && path_contains(&reserved, &hypothetical_collision),
+            "a backend mapped onto the reserved subtree must trip the P5-6 collision guard"
+        );
     }
 
     // ---- The root supervisor's bespoke self-profile (design §4.3) ----
