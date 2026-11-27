@@ -553,6 +553,16 @@ const KNOWN_IMPORTS: &[&str] = &[
     // at register, and the dial-time floor stays authoritative — deny-by-default at every layer.
     // Advertised Experimental.
     "egress-register",
+    // The durable RUN capability (PLAN-run-streaming P1). A granted guest creates / emits-to /
+    // attaches-to / cancels a correlation-scoped, DURABLE, resumable run event stream built on the
+    // v0.74 consumer-delivery core; granting it here only lets a component DECLARE it. Reaching
+    // anything additionally needs the node posture `allow_guest_run_streaming` (OFF by default); the
+    // host fences every run to the guest's OWN resolved tenant + project (it supplies only a `run-id`,
+    // never a tenant/project) — deny-by-default at every layer. Advertised Experimental, and ALSO
+    // cargo-gated (advertised iff the `run-streaming` feature is on), so a lean host that cannot serve
+    // it does not advertise it and a `requires = ["run"]` deploy fails loud. Filtered out of the Stable
+    // base set below.
+    "run",
 ];
 
 /// The import names a deploy may declare in a handler's `imports` (baseline WASI

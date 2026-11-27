@@ -86,6 +86,10 @@ pub mod project_prune;
 pub mod project_sync;
 pub mod redact;
 pub mod registry_auth;
+/// The **run** primitive (PLAN-run-streaming P1): a correlation-scoped, DURABLE, resumable event
+/// stream built on the v0.74 consumer-delivery core — the typed envelope, the tenancy-fenced
+/// keyspace, and the per-run state record. The engine that drives it lives in `boatramp-server`.
+pub mod run;
 pub mod sealed_state;
 pub mod secret_store;
 /// The duplex/resumable session delivery-semantics model (Stage 1 of `PLAN-session-primitive`).

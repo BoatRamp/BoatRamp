@@ -113,6 +113,9 @@ impl SecurityProfile {
                 allow_guest_dynamic_egress: false,
                 allow_guest_tcp_listener: false,
                 allow_guest_egress_register: false,
+                // A new durable surface + guest-facing WIT (PLAN-run-streaming P1): OFF under
+                // multi-tenant until the operator opts in (a Security review gates the default).
+                allow_guest_run_streaming: false,
                 allow_guest_dns_publish: false,
                 // A new, security-sensitive runtime zone-credential surface (cap-req #31): OFF under
                 // multi-tenant until the operator opts in. Its own Security review gates the default.
@@ -158,6 +161,9 @@ impl SecurityProfile {
                 // A new, security-sensitive zone-write surface: OFF even on single-tenant until the
                 // operator opts in explicitly (its Security review gates the broader default).
                 allow_guest_egress_register: false,
+                // A new durable surface + guest-facing WIT (PLAN-run-streaming P1): OFF even on
+                // single-tenant until the operator opts in explicitly (Security review gates it).
+                allow_guest_run_streaming: false,
                 allow_guest_dns_publish: false,
                 // The RUNTIME per-tenant zone-credential path (cap-req #31): ON under single-tenant —
                 // the one tenant supplies its OWN provider token for its OWN zone (still fenced by the
@@ -206,6 +212,9 @@ impl SecurityProfile {
                 // Off even under dev — a guest `dns-publish` would mutate REAL external DNS (the
                 // provider credential is real); an operator opts in explicitly.
                 allow_guest_egress_register: false,
+                // A new durable surface + guest-facing WIT (PLAN-run-streaming P1): OFF even under dev
+                // until the operator opts in explicitly (Security review gates the broader default).
+                allow_guest_run_streaming: false,
                 allow_guest_dns_publish: false,
                 // The RUNTIME per-tenant zone-credential path (cap-req #31): ON under dev (the dev
                 // operator supplies its own token for its own zone; still allowlist- + seal-fenced).
@@ -326,6 +335,12 @@ pub struct PostureOverrides {
     /// egress), validates each entry's grammar + the SSRF floor at register, and the UNCHANGED
     /// dial-time floor stays authoritative. See [`SecurityPosture::allow_guest_egress_register`].
     pub allow_guest_egress_register: Option<bool>,
+    /// Permit a **guest** to use the durable **run** capability (PLAN-run-streaming P1): create /
+    /// emit-to / attach-to / cancel a correlation-scoped, resumable run event stream. **Off** in every
+    /// built-in profile (a new durable surface + guest-facing WIT — an operator opts in). Each run is
+    /// fenced to the guest's OWN resolved tenant + project (the guest names only a `run-id`). See
+    /// [`SecurityPosture::allow_guest_run_streaming`].
+    pub allow_guest_run_streaming: Option<bool>,
     /// Permit host-owned inbound-TCP **listeners** to dispatch an accepted connection to a guest.
     /// Off under `multi-tenant`; on under `single-tenant`/`dev`. Independent of
     /// `allow_guest_tcp_egress` (inbound ≠ outbound). See
@@ -593,6 +608,11 @@ impl SecurityConfig {
             o.allow_guest_egress_register.is_some(),
         );
         row(
+            "allow_guest_run_streaming",
+            p.allow_guest_run_streaming.to_string(),
+            o.allow_guest_run_streaming.is_some(),
+        );
+        row(
             "allow_guest_dns_publish",
             p.allow_guest_dns_publish.to_string(),
             o.allow_guest_dns_publish.is_some(),
@@ -826,6 +846,16 @@ pub struct SecurityPosture {
     /// dial-time `is_global_ip` floor. A new write surface, so OFF by default even on
     /// `single-tenant`/`dev` — an operator opts in explicitly. Any single wiring omission fails CLOSED.
     pub allow_guest_egress_register: bool,
+    /// Permit a **guest** to use the durable **run** capability — create / emit-to / attach-to / cancel
+    /// a correlation-scoped, resumable run event stream on the v0.74 consumer-delivery core
+    /// (PLAN-run-streaming P1). `false` (every built-in profile) makes the `RunHost` binding fail-closed
+    /// to `access-denied` for every run op, regardless of grant. `true` lets a GRANTED component drive
+    /// runs — still fenced to the guest's OWN resolved tenant + project (the host composes the per-run
+    /// topic key; the guest supplies only a `run-id`, so it can never reach another tenant's run). A new
+    /// durable surface + guest-facing WIT, so OFF by default even on `single-tenant`/`dev` — an operator
+    /// opts in explicitly (and a Security review gates the broader default). Any single wiring omission
+    /// fails CLOSED.
+    pub allow_guest_run_streaming: bool,
     /// Permit a **guest** to register a RUNTIME, host-sealed, per-tenant DNS-write credential and route
     /// `dns-publish` writes through it (cap-req #31): the tenant connects its OWN zone with its OWN
     /// provider API token; the host SEALS the token (the `[secrets]` key envelope), holds it keyed to
@@ -1030,6 +1060,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_egress_register {
         base.allow_guest_egress_register = v;
+    }
+    if let Some(v) = o.allow_guest_run_streaming {
+        base.allow_guest_run_streaming = v;
     }
     if let Some(v) = o.allow_guest_dns_publish {
         base.allow_guest_dns_publish = v;

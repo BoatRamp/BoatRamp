@@ -78,6 +78,7 @@ default = [
   "tcp-egress",
   "dns-publish",
   "egress-register",
+  "run-streaming",
   "cluster",
   "operator",
   "k8s-backend",
@@ -327,6 +328,12 @@ dns-publish = ["handlers", "boatramp-server/dns-publish"]
 # `allow_guest_egress_register` + a declared `egress-register` import), so compiling it in enables it
 # for no one by itself. Writes the SAME overlay the control-plane `HandlerPolicy·Write` PUT edits.
 egress-register = ["handlers", "boatramp-server/egress-register"]
+# The durable RUN capability (`boatramp:handlers/run`, PLAN-run-streaming P1): forwards to the server
+# run ENGINE + `RunStore` seam + the host binding. Experimental; batteries-included in the default
+# build (runtime-opt-in via the OFF-by-default posture `allow_guest_run_streaming` + a declared `run`
+# import), so compiling it in enables it for no one by itself. A run is a correlation-scoped, durable,
+# resumable event stream on the v0.74 consumer-delivery core, fenced to the guest's OWN tenant/project.
+run-streaming = ["handlers", "boatramp-server/run-streaming"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /
 # RaftMessaging serving facades. Pulls boatramp-cluster +

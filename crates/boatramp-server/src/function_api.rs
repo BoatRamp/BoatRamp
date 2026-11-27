@@ -285,6 +285,9 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
                 // is likewise Experimental + cargo-gated below (advertised iff the `egress-register`
                 // feature is on) — not Stable, and not advertised unconditionally.
                 && name != "egress-register"
+                // `run` (the durable RUN capability, PLAN-run-streaming P1) is likewise Experimental +
+                // cargo-gated below (advertised iff the `run-streaming` feature is on) — not Stable.
+                && name != "run"
         })
         .map(|&name| CapabilityFeature {
             name,
@@ -512,6 +515,22 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
     if cfg!(feature = "egress-register") {
         f.push(CapabilityFeature {
             name: "egress-register",
+            lifecycle: Experimental,
+        });
+    }
+    // The durable RUN capability (PLAN-run-streaming P1): a granted guest creates / emits-to /
+    // attaches-to / cancels a correlation-scoped, resumable run event stream on the v0.74
+    // consumer-delivery core. Cargo-gated on `run-streaming` (which pulls the server run ENGINE +
+    // the `boatramp-handlers/run` host binding); deny-by-default at RUNTIME — the node posture
+    // `allow_guest_run_streaming` (OFF by default) + the host-forced per-tenant scope. Its OWN grant
+    // token (`run`, a KNOWN_IMPORT — declarable offline), advertised ONLY when the feature is compiled:
+    // a guest declares `requires = ["run"]` so a deploy against a host that cannot serve it (feature
+    // off, or predating P1) is refused cleanly instead of failing to instantiate. Registering it here
+    // is what makes it appear in `boatramp capabilities` and pass `capabilities --check`/`sync`
+    // admission. Experimental until the shape settles (P2 adds the external front door + run-scoped token).
+    if cfg!(feature = "run-streaming") {
+        f.push(CapabilityFeature {
+            name: "run",
             lifecycle: Experimental,
         });
     }

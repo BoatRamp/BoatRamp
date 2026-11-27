@@ -192,6 +192,8 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let allow_guest_dns_publish = options.posture.allow_guest_dns_publish;
     // The guest `egress-register` self-register posture (PLAN-egress-runtime-authz #12 Surface 2).
     let allow_guest_egress_register = options.posture.allow_guest_egress_register;
+    // The durable RUN posture (PLAN-run-streaming P1).
+    let allow_guest_run_streaming = options.posture.allow_guest_run_streaming;
     // The RUNTIME per-tenant DNS-credential posture (cap-req #31).
     let allow_guest_dynamic_dns_publish = options.posture.allow_guest_dynamic_dns_publish;
     // Sub-zone `NS` delegation posture (Security review MEDIUM-3); mapped onto the handler-engine enum
@@ -335,6 +337,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         allow_guest_tcp_listener,
         allow_guest_dns_publish,
         allow_guest_egress_register,
+        allow_guest_run_streaming,
         allow_guest_dynamic_dns_publish,
         guest_dns_publish_ns,
         self_egress_addrs,

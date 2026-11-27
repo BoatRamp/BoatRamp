@@ -240,6 +240,11 @@ pub async fn build_handler_runtime(
     // `access-denied` for every call. Writes the SAME overlay the control-plane `HandlerPolicy·Write`
     // PUT edits; host-scoped to the guest's OWN per-workload key.
     allow_guest_egress_register: bool,
+    // Posture: whether a guest may use the durable RUN capability — create / emit-to / attach-to /
+    // cancel a correlation-scoped, resumable run event stream (PLAN-run-streaming P1). OFF in every
+    // built-in profile; when off the engine makes the `RunHost` binding fail-closed to `access-denied`
+    // for every run op. Each run is fenced to the guest's OWN resolved tenant + project.
+    allow_guest_run_streaming: bool,
     // Posture: whether a guest may register a RUNTIME, host-sealed, per-tenant DNS-write credential and
     // route writes through it (cap-req #31). OFF under multi-tenant; when off the engine makes every
     // `register`/`unregister` `access-denied` and routes no record to a runtime credential. INDEPENDENT
@@ -538,6 +543,9 @@ pub async fn build_handler_runtime(
     // Posture gate for the guest `egress-register` self-register capability (#12 Surface 2). OFF by
     // default ⇒ fail-closed `access-denied`. Writes the SAME overlay as the control-plane PUT.
     .with_egress_register(allow_guest_egress_register)
+    // Posture gate for the durable RUN capability (PLAN-run-streaming P1). OFF by default ⇒
+    // fail-closed `access-denied`. Each run is fenced to the guest's OWN resolved tenant + project.
+    .with_run_streaming(allow_guest_run_streaming)
     // Posture gate for the RUNTIME per-tenant DNS-credential path (cap-req #31). OFF under multi-tenant
     // ⇒ every register/route is fail-closed. INDEPENDENT of `with_dns_publish`.
     .with_dynamic_dns_publish(allow_guest_dynamic_dns_publish)
@@ -1121,6 +1129,10 @@ pub async fn build_handler_runtime(
     // (the caller passes the posture value unconditionally); a lean node has no guest `egress-register`
     // path to gate, so it is ignored (PLAN-egress-runtime-authz #12 Surface 2).
     _allow_guest_egress_register: bool,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single node.rs caller
+    // (the caller passes the posture value unconditionally); a lean node has no guest RUN path to gate,
+    // so it is ignored (PLAN-run-streaming P1).
+    _allow_guest_run_streaming: bool,
     // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature (cap-req #31); a lean node has
     // no guest `dns-publish` runtime path to gate, so it is ignored.
     _allow_guest_dynamic_dns_publish: bool,

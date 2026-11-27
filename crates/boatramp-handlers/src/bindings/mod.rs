@@ -76,6 +76,13 @@ pub mod messaging_stats;
 pub mod migrate;
 #[cfg(feature = "sql")]
 pub mod orm;
+/// The host-side **run** binding (`boatramp:handlers/run`, PLAN-run-streaming P1): a granted,
+/// posture-ON guest creates / emits-to / attaches-to / cancels a durable, correlation-scoped RUN
+/// event stream. The durable engine lives a layer up (boatramp-server) behind the `RunStore` seam;
+/// this gates only the WIT world + the `RunHost` binding + linker. Its own off-by-default
+/// `run-streaming` feature.
+#[cfg(feature = "run-streaming")]
+pub mod run;
 /// The guest sealed-state mint binding (`boatramp:handlers/sealed-state`, PLAN-sealed-state-source): a
 /// granted guest mints an AEAD-sealed state token bound to THIS invocation's host-resolved
 /// tenant+project+site, for a later pre-auth SSO callback to resolve via the `sealed-state` tenancy
@@ -238,6 +245,13 @@ pub struct Bindings {
     /// `EgressRegisterHost` view borrows it. `None` ⇒ not granted (every `set-egress` ⇒ `access-denied`).
     #[cfg(feature = "egress-register")]
     egress_register: Option<egress_register::EgressRegisterBinding>,
+    /// The `run` grant (PLAN-run-streaming P1): the host-held [`RunStore`](run::RunStore), baked to
+    /// THIS invocation's resolved `(project, tenant)` by the server's `build_bindings`, so the guest
+    /// names only a `run-id`. `None` ⇒ not granted (every run op ⇒ `access-denied`). The node posture
+    /// (`allow_guest_run_streaming`) is applied by the engine from `HostState` at link, like
+    /// `egress-register`.
+    #[cfg(feature = "run-streaming")]
+    run: Option<run::RunBinding>,
     /// HOST-MEDIATED egress only (mailroom cap-req #19): when set, a non-empty `egress_allowlist`
     /// feeds ONLY the host-mediated `tcp-egress` binding (the host dials + terminates TLS), and
     /// `new_store` does NOT install the permissive GUEST `socket_addr_check` — so the guest's own
@@ -499,6 +513,23 @@ impl Bindings {
         writer: std::sync::Arc<dyn egress_register::EgressRegisterWriter>,
     ) -> Self {
         self.egress_register = Some(egress_register::EgressRegisterBinding::new(writer));
+        self
+    }
+
+    /// This invocation's `run` grant (`None` ⇒ not granted). Read by the engine's `build_linker`
+    /// closure to build the per-invocation `RunHost` (PLAN-run-streaming P1).
+    #[cfg(feature = "run-streaming")]
+    pub fn run(&self) -> Option<&run::RunBinding> {
+        self.run.as_ref()
+    }
+
+    /// Grant the `run` capability (PLAN-run-streaming P1), backed by the host-held `store` the server
+    /// bakes to THIS invocation's resolved `(project, tenant)`. The guest supplies ONLY a `run-id`, so
+    /// it can only ever reach its own tenant's runs. The node posture (`allow_guest_run_streaming`) is
+    /// applied by the engine from `HostState` at link, like `egress-register`.
+    #[cfg(feature = "run-streaming")]
+    pub fn with_run(mut self, store: std::sync::Arc<dyn run::RunStore>) -> Self {
+        self.run = Some(run::RunBinding::new(store));
         self
     }
 

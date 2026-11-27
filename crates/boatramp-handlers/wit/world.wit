@@ -2190,3 +2190,105 @@ interface egress-register {
 world egress-register-host {
   import egress-register;
 }
+
+/// Value types for the `run` capability (PLAN-run-streaming P1): a RUN is a correlation-scoped,
+/// DURABLE, resumable event stream built ON the v0.74 consumer-delivery core (the durable
+/// claim/lease/ack/retained-log model behind `claim_grouped` — NOT the lossy `Messaging::subscribe`
+/// fan-out). A server-assigned, unguessable `run-id` correlates the stream; events carry a typed
+/// envelope with a monotonic `seq` (the durable resume cursor). A run is fenced to its creator's
+/// tenant + project (the host composes the key from THIS invocation's resolved tenant — the guest
+/// names neither), so a `run-id` from one tenant is unreachable from another.
+///
+/// `@unstable`, OFF by default — the whole binding is cargo-gated (`run-streaming`) and advertised
+/// Experimental; a guest declares `requires = ["run"]` so a deploy against a host that cannot serve
+/// it is refused cleanly. A BRAND-NEW interface (additive: a pinned older guest that does not import
+/// it is unaffected), so a guest WIT addition ⇒ a `boatramp-uchron-shim` rev + a
+/// `HOST_HANDLERS_VERSION` bump.
+interface run-types {
+  /// A server-assigned run correlation id (opaque + unguessable; a clean single key segment).
+  type run-id = string;
+
+  /// The kind of a run event. `progress` is the only NON-terminal kind; `result`/`error`/`end`/
+  /// `cancelled` each CONCLUDE the run (and end the attach stream). `cancelled` is a DISTINCT terminal
+  /// outcome from `error`/`end` — a deliberate stop, not a failure or a clean finish. (`result` is a
+  /// WIT keyword, so the case is escaped `%result`; the guest names it `result`, and the generated
+  /// Rust variant is `Result`.)
+  enum run-event-kind { progress, %result, error, end, cancelled }
+
+  /// A run's lifecycle status (polled via `status`).
+  enum run-status { active, ended, errored, cancelled }
+
+  /// One typed run event. `payload` is opaque JSON bytes (the guest's own event body); `seq` is the
+  /// monotonic per-run cursor to report back on reconnect for a lossless resume.
+  record run-event {
+    run-id: run-id,
+    seq: u64,
+    kind: run-event-kind,
+    timestamp-ms: u64,
+    payload: list<u8>,
+  }
+
+  /// Why a run op was refused.
+  variant run-error {
+    /// The `run` capability was not granted, or the node posture is off (deny-by-default).
+    access-denied,
+    /// No such run under THIS invocation's tenant/project — a wrong-tenant id, one never created, or
+    /// a fabricated id. The cross-tenant refusal surfaces here (the key does not exist for the caller).
+    not-found,
+    /// The run has already ENDED (a `result`/`end`/`error` terminal event was emitted) — a further
+    /// emit is refused. A long-lived emitter treats this as "stop".
+    terminal,
+    /// The run was CANCELLED — a further emit is refused. THE STOP SIGNAL a long-lived emitter
+    /// observes to genuinely stop (so it does not keep burning compute).
+    cancelled,
+    /// The request was malformed (an invalid run-id, an over-cap payload). Carries a reason.
+    invalid(string),
+    /// A backend (messaging / KV) fault. Carries a sanitized reason.
+    backend(string),
+  }
+}
+
+/// The `run` capability: create / emit-to / attach-to / cancel a durable run. Deny-by-default (an
+/// ungranted or posture-off guest gets `access-denied`). The host composes the run's tenancy-fenced
+/// topic from THIS invocation's resolved tenant + project; the guest names only the `run-id`.
+interface run {
+  use run-types.{run-id, run-event, run-event-kind, run-status, run-error};
+
+  /// A resumable attach stream over a run's durable event log.
+  resource run-stream {
+    /// The next envelope in `seq` order, blocking until one is available. `none` = end of stream (a
+    /// terminal event was delivered, or the run is gone). To resume losslessly after a disconnect,
+    /// re-`attach` with `after-seq` = the last `seq` you processed.
+    next: func() -> result<option<run-event>, run-error>;
+  }
+
+  /// Create a new run fenced to THIS invocation's resolved tenant + project. Returns the server-minted
+  /// id. DROP-CANCEL is ON (the default): if every attacher drops before a terminal event, the run is
+  /// cancelled so a long-lived emitter stops.
+  create: func() -> result<run-id, run-error>;
+
+  /// Emit one event to run `id`. The host allocates the monotonic `seq`. A terminal kind ENDS the run;
+  /// a further emit then returns `terminal`/`cancelled`. Returns the allocated `seq`.
+  emit: func(id: run-id, kind: run-event-kind, payload: list<u8>) -> result<u64, run-error>;
+
+  /// Attach to run `id`, resuming strictly AFTER `after-seq` (none = from the first event), lossless
+  /// and in `seq` order. Returns a resumable stream.
+  attach: func(id: run-id, after-seq: option<u64>) -> result<run-stream, run-error>;
+
+  /// Cancel run `id` (explicit): marks it cancelled + emits the terminal `cancelled` event.
+  /// Idempotent (a no-op on an already-concluded run).
+  cancel: func(id: run-id) -> result<_, run-error>;
+
+  /// The current status of run `id` — a cheap poll so a long-lived emitter observes a cancel between
+  /// work steps and stops early.
+  status: func(id: run-id) -> result<run-status, run-error>;
+}
+
+/// Import-only world for the `run` host binding (the `RunHost` Host impl). Off by default —
+/// feature-gated (`run-streaming`) and provided ONLY when the node posture `allow_guest_run_streaming`
+/// is on AND the component was granted the capability. A guest WIT addition ⇒ a `boatramp-uchron-shim`
+/// rev + a `HOST_HANDLERS_VERSION` bump (additive: a pinned older guest that does not import it is
+/// unaffected).
+world run-host {
+  import run;
+}

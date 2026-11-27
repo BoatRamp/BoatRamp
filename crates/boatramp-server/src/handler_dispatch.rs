@@ -3036,6 +3036,30 @@ pub(super) async fn build_bindings(
             resolved_tenant,
         );
     }
+    // The durable RUN capability (PLAN-run-streaming P1): a granted guest creates / emits-to /
+    // attaches-to / cancels a correlation-scoped, resumable run on the v0.74 consumer-delivery core.
+    // The engine is BAKED with this invocation's project + resolved-OWN-tenant scope (the guest names
+    // neither — it supplies only a `run-id`), so a run is reachable ONLY by its own tenant: a `run-id`
+    // from tenant A composes a DIFFERENT (B-scoped) key that does not exist. Deny-by-default: needs the
+    // `run` import ∩ the site allowlist AND the messaging substrate; the node posture
+    // `allow_guest_run_streaming` is the final gate (applied at link). A `None` resolved tenant maps to
+    // the untenanted scope (single-tenant parity). The `seq` allocator + per-run state live in the
+    // control-plane KV (`inner.kv`); the retained event log lives in the messaging substrate.
+    #[cfg(feature = "run-streaming")]
+    if granted("run")
+        && let Some(messaging) = &inner.messaging
+    {
+        let resolved_tenant =
+            super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
+        let run_scope = boatramp_core::run::run_scope_segment(resolved_tenant.as_deref());
+        let engine = crate::RunEngine::new(
+            messaging.clone(),
+            inner.kv.clone(),
+            project.as_str(),
+            run_scope,
+        );
+        bindings = bindings.with_run(std::sync::Arc::new(crate::RunStoreImpl::new(engine)));
+    }
     // The per-tenant sealed-secret capability (task #493): read/write secrets sealed to THIS
     // invocation's resolved OWN-tenant. Two INDEPENDENT rights — `tenant-secrets:read` (get/list)
     // and `tenant-secrets:admin` (set/delete) — each separately granted (import ∩ site allowlist);

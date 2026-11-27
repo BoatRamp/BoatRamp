@@ -5,6 +5,43 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Added
+
+- **Scoped run streaming — the durable RUN primitive (P1).** A **run** is a correlation-scoped,
+  DURABLE, resumable event stream built ON the v0.74 consumer-delivery core (the durable
+  claim/lease/ack/retained-log model behind `claim_grouped` — never the lossy `Messaging::subscribe`
+  fan-out), so a client can invoke a server-side agent and watch its progress → result stream back
+  live, with lossless resume on reconnect. A long-lived bus-consumer agent can now EMIT events to a
+  run over time (the gap `invoke-streaming`'s synchronous HTTP re-entry did not cover). Behind the
+  OFF-by-default `run-streaming` cargo feature + the OFF-by-default node posture
+  `allow_guest_run_streaming`; batteries-included in the released image, runtime-opt-in via the
+  posture + a declared `run` import. A new guest-facing WIT interface (`boatramp:handlers/run`,
+  advertised Experimental) ⇒ needs a `boatramp-uchron-shim` rev to expose it to guests.
+  - **The run scope + envelope (core).** A run is its OWN durable grouped topic under a reserved,
+    tenancy-fenced namespace — `{project}/.boatramp-run/{scope}/{run_id}` — **structurally
+    unreachable by any guest messaging producer** (a producer can name only `{project}/bus/…` or its
+    private `{project}/{site}/…`; a site/project slug can never begin with `.`, and `.boatramp*` is a
+    reserved object-key segment). The scope segment is composed by the HOST from the invocation's
+    resolved own-tenant (`t_{tenant}`, or `u` untenanted), so a `run_id` from tenant A composes a
+    different key under tenant B — cross-tenant reach is structurally impossible (and the `run_id` is
+    a 128-bit-random, unguessable token on top). Typed envelope
+    `{run_id, seq (monotonic durable cursor), kind: progress|result|error|end|cancelled, timestamp,
+    payload (JSON bytes)}`.
+  - **Emit / attach / cancel (host API + guest WIT).** `create` / `emit(id, kind, payload)` /
+    `attach(id, after-seq)` (a resumable `run-stream` resource) / `cancel(id)` / `status(id)`. Emit
+    allocates the monotonic `seq` via an atomic CAS on the per-run state and publishes the envelope to
+    the retained log; attach opens a fresh consumer group per attacher (fan-out), replays the retained
+    log skipping `seq ≤ after-seq`, then tails — lossless, in `seq` order. **Cancellation, both
+    modes:** explicit `cancel`, and DROP-CANCEL (default) when an attacher drops before a terminal
+    event; either emits the distinct terminal `cancelled` envelope AND makes the emitting agent's next
+    `emit`/`status` observe the stop (so it does not keep burning compute).
+  - **Extends, does not duplicate.** The engine (`boatramp-server`) reuses the unchanged
+    `claim_grouped` / `ack` / lease / retained-log core and the shared durable claim pump; it adds
+    only the per-run correlation scope, the envelope, the `seq` allocator, and cancellation. P2 (the
+    external HTTP front door + a run-scoped token) and the sync-handler emit path (P1b) layer on top.
+
 ## [0.75.0] — 2026-11-26
 
 ### Added

@@ -199,6 +199,16 @@ dns-publish = [
 # ONLY when the node posture `allow_guest_egress_register` is on AND the component was granted it. The
 # shipped binary turns it on via batteries-included. `dep:async-trait` for the object-safe writer seam.
 egress-register = ["engine", "dep:async-trait"]
+# The `run` capability (PLAN-run-streaming P1): a granted guest creates / emits-to / attaches-to /
+# cancels a durable, correlation-scoped RUN event stream built ON the v0.74 consumer-delivery core.
+# This gates ONLY the WIT `run-host` world + the `RunHost` binding + linker glue; the durable run
+# ENGINE (the tenancy-fenced per-run topic, the `seq` allocator, the claim pump, cancellation) lives
+# a layer up (boatramp-server) behind the `RunStore` seam, so the lean paths compile without it. Off
+# by default (experimental); the server turns it on inside its batteries-included `handlers` feature,
+# and it is provided ONLY when the node posture `allow_guest_run_streaming` is on AND the component
+# was granted it. `dep:async-trait` for the object-safe `RunStore` seam + `dep:futures` for the
+# attach stream (both already in the engine graph). `dep:serde` for the envelope round-trip in core.
+run-streaming = ["engine", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true

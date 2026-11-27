@@ -113,6 +113,10 @@ pub use bindings::messaging_stats::{
 };
 #[cfg(feature = "migrate")]
 pub use bindings::migrate::MigrateBinding;
+/// The durable RUN capability seam (PLAN-run-streaming P1): the `RunStore` the server implements over
+/// the v0.74 consumer-delivery core, its error, and the live attach-stream handle the binding drives.
+#[cfg(feature = "run-streaming")]
+pub use bindings::run::{RunAttachStream, RunBinding, RunStore, RunStoreError};
 #[cfg(feature = "session")]
 pub use bindings::session::{
     PromoteError, PromoteRequest, PromoteTls, SessionBinding, SessionController, SessionError,

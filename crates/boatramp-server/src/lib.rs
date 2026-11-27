@@ -249,6 +249,13 @@ pub(crate) use operator::{
 mod bus_consumer;
 #[cfg(feature = "handlers")]
 pub(crate) use bus_consumer::{bus_ack, bus_claim, bus_nack, bus_subscribe};
+// The durable RUN engine (PLAN-run-streaming P1): the correlation-scoped, resumable run event stream
+// built on the v0.74 consumer-delivery core + the `RunStore` seam adapter for the guest binding.
+// Gated on `run-streaming` (which implies `handlers`), so the module can reuse the bus-consumer pump.
+#[cfg(feature = "run-streaming")]
+mod run_stream;
+#[cfg(feature = "run-streaming")]
+pub(crate) use run_stream::{RunEngine, RunStoreImpl};
 // The project-bus WEBHOOK SINK (PLAN-messaging-consumer-delivery, increment d): a host-run
 // pseudo-consumer that drains a sink's topic and delivers each message as an outbound signed POST to a
 // sealed, SSRF-confined destination. Two registration surfaces (runtime `PUT/DELETE .../bus/sinks/{name}`

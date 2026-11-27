@@ -269,6 +269,13 @@ dns-publish = [
 # default (OFF node posture `allow_guest_egress_register`). Implies `handlers`. Experimental.
 egress-register = ["handlers", "boatramp-handlers/egress-register"]
 
+# The durable RUN capability (`boatramp:handlers/run`, PLAN-run-streaming P1): the server-side run
+# ENGINE (`run_stream.rs` — the tenancy-fenced per-run topic, the `seq` allocator, the claim pump over
+# the v0.74 consumer-delivery core, cancellation) + the `RunStore` seam adapter + `maybe_attach` grant,
+# plus the `boatramp-handlers/run-streaming` host binding. Fail-closed by default (OFF node posture
+# `allow_guest_run_streaming`). Implies `handlers`. Experimental.
+run-streaming = ["handlers", "boatramp-handlers/run-streaming"]
+
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via
 # the HTTP-token method (no extra dependency). The verification logic is always

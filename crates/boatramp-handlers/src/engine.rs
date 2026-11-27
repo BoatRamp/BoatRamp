@@ -597,6 +597,12 @@ pub struct HostState {
     /// deny-by-default; the binding fail-closes every `set-egress` to `access-denied` when off.
     #[cfg(feature = "egress-register")]
     egress_register_enabled: bool,
+    /// Whether this invocation's guest may create / emit-to / attach-to / cancel a durable RUN through
+    /// the `run` capability (copied from the engine's `allow_run_streaming` posture — the
+    /// `allow_guest_run_streaming` flag, PLAN-run-streaming P1). `false` is the deny-by-default; the
+    /// binding fail-closes every run op to `access-denied` when off.
+    #[cfg(feature = "run-streaming")]
+    run_streaming_enabled: bool,
     /// Whether this invocation's guest may register/route a RUNTIME, host-sealed, per-tenant DNS-write
     /// credential (copied from the engine's `allow_dynamic_dns_publish` posture — the
     /// `allow_guest_dynamic_dns_publish` flag, cap-req #31). `false` is the deny-by-default; the binding
@@ -2019,6 +2025,13 @@ pub struct HandlerEngine {
     /// wiring omission fails CLOSED.
     #[cfg_attr(not(feature = "egress-register"), allow(dead_code))]
     allow_egress_register: bool,
+    /// Whether the node posture allows a guest to use the `run` capability — create / emit-to /
+    /// attach-to / cancel a durable RUN (`allow_guest_run_streaming`, OFF by default in every profile)
+    /// — PLAN-run-streaming P1. `false` (the default) fail-closes every run op to `access-denied`
+    /// regardless of grant; `true` lets a granted component drive runs (still tenancy-fenced by the
+    /// host-baked `(project, tenant)` scope). Any single wiring omission fails CLOSED.
+    #[cfg_attr(not(feature = "run-streaming"), allow(dead_code))]
+    allow_run_streaming: bool,
     /// Whether the node posture allows a guest to register a RUNTIME, host-sealed, per-tenant DNS-write
     /// credential and route writes through it (`allow_guest_dynamic_dns_publish`, cap-req #31) — the
     /// dynamic analogue of the operator serve-static `dns_providers` registry. OFF under multi-tenant
@@ -2283,6 +2296,9 @@ impl HandlerEngine {
             // `with_dns_publish`. A node that never calls it can never let a guest mutate DNS.
             allow_dns_publish: false,
             allow_egress_register: false,
+            // Deny-by-default: the `run` capability is off until an operator opts the posture in via
+            // `with_run_streaming`. A node that never calls it can never let a guest drive a run.
+            allow_run_streaming: false,
             // Deny-by-default: the runtime per-tenant DNS-credential path (cap-req #31) is off until an
             // operator opts the posture in via `with_dynamic_dns_publish`.
             allow_dynamic_dns_publish: false,
@@ -2867,6 +2883,17 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_egress_register(mut self, allow: bool) -> Self {
         self.allow_egress_register = allow;
+        self
+    }
+
+    /// Permit (or refuse) a guest to use the `run` capability — create / emit-to / attach-to / cancel
+    /// a durable RUN — the operator posture's `allow_guest_run_streaming` (PLAN-run-streaming P1).
+    /// Default (`false`, off in every profile) fail-closes every run op to `access-denied` regardless
+    /// of grant; `true` lets a granted component drive runs (still tenancy-fenced by the host-baked
+    /// `(project, tenant)` scope). Any single wiring omission fails CLOSED.
+    #[must_use]
+    pub fn with_run_streaming(mut self, allow: bool) -> Self {
+        self.allow_run_streaming = allow;
         self
     }
 
@@ -4104,6 +4131,19 @@ impl HandlerEngine {
                 state.egress_register_enabled,
             )
         })?;
+        // The durable RUN capability (PLAN-run-streaming P1): create/emit/attach/cancel a
+        // correlation-scoped, resumable run. Gated deny-by-default (binding `None` ⇒ `access-denied`)
+        // AND by the node posture `allow_guest_run_streaming` (`run_streaming_enabled`, OFF by
+        // default); the store is baked to THIS invocation's `(project, tenant)`, so a guest reaches
+        // only its own tenant's runs.
+        #[cfg(feature = "run-streaming")]
+        bindings::run::add_to_linker(linker, |state: &mut HostState| {
+            bindings::run::RunHost::new(
+                &mut state.table,
+                state.bindings.run(),
+                state.run_streaming_enabled,
+            )
+        })?;
         Ok(())
     }
 
@@ -4272,6 +4312,8 @@ impl HandlerEngine {
             dns_publish_enabled: self.allow_dns_publish,
             #[cfg(feature = "egress-register")]
             egress_register_enabled: self.allow_egress_register,
+            #[cfg(feature = "run-streaming")]
+            run_streaming_enabled: self.allow_run_streaming,
             #[cfg(feature = "dns-publish")]
             dynamic_dns_publish_enabled: self.allow_dynamic_dns_publish,
             #[cfg(feature = "dns-publish")]
