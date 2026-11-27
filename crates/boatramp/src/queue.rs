@@ -158,6 +158,18 @@ enum QueueCommand {
         #[arg(long)]
         alias: Option<String>,
     },
+    /// DESTRUCTIVELY purge an ungrouped work-queue topic — drop every live record + its payloads +
+    /// the ready marker. The recovery primitive for a work-queue topic with NO consumer (records
+    /// accumulate forever otherwise — there is no age-GC). Does NOT touch the dead-letter store (use
+    /// `dlq`) nor any consumer group's retained state. Needs `Site·Write` (site) / `Project·Admin`
+    /// (`--bus`).
+    Purge {
+        /// Consumer topic.
+        topic: String,
+        /// Background-alias scope (`{site}/{alias}`); omit for the live site.
+        #[arg(long)]
+        alias: Option<String>,
+    },
 }
 
 /// Serializable projection of a [`QueuePeekEntry`] for typed JSON output (the wire
@@ -243,6 +255,8 @@ pub enum QueueOutput {
         max_rate: Option<u32>,
         max_unflushed: Option<usize>,
     },
+    /// `queue purge` — an ungrouped work-queue topic was purged (`purged` records dropped).
+    Purged { topic: String, purged: usize },
 }
 
 impl crate::output::Rendered for QueueOutput {
@@ -283,6 +297,12 @@ impl crate::output::Rendered for QueueOutput {
                     fmt(*max_depth),
                     max_rate.map_or_else(|| "-".to_string(), |n| n.to_string()),
                     fmt(*max_unflushed),
+                )
+            }
+            Self::Purged { topic, purged } => {
+                writeln!(
+                    w,
+                    "purged {purged} record(s) from work-queue topic {topic:?}"
                 )
             }
         }
@@ -393,6 +413,14 @@ pub async fn run(args: QueueArgs, config: &ProjectConfig) -> Result<QueueOutput>
                 max_depth: *max_depth,
                 max_rate: *max_rate,
                 max_unflushed: *max_unflushed,
+            }
+        }
+        QueueCommand::Purge { topic, alias } => {
+            let scope = queue_scope(args.bus, &site, alias.as_deref())?;
+            let purged = cp.purge_work_queue(scope, topic).await?;
+            QueueOutput::Purged {
+                topic: topic.clone(),
+                purged,
             }
         }
     };

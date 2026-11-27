@@ -235,11 +235,11 @@ pub(crate) use operator::prometheus_metrics;
 pub(crate) use operator::{
     node_health, node_instance_stats, operator_bus_dlq, operator_bus_dlq_list,
     operator_bus_queue_group, operator_bus_queue_groups, operator_bus_queue_pause,
-    operator_bus_queue_peek, operator_bus_queue_policy, operator_bus_queue_replay, operator_dlq,
-    operator_dlq_list, operator_function_logs, operator_function_logs_stream,
-    operator_handler_stats, operator_logs, operator_logs_stream, operator_queue_group,
-    operator_queue_groups, operator_queue_pause, operator_queue_peek, operator_queue_policy,
-    operator_queue_replay,
+    operator_bus_queue_peek, operator_bus_queue_policy, operator_bus_queue_purge,
+    operator_bus_queue_replay, operator_dlq, operator_dlq_list, operator_function_logs,
+    operator_function_logs_stream, operator_handler_stats, operator_logs, operator_logs_stream,
+    operator_queue_group, operator_queue_groups, operator_queue_pause, operator_queue_peek,
+    operator_queue_policy, operator_queue_purge, operator_queue_replay,
 };
 // The external, authenticated project-bus CONSUMER surface (PLAN-messaging-consumer-delivery):
 // long-poll claim (increment a) + the shared ack/nack side-channel, mounted on the control-plane
@@ -6681,6 +6681,103 @@ mod tests {
         assert!(
             !orphaned.contains_key("default/bus/sync/acme/import"),
             "a topic WITH a matching {{tenant}} consumer does NOT raise the signal: {orphaned:?}"
+        );
+    }
+
+    /// **Gate — subscriber-aware orphaned signal.** The orphaned-ready detector must NOT false-flag a
+    /// bus work-queue topic that IS consumed, just not by a MANIFEST consumer: a durable registered
+    /// consumer GROUP (an external SSE/WS subscriber) or a WEBHOOK SINK (a host-run pseudo-consumer).
+    /// It must STILL flag a genuinely-uncovered topic. Purely diagnostic — the signal changes, never
+    /// delivery.
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orphaned_signal_is_subscriber_aware() {
+        use boatramp_core::config::WebhookSink;
+        use boatramp_core::messaging::StartPosition;
+        use boatramp_core::webhook_sink::WebhookSinkStore;
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let messaging: Arc<dyn Messaging> =
+            Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+        // A manifest consumer that covers ONLY `bus:sync/{tenant}/import` — none of the topics below.
+        let (rt, deploy) = setup_consumer_topic(
+            storage,
+            kv.clone(),
+            messaging.clone(),
+            "bus:sync/{tenant}/import",
+            "loader",
+            signer.clone(),
+        )
+        .await;
+        let inner = rt.inner.clone().unwrap();
+
+        // (1) Drained by a durable registered GROUP (an external SSE/WS subscriber): publish work,
+        // then register the group — backlog > 0, no manifest consumer, but a live group covers it.
+        messaging
+            .publish("default/bus/grouped-only", b"x")
+            .await
+            .unwrap();
+        assert!(
+            messaging
+                .claim_grouped(
+                    "default/bus/grouped-only",
+                    "ext-sub",
+                    StartPosition::Earliest,
+                    std::time::Duration::from_secs(30),
+                    10,
+                    5,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // (2) Drained by a WEBHOOK SINK (a host-run pseudo-consumer, never in `manifest.consumers`).
+        WebhookSinkStore::new(kv.clone())
+            .set(
+                "default",
+                &WebhookSink {
+                    name: "fulfillment".into(),
+                    topic: "webhook-drained".into(),
+                    group: String::new(),
+                    url_secret: "boatramp:url".into(),
+                    egress_allow: vec!["example.com:443".into()],
+                    sign_secret: "boatramp:sign".into(),
+                    lease_ms: None,
+                    max_attempts: None,
+                    backoff_ms: None,
+                    max_ack_pending: None,
+                },
+            )
+            .await
+            .unwrap();
+        messaging
+            .publish("default/bus/webhook-drained", b"y")
+            .await
+            .unwrap();
+
+        // (3) A truly-orphaned topic: claimable work, NO consumer of any kind.
+        messaging
+            .publish("default/bus/truly-orphaned", b"z")
+            .await
+            .unwrap();
+
+        run_ticks(&inner, &deploy, 1).await;
+        let orphaned = inner.metrics.orphaned_topics();
+
+        assert!(
+            orphaned.contains_key("default/bus/truly-orphaned"),
+            "a topic with NO consumer of any kind is still flagged: {orphaned:?}"
+        );
+        assert!(
+            !orphaned.contains_key("default/bus/grouped-only"),
+            "a topic with a live registered consumer group is NOT flagged: {orphaned:?}"
+        );
+        assert!(
+            !orphaned.contains_key("default/bus/webhook-drained"),
+            "a topic drained by a webhook sink is NOT flagged: {orphaned:?}"
         );
     }
 

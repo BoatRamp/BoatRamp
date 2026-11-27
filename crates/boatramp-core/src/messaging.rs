@@ -397,6 +397,27 @@ pub trait Messaging: Send + Sync {
         Ok(0)
     }
 
+    /// **Purge** the ungrouped WORK-QUEUE on `topic` — delete every live index record
+    /// (`mq/{topic}/{id}`), its payload (the object-store object, or release the SA1 inline budget for
+    /// an inlined one), AND the topic's ready-set marker. Returns the number of records purged. This
+    /// is the operator RECOVERY primitive for the one otherwise-unbounded backlog: an ungrouped
+    /// work-queue topic (competing-consumer, delete-on-ack) with NO consumer accumulates claimable
+    /// records forever (nothing ever claims⇒acks them, and there is no age-GC) — this is the only way
+    /// to reclaim that space. DESTRUCTIVE: a purged message is dropped, not delivered; the endpoints
+    /// gate it fail-closed (`Site·Write` / `Project·Admin`).
+    ///
+    /// Scoped to EXACTLY `topic`'s own work-queue (`mq/{topic}/` *direct* children — a subtopic
+    /// `mq/{topic}/{sub}/{id}` is a different topic and is left untouched, like every other per-topic
+    /// op). It deliberately does NOT touch the DEAD-LETTER store (`mqdead/…` — use
+    /// [`purge_dead_letters`](Self::purge_dead_letters) / [`discard_dead_letters`](Self::discard_dead_letters))
+    /// nor any GROUPED (fan-out) state (`mqgstate/…` / `mqglog/…` / `mqgp/…` — a grouped topic's
+    /// retained log is reclaimed by [`retention_sweep`](Self::retention_sweep) once every group has
+    /// passed it, never dropped out from under a live group). Default no-op (`0`) for a backend with
+    /// no work-queue index.
+    async fn purge_work_queue(&self, _topic: &str) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
     /// **Redrive** every dead-lettered message on `topic` back onto the live
     /// queue with a fresh attempt count, so consumers retry them (the payload was
     /// preserved at dead-letter time, so nothing is lost). For replaying messages
@@ -3304,6 +3325,63 @@ impl Messaging for LogMessaging {
                 .map_err(MessagingError::backend)?;
             purged += 1;
         }
+        Ok(purged)
+    }
+
+    async fn purge_work_queue(&self, topic: &str) -> Result<usize, MessagingError> {
+        let mut purged = 0;
+        // Work-queue index records (direct children only — a subtopic's queue is a different topic).
+        // Drop the payload then the record (payload-then-index, mirroring `ack`/`purge_dead_letters`):
+        // an inlined payload lived IN the record (no object to free) and its bytes are still charged
+        // to the SA1 aggregate-inline budget (release them, saturating so a post-restart purge of a
+        // pre-restart record can't underflow); a non-inlined one has an object-store payload to delete.
+        let prefix = meta_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &prefix) {
+                continue;
+            }
+            let id = &key[prefix.len()..];
+            let inline_len = self
+                .kv
+                .get(&key)
+                .await
+                .map_err(MessagingError::backend)?
+                .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
+                .and_then(|r| r.inline.map(|p| p.len()));
+            match inline_len {
+                Some(len) => {
+                    let _ = self.inline_inflight_bytes.try_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(len)),
+                    );
+                }
+                None => {
+                    self.storage
+                        .delete(&payload_key(topic, id))
+                        .await
+                        .map_err(MessagingError::backend)?;
+                }
+            }
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+            purged += 1;
+        }
+        // Drop the topic's ready-set marker: with every work-queue record gone there is no claimable
+        // work, so the marker is stale (a drainer probe would do one empty claim and prune it anyway —
+        // B5). The DLQ/grouped lanes keep their own keyspaces (never a ready marker). Best-effort: a
+        // left-behind marker only costs that one empty claim, never correctness.
+        self.kv
+            .delete(&ready_key(topic))
+            .await
+            .map_err(MessagingError::backend)?;
         Ok(purged)
     }
 
@@ -6468,6 +6546,112 @@ mod tests {
         assert!(
             storage.head(&payload_key("t", &id)).await.is_err(),
             "purge frees the dead-lettered payload"
+        );
+    }
+
+    // The operator work-queue RECOVERY primitive: `purge_work_queue` drops every live work-queue
+    // record, its payload (inline-budget release OR object-store delete), and the ready marker — the
+    // only way to reclaim an ungrouped work-queue topic that has no consumer.
+    #[tokio::test]
+    async fn purge_work_queue_deletes_records_payloads_and_marker() {
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage.clone(), kv.clone());
+
+        // One small (inlined into the record) + one large (object-store payload) work-queue message,
+        // never claimed — the immortal-backlog shape (a producer with no consumer).
+        mq.publish("t", b"small").await.unwrap();
+        let big = vec![7u8; INLINE_MAX + 1];
+        mq.publish("t", &big).await.unwrap();
+        assert_eq!(mq.backlog("t").await.unwrap(), 2);
+        assert!(
+            kv.get(&ready_key("t")).await.unwrap().is_some(),
+            "publish armed the ready marker"
+        );
+        assert_eq!(
+            storage.list("mqp/t/").await.unwrap().len(),
+            1,
+            "only the large (non-inline) payload lives in object storage"
+        );
+
+        let purged = mq.purge_work_queue("t").await.unwrap();
+        assert_eq!(purged, 2);
+        assert_eq!(mq.backlog("t").await.unwrap(), 0, "records purged");
+        assert!(
+            kv.get(&ready_key("t")).await.unwrap().is_none(),
+            "the ready marker was dropped"
+        );
+        assert!(
+            storage.list("mqp/t/").await.unwrap().is_empty(),
+            "the object-store payload was reclaimed"
+        );
+        // The inline budget was released, so a fresh small publish inlines again.
+        mq.publish("t", b"again").await.unwrap();
+        let got = mq.claim("t", LEASE, 10, 5).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].inline, "inline budget released by the purge");
+    }
+
+    // `purge_work_queue` is scoped to EXACTLY the work-queue lane: it leaves the DEAD-LETTER store and
+    // every GROUPED (fan-out) state — group registration, retained log, retained payloads — intact.
+    #[tokio::test]
+    async fn purge_work_queue_leaves_dlq_and_grouped_state_intact() {
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage.clone(), kv.clone());
+
+        // Register a consumer group FIRST, so subsequent publishes retain the fan-out log/payload
+        // ALONGSIDE the work-queue record (a grouped topic carries BOTH lanes).
+        assert!(
+            mq.claim_grouped("t", "g", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for _ in 0..3 {
+            mq.publish("t", b"x").await.unwrap();
+        }
+        // Land one message in the work-queue DLQ (terminal quarantine of a claimed message).
+        let claimed = mq.claim("t", LEASE, 1, 5).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        let dead_id = claimed[0].id.clone();
+        mq.dead_letter(&claimed[0], "boom").await.unwrap();
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
+        // Two live work-queue records remain (the un-claimed ones); 3 grouped log entries + payloads.
+        assert_eq!(mq.backlog("t").await.unwrap(), 2);
+        assert_eq!(storage.list("mqgp/t/").await.unwrap().len(), 3);
+
+        let purged = mq.purge_work_queue("t").await.unwrap();
+        assert_eq!(purged, 2, "only the two LIVE work-queue records are purged");
+
+        // Work-queue lane cleared…
+        assert_eq!(mq.backlog("t").await.unwrap(), 0);
+        assert!(kv.get(&ready_key("t")).await.unwrap().is_none());
+        // …but the DLQ survives (record + its preserved payload, still redrivable)…
+        assert_eq!(
+            mq.dead_letter_count("t").await.unwrap(),
+            1,
+            "the dead-letter store is untouched by a work-queue purge"
+        );
+        assert!(
+            storage.head(&payload_key("t", &dead_id)).await.is_ok(),
+            "the dead-lettered message's payload is preserved"
+        );
+        // …and so does every grouped (fan-out) lane.
+        assert_eq!(
+            mq.list_groups("t").await.unwrap().len(),
+            1,
+            "the registered consumer group is untouched"
+        );
+        assert_eq!(
+            kv.list_prefix(&glog_prefix("t")).await.unwrap().len(),
+            3,
+            "the grouped retained log is untouched"
+        );
+        assert_eq!(
+            storage.list("mqgp/t/").await.unwrap().len(),
+            3,
+            "the grouped retained payloads are untouched"
         );
     }
 

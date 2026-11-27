@@ -1040,6 +1040,64 @@ async fn queue_policy_core(
     }
 }
 
+/// `POST …/_boatramp/queue/purge` request: purge an ungrouped WORK-QUEUE topic (recovery primitive).
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct QueuePurgeRequest {
+    topic: String,
+    #[serde(default)]
+    alias: Option<String>,
+}
+
+/// `POST …/_boatramp/queue/purge` response: the number of work-queue records dropped.
+#[cfg(feature = "handlers")]
+#[derive(Serialize)]
+struct QueuePurgeResponse {
+    ok: bool,
+    /// How many live work-queue index records (`mq/{topic}/{id}`) were deleted.
+    purged: usize,
+}
+
+/// Operator work-queue RECOVERY (`POST …/_boatramp/queue/purge`, write → `Site·Write`): DESTRUCTIVELY
+/// drop every live record on an ungrouped work-queue topic + its payloads + the ready marker — the
+/// only way to reclaim the otherwise-unbounded backlog of a work-queue topic that has NO consumer
+/// (nothing claims⇒acks it, and there is no age-GC). Site-scoped so an operator only ever purges
+/// their own site's queues. Does NOT touch the dead-letter store (that is `dlq`) nor any grouped
+/// (fan-out) state. Gated `Site·Write` by the `_boatramp` + `queue` POST arm of
+/// [`authz::Right::required`](boatramp_types::authz::Right::required) — the SAME right as pause/policy.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_queue_purge(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    Path(site): Path<String>,
+    Json(req): Json<QueuePurgeRequest>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = dlq_namespace(&project, &site, &req.alias, &req.topic);
+    queue_purge_core(messaging.as_ref(), &namespaced).await
+}
+
+/// Shared inner logic of the work-queue purge MUTATION, over an already-namespaced topic — so the
+/// site (`{site}/{topic}`) and project-bus (`{project}/bus/{topic}`) endpoints share one
+/// implementation and one typed response shape.
+#[cfg(feature = "handlers")]
+async fn queue_purge_core(
+    messaging: &dyn boatramp_core::messaging::Messaging,
+    namespaced: &str,
+) -> Response {
+    match messaging.purge_work_queue(namespaced).await {
+        Ok(purged) => Json(QueuePurgeResponse { ok: true, purged }).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("work-queue purge failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Which group-lifecycle mutation `POST …/_boatramp/queue/group` runs.
 #[cfg(feature = "handlers")]
 #[derive(Deserialize)]
@@ -1421,6 +1479,33 @@ pub(super) async fn operator_bus_queue_policy(
         max_unflushed: req.max_unflushed,
     };
     queue_policy_core(messaging.as_ref(), &namespaced, &site_req).await
+}
+
+/// `POST …/bus/queue/purge` request on the project bus (no `alias` — the bus has no per-deployment
+/// scope).
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct BusQueuePurgeRequest {
+    topic: String,
+}
+
+/// Project-bus work-queue RECOVERY (`POST …/bus/queue/purge`, write → `Project·Admin`): DESTRUCTIVELY
+/// purge an ungrouped bus work-queue topic for the SHARED project bus. Gated at `Project·Admin` (the
+/// `_boatramp` project arm) — stronger than the per-site surface's `Site·Write`, because the bus is a
+/// project-wide shared resource one operator's purge affects across every site. Never satisfied by a
+/// `project_publisher`.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_bus_queue_purge(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    Json(req): Json<BusQueuePurgeRequest>,
+) -> Response {
+    let messaging = match messaging_or_unavailable(&handlers) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let namespaced = bus_namespace(&project.as_ref(), &req.topic);
+    queue_purge_core(messaging.as_ref(), &namespaced).await
 }
 
 /// `POST …/bus/queue/group` request on the project bus.

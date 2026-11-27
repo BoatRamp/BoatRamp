@@ -3383,6 +3383,17 @@ Set a per-topic operator flow-control policy (v0.4.24). Omit a flag to leave tha
 | `--max-unflushed <MAX_UNFLUSHED>` | — | — | — | Per-topic relaxed-durability budget override (single-node only). Omit = node default |
 | `--alias <ALIAS>` | — | — | — | Background-alias scope (`{site}/{alias}`); omit for the live site |
 
+### `boatramp queue purge`
+
+DESTRUCTIVELY purge an ungrouped work-queue topic — drop every live record + its payloads + the ready marker. The recovery primitive for a work-queue topic with NO consumer (records accumulate forever otherwise — there is no age-GC). Does NOT touch the dead-letter store (use `dlq`) nor any consumer group's retained state. Needs `Site·Write` (site) / `Project·Admin` (`--bus`)
+
+**Usage:** `boatramp queue purge [OPTIONS] <TOPIC>`
+
+| Argument | Env | Default | Values | Description |
+| --- | --- | --- | --- | --- |
+| `<TOPIC>` | — | — | — | Consumer topic |
+| `--alias <ALIAS>` | — | — | — | Background-alias scope (`{site}/{alias}`); omit for the live site |
+
 ## `boatramp prune`
 
 Delete orphan deployments and unreferenced blobs (--dry-run to only report)

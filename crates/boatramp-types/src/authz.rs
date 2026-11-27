@@ -2513,6 +2513,8 @@ mod tests {
             ("POST", "/api/projects/acme/_boatramp/bus/queue/pause"),
             // v0.4.24 per-topic operator policy on the shared project bus.
             ("POST", "/api/projects/acme/_boatramp/bus/queue/policy"),
+            // The DESTRUCTIVE work-queue RECOVERY purge on the shared project bus.
+            ("POST", "/api/projects/acme/_boatramp/bus/queue/purge"),
         ];
         for (method, path) in writes {
             assert_eq!(
@@ -2521,13 +2523,17 @@ mod tests {
                 "{method} {path} must be Project·Admin"
             );
         }
-        // The per-SITE policy POST grades at Site·Write (the same `_boatramp/queue/*` write arm as
-        // pause/group), not Project·Admin — verified via the site-scoped path.
-        assert_eq!(
-            Right::required("POST", "/api/sites/blog/_boatramp/queue/policy"),
-            Right::required("POST", "/api/sites/blog/_boatramp/queue/pause"),
-            "site queue/policy grades identically to queue/pause (Site·Write)"
-        );
+        // The per-SITE policy/purge POSTs grade at Site·Write (the same `_boatramp/queue/*` write arm
+        // as pause/group), not Project·Admin — verified via the site-scoped paths. A destructive
+        // work-queue purge on a site is `Site·Write`, never a silent `None` nor the deny-safe default.
+        let site_write = Right::new(Resource::Site, Some("default/blog".into()), Action::Write);
+        for op in ["policy", "pause", "purge"] {
+            assert_eq!(
+                Right::required("POST", &format!("/api/sites/blog/_boatramp/queue/{op}")),
+                Some(site_write.clone()),
+                "site queue/{op} must grade Site·Write"
+            );
+        }
 
         // The destructive project-bus POST needs `Project·Admin`: a `project_admin`
         // token on the SAME project satisfies it; a `project_publisher` (deploy-grade)
@@ -2571,6 +2577,33 @@ mod tests {
         // A node admin (global) satisfies both, as for every project resource.
         let node_admin = policy.rights_for(&[GrantedRole::global("admin")]);
         assert!(node_admin.allows(&purge) && node_admin.allows(&peek));
+
+        // Fail-closed, specifically on the DESTRUCTIVE work-queue purge endpoints (both scopes): a
+        // project_publisher/viewer and a cross-project admin are refused; only the project's own admin
+        // (or node admin) may purge. The bus purge is a Project·Admin right (proven in `writes`
+        // above); confirm the role semantics directly on its path too.
+        let bus_purge = Right::required("POST", "/api/projects/acme/_boatramp/bus/queue/purge")
+            .expect("bus queue/purge is gated");
+        assert!(
+            policy
+                .rights_for(&[GrantedRole::scoped("project_admin", "acme")])
+                .allows(&bus_purge),
+            "project_admin:acme may purge its own bus work-queue"
+        );
+        for role in ["project_publisher", "project_viewer"] {
+            assert!(
+                !policy
+                    .rights_for(&[GrantedRole::scoped(role, "acme")])
+                    .allows(&bus_purge),
+                "{role}:acme must NOT purge the shared bus work-queue"
+            );
+            assert!(
+                !policy
+                    .rights_for(&[GrantedRole::scoped(role, "globex")])
+                    .allows(&bus_purge),
+                "{role}:globex must be refused on acme's bus purge (cross-project)"
+            );
+        }
     }
 
     /// The external RUN door's authz mapping (PLAN-run-streaming P2): START gates with the project
