@@ -1848,12 +1848,17 @@ pub(super) fn handler_error_response(err: &boatramp_handlers::HandlerError) -> R
             StatusCode::INTERNAL_SERVER_ERROR,
             "handler failed to compile\n",
         ),
-        // `ConsumerError` is produced only on the consumer/async lane (never here on the sync HTTP
-        // path), but the match must be exhaustive: a clean guest error is still a 500-class outcome.
+        // `ConsumerError` / `CommitFailed` are produced only on the consumer/async (and session/tcp)
+        // lanes, never here on the sync HTTP path, but the match must be exhaustive: a clean guest
+        // error or a lost-commit is still a 500-class outcome.
         HandlerError::Trap(_)
         | HandlerError::ConsumerError(_)
+        | HandlerError::CommitFailed(_)
         | HandlerError::NoResponse
         | HandlerError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "handler error\n"),
+        // `HandlerError` is `#[non_exhaustive]`: a future variant we do not yet handle maps to the
+        // same 500-class generic error — never a success status.
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "handler error\n"),
     };
     (status, body).into_response()
 }

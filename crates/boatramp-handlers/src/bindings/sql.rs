@@ -351,13 +351,60 @@ impl SqlSession {
 
     /// Close every open transaction: `commit` if `commit`, else `rollback`.
     /// Independent per database; a no-op for databases that were never used.
-    pub async fn finalize(&mut self, commit: bool) {
-        for (_name, txn) in std::mem::take(&mut self.txns) {
-            let _ = if commit {
+    ///
+    /// The per-transaction commit/rollback outcome is **never swallowed**: every failure is logged
+    /// at `ERROR` with the database name and whether it was a commit or a rollback, and the FIRST
+    /// failure is RETURNED so the caller can act on it (all transactions are still finalized — one
+    /// failure never leaves a sibling transaction dangling). A failed **commit** (`commit == true`)
+    /// means the invocation's SQL writes were **LOST**: the caller MUST turn it into a failed
+    /// invocation — a consumer NACKs / redelivers (eventually dead-letters), a session / tcp handler
+    /// fails, the world lane returns [`HandlerError::CommitFailed`]; only the `wasi:http` lane cannot
+    /// (its response head is already produced via the out-param — it logs + meters instead). A failed
+    /// **rollback** (`commit == false`) is logged for the operator, but the invocation is already
+    /// failing, so there is nothing further to decide.
+    ///
+    /// [`HandlerError::CommitFailed`]: crate::HandlerError::CommitFailed
+    ///
+    /// ## Commit CONDITION divergence across lanes (by design)
+    ///
+    /// The *condition* under which this is called with `commit == true` differs by dispatch lane,
+    /// and the difference is deliberate — a guest author must know it:
+    ///
+    /// * A **`wasi:http`** handler has no application-level outcome channel (it just produces a
+    ///   response), so its SQL **commits whenever the guest does not trap** — a handler that
+    ///   returns a `500` (or any status) still commits its writes. To abort, trap.
+    /// * A **messaging consumer** (and the session / tcp-connection handlers) returns
+    ///   `result<_, error>`, so its SQL **commits only when `handle` returns `ok`**. Returning a
+    ///   non-`ok` result (or trapping) **rolls back every SQL write and redelivers** the message.
+    ///
+    /// This is by-design-correct (a consumer's error IS its transaction-abort signal; an http
+    /// handler has none) but surprising, so it is also called out in the handler `sql` guide.
+    pub async fn finalize(&mut self, commit: bool) -> Result<(), SqlError> {
+        let mut first_error: Option<SqlError> = None;
+        for ((name, _read_only), txn) in std::mem::take(&mut self.txns) {
+            let result = if commit {
                 txn.commit().await
             } else {
                 txn.rollback().await
             };
+            if let Err(err) = result {
+                // NEVER swallowed: a failed commit is LOST data; a failed rollback is data that may
+                // wrongly persist. Both are surfaced to the operator at ERROR with full context, and
+                // the first is returned so the lane dispatcher can fail the invocation.
+                tracing::error!(
+                    database = %name,
+                    operation = if commit { "commit" } else { "rollback" },
+                    %err,
+                    "sql transaction finalize failed",
+                );
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 }
@@ -816,7 +863,7 @@ mod tests {
                 sql_types::Value::Integer(42)
             ));
         }
-        session.finalize(true).await;
+        let _ = session.finalize(true).await;
 
         let log = log.lock().unwrap();
         assert_eq!(log[0], "db:begin");
@@ -843,7 +890,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        session.finalize(true).await;
+        let _ = session.finalize(true).await;
 
         let log = log.lock().unwrap();
         // Each database opened its own transaction and committed independently.
@@ -873,7 +920,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        session.finalize(false).await;
+        let _ = session.finalize(false).await;
         assert_eq!(log.lock().unwrap().last().unwrap(), "db:rollback");
     }
 
@@ -882,7 +929,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut session = session(&[("", "db", log.clone())]);
         // Never opened/queried.
-        session.finalize(true).await;
+        let _ = session.finalize(true).await;
         assert!(log.lock().unwrap().is_empty());
     }
 
@@ -916,7 +963,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        session.finalize(true).await;
+        let _ = session.finalize(true).await;
 
         let log = log.lock().unwrap();
         assert!(
@@ -1997,5 +2044,127 @@ mod tests {
             log.lock().unwrap().is_empty(),
             "the write never reached the backend"
         );
+    }
+
+    // ---- finalize never swallows the commit/rollback outcome (data-integrity hardening) ----------
+
+    /// A backend whose transaction FAILS to commit and/or roll back (configurable), recording that it
+    /// was asked — so `finalize` returning the error, rather than discarding it, is observable.
+    struct FlakyBackend {
+        fail_commit: bool,
+        fail_rollback: bool,
+        asked: Log,
+    }
+    struct FlakyTxn {
+        fail_commit: bool,
+        fail_rollback: bool,
+        asked: Log,
+    }
+
+    #[async_trait]
+    impl SqlBackend for FlakyBackend {
+        async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+            Ok(Box::new(FlakyTxn {
+                fail_commit: self.fail_commit,
+                fail_rollback: self.fail_rollback,
+                asked: self.asked.clone(),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl SqlTransaction for FlakyTxn {
+        async fn query(&mut self, _sql: &str, _p: &[SqlValue]) -> Result<SqlRows, SqlError> {
+            Ok(SqlRows {
+                columns: vec![],
+                rows: vec![],
+            })
+        }
+        async fn execute(&mut self, _sql: &str, _p: &[SqlValue]) -> Result<u64, SqlError> {
+            Ok(1)
+        }
+        async fn commit(self: Box<Self>) -> Result<(), SqlError> {
+            self.asked.lock().unwrap().push("commit".into());
+            if self.fail_commit {
+                Err(SqlError::Other("commit exploded".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn rollback(self: Box<Self>) -> Result<(), SqlError> {
+            self.asked.lock().unwrap().push("rollback".into());
+            if self.fail_rollback {
+                Err(SqlError::Other("rollback exploded".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Open one read-write transaction on a `FlakyBackend`, so a subsequent `finalize` has work.
+    async fn flaky_session_with_open_txn(
+        fail_commit: bool,
+        fail_rollback: bool,
+    ) -> (SqlSession, Log) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let backend: Arc<dyn SqlBackend> = Arc::new(FlakyBackend {
+            fail_commit,
+            fail_rollback,
+            asked: asked.clone(),
+        });
+        let mut session = SqlSession::for_backends(HashMap::from([(String::new(), backend)]));
+        session
+            .begin_for_test("")
+            .await
+            .expect("the transaction opens");
+        (session, asked)
+    }
+
+    #[tokio::test]
+    async fn finalize_returns_a_failed_commit_instead_of_swallowing_it() {
+        // Reproduce-first: a COMMIT that errors must NOT be discarded (the latent silent data loss).
+        let (mut session, asked) = flaky_session_with_open_txn(true, false).await;
+        let outcome = session.finalize(true).await;
+        assert!(
+            matches!(outcome, Err(SqlError::Other(ref m)) if m == "commit exploded"),
+            "a failed commit is surfaced, not swallowed: {outcome:?}"
+        );
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            ["commit"],
+            "commit attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_returns_a_failed_rollback_instead_of_swallowing_it() {
+        let (mut session, asked) = flaky_session_with_open_txn(false, true).await;
+        let outcome = session.finalize(false).await;
+        assert!(
+            matches!(outcome, Err(SqlError::Other(ref m)) if m == "rollback exploded"),
+            "a failed rollback is surfaced, not swallowed: {outcome:?}"
+        );
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            ["rollback"],
+            "rollback attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_is_ok_on_a_clean_commit() {
+        let (mut session, _asked) = flaky_session_with_open_txn(false, false).await;
+        assert!(
+            session.finalize(true).await.is_ok(),
+            "a clean commit returns Ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_is_ok_with_no_open_transactions() {
+        // The common no-SQL invocation: finalize is a trivial Ok (never a spurious error).
+        let mut session = SqlSession::for_backends(HashMap::new());
+        assert!(session.finalize(true).await.is_ok());
+        assert!(session.finalize(false).await.is_ok());
     }
 }

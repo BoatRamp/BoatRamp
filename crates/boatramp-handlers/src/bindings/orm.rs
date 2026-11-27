@@ -1232,7 +1232,7 @@ mod tests {
             };
             host.update(Resource::new_own(rep), upd).await.unwrap();
         }
-        sess.finalize(true).await;
+        let _ = sess.finalize(true).await;
 
         let log = log.lock().unwrap();
         assert_eq!(log[0], "begin");
@@ -1588,7 +1588,7 @@ mod tests {
             };
             assert_eq!(host.delete(db, del).await.unwrap(), 1);
         }
-        sess.finalize(true).await;
+        let _ = sess.finalize(true).await;
         let log = log.lock().unwrap();
         assert!(
             log.iter()
@@ -1617,7 +1617,7 @@ mod tests {
             let res = host.delete_returning(db, del).await.unwrap();
             assert_eq!(res.columns, vec!["id".to_string()]); // fake backend's canned rows
         }
-        sess.finalize(true).await;
+        let _ = sess.finalize(true).await;
         let log = log.lock().unwrap();
         assert!(log.iter().any(|l| {
             l.starts_with("query|DELETE FROM pending_signup WHERE slug = ?1 RETURNING slug|")
@@ -1650,7 +1650,7 @@ mod tests {
             };
             let _ = host.select(db, sel).await.unwrap();
         }
-        sess.finalize(true).await;
+        let _ = sess.finalize(true).await;
         assert!(log.lock().unwrap().iter().any(|l| {
             l.starts_with("query|SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t|")
         }));
@@ -1695,7 +1695,7 @@ mod tests {
             };
             host.select(db, sel).await.unwrap();
         }
-        sess.finalize(true).await;
+        let _ = sess.finalize(true).await;
         assert!(log.lock().unwrap().iter().any(|l| l.starts_with(
             "query|SELECT slug FROM pending_signup WHERE slug = ?1 UNION SELECT slug FROM reserved WHERE slug = ?2|"
         )));
@@ -1741,7 +1741,7 @@ mod tests {
             };
             assert_eq!(host.insert(db, ins).await.unwrap(), 1);
         }
-        sess.finalize(true).await;
+        let _ = sess.finalize(true).await;
         assert!(log.lock().unwrap().iter().any(|l| {
             l.starts_with("execute|INSERT INTO ref (a) SELECT x FROM src WHERE id = ?1|")
         }));

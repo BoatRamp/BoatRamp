@@ -933,3 +933,85 @@ async fn warm_floor_pins_against_capacity_pressure() {
         "exactly the churn component compiled; the pinned one never cold-started"
     );
 }
+
+/// The HTTP lane's post-response commit-failure path: a handler writes a row and responds `200`,
+/// but the COMMIT then fails. The lane cannot un-send the `200` (its response head is produced via
+/// the out-param before finalize — the documented known limitation), but it must NOT swallow the
+/// lost write: `finalize` logs it at ERROR and the per-component `commit_failed` data-integrity
+/// metric fires, so an operator can alert on silent lost writes.
+#[cfg(feature = "sql")]
+mod sql_commit_failure {
+    use super::*;
+    use async_trait::async_trait;
+    use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
+
+    /// The `examples/handlers/sql-counter` guest: opens the default db, inserts a row, and returns
+    /// the running count as `200`. Prebuilt + committed so this runs without a wasm toolchain.
+    const SQL_COUNTER: &[u8] = include_bytes!("fixtures/sql-counter.wasm");
+
+    /// A SQL backend that serves the counter guest normally (so it responds `200`) but whose
+    /// transaction FAILS to commit — modelling a backend that drops/errors at commit time.
+    struct FailingCommitBackend;
+    struct FailingCommitTx;
+
+    #[async_trait]
+    impl SqlBackend for FailingCommitBackend {
+        async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+            Ok(Box::new(FailingCommitTx))
+        }
+    }
+    #[async_trait]
+    impl SqlTransaction for FailingCommitTx {
+        async fn query(&mut self, _sql: &str, _p: &[SqlValue]) -> Result<SqlRows, SqlError> {
+            // The guest's `SELECT count(*)` — one integer cell, so the handler responds 200.
+            Ok(SqlRows {
+                columns: vec!["count".into()],
+                rows: vec![vec![SqlValue::Integer(1)]],
+            })
+        }
+        async fn execute(&mut self, _sql: &str, _p: &[SqlValue]) -> Result<u64, SqlError> {
+            Ok(1)
+        }
+        async fn commit(self: Box<Self>) -> Result<(), SqlError> {
+            Err(SqlError::Other("commit exploded".into()))
+        }
+        async fn rollback(self: Box<Self>) -> Result<(), SqlError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_lane_meters_a_post_response_commit_failure() {
+        let engine = engine();
+        let hash = "sql-counter-commitfail";
+        let backend: Arc<dyn SqlBackend> = Arc::new(FailingCommitBackend);
+        let granted = Bindings::new("blog").with_sql("", backend);
+        let response = engine
+            .serve(hash, SQL_COUNTER, request(), granted)
+            .await
+            .expect("the handler serves a response");
+        // The response head is already produced (the known limitation): the handler returned 200.
+        assert_eq!(response.status(), 200);
+        // Drain the body so the detached drive task completes `call_handle` and runs its finalize.
+        let _ = response.into_body().collect().await;
+        // The finalize runs on the detached drive task; poll the metric until it lands.
+        let mut failures = 0;
+        for _ in 0..200 {
+            failures = engine
+                .instance_stats()
+                .component_stats
+                .iter()
+                .find(|c| c.hash == hash)
+                .map(|c| c.commit_failed)
+                .unwrap_or(0);
+            if failures > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            failures, 1,
+            "the lost commit is recorded on the component's commit_failed metric"
+        );
+    }
+}

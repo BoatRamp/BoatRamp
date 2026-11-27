@@ -195,6 +195,13 @@ pub struct ComponentLive {
     /// count — together with `in_flight` and, for messaging, the per-topic outstanding — IS the
     /// "queue depth" signal (there is no classic waiters gauge to report).
     overloaded: AtomicU64,
+    /// Lifetime per-invocation SQL **commit failures** for this component — a transaction we
+    /// intended to COMMIT (the guest returned cleanly) failed at commit, so the invocation's writes
+    /// were LOST. A data-integrity signal: every nonzero count is a lost write an operator must
+    /// investigate. A consumer delivery NACKs / redelivers on it; an http `200` may already be on the
+    /// wire when it happens (the known post-response-commit limitation), so this counter is the
+    /// authoritative alert for that silent case.
+    commit_failed: AtomicU64,
 }
 
 /// An RAII in-flight guard: increments the component's `in_flight` on creation (see
@@ -259,6 +266,15 @@ impl InstanceStats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a per-invocation SQL **commit failure** for `hash` — a transaction we intended to
+    /// commit (a clean invocation) failed at commit, so its writes were LOST. A data-integrity
+    /// signal (lost writes), surfaced per component on the admin stats snapshot.
+    pub fn record_commit_failed(&self, hash: &str) {
+        self.component(hash)
+            .commit_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot the per-component live state, sorted by hash for a deterministic payload.
     fn component_stats(&self) -> Vec<ComponentStat> {
         let map = self.components.lock().unwrap();
@@ -269,6 +285,7 @@ impl InstanceStats {
                 in_flight: c.in_flight.load(Ordering::Relaxed).max(0) as u64,
                 resident_bytes: c.resident_bytes.load(Ordering::Relaxed),
                 overloaded: c.overloaded.load(Ordering::Relaxed),
+                commit_failed: c.commit_failed.load(Ordering::Relaxed),
             })
             .collect();
         out.sort_by(|a, b| a.hash.cmp(&b.hash));
@@ -309,6 +326,11 @@ pub struct ComponentStat {
     pub resident_bytes: u64,
     /// Lifetime admission rejections (a 503 `Overloaded` — the lane was at its concurrency ceiling).
     pub overloaded: u64,
+    /// Lifetime per-invocation SQL commit failures (lost writes) — a transaction we intended to
+    /// commit failed at commit. Every nonzero count is a data-integrity incident to investigate.
+    /// Additive field: defaulted when absent so an older snapshot still deserializes.
+    #[serde(default)]
+    pub commit_failed: u64,
 }
 
 /// Read-only lifecycle snapshot for one lane (serde: the admin stats API / CLI shape).
@@ -512,6 +534,7 @@ mod tests {
         stats.record_resident_bytes("abc", 4096);
         stats.record_overloaded("abc");
         stats.record_overloaded("abc");
+        stats.record_commit_failed("abc");
         {
             let _g1 = stats.enter_component("abc");
             let _g2 = stats.enter_component("abc");
@@ -524,6 +547,10 @@ mod tests {
             assert_eq!(c.in_flight, 2, "two in-flight guards held");
             assert_eq!(c.resident_bytes, 4096);
             assert_eq!(c.overloaded, 2);
+            assert_eq!(
+                c.commit_failed, 1,
+                "one recorded commit failure (lost write)"
+            );
             // The per-lane warm_components field is untouched (console back-compat).
             assert!(snap.request.warm_components.is_empty());
         }

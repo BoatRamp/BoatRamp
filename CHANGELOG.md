@@ -199,6 +199,39 @@ versions.
   run that re-reclaims via the terminal arm only after the ~24 h terminal-retention window, not on the
   next tick.
 
+### Security
+
+- **Data-integrity hardening: a failing SQL commit is no longer swallowed (silent lost writes).**
+  `SqlSession::finalize` closed each per-invocation transaction with `let _ = txn.commit()…` — a
+  COMMIT that errored was discarded with no log and no surfaced error, so an invocation could be
+  acked-as-done (a messaging **consumer**) or `200`'d (a `wasi:http` handler) while its SQL writes
+  were LOST at commit. `finalize` now returns the commit/rollback outcome and **never swallows it**:
+  every failure is logged at `ERROR` with the database name and whether it was a commit or a
+  rollback, and a failed COMMIT on a clean invocation is turned into a real failure:
+  - **Consumer / session / tcp-connection lanes** — a commit that fails after a clean `handle`
+    becomes a new `HandlerError::CommitFailed`, so the consumer drain **NACKs / redelivers** (and
+    eventually dead-letters, `last_error = commit-failed`) instead of acking the lost write. The
+    consumer's instantiation-error early return now also explicitly rolls back (symmetry with the
+    post-call path).
+  - **`wasi:http` lane** — the response head is produced via the out-param before finalize and
+    cannot be un-sent, so a post-response commit failure is logged **and metered** on a new
+    per-component `commit_failed` stat (the alertable signal for a silent lost write); documented as
+    a known limitation — keep commit-critical work on the consumer path.
+  - **New `commit_failed` per-component counter** on the admin instance-stats snapshot (every
+    nonzero value is a lost write to investigate).
+  - The by-design commit-condition divergence (an http handler commits unless it traps; a
+    consumer/session/tcp handler commits only on an `ok` return, else rolls back and redelivers) is
+    now documented in the `sql` handler guide and the `finalize` binding doc.
+  - `HandlerError` is now sealed **`#[non_exhaustive]`**. The same cut adds the `CommitFailed(String)`
+    variant, so this is the one breaking event; the seal lands with it so every *future* variant is
+    additive (per the non-exhaustive-public-struct policy). Downstream (cross-crate) exhaustive matches
+    must carry a wildcard `_ =>` arm mapping an unknown variant to a safe 500-class / generic-error
+    outcome (never a silent success); in-crate matches are unaffected.
+  - **Breaking (`boatramp-handlers` published crate → uchron / luigi):** both the new
+    `HandlerError::CommitFailed(String)` variant **and** the `#[non_exhaustive]` seal break any
+    downstream exhaustive `match` on `HandlerError` — such a match must add a wildcard `_ =>` arm
+    (which also absorbs every future variant). Relay to uchron / luigi before they bump.
+
 ## [0.75.0] — 2026-11-26
 
 ### Added
