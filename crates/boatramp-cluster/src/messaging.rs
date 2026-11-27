@@ -1779,10 +1779,11 @@ impl Messaging for RaftMessaging {
     async fn purge_topic(&self, topic: &str) -> Result<(), MessagingError> {
         // Complete, REPLICATED reclaim of every durable key of `topic` (see the trait doc). Mirrors
         // `retention_sweep`'s cluster shape: the leader computes the exact delete set from its applied
-        // state and proposes EXPLICIT deletes (version-independent — a mixed-version replica applies
-        // the identical set), then frees the `Storage` payloads client-side (consensus never touches
-        // Storage). Idempotent (a repeated purge is a no-op batch). Unconditional: the caller has
-        // decided the whole topic (e.g. a terminal/abandoned run) is reclaimable.
+        // state, FREES the `Storage` payloads client-side FIRST (consensus never touches Storage — see
+        // the LOW-1 ordering note at the free loops below), then proposes EXPLICIT index deletes
+        // (version-independent — a mixed-version replica applies the identical set). Idempotent (a
+        // repeated purge is a no-op batch + idempotent `Storage::delete`s). Unconditional: the caller
+        // has decided the whole topic (e.g. a terminal/abandoned run) is reclaimable.
         //
         // BOUNDED BATCHES (Security MEDIUM-1): a maxed run has up to ~4×RUN_MAX_EVENTS keys, so a
         // single `WriteOp::Batch` of the whole set would be one enormous Raft entry that stalls the
@@ -1845,14 +1846,15 @@ impl Messaging for RaftMessaging {
         ] {
             deletes.push(WriteOp::Delete { key });
         }
-        // Propose the deletes as BOUNDED batches (never one ~400k-op entry) — each a replicated apply.
-        for batch in deletes.chunks(PURGE_MAX_BATCH) {
-            if batch.is_empty() {
-                continue;
-            }
-            self.propose(WriteOp::Batch(batch.to_vec())).await?;
-        }
-        // Free the object-store payloads (work-queue non-inlined + retained grouped), client-side.
+        // LOW-1 (cluster payload-orphan) — free the object-store payloads (work-queue non-inlined +
+        // retained grouped) BEFORE proposing the index deletes, mirroring the single-node inline free
+        // (each record's payload is freed before its index key is removed). The ids were collected from
+        // the pre-delete scan above, so a FAILED propose partway through can never orphan a payload
+        // PERMANENTLY: the payloads are already gone (an idempotent `Storage::delete`), and any index
+        // keys left by an interrupted propose are re-enumerated + re-freed + re-proposed by the next
+        // sweep (the caller deletes the run-state record only AFTER this returns Ok). Doing it the
+        // other way round — index deletes first — would strand the payloads of every already-committed
+        // batch: their ids vanish from the index, so no later sweep could ever find them to free them.
         for id in &wq_ids {
             self.storage
                 .delete(&messaging::payload_key(topic, id))
@@ -1864,6 +1866,14 @@ impl Messaging for RaftMessaging {
                 .delete(&messaging::gpayload_key(topic, id))
                 .await
                 .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
+        // Propose the INDEX deletes as BOUNDED batches (never one ~400k-op entry) — each a replicated
+        // apply. The payloads above are already freed, so this only removes the now-dangling index.
+        for batch in deletes.chunks(PURGE_MAX_BATCH) {
+            if batch.is_empty() {
+                continue;
+            }
+            self.propose(WriteOp::Batch(batch.to_vec())).await?;
         }
         Ok(())
     }

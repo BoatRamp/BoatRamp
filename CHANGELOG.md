@@ -124,7 +124,10 @@ versions.
       unbounded work (this also bounds the blast radius of a single per-run failure); the remainder
       drains on later ticks. The purge stays COMPLETE + IDEMPOTENT across a chunk-boundary interruption
       (every delete is a no-op if absent, and the control-plane run-state record is removed only AFTER
-      the purge finishes, so the next sweep completes any partial).
+      the purge finishes, so a later sweep re-enumerates + finishes any partial). On the IDLE→cancel→
+      reclaim path the cancel has already made the run TERMINAL, so a purge that then FAILS leaves a
+      now-terminal run that re-reclaims via the terminal arm only after the terminal-retention window
+      (~24 h), NOT on the next tick — bounded, never a permanent leak.
     - **LOW-2 (terminal arm live-attacher).** The terminal-retention arm now also skips a run with a
       LIVE attacher, so a client replaying a 24h-old terminal log right at the retention boundary isn't
       purged mid-replay; it reclaims on a later tick once no reader is attached (the same guard the idle
@@ -153,6 +156,48 @@ versions.
     flipped). The ghost-tenant START (INFO-2 — a start for a non-existent target, RBAC-gated, matching
     the bus precedent) and the orphan run it leaves (INFO-4) are noted; the orphan self-heals via the
     idle-run sweep.
+- **Scoped run streaming — the GraphQL-subscription face (P3).** A GraphQL subscription can now ATTACH
+  to a durable RUN by id and watch its events stream back over the already-shipped graphql-sse
+  transport — the third door onto the same P1 run primitive, alongside the guest `run` binding and the
+  P2 external HTTP door. **D2 Option A (owner-confirmed): boatramp stays GraphQL-AWARE, not an engine.**
+  The guest's own `async-graphql` resolver runs in-guest and owns the subscription's authz — its START
+  mutation (via the P1 `run` capability) mints + hands the client an unguessable `run_id`; boatramp
+  NEVER executes the resolver. A subscription whose single root field is one of the site's declared
+  `[handlers.graphql] run_subscriptions` fields AND carries a `run-id` argument (named `id` / `runId`, a
+  string literal or a `$variable`) is ATTACHED to that run via P1's `RunEngine::attach`; each
+  `RunEnvelope` payload is framed as a graphql-sse `next` event (`id:` = the `seq`, for `Last-Event-ID`
+  resume), ending with a graphql-sse `complete` on the run's terminal event. Behind the SAME
+  OFF-by-default posture `allow_guest_run_streaming` (+ the `run-streaming` cargo feature) as P1/P2.
+  - **Authz = the guest-resolver path (D2-A), not a new credential.** The host resolves the
+    SUBSCRIBER's own-tenant from the request bearer under the site's `/graphql` tenancy declaration
+    (the SAME resolution the guest `run.create` door uses) and attaches under `run_grant_scope` —
+    fail-closed exactly like the guest door: a subscription can NEVER attach a run outside its own
+    tenant (a foreign-tenant id composes a different key ⇒ `404`), and an untenanted subscription under
+    a multi-tenant posture is REFUSED. Within a tenant the guest resolver's START decision + the
+    unguessable id are the fence. (The run request is already authenticated by the site's own bearer
+    auth, so no separate run-cap token is minted here; P2's run-scoped token remains the path for a
+    purely external, no-site-principal client.)
+  - **NO new guest-facing WIT.** The run-binding rides the guest's OWN GraphQL schema (a declared
+    subscription field + the guest's START mutation over the existing P1 `boatramp:handlers/run`
+    interface) and a host config knob (`run_subscriptions`) — no new/changed WIT surface, so no shim
+    rev for P3 beyond P1's.
+  - **No drop-cancel on this face.** graphql-sse is a RESUMABLE transport (the client reconnects with
+    `Last-Event-ID`), so a transient `EventSource` drop must NOT cancel the run — that would kill a run
+    on a normal reconnect and defeat resume. A genuinely abandoned run is reclaimed by the idle-TTL
+    sweep; an explicit stop goes through the guest `run.cancel` or the P2 cancel route. The ephemeral
+    per-attach consumer group is still GC'd on teardown; the per-run connection caps (per-scope +
+    per-IP, keyed by `run:{run_id}`) match the other stream transports.
+- **Run streaming — folded review follow-ups.** (a) **LOW-1 (cluster payload-orphan).** The cluster
+  `RaftMessaging::purge_topic` now frees object-store payloads BEFORE proposing the index deletes
+  (mirroring the single-node inline free), so a propose-failure partway through a multi-batch purge can
+  no longer orphan a payload permanently — the ids are already freed (idempotent), and any index keys
+  left behind are re-enumerated + re-freed by the next sweep. (b) Corrected the single-node
+  `purge_topic` lock-discipline comment: the between-chunk anti-starvation rests on the YIELD + the
+  executor polling the woken waiter first, NOT on `futures::lock::Mutex` being FIFO-fair (the
+  uncontended fast path would otherwise let the purge re-win the lock every chunk). (c) Corrected the
+  MEDIUM-1 CHANGELOG note: on the IDLE→cancel→reclaim path a purge that then fails leaves a now-terminal
+  run that re-reclaims via the terminal arm only after the ~24 h terminal-retention window, not on the
+  next tick.
 
 ## [0.75.0] — 2026-11-26
 

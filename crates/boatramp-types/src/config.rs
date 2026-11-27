@@ -2790,6 +2790,22 @@ pub struct HandlerGraphqlConfig {
     /// gateways; not to `data:` connector sites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subgraphs: Option<Vec<String>>,
+    /// **Run-attach subscriptions** (PLAN-run-streaming P3): the subscription ROOT FIELD NAMES on this
+    /// site that ATTACH to a durable RUN by id instead of fanning out a messaging topic.
+    /// When a GraphQL subscription's single root field is one of these AND carries a run-id argument
+    /// (named `id` or `runId` — a string literal or a `$variable`), the host attaches to that run via
+    /// the P1 run engine (fenced to the SUBSCRIBER's resolved tenant scope — a subscription can never
+    /// attach a run outside its own tenant) and frames each run envelope as a graphql-sse `next` event,
+    /// resumable by `Last-Event-ID` (the `seq`), ending with a graphql-sse `complete` on the run's
+    /// terminal event. boatramp stays **GraphQL-AWARE, not an engine**: the guest's own `async-graphql`
+    /// resolver is the AUTHORITY for which client gets which run (its START mutation mints + hands out
+    /// the unguessable run id via the `run` capability); the subscription merely presents that id, and
+    /// the host attaches — it never executes the resolver. Requires the OFF-by-default node posture
+    /// `allow_guest_run_streaming` (a subscription on a listed field is REFUSED when it is off) + the
+    /// `run-streaming` build feature. **Default empty ⇒ no run-attach fields** (every subscription takes
+    /// the ordinary topic-fan-out path, byte-identical — opt-in only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_subscriptions: Vec<String>,
 }
 
 /// The declarative GraphQL data connector's configuration (see

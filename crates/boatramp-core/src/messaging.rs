@@ -3865,10 +3865,14 @@ impl Messaging for LogMessaging {
         // holding the lock across the whole purge would stall consumer delivery on every OTHER topic
         // for the duration (seconds-to-minutes). Instead we ENUMERATE lock-free (a read; staleness is
         // harmless — see idempotency below) and DELETE in bounded chunks, each chunk under a freshly
-        // acquired `claim_lock` that we RELEASE before the next. `futures::lock::Mutex` is FIFO-fair,
-        // so a claim waiting when we release gets the lock at the chunk boundary ahead of our
-        // re-acquire — other topics' delivery interleaves and is never starved. No single lock-hold
-        // does more than `PURGE_CHUNK` deletes.
+        // acquired `claim_lock` that we RELEASE before the next, with a between-chunk YIELD. The
+        // anti-starvation does NOT rest on `futures::lock::Mutex` being FIFO-fair: an uncontended
+        // `lock().await` returns `Ready` SYNCHRONOUSLY (the fast path), so WITHOUT the yield THIS task
+        // would re-win the lock every chunk and a parked claim would never be polled. The yield (at the
+        // chunk loop below) hands the executor a scheduling point so it polls the woken, already-waiting
+        // claim, which then takes the now-free lock at the boundary ahead of our re-acquire — so other
+        // topics' delivery interleaves and is never starved. No single lock-hold does more than
+        // `PURGE_CHUNK` deletes.
         //
         // COMPLETE + IDEMPOTENT across a chunk boundary: every delete is a no-op if the key is already
         // gone, and a crash/error mid-purge leaves the control-plane run-state record in place (the

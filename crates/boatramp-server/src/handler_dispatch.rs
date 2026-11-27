@@ -249,6 +249,78 @@ pub(super) async fn dispatch_handler(
                         .query()
                         .and_then(|q| query_value(q, "handle"))
                         .map(str::to_string);
+                    // PLAN-run-streaming P3 (D2 Option A) — GraphQL run-attach subscription: when the
+                    // subscription's root field is one of the site's declared `run_subscriptions`
+                    // fields, ATTACH to a durable RUN by id (the guest resolver minted + handed out the
+                    // id; boatramp carries the run's events) instead of fanning out a messaging topic.
+                    // Checked BEFORE the topic path so a run field never falls through to a topic named
+                    // after it. OFF-by-default (the `run-streaming` feature + the node posture
+                    // `allow_guest_run_streaming`). boatramp stays GraphQL-AWARE, not an engine: it
+                    // never executes the resolver — it only carries the run's events for the presented
+                    // id, confined by the subscriber's resolved tenant scope.
+                    #[cfg(feature = "run-streaming")]
+                    if let Some(binding) = graphql_subscription::subscription_run_binding(
+                        query,
+                        &gql.run_subscriptions,
+                        &variables,
+                    ) {
+                        use graphql_subscription::RunSubscription;
+                        // Posture gate FIRST (cheap, before any tenant resolution): a run-attach field
+                        // is REFUSED when the node posture is off — never served, never a topic fallthrough.
+                        if !inner.engine.allow_run_streaming() {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                "run streaming is not enabled on this node \
+                                 (allow_guest_run_streaming is off)\n",
+                            )
+                                .into_response();
+                        }
+                        let run_id = match binding {
+                            RunSubscription::Attach(id) => id,
+                            // A declared run field with no usable run id is a malformed subscription.
+                            RunSubscription::MissingRunId => {
+                                return graphql_guard::error_response(
+                                    "a run-attach subscription requires an `id` (or `runId`) run-id \
+                                     argument (a string literal or a bound $variable)",
+                                );
+                            }
+                        };
+                        // The subscriber's tenancy scope, fail-closed EXACTLY like the guest `run.create`
+                        // door (`run_grant_scope`): a subscription can NEVER attach a run outside its own
+                        // tenant, and an untenanted subscription under a multi-tenant posture is refused.
+                        let run_scope = match resolve_run_subscription_scope(
+                            inner,
+                            project,
+                            handler,
+                            site_handlers,
+                            bearer.as_deref(),
+                            domain_context.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(Some(s)) => s,
+                            Ok(None) => {
+                                return (
+                                    StatusCode::FORBIDDEN,
+                                    "run refused: no resolved tenant under a multi-tenant posture (an \
+                                     untenanted run would share the per-project scope across tenants)\n",
+                                )
+                                    .into_response();
+                            }
+                            Err(resp) => return resp,
+                        };
+                        // Resume cursor: the `Last-Event-ID` header (the SSE `id:` = the run `seq` a
+                        // reconnecting EventSource echoes back) parsed as the engine's `after_seq`.
+                        let after_seq = parts
+                            .headers
+                            .get("last-event-id")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.trim().parse::<u64>().ok());
+                        return crate::stream::serve_graphql_run_subscription(
+                            inner, project, &run_scope, &run_id, after_seq, client_ip,
+                        )
+                        .await;
+                    }
                     // GraphQL subscription: serve it as a graphql-sse event stream,
                     // deriving the messaging topic from the subscription's root field. A
                     // producer (a mutation, a function) publishes each execution result to
@@ -1066,6 +1138,56 @@ async fn resolve_gateway_caller_facts(
         .is_some_and(boatramp_handlers::HostTenancy::pass_unresolved);
     let facts = resolved.map(|h| h.facts().to_vec()).unwrap_or_default();
     Ok((facts, caller_pass))
+}
+
+/// Resolve the tenancy SCOPE a GraphQL run-attach subscription (PLAN-run-streaming P3) attaches
+/// under, fail-closed EXACTLY like the guest `run.create` door — so the subscription addresses the
+/// IDENTICAL keyspace the guest created the run in, and can NEVER attach a run outside its own tenant.
+///
+/// Resolves the subscriber's OWN-tenant from the request bearer under the effective `/graphql` tenancy
+/// declaration (the SAME [`resolve_gateway_caller_facts`] path the gateway/data-connector use, and the
+/// SAME [`resolved_tenant_string`](super::function_runtime::resolved_tenant_string) the guest-door run
+/// grant reads), then applies [`run_grant_scope`](boatramp_core::run::run_grant_scope) with the SAME
+/// `multi_tenant` notion `build_bindings` uses for the run grant (a scoping tenancy on the handler/site,
+/// or any resolved own-tenant). Returns `Ok(Some(scope))` to attach, `Ok(None)` to REFUSE (an
+/// untenanted subscription under a multi-tenant posture would collapse into the shared per-project
+/// scope), or `Err(response)` on a tenancy-declaration error.
+#[cfg(feature = "run-streaming")]
+async fn resolve_run_subscription_scope(
+    inner: &HandlerRuntimeInner,
+    project: &str,
+    handler: &boatramp_core::config::HandlerConfig,
+    site_handlers: &boatramp_core::config::HandlersSiteConfig,
+    bearer: Option<&str>,
+    domain_context: Option<&str>,
+) -> std::result::Result<Option<String>, Response> {
+    let (facts, _pass) = resolve_gateway_caller_facts(
+        inner,
+        project,
+        handler,
+        site_handlers,
+        bearer,
+        domain_context,
+    )
+    .await?;
+    let resolved_tenant = super::function_runtime::resolved_tenant_string(&facts);
+    // The SAME `multi_tenant` notion `build_bindings` uses for the run grant: a SCOPING tenancy on the
+    // handler or site (`Scoped`/`Target`) OR any resolved own-tenant makes the site multi-tenant (so an
+    // untenanted run is refused rather than collapsed into `u`). A plain single-tenant/dev site with no
+    // scoping declaration keeps the safe `u` scope.
+    let multi_tenant = {
+        use boatramp_core::tenancy::Tenancy;
+        let scoping = |t: Option<&Tenancy>| {
+            matches!(t, Some(Tenancy::Scoped { .. } | Tenancy::Target { .. }))
+        };
+        scoping(handler.tenancy.as_ref())
+            || scoping(site_handlers.tenancy.as_ref())
+            || !facts.is_empty()
+    };
+    Ok(boatramp_core::run::run_grant_scope(
+        multi_tenant,
+        resolved_tenant.as_deref(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)] // host-trusted inputs threaded from dispatch; grouping them into a struct would only obscure the plumbing

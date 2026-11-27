@@ -952,6 +952,229 @@ fn graphql_sse_data(payload: &[u8]) -> String {
     }
 }
 
+/// The graphql-sse `complete` event that ENDS a run-attach subscription (PLAN-run-streaming P3): the
+/// protocol's terminal signal telling the client the operation is finished so it does NOT reconnect.
+/// Carries an empty `data` line (graphql-sse clients parse the raw stream and dispatch on the event
+/// name). Unlike the topic-fan-out path — which deliberately never completes, so a dropped client
+/// resumes with `Last-Event-ID` — a RUN has a DEFINITIVE end (its terminal event), so completing is
+/// correct: the run is over, and a reconnect would only replay a concluded log.
+#[cfg(all(feature = "handlers", feature = "run-streaming"))]
+fn graphql_sse_complete() -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event("complete")
+        .data("")
+}
+
+/// Map a host-internal run error onto the pre-stream HTTP response for the GraphQL run-attach face.
+/// A non-existent run (the cross-tenant / fabricated-id case, which surfaces as `NotFound` because the
+/// key does not exist under the subscriber's resolved scope) is a flat `404` — never a cross-tenant
+/// touch, and no oracle beyond what the already-authenticated subscriber could learn about its own run.
+#[cfg(all(feature = "handlers", feature = "run-streaming"))]
+fn run_attach_err(e: &boatramp_core::run::RunError) -> Response {
+    use boatramp_core::run::RunError;
+    match e {
+        RunError::NotFound => (StatusCode::NOT_FOUND, "run not found\n").into_response(),
+        RunError::Invalid(m) => (
+            StatusCode::BAD_REQUEST,
+            format!("invalid run request: {m}\n"),
+        )
+            .into_response(),
+        RunError::Terminal | RunError::Cancelled => {
+            (StatusCode::CONFLICT, "run already concluded\n").into_response()
+        }
+        RunError::Backend(_) => {
+            (StatusCode::BAD_GATEWAY, "run backend unavailable\n").into_response()
+        }
+    }
+}
+
+/// A drop guard that GCs the ephemeral per-attach consumer group a run attach opened (mirrors the
+/// engine seam's cleanup hook). The GraphQL run-attach face deliberately does NOT drop-cancel on a
+/// client disconnect (see [`serve_graphql_run_subscription`]), so this only cleans up group state.
+#[cfg(all(feature = "handlers", feature = "run-streaming"))]
+struct RunGroupCleanup(Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>);
+
+#[cfg(all(feature = "handlers", feature = "run-streaming"))]
+impl Drop for RunGroupCleanup {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take() {
+            tokio::spawn(async move {
+                cleanup().await;
+            });
+        }
+    }
+}
+
+/// The streaming phase of a run-attach SSE body: deliver envelopes, then (on the terminal) a
+/// graphql-sse `complete`, then end.
+#[cfg(all(feature = "handlers", feature = "run-streaming"))]
+enum RunSsePhase {
+    /// Draining the run's envelope stream, framing each payload as `next`.
+    Streaming,
+    /// The terminal `next` was delivered; emit the graphql-sse `complete` on the next poll, then end.
+    CompleteThenEnd,
+    /// The body is complete.
+    Done,
+}
+
+/// Serve a GraphQL **run-attach** subscription (PLAN-run-streaming P3, D2 Option A) as a graphql-sse
+/// event stream: ATTACH to the durable RUN `run_id` (fenced to the subscriber's resolved tenant
+/// `run_scope`) via P1's [`RunEngine`](crate::run_stream::RunEngine), frame each `RunEnvelope`'s
+/// payload as a graphql-sse `next` event (`id:` = the `seq`, for `Last-Event-ID` resume), and end with
+/// a graphql-sse `complete` on the run's terminal event. Resume (`after_seq` from `Last-Event-ID`),
+/// heartbeat, idle timeout, and the per-run connection caps mirror the other stream transports.
+///
+/// boatramp stays **GraphQL-AWARE, not an engine**: it does NOT execute the subscription resolver.
+/// The guest's own resolver is the authority for which run a subscriber may see (its START mutation
+/// minted + handed out the unguessable id via the `run` capability); this transport only CARRIES the
+/// run's events for the id the client presents, confined by the tenancy scope — a subscription can
+/// NEVER attach a run outside its own tenant (a foreign-tenant id composes a different key ⇒ `404`).
+///
+/// **No drop-cancel.** graphql-sse is a RESUMABLE transport (the client reconnects with
+/// `Last-Event-ID`), so a transient `EventSource` drop must NOT cancel the run — that would kill a run
+/// on a normal reconnect and defeat resume. A genuinely abandoned run is reclaimed by the idle-TTL
+/// sweep (and an explicit stop goes through the guest `run.cancel` or the P2 cancel route). The
+/// ephemeral attach consumer group is still GC'd on every teardown.
+#[cfg(all(feature = "handlers", feature = "run-streaming"))]
+pub(super) async fn serve_graphql_run_subscription(
+    inner: &Arc<HandlerRuntimeInner>,
+    project: &str,
+    run_scope: &str,
+    run_id: &str,
+    after_seq: Option<u64>,
+    client_ip: IpAddr,
+) -> Response {
+    use crate::run_stream::{EngineAttach, RunEngine};
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use boatramp_core::run::{RunEnvelope, RunError};
+
+    // Posture gate (defensive — the dispatch branch gates first): the OFF-by-default node posture
+    // `allow_guest_run_streaming`. Off ⇒ `403`, zero runtime exposure, the SAME gate as the guest door
+    // and the P2 external door.
+    if !inner.engine.allow_run_streaming() {
+        return (
+            StatusCode::FORBIDDEN,
+            "run streaming is not enabled on this node (allow_guest_run_streaming is off)\n",
+        )
+            .into_response();
+    }
+    let Some(messaging) = inner.messaging.clone() else {
+        // Runs ride the durable messaging substrate; without one the route is dead.
+        return not_found();
+    };
+
+    // deny-before-resource-use: the per-scope + per-IP stream permits, keyed by the RUN (identical to
+    // the P2 external door — one shared pool per run) so each run's graphql subscribers are bounded
+    // independently and share the configured-stream pools.
+    let scope_key = format!("run:{run_id}");
+    let site_permit =
+        match acquire_stream_permit_capped(inner, &scope_key, DEFAULT_STREAM_CONNECTIONS) {
+            Ok(p) => p,
+            Err(()) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "run stream connection limit reached\n",
+                )
+                    .into_response();
+            }
+        };
+    let ip_guard = match acquire_stream_ip_slot(inner, &scope_key, client_ip) {
+        Ok(g) => g,
+        Err(()) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "per-client run stream connection limit reached\n",
+            )
+                .into_response();
+        }
+    };
+
+    // Build the run engine fenced to (project, resolved tenant scope) — the IDENTICAL keyspace the
+    // guest `run.create` binding and the P2 door address — and attach, resuming strictly past
+    // `after_seq` (lossless). The tenancy fence rides the resolved scope, never the subscription.
+    let engine = RunEngine::new(
+        messaging,
+        inner.kv.clone(),
+        project.to_string(),
+        run_scope.to_string(),
+    );
+    let attach = match engine.attach(run_id, after_seq).await {
+        Ok(a) => a,
+        Err(e) => return run_attach_err(&e),
+    };
+    // Drop drop-cancel (see the fn doc): a graphql-sse reconnect must not cancel the run. We keep only
+    // the ephemeral-group cleanup hook; the run's own `drop_cancel_armed` is intentionally ignored.
+    let EngineAttach {
+        stream, cleanup, ..
+    } = attach;
+
+    struct RunSseState {
+        stream: futures::stream::BoxStream<'static, Result<RunEnvelope, RunError>>,
+        phase: RunSsePhase,
+        _cleanup: RunGroupCleanup,
+        _site_permit: tokio::sync::OwnedSemaphorePermit,
+        _ip_guard: IpStreamGuard,
+    }
+    let state = RunSseState {
+        stream,
+        phase: RunSsePhase::Streaming,
+        _cleanup: RunGroupCleanup(cleanup),
+        _site_permit: site_permit,
+        _ip_guard: ip_guard,
+    };
+
+    let body = futures::stream::unfold(state, |mut st| async move {
+        match st.phase {
+            RunSsePhase::Done => None,
+            RunSsePhase::CompleteThenEnd => {
+                // The terminal payload was delivered last poll; send `complete`, then end.
+                st.phase = RunSsePhase::Done;
+                Some((
+                    Ok::<Event, std::convert::Infallible>(graphql_sse_complete()),
+                    st,
+                ))
+            }
+            RunSsePhase::Streaming => loop {
+                match tokio::time::timeout(STREAM_IDLE_TIMEOUT, st.stream.next()).await {
+                    Ok(Some(Ok(env))) => {
+                        let terminal = env.kind.is_terminal();
+                        if env.payload.is_empty() {
+                            // A terminal with no distinct payload (e.g. `end` / `cancelled`): emit
+                            // `complete` now and end. A non-terminal empty payload is skipped.
+                            if terminal {
+                                st.phase = RunSsePhase::Done;
+                                return Some((Ok(graphql_sse_complete()), st));
+                            }
+                            continue;
+                        }
+                        let event = graphql_sse_next(&env.seq.to_string(), &env.payload);
+                        if terminal {
+                            // Deliver the terminal payload now; `complete` + end on the next poll.
+                            st.phase = RunSsePhase::CompleteThenEnd;
+                        }
+                        return Some((Ok(event), st));
+                    }
+                    // Stream error or the already-terminal empty-stream fast path → close the body
+                    // WITHOUT a `complete`: a resume whose cursor already covers the terminal, or an
+                    // idle gap, is a reconnect case (the client re-attaches with `Last-Event-ID`), so
+                    // we don't tell it the operation finished here.
+                    Ok(Some(Err(_))) | Ok(None) => return None,
+                    // Idle past the timeout → close; the client reconnects.
+                    Err(_) => return None,
+                }
+            },
+        }
+    });
+
+    Sse::new(body)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(STREAM_HEARTBEAT)
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
 #[cfg(all(test, feature = "handlers"))]
 mod tests {
     use super::graphql_sse_data;
@@ -1305,5 +1528,310 @@ fn stream_event(topic: &str, id: &str, payload: &[u8]) -> axum::response::sse::E
                 .event(format!("{topic}.b64"))
                 .data(encoded)
         }
+    }
+}
+
+// ---- PLAN-run-streaming P3 — the GraphQL run-attach subscription face -------------------------
+#[cfg(all(test, feature = "handlers", feature = "run-streaming"))]
+mod run_graphql_subscription_tests {
+    use super::*;
+    use crate::run_stream::RunEngine;
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_core::run::RunEventKind;
+    use boatramp_core::{
+        ByteStream, GetObject, ListPage, ObjectMeta, PutMeta, Storage, StorageError,
+    };
+    use bytes::Bytes as RawBytes;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    // Minimal in-memory `Storage` so the REAL `LogMessaging` durable substrate can be built — mirrors
+    // the run-engine / run-door test `MemStorage`.
+    #[derive(Default, Clone)]
+    struct MemStorage {
+        map: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    }
+    fn meta(key: &str, len: usize) -> ObjectMeta {
+        ObjectMeta {
+            key: key.to_string(),
+            size: Some(len as u64),
+            content_type: None,
+            etag: None,
+        }
+    }
+    fn once_stream(bytes: RawBytes) -> ByteStream {
+        futures::stream::once(async move { Ok::<_, StorageError>(bytes) }).boxed()
+    }
+    #[async_trait::async_trait]
+    impl Storage for MemStorage {
+        async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
+            let data = self
+                .map
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+            Ok(GetObject {
+                meta: meta(key, data.len()),
+                body: once_stream(RawBytes::from(data)),
+            })
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            len: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            let data = self
+                .map
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+            let start = (offset as usize).min(data.len());
+            let end = match len {
+                Some(l) => (start + l as usize).min(data.len()),
+                None => data.len(),
+            };
+            Ok(GetObject {
+                meta: meta(key, end - start),
+                body: once_stream(RawBytes::from(data[start..end].to_vec())),
+            })
+        }
+        async fn put(
+            &self,
+            key: &str,
+            mut body: ByteStream,
+            _meta: PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            let mut buf = Vec::new();
+            while let Some(chunk) = body.next().await {
+                buf.extend_from_slice(&chunk?);
+            }
+            let m = meta(key, buf.len());
+            self.map.lock().unwrap().insert(key.to_string(), buf);
+            Ok(m)
+        }
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+            let map = self.map.lock().unwrap();
+            let data = map
+                .get(key)
+                .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+            Ok(meta(key, data.len()))
+        }
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.map.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(self
+                .map
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| meta(k, v.len()))
+                .collect())
+        }
+        async fn list_page(
+            &self,
+            prefix: &str,
+            _after: Option<&str>,
+            _limit: u32,
+        ) -> Result<ListPage, StorageError> {
+            Ok(ListPage {
+                metas: self.list(prefix).await?,
+                cursor: None,
+            })
+        }
+    }
+
+    /// A runtime wired to a REAL durable messaging + KV, with the `run` posture ON (or off, for the
+    /// posture test). Returns the runtime plus the SAME messaging + kv a target engine emits through.
+    fn setup(run_streaming: bool) -> (Arc<HandlerRuntime>, Arc<dyn Messaging>, Arc<dyn KvStore>) {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let mq_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), mq_kv));
+        let engine =
+            boatramp_handlers::HandlerEngine::new(boatramp_handlers::Limits::default(), 16)
+                .unwrap()
+                .with_run_streaming(run_streaming);
+        let rt = Arc::new(HandlerRuntime::new(
+            engine,
+            kv.clone(),
+            storage,
+            None,
+            Some(messaging.clone()),
+        ));
+        (rt, messaging, kv)
+    }
+
+    /// The target-side run engine emitting to the run (what the real guest `run.emit` binding does),
+    /// fenced to the SAME (project, scope) the subscription will attach under.
+    fn target_engine(
+        messaging: &Arc<dyn Messaging>,
+        kv: &Arc<dyn KvStore>,
+        scope: &str,
+    ) -> RunEngine {
+        RunEngine::new(
+            messaging.clone(),
+            kv.clone(),
+            "acme".to_string(),
+            scope.to_string(),
+        )
+    }
+
+    fn local_ip() -> IpAddr {
+        IpAddr::from([127u8, 0, 0, 1])
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Parse an SSE body into `(event, id, data)` triples, ignoring `:`-comment (keep-alive) lines.
+    fn sse_events(body: &str) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for block in body.split("\n\n") {
+            let (mut event, mut id, mut data) = (String::new(), String::new(), String::new());
+            let mut any = false;
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("event:") {
+                    event = v.trim().to_string();
+                    any = true;
+                } else if let Some(v) = line.strip_prefix("id:") {
+                    id = v.trim().to_string();
+                    any = true;
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data = v.trim().to_string();
+                    any = true;
+                }
+            }
+            if any {
+                out.push((event, id, data));
+            }
+        }
+        out
+    }
+
+    /// A GraphQL subscription ATTACHES to a run and receives the envelopes framed as graphql-sse
+    /// `next` events (payload verbatim, `id:` = `seq`), ending with a `complete` on the terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graphql_subscription_attaches_and_frames_next_then_complete() {
+        let (rt, messaging, kv) = setup(true);
+        let inner = rt.inner.as_ref().unwrap();
+        let te = target_engine(&messaging, &kv, "u");
+        let run = te.create(false).await.unwrap();
+        te.emit(
+            &run,
+            RunEventKind::Progress,
+            br#"{"data":{"stage":"ocr"}}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+        te.emit(
+            &run,
+            RunEventKind::Result,
+            br#"{"data":{"done":true}}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let resp = serve_graphql_run_subscription(inner, "acme", "u", &run, None, local_ip()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let events = sse_events(&body_text(resp).await);
+        // next(progress) · next(result/terminal) · complete.
+        assert_eq!(events.len(), 3, "events: {events:?}");
+        assert_eq!(events[0].0, "next");
+        assert_eq!(events[0].1, "0");
+        assert_eq!(events[0].2, r#"{"data":{"stage":"ocr"}}"#);
+        assert_eq!(events[1].0, "next");
+        assert_eq!(events[1].1, "1");
+        assert_eq!(events[1].2, r#"{"data":{"done":true}}"#);
+        assert_eq!(events[2].0, "complete");
+    }
+
+    /// Resume strictly AFTER a `seq` (the `Last-Event-ID` cursor): only the un-consumed suffix, then
+    /// `complete` — lossless, no gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graphql_subscription_resumes_after_seq() {
+        let (rt, messaging, kv) = setup(true);
+        let inner = rt.inner.as_ref().unwrap();
+        let te = target_engine(&messaging, &kv, "u");
+        let run = te.create(false).await.unwrap();
+        let p = te
+            .emit(
+                &run,
+                RunEventKind::Progress,
+                br#"{"data":{"p":1}}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        te.emit(
+            &run,
+            RunEventKind::Result,
+            br#"{"data":{"done":true}}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let resp =
+            serve_graphql_run_subscription(inner, "acme", "u", &run, Some(p), local_ip()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let events = sse_events(&body_text(resp).await);
+        assert_eq!(
+            events.len(),
+            2,
+            "resume sees only the suffix + complete: {events:?}"
+        );
+        assert_eq!((events[0].0.as_str(), events[0].1.as_str()), ("next", "1"));
+        assert_eq!(events[1].0, "complete");
+    }
+
+    /// A subscription CANNOT attach a run outside its tenancy scope: a run created under tenant `u`
+    /// is `404` when the resolved subscriber scope is a DIFFERENT tenant (the key does not exist
+    /// there) — never a cross-tenant touch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graphql_subscription_cannot_attach_a_run_outside_its_scope() {
+        let (rt, messaging, kv) = setup(true);
+        let inner = rt.inner.as_ref().unwrap();
+        // The run lives under the single-tenant `u` scope.
+        let te = target_engine(&messaging, &kv, "u");
+        let run = te.create(false).await.unwrap();
+        te.emit(
+            &run,
+            RunEventKind::Progress,
+            br#"{"data":{"x":1}}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+        // Attaching under a DIFFERENT tenant scope composes a different key ⇒ NotFound ⇒ 404.
+        let resp =
+            serve_graphql_run_subscription(inner, "acme", "t_other", &run, None, local_ip()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // The real `u`-scoped run is untouched (still active).
+        assert_eq!(
+            te.status(&run).await.unwrap(),
+            boatramp_core::run::RunStatus::Active
+        );
+    }
+
+    /// Posture OFF (the default) ⇒ the run-attach face returns `403`, zero runtime exposure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graphql_subscription_posture_off_is_refused() {
+        let (rt, messaging, kv) = setup(false); // allow_run_streaming = false
+        let inner = rt.inner.as_ref().unwrap();
+        // Even a real, existing run under `u` is refused while the posture is off.
+        let te = target_engine(&messaging, &kv, "u");
+        let run = te.create(false).await.unwrap();
+        let resp = serve_graphql_run_subscription(inner, "acme", "u", &run, None, local_ip()).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

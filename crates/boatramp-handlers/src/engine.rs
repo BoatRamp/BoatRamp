@@ -2897,6 +2897,16 @@ impl HandlerEngine {
         self
     }
 
+    /// Whether this engine's posture permits the `run` capability (the node's
+    /// `allow_guest_run_streaming` flag). Read by the HOST-side GraphQL run-attach subscription face
+    /// (PLAN-run-streaming P3), which attaches to a run by id WITHOUT linking a guest component, so it
+    /// cannot rely on the engine's per-invocation link gate and must consult the posture itself —
+    /// the SAME OFF-by-default gate the guest `run` binding fail-closes on.
+    #[must_use]
+    pub fn allow_run_streaming(&self) -> bool {
+        self.allow_run_streaming
+    }
+
     /// Permit (or refuse) a guest to register a RUNTIME, host-sealed, per-tenant DNS-write credential
     /// and route writes through it — the operator posture's `allow_guest_dynamic_dns_publish` (cap-req
     /// #31). Default (`false`) makes every `register`/`unregister` `access-denied` and keeps every
