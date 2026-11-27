@@ -11,6 +11,11 @@
 //! Every byte path streams: uploads flow request→backend, downloads flow
 //! backend→response, and only small manifests are ever held in memory.
 
+// Bumped from the default 128: the v0.76.0 run-streaming async/stream type-graph pushes the auto-trait
+// (`Send`) solver past 128 when proving the spawned-future bound in `splice.rs` under the full feature
+// set (E0275 "overflow evaluating" — a depth limit, not a cycle). 256 gives headroom.
+#![recursion_limit = "256"]
+
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;

@@ -178,6 +178,17 @@ mod imp {
             // only under the `egress-register` cargo feature, so a guest `requires = ["egress-register"]`
             // fails loud on a pre-feature host.
             ("boatramp:handlers", "egress-register") => Some("egress-register"),
+            // The durable RUN capability (PLAN-run-streaming P1): a granted guest creates / emits-to /
+            // attaches-to / cancels a correlation-scoped durable run stream. Its OWN declarable grant
+            // token `run`, matching `KNOWN_IMPORTS`. The guest `use`s `run-types` (the envelope + kind
+            // records) and imports `run` (the `run-stream` resource + create/emit/attach/cancel/status),
+            // so both label as this token. Without this arm the interface mapped to `None` → "disallowed
+            // interface", so a run-importing guest was refused at deploy even on a run-streaming host that
+            // ADVERTISES the capability (the advertisement in `function_api.rs` was wired, but this
+            // deploy-admission seam was missed — the same WS3/egress-register shape). Posture-gated by
+            // `allow_guest_run_streaming` (off by default) at runtime; advertised only under the
+            // `run-streaming` cargo feature, so a `requires = ["run"]` deploy fails loud on a pre-feature host.
+            ("boatramp:handlers", "run" | "run-types") => Some("run"),
             // `orm` is a **typed view of the same `sql` capability** — it runs on the
             // same per-invocation SQL session/backend and `use`s `sql-types`. So it
             // is the `sql` token: declaring `sql` grants orm (and inherits the
@@ -839,6 +850,7 @@ mod imp {
                 ("dns-resolve", "boatramp:handlers", "dns-resolve"),
                 ("dns-publish", "boatramp:handlers", "dns-publish"),
                 ("egress-register", "boatramp:handlers", "egress-register"),
+                ("run", "boatramp:handlers", "run"),
             ];
             // Each representative interface maps to exactly its grant token.
             for &(token, pkg, iface) in reps {
