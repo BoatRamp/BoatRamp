@@ -323,6 +323,14 @@ fn check_host_forward(name: &str, up: &Upstream) -> Result<(), crate::ConfigErro
     Ok(())
 }
 
+/// The minimum **effective** buffering throughput floor, in bytes per second. A configured
+/// [`Upstream::buffer_min_rate_bytes_per_sec`] below this is treated as *near-disabling* the floor:
+/// at such a trickle the floor can no longer meaningfully cut a slow-loris (a 1 B/s "floor" lets a
+/// ~1 B/s drip pass for years), so disabling OR near-disabling it requires an explicit positive
+/// absolute ceiling — see [`check_upstream_buffering`]. The server default floor (1 KiB/s) is far
+/// above this, so an unset floor never trips the rule.
+const MIN_EFFECTIVE_BUFFER_FLOOR_BYTES_PER_SEC: u64 = 64;
+
 /// Reject a nonsensical request-buffering config so a declarative `apply` / deploy bundle cannot
 /// persist one (the CLI's `requires` already screens its own path). A `max_buffer_bytes` without
 /// `buffer_requests` is a dangling knob (the body is never buffered, so the cap means nothing), and a
@@ -387,24 +395,28 @@ fn check_upstream_buffering(name: &str, up: &Upstream) -> Result<(), crate::Conf
             )));
         }
     }
-    // The throughput floor may be disabled (`buffer_min_rate_bytes_per_sec: 0`) ONLY when a hard
-    // absolute ceiling is ALSO set EXPLICITLY (`buffer_total_timeout_ms` > 0). Disabling the floor
-    // removes the only progress-based backstop; with the ceiling also off (`buffer_total_timeout_ms:
-    // 0`) — or merely left to the default — buffering would be bounded solely by the per-read idle
-    // timeout, so a client dripping one byte just inside each idle window (e.g. 1 byte / 29 s) holds
-    // a connection slot + its temp spill indefinitely. Refuse the combination at declare: to disable
-    // the floor you must pin an explicit positive ceiling. (This holds even when the ceiling is left
-    // unset to fall back on the default — the dangerous choice must be made explicitly, not inherited
-    // from a default that could change.)
-    if up.buffer_min_rate_bytes_per_sec == Some(0)
+    // The throughput floor is the primary progress-based backstop. DISABLING it
+    // (`buffer_min_rate_bytes_per_sec: 0`) — or setting it so low it can no longer meaningfully cut a
+    // drip (below `MIN_EFFECTIVE_BUFFER_FLOOR_BYTES_PER_SEC`, e.g. a 1 B/s "floor") — is permitted ONLY
+    // when a hard absolute ceiling is ALSO set EXPLICITLY (`buffer_total_timeout_ms` > 0). Otherwise
+    // buffering is bounded solely by the per-read idle timeout, so a client dripping one byte just
+    // inside each idle window (e.g. 1 byte / 29 s) holds a connection slot + its temp spill for years
+    // (now bounded only by the node-wide buffering-concurrency semaphore). Refuse the combination at
+    // declare: to disable OR near-disable the floor you must pin an explicit positive ceiling. This
+    // holds even when the ceiling is left unset to fall back on the default — the dangerous choice must
+    // be made explicitly, not inherited from a default that could change. (An UNSET floor — `None` —
+    // takes the server default, far above the threshold, so it never trips this rule.)
+    if matches!(up.buffer_min_rate_bytes_per_sec, Some(floor) if floor < MIN_EFFECTIVE_BUFFER_FLOOR_BYTES_PER_SEC)
         && !matches!(up.buffer_total_timeout_ms, Some(ms) if ms > 0)
     {
         return Err(crate::ConfigError::parse(format!(
-            "gateway upstream `{name}` disables the buffering throughput floor \
-             (`buffer_min_rate_bytes_per_sec: 0`) without a hard absolute ceiling — set a positive \
-             `buffer_total_timeout_ms` alongside it, or raise the floor above 0. Disabling both the \
-             throughput floor and the absolute ceiling leaves a slow drip bounded only by the \
-             per-read idle timeout (effectively unbounded)."
+            "gateway upstream `{name}` disables or near-disables the buffering throughput floor \
+             (`buffer_min_rate_bytes_per_sec` below the {MIN_EFFECTIVE_BUFFER_FLOOR_BYTES_PER_SEC} B/s \
+             minimum-effective floor) without a hard absolute ceiling — set a positive \
+             `buffer_total_timeout_ms` alongside it, or raise the floor to at least \
+             {MIN_EFFECTIVE_BUFFER_FLOOR_BYTES_PER_SEC} B/s. A near-zero floor with the ceiling off \
+             leaves a slow drip bounded only by the per-read idle timeout, so it can hold a connection \
+             slot + its temp spill for years."
         )));
     }
     Ok(())
@@ -774,10 +786,12 @@ pub struct Upstream {
     /// second) a length-unknown body must maintain while buffering — if the body's average rate over
     /// a trailing [`Upstream::buffer_min_rate_window_ms`] window falls below this floor, buffering is
     /// aborted with `408 Request Timeout`. `None` → the server default (1 KiB/s); `Some(0)` →
-    /// **disabled** — permitted ONLY alongside an explicit positive
-    /// [`Upstream::buffer_total_timeout_ms`] ceiling (declare-time validation refuses disabling both
-    /// the floor and the ceiling, which would leave buffering bounded only by the per-read idle
-    /// timeout). This is the throughput-aware backstop that
+    /// **disabled**, and a positive value below the 64 B/s minimum-effective floor is treated as
+    /// *near-disabling* (too low to cut a drip) — both are permitted ONLY alongside an explicit
+    /// positive [`Upstream::buffer_total_timeout_ms`] ceiling (declare-time validation refuses
+    /// disabling or near-disabling the floor without a hard ceiling, which would otherwise leave
+    /// buffering bounded only by the per-read idle timeout). This is the throughput-aware backstop
+    /// that
     /// [`Upstream::buffer_read_timeout_ms`] cannot provide: a slow-loris that trickles just often
     /// enough to keep resetting the read-idle timer never idles, but it also cannot sustain the floor,
     /// so the rate check cuts it — while a steadily-progressing upload of ANY total size, however
@@ -1378,9 +1392,27 @@ mod tests {
         // floor's progress-based bound.
         assert!(validate_site_gateway(&site(buffering(Some(0), Some(300_000)))).is_ok());
 
+        // LOW-1 (Security re-review): a NEAR-zero floor is closed the same way as a disabled one — the
+        // old `== Some(0)` sentinel let a `1` B/s floor + ceiling-off escape (a ~1 B/s drip could then
+        // hold a slot for years). A floor BELOW the minimum-effective threshold is now treated as
+        // disabling it, so it too requires an explicit positive ceiling.
+        let thresh = MIN_EFFECTIVE_BUFFER_FLOOR_BYTES_PER_SEC;
+        // floor = 1 (near-zero) + ceiling OFF → REFUSED.
+        assert!(validate_site_gateway(&site(buffering(Some(1), Some(0)))).is_err());
+        // floor = 1 (near-zero) + ceiling UNSET (default) → REFUSED.
+        assert!(validate_site_gateway(&site(buffering(Some(1), None))).is_err());
+        // floor just BELOW the threshold + ceiling OFF → REFUSED.
+        assert!(validate_site_gateway(&site(buffering(Some(thresh - 1), Some(0)))).is_err());
+        // floor just below the threshold + an explicit POSITIVE ceiling → OK.
+        assert!(validate_site_gateway(&site(buffering(Some(thresh - 1), Some(300_000)))).is_ok());
+        // floor AT the threshold + ceiling OFF → OK (an effective floor is retained as the backstop).
+        assert!(validate_site_gateway(&site(buffering(Some(thresh), Some(0)))).is_ok());
+        // floor at the threshold + ceiling UNSET (default) → OK.
+        assert!(validate_site_gateway(&site(buffering(Some(thresh), None))).is_ok());
+
         // Ceiling OFF (`0`) while the floor stays ON (default via unset, or an explicit positive
-        // value) → OK: the HIGH-1 opt-out for a rare genuinely-huge/slow-link upstream. The floor is
-        // still the backstop.
+        // value at/above the threshold) → OK: the HIGH-1 opt-out for a rare genuinely-huge/slow-link
+        // upstream. The floor is still the backstop.
         assert!(validate_site_gateway(&site(buffering(None, Some(0)))).is_ok());
         assert!(validate_site_gateway(&site(buffering(Some(2048), Some(0)))).is_ok());
     }

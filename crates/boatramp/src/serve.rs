@@ -660,7 +660,8 @@ pub struct ServeArgs {
     /// spill path, distinct from `--max-concurrent-uploads`); further buffering gets 503 until a
     /// slot frees (default 128). Each in-flight buffered body holds up to its upstream's
     /// `--max-buffer-bytes` of temp spill, so this bounds worst-case node spill at
-    /// `limit × max-buffer-bytes`. Flag/env > `serve.max_concurrent_buffering`.
+    /// `limit × max-buffer-bytes`. Must be > 0 (the cap is a DoS bound and cannot be disabled; `0`
+    /// is rejected — omit it for the default). Flag/env > `serve.max_concurrent_buffering`.
     #[arg(long, env = "BOATRAMP_MAX_CONCURRENT_BUFFERING")]
     max_concurrent_buffering: Option<usize>,
 

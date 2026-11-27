@@ -33,8 +33,9 @@ pub struct ServerLimits {
     /// Each in-flight buffered body holds up to its upstream's `max_buffer_bytes` of temp spill, so
     /// this bounds worst-case node spill at `limit × max_buffer_bytes`; further buffering fails fast
     /// with `503`. `None` = the built-in default (128); applied process-wide at serve startup via
-    /// [`crate::proxy::set_buffering_concurrency_limit`]. Cannot be removed entirely (a value is
-    /// clamped to ≥ 1) — it is a DoS bound that must always exist.
+    /// [`crate::proxy::set_buffering_concurrency_limit`]. Cannot be removed entirely — it is a DoS
+    /// bound that must always exist: a configured `0` is rejected at config load, and the runtime
+    /// clamps any value to ≥ 1 as defense-in-depth.
     pub max_concurrent_buffering: Option<usize>,
 }
 

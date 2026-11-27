@@ -273,6 +273,13 @@ const DEFAULT_MAX_CONCURRENT_BUFFERING: usize = 128;
 static BUFFER_SLOTS_LIMIT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_CONCURRENT_BUFFERING);
 
+/// Set `true` the first time [`BUFFER_SLOTS`] is forced — the point at which its slot count is read
+/// from [`BUFFER_SLOTS_LIMIT`] and fixed for the life of the process. Lets
+/// [`set_buffering_concurrency_limit`] detect (and warn about) a late call that can no longer affect
+/// the live count. `Release`/`Acquire` paired with the store below for self-documenting visibility.
+static BUFFER_SLOTS_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Process-wide semaphore bounding concurrent request-buffering operations, shared across every
 /// listener and upstream (like [`POOL`]). A buffering request acquires an OWNED permit BEFORE it
 /// spills (before any pool checkout / dial) and holds it for the whole buffering + forward phase, so
@@ -281,23 +288,31 @@ static BUFFER_SLOTS_LIMIT: std::sync::atomic::AtomicUsize =
 /// [`BUFFER_SLOTS_LIMIT`] at first use.
 static BUFFER_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| {
-        Arc::new(tokio::sync::Semaphore::new(
-            BUFFER_SLOTS_LIMIT
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .max(1),
-        ))
+        let slots = BUFFER_SLOTS_LIMIT
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(1);
+        BUFFER_SLOTS_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
+        Arc::new(tokio::sync::Semaphore::new(slots))
     });
 
 /// Set the node-wide buffering-concurrency cap from the operator config. Call ONCE at serve startup,
 /// before any request is served (buffering only happens while serving a request, so the cap is in
 /// place before [`BUFFER_SLOTS`] is first read). `None` keeps the built-in default
-/// ([`DEFAULT_MAX_CONCURRENT_BUFFERING`]); `Some(n)` sets `n` (clamped to ≥ 1 — the cap can be raised
-/// or lowered, but never removed: it is a DoS bound that must always exist). A call after the
-/// semaphore has already been initialized has no effect on the live count (logged), since the slot
-/// count is fixed at first use.
+/// ([`DEFAULT_MAX_CONCURRENT_BUFFERING`]); `Some(n)` sets `n` (clamped to ≥ 1 as defense-in-depth —
+/// the cap can be raised or lowered, but never removed: it is a DoS bound that must always exist. A
+/// configured `0` is rejected earlier, at config load — `ServerConfig::validate_serve_limits` — so
+/// this clamp is a backstop, not the primary guard). A call made AFTER the semaphore has already been
+/// initialized (i.e. after the first request was served) cannot change the live count — the slot
+/// count is fixed at first use — so it is logged as a warning rather than silently ignored.
 pub(crate) fn set_buffering_concurrency_limit(limit: Option<usize>) {
     if let Some(n) = limit {
-        BUFFER_SLOTS_LIMIT.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+        BUFFER_SLOTS_LIMIT.store(n.max(1), std::sync::atomic::Ordering::Release);
+    }
+    if BUFFER_SLOTS_INITIALIZED.load(std::sync::atomic::Ordering::Acquire) {
+        tracing::warn!(
+            "set_buffering_concurrency_limit called after the node buffering semaphore was already \
+             initialized; the live slot count is fixed at first use and is left unchanged"
+        );
     }
 }
 
@@ -3613,6 +3628,183 @@ Connection: close\r\n\r\n";
             sem.available_permits(),
             1,
             "the slot frees again after release"
+        );
+    }
+
+    /// The buffering permit is released on the DIAL-FAILURE exit path (INFO-2): the body buffers
+    /// fully (permit held), then the upstream dial fails — the permit MUST drop on that early return,
+    /// not leak. A dead address (bound, then dropped) refuses the connect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_buffering_permit_released_on_dial_failure() {
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l); // nothing listens on `a` now → connect is refused
+            a
+        };
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let client = cached_client("127.0.0.1", dead, None, None, false, None, false)
+            .unwrap()
+            .with_buffering(true, Some(16 * 1024 * 1024), None, None, None, None)
+            .with_buffer_slots(sem.clone());
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/dial",
+            dead.port()
+        );
+        match client
+            .send(streamed_put(&uri, vec![b"layer-", b"bytes"]))
+            .await
+        {
+            Err(UpstreamError::Failed) => {}
+            Ok(_) => panic!("a dial to a dead upstream must fail, not forward"),
+            Err(e) => panic!("expected Failed (dial failure after buffering), got {e:?}"),
+        }
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit is released on the dial-failure path (body buffered, then dial failed)"
+        );
+    }
+
+    /// The buffering permit is released on the CLIENT-DISCONNECT exit path (INFO-2): the inbound body
+    /// errors mid-stream (the downstream client dropped) while buffering — `buffer_body_to_length_in`
+    /// returns an I/O error (→ `UpstreamError::Failed`) and the held permit MUST drop on that return.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_buffering_permit_released_on_client_disconnect() {
+        // The abort happens DURING buffering, before any dial, so a dead address is never contacted.
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let client = cached_client("127.0.0.1", dead, None, None, false, None, false)
+            .unwrap()
+            .with_buffering(true, Some(16 * 1024 * 1024), None, None, None, None)
+            .with_buffer_slots(sem.clone());
+        let uri = format!(
+            "http://127.0.0.1:{}/v2/team/repo/blobs/uploads/disc",
+            dead.port()
+        );
+        // A body that yields one chunk, then ERRORS — the client went away mid-upload.
+        let body = futures::stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial-chunk"))
+        })
+        .chain(futures::stream::once(async {
+            Err::<Bytes, std::io::Error>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "client disconnected mid-body",
+            ))
+        }));
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .body(Body::from_stream(body))
+            .unwrap();
+        match client.send(req).await {
+            Err(UpstreamError::Failed) => {}
+            Ok(_) => panic!("a client disconnect mid-buffering must fail, not forward"),
+            Err(e) => panic!("expected Failed (client disconnect), got {e:?}"),
+        }
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit is released on the client-disconnect (mid-body I/O error) path"
+        );
+    }
+
+    // --- dispatch-level passive-health recording vs. a LOCAL pre-dial overload (INFO-2) ----------
+    //
+    // `dispatch_gateway` records every proxy outcome against the selected backend's passive health —
+    // EXCEPT a node-wide buffering-overload `503`, a LOCAL pre-dial refusal (no backend was contacted)
+    // tagged `LocalPreDialOverload`, which it must SKIP so the overload never ejects a healthy backend.
+    //
+    // This test exercises the recorded side: a backend-origin `503` DID come from the backend and MUST
+    // be recorded (and, with `max_fails: 1`, ejects it). A two-backend pool makes the ejection
+    // observable — a single ejected backend is kept by the all-ejected fallback, masking the
+    // difference, so we eject one of two and watch it drop out of the healthy candidate set. The
+    // `ProjectOwnWorkload` policy admits the loopback/dead backend addresses without a custom posture
+    // (it is posture-independent by design).
+    //
+    // The complementary case — an overload-tagged `503` must NOT be recorded — is deliberately NOT
+    // asserted here at the dispatch level: the only way to make `proxy_upstream` emit the
+    // `LocalPreDialOverload` tag is to saturate the PROCESS-WIDE `BUFFER_SLOTS`, which the sibling
+    // `native_client_buffer_requests_*` tests also draw from (via `cached_client`'s default handle), so
+    // starving it flakes them under the harness's parallel execution, and `dispatch_gateway` offers no
+    // seam to inject a private semaphore without a refactor outside this hardening's scope. The
+    // tag-producing path itself is covered by `gateway_buffering_cap_503_when_saturated_then_reusable`
+    // (an injected semaphore → `BufferingOverloaded`, which `proxy_upstream` maps to the tagged `503`),
+    // and the skip is a single `extensions().get::<LocalPreDialOverload>().is_none()` guard on that tag.
+
+    /// Bind a socket to grab a free port, then drop it: the address is resolvable + pinnable but has
+    /// no listener, so a connect is refused (and this path only dials the 503 stub anyway).
+    async fn free_dead_addr() -> SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatch_gateway_records_backend_origin_503_against_passive_health() {
+        use boatramp_core::gateway::{LbPolicy, PassiveHealth, Upstream};
+
+        let client_ip: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        let (site_b, proj_b, name_b) = ("dispatch-backend503-site", "proj-b", "up-b");
+        const RESP_503: &[u8] =
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (stub_addr, _rx) = capture_upstream(RESP_503).await;
+        let sb0 = format!("http://127.0.0.1:{}", stub_addr.port());
+        let sb1 = format!("http://127.0.0.1:{}", free_dead_addr().await.port());
+        let up_dispatch = Upstream {
+            targets: vec![sb0.clone(), sb1.clone()],
+            lb: LbPolicy::RoundRobin,
+            max_retries: 0, // single-backend path → candidates[0] = sb0 (the 503 stub)
+            passive_health: Some(PassiveHealth {
+                max_fails: 1,
+                fail_timeout_ms: 60_000,
+            }),
+            ..Default::default()
+        };
+        let get = Request::builder()
+            .method(Method::GET)
+            .uri("http://edge.test/v2/x/blobs/sb")
+            .body(Body::empty())
+            .unwrap();
+        let resp = dispatch_gateway(
+            get,
+            site_b,
+            Some(proj_b),
+            name_b,
+            &up_dispatch,
+            GatewayTargetPolicy::ProjectOwnWorkload,
+            "/v2/x/blobs/sb",
+            client_ip,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the backend-origin 503 propagates to the client"
+        );
+        // The backend-origin 503 WAS recorded (it is NOT tagged `LocalPreDialOverload`): with
+        // `max_fails: 1` the hit backend (sb0) is ejected, so it drops out of the healthy candidate set
+        // when the full set (high retry budget) is requested.
+        let state = gateway::upstream_state(site_b, &format!("p\u{1}{proj_b}\u{1}{name_b}"));
+        let up_observe = Upstream {
+            targets: vec![sb0.clone(), sb1.clone()],
+            lb: LbPolicy::RoundRobin,
+            max_retries: 5,
+            ..Default::default()
+        };
+        let now = std::time::Instant::now();
+        let cands = state.candidates(&[sb0.clone(), sb1.clone()], &up_observe, now, None);
+        assert!(
+            !cands.contains(&sb0),
+            "a backend-origin 503 must be recorded and eject the backend; candidates: {cands:?}"
         );
     }
 

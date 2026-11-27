@@ -25,7 +25,9 @@ versions.
     the flat whole-phase cap as the primary backstop. It cuts a stalled OR a drip-feed
     slow-loris that never idles, while letting a steadily-progressing upload of **any** total
     size finish as long as it clears the floor. Set the floor to `0` to disable it (rely on
-    read-idle only).
+    read-idle only); a positive floor below the **64 B/s minimum-effective** threshold is treated as
+    *near-disabling* (too low to cut a drip) and follows the same rule as a disabled floor — see the
+    validation note below.
   - **absolute ceiling** (`--buffer-total-timeout-ms` / `buffer_total_timeout_ms`, now default
     **1 hour, ON**) — a hard per-connection upper bound on total buffering time regardless of
     throughput. The throughput floor alone leaves a residual gap: a client dripping just over the
@@ -43,15 +45,18 @@ versions.
     buffering operations across all listeners/upstreams; beyond the cap, further buffering fails fast
     with `503 Service Unavailable` (a local pre-dial refusal — it never contacts a backend, so it does
     not affect passive health / eject a backend). Worst-case node temp spill is bounded at
-    `limit × max_buffer_bytes`.
+    `limit × max_buffer_bytes`. A configured `max_concurrent_buffering: 0` is **rejected at config
+    load** (the cap is a DoS bound and cannot be disabled — omit it for the default instead); the
+    runtime keeps a `≥ 1` clamp as defense-in-depth.
 
   Default-off upstreams are unchanged (the new config fields are skipped when unset, so stored
   gateways are byte-identical). Declare-time validation rejects a buffering knob set without
-  `buffer_requests`, a zero read-idle / window, and — to disable the throughput floor
-  (`buffer_min_rate_bytes_per_sec: 0`) — requires an explicit positive absolute ceiling, so the floor
-  and the ceiling can never both be off (that would leave buffering bounded only by the per-read idle
-  timeout). A zero absolute ceiling (`buffer_total_timeout_ms: 0`) now means "ceiling disabled" (the
-  opt-out), not an error.
+  `buffer_requests`, a zero read-idle / window, and — to disable OR near-disable the throughput floor
+  (`buffer_min_rate_bytes_per_sec: 0`, or a positive value below the 64 B/s minimum-effective floor) —
+  requires an explicit positive absolute ceiling, so the floor and the ceiling can never both be off
+  (that would leave buffering bounded only by the per-read idle timeout, letting a ~1 B/s drip hold a
+  slot for years). A zero absolute ceiling (`buffer_total_timeout_ms: 0`) means "ceiling disabled"
+  (the opt-out), not an error.
 
 ## [0.75.0] — 2026-11-26
 
