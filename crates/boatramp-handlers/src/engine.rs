@@ -393,7 +393,14 @@ pub const DEFAULT_DNS_PUBLISH_BUDGET: u32 = 64;
 pub const MAX_CONSUMER_ERROR_LEN: usize = 512;
 
 /// Outcome of a failed invocation.
+///
+/// Sealed `#[non_exhaustive]`: `boatramp-handlers` is a published crate and this enum is re-exported
+/// from its root, so a new variant would otherwise be a breaking change for every downstream match.
+/// Adding `CommitFailed` was already the one such break, so the seal lands with it — every future
+/// variant is now additive. Downstream (cross-crate) exhaustive matches must carry a wildcard `_ =>`
+/// arm mapping an unknown variant to a SAFE 500-class / generic-error outcome (never a silent success).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HandlerError {
     /// The component could not be compiled/instantiated.
     #[error("component compile error: {0}")]

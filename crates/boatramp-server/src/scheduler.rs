@@ -1816,6 +1816,9 @@ pub(super) fn handler_error_response(err: &boatramp_handlers::HandlerError) -> R
         | HandlerError::CommitFailed(_)
         | HandlerError::NoResponse
         | HandlerError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "handler error\n"),
+        // `HandlerError` is `#[non_exhaustive]`: a future variant we do not yet handle maps to the
+        // same 500-class generic error — never a success status.
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "handler error\n"),
     };
     (status, body).into_response()
 }

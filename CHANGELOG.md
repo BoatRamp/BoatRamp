@@ -30,8 +30,15 @@ versions.
   - The by-design commit-condition divergence (an http handler commits unless it traps; a
     consumer/session/tcp handler commits only on an `ok` return, else rolls back and redelivers) is
     now documented in the `sql` handler guide and the `finalize` binding doc.
-  - **Breaking (internal):** `HandlerError` gained a `CommitFailed(String)` variant (the enum is not
-    `#[non_exhaustive]`); exhaustive matches on it must add an arm.
+  - `HandlerError` is now sealed **`#[non_exhaustive]`**. The same cut adds the `CommitFailed(String)`
+    variant, so this is the one breaking event; the seal lands with it so every *future* variant is
+    additive (per the non-exhaustive-public-struct policy). Downstream (cross-crate) exhaustive matches
+    must carry a wildcard `_ =>` arm mapping an unknown variant to a safe 500-class / generic-error
+    outcome (never a silent success); in-crate matches are unaffected.
+  - **Breaking (`boatramp-handlers` published crate → uchron / luigi):** both the new
+    `HandlerError::CommitFailed(String)` variant **and** the `#[non_exhaustive]` seal break any
+    downstream exhaustive `match` on `HandlerError` — such a match must add a wildcard `_ =>` arm
+    (which also absorbs every future variant). Relay to uchron / luigi before they bump.
 
 ## [0.75.0] — 2026-11-26
 

@@ -366,7 +366,9 @@ transaction for a given name, so you can mix them freely.
   not process this, try again": the transaction abort and the redelivery are the same decision.
 
 So a consumer that writes rows and then returns an error leaves **no rows behind** — plan your
-idempotency around redelivery, not around partial writes.
+idempotency around redelivery, not around partial writes. **This "no rows behind" guarantee is the
+guest-`Err` rollback case only** — see the at-least-once caveat below for what a *commit failure*
+redelivers.
 
 **If a commit itself fails** (the backend rejected or dropped it at commit time), the write is
 lost — boatramp never hides this. The failure is logged at `ERROR`, counted on the component's
@@ -376,6 +378,23 @@ The one case it cannot fully recover is a `wasi:http` handler whose response hea
 wire when the commit fails — there the `200` cannot be un-sent, so the failure is logged and metered
 but the client may have seen success. Keep commit-critical work on the consumer path when you need
 that guarantee.
+
+> **At-least-once on a commit failure — it can double-apply.** The rollback-on-`Err` path above
+> leaves no rows behind, but a redelivery caused by a *commit failure* is **at-least-once** and can
+> **apply the same write twice**. Two cases:
+>
+> - **Multiple databases in one invocation.** `finalize` commits each database **independently —
+>   there is no two-phase commit** across them. If the invocation opened DB-A *and* DB-B, DB-A's
+>   commit succeeds, and then DB-B's commit fails, the invocation is failed and the message
+>   redelivers — re-running the handler and **re-applying DB-A's already-committed write**.
+> - **Commit ambiguity.** A commit can land on the server yet report an error back to the host (a
+>   connection drop after the backend durably committed, a timeout on the ack). boatramp must treat
+>   that as a failure and redeliver, so the write that *did* land gets applied again.
+>
+> Therefore **idempotency keys or upserts are required** for any consumer that writes to **more than
+> one database** or whose writes are **not naturally idempotent**. Design the handler so a redelivery
+> that re-applies a committed write is a no-op (e.g. `INSERT ... ON CONFLICT DO NOTHING/UPDATE`,
+> keyed on a message/dedup id), not a duplicate row or a double-counted increment.
 
 ## See also
 

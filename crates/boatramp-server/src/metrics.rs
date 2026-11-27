@@ -77,6 +77,9 @@ impl Outcome {
             Err(HandlerError::Compile(_))
             | Err(HandlerError::NoResponse)
             | Err(HandlerError::Internal(_)) => Self::Error,
+            // `HandlerError` is `#[non_exhaustive]`: an unknown future variant classifies as the
+            // generic error bucket (a 500-class failure), never as `Ok`.
+            Err(_) => Self::Error,
         }
     }
 
