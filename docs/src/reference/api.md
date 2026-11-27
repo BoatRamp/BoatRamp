@@ -588,6 +588,25 @@ Top-level (`default`-project) function and workflow endpoints; the
 | `POST` | `/api/workflows/:name/runs` | Start a workflow run. |
 | `GET` | `/api/workflows/:name/runs/:id` | Get one workflow run. |
 
+## Run streaming
+
+The **external run front door**: an authenticated non-guest client (an MCP app, a
+GraphQL client — anything that is not a wasm guest) STARTs a durable run, ATTACHes to
+its event stream (resumably), and CANCELs it. START is RBAC-gated like an invoke; it
+mints a **run-scoped capability token** (fleet-signed, bound to exactly one `{run_id,
+tenant-scope, rights}`, audience-bound to the project, short-TTL) and returns it as
+`attach_token`. ATTACH/CANCEL carry no project right — they present that token as
+`Authorization: Bearer <attach_token>` and self-verify it fail-closed, so a token for
+one run can never reach another run or tenant. Behind the **off-by-default** posture
+`allow_guest_run_streaming` + the `run-streaming` feature (every door `403` when off);
+a non-issuing node (no fleet signer) returns `501` at START. Since 0.76.0.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/projects/:project/runs` | **Start** a run in the caller's tenant (`Project·Deploy`). Dispatches a start-message tagged with the `run_id` to the target's bus topic; returns `{ run_id, attach_token }`. |
+| `GET` | `/api/projects/:project/runs/:run_id/events` | **Attach** to the run's event stream — SSE (default) / **WebSocket** on `Upgrade` / long-poll (`?wait_ms`), resumable by `?after_seq` or `Last-Event-ID`. Authed by the run-scoped capability token (RBAC-ungated). |
+| `POST` | `/api/projects/:project/runs/:run_id/cancel` | **Cancel** the run (terminal `cancelled`). Same run-scoped-token auth. |
+
 ## Compute
 
 Top-level paths target the `default` project; `/api/projects/:project/compute/…`
@@ -853,7 +872,7 @@ Present with the `handlers` feature.
 | `POST` | `/api/sites/:site/_boatramp/dlq` | Dead-letter-queue operations. |
 | `GET`/`POST` | `/api/projects/:project/_boatramp/bus/dlq` | Shared **project-bus** DLQ: inspect (`Project·Read`) / purge·redrive·discard (`Project·Admin`). Since 0.4.24. |
 | `GET` | `/api/projects/:project/_boatramp/bus/queue/{peek,replay,groups}` | Project-bus live-queue inspection (`Project·Read`). Since 0.4.24. |
-| `POST` | `/api/projects/:project/_boatramp/bus/queue/{group,pause}` | Project-bus group reset·delete / pause·resume (`Project·Admin`). Since 0.4.24. |
+| `POST` | `/api/projects/:project/_boatramp/bus/queue/{group,pause,policy,purge}` | Project-bus group reset·delete / pause·resume / flow-control policy / destructive work-queue purge (`Project·Admin`). `group`/`pause`/`policy` since 0.4.24; `purge` since 0.76.0. |
 | `GET` | `/api/functions/:name/_boatramp/logs` | Captured per-function guest logs (project-owned read). Since 0.3.17. |
 | `GET` | `/api/functions/:name/_boatramp/logs/stream` | Stream per-function logs (SSE). Since 0.3.17. |
 

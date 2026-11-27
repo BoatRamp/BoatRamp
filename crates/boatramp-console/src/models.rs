@@ -95,7 +95,7 @@ pub struct FunctionSummary {
 /// shaped as an object so it can grow build metadata without breaking clients).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct NodeVersion {
-    /// The workspace version every crate shares, e.g. `"0.15.0"`.
+    /// The workspace version every crate shares, e.g. `"0.76.0"`.
     pub version: String,
 }
 
