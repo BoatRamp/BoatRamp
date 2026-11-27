@@ -21,9 +21,11 @@ versions.
   advertised Experimental) ⇒ needs a `boatramp-uchron-shim` rev to expose it to guests.
   - **The run scope + envelope (core).** A run is its OWN durable grouped topic under a reserved,
     tenancy-fenced namespace — `{project}/.boatramp-run/{scope}/{run_id}` — **structurally
-    unreachable by any guest messaging producer** (a producer can name only `{project}/bus/…` or its
-    private `{project}/{site}/…`; a site/project slug can never begin with `.`, and `.boatramp*` is a
-    reserved object-key segment). The scope segment is composed by the HOST from the invocation's
+    unreachable by any guest messaging producer**: the host roots every guest topic under a host-chosen
+    prefix (`{project}/bus/` for a `bus:<topic>`, else the component-private `{project}/{site}/`) with
+    the guest's string riding only as an opaque suffix, so a guest topic can never reach the sibling
+    `{project}/.boatramp-run/…` root (the host-rooting-prefix invariant — the guest publish path runs
+    no object-key check). The scope segment is composed by the HOST from the invocation's
     resolved own-tenant (`t_{tenant}`, or `u` untenanted), so a `run_id` from tenant A composes a
     different key under tenant B — cross-tenant reach is structurally impossible (and the `run_id` is
     a 128-bit-random, unguessable token on top). Typed envelope
@@ -36,11 +38,24 @@ versions.
     log skipping `seq ≤ after-seq`, then tails — lossless, in `seq` order. **Cancellation, both
     modes:** explicit `cancel`, and DROP-CANCEL (default) when an attacher drops before a terminal
     event; either emits the distinct terminal `cancelled` envelope AND makes the emitting agent's next
-    `emit`/`status` observe the stop (so it does not keep burning compute).
+    `emit`/`status` observe the stop (so it does not keep burning compute). A run is **single-emitter**
+    (one run ⇔ one task): attach delivers in `seq` order and ends on the first terminal, so concurrent
+    emitters to one run can interleave/race — fan-in several producers onto a `bus:` topic instead.
   - **Extends, does not duplicate.** The engine (`boatramp-server`) reuses the unchanged
     `claim_grouped` / `ack` / lease / retained-log core and the shared durable claim pump; it adds
     only the per-run correlation scope, the envelope, the `seq` allocator, and cancellation. P2 (the
     external HTTP front door + a run-scoped token) and the sync-handler emit path (P1b) layer on top.
+  - **P1 Security-review hardening (fail-closed).** Folded in from the SHIP-WITH-FIXES review:
+    (1) **fail-close an untenanted run under a multi-tenant posture** — when a node is multi-tenant but
+    no own-tenant resolves (anonymous, a capability funnel, cron/system, empty-tenant), the run grant is
+    REFUSED rather than collapsed into the shared per-project `u` scope (a cross-tenant reach); the
+    resolved tenant is also screened as a clean key segment (def-in-depth, matching the blob container
+    path). (2) **per-run log cap** — a run may emit at most `RUN_MAX_EVENTS` (100 000) non-terminal
+    events; a further `progress` emit fails closed while a terminal emit is always admitted, bounding
+    the retained log (the per-event 1 MiB cap did not bound a run's total). (3) **ephemeral attach-group
+    cleanup** — the fresh consumer group each `attach` opens is deleted on stream end/drop, so repeated
+    attach/detach no longer leaks group state. (The terminal+idle-run TTL/sweep remains a tracked P2
+    enable-precondition.)
 
 ## [0.75.0] — 2026-11-26
 

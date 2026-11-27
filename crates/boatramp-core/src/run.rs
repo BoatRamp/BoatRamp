@@ -19,13 +19,22 @@
 //! ```
 //!
 //! - `{project}` is the project-qualified root (the same root [`bus_namespace`] builds on).
-//! - `.boatramp-run` is a RESERVED path segment. A guest's `wasi:messaging` producer can name only
-//!   `{project}/bus/…` (`bus:<topic>`) or its component-private `{project}/{site}/…` namespace; a
-//!   site/project name is a strict slug that can NEVER begin with `.` (see
-//!   [`validate_resource_name`](crate::project::validate_resource_name)), and `.boatramp*` is itself
-//!   a reserved object-key segment (see [`validate_object_key`](crate::project::validate_object_key)).
-//!   So no guest producer — and no authenticated external bus consumer, which screens the topic with
-//!   `validate_object_key` AND is rooted at `{project}/bus/` — can ever address a run topic.
+//! - `.boatramp-run` is a RESERVED path segment, immediately below the project root and a SIBLING of
+//!   the `{project}/bus/…` and component-private `{project}/{site}/…` namespaces a guest can reach.
+//!   The guest-unreachability guarantee on the `wasi:messaging` PUBLISH path is the **host-rooting
+//!   prefix + opaque-key** invariant — NOT an object-key check. The host prepends a host-chosen root
+//!   to every guest topic (`{project}/bus/` for a `bus:<topic>`, else the component-private
+//!   `{project}/{site}/`) and the guest's string rides only as an opaque SUFFIX (see
+//!   `MessagingHost::resolve_topic` in `boatramp-handlers`). The guest controls neither the leading
+//!   project segment nor the root segment after it (always `bus` or a `{site}` slug — a strict slug
+//!   that can NEVER begin with `.`, see
+//!   [`validate_resource_name`](crate::project::validate_resource_name)), so a guest topic composes
+//!   to `{project}/bus/<anything>` or `{project}/{site}/<anything>` and can never reach the sibling
+//!   `{project}/.boatramp-run/…`. (The `.boatramp*` object-key reservation —
+//!   [`validate_object_key`](crate::project::validate_object_key) — is a SEPARATE backstop on the
+//!   authenticated EXTERNAL bus-consumer path, which screens the topic AND is rooted at
+//!   `{project}/bus/`. The guest publish path does NOT call it, so this fence must not rely on it —
+//!   a future refactor of the reserved-key check must not weaken the run keyspace.)
 //! - `{scope}` fences the run to its creator's **tenant** (see [`run_scope_segment`]): a run created
 //!   by tenant A is keyed under A's scope, so a `run_id` presented by tenant B composes to a DIFFERENT
 //!   key (B's scope) that does not exist — cross-tenant reach is structurally impossible, and the
@@ -37,14 +46,28 @@
 //! durability (lease / ack / retained log / at-least-once) is inherited from the unchanged
 //! `claim_grouped` core — this module adds only the correlation scope, the envelope, and the
 //! per-run state.
+//!
+//! # Single-emitter model (one run ⇔ one task)
+//! A run is **single-emitter** by design: exactly one task emits to a given run over its lifetime.
+//! An attach delivers that run's events in `seq` order and ENDS on the FIRST terminal event. The `seq`
+//! allocator ([`RunState::next_seq`], a CAS) keeps every reserved `seq` unique and monotonic even
+//! under concurrent emitters, but two tasks emitting to the SAME run is NOT a supported pattern: their
+//! events can interleave in an order neither intends, and whichever emits a terminal first concludes
+//! the run and ends every attach (the other emitter then observes the stop). A fan-in of several
+//! producers belongs on its own `bus:` topic with a consumer that drives one run. (P2's run-scoped
+//! token is minted for one run ⇒ one emitting task, reinforcing this model at the external door.)
 
 use serde::{Deserialize, Serialize};
 
 use crate::time::now_unix_ms;
 
-/// The reserved namespace segment a run topic is rooted under, immediately below the project root.
-/// A guest producer can never name it (a site/project slug cannot begin with `.`, and `.boatramp*`
-/// is a reserved object-key segment), so the whole run keyspace is unreachable from the data plane.
+/// The reserved namespace segment a run topic is rooted under, immediately below the project root —
+/// a SIBLING of the `{project}/bus/…` and `{project}/{site}/…` namespaces. A guest `wasi:messaging`
+/// producer can never address it: the host roots every guest topic under a host-chosen prefix
+/// (`{project}/bus/` or the component-private `{project}/{site}/`) with the guest string as an opaque
+/// suffix, so a guest topic can never reach this sibling root (the host-rooting-prefix invariant — NOT
+/// an object-key check, which the guest publish path does not run). So the whole run keyspace is
+/// unreachable from the data plane.
 pub const RUN_NAMESPACE: &str = ".boatramp-run";
 
 /// The durable **retention** consumer group seeded at run-create. Registering it makes every emit
@@ -57,18 +80,65 @@ pub const RUN_RETENTION_GROUP: &str = "ret";
 /// opaque JSON bytes supplied by the guest; a larger one is refused at emit ([`RunError::Invalid`]).
 pub const RUN_PAYLOAD_MAX: usize = 1024 * 1024;
 
+/// Per-run cap on the number of NON-terminal (`progress`) events a run may emit (P1 Security #3a).
+///
+/// The [`RUN_PAYLOAD_MAX`] cap is PER-EVENT, so without a per-run ceiling a granted emitter could grow
+/// a run's retained log without bound (in P1 the retained log is pinned by the never-advanced
+/// retention group and has no TTL — the terminal+idle sweep is the deferred P2 enable-gate). This caps
+/// the retained log at `RUN_MAX_EVENTS` progress events + at most one terminal event, so a run's log is
+/// bounded by `RUN_MAX_EVENTS * RUN_PAYLOAD_MAX`. The engine enforces it at the `seq` allocator: a
+/// `progress` emit at/over the cap fails closed ([`RunError::Invalid`]); a TERMINAL emit (`result` /
+/// `error` / `end` / `cancelled`) is ALWAYS admitted so a capped run can still conclude or be
+/// cancelled. The default is generous for any legitimate run (≈ a full day of once-a-second progress)
+/// and is a safety ceiling against a misbehaving granted emitter, not a tuning knob (the capability is
+/// posture-OFF by default; P1 adds no operator override).
+pub const RUN_MAX_EVENTS: u64 = 100_000;
+
 /// The tenancy **scope segment** of a run topic, composed by the HOST from THIS invocation's resolved
 /// own-tenant (never guest-supplied). A resolved tenant `t` maps to `t_{t}`; an unresolved tenant (a
 /// single-tenant / unscoped invocation) maps to the fixed sentinel `u`. The `t_` prefix is
 /// host-added, so a tenanted scope is always `t_…` and the untenanted scope is exactly `u` — the two
 /// spaces are disjoint, and two distinct tenants map to distinct scopes, so a run is reachable ONLY by
 /// its own tenant (a different resolved tenant composes a different key).
+///
+/// This is a pure composer: it does NOT screen the tenant. Callers that take an untrusted/host-resolved
+/// tenant go through [`run_grant_scope`], which screens the tenant as a clean key segment and
+/// fail-closes an untenanted run under a multi-tenant posture.
 #[must_use]
 pub fn run_scope_segment(resolved_tenant: Option<&str>) -> String {
     match resolved_tenant {
         Some(tenant) => format!("t_{tenant}"),
         None => "u".to_string(),
     }
+}
+
+/// Decide a run grant's scope segment, fail-closed (P1 Security #2 + #5). Returns `Some(scope)` to
+/// BUILD the run engine for this invocation, or `None` to REFUSE the grant entirely (the host then
+/// does not bake a run binding, so every run op fails `access-denied`).
+///
+/// - **#5 def-in-depth — screen the resolved tenant.** The resolved own-tenant is screened as a clean
+///   key segment ([`validate_key_segment`](crate::project::validate_key_segment), the same check the
+///   blob container path runs) before it is ever composed into `t_{tenant}`. An unscreenable tenant
+///   (one that could reshape the key — a path separator, `*`, control/whitespace) is treated as
+///   NO-resolved-tenant, fail-closed.
+/// - **#2 fail-close an untenanted run under a multi-tenant posture.** When the node is multi-tenant
+///   (`multi_tenant`) and no own-tenant resolved (anonymous, a capability FUNNEL — a `TargetTenant`
+///   with no own `Tenant` → `None` —, cron/system, empty-tenant, or an unscreenable tenant from the
+///   step above), the run would otherwise collapse into the SHARED per-project `u` scope — a
+///   cross-tenant reach (two distinct funnels would both land in `u`). It is REFUSED. This mirrors the
+///   tenant-secrets hard-fail-on-no-resolved-tenant precedent and the blob multi-tenant deny-default.
+/// - **Single-tenant / dev** (`!multi_tenant`) keeps the `u` scope for an untenanted run — one tenant,
+///   so `u` is safe.
+#[must_use]
+pub fn run_grant_scope(multi_tenant: bool, resolved_tenant: Option<&str>) -> Option<String> {
+    // #5: screen the resolved tenant as a clean key segment; an unscreenable one ⇒ no-resolved-tenant.
+    let screened =
+        resolved_tenant.filter(|t| crate::project::validate_key_segment("tenant", t).is_ok());
+    // #2: under a multi-tenant posture an untenanted run would share the per-project `u` scope → deny.
+    if multi_tenant && screened.is_none() {
+        return None;
+    }
+    Some(run_scope_segment(screened))
 }
 
 /// The durable topic for a run — tenancy-fenced and structurally unreachable by any guest producer
@@ -305,6 +375,59 @@ mod tests {
         assert_ne!(tenanted_u, untenanted);
         assert_eq!(untenanted, "acme/.boatramp-run/u/RID");
         assert_eq!(tenanted_u, "acme/.boatramp-run/t_u/RID");
+    }
+
+    #[test]
+    fn run_grant_scope_fail_closes_untenanted_under_multi_tenant() {
+        // #2: under a multi-tenant posture, a None resolved tenant (anonymous, capability-funnel,
+        // cron/system, empty-tenant) is REFUSED — no scope, so the host builds no run engine.
+        assert_eq!(run_grant_scope(true, None), None);
+        // A properly tenanted run under multi-tenant gets its own disjoint `t_…` scope.
+        assert_eq!(
+            run_grant_scope(true, Some("firm-a")).as_deref(),
+            Some("t_firm-a")
+        );
+        // Single-tenant / dev keeps `u` for an untenanted run — one tenant, so `u` is safe.
+        assert_eq!(run_grant_scope(false, None).as_deref(), Some("u"));
+        assert_eq!(run_grant_scope(false, Some("x")).as_deref(), Some("t_x"));
+    }
+
+    #[test]
+    fn run_grant_scope_screens_the_resolved_tenant() {
+        // #5 def-in-depth: a tenant that could reshape the key (path separator / `*` / control /
+        // whitespace / `.`/`..`) is unscreenable ⇒ treated as no-resolved-tenant, fail-closed.
+        for dirty in ["a/b", "a\\b", "with*star", "sp ace", ".", "..", "ctl\u{0}x"] {
+            // Under multi-tenant an unscreenable tenant is REFUSED (it cannot be safely scoped, and it
+            // must not collapse into the shared `u` space).
+            assert_eq!(
+                run_grant_scope(true, Some(dirty)),
+                None,
+                "dirty tenant {dirty:?} must be refused under multi-tenant"
+            );
+            // Under single-tenant it degrades to the safe `u` sentinel rather than `t_<garbage>` (the
+            // garbage never reaches the key), matching the blob container-screen behavior.
+            assert_eq!(
+                run_grant_scope(false, Some(dirty)).as_deref(),
+                Some("u"),
+                "dirty tenant {dirty:?} must not shape a key under single-tenant"
+            );
+        }
+        // A real-world tenant slug (`@`/`.`/`-` are allowed) screens cleanly to its own scope.
+        assert_eq!(
+            run_grant_scope(true, Some("firm-a@x.com")).as_deref(),
+            Some("t_firm-a@x.com")
+        );
+    }
+
+    #[test]
+    fn two_distinct_funnels_cannot_share_a_run_under_multi_tenant() {
+        // The hazard the #2 fix closes: two DIFFERENT end-tenants funnelled through a capability that
+        // resolves NO own-tenant both compose the SAME untenanted scope (`u`) — a shared space.
+        assert_eq!(run_scope_segment(None), run_scope_segment(None));
+        assert_eq!(run_scope_segment(None), "u");
+        // With the fix, under a multi-tenant posture neither funnel is granted a run at all, so the
+        // shared `u` space is never reachable — the collision is structurally impossible.
+        assert_eq!(run_grant_scope(true, None), None);
     }
 
     #[test]

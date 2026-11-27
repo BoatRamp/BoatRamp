@@ -2916,19 +2916,24 @@ pub(super) async fn build_bindings(
     // (`handler_caller_tenant` non-empty). The resolved own tenant is
     // `resolved_tenant_string(&handler_caller_tenant)` (the OWN-`Tenant` axis only; `None` for a
     // target/anon/unscoped invocation ⇒ `{tenant}` entries fail closed).
-    if granted("wasi:blobstore") {
+    // Multi-tenant posture (Security MEDIUM-1), computed ONCE here and shared by the `wasi:blobstore`
+    // and `run` grants below (both deny-default when the site is multi-tenant but no own-tenant
+    // resolved). Only a SCOPING tenancy (`Scoped`/`Target`) makes the site multi-tenant; an explicit
+    // `Tenancy::Disabled` is deliberate single-tenant — `Some(..)` but NOT multi-tenant (so the
+    // deny-default must not fire for a Disabled guest) — and `!handler_caller_tenant.is_empty()` stays
+    // false under Disabled (it resolves to no facts). A confining `HostTenancy`
+    // (`handler_caller_tenant` non-empty) also makes it multi-tenant.
+    let multi_tenant = {
         use boatramp_core::tenancy::Tenancy;
-        let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
-        // Security MEDIUM-1: only a SCOPING tenancy (`Scoped`/`Target`) makes the site multi-tenant.
-        // An explicit `Tenancy::Disabled` is deliberate single-tenant — `Some(..)` but NOT multi-tenant
-        // (so the deny-default must not fire for a Disabled blob guest). `!handler_caller_tenant`
-        // -`.is_empty()` stays false under Disabled (it resolves to no facts).
         let scoping = |t: Option<&Tenancy>| {
             matches!(t, Some(Tenancy::Scoped { .. } | Tenancy::Target { .. }))
         };
-        let multi_tenant = scoping(handler_tenancy)
+        scoping(handler_tenancy)
             || scoping(site_handlers.tenancy.as_ref())
-            || !handler_caller_tenant.is_empty();
+            || !handler_caller_tenant.is_empty()
+    };
+    if granted("wasi:blobstore") {
+        let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
         // UX (C4): a multi-tenant site that grants `wasi:blobstore` without declaring an allowlist
         // will DENY every container op — surface it loudly at bind so operators find affected
         // handlers, naming the one-line remedy.
@@ -3042,23 +3047,41 @@ pub(super) async fn build_bindings(
     // neither — it supplies only a `run-id`), so a run is reachable ONLY by its own tenant: a `run-id`
     // from tenant A composes a DIFFERENT (B-scoped) key that does not exist. Deny-by-default: needs the
     // `run` import ∩ the site allowlist AND the messaging substrate; the node posture
-    // `allow_guest_run_streaming` is the final gate (applied at link). A `None` resolved tenant maps to
-    // the untenanted scope (single-tenant parity). The `seq` allocator + per-run state live in the
-    // control-plane KV (`inner.kv`); the retained event log lives in the messaging substrate.
+    // `allow_guest_run_streaming` is the final gate (applied at link). The `seq` allocator + per-run
+    // state live in the control-plane KV (`inner.kv`); the retained event log lives in the messaging
+    // substrate.
+    //
+    // Security #2 + #5 (fail-closed tenancy): `run_grant_scope` screens the resolved own-tenant as a
+    // clean key segment (an unscreenable tenant ⇒ no-resolved-tenant) and, under a MULTI-TENANT
+    // posture, REFUSES an untenanted run (`None` scope) — otherwise every untenanted class (anonymous,
+    // a capability FUNNEL with a `TargetTenant` but no own `Tenant`, cron/system, empty-tenant) would
+    // collapse into the SHARED per-project `u` scope, a cross-tenant reach. On a refusal we do NOT bake
+    // the run binding, so every run op fails `access-denied`. Single-tenant / dev keeps `u` (safe).
     #[cfg(feature = "run-streaming")]
     if granted("run")
         && let Some(messaging) = &inner.messaging
     {
         let resolved_tenant =
             super::function_runtime::resolved_tenant_string(&handler_caller_tenant);
-        let run_scope = boatramp_core::run::run_scope_segment(resolved_tenant.as_deref());
-        let engine = crate::RunEngine::new(
-            messaging.clone(),
-            inner.kv.clone(),
-            project.as_str(),
-            run_scope,
-        );
-        bindings = bindings.with_run(std::sync::Arc::new(crate::RunStoreImpl::new(engine)));
+        match boatramp_core::run::run_grant_scope(multi_tenant, resolved_tenant.as_deref()) {
+            Some(run_scope) => {
+                let engine = crate::RunEngine::new(
+                    messaging.clone(),
+                    inner.kv.clone(),
+                    project.as_str(),
+                    run_scope,
+                );
+                bindings = bindings.with_run(std::sync::Arc::new(crate::RunStoreImpl::new(engine)));
+            }
+            None => {
+                tracing::warn!(
+                    project = %project.as_str(),
+                    site,
+                    "refusing the run capability for an untenanted invocation under a multi-tenant \
+                     posture (an untenanted run would share the per-project `u` scope across tenants)"
+                );
+            }
+        }
     }
     // The per-tenant sealed-secret capability (task #493): read/write secrets sealed to THIS
     // invocation's resolved OWN-tenant. Two INDEPENDENT rights — `tenant-secrets:read` (get/list)

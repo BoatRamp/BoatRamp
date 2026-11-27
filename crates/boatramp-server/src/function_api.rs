@@ -1112,6 +1112,13 @@ mod tests {
             host.contains(&"egress-register"),
             cfg!(feature = "egress-register")
         );
+        // The `run` (durable run-streaming, PLAN-run-streaming P1) capability is cargo-gated:
+        // advertised iff this build enabled the `run-streaming` feature. A lean host that cannot serve
+        // it must NOT advertise it, so a guest's `requires = ["run"]` fails loud on a pre-feature host
+        // and is admitted on a supporting one — its absence would be a fail-OPEN admission gap. This is
+        // the SAME CI consistency gate that caught the v0.75 `egress-register` advertisement gap
+        // (LOW-PIN-1).
+        assert_eq!(host.contains(&"run"), cfg!(feature = "run-streaming"));
         // The gated `wasi:sockets` outbound-TCP capability (PLAN-handler-tcp-egress) is advertised
         // whenever handlers are compiled (the socket host is always linked), so a guest's
         // `requires = ["wasi:sockets"]` is admitted on a supporting host and refused cleanly on one
@@ -1161,6 +1168,14 @@ mod tests {
         assert_eq!(
             lifecycle("egress-register"),
             cfg!(feature = "egress-register").then_some(super::Lifecycle::Experimental)
+        );
+        // `run` is a KNOWN_IMPORT but, when advertised (feature on), it is Experimental — NOT the
+        // blanket-Stable auto-map lifecycle (P2 adds the external front door + run-scoped token). Feature
+        // off ⇒ absent (`None`). A regression that re-admits it to the Stable auto-map (or drops the
+        // cargo gate) is caught here.
+        assert_eq!(
+            lifecycle("run"),
+            cfg!(feature = "run-streaming").then_some(super::Lifecycle::Experimental)
         );
         // The admission filter keeps only requirements the host cannot satisfy.
         let unmet: Vec<&str> = ["sql", "streaming", "quantum-teleport", "warp-drive"]

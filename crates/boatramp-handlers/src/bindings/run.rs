@@ -64,6 +64,11 @@ pub struct RunAttachStream {
     /// Called once, on resource drop, IFF no terminal event was delivered (implements drop-cancel).
     /// `None` when drop-cancel is not armed for this run.
     drop_cancel: Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>,
+    /// Called once, UNCONDITIONALLY on resource drop (P1 Security #3b): deletes the ephemeral
+    /// per-attach consumer group the engine opened for this stream, so repeated attach/detach does not
+    /// leak that group's `gstate`/delivery records. `None` for an attach that opened no group (e.g. an
+    /// already-terminal run served an empty stream, or a stub).
+    cleanup: Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>,
     /// Set once a terminal envelope has been delivered — suppresses drop-cancel on drop.
     terminal_seen: bool,
     /// Set once the stream has ended (a terminal, an error, or end-of-stream).
@@ -71,15 +76,18 @@ pub struct RunAttachStream {
 }
 
 impl RunAttachStream {
-    /// Build an attach from the server's stream + optional drop-cancel hook.
+    /// Build an attach from the server's stream + optional drop-cancel hook + optional group-cleanup
+    /// hook (the ephemeral per-attach consumer group is deleted on drop — Security #3b).
     #[must_use]
     pub fn new(
         stream: futures::stream::BoxStream<'static, Result<RunEnvelope, RunStoreError>>,
         drop_cancel: Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>,
+        cleanup: Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>,
     ) -> Self {
         Self {
             stream,
             drop_cancel,
+            cleanup,
             terminal_seen: false,
             ended: false,
         }
@@ -111,13 +119,18 @@ impl RunAttachStream {
         }
     }
 
-    /// Called when the guest drops the attach resource: if no terminal event was delivered and
-    /// drop-cancel is armed, cancel the run (so a long-lived emitter stops).
+    /// Called when the guest drops the attach resource. Two independent finalizers, each fired at most
+    /// once: (1) DROP-CANCEL — if no terminal event was delivered and drop-cancel is armed, cancel the
+    /// run (so a long-lived emitter stops); (2) GROUP CLEANUP (Security #3b) — UNCONDITIONALLY delete
+    /// the ephemeral per-attach consumer group, so repeated attach/detach does not leak `gstate`.
     pub async fn on_drop(&mut self) {
         if !self.terminal_seen
             && let Some(hook) = self.drop_cancel.take()
         {
             hook().await;
+        }
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup().await;
         }
     }
 }
@@ -401,7 +414,7 @@ mod tests {
             let stream = futures::stream::iter(vec![Ok(env)]).boxed();
             let cancelled = Arc::new(());
             let _ = cancelled; // placeholder
-            Ok(RunAttachStream::new(stream, None))
+            Ok(RunAttachStream::new(stream, None, None))
         }
         async fn cancel(&self, run_id: &str) -> Result<(), RunStoreError> {
             *self.cancelled.lock().unwrap() = true;
@@ -486,7 +499,7 @@ mod tests {
             payload: vec![],
         };
         let stream = futures::stream::iter(vec![Ok(env)]).boxed();
-        let mut attach = RunAttachStream::new(stream, Some(hook));
+        let mut attach = RunAttachStream::new(stream, Some(hook), None);
         // Read the non-terminal event, then drop WITHOUT reading a terminal.
         let _ = attach.next().await.unwrap().unwrap();
         attach.on_drop().await;
@@ -511,12 +524,46 @@ mod tests {
             payload: vec![],
         };
         let stream = futures::stream::iter(vec![Ok(term)]).boxed();
-        let mut attach = RunAttachStream::new(stream, Some(hook));
+        let mut attach = RunAttachStream::new(stream, Some(hook), None);
         let _ = attach.next().await.unwrap().unwrap(); // terminal
         attach.on_drop().await;
         assert!(
             !*fired.lock().unwrap(),
             "no drop-cancel after a terminal event was delivered"
+        );
+    }
+
+    /// Security #3b: the group-cleanup hook fires on `on_drop` UNCONDITIONALLY — even after a terminal
+    /// event was delivered (so drop-cancel is suppressed). The ephemeral per-attach consumer group
+    /// must always be deleted, whether the stream ended on a terminal or was dropped early.
+    #[tokio::test]
+    async fn cleanup_hook_fires_on_drop_even_after_a_terminal() {
+        let cancel_fired = Arc::new(Mutex::new(false));
+        let clean_fired = Arc::new(Mutex::new(false));
+        let cf = cancel_fired.clone();
+        let kf = clean_fired.clone();
+        let drop_cancel: Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send> =
+            Box::new(move || Box::pin(async move { *cf.lock().unwrap() = true }));
+        let cleanup: Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send> =
+            Box::new(move || Box::pin(async move { *kf.lock().unwrap() = true }));
+        let term = RunEnvelope {
+            run_id: "r".into(),
+            seq: 0,
+            kind: RunEventKind::End,
+            timestamp_ms: 1,
+            payload: vec![],
+        };
+        let stream = futures::stream::iter(vec![Ok(term)]).boxed();
+        let mut attach = RunAttachStream::new(stream, Some(drop_cancel), Some(cleanup));
+        let _ = attach.next().await.unwrap().unwrap(); // terminal delivered
+        attach.on_drop().await;
+        assert!(
+            !*cancel_fired.lock().unwrap(),
+            "drop-cancel is suppressed after a terminal"
+        );
+        assert!(
+            *clean_fired.lock().unwrap(),
+            "group cleanup fires regardless of the terminal"
         );
     }
 }

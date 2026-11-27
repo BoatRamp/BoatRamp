@@ -40,8 +40,9 @@ use boatramp_core::config::{StartPosition, SubscriptionParams};
 use boatramp_core::kv::KvStore;
 use boatramp_core::messaging::{ClaimedMessage, Messaging, Wake};
 use boatramp_core::run::{
-    RUN_PAYLOAD_MAX, RUN_RETENTION_GROUP, RunEnvelope, RunError, RunEventKind, RunState, RunStatus,
-    decode_envelope, encode_envelope, mint_run_id, run_state_key, run_topic, validate_run_id,
+    RUN_MAX_EVENTS, RUN_PAYLOAD_MAX, RUN_RETENTION_GROUP, RunEnvelope, RunError, RunEventKind,
+    RunState, RunStatus, decode_envelope, encode_envelope, mint_run_id, run_state_key, run_topic,
+    validate_run_id,
 };
 use boatramp_core::time::now_unix_ms;
 use futures::StreamExt;
@@ -67,6 +68,10 @@ pub struct EngineAttach {
     /// Whether this run has drop-cancel armed — the caller cancels the run if the attacher drops
     /// before a terminal event.
     pub drop_cancel_armed: bool,
+    /// Delete the ephemeral per-attach consumer group this attach opened, invoked once on stream
+    /// end/drop (P1 Security #3b — so repeated attach/detach does not leak group `gstate`). `None`
+    /// when the attach opened no group (the already-terminal empty-stream fast path).
+    pub cleanup: Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>,
 }
 
 /// The durable run engine, baked to one invocation's resolved `(project, scope)`. Cheap to clone
@@ -81,6 +86,10 @@ pub struct RunEngine {
     /// The tenancy scope segment (`boatramp_core::run::run_scope_segment`) — host-composed from the
     /// invocation's resolved own-tenant, never guest input.
     scope: String,
+    /// Per-run cap on NON-terminal (`progress`) events (P1 Security #3a), defaulting to
+    /// [`RUN_MAX_EVENTS`]. A `progress` emit at/over the cap fails closed; a terminal emit is always
+    /// admitted. A field (not the bare const) so tests can exercise the boundary with a small ceiling.
+    max_events: u64,
 }
 
 impl RunEngine {
@@ -97,6 +106,7 @@ impl RunEngine {
             kv,
             project_qualified: project_qualified.into(),
             scope: scope.into(),
+            max_events: RUN_MAX_EVENTS,
         }
     }
 
@@ -164,7 +174,11 @@ impl RunEngine {
     /// (the stop signal). Returns the reserved `seq`. The status is NOT changed here — a terminal
     /// transition is finalized AFTER the terminal envelope is durably published (so an attacher always
     /// finds the terminal envelope, and emit-after-terminal is refused).
-    async fn reserve_seq(&self, state_key: &str) -> Result<u64, RunError> {
+    ///
+    /// `is_terminal` is the kind being emitted: a NON-terminal (`progress`) emit at/over the per-run
+    /// [`max_events`](Self::max_events) cap fails closed ([`RunError::Invalid`], Security #3a), while a
+    /// terminal emit is ALWAYS admitted so a capped run can still conclude or be cancelled.
+    async fn reserve_seq(&self, state_key: &str, is_terminal: bool) -> Result<u64, RunError> {
         loop {
             let Some((state, raw)) = self.load_state(state_key).await? else {
                 return Err(RunError::NotFound);
@@ -173,6 +187,15 @@ impl RunEngine {
                 RunStatus::Active => {}
                 RunStatus::Cancelled => return Err(RunError::Cancelled),
                 RunStatus::Ended | RunStatus::Errored => return Err(RunError::Terminal),
+            }
+            // #3a per-run log cap: bound retained-log growth by refusing a progress emit once the run
+            // has reached its event ceiling. A terminal emit is exempt (a run must always be able to
+            // conclude / be cancelled), so the log is bounded by `max_events` progress + one terminal.
+            if !is_terminal && state.next_seq >= self.max_events {
+                return Err(RunError::Invalid(format!(
+                    "run reached its {}-event log cap",
+                    self.max_events
+                )));
             }
             let seq = state.next_seq;
             let next = RunState {
@@ -247,7 +270,7 @@ impl RunEngine {
         }
         let topic = self.topic(run_id);
         let state_key = run_state_key(&topic);
-        let seq = self.reserve_seq(&state_key).await?;
+        let seq = self.reserve_seq(&state_key, kind.is_terminal()).await?;
         let env = RunEnvelope {
             run_id: run_id.to_string(),
             seq,
@@ -316,6 +339,7 @@ impl RunEngine {
             return Ok(EngineAttach {
                 stream: empty,
                 drop_cancel_armed: false, // already terminal — nothing to drop-cancel
+                cleanup: None,            // no ephemeral group opened on the empty-stream fast path
             });
         }
 
@@ -323,6 +347,19 @@ impl RunEngine {
         // `earliest` so it replays the whole retained log, filtered by `after_seq`. The retention
         // group keeps the log retained regardless of this group's acks.
         let group = format!("a{}", mint_run_id().replace('-', ""));
+        // Security #3b: a cleanup hook that deletes THIS ephemeral group on stream end/drop, so
+        // repeated attach/detach does not leak its `gstate` (the retention group `ret` still pins the
+        // retained log). Clone the handles the hook needs before `group`/`topic` are moved below.
+        let cleanup: Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>> = {
+            let messaging = self.messaging.clone();
+            let topic = topic.clone();
+            let group = group.clone();
+            Some(Box::new(move || {
+                Box::pin(async move {
+                    let _ = messaging.delete_group(&topic, &group).await;
+                })
+            }))
+        };
         let sub = SubscriptionParams {
             group,
             start: StartPosition::Earliest,
@@ -399,6 +436,7 @@ impl RunEngine {
         Ok(EngineAttach {
             stream,
             drop_cancel_armed: state.drop_cancel,
+            cleanup,
         })
     }
 }
@@ -467,6 +505,7 @@ impl RunStore for RunStoreImpl {
         let EngineAttach {
             stream,
             drop_cancel_armed,
+            cleanup,
         } = self
             .engine
             .attach(run_id, after_seq)
@@ -488,7 +527,7 @@ impl RunStore for RunStoreImpl {
         } else {
             None
         };
-        Ok(RunAttachStream::new(mapped, drop_cancel))
+        Ok(RunAttachStream::new(mapped, drop_cancel, cleanup))
     }
 
     async fn cancel(&self, run_id: &str) -> Result<(), RunStoreError> {
@@ -845,5 +884,124 @@ mod tests {
             Err(RunError::NotFound)
         );
         assert_eq!(engine.status(&fake).await, Err(RunError::NotFound));
+    }
+
+    /// Security #3a — the per-run log cap: once a run reaches its NON-terminal event ceiling, a further
+    /// `progress` emit fails closed, but a TERMINAL emit is still admitted (a capped run can conclude /
+    /// be cancelled). Uses a tiny `max_events` so the boundary is cheap to exercise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_run_log_cap_refuses_progress_over_ceiling_but_admits_a_terminal() {
+        let mut engine = engine_for(Some("firm-a"));
+        engine.max_events = 3; // in-module: exercise the boundary with a 3-event ceiling
+        let run = engine.create(false).await.unwrap();
+        // Three progress events fill the cap (seqs 0,1,2).
+        for i in 0..3u8 {
+            assert_eq!(
+                engine.emit(&run, RunEventKind::Progress, vec![i]).await,
+                Ok(u64::from(i))
+            );
+        }
+        // The next progress emit is refused, fail-closed — the retained log stops growing.
+        assert!(matches!(
+            engine.emit(&run, RunEventKind::Progress, vec![9]).await,
+            Err(RunError::Invalid(_))
+        ));
+        // The run is still active and unchanged (the refused emit reserved no seq).
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Active);
+        // A TERMINAL emit is exempt from the cap — a capped run can still conclude.
+        assert_eq!(
+            engine.emit(&run, RunEventKind::End, Vec::new()).await,
+            Ok(3)
+        );
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Ended);
+    }
+
+    /// Security #3a — a capped run can still be CANCELLED (cancel emits the terminal `cancelled`, which
+    /// is cap-exempt), so the per-run ceiling never wedges cancellation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_run_log_cap_still_allows_cancel() {
+        let mut engine = engine_for(Some("firm-a"));
+        engine.max_events = 2;
+        let run = engine.create(true).await.unwrap();
+        for i in 0..2u8 {
+            engine
+                .emit(&run, RunEventKind::Progress, vec![i])
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            engine.emit(&run, RunEventKind::Progress, vec![9]).await,
+            Err(RunError::Invalid(_))
+        ));
+        engine.cancel(&run).await.unwrap();
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Cancelled);
+    }
+
+    /// Security #3b — the ephemeral per-attach consumer group is DELETED on stream drop, so repeated
+    /// attach/detach does not leak group `gstate`. Driven through the `RunStore` seam (whose `on_drop`
+    /// fires the cleanup hook); the retention group `ret` must survive (it pins the retained log).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_group_is_deleted_on_drop_leaving_only_retention() {
+        use boatramp_core::messaging::gstate_prefix;
+
+        // Retain the messaging substrate's KV so we can read the registered group set directly.
+        let mq_kv = Arc::new(MemoryKv::new());
+        let messaging = Arc::new(LogMessaging::new(
+            Arc::new(MemStorage::default()),
+            mq_kv.clone(),
+        ));
+        let engine = RunEngine::new(
+            messaging,
+            Arc::new(MemoryKv::new()),
+            "acme",
+            run_scope_segment(Some("firm-a")),
+        );
+        let store = RunStoreImpl::new(engine);
+        let run = store.create().await.unwrap();
+        let topic = run_topic("acme", &run_scope_segment(Some("firm-a")), &run);
+        store
+            .emit(&run, RunEventKind::Progress, b"p".to_vec())
+            .await
+            .unwrap();
+
+        // The set of registered consumer groups on the run topic (`mqgstate/{topic}/{group}`).
+        let groups = |kv: Arc<MemoryKv>, topic: String| async move {
+            let prefix = gstate_prefix(&topic);
+            let mut g: Vec<String> = kv
+                .list_prefix(&prefix)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|k| k[prefix.len()..].to_string())
+                .collect();
+            g.sort();
+            g
+        };
+
+        // After create+emit, only the retention group exists.
+        assert_eq!(
+            groups(mq_kv.clone(), topic.clone()).await,
+            vec!["ret".to_string()],
+            "only the retention group before any attach"
+        );
+
+        let mut attach = store.attach(&run, None).await.unwrap();
+        // The first `next` drives the pump, which registers the ephemeral attach group.
+        let first = attach.next().await.expect("one event").expect("ok");
+        assert_eq!(first.kind, RunEventKind::Progress);
+        let during = groups(mq_kv.clone(), topic.clone()).await;
+        assert_eq!(
+            during.len(),
+            2,
+            "the ephemeral attach group is registered alongside `ret`: {during:?}"
+        );
+
+        // Dropping the attach (resource drop) must delete ONLY the ephemeral group.
+        attach.on_drop().await;
+        assert_eq!(
+            groups(mq_kv.clone(), topic.clone()).await,
+            vec!["ret".to_string()],
+            "the ephemeral attach group is cleaned up on drop; `ret` survives"
+        );
     }
 }
