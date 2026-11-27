@@ -112,6 +112,27 @@ versions.
     delete (explicit, version-independent — like the cluster retention sweep). The sweep is
     host-internal and per-run WITHIN each scope — it never crosses a tenant boundary. Cheap when no
     runs exist (an empty prefix scan), and reclaims runs left behind even while the posture is off.
+  - **TTL-sweep Security review — self-DoS fix + boundary hardenings (SHIP-WITH-FIXES).**
+    - **MEDIUM-1 (unbounded purge = messaging-delivery self-DoS).** A maxed run's purge is up to
+      ~4×`RUN_MAX_EVENTS` (~400k) deletes. Single-node `purge_topic` no longer holds the instance-GLOBAL
+      `claim_lock` across all of them (which starved consumer delivery — the claim path — on EVERY
+      topic for seconds-to-minutes): it enumerates lock-free and deletes in bounded 1024-key chunks,
+      RELEASING + re-acquiring the lock between chunks so other topics' claims interleave at every
+      boundary. The cluster purge splits its delete set into bounded `WriteOp::Batch` proposals (≤1024
+      each) instead of one ~400k-op Raft entry that would stall the apply loop. The sweep caps how many
+      runs it reclaims per tick (`RunSweepTtls::max_reclaim_per_tick`, default 256) so one tick can't do
+      unbounded work (this also bounds the blast radius of a single per-run failure); the remainder
+      drains on later ticks. The purge stays COMPLETE + IDEMPOTENT across a chunk-boundary interruption
+      (every delete is a no-op if absent, and the control-plane run-state record is removed only AFTER
+      the purge finishes, so the next sweep completes any partial).
+    - **LOW-2 (terminal arm live-attacher).** The terminal-retention arm now also skips a run with a
+      LIVE attacher, so a client replaying a 24h-old terminal log right at the retention boundary isn't
+      purged mid-replay; it reclaims on a later tick once no reader is attached (the same guard the idle
+      arm uses).
+    - **LOW-3 (serde-default `Active` 0-clock).** A legacy/pre-sweep `Active` record that deserializes
+      `created_ms` / `last_emit_ms` as `0` is backfilled to `now` at the sweep's read, so an
+      idle-since-1970 clock can't satisfy the idle test and get the run spuriously cancelled on the
+      first sweep.
   - **LOW-2 — long-poll stream permits.** The long-poll attach now acquires the SAME per-scope +
     per-IP stream permits SSE/WS do (keyed by `run:{run_id}`), so concurrent long-polls — and the
     ephemeral-group churn each opens on the holder's own run — are bounded (shed to `503`/`429`)

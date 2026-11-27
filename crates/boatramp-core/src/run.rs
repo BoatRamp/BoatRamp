@@ -112,6 +112,19 @@ pub const RUN_TERMINAL_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 /// [`crate::run::RunSweepTtls`].
 pub const RUN_IDLE_TTL_MS: u64 = 60 * 60 * 1000;
 
+/// Default per-tick cap on how many runs ONE sweep pass reclaims for a project (PLAN-run-streaming
+/// enable-precondition, Security MEDIUM-1). The sweep runs once a minute per project; a reclaim is a
+/// COMPLETE topic purge (up to ~4×[`RUN_MAX_EVENTS`] key/payload deletes for a maxed run), so an
+/// uncapped tick that reclaimed every reclaimable run at once — a large backlog that built up while
+/// the capability was posture-OFF, then an operator enables it — would do unbounded work on the
+/// maintenance task in a single tick. Capping it bounds the per-tick cost; the remainder reclaims on
+/// later ticks (the sweep is idempotent and re-runs every minute). It also bounds the blast radius of
+/// a single per-run failure (the error surfaces to the scheduler, which logs + retries next tick), so
+/// at most this many runs are attempted before one error ends the pass. 256/min (≈15k/hour) drains
+/// any realistic backlog quickly while keeping a tick's work bounded. Configurable via
+/// [`crate::run::RunSweepTtls`].
+pub const RUN_SWEEP_MAX_RECLAIM_PER_TICK: usize = 256;
+
 /// The tenancy **scope segment** of a run topic, composed by the HOST from THIS invocation's resolved
 /// own-tenant (never guest-supplied). A resolved tenant `t` maps to `t_{t}`; an unresolved tenant (a
 /// single-tenant / unscoped invocation) maps to the fixed sentinel `u`. The `t_` prefix is
@@ -266,13 +279,16 @@ pub struct RunState {
     pub drop_cancel: bool,
     /// When the run was created, Unix millis (the run sweep's age baseline; also the `last_emit_ms`
     /// seed so a created-but-never-emitted run — e.g. an orphan from a non-existent START target —
-    /// still ages from creation). `#[serde(default)]` for forward-compat with a pre-sweep record
-    /// (a `0` reads as "ancient", which only makes the sweep reclaim it sooner — fail-safe).
+    /// still ages from creation). `#[serde(default)]` for forward-compat with a pre-sweep record.
+    /// A legacy `0` is BACKFILLED to `now` at the sweep's read (Security LOW-3) so it reads as
+    /// just-created rather than idle-since-1970 — see `sweep_runs`.
     #[serde(default)]
     pub created_ms: u64,
     /// When this run last had an emit reserved against it, Unix millis — the IDLE-TTL clock. Advanced
     /// on every `emit` (in the same CAS that reserves the `seq`); seeded to `created_ms` at create.
-    /// The sweep treats `now - last_emit_ms > idle_ttl` (AND no live attacher) as abandoned.
+    /// The sweep treats `now - last_emit_ms > idle_ttl` (AND no live attacher) as abandoned. A legacy
+    /// `0` (a pre-sweep `Active` record) is BACKFILLED to `now` at the sweep's read (Security LOW-3)
+    /// so a 0-clock can't immediately satisfy the idle test and get the run spuriously cancelled.
     #[serde(default)]
     pub last_emit_ms: u64,
     /// When the run CONCLUDED, Unix millis — the TERMINAL-RETENTION clock. Set when the terminal
@@ -312,6 +328,10 @@ pub struct RunSweepTtls {
     pub terminal_retention_ms: u64,
     /// Cancel + reclaim an `Active` run idle (no emit) this long with no live attacher.
     pub idle_ms: u64,
+    /// Max runs ONE sweep pass reclaims for a project (Security MEDIUM-1): bounds a single tick's
+    /// work (each reclaim is a complete topic purge) and the blast radius of one per-run failure. The
+    /// remainder reclaims on later ticks. Clamped to ≥1 at the sweep so a `0` can't disable reclaim.
+    pub max_reclaim_per_tick: usize,
 }
 
 impl Default for RunSweepTtls {
@@ -319,6 +339,7 @@ impl Default for RunSweepTtls {
         Self {
             terminal_retention_ms: RUN_TERMINAL_RETENTION_MS,
             idle_ms: RUN_IDLE_TTL_MS,
+            max_reclaim_per_tick: RUN_SWEEP_MAX_RECLAIM_PER_TICK,
         }
     }
 }

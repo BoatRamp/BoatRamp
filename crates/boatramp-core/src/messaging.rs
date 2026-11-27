@@ -3859,9 +3859,27 @@ impl Messaging for LogMessaging {
 
     async fn purge_topic(&self, topic: &str) -> Result<(), MessagingError> {
         // Complete, unconditional reclaim of every durable key/payload of `topic` (see the trait doc).
-        // Under the claim lock so a concurrent publish/claim on the topic can't interleave a write
-        // between our enumeration and delete (same guard `gc_grouped` takes).
-        let _guard = self.claim_lock.lock().await;
+        //
+        // LOCK DISCIPLINE (Security MEDIUM-1): the `claim_lock` is instance-GLOBAL — one mutex
+        // serializing EVERY topic's claim delivery. A maxed run has up to ~4×RUN_MAX_EVENTS keys, so
+        // holding the lock across the whole purge would stall consumer delivery on every OTHER topic
+        // for the duration (seconds-to-minutes). Instead we ENUMERATE lock-free (a read; staleness is
+        // harmless — see idempotency below) and DELETE in bounded chunks, each chunk under a freshly
+        // acquired `claim_lock` that we RELEASE before the next. `futures::lock::Mutex` is FIFO-fair,
+        // so a claim waiting when we release gets the lock at the chunk boundary ahead of our
+        // re-acquire — other topics' delivery interleaves and is never starved. No single lock-hold
+        // does more than `PURGE_CHUNK` deletes.
+        //
+        // COMPLETE + IDEMPOTENT across a chunk boundary: every delete is a no-op if the key is already
+        // gone, and a crash/error mid-purge leaves the control-plane run-state record in place (the
+        // caller, `reclaim_run`, deletes it only AFTER this returns Ok), so the next sweep re-enumerates
+        // whatever remains and finishes the purge. Enumerating lock-free is safe because a
+        // terminal/abandoned run has no concurrent producer; a racing write would merely be left for
+        // the next sweep.
+        const PURGE_CHUNK: usize = 1024;
+
+        // Enumerate every durable key to delete as `(kv_key, optional object-store payload key)`.
+        let mut work: Vec<(String, Option<String>)> = Vec::new();
 
         // (1) Work-queue index records (`mq/{topic}/{id}`) + their object-store payloads. A grouped
         // publish writes one of these per message too, and a run has no work-queue claimer to ack it,
@@ -3878,12 +3896,8 @@ impl Messaging for LogMessaging {
             if !is_direct_child(&key, &meta_prefix) {
                 continue; // a subtopic's record — never touched by this topic's purge
             }
-            let id = &key[meta_prefix.len()..];
-            let _ = self.storage.delete(&payload_key(topic, id)).await;
-            self.kv
-                .delete(&key)
-                .await
-                .map_err(MessagingError::backend)?;
+            let payload = payload_key(topic, &key[meta_prefix.len()..]);
+            work.push((key, Some(payload)));
         }
 
         // (2) Retained grouped log entries (`mqglog/{topic}/{id}`) + their retained payloads
@@ -3899,12 +3913,8 @@ impl Messaging for LogMessaging {
             if !is_direct_child(&key, &log_prefix) {
                 continue;
             }
-            let id = &key[log_prefix.len()..];
-            let _ = self.storage.delete(&gpayload_key(topic, id)).await;
-            self.kv
-                .delete(&key)
-                .await
-                .map_err(MessagingError::backend)?;
+            let payload = gpayload_key(topic, &key[log_prefix.len()..]);
+            work.push((key, Some(payload)));
         }
 
         // (3) Every group's compact state (incl. the run `ret` retention group that pins the log) and
@@ -3917,10 +3927,7 @@ impl Messaging for LogMessaging {
             .map_err(MessagingError::backend)?
         {
             if is_direct_child(&key, &state_prefix) {
-                self.kv
-                    .delete(&key)
-                    .await
-                    .map_err(MessagingError::backend)?;
+                work.push((key, None));
             }
         }
         let gdead_prefix = gdead_topic_prefix(topic);
@@ -3932,10 +3939,7 @@ impl Messaging for LogMessaging {
         {
             // `{group}/{id}` (two segments) — a subtopic bleed (≥3) is rejected by `split_group_id`.
             if split_group_id(&key[gdead_prefix.len()..]).is_some() {
-                self.kv
-                    .delete(&key)
-                    .await
-                    .map_err(MessagingError::backend)?;
+                work.push((key, None));
             }
         }
 
@@ -3951,12 +3955,8 @@ impl Messaging for LogMessaging {
             if !is_direct_child(&key, &dead_prefix) {
                 continue;
             }
-            let id = &key[dead_prefix.len()..];
-            let _ = self.storage.delete(&payload_key(topic, id)).await;
-            self.kv
-                .delete(&key)
-                .await
-                .map_err(MessagingError::backend)?;
+            let payload = payload_key(topic, &key[dead_prefix.len()..]);
+            work.push((key, Some(payload)));
         }
 
         // (5) The per-topic single markers: ready-set, logmax gate, operator policy, pause flag.
@@ -3966,10 +3966,41 @@ impl Messaging for LogMessaging {
             mqpolicy_key(topic),
             pause_key(topic),
         ] {
-            self.kv
-                .delete(&key)
-                .await
-                .map_err(MessagingError::backend)?;
+            work.push((key, None));
+        }
+
+        // Delete in bounded chunks, releasing + re-acquiring the global `claim_lock` between chunks so
+        // claims on other topics interleave (MEDIUM-1). Each delete frees its object-store payload
+        // first (best-effort — absent for an inlined/empty payload) then removes the KV record.
+        //
+        // Between chunks we YIELD once (runtime-agnostic: a single-poll `poll_fn`) AFTER the previous
+        // guard has dropped and BEFORE re-acquiring. Without it, dropping and immediately re-requesting
+        // the lock in a tight loop lets THIS task win the re-acquire race every time (an uncontended
+        // `lock().await` returns `Ready` synchronously and never re-enters the executor), so a claim
+        // waiting on the lock would never be polled — the release would be a no-op and delivery would
+        // still be starved. The yield hands the executor a scheduling point so a pending claim acquires
+        // the now-free lock at the boundary before the purge takes it back.
+        for (i, chunk) in work.chunks(PURGE_CHUNK).enumerate() {
+            if i > 0 {
+                let mut yielded = false;
+                futures::future::poll_fn(|cx| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+            let _guard = self.claim_lock.lock().await;
+            for (key, payload) in chunk {
+                if let Some(p) = payload {
+                    let _ = self.storage.delete(p).await;
+                }
+                self.kv.delete(key).await.map_err(MessagingError::backend)?;
+            }
         }
         // Drop the cached in-memory policy so a later same-named topic re-reads fresh (defensive — a
         // run topic's id is unguessable, so reuse is effectively impossible).
@@ -4895,6 +4926,231 @@ mod tests {
         );
         // Idempotent: a repeated purge is a clean no-op.
         mq.purge_topic(t).await.unwrap();
+    }
+
+    /// A `KvStore` over `MemoryKv` that counts `delete`s and fires `entered` on the very first one —
+    /// so a test can observe `purge_topic` is mid-flight (has acquired the global `claim_lock` and
+    /// begun deleting) and then prove a claim on ANOTHER topic interleaves (MEDIUM-1: the purge
+    /// releases + re-acquires the lock between bounded chunks instead of holding it for the whole run).
+    struct ChunkProbeKv {
+        inner: MemoryKv,
+        deletes: std::sync::atomic::AtomicUsize,
+        /// Fired on the FIRST delete — "the purge is now inside chunk 1 holding the claim_lock".
+        entered: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+        /// Awaited on the FIRST delete (after `entered`) — holds the purge INSIDE chunk 1 (lock held)
+        /// until the test releases it, so the test can deterministically park a competing claim as a
+        /// waiter BEFORE the purge reaches the chunk-1 boundary.
+        gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    }
+    #[async_trait]
+    impl KvStore for ChunkProbeKv {
+        async fn get(&self, k: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), crate::kv::KvError> {
+            let n = self
+                .deletes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                if let Some(tx) = self.entered.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                // Drop the std guard BEFORE awaiting (never hold it across an await).
+                let gate = self.gate.lock().unwrap().take();
+                if let Some(rx) = gate {
+                    let _ = rx.await;
+                }
+            }
+            self.inner.delete(k).await
+        }
+        async fn list_prefix(&self, p: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            self.inner.list_prefix(p).await
+        }
+        fn atomic_write_batch(&self) -> bool {
+            self.inner.atomic_write_batch()
+        }
+        async fn write_batch(
+            &self,
+            ops: Vec<crate::kv::WriteOp>,
+        ) -> Result<(), crate::kv::KvError> {
+            self.inner.write_batch(ops).await
+        }
+    }
+
+    /// MEDIUM-1: a big run's `purge_topic` RELEASES the instance-global `claim_lock` between bounded
+    /// chunks (and YIELDS so a waiter is actually polled), so consumer delivery (a claim) on an
+    /// UNRELATED topic is handed the lock at a chunk boundary instead of being starved for the whole
+    /// ~Nk-key purge. Made deterministic on a single-threaded runtime: we hold the purge INSIDE chunk 1
+    /// (lock held) until a competing claim has parked as a waiter, then release it. At the chunk-1
+    /// boundary the purge drops the lock and yields; the parked claim (woken first) acquires the
+    /// now-free lock BEFORE the purge re-takes it for chunk 2. We snapshot how many of the big topic's
+    /// keys were deleted when the claim acquired: with the per-chunk release it is exactly ONE chunk's
+    /// worth; an unchunked purge holding the lock throughout would force the claim to the very end
+    /// (== the total). (Without the between-chunk yield the purge would steal the lock back via the
+    /// `futures::lock::Mutex` fast path and the claim would never interleave — so this also guards the
+    /// yield.)
+    #[tokio::test]
+    async fn purge_releases_claim_lock_between_chunks_so_other_topics_deliver() {
+        let (entered_tx, entered_rx) = futures::channel::oneshot::channel();
+        let (gate_tx, gate_rx) = futures::channel::oneshot::channel();
+        let kv = Arc::new(ChunkProbeKv {
+            inner: MemoryKv::new(),
+            deletes: std::sync::atomic::AtomicUsize::new(0),
+            entered: Mutex::new(Some(entered_tx)),
+            gate: Mutex::new(Some(gate_rx)),
+        });
+        let mq = Arc::new(LogMessaging::new(
+            Arc::new(MemStorage::default()),
+            kv.clone(),
+        ));
+        let big = "acme/.boatramp-run/t_firm-a/runbig";
+        let other = "orders/created";
+        // Seed the big run topic with 2×PURGE_CHUNK direct work-queue records so the purge spans ≥2
+        // bounded chunks (⇒ a chunk boundary). Seeded directly (fast) — the purge enumerates + deletes
+        // them exactly as it would a real maxed run.
+        const N: usize = 2 * 1024;
+        for i in 0..N {
+            kv.inner
+                .put(&format!("{}{i:08}", meta_prefix(big)), b"x".to_vec())
+                .await
+                .unwrap();
+        }
+        // The unrelated topic has one claimable message.
+        mq.publish(other, b"msg").await.unwrap();
+
+        // Start the purge; it takes the claim_lock for chunk 1 and blocks at its FIRST delete (holding
+        // the lock) until we release the gate.
+        let mqp = mq.clone();
+        let purge = tokio::spawn(async move { mqp.purge_topic(big).await.unwrap() });
+        entered_rx.await.unwrap();
+
+        // Spawn a claim on the UNRELATED topic; it parks as a waiter on the held claim_lock and returns
+        // the delete-count it observes right after it acquires + completes.
+        let mqc = mq.clone();
+        let kvc = kv.clone();
+        let claim = tokio::spawn(async move {
+            let got = mqc.claim(other, LEASE, 10, 5).await.unwrap();
+            (
+                got.len(),
+                kvc.deletes.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        });
+        // Let the claim task run up to the point where it parks on the (held) lock.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Release the purge: chunk 1 completes, drops the lock at the boundary + yields, and the parked
+        // claim is handed the now-free lock before the purge re-acquires for chunk 2.
+        let _ = gate_tx.send(());
+
+        let (claimed, snapshot) = claim.await.unwrap();
+        assert_eq!(claimed, 1, "the claim delivered during the big purge");
+        assert!(
+            snapshot < N,
+            "the claim interleaved at the chunk boundary (deleted {snapshot}/{N} — an unchunked purge \
+             holding the lock throughout would force the claim to {N})"
+        );
+
+        purge.await.unwrap();
+        // COMPLETE across the chunk boundary: the big topic is fully reclaimed.
+        assert!(
+            kv.inner
+                .list_prefix(&meta_prefix(big))
+                .await
+                .unwrap()
+                .is_empty(),
+            "chunked purge still reclaims every key"
+        );
+    }
+
+    /// A `KvStore` over `MemoryKv` that fails the delete at a chosen index once, then (disarmed) lets
+    /// every delete through — simulates a crash/error partway through a chunked purge.
+    struct FlakyDeleteKv {
+        inner: MemoryKv,
+        deletes: std::sync::atomic::AtomicUsize,
+        fail_at: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl KvStore for FlakyDeleteKv {
+        async fn get(&self, k: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), crate::kv::KvError> {
+            let n = self
+                .deletes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == self.fail_at.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::kv::KvError::backend(
+                    "simulated mid-purge interruption",
+                ));
+            }
+            self.inner.delete(k).await
+        }
+        async fn list_prefix(&self, p: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            self.inner.list_prefix(p).await
+        }
+        fn atomic_write_batch(&self) -> bool {
+            self.inner.atomic_write_batch()
+        }
+        async fn write_batch(
+            &self,
+            ops: Vec<crate::kv::WriteOp>,
+        ) -> Result<(), crate::kv::KvError> {
+            self.inner.write_batch(ops).await
+        }
+    }
+
+    /// MEDIUM-1 idempotency: because the chunked purge can be interrupted mid-way (and because the
+    /// caller — `reclaim_run` — deletes the run-state record only AFTER the purge returns Ok, so the
+    /// next sweep re-runs it), the purge must FINISH a partially-purged topic on a re-run. We fail a
+    /// delete in the middle of the second chunk, confirm the purge errored with the topic only
+    /// partly drained, then re-run it (disarmed) and confirm it reclaims everything.
+    #[tokio::test]
+    async fn purge_is_idempotent_across_a_chunk_boundary_interruption() {
+        let kv = Arc::new(FlakyDeleteKv {
+            inner: MemoryKv::new(),
+            deletes: std::sync::atomic::AtomicUsize::new(0),
+            fail_at: std::sync::atomic::AtomicUsize::new(1500), // mid second chunk (PURGE_CHUNK=1024)
+        });
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), kv.clone());
+        let t = "acme/.boatramp-run/t_firm-a/runflaky";
+        const N: usize = 2 * 1024 + 500;
+        for i in 0..N {
+            kv.inner
+                .put(&format!("{}{i:08}", meta_prefix(t)), b"x".to_vec())
+                .await
+                .unwrap();
+        }
+        // First pass: the armed KV errors mid second chunk ⇒ the purge fails with the topic only
+        // partly drained (chunking means a crash leaves a partial).
+        assert!(
+            mq.purge_topic(t).await.is_err(),
+            "the interruption surfaced"
+        );
+        let remaining = kv.inner.list_prefix(&meta_prefix(t)).await.unwrap().len();
+        assert!(
+            (1..N).contains(&remaining),
+            "partly purged: {remaining} of {N} remain (neither untouched nor already complete)"
+        );
+        // Disarm and re-run: the purge finishes the partially-purged topic (COMPLETE + IDEMPOTENT).
+        kv.fail_at
+            .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        mq.purge_topic(t).await.unwrap();
+        assert!(
+            kv.inner
+                .list_prefix(&meta_prefix(t))
+                .await
+                .unwrap()
+                .is_empty(),
+            "the re-run reclaimed every remaining key"
+        );
     }
 
     #[tokio::test]

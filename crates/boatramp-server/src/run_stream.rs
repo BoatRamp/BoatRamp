@@ -609,13 +609,16 @@ fn split_run_topic(topic: &str) -> Option<(&str, &str, &str)> {
 /// sweep is host-internal and only ever reclaims a run WITHIN its own scope) and, at `now_ms`:
 ///
 /// - **TERMINAL run** (`result`/`end`/`error`/`cancelled`): reclaim once `now - terminal_ms >
-///   terminal_retention` — a concluded run's log is kept that long so a reconnecting client can still
-///   fetch the result, then reclaimed.
+///   terminal_retention` AND no live attacher — a concluded run's log is kept that long so a
+///   reconnecting client can still fetch the result, and a client actively replaying it at the
+///   boundary (a non-`ret` group) holds it one more tick so the replay is not truncated (LOW-2).
 /// - **IDLE/ABANDONED run** (`Active`, `now - last_emit_ms > idle_ms`, AND no live attacher): CANCEL it
 ///   (emit the terminal `cancelled` — the stop signal a returning emitter observes) then reclaim. An
 ///   actively-emitting run (recent `last_emit_ms`) OR a currently-attached run (a non-`ret` group) is
 ///   NEVER reclaimed.
 ///
+/// At most [`RunSweepTtls::max_reclaim_per_tick`] runs are reclaimed per pass (MEDIUM-1): each reclaim
+/// is a complete topic purge, so one tick's work is bounded and the remainder drains on later ticks.
 /// Returns the number of runs reclaimed. A record that fails to decode is LEFT in place (a
 /// reviewer-visible anomaly, never a blind delete). Per-run failures are surfaced to the caller (the
 /// scheduler logs + continues next tick).
@@ -631,8 +634,19 @@ pub async fn sweep_runs(
         .list_prefix(&prefix)
         .await
         .map_err(|e| RunError::Backend(e.to_string()))?;
+    // Per-tick reclaim cap (Security MEDIUM-1): each reclaim is a COMPLETE topic purge (up to
+    // ~4×RUN_MAX_EVENTS key/payload deletes for a maxed run), so an uncapped tick draining a whole
+    // backlog at once would do unbounded work on the maintenance task. We stop after this many and let
+    // the remainder reclaim on later ticks (the sweep is idempotent and re-runs every minute). This
+    // also bounds the blast radius of a single per-run failure (the error ends the pass; the scheduler
+    // logs + retries next tick), so at most `cap` runs are attempted before one error ends the tick.
+    // Clamped to ≥1 so a misconfigured `0` can't silently disable reclaim.
+    let cap = ttls.max_reclaim_per_tick.max(1);
     let mut reclaimed = 0usize;
     for state_key in keys {
+        if reclaimed >= cap {
+            break; // per-tick budget spent — the rest reclaim on a later tick
+        }
         // The full run topic is the state key minus the `runstate/` prefix.
         let Some(topic) = state_key.strip_prefix("runstate/") else {
             continue;
@@ -645,11 +659,22 @@ pub async fn sweep_runs(
         else {
             continue; // raced a concurrent reclaim — already gone
         };
-        let Ok(state) = serde_json::from_slice::<RunState>(&bytes) else {
+        let Ok(mut state) = serde_json::from_slice::<RunState>(&bytes) else {
             // A record this host never wrote (or a future schema we can't read) — leave it rather
             // than blind-delete; an operator/reviewer can see the anomaly.
             continue;
         };
+        // LOW-3 (serde-default 0-clock): a legacy/pre-sweep record can deserialize `created_ms` /
+        // `last_emit_ms` as `0`. BACKFILL them to `now` so a 0 clock reads as just-created rather than
+        // idle-since-1970 — otherwise an `Active` 0-clock run would satisfy the idle test on the first
+        // sweep and be spuriously cancelled. (Belt-and-suspenders: `RunState::new` seeds both, so a
+        // real run never carries a 0; this only normalizes a pre-sweep record.)
+        if state.created_ms == 0 {
+            state.created_ms = now_ms;
+        }
+        if state.last_emit_ms == 0 {
+            state.last_emit_ms = now_ms;
+        }
         match state.status {
             RunStatus::Active => {
                 let idle = now_ms.saturating_sub(state.last_emit_ms) > ttls.idle_ms;
@@ -670,7 +695,13 @@ pub async fn sweep_runs(
                 // Fall back to `created_ms` if `terminal_ms` is somehow unset (a pre-sweep record), so
                 // a terminal run always ages toward reclaim.
                 let since = state.terminal_ms.unwrap_or(state.created_ms);
-                if now_ms.saturating_sub(since) > ttls.terminal_retention_ms {
+                // LOW-2: gate the terminal arm on no live attacher too — a client replaying a terminal
+                // run's log right at the retention boundary registers a non-`ret` consumer group, and
+                // purging mid-replay would truncate it. Keep it until no reader is attached (the same
+                // check the idle arm uses); it reclaims on a later tick once the reader drops.
+                if now_ms.saturating_sub(since) > ttls.terminal_retention_ms
+                    && !has_live_attacher(messaging, &topic).await
+                {
                     reclaim_run(messaging, kv, &topic).await?;
                     reclaimed += 1;
                 }
@@ -1288,5 +1319,122 @@ mod tests {
         );
         assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Active);
         drop(attach);
+    }
+
+    /// LOW-2: a TERMINAL run with a LIVE attacher (a client replaying its concluded log) is NOT
+    /// reclaimed at the retention boundary — purging mid-replay would truncate the client's stream.
+    /// It waits for a later tick once no reader is attached (the same guard the idle arm uses).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_run_with_live_attacher_is_not_reclaimed_at_the_boundary() {
+        let (engine, messaging, kv) = engine_and_backends(Some("firm-a"));
+        let run = engine.create(false).await.unwrap();
+        // A progress event then the terminal — so an attacher can park MID-replay (after progress,
+        // before the terminal) while the run is already concluded.
+        engine
+            .emit(&run, RunEventKind::Progress, b"p".to_vec())
+            .await
+            .unwrap();
+        engine
+            .emit(&run, RunEventKind::Result, b"done".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Ended);
+        // Open an attach and drive its first poll so the ephemeral (non-`ret`) group is registered;
+        // hold it alive across the sweep — a client actively replaying the terminal run's log.
+        let mut attach = engine.attach(&run, None).await.unwrap();
+        let first = attach.stream.next().await.expect("progress").expect("ok");
+        assert_eq!(first.kind, RunEventKind::Progress);
+
+        let ttls = RunSweepTtls::default();
+        // Past the terminal-retention TTL, but a live reader is attached ⇒ NOT reclaimed (LOW-2).
+        let later = now_unix_ms() + ttls.terminal_retention_ms + 1;
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, later)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Ended);
+        drop(attach);
+    }
+
+    /// LOW-3: a legacy/pre-sweep `Active` record can deserialize a `0` idle clock (idle-since-1970).
+    /// The sweep BACKFILLS a 0 clock to `now`, so such a run is treated as just-created and is NOT
+    /// spuriously cancelled on the first sweep (without the backfill the idle test fires immediately).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_zero_clock_active_run_is_not_spuriously_cancelled() {
+        let (engine, messaging, kv) = engine_and_backends(Some("firm-a"));
+        let run = engine.create(true).await.unwrap();
+        // Rewrite the state record with 0 age clocks, simulating a pre-sweep record.
+        let topic = run_topic("acme", &run_scope_segment(Some("firm-a")), &run);
+        let key = run_state_key(&topic);
+        let bytes = kv.get(&key).await.unwrap().expect("state record exists");
+        let mut state: RunState = serde_json::from_slice(&bytes).unwrap();
+        state.created_ms = 0;
+        state.last_emit_ms = 0;
+        kv.put(&key, serde_json::to_vec(&state).unwrap())
+            .await
+            .unwrap();
+
+        // A sweep at "now" must NOT cancel it — the 0 clock backfills to `now` ⇒ not idle.
+        let ttls = RunSweepTtls::default();
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, now_unix_ms())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Active);
+    }
+
+    /// MEDIUM-1: the sweep reclaims AT MOST `max_reclaim_per_tick` runs per pass (so a large backlog
+    /// can't do unbounded work in one tick), and the remainder drains on later ticks (the sweep is
+    /// idempotent and re-runs every minute).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sweep_reclaims_at_most_the_per_tick_cap_and_drains_the_remainder() {
+        let (engine, messaging, kv) = engine_and_backends(Some("firm-a"));
+        // Five terminal runs, all eligible for reclaim once past the retention TTL.
+        let mut runs = Vec::new();
+        for _ in 0..5 {
+            let run = engine.create(false).await.unwrap();
+            engine
+                .emit(&run, RunEventKind::Result, b"done".to_vec())
+                .await
+                .unwrap();
+            runs.push(run);
+        }
+        let ttls = RunSweepTtls {
+            max_reclaim_per_tick: 2,
+            ..RunSweepTtls::default()
+        };
+        let later = now_unix_ms() + ttls.terminal_retention_ms + 1;
+        // Each tick reclaims at most the cap (2, 2, 1), draining the remainder; then nothing is left.
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, later)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, later)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, later)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, later)
+                .await
+                .unwrap(),
+            0
+        );
+        for run in &runs {
+            assert_eq!(engine.status(run).await, Err(RunError::NotFound));
+        }
     }
 }

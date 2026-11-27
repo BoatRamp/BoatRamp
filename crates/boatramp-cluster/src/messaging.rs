@@ -1783,6 +1783,15 @@ impl Messaging for RaftMessaging {
         // the identical set), then frees the `Storage` payloads client-side (consensus never touches
         // Storage). Idempotent (a repeated purge is a no-op batch). Unconditional: the caller has
         // decided the whole topic (e.g. a terminal/abandoned run) is reclaimable.
+        //
+        // BOUNDED BATCHES (Security MEDIUM-1): a maxed run has up to ~4×RUN_MAX_EVENTS keys, so a
+        // single `WriteOp::Batch` of the whole set would be one enormous Raft entry that stalls the
+        // apply loop (and bloats the log/snapshot) on every node. We split the delete set into
+        // `PURGE_MAX_BATCH`-sized proposals; each applies as an ordinary batch. Idempotent across a
+        // partial purge: an interruption after some batches leaves the rest in applied state, and the
+        // next sweep re-enumerates + re-proposes them (the caller deletes the run-state record only
+        // after this returns Ok).
+        const PURGE_MAX_BATCH: usize = 1024;
         let mut deletes: Vec<WriteOp> = Vec::new();
         // Work-queue meta records (`mq/{topic}/{id}`) + collect ids for their object-store payloads.
         let meta_prefix = messaging::meta_prefix(topic);
@@ -1836,8 +1845,12 @@ impl Messaging for RaftMessaging {
         ] {
             deletes.push(WriteOp::Delete { key });
         }
-        if !deletes.is_empty() {
-            self.propose(WriteOp::Batch(deletes)).await?;
+        // Propose the deletes as BOUNDED batches (never one ~400k-op entry) — each a replicated apply.
+        for batch in deletes.chunks(PURGE_MAX_BATCH) {
+            if batch.is_empty() {
+                continue;
+            }
+            self.propose(WriteOp::Batch(batch.to_vec())).await?;
         }
         // Free the object-store payloads (work-queue non-inlined + retained grouped), client-side.
         for id in &wq_ids {
@@ -2570,6 +2583,111 @@ mod tests {
         assert!(converged, "the purge replicated to the follower");
 
         shutdown(rafts).await;
+    }
+
+    /// A [`Forwarder`] that RECORDS every proposed op (flattening `Batch`es) instead of replicating —
+    /// so a test can assert how a purge splits its delete set, with no live cluster.
+    #[derive(Default)]
+    struct RecordingForwarder {
+        batch_sizes: StdMutex<Vec<usize>>,
+        deleted: StdMutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Forwarder for RecordingForwarder {
+        async fn commit(&self, op: WriteOp) -> Result<WriteResponse, crate::raft::ForwardError> {
+            match op {
+                WriteOp::Batch(ops) => {
+                    self.batch_sizes.lock().unwrap().push(ops.len());
+                    for o in ops {
+                        if let WriteOp::Delete { key } = o {
+                            self.deleted.lock().unwrap().push(key);
+                        }
+                    }
+                }
+                WriteOp::Delete { key } => {
+                    self.batch_sizes.lock().unwrap().push(1);
+                    self.deleted.lock().unwrap().push(key);
+                }
+                _ => {}
+            }
+            Ok(WriteResponse::Kv)
+        }
+    }
+
+    /// An [`AppliedState`] seeded with a fixed key set — the read side a purge enumerates.
+    struct SeededState {
+        data: BTreeMap<String, Vec<u8>>,
+    }
+    #[async_trait]
+    impl AppliedState for SeededState {
+        async fn get(&self, key: &str) -> Option<Vec<u8>> {
+            self.data.get(key).cloned()
+        }
+        async fn list_prefix(&self, prefix: &str) -> Vec<String> {
+            self.data
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// MEDIUM-1 (cluster): a maxed run's purge must propose BOUNDED `WriteOp::Batch`es, never one
+    /// enormous ~400k-op entry that stalls the apply loop (and bloats the log/snapshot). We seed a run
+    /// topic's applied state with well over `PURGE_MAX_BATCH` durable keys, run the purge against a
+    /// recording forwarder, and assert every proposed batch is within the bound AND the union of
+    /// deleted keys covers every seeded key + marker (COMPLETE — the chunking loses nothing).
+    #[tokio::test]
+    async fn cluster_purge_splits_into_bounded_batches() {
+        let t = "acme/.boatramp-run/t_firm-a/runbig";
+        let mut data = BTreeMap::new();
+        const META: usize = 2100; // > 2×PURGE_MAX_BATCH once the other classes + markers are added
+        for i in 0..META {
+            data.insert(format!("{}{i:08}", messaging::meta_prefix(t)), vec![1u8]);
+        }
+        // A never-advanced `ret` group state + a few retained-log entries, so the other enumerated
+        // key classes ride the batching too.
+        data.insert(format!("{}ret", messaging::gstate_prefix(t)), vec![1u8]);
+        for i in 0..3 {
+            data.insert(format!("{}{i:08}", messaging::glog_prefix(t)), vec![1u8]);
+        }
+
+        let forward = Arc::new(RecordingForwarder::default());
+        let state = Arc::new(SeededState { data: data.clone() });
+        let bus = InProcessStreamBus::new();
+        let mq = RaftMessaging::new(
+            Arc::new(MemStorage::default()),
+            forward.clone(),
+            state,
+            1,
+            bus.register(),
+            Arc::new(bus.clone()),
+        );
+
+        mq.purge_topic(t).await.unwrap();
+
+        let sizes = forward.batch_sizes.lock().unwrap().clone();
+        assert!(
+            sizes.len() >= 2,
+            "a big purge spans multiple bounded batches, got {sizes:?}"
+        );
+        assert!(
+            sizes.iter().all(|&n| n <= 1024),
+            "every batch stays within PURGE_MAX_BATCH, got {sizes:?}"
+        );
+        // COMPLETE: every seeded durable key was proposed for deletion across the batches.
+        let deleted: HashSet<String> = forward.deleted.lock().unwrap().iter().cloned().collect();
+        for k in data.keys() {
+            assert!(deleted.contains(k), "the bounded-batch purge missed {k}");
+        }
+        for k in [
+            messaging::ready_key(t),
+            messaging::logmax_key(t),
+            messaging::mqpolicy_key(t),
+            messaging::pause_key(t),
+        ] {
+            assert!(deleted.contains(&k), "the purge missed the marker {k}");
+        }
     }
 
     /// Event-driven delivery (B1, cluster): a publish flags the topic in the REPLICATED ready-set (in
