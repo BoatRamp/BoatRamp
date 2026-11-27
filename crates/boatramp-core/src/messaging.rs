@@ -568,6 +568,30 @@ pub trait Messaging: Send + Sync {
         Ok(0)
     }
 
+    /// **Completely purge** every durable trace of `topic` — the work-queue index + payloads, the
+    /// retained grouped log + payloads, ALL registered group states (incl. the never-advanced run
+    /// `ret` retention group that otherwise pins the log for life) + their dead-letters, and the
+    /// per-topic ready/logmax/policy/pause markers. UNCONDITIONAL (unlike [`retention_sweep`], which
+    /// keeps anything a group still needs): the caller has decided the topic is reclaimable in full.
+    ///
+    /// The run sweep (PLAN-run-streaming) uses this to reclaim a terminal/abandoned run's topic:
+    /// `delete_group` + `retention_sweep` alone would leave the run's **work-queue meta records**
+    /// (a grouped publish writes both a `mq/` record AND a `mqglog/` entry, and the run has no
+    /// work-queue claimer to ack the former) and the ready/logmax markers — an unbounded per-run leak.
+    /// A complete purge closes that. Idempotent (a repeated purge is a no-op).
+    ///
+    /// Default: a BEST-EFFORT compose over the public ops (`delete_group` every group, then
+    /// `retention_sweep(topic, 0)`) for backends without a native purge — it reclaims the grouped log
+    /// but not the work-queue records. The durable backends (`LogMessaging`, cluster `RaftMessaging`)
+    /// override it for a COMPLETE, and on the cluster a REPLICATED, purge.
+    async fn purge_topic(&self, topic: &str) -> Result<(), MessagingError> {
+        for g in self.list_groups(topic).await.unwrap_or_default() {
+            let _ = self.delete_group(topic, &g.group).await;
+        }
+        let _ = self.retention_sweep(topic, 0).await;
+        Ok(())
+    }
+
     // --- event-driven delivery (Phase A) ------------------------------------------------------
     //
     // The drainer reacts to the durable **ready-set** (topics with claimable work) instead of
@@ -3833,6 +3857,126 @@ impl Messaging for LogMessaging {
         self.gc_grouped(topic, retention_ms).await
     }
 
+    async fn purge_topic(&self, topic: &str) -> Result<(), MessagingError> {
+        // Complete, unconditional reclaim of every durable key/payload of `topic` (see the trait doc).
+        // Under the claim lock so a concurrent publish/claim on the topic can't interleave a write
+        // between our enumeration and delete (same guard `gc_grouped` takes).
+        let _guard = self.claim_lock.lock().await;
+
+        // (1) Work-queue index records (`mq/{topic}/{id}`) + their object-store payloads. A grouped
+        // publish writes one of these per message too, and a run has no work-queue claimer to ack it,
+        // so these would otherwise leak. (A small payload is inlined IN the record, so a delete of the
+        // record frees it; `mqp/{topic}/{id}` only exists for a non-inlined one — delete is a no-op if
+        // absent.)
+        let meta_prefix = meta_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&meta_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &meta_prefix) {
+                continue; // a subtopic's record — never touched by this topic's purge
+            }
+            let id = &key[meta_prefix.len()..];
+            let _ = self.storage.delete(&payload_key(topic, id)).await;
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+
+        // (2) Retained grouped log entries (`mqglog/{topic}/{id}`) + their retained payloads
+        // (`mqgp/{topic}/{id}`) — unconditional (no "still needed by a group" check; the whole run is
+        // being reclaimed).
+        let log_prefix = glog_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&log_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &log_prefix) {
+                continue;
+            }
+            let id = &key[log_prefix.len()..];
+            let _ = self.storage.delete(&gpayload_key(topic, id)).await;
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+
+        // (3) Every group's compact state (incl. the run `ret` retention group that pins the log) and
+        // every group's dead-letters.
+        let state_prefix = gstate_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&state_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if is_direct_child(&key, &state_prefix) {
+                self.kv
+                    .delete(&key)
+                    .await
+                    .map_err(MessagingError::backend)?;
+            }
+        }
+        let gdead_prefix = gdead_topic_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&gdead_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            // `{group}/{id}` (two segments) — a subtopic bleed (≥3) is rejected by `split_group_id`.
+            if split_group_id(&key[gdead_prefix.len()..]).is_some() {
+                self.kv
+                    .delete(&key)
+                    .await
+                    .map_err(MessagingError::backend)?;
+            }
+        }
+
+        // (4) Work-queue dead-letters (`mqdead/{topic}/{id}`) + their payloads — a run has none in
+        // practice (no work-queue claim path), but a complete purge leaves nothing behind.
+        let dead_prefix = dead_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&dead_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &dead_prefix) {
+                continue;
+            }
+            let id = &key[dead_prefix.len()..];
+            let _ = self.storage.delete(&payload_key(topic, id)).await;
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+
+        // (5) The per-topic single markers: ready-set, logmax gate, operator policy, pause flag.
+        for key in [
+            ready_key(topic),
+            logmax_key(topic),
+            mqpolicy_key(topic),
+            pause_key(topic),
+        ] {
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+        // Drop the cached in-memory policy so a later same-named topic re-reads fresh (defensive — a
+        // run topic's id is unguessable, so reuse is effectively impossible).
+        self.policy_cache.lock().unwrap().remove(topic);
+        Ok(())
+    }
+
     fn subscribe(
         &self,
         topic: &str,
@@ -4686,6 +4830,71 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn purge_topic_removes_every_durable_trace_incl_work_queue_and_ret_group() {
+        // A run topic shape: a never-advanced `ret` retention group (pins the log for life) + emits.
+        // A grouped publish writes BOTH a work-queue meta record AND a retained glog entry, so
+        // `delete_group` + `retention_sweep` alone would leak the meta records + ready/logmax markers.
+        // `purge_topic` must leave NOTHING behind.
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage.clone(), kv.clone());
+        let t = "acme/.boatramp-run/t_firm-a/run1";
+        // Register the retention group (never advanced), then publish two retained events.
+        assert!(
+            mq.claim_grouped(t, "ret", StartPosition::Earliest, LEASE, 1, 1000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        mq.publish(t, b"progress").await.unwrap();
+        mq.publish(t, b"result").await.unwrap();
+        // Precondition: the work-queue meta records, the retained log, the `ret` group, and the
+        // ready/logmax markers all exist (so the purge has something real to reclaim).
+        assert_eq!(
+            kv.list_prefix(&meta_prefix(t)).await.unwrap().len(),
+            2,
+            "two work-queue meta records (a grouped publish writes one each)"
+        );
+        assert_eq!(kv.list_prefix(&glog_prefix(t)).await.unwrap().len(), 2);
+        assert_eq!(kv.list_prefix(&gstate_prefix(t)).await.unwrap().len(), 1);
+        assert!(kv.get(&ready_key(t)).await.unwrap().is_some());
+        assert!(kv.get(&logmax_key(t)).await.unwrap().is_some());
+
+        mq.purge_topic(t).await.unwrap();
+
+        // Every durable KV trace is gone — work-queue, grouped log, group state, markers.
+        for prefix in [
+            meta_prefix(t),
+            glog_prefix(t),
+            gstate_prefix(t),
+            gdead_topic_prefix(t),
+            dead_prefix(t),
+        ] {
+            assert!(
+                kv.list_prefix(&prefix).await.unwrap().is_empty(),
+                "purge left KV entries under {prefix}"
+            );
+        }
+        for key in [ready_key(t), logmax_key(t), mqpolicy_key(t), pause_key(t)] {
+            assert!(
+                kv.get(&key).await.unwrap().is_none(),
+                "purge left the marker {key}"
+            );
+        }
+        // And the retained payloads are freed from object storage.
+        assert!(
+            storage
+                .list(&format!("mqgp/{t}/"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "purge left retained payloads in storage"
+        );
+        // Idempotent: a repeated purge is a clean no-op.
+        mq.purge_topic(t).await.unwrap();
     }
 
     #[tokio::test]

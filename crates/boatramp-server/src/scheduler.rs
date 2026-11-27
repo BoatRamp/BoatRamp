@@ -847,6 +847,46 @@ pub(super) async fn run_scheduler_tick(
                 }
             }
         }
+        // Run TTL / idle sweep (PLAN-run-streaming enable-precondition): reclaim this project's
+        // TERMINAL runs past their retention TTL and IDLE/ABANDONED runs (Active, no emit past the
+        // idle TTL, no live attacher → cancel + reclaim). This is the HARD precondition for enabling
+        // `allow_guest_run_streaming`: a never-advanced `ret` retention group pins a terminal run's log
+        // for life, and drop-cancel is best-effort (an abrupt teardown leaves a run Active + pinned).
+        // Once a minute, leader-only, off the hot path — the same cadence/gating as the consumer-group
+        // retention sweep + session reap (maintenance pass only — never on a per-ready-topic drain).
+        // Cheap when no runs exist (an empty prefix scan), and reclaims runs left behind even while the
+        // capability is posture-OFF. Host-internal + per-run within each scope — never cross-tenant.
+        #[cfg(feature = "run-streaming")]
+        if maintenance
+            && inner.cron_leader_gate.get().is_none_or(|gate| gate())
+            && let Some(messaging) = inner.messaging.clone()
+        {
+            let sweep_key = format!("__run_sweep/{project_name}");
+            if sweep_state
+                .get(&sweep_key)
+                .is_none_or(|stamp| *stamp != now.minute_stamp)
+            {
+                sweep_state.insert(sweep_key, now.minute_stamp);
+                let ttls = inner.run_sweep_ttls();
+                match crate::run_stream::sweep_runs(
+                    &messaging,
+                    &inner.kv,
+                    project.as_str(),
+                    ttls,
+                    boatramp_core::time::now_unix_ms(),
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => {
+                        tracing::debug!(project = %project_name, reclaimed = n, "run sweep");
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(project = %project_name, %err, "run sweep failed");
+                    }
+                }
+            }
+        }
         for site in deploy.list_sites(project).await? {
             let Some(site_config) = deploy.get_site_config(project, &site).await? else {
                 continue;

@@ -1776,6 +1776,85 @@ impl Messaging for RaftMessaging {
         Ok(reclaim.len())
     }
 
+    async fn purge_topic(&self, topic: &str) -> Result<(), MessagingError> {
+        // Complete, REPLICATED reclaim of every durable key of `topic` (see the trait doc). Mirrors
+        // `retention_sweep`'s cluster shape: the leader computes the exact delete set from its applied
+        // state and proposes EXPLICIT deletes (version-independent — a mixed-version replica applies
+        // the identical set), then frees the `Storage` payloads client-side (consensus never touches
+        // Storage). Idempotent (a repeated purge is a no-op batch). Unconditional: the caller has
+        // decided the whole topic (e.g. a terminal/abandoned run) is reclaimable.
+        let mut deletes: Vec<WriteOp> = Vec::new();
+        // Work-queue meta records (`mq/{topic}/{id}`) + collect ids for their object-store payloads.
+        let meta_prefix = messaging::meta_prefix(topic);
+        let mut wq_ids: Vec<String> = Vec::new();
+        for key in self.state.list_prefix(&meta_prefix).await {
+            if !messaging::is_direct_child(&key, &meta_prefix) {
+                continue;
+            }
+            wq_ids.push(key[meta_prefix.len()..].to_string());
+            deletes.push(WriteOp::Delete { key });
+        }
+        // Retained grouped log (`mqglog/{topic}/{id}`) + collect ids for their retained payloads.
+        let log_prefix = messaging::glog_prefix(topic);
+        let mut glog_ids: Vec<String> = Vec::new();
+        for key in self.state.list_prefix(&log_prefix).await {
+            if !messaging::is_direct_child(&key, &log_prefix) {
+                continue;
+            }
+            glog_ids.push(key[log_prefix.len()..].to_string());
+            deletes.push(WriteOp::Delete { key });
+        }
+        // Every group's compact state (incl. the never-advanced run `ret` group).
+        let state_prefix = messaging::gstate_prefix(topic);
+        for key in self.state.list_prefix(&state_prefix).await {
+            if messaging::is_direct_child(&key, &state_prefix) {
+                deletes.push(WriteOp::Delete { key });
+            }
+        }
+        // Grouped dead-letters (`mqgd/{topic}/{group}/{id}`, two segments below the prefix).
+        let gdead_prefix = messaging::gdead_topic_prefix(topic);
+        for key in self.state.list_prefix(&gdead_prefix).await {
+            if messaging::split_group_id(&key[gdead_prefix.len()..]).is_some() {
+                deletes.push(WriteOp::Delete { key });
+            }
+        }
+        // Work-queue dead-letters (`mqdead/{topic}/{id}`) + collect ids for their payloads.
+        let dead_prefix = messaging::dead_prefix(topic);
+        for key in self.state.list_prefix(&dead_prefix).await {
+            if !messaging::is_direct_child(&key, &dead_prefix) {
+                continue;
+            }
+            wq_ids.push(key[dead_prefix.len()..].to_string());
+            deletes.push(WriteOp::Delete { key });
+        }
+        // The per-topic single markers.
+        for key in [
+            messaging::ready_key(topic),
+            messaging::logmax_key(topic),
+            messaging::mqpolicy_key(topic),
+            messaging::pause_key(topic),
+        ] {
+            deletes.push(WriteOp::Delete { key });
+        }
+        if !deletes.is_empty() {
+            self.propose(WriteOp::Batch(deletes)).await?;
+        }
+        // Free the object-store payloads (work-queue non-inlined + retained grouped), client-side.
+        for id in &wq_ids {
+            self.storage
+                .delete(&messaging::payload_key(topic, id))
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
+        for id in &glog_ids {
+            self.storage
+                .delete(&messaging::gpayload_key(topic, id))
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn subscribe(
         &self,
         topic: &str,
@@ -2435,6 +2514,60 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(mqs[&1].backlog("t").await.unwrap(), 0);
+
+        shutdown(rafts).await;
+    }
+
+    /// `purge_topic` (PLAN-run-streaming reclaim) on the cluster is a REPLICATED, COMPLETE delete: a
+    /// run-shaped grouped topic — a never-advanced `ret` retention group (pins the log for life) +
+    /// retained events + the work-queue meta records a grouped publish writes — is fully reclaimed
+    /// fleet-wide. The explicit deletes ride the leader-serialized apply exactly like the retention
+    /// sweep, so every replica converges to an empty topic.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_purge_topic_replicates_a_complete_reclaim() {
+        let (rafts, mqs) = cluster_mq(3).await;
+        let t = "acme/.boatramp-run/t_firm-a/run1";
+        // Register the never-advanced retention group + publish two retained events (from any node).
+        assert!(
+            mqs[&1]
+                .claim_grouped(t, "ret", messaging::StartPosition::Earliest, LEASE, 1, 1000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        mqs[&2].publish(t, b"progress").await.unwrap();
+        mqs[&2].publish(t, b"result").await.unwrap();
+        // Precondition on the leader: the `ret` group exists and the topic has backlog (work-queue
+        // meta records a grouped publish writes — the leak `delete_group` + `retention_sweep` miss).
+        assert_eq!(mqs[&1].list_groups(t).await.unwrap().len(), 1);
+        assert_eq!(mqs[&1].backlog(t).await.unwrap(), 2);
+
+        // Purge from node 3 (forwards to the leader); the batch of explicit deletes replicates + applies.
+        mqs[&3].purge_topic(t).await.unwrap();
+
+        // On the leader (which applied the proposal): no groups, no backlog — a COMPLETE reclaim.
+        assert!(
+            mqs[&1].list_groups(t).await.unwrap().is_empty(),
+            "the `ret` retention group is reclaimed"
+        );
+        assert_eq!(
+            mqs[&1].backlog(t).await.unwrap(),
+            0,
+            "the work-queue meta records are reclaimed too"
+        );
+        // And it REPLICATES: a follower converges to the same empty topic.
+        let mut converged = false;
+        for _ in 0..50 {
+            if mqs[&2].list_groups(t).await.unwrap().is_empty()
+                && mqs[&2].backlog(t).await.unwrap() == 0
+            {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(converged, "the purge replicated to the follower");
 
         shutdown(rafts).await;
     }

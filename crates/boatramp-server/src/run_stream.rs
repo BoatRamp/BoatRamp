@@ -40,9 +40,9 @@ use boatramp_core::config::{StartPosition, SubscriptionParams};
 use boatramp_core::kv::KvStore;
 use boatramp_core::messaging::{ClaimedMessage, Messaging, Wake};
 use boatramp_core::run::{
-    RUN_MAX_EVENTS, RUN_PAYLOAD_MAX, RUN_RETENTION_GROUP, RunEnvelope, RunError, RunEventKind,
-    RunState, RunStatus, decode_envelope, encode_envelope, mint_run_id, run_state_key, run_topic,
-    validate_run_id,
+    RUN_MAX_EVENTS, RUN_NAMESPACE, RUN_PAYLOAD_MAX, RUN_RETENTION_GROUP, RunEnvelope, RunError,
+    RunEventKind, RunState, RunStatus, RunSweepTtls, decode_envelope, encode_envelope, mint_run_id,
+    run_state_key, run_topic, validate_run_id,
 };
 use boatramp_core::time::now_unix_ms;
 use futures::StreamExt;
@@ -200,6 +200,9 @@ impl RunEngine {
             let seq = state.next_seq;
             let next = RunState {
                 next_seq: seq + 1,
+                // Advance the IDLE-TTL clock in the same CAS: every emit proves the run is alive, so
+                // the sweep's "no emit for idle_ttl" test ages from the last emit (see `sweep_runs`).
+                last_emit_ms: now_unix_ms(),
                 ..state.clone()
             };
             let bytes = serde_json::to_vec(&next)
@@ -236,6 +239,9 @@ impl RunEngine {
             let next = RunState {
                 status,
                 terminal_seq: Some(seq),
+                // Start the TERMINAL-RETENTION clock: the sweep reclaims this run `terminal_retention`
+                // after it concluded (so a reconnecting client can still fetch the result until then).
+                terminal_ms: Some(now_unix_ms()),
                 ..state.clone()
             };
             let bytes = serde_json::to_vec(&next)
@@ -537,6 +543,141 @@ impl RunStore for RunStoreImpl {
     async fn status(&self, run_id: &str) -> Result<RunStatus, RunStoreError> {
         self.engine.status(run_id).await.map_err(to_store_err)
     }
+}
+
+// ---- the TTL / idle-run sweep (PLAN-run-streaming enable-precondition) -------------------------
+//
+// P1 made a run its own durable grouped topic pinned for LIFE by the never-advanced `ret` retention
+// group, and drop-cancel is best-effort (only a clean resource drop fires it — an abrupt instance or
+// connection teardown does not). So without a sweep a TERMINAL run's log stays pinned forever, and an
+// abandoned run stays `Active` with its log pinned — an unbounded leak + the HARD enable-precondition
+// the PLAN gates `allow_guest_run_streaming` on. The scheduler's maintenance tick calls [`sweep_runs`]
+// once a minute per project (leader-gated, off the hot path — the same place the consumer-group
+// retention sweep + session reap run). The sweep is HOST-INTERNAL and operates per-run WITHIN each
+// scope (it only ever purges the one run topic it is handed + that run's own state record), so it
+// never crosses a tenant boundary.
+
+/// Reclaim a SINGLE run completely: purge its durable messaging topic (work-queue + retained log +
+/// EVERY group incl. the `ret` retention group + the ready/logmax markers — [`Messaging::purge_topic`],
+/// a REPLICATED delete on the cluster, like P1's attach-group cleanup) and delete its control-plane
+/// state record. Idempotent. Operates on exactly the topic it is handed — never cross-tenant.
+async fn reclaim_run(
+    messaging: &Arc<dyn Messaging>,
+    kv: &Arc<dyn KvStore>,
+    topic: &str,
+) -> Result<(), RunError> {
+    messaging
+        .purge_topic(topic)
+        .await
+        .map_err(|e| RunError::Backend(e.to_string()))?;
+    kv.delete(&run_state_key(topic))
+        .await
+        .map_err(|e| RunError::Backend(e.to_string()))?;
+    Ok(())
+}
+
+/// Whether a run topic currently has a LIVE attacher: a registered consumer group OTHER than the
+/// never-advanced `ret` retention group (every attach opens its own ephemeral group for the life of
+/// the connection, cleaned up on drop). A run being actively watched therefore always shows a non-`ret`
+/// group, so the idle sweep never reclaims a currently-attached run. Fails SAFE: an enumeration error
+/// is treated as "a live attacher may exist" (don't reclaim a run we cannot inspect).
+async fn has_live_attacher(messaging: &Arc<dyn Messaging>, topic: &str) -> bool {
+    match messaging.list_groups(topic).await {
+        Ok(groups) => groups.iter().any(|g| g.group != RUN_RETENTION_GROUP),
+        Err(_) => true,
+    }
+}
+
+/// Decompose a run topic `{project}/.boatramp-run/{scope}/{run_id}` into its parts — exactly four
+/// segments, none of which contain `/` (the project is a single slug, `.boatramp-run` the reserved
+/// namespace, the scope a `t_…`/`u` segment, the run id a single clean segment). `None` for anything
+/// that is not a well-formed run topic (so the sweep never acts on a stray key).
+fn split_run_topic(topic: &str) -> Option<(&str, &str, &str)> {
+    let mut it = topic.split('/');
+    let project = it.next()?;
+    let namespace = it.next()?;
+    let scope = it.next()?;
+    let run_id = it.next()?;
+    if namespace != RUN_NAMESPACE || it.next().is_some() || project.is_empty() {
+        return None;
+    }
+    Some((project, scope, run_id))
+}
+
+/// The TTL / idle-run SWEEP for one `project` (PLAN-run-streaming enable-precondition). Enumerates the
+/// project's run-state records (`runstate/{project}/.boatramp-run/…`, across EVERY tenant scope — the
+/// sweep is host-internal and only ever reclaims a run WITHIN its own scope) and, at `now_ms`:
+///
+/// - **TERMINAL run** (`result`/`end`/`error`/`cancelled`): reclaim once `now - terminal_ms >
+///   terminal_retention` — a concluded run's log is kept that long so a reconnecting client can still
+///   fetch the result, then reclaimed.
+/// - **IDLE/ABANDONED run** (`Active`, `now - last_emit_ms > idle_ms`, AND no live attacher): CANCEL it
+///   (emit the terminal `cancelled` — the stop signal a returning emitter observes) then reclaim. An
+///   actively-emitting run (recent `last_emit_ms`) OR a currently-attached run (a non-`ret` group) is
+///   NEVER reclaimed.
+///
+/// Returns the number of runs reclaimed. A record that fails to decode is LEFT in place (a
+/// reviewer-visible anomaly, never a blind delete). Per-run failures are surfaced to the caller (the
+/// scheduler logs + continues next tick).
+pub async fn sweep_runs(
+    messaging: &Arc<dyn Messaging>,
+    kv: &Arc<dyn KvStore>,
+    project: &str,
+    ttls: RunSweepTtls,
+    now_ms: u64,
+) -> Result<usize, RunError> {
+    let prefix = format!("runstate/{project}/{RUN_NAMESPACE}/");
+    let keys = kv
+        .list_prefix(&prefix)
+        .await
+        .map_err(|e| RunError::Backend(e.to_string()))?;
+    let mut reclaimed = 0usize;
+    for state_key in keys {
+        // The full run topic is the state key minus the `runstate/` prefix.
+        let Some(topic) = state_key.strip_prefix("runstate/") else {
+            continue;
+        };
+        let topic = topic.to_string();
+        let Some(bytes) = kv
+            .get(&state_key)
+            .await
+            .map_err(|e| RunError::Backend(e.to_string()))?
+        else {
+            continue; // raced a concurrent reclaim — already gone
+        };
+        let Ok(state) = serde_json::from_slice::<RunState>(&bytes) else {
+            // A record this host never wrote (or a future schema we can't read) — leave it rather
+            // than blind-delete; an operator/reviewer can see the anomaly.
+            continue;
+        };
+        match state.status {
+            RunStatus::Active => {
+                let idle = now_ms.saturating_sub(state.last_emit_ms) > ttls.idle_ms;
+                if idle && !has_live_attacher(messaging, &topic).await {
+                    // Cancel (emit the terminal `cancelled`) via a run engine rebuilt from the topic's
+                    // own (project, scope) — then reclaim. `cancel` is idempotent, so a run that
+                    // concluded between the read and here is fine.
+                    if let Some((proj, scope, run_id)) = split_run_topic(&topic) {
+                        let engine =
+                            RunEngine::new(messaging.clone(), kv.clone(), proj, scope.to_string());
+                        let _ = engine.cancel(run_id).await;
+                    }
+                    reclaim_run(messaging, kv, &topic).await?;
+                    reclaimed += 1;
+                }
+            }
+            RunStatus::Ended | RunStatus::Errored | RunStatus::Cancelled => {
+                // Fall back to `created_ms` if `terminal_ms` is somehow unset (a pre-sweep record), so
+                // a terminal run always ages toward reclaim.
+                let since = state.terminal_ms.unwrap_or(state.created_ms);
+                if now_ms.saturating_sub(since) > ttls.terminal_retention_ms {
+                    reclaim_run(messaging, kv, &topic).await?;
+                    reclaimed += 1;
+                }
+            }
+        }
+    }
+    Ok(reclaimed)
 }
 
 #[cfg(test)]
@@ -1003,5 +1144,149 @@ mod tests {
             vec!["ret".to_string()],
             "the ephemeral attach group is cleaned up on drop; `ret` survives"
         );
+    }
+
+    // ---- the TTL / idle-run sweep (the enable-precondition) -----------------------------------
+
+    /// Like [`engine_for`] but also hands back the SAME messaging + control-plane KV the engine was
+    /// built over, so a test can drive [`sweep_runs`] against the identical substrate the engine writes.
+    fn engine_and_backends(
+        tenant: Option<&str>,
+    ) -> (RunEngine, Arc<dyn Messaging>, Arc<dyn KvStore>) {
+        let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(
+            Arc::new(MemStorage::default()),
+            Arc::new(MemoryKv::new()),
+        ));
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let engine = RunEngine::new(
+            messaging.clone(),
+            kv.clone(),
+            "acme",
+            run_scope_segment(tenant),
+        );
+        (engine, messaging, kv)
+    }
+
+    /// A TERMINAL run is reclaimed once past its retention TTL, and kept before it — plus the sweep is
+    /// idempotent and fully reclaims (status → NotFound).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_run_reclaimed_after_retention_ttl() {
+        let (engine, messaging, kv) = engine_and_backends(Some("firm-a"));
+        let run = engine.create(false).await.unwrap();
+        engine
+            .emit(&run, RunEventKind::Result, b"done".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Ended);
+
+        let ttls = RunSweepTtls::default();
+        let now = now_unix_ms();
+        // Within the retention window ⇒ NOT reclaimed (a client can still fetch the result).
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, now)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Ended);
+        // Past the retention TTL ⇒ reclaimed.
+        let later = now + ttls.terminal_retention_ms + 1;
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, later)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(engine.status(&run).await, Err(RunError::NotFound));
+        // Idempotent — a second pass finds nothing.
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, later)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// An IDLE/ABANDONED `Active` run (no emit past the idle TTL, no live attacher) is cancelled +
+    /// reclaimed; a run still inside the idle window is left alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_abandoned_run_is_cancelled_and_reclaimed() {
+        let (engine, messaging, kv) = engine_and_backends(Some("firm-a"));
+        let run = engine.create(true).await.unwrap();
+        engine
+            .emit(&run, RunEventKind::Progress, b"p".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Active);
+
+        let ttls = RunSweepTtls::default();
+        let now = now_unix_ms();
+        // Inside the idle window ⇒ not reclaimed.
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, now)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Active);
+        // Past the idle TTL with no live attacher ⇒ cancelled + reclaimed (state gone).
+        let later = now + ttls.idle_ms + 1;
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, later)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(engine.status(&run).await, Err(RunError::NotFound));
+    }
+
+    /// An ACTIVELY-EMITTING run (recent `last_emit_ms`) inside the idle window is NOT reclaimed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actively_emitting_run_is_not_reclaimed() {
+        let (engine, messaging, kv) = engine_and_backends(Some("firm-a"));
+        let run = engine.create(false).await.unwrap();
+        engine
+            .emit(&run, RunEventKind::Progress, b"p".to_vec())
+            .await
+            .unwrap();
+        let ttls = RunSweepTtls::default();
+        // 30 min after the last emit — comfortably inside the 1h idle TTL ⇒ not reclaimed.
+        let now = now_unix_ms() + 30 * 60 * 1000;
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, now)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Active);
+    }
+
+    /// A CURRENTLY-ATTACHED run is NOT reclaimed even far past the idle TTL — a live attach registers a
+    /// non-`ret` consumer group, which [`has_live_attacher`] observes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn currently_attached_run_is_not_reclaimed_past_idle_ttl() {
+        let (engine, messaging, kv) = engine_and_backends(Some("firm-a"));
+        let run = engine.create(true).await.unwrap();
+        engine
+            .emit(&run, RunEventKind::Progress, b"p".to_vec())
+            .await
+            .unwrap();
+        // Open an attach and drive its first poll so the ephemeral attach group is registered; hold it
+        // alive across the sweep (a currently-attached run).
+        let mut attach = engine.attach(&run, None).await.unwrap();
+        let first = attach.stream.next().await.expect("one event").expect("ok");
+        assert_eq!(first.kind, RunEventKind::Progress);
+
+        let ttls = RunSweepTtls::default();
+        // Far past the idle TTL, but a live attacher is present ⇒ NOT reclaimed.
+        let later = now_unix_ms() + 10 * ttls.idle_ms;
+        assert_eq!(
+            sweep_runs(&messaging, &kv, "acme", ttls, later)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(engine.status(&run).await.unwrap(), RunStatus::Active);
+        drop(attach);
     }
 }

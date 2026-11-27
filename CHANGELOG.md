@@ -90,6 +90,48 @@ versions.
     flipping the posture on — unchanged by P2.
   - **INFO-1 doc fix.** Corrected a dangling symbol in `boatramp-core::run`'s security-invariant
     comment (`MessagingHost::resolve_topic` → the real `MessagingBinding::namespace`).
+- **Scoped run streaming — enable-readiness: the TTL / idle-run sweep + P2 Security LOW/INFO
+  hardenings.** The HARD precondition for turning `allow_guest_run_streaming` on (the posture stays
+  OFF in every profile — this only makes the capability SAFE to enable; an operator still opts in).
+  - **Terminal / idle-run TTL sweep (the main deliverable).** P1 pins a run's retained log for LIFE
+    via the never-advanced `ret` retention group, and drop-cancel is best-effort (an abrupt instance
+    or connection teardown leaves a run `Active` with its log pinned) — so without a sweep a run's
+    bytes are NEVER reclaimed. A new scheduler-driven sweep (on the existing maintenance tick that
+    already runs the consumer-group retention sweep + session reap — once a minute per project,
+    leader-only, off the hot claim path) reclaims: **(a) a TERMINAL run** after a retention TTL
+    (default 24 h — kept that long so a reconnecting client can still fetch the result); **(b) an
+    IDLE/ABANDONED run** — `Active`, no emit for an idle TTL (default 1 h) AND no live attacher —
+    which it CANCELS (emits the terminal `cancelled`, the stop signal a returning emitter observes)
+    then reclaims. An actively-emitting run (recent emit) OR a currently-attached run (a live, non-`ret`
+    consumer group) is NEVER reclaimed. TTLs are configurable (`RunSweepTtls`, defaulting to the
+    `RUN_TERMINAL_RETENTION_MS` / `RUN_IDLE_TTL_MS` constants). Reclaim is a COMPLETE purge of the run
+    topic — a new `Messaging::purge_topic` removes the work-queue index + payloads, the retained
+    grouped log + payloads, EVERY group (incl. `ret`) + dead-letters, and the ready/logmax/policy/pause
+    markers (`delete_group` + `retention_sweep` alone leak the work-queue meta records a grouped
+    publish writes), plus the control-plane run-state record. On a cluster the purge is a REPLICATED
+    delete (explicit, version-independent — like the cluster retention sweep). The sweep is
+    host-internal and per-run WITHIN each scope — it never crosses a tenant boundary. Cheap when no
+    runs exist (an empty prefix scan), and reclaims runs left behind even while the posture is off.
+  - **LOW-2 — long-poll stream permits.** The long-poll attach now acquires the SAME per-scope +
+    per-IP stream permits SSE/WS do (keyed by `run:{run_id}`), so concurrent long-polls — and the
+    ephemeral-group churn each opens on the holder's own run — are bounded (shed to `503`/`429`)
+    exactly like the streaming transports, rather than being an un-capped hole.
+  - **INFO-1 — START target shape.** Documented that a START `target` is a bus TOPIC PATH (a real
+    `bus:` topic is dotted/slashed, e.g. `concept.generate` / `orders/created`), screened with
+    `validate_object_key` (rejects traversal, control bytes, `*`, and the reserved `.boatramp*`
+    namespace) rather than a single `validate_resource_name` segment (which would wrongly reject those
+    topics); the start is confined to `{project}/bus/<target>`, so a screened target can never escape
+    the bus or reach the run keyspace.
+  - **LOW-1 / INFO-2 / INFO-3 — documented.** The run-cap is a plain bearer (ATTACH/CANCEL bypass the
+    middleware's PoP / `require_channel_bound_tokens`): a leaked `attach_token` grants attach+cancel on
+    ONE run for its short mandatory TTL (3600 s) with no in-TTL revocation (INFO-3) — never broad creds,
+    never cross-run / cross-tenant / cross-project, and now further bounded by the sweep (a reclaimed
+    run's token resolves to `NotFound`). cnf-binding the run-cap (a holder-key `cnf` + per-request PoP
+    on the RBAC-ungated attach/cancel routes, plus the external-client contract change that implies) is
+    a LARGER change assessed and DEFERRED as an enable-time follow-up (NOT implemented; no posture
+    flipped). The ghost-tenant START (INFO-2 — a start for a non-existent target, RBAC-gated, matching
+    the bus precedent) and the orphan run it leaves (INFO-4) are noted; the orphan self-heals via the
+    idle-run sweep.
 
 ## [0.75.0] — 2026-11-26
 

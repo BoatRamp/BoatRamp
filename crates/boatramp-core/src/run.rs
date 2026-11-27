@@ -94,6 +94,24 @@ pub const RUN_PAYLOAD_MAX: usize = 1024 * 1024;
 /// posture-OFF by default; P1 adds no operator override).
 pub const RUN_MAX_EVENTS: u64 = 100_000;
 
+/// Default retention TTL for a CONCLUDED run (PLAN-run-streaming enable-precondition). Once a run
+/// reaches a terminal status (`result`/`end`/`error`/`cancelled`), its retained event log + state are
+/// kept for this long so a reconnecting client can still fetch the result/outcome, THEN reclaimed by
+/// the scheduler-driven run sweep. Without this a terminal run's log is pinned forever (the never-
+/// advanced `ret` retention group pins it for the run's life). 24h is generous for a client to collect
+/// a result across reconnects while bounding how long a concluded run's bytes linger. Configurable via
+/// [`crate::run::RunSweepTtls`] (the node runtime default when the operator sets nothing).
+pub const RUN_TERMINAL_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Default idle TTL for an ABANDONED run (PLAN-run-streaming enable-precondition). An `Active` run with
+/// NO emit for this long AND no live attacher is treated as abandoned — the scheduler-driven sweep
+/// cancels it (emits the terminal `cancelled`) and reclaims it. This is the backstop for the
+/// best-effort drop-cancel: an abrupt instance/connection teardown can leave a run `Active` with its
+/// log pinned, which this bounds. 1h comfortably outlives a legitimate long agent run's inter-emit gap
+/// (a working agent emits progress; a truly idle+unwatched run is abandoned). Configurable via
+/// [`crate::run::RunSweepTtls`].
+pub const RUN_IDLE_TTL_MS: u64 = 60 * 60 * 1000;
+
 /// The tenancy **scope segment** of a run topic, composed by the HOST from THIS invocation's resolved
 /// own-tenant (never guest-supplied). A resolved tenant `t` maps to `t_{t}`; an unresolved tenant (a
 /// single-tenant / unscoped invocation) maps to the fixed sentinel `u`. The `t_` prefix is
@@ -246,18 +264,61 @@ pub struct RunState {
     /// cancelled (so a long-lived emitter stops). On by default (the plan's default); the creator may
     /// turn it off (e.g. a fire-and-forget run with no watcher).
     pub drop_cancel: bool,
+    /// When the run was created, Unix millis (the run sweep's age baseline; also the `last_emit_ms`
+    /// seed so a created-but-never-emitted run — e.g. an orphan from a non-existent START target —
+    /// still ages from creation). `#[serde(default)]` for forward-compat with a pre-sweep record
+    /// (a `0` reads as "ancient", which only makes the sweep reclaim it sooner — fail-safe).
+    #[serde(default)]
+    pub created_ms: u64,
+    /// When this run last had an emit reserved against it, Unix millis — the IDLE-TTL clock. Advanced
+    /// on every `emit` (in the same CAS that reserves the `seq`); seeded to `created_ms` at create.
+    /// The sweep treats `now - last_emit_ms > idle_ttl` (AND no live attacher) as abandoned.
+    #[serde(default)]
+    pub last_emit_ms: u64,
+    /// When the run CONCLUDED, Unix millis — the TERMINAL-RETENTION clock. Set when the terminal
+    /// transition is finalized; `None` while the run is `Active`. The sweep reclaims a terminal run
+    /// once `now - terminal_ms > terminal_retention`.
+    #[serde(default)]
+    pub terminal_ms: Option<u64>,
 }
 
 impl RunState {
-    /// A freshly-created, active run with the `seq` allocator at 0.
+    /// A freshly-created, active run with the `seq` allocator at 0, timestamped `now`.
     #[must_use]
     pub fn new(drop_cancel: bool) -> Self {
+        let now = now_unix_ms();
         Self {
             version: crate::schema_version(),
             status: RunStatus::Active,
             next_seq: 0,
             terminal_seq: None,
             drop_cancel,
+            created_ms: now,
+            // Seed the idle clock at creation: a run that is created but never emitted to (an orphan
+            // from a non-existent START target — INFO-4) still ages toward the idle sweep from `now`.
+            last_emit_ms: now,
+            terminal_ms: None,
+        }
+    }
+}
+
+/// Operator-tunable TTLs for the scheduler-driven run sweep (PLAN-run-streaming enable-precondition).
+/// Both default to the module constants ([`RUN_TERMINAL_RETENTION_MS`] / [`RUN_IDLE_TTL_MS`]); a node
+/// runtime may override them. Purely a reclaim-latency knob — it never affects at-least-once delivery
+/// or tenancy (the sweep is host-internal, per-run within each scope, never cross-tenant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSweepTtls {
+    /// Reclaim a TERMINAL run this long after it concluded.
+    pub terminal_retention_ms: u64,
+    /// Cancel + reclaim an `Active` run idle (no emit) this long with no live attacher.
+    pub idle_ms: u64,
+}
+
+impl Default for RunSweepTtls {
+    fn default() -> Self {
+        Self {
+            terminal_retention_ms: RUN_TERMINAL_RETENTION_MS,
+            idle_ms: RUN_IDLE_TTL_MS,
         }
     }
 }

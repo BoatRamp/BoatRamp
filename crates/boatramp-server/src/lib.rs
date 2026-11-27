@@ -695,6 +695,13 @@ struct HandlerRuntimeInner {
     /// due-heap are the authority regardless of cadence) — only latency vs idle-wakeup tradeoff.
     #[cfg(feature = "handlers")]
     delivery_config: std::sync::OnceLock<DeliveryConfig>,
+    /// The run-sweep TTLs (PLAN-run-streaming enable-precondition): the operator override for the
+    /// terminal-retention + idle-run reclaim windows; **unset ⇒ the built-in defaults**
+    /// ([`boatramp_core::run::RunSweepTtls::default`]). Set once at startup via
+    /// [`HandlerRuntime::set_run_sweep_ttls`]. A pure reclaim-latency knob (the capability is
+    /// posture-OFF by default; this only tunes how promptly a terminal/abandoned run is reclaimed).
+    #[cfg(feature = "run-streaming")]
+    run_sweep_ttls: std::sync::OnceLock<boatramp_core::run::RunSweepTtls>,
     /// Count of async invocations claimed by the **unsharded safety-net** pass rather than the sharded
     /// fast path (B10/B14 observability). A rising counter is the "wake/ownership gap" early warning —
     /// work IS getting drained, but only by the coarse backstop, not the owning node's fast path — so
@@ -927,6 +934,15 @@ impl HandlerRuntimeInner {
         self.delivery_config.get().copied().unwrap_or_default()
     }
 
+    /// The resolved run-sweep TTLs (PLAN-run-streaming enable-precondition): the operator override if
+    /// set, else [`boatramp_core::run::RunSweepTtls::default`] (terminal-retention 24h, idle 1h). Read
+    /// by the scheduler's once-a-minute run sweep. A pure reclaim-latency knob (never affects delivery
+    /// or tenancy).
+    #[cfg(feature = "run-streaming")]
+    fn run_sweep_ttls(&self) -> boatramp_core::run::RunSweepTtls {
+        self.run_sweep_ttls.get().copied().unwrap_or_default()
+    }
+
     /// **Does THIS node own the async-lane work for `key`?** (B10 — the async-lane shard gate.) The
     /// key is a function/cron identity (see [`async_shard_key_function`]/[`async_shard_key_site_cron`]).
     ///
@@ -1102,6 +1118,8 @@ impl HandlerRuntime {
                 tenancy_posture_overrides: std::sync::OnceLock::new(),
                 #[cfg(feature = "handlers")]
                 delivery_config: std::sync::OnceLock::new(),
+                #[cfg(feature = "run-streaming")]
+                run_sweep_ttls: std::sync::OnceLock::new(),
                 safetynet_only_drains: std::sync::atomic::AtomicU64::new(0),
             })),
         }
@@ -2264,6 +2282,17 @@ impl HandlerRuntime {
     pub fn set_delivery_config(&self, config: DeliveryConfig) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.delivery_config.set(config);
+        }
+    }
+
+    /// Set the run-sweep TTLs (PLAN-run-streaming enable-precondition) from the node config. Set once
+    /// at startup; a no-op runtime ignores it, and an unset runtime uses
+    /// [`boatramp_core::run::RunSweepTtls::default`] (terminal-retention 24h, idle 1h). A pure
+    /// reclaim-latency knob — it never affects at-least-once delivery or the per-run tenancy fence.
+    #[cfg(feature = "run-streaming")]
+    pub fn set_run_sweep_ttls(&self, ttls: boatramp_core::run::RunSweepTtls) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.run_sweep_ttls.set(ttls);
         }
     }
 

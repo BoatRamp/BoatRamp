@@ -37,6 +37,44 @@
 //! gate as P1's guest door) AND the `run-streaming` cargo feature. With the posture off every door
 //! returns `403` — zero runtime exposure. Minting the run-scoped token requires an ISSUING node (one
 //! with a fleet signer); a non-issuing node returns `501` at START.
+//!
+//! # Security notes (P2 Security-review LOW/INFO items)
+//!
+//! **LOW-1 — the run-cap is a plain bearer, NOT channel-bound.** ATTACH/CANCEL verify only the
+//! fleet SIGNATURE of the run-scoped token (`verify_run_cap`); they do NOT run the control-plane
+//! middleware's proof-of-possession / `require_channel_bound_tokens` path (these two routes are
+//! RBAC-ungated and self-verify the bearer). So a LEAKED `attach_token` grants attach + cancel on
+//! that ONE run to anyone who holds it. **Blast radius is deliberately tight:** exactly one run
+//! (`run_id` in the signed scope, matched to the path), under one tenant (the signed `scope` — never
+//! cross-tenant), redeemable only at one project (the `aud`), for at most the mandatory TTL
+//! ([`RUN_CAP_TTL_SECS`] = 3600s), and it can never be redeemed as any other token kind (the exact
+//! `br_kind` check). It is never broad creds. **No revocation within the TTL** (INFO-3): a leaked
+//! token is valid until it expires — bounded by the short TTL AND by the run itself being reclaimed
+//! by the TTL/idle sweep (after which the token resolves to `NotFound`).
+//!
+//! *Assessment — cnf-binding the run-cap is a LARGER change, DEFERRED as an enable-time follow-up (we
+//! did NOT implement it here, and we did NOT flip any posture):* binding the run-cap to the START
+//! caller's holder key (a `cnf` claim + a per-request PoP, so a leaked token is useless without the
+//! holder's private key) would require (a) plumbing the START caller's verified terminal holder key
+//! out of `require_auth` into the mint, (b) stamping a `cnf` claim onto the run-cap, and (c) building
+//! a PoP challenge/response verification ON these two RBAC-ungated routes (they today run NONE of the
+//! middleware's PoP machinery), plus deciding its interaction with `require_channel_bound_tokens`.
+//! That also changes the EXTERNAL-client contract — the whole point of the run-cap (D3) is a
+//! run-scoped bearer for non-guest clients (MCP apps, third-party GraphQL) that we do not control and
+//! that commonly present a plain HTTP bearer, not a DPoP-style PoP. So it is a design + Security-review
+//! item to pin with the requester at enable time, not a clean drop-in here. The present mitigation is
+//! the tight blast radius above (one run · short mandatory TTL · never cross-run/tenant/project) plus
+//! the sweep that bounds the window a leaked token can reach anything.
+//!
+//! **INFO-2 — ghost-tenant START.** START authorizes the project invoke right + a host-resolved
+//! tenant, but does not pre-verify the target agent EXISTS; a START for a non-existent target creates
+//! an (orphan) run and publishes a start-message nobody consumes. This matches the project-bus
+//! precedent (a publish to a topic with no consumer is accepted) and is RBAC-gated (only a principal
+//! with the project invoke right can do it) — hygiene, not a breach.
+//!
+//! **INFO-4 — the orphan run from a non-existent target self-heals.** Such a run stays `Active` with
+//! no emit and no attacher, so the IDLE/ABANDONED arm of the TTL sweep (see
+//! [`crate::run_stream::sweep_runs`]) cancels + reclaims it after the idle TTL — no permanent leak.
 
 #![cfg(feature = "run-streaming")]
 
@@ -223,8 +261,16 @@ fn authorize_run_token(
 /// `POST /api/projects/{project}/runs` body: the target handler/agent to invoke + its opaque input.
 #[derive(Deserialize)]
 pub(crate) struct RunStartBody {
-    /// The target handler/agent name (a bus topic segment, screened for traversal). The run's start
-    /// is published to the target's `{project}/bus/<target>` topic; the target emits to the run.
+    /// The target agent's **bus topic path** — the start is published to the target's
+    /// `{project}/bus/<target>` topic, where a long-lived bus-consumer agent subscribes and emits to
+    /// the run. INFO-1: this is a bus TOPIC PATH, not a single resource-name segment — a legitimate
+    /// `bus:` topic is dotted/slashed (`concept.generate`, `orders/created`), so it is screened with
+    /// [`validate_object_key`] (rejects traversal `..`, control bytes, `*`, and the reserved
+    /// `.boatramp*` namespace — so a target can never escape the project bus or reach the sibling
+    /// `{project}/.boatramp-run/…` run keyspace) rather than the strict single-segment
+    /// `validate_resource_name` (which would wrongly reject those real bus topics). The confinement to
+    /// `{project}/bus/<target>` is what keeps the target in-bounds; the screen is the traversal
+    /// backstop.
     target: String,
     /// The opaque input handed to the target (carried verbatim in the start-message). Defaults to
     /// JSON `null` when omitted.
@@ -283,8 +329,12 @@ pub(crate) async fn run_start(
         )
             .into_response();
     };
-    // Screen the target as a clean bus topic segment BEFORE composing its key (traversal / control
-    // bytes / reserved namespace), exactly as the bus-consumer claim path screens its topic.
+    // Screen the target as a clean bus topic PATH BEFORE composing its key (INFO-1): `validate_object_key`
+    // allows a real dotted/slashed `bus:` topic (`concept.generate`, `orders/created`) while rejecting
+    // traversal (`..`), control bytes, `*`, and the reserved `.boatramp*` namespace — the SAME screen
+    // the authenticated bus-consumer path runs on its topic. The start is then confined to
+    // `{project}/bus/<target>`, so a screened target can never escape the project bus or reach the
+    // sibling run keyspace.
     if body.target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target must not be empty\n").into_response();
     }
@@ -474,7 +524,7 @@ pub(crate) async fn run_events(
     };
 
     if let Some(wait_ms) = q.wait_ms {
-        return serve_run_longpoll(engine, run_id, attach, wait_ms).await;
+        return serve_run_longpoll(inner, engine, run_id, attach, client_ip, wait_ms).await;
     }
     if boatramp_http::is_upgrade_request(request.headers()) {
         return serve_run_ws(inner, engine, run_id, attach, client_ip, request).await;
@@ -485,10 +535,16 @@ pub(crate) async fn run_events(
 /// LONG-POLL: drain the envelopes available within `wait_ms` (bounded by [`MAX_POLL_BATCH`]) and
 /// return them as a JSON batch with the next resume cursor. Does NOT arm drop-cancel (a poll gap is
 /// not a watcher disconnect); the ephemeral attach group is still cleaned up on return.
+///
+/// LOW-2: acquires the SAME per-scope + per-IP stream permits SSE/WS do (keyed by `run:{run_id}`), so
+/// concurrent long-polls — and the ephemeral-group churn each one opens on the holder's own run — are
+/// bounded exactly like the streaming transports, rather than being an un-capped churn hole.
 async fn serve_run_longpoll(
+    inner: &HandlerRuntimeInner,
     engine: RunEngine,
     run_id: String,
     attach: EngineAttach,
+    client_ip: IpAddr,
     wait_ms: u64,
 ) -> Response {
     #[derive(Serialize)]
@@ -499,6 +555,36 @@ async fn serve_run_longpoll(
         /// Whether a terminal envelope was delivered (the run has concluded — stop polling).
         done: bool,
     }
+
+    // deny-before-resource-use: the per-scope + per-IP permits, keyed by the run topic (identical to
+    // SSE/WS — one shared pool per run), acquired BEFORE opening the poll so a flood of long-polls on
+    // one run is shed to 503 / 429 rather than opening unbounded ephemeral attach groups (LOW-2). Held
+    // for the whole poll (released on return).
+    let scope_key = format!("run:{run_id}");
+    let _site_permit = match crate::stream::acquire_stream_permit_capped(
+        inner,
+        &scope_key,
+        crate::stream::DEFAULT_STREAM_CONNECTIONS,
+    ) {
+        Ok(p) => p,
+        Err(()) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "run stream connection limit reached\n",
+            )
+                .into_response();
+        }
+    };
+    let _ip_guard = match crate::stream::acquire_stream_ip_slot(inner, &scope_key, client_ip) {
+        Ok(g) => g,
+        Err(()) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "per-client run stream connection limit reached\n",
+            )
+                .into_response();
+        }
+    };
 
     let EngineAttach {
         mut stream,
@@ -1361,5 +1447,45 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// LOW-2: the long-poll attach acquires the SAME per-scope + per-IP stream permits SSE/WS do, so a
+    /// client already at the per-IP cap on a run is shed with 429 (bounding concurrent long-polls +
+    /// the ephemeral-group churn each would open), and a released slot lets one through again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn longpoll_applies_the_per_ip_stream_cap() {
+        let h = setup();
+        let (run_id, token, _) = start(&h).await;
+        let inner = h.rt.inner.as_ref().unwrap();
+        let scope_key = format!("run:{run_id}");
+        // Saturate the per-IP cap on this run's scope for the default client IP (0.0.0.0 — the value
+        // the attach handler uses when the request carries no `ConnectInfo`, as in these unit calls).
+        let ip = IpAddr::from([0u8, 0, 0, 0]);
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(
+                crate::stream::acquire_stream_ip_slot(inner, &scope_key, ip)
+                    .expect("under the cap"),
+            );
+        }
+        let longpoll = |h: &Harness| {
+            run_events(
+                Extension(h.rt.clone()),
+                Extension(proj()),
+                Extension(h.posture),
+                Extension(h.auth.clone()),
+                Path(("acme".into(), run_id.clone())),
+                Query(RunEventsQuery {
+                    after_seq: None,
+                    wait_ms: Some(50),
+                }),
+                bearer_request("GET", &token),
+            )
+        };
+        // The next long-poll on the same run from the same IP is shed (the cap applies).
+        assert_eq!(longpoll(&h).await.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Releasing a slot lets a long-poll through again (now under the cap).
+        held.pop();
+        assert_eq!(longpoll(&h).await.status(), StatusCode::OK);
     }
 }
