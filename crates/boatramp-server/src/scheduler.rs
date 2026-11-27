@@ -1425,15 +1425,29 @@ pub(super) async fn run_scheduler_tick(
                             .contains(&boatramp_core::migrate::DEFAULT_SCOPE_REHOME_VERSION)
                     })
                     .unwrap_or(false);
+                // Subscriber-aware coverage (beyond manifest consumers): a `bus:` work-queue topic can
+                // be drained by an EXTERNALLY-registered consumer — a webhook sink (a host-run
+                // pseudo-consumer claiming the work-queue) or a durable SSE/WS group subscriber — NONE
+                // of which appear in `manifest.config.consumers`. Fold both in so the orphaned signal
+                // does not false-flag a topic that genuinely HAS a consumer, just not a manifest one.
+                // DIAGNOSTIC-only: this changes the warn + the `boatramp_orphaned_ready_topic` gauge,
+                // never delivery. The webhook-sink set (the drainer's OWN enumeration, so signal and
+                // delivery agree) is gathered once per pass; the registered-group probe (`list_groups`)
+                // is deferred below to only a would-be-orphan topic (the normally-empty set).
+                let sink_topics =
+                    crate::bus_webhook::active_sink_bus_topics(&inner.kv, deploy).await;
                 let indexed_set: std::collections::HashSet<&String> = indexed.iter().collect();
                 let mut orphaned = std::collections::BTreeMap::new();
                 for topic in &indexed {
                     // Covered if ANY active subscription matches this concrete topic (an exact
                     // literal or a `{tenant}` template) — reuse the SAME matcher the dispatch uses,
-                    // so the orphaned signal and the delivery path agree exactly.
-                    let covered = active_subscriptions.iter().any(|sub| {
-                        boatramp_core::messaging::tenant_tmpl_matches(sub, topic).is_some()
-                    });
+                    // so the orphaned signal and the delivery path agree exactly — OR a webhook sink
+                    // drains this exact (already-namespaced) bus topic (a host-run pseudo-consumer the
+                    // manifest-consumer walk never sees).
+                    let covered = sink_topics.contains(topic)
+                        || active_subscriptions.iter().any(|sub| {
+                            boatramp_core::messaging::tenant_tmpl_matches(sub, topic).is_some()
+                        });
                     if covered {
                         continue;
                     }
@@ -1449,16 +1463,33 @@ pub(super) async fn run_scheduler_tick(
                     // so its whole backlog is never-attempted `attempts=0` work). A topic with zero
                     // backlog is not orphaned work — skip it (idle/drained).
                     let backlog = messaging.backlog(topic).await.unwrap_or(0);
-                    if backlog > 0 {
-                        tracing::warn!(
-                            topic = %topic,
-                            claimable = backlog,
-                            "orphaned ready topic: claimable work with NO active consumer \
-                             subscription covering it (a declared-but-un-routable consumer, or a \
-                             producer with no consumer) — messages will never be delivered"
-                        );
-                        orphaned.insert(topic.clone(), backlog as u64);
+                    if backlog == 0 {
+                        continue;
                     }
+                    // A live registered consumer GROUP (a durable external SSE/WS subscriber on this
+                    // topic) covers it: the operator intends consumption via the grouped lane, so the
+                    // work-queue backlog is not an orphaned producer-with-no-consumer. Probed LAST (the
+                    // most expensive check — a per-topic `mqgstate`/`mqglog` scan) and ONLY for a
+                    // would-be-orphan topic, so the common idle/covered path never pays it. Diagnostic
+                    // only (a group registered but not actively claiming the work-queue still drains it
+                    // on its own cursor — never the competing-consumer `mq/` lane this backlog counts;
+                    // suppressing the warn matches operator intent and never changes delivery).
+                    if messaging
+                        .list_groups(topic)
+                        .await
+                        .map(|groups| !groups.is_empty())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    tracing::warn!(
+                        topic = %topic,
+                        claimable = backlog,
+                        "orphaned ready topic: claimable work with NO active consumer \
+                         subscription covering it (a declared-but-un-routable consumer, or a \
+                         producer with no consumer) — messages will never be delivered"
+                    );
+                    orphaned.insert(topic.clone(), backlog as u64);
                 }
                 inner.metrics.set_orphaned_topics(orphaned);
             }

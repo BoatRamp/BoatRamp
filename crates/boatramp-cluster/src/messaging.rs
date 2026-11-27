@@ -707,6 +707,20 @@ impl RaftMessaging {
             .collect()
     }
 
+    /// The ids of `topic`'s live WORK-QUEUE index records (`mq/{topic}/{id}`, direct children only —
+    /// a subtopic is a different topic), read from this node's applied state. The work-queue analog of
+    /// [`dead_ids`](Self::dead_ids), behind [`purge_work_queue`](Messaging::purge_work_queue).
+    async fn work_queue_ids(&self, topic: &str) -> Vec<String> {
+        let prefix = messaging::meta_prefix(topic);
+        self.state
+            .list_prefix(&prefix)
+            .await
+            .into_iter()
+            .filter(|k| messaging::is_direct_child(k, &prefix))
+            .map(|k| k[prefix.len()..].to_string())
+            .collect()
+    }
+
     /// `topic`'s grouped (fan-out) dead-letters as `(group, id)`, read from this node's applied
     /// state (`mqgd/{topic}/{group}/{id}`). The work-queue `dead_ids` above and this together are
     /// the full DLQ; before this both count/purge/redrive saw only the work-queue keyspace.
@@ -1241,6 +1255,69 @@ impl Messaging for RaftMessaging {
                     });
         }
         Ok(ids.len() + grouped.len())
+    }
+
+    async fn purge_work_queue(&self, topic: &str) -> Result<usize, MessagingError> {
+        // The ungrouped work-queue backlog with no consumer, reclaimed via an EXPLICIT replicated
+        // delete proposal (the index IS the Raft state machine — never a raw local KV delete on a
+        // cluster; mirrors `purge_dead_letters` / `retention_sweep`). The record deletes replicate
+        // through Raft; the shared object-store payloads are deleted directly (object storage is never
+        // replicated through Raft). Scoped to EXACTLY `topic`'s own work-queue (`mq/{topic}/` direct
+        // children) — never the DLQ (`mqdead/…`) nor any grouped state (`mqgstate/…`/`mqglog/…`).
+        let ids = self.work_queue_ids(topic).await;
+        if ids.is_empty() {
+            // Still drop any stale ready marker (cheap, idempotent) — a topic drained to empty may
+            // have left one, and the drainer would otherwise do one empty claim to prune it (B5).
+            self.propose(WriteOp::Delete {
+                key: messaging::ready_key(topic),
+            })
+            .await?;
+            return Ok(0);
+        }
+        // Classify each record BEFORE the delete proposal removes it (reading THIS node's applied
+        // state — identical to `purge_dead_letters`): an inline one carried its payload in the record
+        // (no object to free) and its bytes are still charged to the SA1 aggregate-inline budget; a
+        // non-inline one has an object-store payload to delete afterward.
+        let mut inline_release = 0usize;
+        let mut object_ids: Vec<String> = Vec::new();
+        for id in &ids {
+            let inline_len = self
+                .state
+                .get(&messaging::meta_key(topic, id))
+                .await
+                .and_then(|raw| serde_json::from_slice::<messaging::Record>(&raw).ok())
+                .and_then(|r| r.inline.map(|p| p.len()));
+            match inline_len {
+                Some(len) => inline_release += len,
+                None => object_ids.push(id.clone()),
+            }
+        }
+        // One replicated batch: delete every index record, then the now-stale ready marker (B5), so a
+        // crash mid-purge leaves a consistent — never half-marked — index on every replica.
+        let mut deletes: Vec<WriteOp> = ids
+            .iter()
+            .map(|id| WriteOp::Delete {
+                key: messaging::meta_key(topic, id),
+            })
+            .collect();
+        deletes.push(WriteOp::Delete {
+            key: messaging::ready_key(topic),
+        });
+        self.propose(WriteOp::Batch(deletes)).await?;
+        for id in &object_ids {
+            self.storage
+                .delete(&messaging::payload_key(topic, id))
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
+        if inline_release > 0 {
+            let _ =
+                self.inline_inflight_bytes
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(inline_release))
+                    });
+        }
+        Ok(ids.len())
     }
 
     async fn redrive_dead_letters(&self, topic: &str) -> Result<usize, MessagingError> {
@@ -2319,6 +2396,18 @@ mod tests {
             let mut got = mq.ready_topics().await.unwrap();
             got.sort();
             if got == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// Poll a (possibly-follower) node's LOCAL applied-state backlog until it equals `want` — so a
+    /// cross-node replication assertion tolerates apply lag without flaking.
+    async fn poll_backlog(mq: &RaftMessaging, topic: &str, want: usize) -> bool {
+        for _ in 0..100 {
+            if mq.backlog(topic).await.unwrap() == want {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4163,6 +4252,63 @@ mod tests {
             mq.inline_inflight_bytes.load(Relaxed),
             0,
             "purge releases the inline dead-letter's bytes from the SA1 budget"
+        );
+
+        shutdown(rafts).await;
+    }
+
+    /// **The operator work-queue purge REPLICATES (cluster).** An ungrouped work-queue topic with no
+    /// consumer accumulates immortal records; `purge_work_queue` reclaims them via an EXPLICIT
+    /// replicated delete proposal through the leader (never a raw local KV delete — the index IS the
+    /// Raft state machine). The deletes + the ready-marker prune must therefore be visible on EVERY
+    /// node, and the purging node's SA1 inline budget is released.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_purge_work_queue_replicates() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (rafts, mqs) = cluster_mq(3).await;
+
+        // Three ungrouped work-queue messages, never claimed (producer with no consumer), published
+        // from node 1 — small ⇒ A3-inline ⇒ charged to node 1's SA1 budget.
+        let payload = b"orphan";
+        for _ in 0..3 {
+            mqs[&1].publish("t", payload).await.unwrap();
+        }
+        assert_eq!(
+            mqs[&1].inline_inflight_bytes.load(Relaxed),
+            payload.len() * 3
+        );
+        assert!(
+            poll_ready(&mqs[&1], &["t"]).await,
+            "publish armed the replicated ready marker"
+        );
+        assert!(
+            poll_backlog(&mqs[&2], "t", 3).await,
+            "the backlog replicated to a follower"
+        );
+
+        // Purge on node 1 (the leader): an EXPLICIT replicated batch of index deletes + the ready prune.
+        assert_eq!(mqs[&1].purge_work_queue("t").await.unwrap(), 3);
+
+        // The deletes replicated: the backlog is gone on EVERY node, and the ready marker is pruned
+        // cluster-wide (read from a follower, so this proves replication, not just a local delete).
+        assert_eq!(mqs[&1].backlog("t").await.unwrap(), 0);
+        assert!(
+            poll_backlog(&mqs[&2], "t", 0).await,
+            "purge replicated to node 2"
+        );
+        assert!(
+            poll_backlog(&mqs[&3], "t", 0).await,
+            "purge replicated to node 3"
+        );
+        assert!(
+            poll_ready(&mqs[&2], &[]).await,
+            "the ready marker prune replicated"
+        );
+        assert_eq!(
+            mqs[&1].inline_inflight_bytes.load(Relaxed),
+            0,
+            "the purging node released its inline budget"
         );
 
         shutdown(rafts).await;

@@ -711,6 +711,12 @@ pub fn router_with_fast(
             "/api/sites/{site}/_boatramp/queue/policy",
             post(operator_queue_policy),
         )
+        // Work-queue RECOVERY purge (destructive): drop every live record on an ungrouped work-queue
+        // topic with no consumer. Gated `Site·Write` (the `_boatramp`+`queue` POST arm), like pause/policy.
+        .route(
+            "/api/sites/{site}/_boatramp/queue/purge",
+            post(operator_queue_purge),
+        )
         // Project-BUS operator surface: the same DLQ/queue ops as the per-site surface
         // above, but for the SHARED project bus (`{project}/bus/{topic}`, the keyspace a
         // `bus:<topic>` publish routes to across every site in the project) rather than a
@@ -750,6 +756,12 @@ pub fn router_with_fast(
         .route(
             "/api/projects/{project}/_boatramp/bus/queue/policy",
             post(operator_bus_queue_policy),
+        )
+        // Project-bus work-queue RECOVERY purge (destructive): gated `Project·Admin` (the `_boatramp`
+        // project arm) — stronger than the per-site `Site·Write`, as the bus is a project-wide resource.
+        .route(
+            "/api/projects/{project}/_boatramp/bus/queue/purge",
+            post(operator_bus_queue_purge),
         )
         // The EXTERNAL project-bus CONSUMER surface (PLAN-messaging-consumer-delivery): an
         // authenticated off-node client consumes its own project's `{project}/bus/<topic>` topics

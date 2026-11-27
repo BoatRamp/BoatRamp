@@ -2767,6 +2767,39 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// DESTRUCTIVELY purge an ungrouped WORK-QUEUE topic (`POST …/_boatramp/queue/purge`): drop every
+    /// live record + its payloads + the ready marker, the recovery primitive for a work-queue topic
+    /// with no consumer. Returns the number of records purged. NOT the dead-letter store (that is
+    /// `dlq`) nor any grouped state. Gated `Site·Write` (site scope) / `Project·Admin` (bus scope).
+    pub async fn purge_work_queue(&self, scope: OpScope<'_>, topic: &str) -> Result<usize> {
+        let url = self.op_url(scope, "queue/purge");
+        let client = &self.http;
+        #[derive(Serialize)]
+        struct Request<'a> {
+            topic: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            alias: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        struct PurgeResponse {
+            #[allow(dead_code)]
+            ok: bool,
+            purged: usize,
+        }
+        let resp: PurgeResponse = client
+            .post(url)
+            .json(&Request {
+                topic,
+                alias: scope.alias(),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp.purged)
+    }
+
     /// Set a topic's per-topic operator flow-control policy (`POST …/_boatramp/queue/policy`,
     /// v0.4.24). Each cap is optional (`None` = uncapped on that axis).
     pub async fn set_topic_policy(

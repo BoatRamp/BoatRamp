@@ -425,6 +425,24 @@ async fn collect_active_sinks(
     by_name
 }
 
+/// Every ACTIVE webhook sink's NAMESPACED bus topic (`{project}/bus/<topic>`), across BOTH
+/// registration paths (config-declared + runtime-registered) — the exact set the drainer supervisor
+/// drives. The scheduler's orphaned-ready detector folds this into its "covered" test: a bus
+/// work-queue topic drained purely by a webhook sink has NO `manifest.config.consumers` entry (a sink
+/// is a host-run pseudo-consumer, not a wasm consumer), so without this it would be false-flagged as
+/// an orphaned producer-with-no-consumer. Reusing the SAME enumeration guarantees the diagnostic
+/// signal and the actual delivery agree. Purely diagnostic — never touches delivery.
+pub(crate) async fn active_sink_bus_topics(
+    kv: &std::sync::Arc<dyn KvStore>,
+    deploy: &DeployStore,
+) -> std::collections::HashSet<String> {
+    collect_active_sinks(kv, deploy)
+        .await
+        .into_iter()
+        .map(|((project, _name), sink)| bus_namespace(&ProjectRef::new(&project), &sink.topic))
+        .collect()
+}
+
 /// A content fingerprint of a sink record, so the supervisor restarts a per-sink subscriber only when
 /// the sink's definition actually changed (not on every reconcile).
 fn sink_fingerprint(sink: &WebhookSink) -> u64 {
