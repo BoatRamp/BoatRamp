@@ -2367,10 +2367,12 @@ pub fn check_grant_disjointness(
             if path_contains(&backend_dir, &reserved_cache)
                 || path_contains(&reserved_cache, &backend_dir)
             {
-                return Err(CompositionGrantError::BackendCollidesWithReservedExecCache {
-                    authority: a,
-                    reserved: reserved_cache,
-                });
+                return Err(
+                    CompositionGrantError::BackendCollidesWithReservedExecCache {
+                        authority: a,
+                        reserved: reserved_cache,
+                    },
+                );
             }
         }
     }
@@ -4024,7 +4026,8 @@ mod privsep_derivation_tests {
     // because the cache is loaded as executable code WITHOUT a content MAC (the `aot` HMAC gate covers
     // only the cluster/blob path, not this local cache), that overlap is a cache-poisoning → RCE seam.
     #[test]
-    fn reserved_exec_cache_subtree_is_disjoint_from_every_backend_state_grant_and_ungranted_today() {
+    fn reserved_exec_cache_subtree_is_disjoint_from_every_backend_state_grant_and_ungranted_today()
+    {
         let data = Path::new("/data");
         let reserved = node_own_exec_cache_dir(data);
         assert_eq!(
