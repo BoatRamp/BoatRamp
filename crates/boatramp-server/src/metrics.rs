@@ -53,6 +53,11 @@ pub enum Outcome {
     /// Distinct from [`Trap`](Self::Trap) so the DLQ reason reads `consumer-error`, legible as a guest
     /// -returned error rather than a crash (PLAN-async-persona legible-terminal-outcome taxonomy).
     ConsumerError,
+    /// A per-invocation SQL COMMIT failed after an otherwise-clean invocation — the guest's writes
+    /// were LOST. Distinct from [`Error`](Self::Error) so the DLQ reason + stats read `commit-failed`:
+    /// a silent lost-write is a data-integrity incident an operator must tell apart from a generic
+    /// crash (a consumer delivery redelivers/dead-letters on it).
+    CommitFailed,
     Error,
 }
 
@@ -68,6 +73,7 @@ impl Outcome {
             Err(HandlerError::Overloaded) => Self::Overloaded,
             Err(HandlerError::Trap(_)) => Self::Trap,
             Err(HandlerError::ConsumerError(_)) => Self::ConsumerError,
+            Err(HandlerError::CommitFailed(_)) => Self::CommitFailed,
             Err(HandlerError::Compile(_))
             | Err(HandlerError::NoResponse)
             | Err(HandlerError::Internal(_)) => Self::Error,
@@ -85,6 +91,7 @@ impl Outcome {
             Self::Overloaded => "overloaded",
             Self::Trap => "trap",
             Self::ConsumerError => "consumer-error",
+            Self::CommitFailed => "commit-failed",
             Self::Error => "error",
         }
     }
@@ -103,6 +110,10 @@ pub struct Counters {
     pub trap: u64,
     /// Clean consumer-returned errors (distinct from `trap`) — PLAN-async-persona taxonomy.
     pub consumer_error: u64,
+    /// Per-invocation SQL commit failures (lost writes) — distinct from `error` so an operator can
+    /// alert on silent data loss. A data-integrity signal.
+    #[serde(default)]
+    pub commit_failed: u64,
     pub error: u64,
     /// Sum of wall-clock durations (for computing a mean in the UI).
     pub total_duration_ms: u64,
@@ -120,6 +131,7 @@ impl Counters {
             Outcome::Overloaded => self.overloaded += 1,
             Outcome::Trap => self.trap += 1,
             Outcome::ConsumerError => self.consumer_error += 1,
+            Outcome::CommitFailed => self.commit_failed += 1,
             Outcome::Error => self.error += 1,
         }
     }

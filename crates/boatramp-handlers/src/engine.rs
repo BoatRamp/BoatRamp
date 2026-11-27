@@ -428,6 +428,16 @@ pub enum HandlerError {
     /// The guest returned without producing a response.
     #[error("handler produced no response")]
     NoResponse,
+    /// A per-invocation SQL transaction that we intended to COMMIT (the guest handled the invocation
+    /// cleanly) **failed at commit** — the invocation's writes were LOST. A distinct data-integrity
+    /// terminal outcome, never folded into the opaque [`Trap`](Self::Trap) / [`Internal`](Self::Internal)
+    /// 500-class, so an operator can tell a lost write apart from a crash: on the consumer / session /
+    /// tcp lanes this fails the invocation (the message / inbound work redelivers), and on every lane
+    /// the per-component `commit_failed` stat + an `ERROR` log fire. The carried string is the
+    /// host-formatted commit error (never guest text). (The `wasi:http` lane cannot surface this as a
+    /// status — its response head is already produced via the out-param — so it logs + meters only.)
+    #[error("sql commit failed after a clean handler return (writes were not persisted): {0}")]
+    CommitFailed(String),
     /// An internal engine error.
     #[error("handler engine error: {0}")]
     Internal(String),
@@ -2581,6 +2591,32 @@ impl HandlerEngine {
         self.world_cache.lock().unwrap().contains(hash)
     }
 
+    /// Fold a per-invocation SQL `finalize(commit = true)` outcome into a **commit-on-success**
+    /// lane's result. A COMMIT that failed after a clean guest return means the invocation's writes
+    /// were LOST, so the invocation MUST fail — a consumer NACKs / redelivers, a session / tcp
+    /// handler fails — never be reported as done. `finalized` is exactly what
+    /// [`SqlSession::finalize`](crate::bindings::sql::SqlSession::finalize) returned (it has ALREADY
+    /// logged every commit/rollback error at `ERROR` with context); this only decides the invocation
+    /// OUTCOME and bumps the per-component `commit_failed` data-integrity metric. Shared by every
+    /// commit-on-success lane so a lost write is handled identically on all of them (the `wasi:http`
+    /// lane is the one exception — its response is already produced via the out-param, so it meters
+    /// the failure inline instead of returning it). A rollback outcome is never passed here: a failed
+    /// rollback is logged inside `finalize` and cannot change an already-failing invocation.
+    #[cfg(feature = "sql")]
+    fn commit_outcome(
+        &self,
+        hash: &str,
+        finalized: Result<(), boatramp_core::sql::SqlError>,
+    ) -> Result<(), HandlerError> {
+        match finalized {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.stats.record_commit_failed(hash);
+                Err(HandlerError::CommitFailed(err.to_string()))
+            }
+        }
+    }
+
     /// Call a named export of a resident **world-lane** component (U7), under the engine's
     /// `Limits` (linear-memory ceiling, epoch wall-clock timeout, CPU fuel) with the per-invocation
     /// SQL session finalized the same way as the request lane: **commit on `Ok`, roll back on `Err`
@@ -2650,8 +2686,10 @@ impl HandlerEngine {
                 // return too, so such a transaction is EXPLICITLY rolled back — symmetric with the
                 // missing-export and post-call paths, never left to backend drop semantics.
                 let err = classify(&e, store.data().oom());
+                // A rollback failure here is logged inside `finalize`; the call already fails with
+                // `err`, so there is nothing more to decide (hence the explicit discard).
                 #[cfg(feature = "sql")]
-                store.data_mut().sql.finalize(false).await;
+                let _ = store.data_mut().sql.finalize(false).await;
                 return Err(err);
             }
         };
@@ -2659,9 +2697,10 @@ impl HandlerEngine {
             Some(f) => f,
             None => {
                 // Finalize (roll back) the SQL session even on a pre-call shape error, so a lazily
-                // begun transaction never dangles.
+                // begun transaction never dangles. A rollback failure is logged inside `finalize`;
+                // the call already fails, so the outcome is explicitly discarded here.
                 #[cfg(feature = "sql")]
-                store.data_mut().sql.finalize(false).await;
+                let _ = store.data_mut().sql.finalize(false).await;
                 return Err(HandlerError::Compile(format!(
                     "world component does not export `{export}`"
                 )));
@@ -2673,11 +2712,17 @@ impl HandlerEngine {
         let mut results = vec![Val::Bool(false); result_arity];
         let call = func.call_async(&mut store, params, &mut results).await;
         // Close the per-invocation SQL transaction: commit only on a clean return, roll back on a
-        // trap/timeout/fuel/oom — identical to the request and consumer lanes.
+        // trap/timeout/fuel/oom — identical to the request and consumer lanes. The commit/rollback
+        // outcome is NEVER swallowed: `finalize` logs every failure, and a failed COMMIT on a clean
+        // return turns the call into `CommitFailed` (the writes were lost — don't report success).
         #[cfg(feature = "sql")]
-        store.data_mut().sql.finalize(call.is_ok()).await;
+        let finalized = store.data_mut().sql.finalize(call.is_ok()).await;
         match call {
-            Ok(()) => Ok(results),
+            Ok(()) => {
+                #[cfg(feature = "sql")]
+                self.commit_outcome(hash, finalized)?;
+                Ok(results)
+            }
             Err(trap) => Err(classify(&trap, store.data().oom())),
         }
     }
@@ -3315,10 +3360,19 @@ impl HandlerEngine {
         let consumer_pre = self.consumer_pre(hash, wasm)?;
         let mut store = self.new_store(bindings, self.effective_limits(Lane::Async, limits));
         let instantiated_at = std::time::Instant::now();
-        let consumer = consumer_pre
-            .instantiate_async(&mut store)
-            .await
-            .map_err(|e| classify(&e, store.data().oom()))?;
+        let consumer = match consumer_pre.instantiate_async(&mut store).await {
+            Ok(consumer) => consumer,
+            Err(e) => {
+                // A consumer may open a SQL transaction from a core `start` during instantiation and
+                // then trap. EXPLICITLY roll it back on this early return too (commit == false) —
+                // symmetric with `call_export` and the post-call path, never left to backend drop.
+                // `finalize` logs any rollback failure; the invocation already fails with `e`.
+                let err = classify(&e, store.data().oom());
+                #[cfg(feature = "sql")]
+                let _ = store.data_mut().sql.finalize(false).await;
+                return Err(err);
+            }
+        };
         self.stats
             .consumer
             .record_instantiation(instantiated_at.elapsed().as_nanos() as u64);
@@ -3330,14 +3384,23 @@ impl HandlerEngine {
             .boatramp_handlers_messaging_handler()
             .call_handle(&mut store, &message)
             .await;
-        // Close any per-invocation SQL transaction: commit only if the consumer
-        // handled the message cleanly.
+        // Close any per-invocation SQL transaction: commit only if the consumer handled the message
+        // cleanly. The outcome is NEVER swallowed — a COMMIT that fails after a clean `handle` means
+        // the writes were LOST, so the invocation becomes `CommitFailed` and the drain loop
+        // NACKs/redelivers it (eventually dead-letters), never acks it as done.
         #[cfg(feature = "sql")]
-        store
+        let finalized = store
             .data_mut()
             .sql
             .finalize(matches!(result, Ok(Ok(()))))
             .await;
+        // A clean `handle` whose COMMIT then fails is a LOST write: fail the invocation so the drain
+        // loop NACKs / redelivers it (eventually dead-letters, `last_error = commit-failed`) rather
+        // than ack it as done. `finalize` has already logged the failure at ERROR.
+        #[cfg(feature = "sql")]
+        if matches!(result, Ok(Ok(()))) {
+            self.commit_outcome(hash, finalized)?;
+        }
         match result {
             Ok(Ok(())) => Ok(()),
             // A CLEAN guest `Err` (the consumer's `handle` returned an error value) — distinct from a
@@ -3618,13 +3681,21 @@ impl HandlerEngine {
             .boatramp_handlers_session_handler()
             .call_handle(&mut store, &input)
             .await;
-        // Close any per-invocation SQL transaction: commit only on a clean re-entry.
+        // Close any per-invocation SQL transaction: commit only on a clean re-entry. NEVER swallowed
+        // — a COMMIT that fails after a clean re-entry means the writes were LOST, so the re-entry
+        // becomes `CommitFailed` (its inbound frames redeliver), never reported as committed.
         #[cfg(feature = "sql")]
-        store
+        let finalized = store
             .data_mut()
             .sql
             .finalize(matches!(result, Ok(Ok(()))))
             .await;
+        // A clean re-entry whose COMMIT then fails is a LOST write: fail it (its inbound frames
+        // redeliver) rather than report it committed. `finalize` has already logged the failure.
+        #[cfg(feature = "sql")]
+        if matches!(result, Ok(Ok(()))) {
+            self.commit_outcome(hash, finalized)?;
+        }
         match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => Err(HandlerError::Trap(format!(
@@ -3817,13 +3888,21 @@ impl HandlerEngine {
                 kind = &mut watchdog => Err(kind),
             }
         };
-        // Close any per-invocation SQL transaction: commit only on a clean guest return.
+        // Close any per-invocation SQL transaction: commit only on a clean guest return. NEVER
+        // swallowed — a COMMIT that fails after a clean return means the writes were LOST, so the
+        // connection fails with `CommitFailed` rather than being reported as a clean close.
         #[cfg(feature = "sql")]
-        store
+        let finalized = store
             .data_mut()
             .sql
             .finalize(matches!(&outcome, Ok(Ok(Ok(())))))
             .await;
+        // A clean connection whose COMMIT then fails is a LOST write: fail the connection rather than
+        // report a clean close. `finalize` has already logged the failure at ERROR.
+        #[cfg(feature = "sql")]
+        if matches!(&outcome, Ok(Ok(Ok(())))) {
+            self.commit_outcome(hash, finalized)?;
+        }
         match outcome {
             Ok(Ok(Ok(()))) => Ok(()),
             // The guest-returned `connection-error.message` is UNTRUSTED (guest-controlled length) and
@@ -4480,6 +4559,13 @@ impl HandlerEngine {
         // back after a trap (the moved store is otherwise unreachable from here).
         let oom_flag = store.data().oom_flag();
 
+        // A post-response COMMIT failure (below) can't un-send the already-produced response, so it
+        // is metered rather than returned — clone the per-component stat handle + hash INTO the task.
+        #[cfg(feature = "sql")]
+        let commit_stats = self.stats.clone();
+        #[cfg(feature = "sql")]
+        let commit_hash = hash.to_string();
+
         // Drive the guest on its own task: it may stream the body after setting
         // the response outparam, so the task must outlive the head response.
         let task = tokio::spawn(async move {
@@ -4487,10 +4573,24 @@ impl HandlerEngine {
                 .wasi_http_incoming_handler()
                 .call_handle(&mut store, req, out)
                 .await;
-            // Close the per-invocation SQL transaction once the guest is done
-            // (after any streamed body): commit on success, roll back otherwise.
+            // Close the per-invocation SQL transaction once the guest is done (after any streamed
+            // body): commit when the guest did not trap, roll back otherwise. The outcome is NEVER
+            // swallowed — `finalize` logs every commit/rollback failure at ERROR with context.
+            //
+            // KNOWN LIMITATION (documented): unlike the consumer/session/tcp lanes, the `wasi:http`
+            // lane cannot turn a commit failure into a `500`. The response head is produced via the
+            // out-param DURING `call_handle` and has already been handed to the caller (see
+            // `receiver.await` below) — often already on the wire — by the time this runs. So a
+            // commit failure after a successful handler is logged (in `finalize`) AND recorded on the
+            // per-component `commit_failed` data-integrity metric (the alertable signal for a silent
+            // lost write); it is never silently reported as a clean `200`-with-lost-write beyond that.
             #[cfg(feature = "sql")]
-            store.data_mut().sql.finalize(result.is_ok()).await;
+            {
+                let committing = result.is_ok();
+                if store.data_mut().sql.finalize(committing).await.is_err() && committing {
+                    commit_stats.record_commit_failed(&commit_hash);
+                }
+            }
             result
         });
 
@@ -6998,6 +7098,130 @@ mod u7_host_world_lane_tests {
             assert!(
                 !committed.load(Ordering::SeqCst),
                 "an instantiation trap must never commit"
+            );
+        }
+
+        // ---- finalize must NOT swallow a failing commit/rollback ------------------------------
+
+        /// A backend whose single transaction FAILS to commit, recording that it was asked — so the
+        /// lane folding a lost commit into `CommitFailed` (rather than reporting success) is visible.
+        struct FailingCommitBackend {
+            attempted: Arc<AtomicBool>,
+        }
+        struct FailingCommitTx {
+            attempted: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl SqlBackend for FailingCommitBackend {
+            async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+                Ok(Box::new(FailingCommitTx {
+                    attempted: self.attempted.clone(),
+                }))
+            }
+        }
+        #[async_trait]
+        impl SqlTransaction for FailingCommitTx {
+            async fn query(&mut self, _s: &str, _p: &[SqlValue]) -> Result<SqlRows, SqlError> {
+                unreachable!("the finalize test never issues a query")
+            }
+            async fn execute(&mut self, _s: &str, _p: &[SqlValue]) -> Result<u64, SqlError> {
+                unreachable!("the finalize test never issues a statement")
+            }
+            async fn commit(self: Box<Self>) -> Result<(), SqlError> {
+                self.attempted.store(true, Ordering::SeqCst);
+                Err(SqlError::Other("commit exploded".into()))
+            }
+            async fn rollback(self: Box<Self>) -> Result<(), SqlError> {
+                Ok(())
+            }
+        }
+
+        /// A backend whose single transaction FAILS to roll back, recording the attempt — so a
+        /// failed rollback is handled (logged), never silently skipped, and never masks the trap.
+        struct FailingRollbackBackend {
+            attempted: Arc<AtomicBool>,
+        }
+        struct FailingRollbackTx {
+            attempted: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl SqlBackend for FailingRollbackBackend {
+            async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+                Ok(Box::new(FailingRollbackTx {
+                    attempted: self.attempted.clone(),
+                }))
+            }
+        }
+        #[async_trait]
+        impl SqlTransaction for FailingRollbackTx {
+            async fn query(&mut self, _s: &str, _p: &[SqlValue]) -> Result<SqlRows, SqlError> {
+                unreachable!("the finalize test never issues a query")
+            }
+            async fn execute(&mut self, _s: &str, _p: &[SqlValue]) -> Result<u64, SqlError> {
+                unreachable!("the finalize test never issues a statement")
+            }
+            async fn commit(self: Box<Self>) -> Result<(), SqlError> {
+                Ok(())
+            }
+            async fn rollback(self: Box<Self>) -> Result<(), SqlError> {
+                self.attempted.store(true, Ordering::SeqCst);
+                Err(SqlError::Other("rollback exploded".into()))
+            }
+        }
+
+        #[tokio::test]
+        async fn a_failed_commit_on_a_clean_return_surfaces_as_commit_failed() {
+            // Reproduce-first: the guest opens a transaction and returns cleanly, but the COMMIT
+            // fails. The invocation MUST become `CommitFailed` (the writes were lost) — never a
+            // silent success. (Pre-fix: the error was discarded with `let _ =` and the call returned
+            // `Ok`.)
+            let component = call_host_component("test:sql/probe", "touch", false);
+            let (engine, _host) = engine_with_host(Limits::default());
+            engine
+                .precompile_and_serialize_world("commit-fail", &component)
+                .expect("compiles");
+            let attempted = Arc::new(AtomicBool::new(false));
+            let backend = Arc::new(FailingCommitBackend {
+                attempted: attempted.clone(),
+            });
+            let bindings = Bindings::new("test").with_sql("db", backend);
+            let result = engine
+                .call_export("commit-fail", bindings, Box::new(0u32), "run", &[], None)
+                .await;
+            assert!(
+                matches!(result, Err(HandlerError::CommitFailed(_))),
+                "a lost commit must surface as CommitFailed, not success: {result:?}"
+            );
+            assert!(
+                attempted.load(Ordering::SeqCst),
+                "the commit was actually attempted (finalize ran)"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_trap_with_a_failing_rollback_still_surfaces_the_trap() {
+            // A guest that traps AND whose rollback then fails: the trap must still be the surfaced
+            // outcome (the rollback failure is logged, never swallowed, and never masks the crash).
+            let component = call_host_component("test:sql/probe", "touch", true);
+            let (engine, _host) = engine_with_host(Limits::default());
+            engine
+                .precompile_and_serialize_world("rollback-fail", &component)
+                .expect("compiles");
+            let attempted = Arc::new(AtomicBool::new(false));
+            let backend = Arc::new(FailingRollbackBackend {
+                attempted: attempted.clone(),
+            });
+            let bindings = Bindings::new("test").with_sql("db", backend);
+            let result = engine
+                .call_export("rollback-fail", bindings, Box::new(0u32), "run", &[], None)
+                .await;
+            assert!(
+                matches!(result, Err(HandlerError::Trap(_))),
+                "the trap must not be masked by the rollback failure: {result:?}"
+            );
+            assert!(
+                attempted.load(Ordering::SeqCst),
+                "the rollback was attempted (the failing rollback was handled, not skipped)"
             );
         }
     }
