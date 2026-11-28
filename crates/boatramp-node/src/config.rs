@@ -903,6 +903,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_ALLOW_GUEST_TCP_LISTENER",
     "BOATRAMP_SECURITY_ALLOW_GUEST_DNS_PUBLISH",
     "BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_REGISTER",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_RUN_STREAMING",
     "BOATRAMP_SECURITY_ALLOW_GUEST_DYNAMIC_DNS_PUBLISH",
     "BOATRAMP_SECURITY_GUEST_DNS_PUBLISH_NS",
     "BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES",
@@ -5253,6 +5254,9 @@ mod tests {
             }),
             ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SECRETS", |p| {
                 p.allow_guest_admin_secrets
+            }),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_RUN_STREAMING", |p| {
+                p.allow_guest_run_streaming
             }),
         ] {
             let mut cfg = ServerConfig::default();
