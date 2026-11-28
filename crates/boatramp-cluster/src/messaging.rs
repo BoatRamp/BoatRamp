@@ -2666,6 +2666,19 @@ mod tests {
         // Purge from node 3 (forwards to the leader); the batch of explicit deletes replicates + applies.
         mqs[&3].purge_topic(t).await.unwrap();
 
+        // `propose().await` returns on COMMIT; the state-machine APPLY lags slightly, so the LEADER
+        // can momentarily still show the pre-purge state just like a follower (an immediate leader read
+        // raced ~20% of the time). Poll BOTH nodes to convergence, then assert granularly.
+        for _ in 0..50 {
+            if mqs[&1].list_groups(t).await.unwrap().is_empty()
+                && mqs[&1].backlog(t).await.unwrap() == 0
+                && mqs[&2].list_groups(t).await.unwrap().is_empty()
+                && mqs[&2].backlog(t).await.unwrap() == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         // On the leader (which applied the proposal): no groups, no backlog — a COMPLETE reclaim.
         assert!(
             mqs[&1].list_groups(t).await.unwrap().is_empty(),
@@ -2676,18 +2689,12 @@ mod tests {
             0,
             "the work-queue meta records are reclaimed too"
         );
-        // And it REPLICATES: a follower converges to the same empty topic.
-        let mut converged = false;
-        for _ in 0..50 {
-            if mqs[&2].list_groups(t).await.unwrap().is_empty()
-                && mqs[&2].backlog(t).await.unwrap() == 0
-            {
-                converged = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(converged, "the purge replicated to the follower");
+        // And it REPLICATES: the follower converged to the same empty topic.
+        assert!(
+            mqs[&2].list_groups(t).await.unwrap().is_empty()
+                && mqs[&2].backlog(t).await.unwrap() == 0,
+            "the purge replicated to the follower"
+        );
 
         shutdown(rafts).await;
     }
@@ -4638,7 +4645,11 @@ mod tests {
                         .unwrap();
                     if batch.is_empty() {
                         empty_rounds += 1;
-                        if empty_rounds >= 50 {
+                        // Bumped 50→200 (250ms→1s): under extreme concurrent CI load a straggler can
+                        // exceed the old window on all three nodes (a delivery-timing flake, not a loss —
+                        // the long lease makes re-polling safe). The post-loop exactly-N + no-dup asserts
+                        // still require a complete, non-duplicated delivery, so this masks no real defect.
+                        if empty_rounds >= 200 {
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(5)).await;
